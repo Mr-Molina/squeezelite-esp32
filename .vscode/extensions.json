@@ -1,0 +1,10 @@
+{
+    "recommendations": [
+        "espressif.esp-idf-extension",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "ms-python.python",
+        "platformio.platformio-ide"
+    ]
+}

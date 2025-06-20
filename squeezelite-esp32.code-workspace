@@ -1,0 +1,18 @@
+{
+    "folders": [
+        {
+            "name": "squeezelite-esp32-v4.3",
+            "path": "."
+        }
+    ],
+    "settings": {
+        "terminal.integrated.cwd": "${workspaceFolder}"
+    },
+    "extensions": {
+        "recommendations": [
+            "espressif.esp-idf-extension",
+            "ms-vscode.cpptools",
+            "ms-vscode.cmake-tools"
+        ]
+    }
+}
