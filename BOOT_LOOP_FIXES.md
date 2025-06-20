@@ -16,6 +16,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
 ### ✅ Solutions Applied
 
 #### 1. Boot Stabilization Implementation
+
 - **File**: `main/esp_app_main.c`
 - **Fix**: Added `implement_boot_stabilization()` function that:
   - Detects power-on resets
@@ -24,6 +25,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
   - Prevents sporadic boot failures
 
 #### 2. Extended Watchdog Timeouts
+
 - **File**: `sdkconfig`
 - **Fix**: Extended interrupt watchdog timeout from 2s to 5s
   ```
@@ -31,6 +33,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
   ```
 
 #### 3. Improved IP Change Handling
+
 - **File**: `main/esp_app_main.c`
 - **Fix**: Enhanced `cb_connection_got_ip()` function:
   - Added IP change logging
@@ -39,6 +42,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
   - Added 2-second delay before restart to prevent loops
 
 #### 4. SPIRAM Cache Strategy Fix
+
 - **File**: `sdkconfig`
 - **Fix**: Changed cache workaround strategy:
   ```
@@ -46,6 +50,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
   ```
 
 #### 5. Fixed Partition Overlap
+
 - **File**: `CMakeLists.txt`
 - **Fix**: Removed conflicting flash target to prevent overlap
 - **Created**: Separate flash scripts:
@@ -54,7 +59,8 @@ This document summarizes the boot loop issues that were identified and fixed in 
   - `manual_flash.sh` - Updated to flash recovery only
 
 #### 6. Memory Leak Fix
-- **File**: `main/esp_app_main.c` 
+
+- **File**: `main/esp_app_main.c`
 - **Fix**: Added missing `free(bypass_wm)` call
 
 ### 📁 New Files Created
@@ -66,6 +72,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
 ### 🔄 Proper Flash Procedure
 
 #### Initial Setup (First Time)
+
 ```bash
 # 1. Build firmware
 ./build.sh
@@ -75,6 +82,7 @@ This document summarizes the boot loop issues that were identified and fixed in 
 ```
 
 #### Update Main Application
+
 ```bash
 # Option A: Via OTA (Recommended)
 # - Boot ESP32 in recovery mode
@@ -98,6 +106,7 @@ The fixes implement multiple layers of protection:
 ### 📊 Expected Results
 
 After applying these fixes:
+
 - ✅ Significantly reduced or eliminated sporadic boot loops
 - ✅ More reliable power-on boot sequence
 - ✅ Stable network connectivity without restart loops
@@ -107,6 +116,7 @@ After applying these fixes:
 ### 🔍 Monitoring
 
 The enhanced logging will help track:
+
 - Boot stabilization events
 - Reboot counter status
 - IP change events
@@ -115,6 +125,7 @@ The enhanced logging will help track:
 ### 🚨 If Issues Persist
 
 If boot loops still occur after these fixes:
+
 1. Check hardware connections and power supply stability
 2. Verify GPIO pin configurations for your specific board
 3. Consider hardware-specific boot timing requirements

@@ -407,31 +407,31 @@ esp_reset_reason_t xReason = ESP_RST_UNKNOWN;
 // Boot stabilization function to prevent sporadic boot issues
 void implement_boot_stabilization(void)
 {
-     // Check if this is a power-on reset
-     esp_reset_reason_t reset_reason = esp_reset_reason();
+	// Check if this is a power-on reset
+	esp_reset_reason_t reset_reason = esp_reset_reason();
 
-     if (reset_reason == ESP_RST_POWERON)
-     {
-          ESP_LOGI(TAG, "Power-on reset detected, implementing stabilization");
+	if (reset_reason == ESP_RST_POWERON)
+	{
+		ESP_LOGI(TAG, "Power-on reset detected, implementing stabilization");
 
-          // Add a delay to allow power to stabilize
-          vTaskDelay(pdMS_TO_TICKS(100));
+		// Add a delay to allow power to stabilize
+		vTaskDelay(pdMS_TO_TICKS(100));
 
-          // Configure critical pins with proper pull-ups
-          gpio_config_t io_conf = {
-              .intr_type = GPIO_INTR_DISABLE,
-              .mode = GPIO_MODE_INPUT,
-              .pin_bit_mask = (1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_2),
-              .pull_down_en = 0,
-              .pull_up_en = 1,
-          };
-          gpio_config(&io_conf);
+		// Configure critical pins with proper pull-ups
+		gpio_config_t io_conf = {
+		    .intr_type = GPIO_INTR_DISABLE,
+		    .mode = GPIO_MODE_INPUT,
+		    .pin_bit_mask = (1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_2),
+		    .pull_down_en = 0,
+		    .pull_up_en = 1,
+		};
+		gpio_config(&io_conf);
 
-          // Brief delay for GPIO stabilization
-          vTaskDelay(pdMS_TO_TICKS(50));
+		// Brief delay for GPIO stabilization
+		vTaskDelay(pdMS_TO_TICKS(50));
 
-          ESP_LOGI(TAG, "Boot stabilization complete");
-     }
+		ESP_LOGI(TAG, "Boot stabilization complete");
+	}
 }
 
 void app_main()
