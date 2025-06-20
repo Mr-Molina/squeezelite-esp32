@@ -3,15 +3,17 @@
 ## 🎵 Optimal GPIO Mapping for Audio Device
 
 ### **I2S Audio Output (Using Former Camera Pins)**
+
 ```
 I2S Function      GPIO   Original Camera Use    Wire Color Suggestion
 ═══════════════════════════════════════════════════════════════════════
 BCK (Bit Clock)    26    SIOD (Camera I2C SDA)    Blue
-WS (Word Select)   25    VSYNC (Camera sync)       White  
+WS (Word Select)   25    VSYNC (Camera sync)       White
 DO (Data Out)      22    PCLK (Camera clock)       Green
 ```
 
 ### **I2C Control (For DAC Configuration)**
+
 ```
 I2C Function      GPIO   Original Camera Use
 ═══════════════════════════════════════════════
@@ -20,11 +22,12 @@ SCL (Clock)        27    SIOC (Camera I2C SCL)
 ```
 
 ### **Control Interface**
+
 ```
 Control Function   GPIO   Original Camera Use    Purpose
 ═══════════════════════════════════════════════════════
 Rotary Encoder A   18    Y4 (Camera data)       Volume/Track
-Rotary Encoder B   19    Y5 (Camera data)       Volume/Track  
+Rotary Encoder B   19    Y5 (Camera data)       Volume/Track
 Rotary Button      5     Y3 (Camera data)       Play/Pause
 Power Button       4     Y2 (Camera data)       Power On/Off
 Green LED          2     Built-in LED           Status Good
@@ -34,11 +37,12 @@ Amp Control       35    Y9 (Camera data)       Amplifier on/off
 ```
 
 ### **Available for Additional Features**
+
 ```
 GPIO   Original Camera Use    Available For
 ═══════════════════════════════════════════════
 36     Y6 (Camera data)       Button/Sensor input
-39     Y7 (Camera data)       Button/Sensor input  
+39     Y7 (Camera data)       Button/Sensor input
 0      Boot (pull-up)         Button (advanced)
 1      TX (UART)              Debug/Button
 3      RX (UART)              Debug/Button
@@ -55,11 +59,12 @@ GPIO   Original Camera Use    Available For
 ## 🛠️ Configuration Commands
 
 ### **ESP-IDF MenuConfig Settings**
+
 ```bash
 # Navigate to Audio I2S Settings
 Component config → Audio → I2S Settings:
 CONFIG_I2S_BCK_IO=26
-CONFIG_I2S_WS_IO=25  
+CONFIG_I2S_WS_IO=25
 CONFIG_I2S_DO_IO=22
 
 # I2C for DAC control
@@ -73,15 +78,16 @@ CONFIG_ROTARY_ENCODER="A=18,B=19,SW=5,volume"
 ```
 
 ### **Recommended Audio Setup**
+
 ```bash
 # High-quality I2S DAC examples:
 - PCM5102A (32-bit, 384kHz capable)
-- ES9023 (24-bit, 192kHz)  
+- ES9023 (24-bit, 192kHz)
 - MAX98357A (Class D amplifier with I2S)
 
 # Connection example for PCM5102A:
 VCC  → 3.3V
-GND  → GND  
+GND  → GND
 SCK  → GPIO 26 (BCK)
 LCK  → GPIO 25 (WS)
 DIN  → GPIO 22 (DO)
@@ -100,7 +106,7 @@ CONFIG_AUDIO_BOARD_CUSTOM=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 
-# Memory optimization  
+# Memory optimization
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 ```
@@ -112,7 +118,7 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 ✅ **Expandable** - Many free GPIOs for future features  
 ✅ **Professional Features** - Jack detection, amp control  
 ✅ **Easy Programming** - Built-in USB programmer  
-✅ **Stable Power** - USB power with good regulation  
+✅ **Stable Power** - USB power with good regulation
 
 ## 🚀 **Next Steps**
 
