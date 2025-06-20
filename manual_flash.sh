@@ -2,8 +2,11 @@
 
 # ESP32 Manual Flash Helper Script
 echo "======================================"
-echo "ESP32 MANUAL FLASH PROCEDURE"
+echo "ESP32 RECOVERY FLASH PROCEDURE"
 echo "======================================"
+echo ""
+echo "📋 This script flashes the RECOVERY firmware only"
+echo "   Use './flash_squeezelite_ota.sh' for the main application"
 echo ""
 
 # Check if build directory exists

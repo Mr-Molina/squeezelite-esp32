@@ -97,7 +97,9 @@ idf_component_get_property(main_args esptool_py FLASH_ARGS)
 idf_component_get_property(sub_args esptool_py FLASH_SUB_ARGS)
 esptool_py_flash_target(squeezelite-flash "${main_args}" "${sub_args}")
 esptool_py_flash_target_image(squeezelite-flash squeezelite "${otaapp_offset}" "${BUILD_DIR}/squeezelite.bin")
-esptool_py_flash_target_image(flash squeezelite "${otaapp_offset}" "${BUILD_DIR}/squeezelite.bin")
+# Note: Removed squeezelite.bin from main flash target to prevent partition overlap
+# Use 'idf.py squeezelite-flash' to flash the squeezelite app to OTA partition
+# esptool_py_flash_target_image(flash squeezelite "${otaapp_offset}" "${BUILD_DIR}/squeezelite.bin")
 
 # and JTAG scripts
 add_custom_target(_jtag_scripts  ALL
