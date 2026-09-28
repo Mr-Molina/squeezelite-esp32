@@ -1,0 +1,31 @@
+{
+  "name": "Squeezelite-ESP32 (ESP-IDF v4.3.5)",
+  "image": "docker.io/sle118/squeezelite-esp32-idfv435",
+  "workspaceFolder": "/workspace/squeezelite-esp32",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/squeezelite-esp32,type=bind,consistency=delegated",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "idf.espIdfPath": "/opt/esp/idf",
+        "idf.toolsPath": "/opt/esp",
+        "idf.pythonInstallPath": "/opt/esp/python_env/idf4.3_py3.8_env/bin/python",
+        "C_Cpp.default.compilerPath": "/opt/esp/tools/xtensa-esp32-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32-elf/bin/xtensa-esp32-elf-gcc",
+        "C_Cpp.default.cStandard": "c11",
+        "C_Cpp.default.cppStandard": "c++17",
+        "C_Cpp.default.intelliSenseMode": "linux-gcc-arm"
+      },
+      "extensions": [
+        "ms-vscode.cpptools",
+        "espressif.esp-idf-extension"
+      ]
+    }
+  },
+  "containerEnv": {
+    "IDF_PATH": "/opt/esp/idf",
+    "IDF_TOOLS_PATH": "/opt/esp",
+    "PYTHONPATH": "/opt/esp/idf/tools:/opt/esp/idf/components/esptool_py/esptool",
+    "PATH": "/opt/esp/python_env/idf4.3_py3.8_env/bin:/opt/esp/idf/tools:/opt/esp/tools/xtensa-esp32-elf/esp-2021r2-patch3-8.4.0/xtensa-esp32-elf/bin:/opt/esp/tools/esp32ulp-elf/2.28.51-esp-20191205/esp32ulp-elf-binutils/bin:/opt/esp/tools/cmake/3.16.4/bin:/opt/esp/tools/openocd-esp32/v0.10.0-esp32-20210401/openocd-esp32/bin:/opt/esp/tools/ninja/1.10.0/:${containerEnv:PATH}"
+  },
+  "remoteUser": "root"
+}
