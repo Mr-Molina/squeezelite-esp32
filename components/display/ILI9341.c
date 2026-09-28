@@ -265,7 +265,15 @@ static bool Init( struct GDS_Device* Device ) {
 	Private->PageSize = min(8, PAGE_BLOCK / (Device->Width * Depth));
 
 #ifdef SHADOW_BUFFER	
+	if (Private->Shadowbuffer) {
+		free(Private->Shadowbuffer);
+		Private->Shadowbuffer = NULL;
+	}
 	Private->Shadowbuffer = malloc( Device->FramebufferSize );	
+	if (!Private->Shadowbuffer) {
+		ESP_LOGE(TAG, "failed to allocate %d bytes for shadow buffer", Device->FramebufferSize);
+		return false;
+	}
 	memset(Private->Shadowbuffer, 0xFF, Device->FramebufferSize);
 #endif
 #ifdef USE_IRAM

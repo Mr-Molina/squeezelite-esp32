@@ -41,6 +41,45 @@ EXT_RAM_ATTR static httpd_handle_t _server;
 EXT_RAM_ATTR static int _port;
 EXT_RAM_ATTR rest_server_context_t *rest_context;
 EXT_RAM_ATTR RingbufHandle_t messaging;
+static SemaphoreHandle_t scratch_mutex = NULL;
+static TaskHandle_t scratch_locked_task = NULL;
+static int scratch_lock_count = 0;
+
+bool http_server_lock_scratch(TickType_t xTicksToWait) {
+    TaskHandle_t calling_task = xTaskGetCurrentTaskHandle();
+    if (calling_task == scratch_locked_task) {
+        scratch_lock_count++;
+        return true;
+    }
+    if (!scratch_mutex) {
+        return false;
+    }
+    if (xSemaphoreTake(scratch_mutex, xTicksToWait) == pdTRUE) {
+        scratch_locked_task = calling_task;
+        scratch_lock_count = 1;
+        return true;
+    }
+    return false;
+}
+
+void http_server_unlock_scratch(void) {
+    TaskHandle_t calling_task = xTaskGetCurrentTaskHandle();
+    if (calling_task == scratch_locked_task) {
+        if (--scratch_lock_count <= 0) {
+            scratch_lock_count = 0;
+            scratch_locked_task = NULL;
+            xSemaphoreGive(scratch_mutex);
+        }
+    }
+}
+
+bool http_server_lock_json_object(TickType_t xTicksToWait) {
+    return http_server_lock_scratch(xTicksToWait);
+}
+
+void http_server_unlock_json_object(void) {
+    http_server_unlock_scratch();
+}
 
 httpd_handle_t http_get_server(int *port) {
 	if (port) *port = _port;
@@ -143,6 +182,9 @@ esp_err_t http_server_start()
     	ESP_LOGE(TAG,"No memory for http context");
     	return ESP_FAIL;
     }
+    if (!scratch_mutex) {
+        scratch_mutex = xSemaphoreCreateMutex();
+    }
 
     strlcpy(rest_context->base_path, "/res/", sizeof(rest_context->base_path));
 
@@ -186,6 +228,12 @@ void stop_webserver(httpd_handle_t server)
 {
     // Stop the httpd server
     httpd_stop(server);
+    if (scratch_mutex) {
+        vSemaphoreDelete(scratch_mutex);
+        scratch_mutex = NULL;
+        scratch_locked_task = NULL;
+        scratch_lock_count = 0;
+    }
 }
 
 

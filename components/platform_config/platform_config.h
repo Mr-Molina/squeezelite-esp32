@@ -48,6 +48,7 @@ DECLARE_GET_NUM(int32_t);
 
 bool config_has_changes();
 void config_commit_to_nvs();
+void config_flush_now(void);
 void config_start_timer();
 void config_init();
 void * config_alloc_get_default(nvs_type_t type, const char *key, void * default_value, size_t blob_size);

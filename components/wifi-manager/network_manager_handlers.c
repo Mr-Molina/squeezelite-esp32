@@ -431,7 +431,7 @@ static state_machine_result_t ETH_CONNECTING_NEW_STATE_handler(state_machine_t* 
     state_machine_result_t result = EVENT_HANDLED;
     switch (State_Machine->Event) {
         case EN_GOT_IP:
-            result= local_traverse_state(State_Machine, &network_states[WIFI_CONNECTED_STATE],__FUNCTION__);
+            result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_CONNECTED_STATE],__FUNCTION__);
             break;
         case EN_LOST_CONNECTION:
             network_status_update_ip_info(UPDATE_FAILED_ATTEMPT);
@@ -1087,7 +1087,7 @@ static state_machine_result_t WIFI_LOST_CONNECTION_STATE_handler(state_machine_t
             result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_LOST_CONNECTION_STATE],__FUNCTION__);
             break;
         case EN_CONNECT:
-            result= local_traverse_state(State_Machine, &Wifi_Configuring_State[WIFI_CONNECTING_STATE],__FUNCTION__);
+            result= local_traverse_state(State_Machine, &Wifi_Active_State[WIFI_CONNECTING_STATE],__FUNCTION__);
             break;
         default:
             result= EVENT_UN_HANDLED;

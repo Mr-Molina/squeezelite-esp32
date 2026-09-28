@@ -13,6 +13,7 @@
 #include "config.h"
 #include "nvs_utilities.h"
 #include "platform_esp32.h"
+#include "freertos/semphr.h"
 #include "messaging.h"
 #include "tools.h"
 /************************************
@@ -27,6 +28,22 @@ typedef struct {
 	RingbufHandle_t buf_handle;
 } messaging_list_t;
 static messaging_list_t top;
+static SemaphoreHandle_t messaging_mutex = NULL;
+
+static void messaging_lock(void) {
+	if (!messaging_mutex) {
+		messaging_mutex = xSemaphoreCreateRecursiveMutex();
+	}
+	if (messaging_mutex) {
+		xSemaphoreTakeRecursive(messaging_mutex, portMAX_DELAY);
+	}
+}
+
+static void messaging_unlock(void) {
+	if (messaging_mutex) {
+		xSemaphoreGiveRecursive(messaging_mutex);
+	}
+}
 #define MSG_LENGTH_AVG 1024
 
 messaging_list_t * get_struct_ptr(messaging_handle_t handle){
@@ -59,6 +76,7 @@ void messaging_fill_messages(messaging_list_t * target_subscriber){
 	single_message_t * message=NULL;
     UBaseType_t uxItemsWaiting;
 
+	messaging_lock();
     vRingbufferGetInfo(top.buf_handle, NULL, NULL, NULL, NULL, &uxItemsWaiting);
     for(size_t i=0;i<uxItemsWaiting;i++){
     	message= messaging_retrieve_message(top.buf_handle);
@@ -70,8 +88,10 @@ void messaging_fill_messages(messaging_list_t * target_subscriber){
 			FREE_AND_NULL(message);
     	}
     }
+	messaging_unlock();
 }
 messaging_handle_t messaging_register_subscriber(uint8_t max_count, char * name){
+	messaging_lock();
 	messaging_list_t * cur=&top;
 	while(cur->next){
 		cur = get_struct_ptr(cur->next);
@@ -79,6 +99,7 @@ messaging_handle_t messaging_register_subscriber(uint8_t max_count, char * name)
 	cur->next=malloc_init_external(sizeof(messaging_list_t));
 	if(!cur->next){
 		ESP_LOGE(tag,"subscriber alloc failed");
+		messaging_unlock();
 		return NULL;
 	}
 	memset(cur->next,0x00,sizeof(messaging_list_t));
@@ -89,10 +110,37 @@ messaging_handle_t messaging_register_subscriber(uint8_t max_count, char * name)
 	if(cur->buf_handle){
 		messaging_fill_messages(cur);
 	}
+	messaging_unlock();
 	return cur->buf_handle;
+}
+esp_err_t messaging_unregister_subscriber(messaging_handle_t subscriber_handle){
+	if (!subscriber_handle) return ESP_FAIL;
+	messaging_lock();
+	messaging_list_t *cur = &top;
+	while (cur && cur->next) {
+		messaging_list_t *target = get_struct_ptr(cur->next);
+		if (target->buf_handle == (RingbufHandle_t)subscriber_handle || target == get_struct_ptr(subscriber_handle)) {
+			cur->next = target->next;
+			if (target->buf_handle) {
+				vRingbufferDelete(target->buf_handle);
+			}
+			if (target->subscriber_name) {
+				free(target->subscriber_name);
+			}
+			free(target);
+			messaging_unlock();
+			return ESP_OK;
+		}
+		cur = get_struct_ptr(cur->next);
+	}
+	messaging_unlock();
+	return ESP_ERR_NOT_FOUND;
 }
 void messaging_service_init(){
 	size_t max_count=15;
+	if (!messaging_mutex) {
+		messaging_mutex = xSemaphoreCreateRecursiveMutex();
+	}
 	top.buf_handle = messaging_create_ring_buffer(max_count);
 	if(!top.buf_handle){
 		ESP_LOGE(tag, "messaging service init failed.");
@@ -133,6 +181,7 @@ cJSON *  messaging_retrieve_messages(RingbufHandle_t buf_handle){
 	cJSON * json_message=NULL;
 	size_t item_size;
     UBaseType_t uxItemsWaiting;
+	messaging_lock();
     vRingbufferGetInfo(buf_handle, NULL, NULL, NULL, NULL, &uxItemsWaiting);
 	for(int i = 0;i<uxItemsWaiting;i++){
 		message = (single_message_t *)xRingbufferReceive(buf_handle, &item_size, pdMS_TO_TICKS(50));
@@ -151,6 +200,7 @@ cJSON *  messaging_retrieve_messages(RingbufHandle_t buf_handle){
 			vRingbufferReturnItem(buf_handle, (void *)message);
 		}
 	}
+	messaging_unlock();
 	return json_messages;
 }
 single_message_t *  messaging_retrieve_message(RingbufHandle_t buf_handle){
@@ -158,12 +208,14 @@ single_message_t *  messaging_retrieve_message(RingbufHandle_t buf_handle){
 	single_message_t * message_copy=NULL;
 	size_t item_size;
     UBaseType_t uxItemsWaiting;
+	messaging_lock();
     vRingbufferGetInfo(buf_handle, NULL, NULL, NULL, NULL, &uxItemsWaiting);
 	if(uxItemsWaiting>0){
 		message = (single_message_t *)xRingbufferReceive(buf_handle, &item_size, pdMS_TO_TICKS(50));
 		message_copy  = clone_obj_psram(message,item_size);
 		vRingbufferReturnItem(buf_handle, (void *)message);
 	}
+	messaging_unlock();
 	return message_copy;
 }
 
@@ -176,6 +228,7 @@ esp_err_t messaging_post_to_queue(messaging_handle_t subscriber_handle, single_m
 	}
 	void * pItem=NULL;
 	UBaseType_t res=pdFALSE;
+	messaging_lock();
 	while(1){
 		ESP_LOGD(tag,"Attempting to reserve %d bytes for %s",message_size, str_or_unknown(subscriber->subscriber_name));
 		res =  xRingbufferSendAcquire(subscriber->buf_handle, &pItem, message_size, pdMS_TO_TICKS(50));
@@ -196,6 +249,7 @@ esp_err_t messaging_post_to_queue(messaging_handle_t subscriber_handle, single_m
 			vRingbufferReturnItem(subscriber->buf_handle, (void *)dummy);
 		}
 	}
+	messaging_unlock();
 	if (res != pdTRUE) {
 		ESP_LOGE(tag,"post to %s failed",str_or_unknown(subscriber->subscriber_name));
 		return ESP_FAIL;
@@ -250,10 +304,12 @@ void vmessaging_post_message(messaging_types type,messaging_classes msg_class, c
 		ESP_LOGD(tag,"Post: %s",message->message);
 	}
 
+	messaging_lock();
 	while(cur){
 		messaging_post_to_queue(get_handle_ptr(cur),  message, msg_size);
 		cur = get_struct_ptr(cur->next);
 	}
+	messaging_unlock();
 	FREE_AND_NULL(message);
 	return;
 

@@ -35,6 +35,7 @@
 #include <math.h>
 #include "audio_controls.h"
 #include "platform_config.h"
+#include "services.h"
 #include "telnet.h"
 #include "messaging.h"
 #include "gds.h"
@@ -152,6 +153,7 @@ void cb_connection_got_ip(nm_state_t new_state, int sub_state){
 	network_get_ip_info(&ipInfo);
 	if (ip.addr && ipInfo.ip.addr != ip.addr) {
 		ESP_LOGW(TAG, "IP change, need to reboot");
+		config_flush_now();
 		if(!wait_for_commit()){
 			ESP_LOGW(TAG,"Unable to commit configuration. ");
 		}
@@ -334,26 +336,35 @@ void handle_network_up(nm_state_t new_state, int sub_state){
 }
 esp_reset_reason_t xReason=ESP_RST_UNKNOWN;
 
+#ifndef POWERON_RESET
+#define POWERON_RESET ESP_RST_POWERON
+#endif
+
 void app_main()
 {
-	if(ColdBootIndicatorFlag != 0xFACE ){
+	xReason = esp_reset_reason();
+	ESP_LOGI(TAG,"Reset reason is: %u", xReason);
+
+	if(xReason == POWERON_RESET || ColdBootIndicatorFlag != 0xFACE ){
 		ESP_LOGI(TAG, "System is booting from power on.");
 		cold_boot = true;
-        ColdBootIndicatorFlag = 0xFACE;
-    }
+		ColdBootIndicatorFlag = 0xFACE;
+		RebootCounter = 0;
+		RecoveryRebootCounter = 0;
+	}
 	else {
 		cold_boot = false;
 	}
 	const esp_partition_t *running = esp_ota_get_running_partition();
 	is_recovery_running = (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY);
-	xReason = esp_reset_reason();
-	ESP_LOGI(TAG,"Reset reason is: %u", xReason);
+
 	if(!is_recovery_running )  {
 		/* unscheduled restart (HW, Watchdog or similar) thus increment dynamic
 	 	* counter then log current boot statistics as a warning */
 		uint32_t Counter = halSTORAGE_RebootCounterUpdate(1) ;		// increment counter
 		ESP_LOGI(TAG,"Reboot counter=%u\n", Counter) ;
 		if (Counter == 5) {
+			config_flush_now();
 			guided_factory();
 		}
 	}
@@ -485,5 +496,6 @@ void app_main()
 		free(fwurl);
 	}
     services_sleep_init();
+    services_sleep_setsuspend(config_flush_now);
 	messaging_post_message(MESSAGING_INFO,MESSAGING_CLASS_SYSTEM,"System started");
 }

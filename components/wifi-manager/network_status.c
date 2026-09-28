@@ -23,6 +23,7 @@
 static const char TAG[] = "network_status";
 SemaphoreHandle_t network_status_json_mutex = NULL;
 static TaskHandle_t network_json_locked_task = NULL;
+static int network_json_lock_count = 0;
 SemaphoreHandle_t network_status_ip_address_mutex = NULL;
 static TaskHandle_t network_status_ip_address_locked_task = NULL;
 char* release_url = NULL;
@@ -66,6 +67,8 @@ void destroy_network_status() {
     vSemaphoreDelete(network_status_ip_address_mutex);
     network_status_ip_address_mutex = NULL;
     ip_info_cjson = NULL;
+    network_json_lock_count = 0;
+    network_json_locked_task = NULL;
 }
 cJSON* network_status_get_new_json(cJSON** old) {
     ESP_LOGV(TAG, "network_status_get_new_json called");
@@ -98,13 +101,24 @@ void network_status_clear_ip() {
     }
 }
 char* network_status_alloc_get_ip_info_json() {
-    return cJSON_PrintUnformatted(ip_info_cjson);
+    char* str = NULL;
+    if (network_status_lock_json_buffer(portMAX_DELAY)) {
+        str = cJSON_PrintUnformatted(ip_info_cjson);
+        network_status_unlock_json_buffer();
+    }
+    return str;
 }
 
 void network_status_unlock_json_buffer() {
     ESP_LOGV(TAG, "Unlocking json buffer!");
-    network_json_locked_task = NULL;
-    xSemaphoreGive(network_status_json_mutex);
+    TaskHandle_t calling_task = xTaskGetCurrentTaskHandle();
+    if (calling_task == network_json_locked_task) {
+        if (--network_json_lock_count <= 0) {
+            network_json_lock_count = 0;
+            network_json_locked_task = NULL;
+            xSemaphoreGive(network_status_json_mutex);
+        }
+    }
 }
 
 bool network_status_lock_json_buffer(TickType_t xTicksToWait) {
@@ -113,6 +127,7 @@ bool network_status_lock_json_buffer(TickType_t xTicksToWait) {
     TaskHandle_t calling_task = xTaskGetCurrentTaskHandle();
     if (calling_task == network_json_locked_task) {
         ESP_LOGV(TAG, "json buffer already locked to current task");
+        network_json_lock_count++;
         return true;
     }
 
@@ -120,6 +135,7 @@ bool network_status_lock_json_buffer(TickType_t xTicksToWait) {
         if (xSemaphoreTake(network_status_json_mutex, xTicksToWait) == pdTRUE) {
             ESP_LOGV(TAG, "Json buffer locked!");
             network_json_locked_task = calling_task;
+            network_json_lock_count = 1;
             return true;
         } else {
             ESP_LOGE(TAG, "Semaphore take failed. Unable to lock json buffer mutex");

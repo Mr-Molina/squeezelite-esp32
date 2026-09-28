@@ -85,7 +85,7 @@ static void common_task_init(void) {
 	static EXT_RAM_ATTR StackType_t xStack[BUTTON_STACK_SIZE] __attribute__ ((aligned (4)));
 	
 	if (!common_queue_set) {
-		common_queue_set = xQueueCreateSet(BUTTON_QUEUE_LEN + 1);
+		common_queue_set = xQueueCreateSet(MAX_BUTTONS * BUTTON_QUEUE_LEN);
 		xTaskCreateStatic( (TaskFunction_t) buttons_task, "buttons", BUTTON_STACK_SIZE, NULL, ESP_TASK_PRIO_MIN + 2, xStack, &xTaskBuffer);
 	}
  }	

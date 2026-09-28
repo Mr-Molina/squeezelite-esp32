@@ -106,6 +106,7 @@ void config_init(){
 	MEMTRACE_PRINT_DELTA();
 	config_set_group_bit(CONFIG_LOAD_BIT,false);
 	MEMTRACE_PRINT_DELTA();
+	esp_register_shutdown_handler(config_flush_now);
 	config_start_timer();
 }
 
@@ -387,6 +388,33 @@ void * config_safe_alloc_get_entry_value(nvs_type_t nvs_type, cJSON * entry){
 	return value;
 }
 
+static esp_err_t config_nvs_set_value(nvs_handle nvs, nvs_type_t type, const char *key, const void *data) {
+	esp_err_t err = ESP_OK;
+	if (type == NVS_TYPE_I8) {
+		err = nvs_set_i8(nvs, key, *(int8_t *) data);
+	} else if (type == NVS_TYPE_U8) {
+		err = nvs_set_u8(nvs, key, *(uint8_t *) data);
+	} else if (type == NVS_TYPE_I16) {
+		err = nvs_set_i16(nvs, key, *(int16_t *) data);
+	} else if (type == NVS_TYPE_U16) {
+		err = nvs_set_u16(nvs, key, *(uint16_t *) data);
+	} else if (type == NVS_TYPE_I32) {
+		err = nvs_set_i32(nvs, key, *(int32_t *) data);
+	} else if (type == NVS_TYPE_U32) {
+		err = nvs_set_u32(nvs, key, *(uint32_t *) data);
+	} else if (type == NVS_TYPE_I64) {
+		err = nvs_set_i64(nvs, key, *(int64_t *) data);
+	} else if (type == NVS_TYPE_U64) {
+		err = nvs_set_u64(nvs, key, *(uint64_t *) data);
+	} else if (type == NVS_TYPE_STR) {
+		err = nvs_set_str(nvs, key, (const char *) data);
+	} else {
+		ESP_LOGE(TAG, "Unsupported NVS type %d for key %s", type, key);
+		err = ESP_ERR_NVS_TYPE_MISMATCH;
+	}
+	return err;
+}
+
 void config_commit_to_nvs(){
 	ESP_LOGI(TAG,"Committing configuration to nvs. Locking config object.");
 	if(!config_lock(LOCK_MAX_WAIT/portTICK_PERIOD_MS)){
@@ -395,10 +423,15 @@ void config_commit_to_nvs(){
 	}
 	if(nvs_json==NULL){
 		ESP_LOGE(TAG, ": cJSON nvs cache object not set.");
+		config_unlock();
 		return;
 	}
 	ESP_LOGV(TAG,"config_commit_to_nvs. Config Locked!");
 	cJSON * entry=nvs_json->child;
+	nvs_handle nvs = 0;
+	bool nvs_opened = false;
+	bool commit_needed = false;
+
 	while(entry!= NULL){
 		char * entry_str = cJSON_PrintUnformatted(entry);
 		if(entry_str!=NULL){
@@ -407,39 +440,41 @@ void config_commit_to_nvs(){
 		}
 
 		if(config_is_entry_changed(entry)){
-			ESP_LOGD(TAG, "Committing entry %s value to nvs.",(entry->string==NULL)?"UNKNOWN":entry->string);
+			if(!nvs_opened){
+				esp_err_t open_err = nvs_open_from_partition(settings_partition, current_namespace, NVS_READWRITE, &nvs);
+				if(open_err != ESP_OK){
+					ESP_LOGE(TAG, "config_commit_to_nvs: Unable to open nvs partition %s (%s)", settings_partition, esp_err_to_name(open_err));
+					config_unlock();
+					return;
+				}
+				nvs_opened = true;
+			}
+			ESP_LOGD(TAG, "Staging entry %s value to nvs.",(entry->string==NULL)?"UNKNOWN":entry->string);
 			nvs_type_t type = config_get_entry_type(entry);
 			void * value = config_safe_alloc_get_entry_value(type, entry);
 			if(value!=NULL){
-				size_t len=strlen(entry->string);
-				char * key=(void *)malloc_init_external(len+1);
-				memcpy(key,entry->string,len);
-				esp_err_t err = store_nvs_value(type,key,value);
-				FREE_AND_NULL(key);
-				FREE_AND_NULL(value);
-
-				if(err!=ESP_OK){
-					char * entry_str = cJSON_PrintUnformatted(entry);
-					if(entry_str!=NULL){
-						ESP_LOGE(TAG, "Error comitting value to nvs for key %s, Object: \n%s",entry->string,entry_str);
-						free(entry_str);
+				if(entry->string && strlen(entry->string) > 0){
+					esp_err_t err = config_nvs_set_value(nvs, type, entry->string, value);
+					if(err!=ESP_OK){
+						ESP_LOGE(TAG, "Error writing value to nvs for key %s: %s", entry->string, esp_err_to_name(err));
 					}
 					else {
-						ESP_LOGE(TAG, "Error comitting value to nvs for key %s",entry->string);
+						commit_needed = true;
 					}
 				}
 				else {
-					config_set_entry_changed_flag(entry, false);
+					ESP_LOGE(TAG, "Cannot commit entry with empty or NULL key name");
 				}
+				FREE_AND_NULL(value);
 			}
 			else {
 				char * entry_str = cJSON_PrintUnformatted(entry);
 				if(entry_str!=NULL){
-					ESP_LOGE(TAG, "Unable to retrieve value. Error comitting value to nvs for key %s, Object: \n%s",entry->string,entry_str);
+					ESP_LOGE(TAG, "Unable to retrieve value. Error committing value to nvs for key %s, Object: \n%s",entry->string,entry_str);
 					free(entry_str);
 				}
 				else {
-					ESP_LOGE(TAG, "Unable to retrieve value. Error comitting value to nvs for key %s",entry->string);
+					ESP_LOGE(TAG, "Unable to retrieve value. Error committing value to nvs for key %s",entry->string);
 				}
 			}
 		}
@@ -449,18 +484,55 @@ void config_commit_to_nvs(){
 		taskYIELD();  /* allows the freeRTOS scheduler to take over if needed. */
 		entry = entry->next;
 	}
-	ESP_LOGV(TAG,"config_commit_to_nvs. Resetting the global commit flag.");
-	config_raise_change(false);
+
+	bool all_committed = true;
+	if(nvs_opened){
+		if(commit_needed){
+			ESP_LOGI(TAG, "Executing single consolidated nvs_commit.");
+			esp_err_t commit_err = nvs_commit(nvs);
+			if(commit_err != ESP_OK){
+				ESP_LOGE(TAG, "Error committing nvs changes: %s", esp_err_to_name(commit_err));
+				all_committed = false;
+			}
+			else {
+				ESP_LOGI(TAG, "Successfully committed configuration to nvs.");
+				entry = nvs_json->child;
+				while(entry != NULL){
+					if(config_is_entry_changed(entry)){
+						config_set_entry_changed_flag(entry, false);
+					}
+					entry = entry->next;
+				}
+			}
+		}
+		nvs_close(nvs);
+	}
+
+	if(all_committed){
+		ESP_LOGV(TAG,"config_commit_to_nvs. Resetting the global commit flag.");
+		config_raise_change(false);
+	}
 	ESP_LOGV(TAG,"config_commit_to_nvs. Releasing the lock object.");
 	config_unlock();
 	ESP_LOGI(TAG,"Done Committing configuration to nvs.");
 }
+
+void config_flush_now(void) {
+	ESP_LOGI(TAG, "Flushing configuration immediately to NVS.");
+	if(config_has_changes()){
+		config_commit_to_nvs();
+	}
+}
+
 bool config_has_changes(){
 	return  (xEventGroupGetBits(config_group) & CONFIG_NO_COMMIT_PENDING)==0;
 }
 
 
 bool wait_for_commit(){
+	if(config_has_changes()){
+		config_flush_now();
+	}
 	bool commit_pending=(xEventGroupGetBits(config_group) & CONFIG_NO_COMMIT_PENDING)==0;
 	while (commit_pending){
 		ESP_LOGW(TAG,"Waiting for config commit ...");

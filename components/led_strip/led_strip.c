@@ -18,11 +18,12 @@
 
 #include "led_strip.h"
 #include "freertos/task.h"
+#include "esp_task.h"
 
 #include <string.h>
 
 #define LED_STRIP_TASK_SIZE             (1024)
-#define LED_STRIP_TASK_PRIORITY         (configMAX_PRIORITIES - 1)
+#define LED_STRIP_TASK_PRIORITY         (ESP_TASK_PRIO_MIN + 2)
 
 #define LED_STRIP_REFRESH_PERIOD_MS     (30U) // TODO: add as parameter to led_strip_init
 
@@ -238,15 +239,17 @@ static void led_strip_task(void *arg)
         rmt_wait_tx_done(led_strip->rmt_channel, portMAX_DELAY);
         vTaskDelay(LED_STRIP_REFRESH_PERIOD_MS / portTICK_PERIOD_MS);
 
-        xSemaphoreTake(led_strip->access_semaphore, portMAX_DELAY);
+        if (xSemaphoreTake(led_strip->access_semaphore, portMAX_DELAY) == pdTRUE) {
+            led_make_waveform(led_strip->led_strip_showing,
+                              rmt_items,
+                              led_strip->led_strip_length);
+            xSemaphoreGive(led_strip->access_semaphore);
 
-        led_make_waveform(led_strip->led_strip_working,
-                          rmt_items,
-                          led_strip->led_strip_length);
-        rmt_write_items(led_strip->rmt_channel,
-                        rmt_items,
-                        num_items_malloc,
-                        false);
+            rmt_write_items(led_strip->rmt_channel,
+                            rmt_items,
+                            num_items_malloc,
+                            false);
+        }
     }
 
     if (rmt_items) {
@@ -330,7 +333,7 @@ bool led_strip_set_pixel_color(struct led_strip_t *led_strip, uint32_t pixel_num
 {
     bool set_led_success = true;
 
-    if ((!led_strip) || (!color) || (pixel_num > led_strip->led_strip_length)) {
+    if ((!led_strip) || (!color) || (pixel_num >= led_strip->led_strip_length)) {
         return false;
     }
 
@@ -343,7 +346,7 @@ bool led_strip_set_pixel_rgb(struct led_strip_t *led_strip, uint32_t pixel_num, 
 {
     bool set_led_success = true;
 
-    if ((!led_strip) || (pixel_num > led_strip->led_strip_length)) {
+    if ((!led_strip) || (pixel_num >= led_strip->led_strip_length)) {
         return false;
     }
 
@@ -359,7 +362,7 @@ bool led_strip_get_pixel_color(struct led_strip_t *led_strip, uint32_t pixel_num
     bool get_success = true;
 
     if ((!led_strip) ||
-        (pixel_num > led_strip->led_strip_length) ||
+        (pixel_num >= led_strip->led_strip_length) ||
         (!color)) {
         color = NULL;
         return false;
@@ -375,17 +378,17 @@ bool led_strip_get_pixel_color(struct led_strip_t *led_strip, uint32_t pixel_num
  */
 bool led_strip_show(struct led_strip_t *led_strip)
 {
-    bool success = true;
-
     if (!led_strip) {
         return false;
     }
-    /* copy the current buffer for display */
-    memcpy(led_strip->led_strip_showing,led_strip->led_strip_working, sizeof(struct led_color_t) * led_strip->led_strip_length);
+    if (xSemaphoreTake(led_strip->access_semaphore, portMAX_DELAY) == pdTRUE) {
+        /* copy the current buffer for display */
+        memcpy(led_strip->led_strip_showing, led_strip->led_strip_working, sizeof(struct led_color_t) * led_strip->led_strip_length);
+        xSemaphoreGive(led_strip->access_semaphore);
+        return true;
+    }
 
-    xSemaphoreGive(led_strip->access_semaphore);
-
-    return success;
+    return false;
 }
 
 /**

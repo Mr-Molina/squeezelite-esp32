@@ -237,7 +237,7 @@ void vTaskDeleteEXTRAM(TaskHandle_t xTask) {
 typedef struct {
 	void *user_context;
 	http_download_cb_t callback;
-	size_t max, bytes;
+	size_t max, bytes, size;
 	bool abort;
 	uint8_t *data;
 	esp_http_client_handle_t client;
@@ -269,6 +269,7 @@ static void http_downloader(void *arg) {
 	esp_http_client_perform(http_context->client);
 	esp_http_client_cleanup(http_context->client);
 
+	if (http_context->data) free(http_context->data);
 	free(http_context);
 	vTaskDeleteEXTRAM(NULL);
 }
@@ -280,26 +281,81 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
 
 	switch(evt->event_id) {
 	case HTTP_EVENT_ERROR:
+		if (http_context->data) {
+			free(http_context->data);
+			http_context->data = NULL;
+		}
 		http_context->callback(NULL, 0, http_context->user_context);
 		http_context->abort = true;
 		break;
 	case HTTP_EVENT_ON_HEADER:
 		if (!strcasecmp(evt->header_key, "Content-Length")) {
-			size_t len = atoi(evt->header_value);
-			if (!len || len > http_context->max) {
-				ESP_LOGI(TAG, "content-length null or too large %zu / %zu", len, http_context->max);
+			int len = atoi(evt->header_value);
+			if (len <= 0 || (http_context->max && (size_t)len > http_context->max)) {
+				ESP_LOGI(TAG, "content-length null or too large %d / %zu", len, http_context->max);
 				http_context->abort = true;
+				if (http_context->data) {
+					free(http_context->data);
+					http_context->data = NULL;
+				}
+				http_context->callback(NULL, 0, http_context->user_context);
+				return ESP_FAIL;
 			}
 		}
 		break;
 	case HTTP_EVENT_ON_DATA: {
-		size_t len = esp_http_client_get_content_length(evt->client);
-		if (!http_context->data) {
-			if ((http_context->data = (uint8_t*) malloc(len)) == NULL) {
+		if (evt->data_len <= 0) break;
+
+		// Bound buffer growth and validate against max
+		if (http_context->max && (http_context->bytes + evt->data_len > http_context->max)) {
+			ESP_LOGE(TAG, "HTTP download exceeded maximum size: %zu + %d > %zu",
+					http_context->bytes, evt->data_len, http_context->max);
+			http_context->abort = true;
+			if (http_context->data) {
+				free(http_context->data);
+				http_context->data = NULL;
+			}
+			http_context->callback(NULL, 0, http_context->user_context);
+			return ESP_FAIL;
+		}
+
+		int clen = esp_http_client_get_content_length(evt->client);
+		// Validate Content-Length if specified
+		if (clen > 0 && http_context->max && (size_t)clen > http_context->max) {
+			ESP_LOGE(TAG, "Content-Length %d exceeds max %zu", clen, http_context->max);
+			http_context->abort = true;
+			if (http_context->data) {
+				free(http_context->data);
+				http_context->data = NULL;
+			}
+			http_context->callback(NULL, 0, http_context->user_context);
+			return ESP_FAIL;
+		}
+
+		size_t needed = http_context->bytes + evt->data_len;
+		if (needed > http_context->size) {
+			size_t new_size = needed;
+			if (clen > 0 && (size_t)clen >= needed && (!http_context->max || (size_t)clen <= http_context->max)) {
+				new_size = (size_t)clen;
+			} else {
+				new_size = needed + 4096;
+				if (http_context->max && new_size > http_context->max) {
+					new_size = http_context->max;
+				}
+			}
+			uint8_t *new_data = (uint8_t*) realloc(http_context->data, new_size);
+			if (!new_data) {
+				ESP_LOGE(TAG, "failed to allocate memory for output buffer %zu", new_size);
 				http_context->abort = true;
-				ESP_LOGE(TAG, "failed to allocate memory for output buffer %zu", len);
+				if (http_context->data) {
+					free(http_context->data);
+					http_context->data = NULL;
+				}
+				http_context->callback(NULL, 0, http_context->user_context);
 				return ESP_FAIL;
 			}
+			http_context->data = new_data;
+			http_context->size = new_size;
 		}
 		memcpy(http_context->data + http_context->bytes, evt->data, evt->data_len);
 		http_context->bytes += evt->data_len;
@@ -307,20 +363,24 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
 	}
 	case HTTP_EVENT_ON_FINISH:
 		http_context->callback(http_context->data, http_context->bytes, http_context->user_context);
+		http_context->data = NULL;
 		break;
 	case HTTP_EVENT_DISCONNECTED: {
 		int mbedtls_err = 0;
 		esp_err_t err = esp_tls_get_and_clear_last_error(evt->data, &mbedtls_err, NULL);
 		if (err != ESP_OK) {
 			ESP_LOGE(TAG, "HTTP download disconnect %d", err);
-			if (http_context->data) free(http_context->data);
+			if (http_context->data) {
+				free(http_context->data);
+				http_context->data = NULL;
+			}
 			http_context->callback(NULL, 0, http_context->user_context);
 			return ESP_FAIL;
 		}
 		break;
+	}
 	default:
 		break;
-	}
 	}
 
 	return ESP_OK;

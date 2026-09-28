@@ -159,7 +159,7 @@ void display_init(char *welcome) {
 		GDS_TextPos(display, GDS_FONT_DEFAULT, GDS_TEXT_CENTERED, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, welcome);
 
 		// start the task that will handle scrolling & counting
-		displayer.mutex = xSemaphoreCreateMutex();
+		displayer.mutex = xSemaphoreCreateRecursiveMutex();
 		displayer.by = 2;
 		displayer.pause = 3600;
 		displayer.speed = 33;
@@ -194,9 +194,8 @@ static void display_sleep(void) {
 }
 
 /****************************************************************************************
- * This is not thread-safe as displayer_task might be in the middle of line drawing
- * but it won't crash (I think) and making it thread-safe would be complicated for a
- * feature which is secondary (the LMS version of scrolling is thread-safe)
+ * Framebuffer access is synchronized using displayer.mutex to ensure thread-safety
+ * between displayer_task and external drawing routines (e.g. displayer_artwork).
  */
 static void displayer_task(void *args) {
 	int scroll_sleep = 0, timer_sleep;
@@ -204,22 +203,30 @@ static void displayer_task(void *args) {
 	while (1) {
 		// suspend ourselves if nothing to do
 		if (displayer.state < DISPLAYER_ACTIVE) {
-			if (displayer.state == DISPLAYER_IDLE) GDS_TextLine(display, 2, 0, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.string);
+			if (displayer.state == DISPLAYER_IDLE) {
+				xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
+				GDS_TextLine(display, 2, 0, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.string);
+				xSemaphoreGiveRecursive(displayer.mutex);
+			}
 			vTaskSuspend(NULL);
 			scroll_sleep = 0;
+			xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 			GDS_ClearExt(display, true);
 			GDS_TextLine(display, 1, GDS_TEXT_LEFT, GDS_TEXT_UPDATE, displayer.header);
+			xSemaphoreGiveRecursive(displayer.mutex);
 		} else if (displayer.refresh) {
 			// little trick when switching master while in IDLE and missing it
+			xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 			GDS_TextLine(display, 1, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, displayer.header);	
 			displayer.refresh = false;			
+			xSemaphoreGiveRecursive(displayer.mutex);
 		}
 		
 		// we have been waken up before our requested time
 		if (scroll_sleep <= 10) {
 			// something to scroll (or we'll wake-up every pause ms ... no big deal)
 			if (*displayer.string && displayer.state == DISPLAYER_ACTIVE) {
-				xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+				xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 				
 				// need to work with local copies as we don't want to suspend caller
 				int offset = -displayer.offset;
@@ -227,10 +234,9 @@ static void displayer_task(void *args) {
 				scroll_sleep = displayer.offset ? displayer.speed : displayer.pause;
 				displayer.offset = displayer.offset >= displayer.boundary ? 0 : (displayer.offset + min(displayer.by, displayer.boundary - displayer.offset));			
 				
-				xSemaphoreGive(displayer.mutex);				
-				
-				// now display using safe copies, can be lengthy
+				// now display using safe copies under mutex protection
 				GDS_TextLine(display, 2, offset, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, string);
+				xSemaphoreGiveRecursive(displayer.mutex);				
 				free(string);
 			} else {
 				scroll_sleep = DEFAULT_SLEEP;
@@ -244,10 +250,9 @@ static void displayer_task(void *args) {
 			uint32_t elapsed = (tick - displayer.tick) * portTICK_PERIOD_MS;
 
 			if (elapsed >= 1000) {
-				xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+				xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 				displayer.tick = tick;
 				elapsed = displayer.elapsed += elapsed / 1000;
-				xSemaphoreGive(displayer.mutex);
 
 				// when we have duration but no space, display remaining time
 				if (displayer.duration.value && !displayer.duration.visible) elapsed = displayer.duration.value - elapsed;
@@ -272,6 +277,7 @@ static void displayer_task(void *args) {
 					ESP_LOGI(TAG, "no artwork received, setting default");
 					displayer_artwork((uint8_t*) default_artwork);
 				}	
+				xSemaphoreGiveRecursive(displayer.mutex);
 				timer_sleep = 1000;
 			} else timer_sleep = max(1000 - elapsed, 0);	
 		} else timer_sleep = DEFAULT_SLEEP;
@@ -290,6 +296,7 @@ static void displayer_task(void *args) {
 void displayer_artwork(uint8_t *data) {
 	if (!displayer.artwork.active) return;
 	
+	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 	int x = displayer.artwork.offset ? displayer.artwork.offset + ARTWORK_BORDER : 0;
 	int y = x ? 0 : 32;
 	GDS_ClearWindow(display, x, y, -1, -1, GDS_COLOR_BLACK);
@@ -300,7 +307,7 @@ void displayer_artwork(uint8_t *data) {
 		displayer.artwork.updated = false;
 		displayer.artwork.tick = xTaskGetTickCount();
 	}	
-	
+	xSemaphoreGiveRecursive(displayer.mutex);
 }
 
 /****************************************************************************************
@@ -326,7 +333,7 @@ void displayer_metadata(char *artist, char *album, char *title) {
 		return;
 	}
 	
-	xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 	
 	// format metadata parameters and write them directly
 	if ((p = strcasestr(displayer.metadata_config, "format")) != NULL) {
@@ -380,7 +387,7 @@ void displayer_metadata(char *artist, char *album, char *title) {
 	ESP_LOGI(TAG, "playing %s", displayer.string);
 	displayer.boundary = GDS_TextStretch(display, 2, displayer.string, SCROLLABLE_SIZE);
 		
-	xSemaphoreGive(displayer.mutex);
+	xSemaphoreGiveRecursive(displayer.mutex);
 }	
 
 /****************************************************************************************
@@ -390,7 +397,7 @@ void displayer_scroll(char *string, int speed, int pause) {
 	// need a display!
 	if (!display) return;
 	
-	xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 
 	if (speed) displayer.speed = speed;
 	if (pause) displayer.pause = pause;
@@ -399,7 +406,7 @@ void displayer_scroll(char *string, int speed, int pause) {
 	displayer.string[SCROLLABLE_SIZE] = '\0';
 	displayer.boundary = GDS_TextStretch(display, 2, displayer.string, SCROLLABLE_SIZE);
 		
-	xSemaphoreGive(displayer.mutex);
+	xSemaphoreGiveRecursive(displayer.mutex);
 }
 
 /****************************************************************************************
@@ -409,7 +416,7 @@ void displayer_timer(enum displayer_time_e mode, int elapsed, int duration) {
 	// need a display!
 	if (!display) return;
 	
-	xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 
 	if (displayer.timer) displayer.tick = xTaskGetTickCount();
 	if (elapsed >= 0) displayer.elapsed = elapsed / 1000;	
@@ -433,7 +440,7 @@ void displayer_timer(enum displayer_time_e mode, int elapsed, int duration) {
 		displayer.duration.value = 0;
 	}
 		
-	xSemaphoreGive(displayer.mutex);
+	xSemaphoreGiveRecursive(displayer.mutex);
 }	
 
 /****************************************************************************************
@@ -445,7 +452,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 	if (!display) return;
 	
 	va_start(args, cmd);
-	xSemaphoreTake(displayer.mutex, portMAX_DELAY);
+	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 		
 	switch(cmd) {
 	case DISPLAYER_ACTIVATE: {	
@@ -492,7 +499,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 		break;
 	}	
 	
-	xSemaphoreGive(displayer.mutex);
+	xSemaphoreGiveRecursive(displayer.mutex);
 	va_end(args);
 }
 

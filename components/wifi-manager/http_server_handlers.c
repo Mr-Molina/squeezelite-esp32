@@ -53,6 +53,8 @@ union sockaddr_aligned {
     struct sockaddr_in6 sin6;
 } aligned_sockaddr_t;
 esp_err_t post_handler_buff_receive(httpd_req_t * req);
+bool http_server_lock_scratch(TickType_t xTicksToWait);
+void http_server_unlock_scratch(void);
 static const char redirect_payload1[]="<html><head><title>Redirecting to Captive Portal</title><meta http-equiv='refresh' content='0; url=";
 static const char redirect_payload2[]="'></head><body><p>Please wait, refreshing.  If page does not refresh, click <a href='";
 static const char redirect_payload3[]="'>here</a> to login.</p></body></html>";
@@ -570,14 +572,28 @@ esp_err_t post_handler_buff_receive(httpd_req_t * req){
     int cur_len = 0;
     char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
     int received = 0;
-    if (total_len >= SCRATCH_BUFSIZE) {
+    if (total_len <= 0 || total_len >= SCRATCH_BUFSIZE) {
         /* Respond with 500 Internal Server Error */
-    	ESP_LOGE_LOC(TAG,"Received content was too long. ");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR , "Content too long");
-        err = ESP_FAIL;
+    	ESP_LOGE_LOC(TAG,"Received content length invalid or too long: %d", total_len);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR , "Invalid content length");
+        return ESP_FAIL;
+    }
+    if (!http_server_lock_scratch(pdMS_TO_TICKS(2000))) {
+        ESP_LOGE_LOC(TAG, "Failed to lock scratch buffer");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Server busy");
+        return ESP_FAIL;
     }
     while (err == ESP_OK && cur_len < total_len) {
-        received = httpd_req_recv(req, buf + cur_len, total_len);
+        int remaining = total_len - cur_len;
+        int max_space = (SCRATCH_BUFSIZE - 1) - cur_len;
+        if (max_space <= 0) {
+            ESP_LOGE_LOC(TAG, "Scratch buffer space exceeded");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Buffer overflow");
+            err = ESP_FAIL;
+            break;
+        }
+        int to_recv = (remaining < max_space) ? remaining : max_space;
+        received = httpd_req_recv(req, buf + cur_len, to_recv);
         if (received <= 0) {
             /* Respond with 500 Internal Server Error */
         	ESP_LOGE_LOC(TAG,"Not all data was received. ");
@@ -592,6 +608,7 @@ esp_err_t post_handler_buff_receive(httpd_req_t * req){
     if(err == ESP_OK) {
     	buf[total_len] = '\0';
     }
+    http_server_unlock_scratch();
     return err;
 }
 
@@ -867,6 +884,11 @@ esp_err_t flash_post_handler(httpd_req_t *req){
 			return ESP_FAIL;
 		}
 		ESP_LOGI(TAG, "Receiving ota binary file");
+		if (!http_server_lock_scratch(pdMS_TO_TICKS(5000))) {
+			FREE_RESET(binary_buffer);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Server busy");
+			return ESP_FAIL;
+		}
 		/* Retrieve the pointer to scratch buffer for temporary storage */
 		char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
 
@@ -917,7 +939,7 @@ esp_err_t flash_post_handler(httpd_req_t *req){
 		httpd_resp_send(req, (const char *)success, strlen(success));
 	}
 bail_out:
-
+	http_server_unlock_scratch();
 	return err;
 }
 
@@ -961,12 +983,14 @@ esp_err_t process_redirect(httpd_req_t *req, const char * status){
 	char * redirect=malloc_init_external(buf_size);
 
 	if(strcasestr(status,"302")){
-		size_t url_buf_size = strlen(location_prefix) + strlen(ap_ip_address)+1;
+		size_t url_buf_size = strlen(location_prefix) + strlen(ap_ip_address) + 2;
 		redirect_url = malloc_init_external(url_buf_size);
-		memset(redirect_url,0x00,url_buf_size);
-		snprintf(redirect_url, buf_size,"%s%s/",location_prefix, ap_ip_address);
-		ESP_LOGW_LOC(TAG,  "Redirecting host [%s] to %s (from uri %s)",remote_ip, redirect_url,req->uri);
-		httpd_resp_set_hdr(req,"Location",redirect_url);
+		if (redirect_url) {
+			memset(redirect_url, 0x00, url_buf_size);
+			snprintf(redirect_url, url_buf_size, "%s%s/", location_prefix, ap_ip_address);
+			ESP_LOGW_LOC(TAG,  "Redirecting host [%s] to %s (from uri %s)",remote_ip, redirect_url,req->uri);
+			httpd_resp_set_hdr(req,"Location",redirect_url);
+		}
 		snprintf(redirect, buf_size,"OK");
 	}
 	else {

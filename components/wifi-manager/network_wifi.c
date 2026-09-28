@@ -54,6 +54,78 @@ static inline const char* password_string(const wifi_sta_config_t* sta) {
 static inline const char* ap_ssid_string(const wifi_ap_record_t* ap) {
     UINT_TO_STRING(ap->ssid);
 }
+
+static const char ENC_PREFIX[] = "enc:";
+
+static void get_wifi_device_key(uint8_t* key, size_t key_len) {
+    uint8_t mac[6] = {0};
+#ifdef ESP_PLATFORM
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+#endif
+    // 16-byte domain-specific salt combined with hardware MAC
+    static const uint8_t salt[16] = {
+        0x57, 0x69, 0x46, 0x69, 0x4e, 0x56, 0x53, 0x4b,
+        0x65, 0x79, 0x24, 0x53, 0x65, 0x63, 0x75, 0x72
+    };
+    for (size_t i = 0; i < key_len && i < 16; i++) {
+        key[i] = salt[i] ^ mac[i % 6];
+    }
+}
+
+static char* encrypt_wifi_credentials(const char* plaintext) {
+    if (!plaintext || strlen(plaintext) == 0) {
+        return strdup_psram("");
+    }
+    size_t prefix_len = strlen(ENC_PREFIX);
+    if (strncmp(plaintext, ENC_PREFIX, prefix_len) == 0) {
+        return strdup_psram(plaintext);
+    }
+    uint8_t key[16];
+    get_wifi_device_key(key, sizeof(key));
+    size_t plain_len = strlen(plaintext);
+    size_t enc_len = prefix_len + (plain_len * 2) + 1;
+    char* enc_str = (char*)malloc_init_external(enc_len);
+    if (!enc_str) {
+        return NULL;
+    }
+    strcpy(enc_str, ENC_PREFIX);
+    for (size_t i = 0; i < plain_len; i++) {
+        uint8_t b = (uint8_t)plaintext[i] ^ key[i % sizeof(key)];
+        snprintf(enc_str + prefix_len + (i * 2), 3, "%02x", b);
+    }
+    enc_str[enc_len - 1] = '\0';
+    return enc_str;
+}
+
+static char* decrypt_wifi_credentials(const char* ciphertext) {
+    if (!ciphertext || strlen(ciphertext) == 0) {
+        return strdup_psram("");
+    }
+    size_t prefix_len = strlen(ENC_PREFIX);
+    if (strncmp(ciphertext, ENC_PREFIX, prefix_len) == 0) {
+        const char* hex_payload = ciphertext + prefix_len;
+        size_t hex_len = strlen(hex_payload);
+        if (hex_len % 2 != 0) {
+            ESP_LOGE(TAG, "Invalid encrypted credentials hex length");
+            return strdup_psram(ciphertext);
+        }
+        uint8_t key[16];
+        get_wifi_device_key(key, sizeof(key));
+        size_t plain_len = hex_len / 2;
+        char* plaintext = (char*)malloc_init_external(plain_len + 1);
+        if (!plaintext) {
+            return NULL;
+        }
+        for (size_t i = 0; i < hex_len; i += 2) {
+            char byte_chars[3] = { hex_payload[i], hex_payload[i + 1], '\0' };
+            unsigned long val = strtoul(byte_chars, NULL, 16);
+            plaintext[i / 2] = (char)((uint8_t)val ^ key[(i / 2) % sizeof(key)]);
+        }
+        plaintext[plain_len] = '\0';
+        return plaintext;
+    }
+    return strdup_psram(ciphertext);
+}
 typedef struct known_access_point {
     char* ssid;
     char* password;
@@ -282,7 +354,9 @@ esp_err_t network_wifi_alloc_ap_json(known_access_point_t* item, char** json_str
         return ESP_ERR_NO_MEM;
     }
     cJSON_AddStringToObject(cjson_item, "ssid", item->ssid);
-    cJSON_AddStringToObject(cjson_item, "pass", item->password);
+    char* enc_pass = encrypt_wifi_credentials(item->password);
+    cJSON_AddStringToObject(cjson_item, "pass", enc_pass ? enc_pass : "");
+    FREE_AND_NULL(enc_pass);
     cJSON_AddNumberToObject(cjson_item, "chan", item->primary);
     cJSON_AddNumberToObject(cjson_item, "auth", item->authmode);
     char* bssid = network_manager_alloc_get_mac_string(item->bssid);
@@ -332,7 +406,7 @@ esp_err_t network_wifi_add_json_entry(const char* json_text) {
             known_ap.ssid = strdup_psram(cJSON_GetStringValue(value));
             value = cJSON_GetObjectItemCaseSensitive(cjson_item, "pass");
             if (value && cJSON_IsString(value) && strlen(cJSON_GetStringValue(value)) > 0) {
-                known_ap.password = strdup_psram(cJSON_GetStringValue(value));
+                known_ap.password = decrypt_wifi_credentials(cJSON_GetStringValue(value));
             }
             value = cJSON_GetObjectItemCaseSensitive(cjson_item, "chan");
             if (value) {
@@ -456,7 +530,9 @@ esp_err_t network_wifi_store_ap_json(known_access_point_t* item) {
                 ESP_LOGI(TAG, "Committing active access point");
                 err = network_wifi_write_nvs("ssid", ssid_string(sta), 0);
                 if (err == ESP_OK) {
-                    err = network_wifi_write_nvs("password", STR_OR_BLANK(password_string(sta)), 0);
+                    char* enc_pw = encrypt_wifi_credentials(STR_OR_BLANK(password_string(sta)));
+                    err = network_wifi_write_nvs("password", enc_pw ? enc_pw : "", 0);
+                    FREE_AND_NULL(enc_pw);
                 }
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Error committing active access point : %s", esp_err_to_name(err));
@@ -625,8 +701,16 @@ const wifi_sta_config_t* network_wifi_load_active_config() {
     esp_err = network_wifi_get_blob(&config.ssid, sizeof(config.ssid), "ssid");
     if (esp_err == ESP_OK && strlen((char*)config.ssid) > 0) {
         ESP_LOGD(TAG,"network_wifi_load_active_config: ssid:%s. Fetching password (if any) ", ssid_string(&config));
-        if (network_wifi_get_blob(&config.password, sizeof(config.password), "password") != ESP_OK) {
+        char raw_pwd[sizeof(config.password) * 2 + 32];
+        memset(raw_pwd, 0, sizeof(raw_pwd));
+        if (network_wifi_get_blob(raw_pwd, sizeof(raw_pwd) - 1, "password") != ESP_OK) {
             ESP_LOGW(TAG, "No wifi password found in nvs");
+        } else {
+            char* dec_pw = decrypt_wifi_credentials(raw_pwd);
+            if (dec_pw) {
+                strlcpy((char*)config.password, dec_pw, sizeof(config.password));
+                free(dec_pw);
+            }
         }
     } else {
         if(network_wifi_get_known_count() > 0) {
@@ -908,7 +992,7 @@ esp_netif_t* network_wifi_config_ap() {
     value = config_alloc_get_default(NVS_TYPE_STR, "ap_pwd", DEFAULT_AP_PASSWORD, 0);
     if (value != NULL) {
         strlcpy((char*)ap_config.ap.password, value, sizeof(ap_config.ap.password));
-        ESP_LOGI(TAG, "AP Password: %s", (char*)ap_config.ap.password);
+        ESP_LOGI(TAG, "AP Password: [REDACTED]");
     }
     FREE_AND_NULL(value);
 
@@ -1019,7 +1103,12 @@ void network_wifi_filter_unique(wifi_ap_record_t* aplist, uint16_t* aps) {
 }
 
 char* network_status_alloc_get_ap_list_json() {
-    return cJSON_PrintUnformatted(accessp_cjson);
+    char* str = NULL;
+    if (network_status_lock_json_buffer(pdMS_TO_TICKS(1000))) {
+        str = cJSON_PrintUnformatted(accessp_cjson);
+        network_status_unlock_json_buffer();
+    }
+    return str;
 }
 cJSON* network_manager_clear_ap_list_json(cJSON** old) {
     ESP_LOGV(TAG, "network_manager_clear_ap_list_json called");
@@ -1047,35 +1136,49 @@ esp_err_t wifi_scan_done() {
     /* As input param, it stores max AP number ap_records can hold. As output param, it receives the actual AP number this API returns.
 				 * As a consequence, ap_num MUST be reset to MAX_AP_NUM at every scan */
     ESP_LOGD(TAG, "Getting AP list records");
-    ap_num = MAX_AP_NUM;
-    if ((err = esp_wifi_scan_get_ap_num(&ap_num)) != ESP_OK) {
+    uint16_t scan_ap_num = MAX_AP_NUM;
+    if ((err = esp_wifi_scan_get_ap_num(&scan_ap_num)) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to retrieve scan results count. Error %s", esp_err_to_name(err));
         return err;
     }
-    FREE_AND_NULL(accessp_records);
-    if (ap_num > 0) {
-        accessp_records = (wifi_ap_record_t*)malloc_init_external(sizeof(wifi_ap_record_t) * ap_num);
-        if ((err = esp_wifi_scan_get_ap_records(&ap_num, accessp_records)) != ESP_OK) {
+    wifi_ap_record_t* new_records = NULL;
+    if (scan_ap_num > 0) {
+        new_records = (wifi_ap_record_t*)malloc_init_external(sizeof(wifi_ap_record_t) * scan_ap_num);
+        if (!new_records) {
+            ESP_LOGE(TAG, "Memory allocation failed for scan records");
+            return ESP_ERR_NO_MEM;
+        }
+        if ((err = esp_wifi_scan_get_ap_records(&scan_ap_num, new_records)) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to retrieve scan results list. Error %s", esp_err_to_name(err));
+            free(new_records);
             return err;
         }
-        /* make sure the http server isn't trying to access the list while it gets refreshed */
-        ESP_LOGD(TAG, "Preparing to build ap JSON list");
-        if (network_status_lock_json_buffer(pdMS_TO_TICKS(1000))) {
+    }
+
+    /* make sure the http server isn't trying to access the list while it gets refreshed */
+    ESP_LOGD(TAG, "Preparing to build ap JSON list");
+    if (network_status_lock_json_buffer(pdMS_TO_TICKS(1000))) {
+        FREE_AND_NULL(accessp_records);
+        accessp_records = new_records;
+        ap_num = scan_ap_num;
+
+        if (ap_num > 0) {
             /* Will remove the duplicate SSIDs from the list and update ap_num */
             network_wifi_filter_unique(accessp_records, &ap_num);
             network_wifi_set_found_ap();
             network_wifi_generate_access_points_json(&accessp_cjson);
-            network_status_unlock_json_buffer();
             ESP_LOGD(TAG, "Done building ap JSON list");
         } else {
-            ESP_LOGE(TAG, "could not get access to json mutex in wifi_scan");
-            err = ESP_FAIL;
+            ESP_LOGD(TAG, "No AP Found.  Emptying the list.");
+            accessp_cjson = network_wifi_get_new_array_json(&accessp_cjson);
         }
+        network_status_unlock_json_buffer();
     } else {
-        //
-        ESP_LOGD(TAG, "No AP Found.  Emptying the list.");
-        accessp_cjson = network_wifi_get_new_array_json(&accessp_cjson);
+        ESP_LOGE(TAG, "could not get access to json mutex in wifi_scan");
+        if (new_records) {
+            free(new_records);
+        }
+        err = ESP_FAIL;
     }
     return err;
 }

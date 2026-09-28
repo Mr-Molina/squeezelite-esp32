@@ -255,9 +255,13 @@ static void control_rotary_handler(void *client, rotary_event_e event, bool long
 	
 	// in raw mode, we just pass rotary events
 	if (current_raw_controls) {
-		if (event == ROTARY_LEFT) (*current_controls[KNOB_LEFT])(true);
-		else if (event == ROTARY_RIGHT) (*current_controls[KNOB_RIGHT])(true);
-		else (*current_controls[KNOB_PUSH])(event == ROTARY_PRESSED);
+		if (event == ROTARY_LEFT) {
+			if (current_controls[KNOB_LEFT]) (*current_controls[KNOB_LEFT])(true);
+		} else if (event == ROTARY_RIGHT) {
+			if (current_controls[KNOB_RIGHT]) (*current_controls[KNOB_RIGHT])(true);
+		} else {
+			if (current_controls[KNOB_PUSH]) (*current_controls[KNOB_PUSH])(event == ROTARY_PRESSED);
+		}
 		return;
 	}
 	
@@ -267,7 +271,7 @@ static void control_rotary_handler(void *client, rotary_event_e event, bool long
 			if (rotary.left_count) {
 				action = KNOB_LEFT;
 				// need to add a left button the first time
-				if (rotary.left_count == 1) (*current_controls[KNOB_LEFT])(true);
+				if (rotary.left_count == 1 && current_controls[KNOB_LEFT]) (*current_controls[KNOB_LEFT])(true);
 			}
 			xTimerStart(rotary.timer, 20 / portTICK_RATE_MS);
 			rotary.left_count++;
@@ -306,7 +310,7 @@ static void control_rotary_handler(void *client, rotary_event_e event, bool long
 		break;
 	}
 	
-	if (action != ACTRLS_NONE) (*current_controls[action])(pressed);
+	if (action != ACTRLS_NONE && current_controls[action]) (*current_controls[action])(pressed);
 }
 
 /****************************************************************************************
@@ -329,7 +333,7 @@ static void volume_rotary_handler(void *client, rotary_event_e event, bool long_
 		break;
 	}
 	
-	if (action != ACTRLS_NONE) (*current_controls[action])(pressed);
+	if (action != ACTRLS_NONE && current_controls[action]) (*current_controls[action])(pressed);
 }
 
 /****************************************************************************************
@@ -337,10 +341,10 @@ static void volume_rotary_handler(void *client, rotary_event_e event, bool long_
  */
 static void rotary_timer( TimerHandle_t xTimer ) {
 	if (rotary.click_pending) {
-		(*current_controls[KNOB_PUSH])(true);
+		if (current_controls[KNOB_PUSH]) (*current_controls[KNOB_PUSH])(true);
 		rotary.click_pending = false;
 	} else if (rotary.left_count) {
-		if (rotary.left_count == 1) (*current_controls[KNOB_LEFT])(true);
+		if (rotary.left_count == 1 && current_controls[KNOB_LEFT]) (*current_controls[KNOB_LEFT])(true);
 		rotary.left_count = 0;
 	}
 }

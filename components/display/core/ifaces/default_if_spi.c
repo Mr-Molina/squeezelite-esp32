@@ -23,6 +23,7 @@ static const int GDS_SPI_Data_Mode = 1;
 
 static spi_host_device_t SPIHost;
 static int DCPin;
+static int s_CSPin = -1;
 
 static bool SPIDefaultWriteBytes( spi_device_handle_t SPIHandle, int WriteMode, const uint8_t* Data, size_t DataLength );
 static bool SPIDefaultWriteCommand( struct GDS_Device* Device, uint8_t Command );
@@ -40,9 +41,10 @@ bool GDS_SPIAttachDevice( struct GDS_Device* Device, int Width, int Height, int 
 
     NullCheck( Device, return false );
 	
+	s_CSPin = CSPin;
 	if (CSPin >= 0) {
 		ESP_ERROR_CHECK_NONFATAL( gpio_set_direction( CSPin, GPIO_MODE_OUTPUT ), return false );
-		ESP_ERROR_CHECK_NONFATAL( gpio_set_level( CSPin, 0 ), return false );
+		ESP_ERROR_CHECK_NONFATAL( gpio_set_level( CSPin, 1 ), return false );
 	}
 	
     SPIDeviceConfig.clock_speed_hz = Speed > 0 ? Speed : SPI_MASTER_FREQ_8M;
@@ -87,14 +89,17 @@ static bool SPIDefaultWriteBytes( spi_device_handle_t SPIHandle, int WriteMode, 
 		
 		if (DataLength <= 4) {
 			SPITransaction.flags = SPI_TRANS_USE_TXDATA;
-			SPITransaction.tx_data[0] = *Data++; SPITransaction.tx_data[1] = *Data++;
-			SPITransaction.tx_data[2] = *Data++; SPITransaction.tx_data[3] = *Data;
+			memcpy(SPITransaction.tx_data, Data, DataLength);
 		} else {
 			SPITransaction.tx_buffer = Data;
 		}	
             
 		// only do polling as we don't have contention on SPI (otherwise DMA for transfers > 16 bytes)		
-		ESP_ERROR_CHECK_NONFATAL( spi_device_polling_transmit(SPIHandle, &SPITransaction), return false );
+		esp_err_t res = spi_device_polling_transmit(SPIHandle, &SPITransaction);
+		if (s_CSPin >= 0) {
+			gpio_set_level( s_CSPin, 1 );
+		}
+		ESP_ERROR_CHECK_NONFATAL( res, return false );
     }
 
     return true;
