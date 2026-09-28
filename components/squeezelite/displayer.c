@@ -8,6 +8,8 @@
 
 #include <ctype.h>
 #include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_dsp.h"
 #include "squeezelite.h"
 #include "slimproto.h"

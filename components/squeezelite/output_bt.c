@@ -10,8 +10,11 @@
  */
 
 #include <assert.h>
-#include "driver/gpio.h"
 #include "squeezelite.h"
+
+#if CONFIG_BT_SINK
+
+#include "driver/gpio.h"
 #include "equalizer.h"
 #include "perf_trace.h"
 #include "platform_config.h"
@@ -237,3 +240,5 @@ void output_bt_start(void) {
     led_on(LED_GREEN);
     bt_idle_since = pdTICKS_TO_MS(xTaskGetTickCount());
 }
+
+#endif /* CONFIG_BT_SINK */

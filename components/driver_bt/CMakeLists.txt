@@ -4,5 +4,7 @@ if(IDF_TARGET STREQUAL "esp32")
                             PRIV_REQUIRES services bt display console tools platform_config
 
 )
+else()
+    idf_component_register()
 endif()
 

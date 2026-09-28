@@ -14,6 +14,13 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include <esp_log.h>
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include "esp_rom_gpio.h"
+#ifndef gpio_pad_select_gpio
+#define gpio_pad_select_gpio esp_rom_gpio_pad_select_gpio
+#endif
+#endif
 
 #include "gds.h"
 #include "gds_private.h"

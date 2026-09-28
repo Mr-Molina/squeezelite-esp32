@@ -30,6 +30,8 @@ there might be a pop and a de-sync when sampling rate change happens. Not
 sure that using rate_delay would fix that
 */
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "squeezelite.h"
 #include "slimproto.h"
 #include "esp_pthread.h"
@@ -298,7 +300,9 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 	i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
 	// in case of overflow, do not replay old buffer
 	i2s_config.tx_desc_auto_clear = true;		
-#ifndef CONFIG_IDF_TARGET_ESP32S3
+#if defined(SOC_I2S_SUPPORTS_APLL)
+    i2s_config.use_apll = SOC_I2S_SUPPORTS_APLL;
+#elif !defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(CONFIG_IDF_TARGET_ESP32C3)
     i2s_config.use_apll = true;
 #endif 
 	i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1; //Interrupt level 1
