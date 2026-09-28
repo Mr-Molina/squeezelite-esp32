@@ -24,6 +24,9 @@
   - 2nd stage bootloader boots cleanly at 80MHz DIO.
   - Partition table verified by bootloader.
   - Diagnostic finding: Target board is an ESP32-WROOM (no external PSRAM). PSRAM ID read error `0xffffffff` triggered `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` panic, confirming hardware requires WROVER module for full audio streaming per official specs.
+- **Physical Flash Erase (`erase_flash`)** ✅:
+  - Executed full chip erase on COM12 via `esptool.py` (completed in 19.6s).
+  - Verified ROM bootloader in clean erased flash state (`invalid header: 0xffffffff`).
 
 ## 2026-09-28 | Antigravity Orchestrator | ESP-IDF v5.x Modernization & Multi-Target Validation (Milestone MK-5)
 **Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
