@@ -2,6 +2,36 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-09-28 | Antigravity Orchestrator | ESP-IDF v5.x Modernization & Multi-Target Validation (Milestone MK-5)
+**Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
+**Host OS**: Windows 11
+**Branch**: `milestone-mk-5` (parent: `milstone-mk-4`)
+**Working Tree**: Clean
+
+### Completed This Session
+- **Phase 1: Build System & CMake Requirements** ✅ (`39beea22`):
+  - Declared explicit `REQUIRES` and `PRIV_REQUIRES` in component `CMakeLists.txt` across all 14 components.
+  - Added empty fallback `idf_component_register()` in `components/_override/CMakeLists.txt` and `components/driver_bt/CMakeLists.txt` for non-ESP32 / ESP-IDF v5 builds.
+  - Normalized CRLF to LF in shell scripts and nanopb generators; enforced LF in `.gitattributes`.
+- **Phase 2: Networking & System Core (`esp_netif` & FreeRTOS)** ✅ (`9086b734`):
+  - Completely eradicated legacy `tcpip_adapter` across all 25 call sites, migrating to modern `esp_netif` APIs (`esp_netif_get_handle_from_ifkey`, `esp_netif_get_ip_info`, `esp_netif_get_hostname`, `esp_ip4addr_ntoa`).
+  - Modernized all 32 occurrences of obsolete `portTICK_RATE_MS` to `pdMS_TO_TICKS()`.
+  - Normalized FreeRTOS include ordering (`#include "freertos/FreeRTOS.h"` first) across the entire codebase.
+- **Phase 3: Peripheral Modernization (ADC, RMT, GPIO)** ✅ (`524157f5`, `0499b9be`, `badfb1af`):
+  - Implemented dual-mode ADC driver in `components/services/battery.c` supporting `esp_adc/adc_oneshot.h` for IDF v5 while retaining legacy `driver/adc.h` on IDF v4.
+  - Added ESP-IDF v5.3+ deprecated header guards (`driver/deprecated/rmt.h`) in `components/services/infrared.c` and `components/led_strip/led_strip.h`.
+  - Implemented `gpio_pad_select_gpio` -> `esp_rom_gpio_pad_select_gpio` compatibility shim in `gpio_exp.h` and `SSD1675.c`.
+- **Phase 4 & 5: Audio Engine, Bluetooth & Ethernet Modernization** ✅ (`badfb1af`):
+  - Modernized `output_i2s.c` and `displayer.c` with FreeRTOS header hygiene and explicit task typing.
+  - Guarded APLL clock configuration with `SOC_I2S_SUPPORTS_APLL` to safely handle silicon targets lacking hardware APLL (ESP32-S3, C3).
+  - Confirmed Spotify CSpot audio sinks are disabled via `BELL_DISABLE_SINKS ON`, routing audio directly through Squeezelite core ringbuffers.
+  - Constrained Classic Bluetooth A2DP Sink to `IDF_TARGET_ESP32` in `main/Kconfig.projbuild`, guarded `output_bt.c` with `#if CONFIG_BT_SINK`, and guarded `driver_bt/CMakeLists.txt`.
+  - Modernized LAN8720 Ethernet driver with dual-mode `esp_eth_mac_new_esp32` and `esp_eth_phy_new_lan87xx` for ESP-IDF v5.
+- **Phase 6: Multi-Target Firmware Validation** ✅:
+  - Target `I2S-4MFlash` (Standard ESP32): 1,462 targets compiled and linked cleanly with ZERO errors.
+  - Target `Muse` (Raspiaudio Muse Luxe): 1,425 targets compiled and linked cleanly with ZERO errors.
+  - Target `SqueezeAmp` (TAS57xx I2C DAC): 1,425 targets compiled and linked cleanly with ZERO errors.
+
 ## 2026-09-28 | Antigravity Orchestrator | Deep Code Audit & Multi-Agent Hardening (Milestone MK-4)
 **Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
 **Host OS**: Windows 11
