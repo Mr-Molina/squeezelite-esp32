@@ -14,7 +14,15 @@
 #include "freertos/timers.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_idf_version.h"
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include "esp_adc/adc_oneshot.h"
+static adc_oneshot_unit_handle_t s_adc1_handle = NULL;
+#else
 #include "driver/adc.h"
+#endif
+
 #include "battery.h"
 #include "platform_config.h"
 
@@ -61,8 +69,23 @@ uint8_t battery_level_svc(void) {
 /****************************************************************************************
  * 
  */
+static int get_adc_raw(int channel) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    int raw = 0;
+    if (s_adc1_handle) {
+        adc_oneshot_read(s_adc1_handle, (adc_channel_t)channel, &raw);
+    }
+    return raw;
+#else
+    return adc1_get_raw(channel);
+#endif
+}
+
+/****************************************************************************************
+ * 
+ */
 static void battery_callback(TimerHandle_t xTimer) {
-	battery.sum += adc1_get_raw(battery.channel) * battery.scale / 4095.0;
+	battery.sum += get_adc_raw(battery.channel) * battery.scale / 4095.0;
 	if (++battery.count == 30) {
 		battery.avg = battery.sum / battery.count;
 		battery.sum = battery.count = 0;
@@ -92,10 +115,22 @@ void battery_svc_init(void) {
 	}	
 
 	if (battery.channel != -1) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+		adc_oneshot_unit_init_cfg_t init_config = {
+			.unit_id = ADC_UNIT_1,
+		};
+		adc_oneshot_new_unit(&init_config, &s_adc1_handle);
+		adc_oneshot_chan_cfg_t config = {
+			.bitwidth = ADC_BITWIDTH_12,
+			.atten = (adc_atten_t)battery.attenuation,
+		};
+		adc_oneshot_config_channel(s_adc1_handle, (adc_channel_t)battery.channel, &config);
+#else
 		adc1_config_width(ADC_WIDTH_BIT_12);
 		adc1_config_channel_atten(battery.channel, battery.attenuation);
+#endif
 
-		battery.avg = adc1_get_raw(battery.channel) * battery.scale / 4095.0;    
+		battery.avg = get_adc_raw(battery.channel) * battery.scale / 4095.0;    
 		battery.timer = xTimerCreate("battery", pdMS_TO_TICKS(BATTERY_TIMER), pdTRUE, NULL, battery_callback);
 		xTimerStart(battery.timer, portMAX_DELAY);
 		
