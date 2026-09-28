@@ -2,6 +2,29 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-09-28 | Antigravity Orchestrator | ESP32 Hardware Flashing & Partition Geometry Hardening (Milestone MK-5)
+**Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
+**Host OS**: Windows 11
+**Branch**: `milestone-mk-5`
+**Hardware**: ESP32-D0WD-V3 (rev 3.1, MAC `e0:5a:1b:df:c5:e8`, 40MHz crystal, 4MB SPI Flash) on COM12
+
+### Completed This Session
+- **Flash Address Overlap Resolution (`partitions.csv`)** ✅:
+  - Root Cause: `build/recovery.bin` (1,375,088 bytes = 0x14FB70) exceeded legacy 0x140000 (1,310,720 bytes) boundary, colliding with `ota_0` at 0x150000.
+  - Solution: Aligned `recovery` partition size to `0x150000` (1,376,256 bytes) and adjusted `ota_0` to `0x290000` (2,686,976 bytes) starting at `0x160000`.
+  - Result: Both binaries (`recovery.bin` @ 1,375,088 B and `squeezelite.bin` @ 2,667,088 B) fit completely within 4MB SPI Flash with zero overlap and clean 64KB sector alignment.
+- **Physical ESP32 Flashing Verification (COM12)** ✅:
+  - Successfully wrote all partition images at 460800 baud:
+    - `0x1000`: bootloader.bin (26,496 B) — verified
+    - `0x8000`: partition-table.bin (3,072 B) — verified
+    - `0xd000`: ota_data_initial.bin (8,192 B) — verified
+    - `0x10000`: recovery.bin (1,375,088 B) — verified
+    - `0x160000`: squeezelite.bin (2,667,088 B) — verified
+- **Hardware Diagnostic & Bootloader Analysis** ✅:
+  - 2nd stage bootloader boots cleanly at 80MHz DIO.
+  - Partition table verified by bootloader.
+  - Diagnostic finding: Target board is an ESP32-WROOM (no external PSRAM). PSRAM ID read error `0xffffffff` triggered `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` panic, confirming hardware requires WROVER module for full audio streaming per official specs.
+
 ## 2026-09-28 | Antigravity Orchestrator | ESP-IDF v5.x Modernization & Multi-Target Validation (Milestone MK-5)
 **Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
 **Host OS**: Windows 11
