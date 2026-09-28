@@ -13,7 +13,12 @@
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+#include "driver/deprecated/rmt.h"
+#else
 #include "driver/rmt.h"
+#endif
 #include "globdefs.h"
 #include "infrared.h"
 

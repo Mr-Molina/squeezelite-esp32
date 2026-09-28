@@ -15,7 +15,12 @@
 extern "C" {
 #endif
 
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+#include <driver/deprecated/rmt.h>
+#else
 #include <driver/rmt.h>
+#endif
 #include <driver/gpio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
