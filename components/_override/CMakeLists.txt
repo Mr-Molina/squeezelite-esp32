@@ -21,4 +21,5 @@ if(IDF_TARGET STREQUAL esp32 AND IDF_VERSION_MAJOR EQUAL 4 AND IDF_VERSION_MINOR
     )
 else()
     message(STATUS "==> NO OVERRIDE <==")
+    idf_component_register()
 endif()

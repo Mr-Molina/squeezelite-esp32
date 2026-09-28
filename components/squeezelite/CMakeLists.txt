@@ -18,6 +18,8 @@ idf_component_register( SRC_DIRS . external ac101 tas57xx wm8978
 						 			tools
 						 			audio
 									led_strip
+									driver
+									freertos
 									_override
 						 			${target_requires}                                    
 						EMBED_FILES vu_s.data arrow.data
