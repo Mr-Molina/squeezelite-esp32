@@ -368,7 +368,8 @@ void led_vu_display(int vu_l, int vu_r, int bright, bool comet) {
     led_strip_clear(led_display);
 
     // set the led bar values
-    uint8_t step = bright / (strip.vu_length-1);
+    if (strip.vu_length <= 1) return;
+    uint8_t step = bright / (strip.vu_length - 1);
     if (step < 1) step = 1; // dor low brightness or larger strips     
     uint8_t g = bright * 2 / 3; // more red at top
     uint8_t r = 0;

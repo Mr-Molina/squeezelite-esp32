@@ -159,8 +159,22 @@ static bool cmd_handler(raop_event_t event, ...) {
  * Airplay sink de-initialization
  */
 void raop_sink_deinit(void) {
-	raop_delete(raop);
+	if (raop) {
+		raop_delete(raop);
+		raop = NULL;
+	}
 }	
+
+/****************************************************************************************
+ * Airplay sink shutdown
+ */
+static void raop_sink_stop(nm_state_t state_id, int sub_state) {
+	if (raop) {
+		LOG_INFO("stopping Airplay sink");
+		raop_delete(raop);
+		raop = NULL;
+	}
+}
 
 /****************************************************************************************
  * Airplay sink startup
@@ -171,7 +185,18 @@ static void raop_sink_start(nm_state_t state_id, int sub_state) {
 	uint8_t mac[6];	
     char* sink_name = (char*) config_alloc_get_default(NVS_TYPE_STR, "airplay_name", CONFIG_AIRPLAY_NAME, 0);
 
+	if (raop) {
+		LOG_INFO("stopping previous Airplay instance");
+		raop_delete(raop);
+		raop = NULL;
+	}
+
     netif = network_get_active_interface();
+    if (!netif) {
+        LOG_WARN("no active network interface for Airplay");
+        free(sink_name);
+        return;
+    }
 	esp_netif_get_ip_info(netif, &ipInfo);
 	esp_netif_get_mac(netif, mac);
 	cmd_handler_chain = raop_cbs.cmd;
@@ -190,6 +215,9 @@ void raop_sink_init(raop_cmd_vcb_t cmd_cb, raop_data_cb_t data_cb) {
 
 	network_register_state_callback(NETWORK_WIFI_ACTIVE_STATE, WIFI_CONNECTED_STATE, "raop_sink_start", raop_sink_start);
 	network_register_state_callback(NETWORK_ETH_ACTIVE_STATE, ETH_ACTIVE_CONNECTED_STATE, "raop_sink_start", raop_sink_start);
+	network_register_state_callback(NETWORK_WIFI_ACTIVE_STATE, WIFI_LOST_CONNECTION_STATE, "raop_sink_stop", raop_sink_stop);
+	network_register_state_callback(NETWORK_WIFI_ACTIVE_STATE, WIFI_USER_DISCONNECTED_STATE, "raop_sink_stop", raop_sink_stop);
+	network_register_state_callback(NETWORK_ETH_ACTIVE_STATE, ETH_ACTIVE_LINKDOWN_STATE, "raop_sink_stop", raop_sink_stop);
 }
 
 /****************************************************************************************
@@ -198,6 +226,6 @@ void raop_sink_init(raop_cmd_vcb_t cmd_cb, raop_data_cb_t data_cb) {
 void raop_disconnect(void) {
 	LOG_INFO("forced disconnection");
 	// in case we can't communicate with AirPlay controller, abort session 
-	if (!raop_cmd(raop, RAOP_STOP, NULL)) cmd_handler(RAOP_STALLED);
+	if (!raop || !raop_cmd(raop, RAOP_STOP, NULL)) cmd_handler(RAOP_STALLED);
     else displayer_control(DISPLAYER_SHUTDOWN);
 }

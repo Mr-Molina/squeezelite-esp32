@@ -108,6 +108,12 @@ void init_network_ethernet() {
         return;
     }
 
+    network_driver = network_ethernet_driver_autodetect(eth.model);
+    if (!network_driver) {
+        ESP_LOGE(TAG, "Failed to detect Ethernet driver for model: %s", STR_OR_BLANK(eth.model));
+        return;
+    }
+
     network_driver->init_config(&eth);
     network_ethernet_print_config(&eth);
 

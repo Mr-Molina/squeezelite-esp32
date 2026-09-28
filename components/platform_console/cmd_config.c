@@ -1008,7 +1008,7 @@ cJSON *squeezelite_cb() {
     char *buf = NULL;
     size_t buf_size = 0;
     int nerrors = 1;
-    FILE *f = system_open_memstream(argv[0], &buf, &buf_size);
+    FILE *f = system_open_memstream("squeezelite", &buf, &buf_size);
     if (f == NULL) {
         return values;
     }

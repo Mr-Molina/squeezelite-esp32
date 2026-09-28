@@ -64,9 +64,9 @@ void  dns_server_start(esp_netif_t * netif) {
 }
 
 void  dns_server_stop(){
+	close(socket_fd);
 	if(task_dns_server){
 		vTaskDelete(task_dns_server);
-		close(socket_fd);
 		task_dns_server = NULL;
 	}
 
@@ -86,7 +86,8 @@ void  dns_server(void *pvParameters) {
     socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd < 0){
         ESP_LOGE(TAG, "Failed to create socket");
-        exit(0);
+        vTaskDelete(NULL);
+        return;
     }
     memset(&sa, 0, sizeof(struct sockaddr_in));
 
@@ -95,7 +96,9 @@ void  dns_server(void *pvParameters) {
     esp_err = esp_netif_get_ip_info(netif,&ip_info);
     if(esp_err!=ESP_OK)    {
         ESP_LOGE(TAG, "Failed to get adapter info for udp: %s", esp_err_to_name(esp_err));
-        exit(1);
+        close(socket_fd);
+        vTaskDelete(NULL);
+        return;
     }
     ra.sin_family = AF_INET;
     ra.sin_addr.s_addr = ip_info.ip.addr;
@@ -103,7 +106,8 @@ void  dns_server(void *pvParameters) {
     if (bind(socket_fd, (struct sockaddr *)&ra, sizeof(struct sockaddr_in)) == -1) {
         ESP_LOGE(TAG, "Failed to bind to 53/udp");
         close(socket_fd);
-        exit(1);
+        vTaskDelete(NULL);
+        return;
     }
 
     struct sockaddr_in client;
@@ -126,7 +130,7 @@ void  dns_server(void *pvParameters) {
 
         /*if the query is bigger than the buffer size we simply ignore it. This case should only happen in case of multiple
          * queries within the same DNS packet and is not supported by this simple DNS hijack. */
-        if ( length >= (int)sizeof(dns_header_t) && length < DNS_QUERY_MAX_SIZE && ((length + sizeof(dns_answer_t)) <= DNS_ANSWER_MAX_SIZE) ) {
+        if ( length >= (int)(sizeof(dns_header_t) + 5) && length < DNS_QUERY_MAX_SIZE && ((length + sizeof(dns_answer_t)) <= DNS_ANSWER_MAX_SIZE) ) {
 
         	data[length] = '\0'; /*in case there's a bogus domain name that isn't null terminated */
 
@@ -151,7 +155,7 @@ void  dns_server(void *pvParameters) {
             /* extract domain name and request IP for debug */
             inet_ntop(AF_INET, &(client.sin_addr), ip_address, INET_ADDRSTRLEN);
             domain = (char*) &data[sizeof(dns_header_t) + 1];
-            for(char* c=domain; *c != '\0'; c++){
+            for(char* c=domain; c < (char*)&data[length] && *c != '\0'; c++){
             	if(*c < ' ' || *c > 'z') *c = '.'; /* technically we should test if the first two bits are 00 (e.g. if( (*c & 0xC0) == 0x00) *c = '.') but this makes the code a lot more readable */
             }
             ESP_LOGD(TAG, "Replying to DNS request for %s from %s", domain, ip_address);
@@ -164,7 +168,7 @@ void  dns_server(void *pvParameters) {
             dns_answer->CLASS = __bswap_16(DNS_ANSWER_CLASS_IN);
             dns_answer->TTL = (uint32_t)0x00000000; /* no caching. Avoids DNS poisoning since this is a DNS hijack */
             dns_answer->RDLENGTH = __bswap_16(0x0004); /* 4 byte => size of an ipv4 address */
-            dns_answer->RDATA = ip_resolved.addr;
+            dns_answer->RDATA = ip_info.ip.addr;
 
             err = sendto(socket_fd, response, length+sizeof(dns_answer_t), 0, (struct sockaddr *)&client, client_len);
             if (err < 0) {

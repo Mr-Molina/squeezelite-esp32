@@ -313,6 +313,10 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 		spdif.enabled = true;	
 		if ((spdif.buf = heap_caps_malloc(SPDIF_BLOCK * 16, MALLOC_CAP_INTERNAL)) == NULL) {
 			LOG_ERROR("Cannot allocate SPDIF buffer");
+			spdif.enabled = false;
+			free(dac_config);
+			free(spdif_config);
+			return;
 		}
 	
 		if (i2s_spdif_pin.bck_io_num == -1 || i2s_spdif_pin.ws_io_num == -1 || i2s_spdif_pin.data_out_num == -1) {
@@ -460,7 +464,7 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 	// create task as a FreeRTOS task but uses stack in internal RAM
 	{
 		static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
-		static EXT_RAM_ATTR StackType_t xStack[OUTPUT_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
+		static DRAM_ATTR StackType_t xStack[OUTPUT_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
 		output_i2s_task = xTaskCreateStaticPinnedToCore( (TaskFunction_t) output_thread_i2s, "output_i2s", OUTPUT_THREAD_STACK_SIZE, 
 											  NULL, CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 10, xStack, &xTaskBuffer, 0 );
 	}
@@ -574,7 +578,12 @@ static void output_thread_i2s(void *arg) {
 		output.updated = gettime_ms();
 		output.frames_played_dmp = output.frames_played;
 		// try to estimate how much we have consumed from the DMA buffer (calculation is incorrect at the very beginning ...)
-		output.device_frames = dma_buf_frames - ((output.updated - fullness) * output.current_sample_rate) / 1000;
+		long consumed = ((output.updated - fullness) * output.current_sample_rate) / 1000;
+		if (consumed >= dma_buf_frames) {
+			output.device_frames = 0;
+		} else {
+			output.device_frames = (frames_t)(dma_buf_frames - consumed);
+		}
         // we'll try to produce iframes if we have any, but we might return less if outpuf does not have enough
 		_output_frames( iframes );
 		// oframes must be a global updated by the write callback
@@ -654,7 +663,13 @@ static void output_thread_i2s(void *arg) {
 
 		fullness = gettime_ms();
 
-		if (bytes != oframes * BYTES_PER_FRAME) {
+		size_t expected_bytes = oframes * BYTES_PER_FRAME;
+#if BYTES_PER_FRAME == 4
+		if (i2s_config.bits_per_sample == 32) {
+			expected_bytes = oframes * BYTES_PER_FRAME * 2;
+		}
+#endif
+		if (bytes != expected_bytes && !(i2s_config.bits_per_sample == 32 && bytes == oframes * BYTES_PER_FRAME)) {
 			LOG_WARN("I2S DMA Overflow! available bytes: %d, I2S wrote %d bytes", oframes * BYTES_PER_FRAME, bytes);
 		}
 		

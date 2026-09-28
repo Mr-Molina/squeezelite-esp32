@@ -43,7 +43,7 @@ static void init_config(eth_config_t* ethernet_config) {
     W5500.start = start;
 
 }
-network_ethernet_driver_t* W5500_Detect(char* Driver, network_ethernet_driver_t* Device) {
+network_ethernet_driver_t* W5500_Detect(const char* Driver) {
     if (!strcasestr(Driver, "W5500"))
         return NULL;
     W5500.init_config = init_config;        

@@ -293,7 +293,7 @@ static decode_state opus_decompress(void) {
 				u->overframes = n - min(n, frames);
 				n = min(n, frames);
 				memcpy(write_buf, u->overbuf, n * BYTES_PER_FRAME);
-				memmove(u->overbuf, u->overbuf + n, u->overframes);
+				memmove(u->overbuf, u->overbuf + (n * BYTES_PER_FRAME), u->overframes * BYTES_PER_FRAME);
 			}
 		} else {
 			/* we just do one packet at a time, although we could loop on packets but that means locking the 

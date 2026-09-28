@@ -14,6 +14,12 @@ set(TEST_COMPONENTS "platform_console" CACHE STRING "List of components to test"
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(squeezelite_esp32_test)
-add_definitions(-include "${PROJECT_SOURCE_DIR}/../build/config/sdkconfig.h")
-set_property(TARGET squeezelite_esp32_test.elf PROPERTY RECOVERY_PREFIX app_update )
+
+if(EXISTS "${PROJECT_SOURCE_DIR}/../build/config/sdkconfig.h")
+    add_definitions(-include "${PROJECT_SOURCE_DIR}/../build/config/sdkconfig.h")
+endif()
+
+if(TARGET squeezelite_esp32_test.elf)
+    set_property(TARGET squeezelite_esp32_test.elf PROPERTY RECOVERY_PREFIX app_update )
+endif()
 

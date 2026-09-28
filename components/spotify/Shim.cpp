@@ -35,6 +35,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <mbedtls/sha256.h>
 #ifdef ESP_PLATFORM
 #include "esp_system.h"
 #if __has_include("esp_mac.h")
@@ -73,11 +74,12 @@ static std::vector<uint8_t> getDeviceKey() {
         0x53, 0x70, 0x6f, 0x74, 0x4e, 0x56, 0x53, 0x4b,
         0x65, 0x79, 0x24, 0x53, 0x65, 0x63, 0x75, 0x72
     };
-    std::vector<uint8_t> key(16);
-    for (size_t i = 0; i < 16; i++) {
-        key[i] = salt[i] ^ mac[i % 6];
-    }
-    return key;
+    uint8_t combined[sizeof(salt) + sizeof(mac)];
+    memcpy(combined, salt, sizeof(salt));
+    memcpy(combined + sizeof(salt), mac, sizeof(mac));
+    uint8_t digest[32];
+    mbedtls_sha256(combined, sizeof(combined), digest, 0);
+    return std::vector<uint8_t>(digest, digest + sizeof(digest));
 }
 
 static std::string encryptCredentials(const std::string& plaintext) {
@@ -206,7 +208,7 @@ cspotPlayer::cspotPlayer(const char* name, httpd_handle_t server, int port, cspo
 
 size_t cspotPlayer::pcmWrite(uint8_t *pcm, size_t bytes, std::string_view trackId) {
     if (lastTrackId != trackId) {
-        CSPOT_LOG(info, "new track started <%s> => <%s>", lastTrackId.c_str(), trackId.data());
+        CSPOT_LOG(info, "new track started <%s> => <%.*s>", lastTrackId.c_str(), (int)trackId.size(), trackId.data());
         lastTrackId = trackId;
         trackHandler();
     }

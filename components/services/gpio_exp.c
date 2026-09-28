@@ -270,7 +270,7 @@ esp_err_t gpio_exp_set_direction(int gpio, gpio_mode_t mode, gpio_exp_t *expande
 	if (gpio < GPIO_NUM_MAX && !expander) return gpio_set_direction(gpio, mode);
 	if ((expander = find_expander(expander, &gpio)) == NULL) return ESP_ERR_INVALID_ARG;
 
-	xSemaphoreTake(expander->mutex, pdMS_TO_TICKS(portMAX_DELAY));
+	xSemaphoreTake(expander->mutex, portMAX_DELAY);
 
 	if (mode == GPIO_MODE_INPUT) {
 		expander->r_mask |= 1 << gpio;
@@ -340,7 +340,7 @@ esp_err_t gpio_exp_set_level(int gpio, int level, bool direct, gpio_exp_t *expan
 	}
 
 	if (direct) {
-		xSemaphoreTake(expander->mutex, pdMS_TO_TICKS(portMAX_DELAY));
+		xSemaphoreTake(expander->mutex, portMAX_DELAY);
 
 		level = level ? mask : 0;
 		mask &= expander->shadow;
@@ -463,21 +463,20 @@ void service_handler(void *arg) {
 				// no interrupt for that gpio or not pending (safe as interrupt is disabled)
 				if (expander->intr < 0 || !expander->intr_pending) continue;
 
-				xSemaphoreTake(expander->mutex, pdMS_TO_TICKS(50));
-
-				// read GPIOs and clear all pending status
-				uint32_t value = expander->model->read(expander);
-				expander->age = xTaskGetTickCount();
-				
-				// re-enable interrupt now that it has been cleared
-				expander->intr_pending = false;
-				gpio_intr_enable(expander->intr);				
-				
-				uint32_t pending = expander->pending | ((expander->shadow ^ value) & expander->r_mask);
-				expander->shadow = value;
-				expander->pending = 0;
-
-				xSemaphoreGive(expander->mutex);
+				if (xSemaphoreTake(expander->mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+					// read GPIOs and clear all pending status
+					uint32_t value = expander->model->read(expander);
+					expander->age = xTaskGetTickCount();
+					expander->intr_pending = false;
+					gpio_intr_enable(expander->intr);
+					uint32_t pending = expander->pending | ((expander->shadow ^ value) & expander->r_mask);
+					expander->shadow = value;
+					expander->pending = 0;
+					xSemaphoreGive(expander->mutex);
+				} else {
+					ESP_LOGW(TAG, "Mutex timeout handling expander base %d interrupt", expander->first);
+					continue;
+				}
 				ESP_LOGD(TAG, "Handling GPIO %d reads 0x%04x and has 0x%04x pending", expander->first, expander->shadow, pending);
 				
 				while (pending) {
@@ -807,6 +806,10 @@ static esp_err_t spi_write(spi_device_handle_t handle, uint8_t addr, uint8_t reg
  */
 static uint32_t spi_read(spi_device_handle_t handle, uint8_t addr, uint8_t reg, int len) {
 	spi_transaction_t *transaction = heap_caps_calloc(1, sizeof(spi_transaction_t), MALLOC_CAP_DMA);
+	if (!transaction) {
+		ESP_LOGE(TAG, "spi_read: failed to allocate SPI transaction buffer");
+		return ESP_ERR_NO_MEM;
+	}
 
 	// tx_buffer is NULL, nothing to transmit except cmd/addr
 	transaction->flags = SPI_TRANS_USE_RXDATA;

@@ -17,6 +17,7 @@
 #include "gds_draw.h"
 #include "gds_text.h"
 
+#define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 
 static char TAG[] = "gds";
@@ -66,7 +67,7 @@ bool GDS_TextSetFontAuto(struct GDS_Device* Device, int N, int FontType, int Spa
  *  Set fonts for each line in text mode
  */
 bool GDS_TextSetFont(struct GDS_Device* Device, int N, const struct GDS_FontDef *Font, int Space) {
-	if (--N >= MAX_LINES) return false;
+	if (N <= 0 || --N >= MAX_LINES) return false;
 
 	Device->Lines[N].Font = Font;
 	
@@ -92,7 +93,7 @@ bool GDS_TextLine(struct GDS_Device* Device, int N, int Pos, int Attr, char *Tex
 	int Width, X = Pos;
 
 	// counting 1..n
-	N--;
+	if (N <= 0 || --N >= MAX_LINES || !Device->Lines[N].Font) return false;
 	
 	GDS_SetFont( Device, Device->Lines[N].Font );	
 	if (Attr & GDS_TEXT_MONOSPACE) GDS_FontForceMonospace( Device, true );
@@ -106,6 +107,7 @@ bool GDS_TextLine(struct GDS_Device* Device, int N, int Pos, int Attr, char *Tex
 	// erase if requested
 	if (Attr & GDS_TEXT_CLEAR) {
 		int Y_min = max(0, Device->Lines[N].Y), Y_max = max(0, Device->Lines[N].Y + Device->Lines[N].Font->Height);
+		Y_max = min(Device->Height, Y_max);
 		for (int c = (Attr & GDS_TEXT_CLEAR_EOL) ? X : 0; c < Device->TextWidth; c++) 
 			for (int y = Y_min; y < Y_max; y++)
 				Device->DrawPixelFast( Device, c, y, GDS_COLOR_BLACK );

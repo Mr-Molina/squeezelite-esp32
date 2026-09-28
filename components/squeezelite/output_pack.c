@@ -367,7 +367,7 @@ void _apply_cross(struct buffer *outputbuf, frames_t out_frames, s32_t cross_gai
 	ISAMPLE_T *ptr = (ISAMPLE_T *)(void *)outputbuf->readp;
 	frames_t count = out_frames * 2;
 	while (count--) {
-		if (*cross_ptr > (ISAMPLE_T *)outputbuf->wrap) {
+		if (*cross_ptr >= (ISAMPLE_T *)outputbuf->wrap) {
 			*cross_ptr -= outputbuf->size / BYTES_PER_FRAME * 2;
 		}
 		*ptr = gain(cross_gain_out, *ptr) + gain(cross_gain_in, **cross_ptr);

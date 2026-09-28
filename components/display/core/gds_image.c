@@ -134,10 +134,10 @@ static unsigned OutHandler(JDEC *Decoder, void *Bitmap, JRECT *Frame) {
 // version as X,Y may be beyond screen				
 #define OUTHANDLERDIRECT(F,S)																		\
 	for (int y = Frame->top; y <= Frame->bottom; y++) {												\
-		if (y < Context->YMin) continue;															\
 		for (int x = Frame->left; x <= Frame->right; x++) {											\
-			if (x < Context->XMin) continue;														\
-			DrawPixel( Context->Device, x + Context->XOfs, y + Context->YOfs, F(Pixels) >> S);	\
+			if (y >= Context->YMin && x >= Context->XMin) {											\
+				DrawPixel( Context->Device, x + Context->XOfs, y + Context->YOfs, F(Pixels) >> S);	\
+			}																						\
 			Pixels += 3;																			\
 		}																							\
 	}

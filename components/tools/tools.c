@@ -108,11 +108,10 @@ static uint8_t UNICODEtoCP1252(uint16_t chr) {
 void utf8_decode(char *src) {
 	uint32_t codep = 0, state = UTF8_ACCEPT;
 	char *dst = src;
-
-	while (src && *src) {
-		if (!decode(&state, &codep, *src++)) *dst++ = UNICODEtoCP1252(codep);
+	uint8_t *s = (uint8_t *)src;
+	while (s && *s) {
+		if (!decode(&state, &codep, *s++)) *dst++ = UNICODEtoCP1252(codep);
 	}
-
 	*dst = '\0';
 }
 

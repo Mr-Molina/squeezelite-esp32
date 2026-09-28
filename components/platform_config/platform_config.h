@@ -10,19 +10,22 @@ extern "C" {
 #endif
 
 #define PARSE_PARAM(S,P,C,V) do {												\
+	const char *__s = (S);														\
 	char *__p;																	\
-	if ((__p = strcasestr(S, P)) && (__p = strchr(__p, C))) V = atoi(__p+1); 	\
+	if (__s && (__p = strcasestr(__s, P)) && (__p == __s || *(__p-1) == ',' || *(__p-1) == ' ') && (__p = strchr(__p, C))) V = atoi(__p+1); 	\
 } while (0)
 
 #define PARSE_PARAM_FLOAT(S,P,C,V) do {												\
+	const char *__s = (S);														\
 	char *__p;																	\
-	if ((__p = strcasestr(S, P)) && (__p = strchr(__p, C))) V = atof(__p+1); 	\
+	if (__s && (__p = strcasestr(__s, P)) && (__p == __s || *(__p-1) == ',' || *(__p-1) == ' ') && (__p = strchr(__p, C))) V = atof(__p+1); 	\
 } while (0)
 
 #define PARSE_PARAM_STR(S,P,C,V,I) do {						\
+	const char *__s = (S);									\
 	char *__p;                                              \
-	if ((__p = strstr(S, P)) && (__p = strchr(__p, C))) {	\
-		while (*++__p == ' ');								\
+	if (__s && (__p = strstr(__s, P)) && (__p == __s || *(__p-1) == ',' || *(__p-1) == ' ') && (__p = strchr(__p, C))) {	\
+		while (*__p != '\0' && *++__p == ' ');				\
 		sscanf(__p,"%" #I "[^,]", V);						\
 	}   													\
 } while (0)
@@ -30,7 +33,7 @@ extern "C" {
 #define DECLARE_SET_DEFAULT(t) void config_set_default_## t (const char *key, t  value);
 #define DECLARE_GET_NUM(t) esp_err_t config_get_## t (const char *key, t *  value);
 #ifndef FREE_RESET
-#define FREE_RESET(p) if(p!=NULL) { free(p); p=NULL; }
+#define FREE_RESET(p) do { if (p) { free(p); (p) = NULL; } } while (0)
 #endif
 
 DECLARE_SET_DEFAULT(uint8_t);
@@ -57,6 +60,8 @@ cJSON * config_alloc_get_cjson(const char *key);
 esp_err_t config_set_cjson_str_and_free(const char *key, cJSON *value);
 void config_get_uint16t_from_str(const char *key, uint16_t *value, uint16_t default_value);
 void config_delete_key(const char *key);
+void config_reset_cache(void);
+void config_invalidate_cache(void);
 void config_set_default(nvs_type_t type, const char *key, const void * default_value, size_t blob_size);
 void * config_alloc_get(nvs_type_t nvs_type, const char *key) ;
 bool wait_for_commit();

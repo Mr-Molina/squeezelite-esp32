@@ -43,6 +43,7 @@ void bell::TLSSocket::open(const std::string& hostUrl, uint16_t port) {
                                  std::to_string(port).c_str(),
                                  MBEDTLS_NET_PROTO_TCP)) != 0) {
     BELL_LOG(error, "http_tls", "failed! connect returned %d\n", ret);
+    throw std::runtime_error("mbedtls_net_connect failed");
   }
 
   if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
@@ -78,11 +79,25 @@ void bell::TLSSocket::open(const std::string& hostUrl, uint16_t port) {
 }
 
 size_t bell::TLSSocket::read(uint8_t* buf, size_t len) {
-  return mbedtls_ssl_read(&ssl, buf, len);
+  int ret = mbedtls_ssl_read(&ssl, buf, len);
+  if (ret < 0) {
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      return 0;
+    }
+    return ret;
+  }
+  return ret;
 }
 
 size_t bell::TLSSocket::write(uint8_t* buf, size_t len) {
-  return mbedtls_ssl_write(&ssl, buf, len);
+  int ret = mbedtls_ssl_write(&ssl, buf, len);
+  if (ret < 0) {
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      return 0;
+    }
+    return ret;
+  }
+  return ret;
 }
 
 size_t bell::TLSSocket::poll() {

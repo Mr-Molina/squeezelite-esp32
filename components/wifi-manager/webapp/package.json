@@ -6,6 +6,7 @@
   "author": "Sebastien L",
   "license": "MIT",
   "scripts": {
+    "test": "node test/test.js",
     "prod": "webpack serve --open  --mode=production",
     "build": "webpack  --mode=production ",
     "stats": "webpack  --env ANALYZE_SIZE=1 --mode=production ",
@@ -51,7 +52,8 @@
     "lodash-es": "^4.17.21",
     "lodash-webpack-plugin": "^0.11.6",
     "mini-css-extract-plugin": "^2.5.2",
-    "node-sass": "^7.0.1",
+    "node-sass": "^7.0.1 || ^8.0.0 || ^9.0.0",
+    "sass": "^1.49.9",
     "open": "^9.1.0",
     "postcss": "^8.4.5",
     "postcss-loader": "^6.2.1",
@@ -81,6 +83,9 @@
     "popper.js": "^1.16.1",
     "webpack-visualizer-plugin": "^0.1.11",
     "webpack-visualizer-plugin2": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   },
   "keywords": [
     "webppack4",

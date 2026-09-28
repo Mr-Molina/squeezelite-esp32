@@ -12,6 +12,7 @@
 #include "platform_config.h"
 #include "squeezelite.h"
 #include "equalizer.h"
+#include "freertos/FreeRTOS.h"
 #include "esp_equalizer.h"
 
 #define EQ_BANDS 10
@@ -20,14 +21,19 @@ static log_level loglevel = lINFO;
 
 static mutex_type eq_mutex;
 static bool eq_mutex_init = false;
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 #define LOCK_EQ   mutex_lock(eq_mutex)
 #define UNLOCK_EQ mutex_unlock(eq_mutex)
 
 static inline void check_init_mutex(void) {
 	if (!eq_mutex_init) {
-		mutex_create(eq_mutex);
-		eq_mutex_init = true;
+		portENTER_CRITICAL(&mux);
+		if (!eq_mutex_init) {
+			mutex_create(eq_mutex);
+			eq_mutex_init = true;
+		}
+		portEXIT_CRITICAL(&mux);
 	}
 }
 
@@ -102,18 +108,24 @@ void equalizer_init(void) {
 	LOCK_EQ;
     // handle equalizer
 	char *config = config_alloc_get(NVS_TYPE_STR, "equalizer");
-	char *p = strtok(config, ", !");
+	if (config) {
+		char *p = strtok(config, ", !");
 
-	for (int i = 0; p && i < EQ_BANDS; i++) {
-		equalizer.gain[i] = atoi(p);
-		p = strtok(NULL, ", :");
+		for (int i = 0; p && i < EQ_BANDS; i++) {
+			equalizer.gain[i] = atoi(p);
+			p = strtok(NULL, ", :");
+		}
 	}
 
 	free(config);
 
     // handle loudness
     config = config_alloc_get(NVS_TYPE_STR, "loudness");
-    equalizer.loudness = atof(config) / 10.0;
+    if (config) {
+        equalizer.loudness = atof(config) / 10.0;
+    } else {
+        equalizer.loudness = 0.0f;
+    }
 
 	free(config);
 	UNLOCK_EQ;

@@ -188,6 +188,7 @@ esp_err_t guided_boot(esp_partition_subtype_t partition_subtype)
 
 	if(it == NULL){
 		log_send_messaging(MESSAGING_ERROR,"Reboot failed. Partitions error");
+		return ESP_ERR_NOT_FOUND;
 	}
 	else
 	{
@@ -200,12 +201,13 @@ esp_err_t guided_boot(esp_partition_subtype_t partition_subtype)
 			err=esp_ota_set_boot_partition(partition);
 			if(err!=ESP_OK){
 				log_send_messaging(MESSAGING_ERROR,"Unable to select partition for reboot: %s",esp_err_to_name(err));
+				return err;
 			}
 		}
 		else
 		{
 			log_send_messaging(MESSAGING_ERROR,"partition type %u not found!  Unable to reboot to recovery.",partition_subtype);
-
+			return ESP_ERR_NOT_FOUND;
 		}
 		ESP_LOGD(TAG, "Yielding to other processes");
 		taskYIELD();
@@ -365,9 +367,10 @@ int set_cspot_player_name(FILE * f,const char * name){
         return 1;
     }
     cJSON * player_name = cJSON_GetObjectItemCaseSensitive(cspot_config,"deviceName");
-    if(player_name==NULL){
+    if(player_name == NULL || !cJSON_IsString(player_name) || !player_name->valuestring){
         fprintf(f,"Unable to get deviceName\n");
-        ret=1;
+        cJSON_Delete(cspot_config);
+        return 1;
     }
     if(strcmp(player_name->valuestring,name)==0){
         fprintf(f,"CSpot device name not changed.\n");
@@ -375,13 +378,15 @@ int set_cspot_player_name(FILE * f,const char * name){
     }
     else{
         cJSON_SetValuestring(player_name,name);
-        if(setnamevar("cspot_config",f,cJSON_Print(cspot_config))!=0){
+        char *json_str = cJSON_PrintUnformatted(cspot_config);
+        if(setnamevar("cspot_config",f,json_str)!=0){
             fprintf(f,"Unable to set cspot_config\n");
             ret=1;
         }
         else{
             fprintf(f,"CSpot device name set to %s\n",name);
         }
+        free(json_str);
     }
     cJSON_Delete(cspot_config);
     return ret;
@@ -396,6 +401,10 @@ int set_squeezelite_player_name(FILE * f,const char * name){
     char * newCommandLine = NULL;
     char * parm = " -n ";
     char * cleaned_name = strdup(name);
+    if (!cleaned_name) {
+        FREE_AND_NULL(nvs_config);
+        return 1;
+    }
     for(char * p=cleaned_name;*p!='\0';p++){
         if(*p == ' '){
             *p='_'; // no spaces allowed
@@ -405,10 +414,18 @@ int set_squeezelite_player_name(FILE * f,const char * name){
         // allocate enough memory to hold the new command line
         size_t cmdLength = strlen(nvs_config) + strlen(cleaned_name) + strlen(parm) +1 ;
         newCommandLine = malloc_init_external(cmdLength);
+        if (newCommandLine == NULL) {
+            FREE_AND_NULL(nvs_config);
+            free(cleaned_name);
+            return 1;
+        }
+        newCommandLine[0] = '\0';
         ESP_LOGD(TAG,"Parsing command %s",nvs_config);
 		argv = (char **) malloc_init_external(22* sizeof(char *));
 		if (argv == NULL) {
 			FREE_AND_NULL(nvs_config);
+			FREE_AND_NULL(newCommandLine);
+			free(cleaned_name);
 			return 1;
 		}
 		size_t argc = esp_console_split_argv(nvs_config, argv,22);
@@ -449,6 +466,7 @@ int set_squeezelite_player_name(FILE * f,const char * name){
 	FREE_AND_NULL(nvs_config);
 	FREE_AND_NULL(argv);
 	free(cleaned_name);
+	FREE_AND_NULL(newCommandLine);
 	return nerrors;
 	
 }
@@ -473,6 +491,7 @@ static int setdevicename(int argc, char **argv)
 	size_t buf_size = 0;
 	FILE *f = system_open_memstream(argv[0],&buf, &buf_size);
 	if (f == NULL) {
+		FREE_AND_NULL(name);
 		return 1;
 	}
 	nerrors+=setnamevar("a2dp_dev_name", f, name);

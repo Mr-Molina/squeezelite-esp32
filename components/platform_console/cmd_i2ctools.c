@@ -598,8 +598,10 @@ static int do_i2cdump_cmd (int argc, char** argv) {
     }
     i2c_port_t loc_i2c_port = i2c_port;
     if (i2cset_args.port->count && i2c_get_port (i2cset_args.port->ival[0], &loc_i2c_port) != ESP_OK) {
+        i2cset_args.port->count = 0;
         return 1;
     }
+    i2cset_args.port->count = 0;
 
     if (size != 1 && size != 2 && size != 4) {
         cmd_send_messaging (argv[0], MESSAGING_ERROR, "Wrong read size. Only support 1,2,4\n");
@@ -688,8 +690,10 @@ static int do_i2cset_cmd (int argc, char** argv) {
 
     i2c_port_t loc_i2c_port = i2c_port;
     if (i2cset_args.port->count && i2c_get_port (i2cset_args.port->ival[0], &loc_i2c_port) != ESP_OK) {
+        i2cset_args.port->count = 0;
         return 1;
     }
+    i2cset_args.port->count = 0;
 
     /* Check data: "-d" option */
     int len = i2cset_args.data->count;
@@ -746,8 +750,10 @@ static int do_i2cget_cmd (int argc, char** argv) {
     }
     i2c_port_t loc_i2c_port = i2c_port;
     if (i2cset_args.port->count && i2c_get_port (i2cset_args.port->ival[0], &loc_i2c_port) != ESP_OK) {
+        i2cset_args.port->count = 0;
         return 1;
     }
+    i2cset_args.port->count = 0;
 
     char* buf = NULL;
     size_t buf_size = 0;
@@ -868,8 +874,10 @@ static int do_i2cdetect_cmd (int argc, char** argv) {
     esp_err_t ret = ESP_OK;
     i2c_port_t loc_i2c_port = i2c_port;
     if (i2cset_args.port->count && i2c_get_port (i2cset_args.port->ival[0], &loc_i2c_port) != ESP_OK) {
+        i2cset_args.port->count = 0;
         return 1;
     }
+    i2cset_args.port->count = 0;
 
     uint8_t address;
     char* buf = NULL;
@@ -977,7 +985,7 @@ static void register_i2c_set_display () {
     i2cdisp_args.hflip = arg_lit0 (NULL, "hf", "Flip horizontally");
     i2cdisp_args.vflip = arg_lit0 (NULL, "vf", "Flip vertically");
     i2cdisp_args.driver = arg_str0 ("d", "driver", supported_drivers ? supported_drivers : "<string>", "Driver");
-    i2cdisp_args.cs = arg_int0 ("b", "cs", "<n>", "SPI Only. CS GPIO (for SPI displays)");
+    i2cdisp_args.cs = arg_int0 ("c", "cs", "<n>", "SPI Only. CS GPIO (for SPI displays)");
     i2cdisp_args.speed = arg_int0 ("s", "speed", "<n>", "SPI Only. Bus Speed (Default 8000000). SPI interface can work up to 26MHz~40MHz");
     i2cdisp_args.back = arg_int0 ("b", "back", "<n>", "Backlight GPIO (if applicable)");
     i2cdisp_args.depth = arg_int0 ("p", "depth", "-1|1|4", "Bit Depth (only for SSD1326 displays)");
@@ -1093,7 +1101,7 @@ static void register_spiconfig (void) {
     spiconfig_args.clear = arg_lit0 (NULL, "clear", "Clear configuration");
     spiconfig_args.clk = arg_int0 ("k", "clk", "<n>", "Clock GPIO");
     spiconfig_args.data = arg_int0 ("d", "data", "<n>", "Data OUT GPIO");
-    spiconfig_args.miso = arg_int0 ("d", "miso", "<n>", "Data IN GPIO");
+    spiconfig_args.miso = arg_int0 ("m", "miso", "<n>", "Data IN GPIO");
     spiconfig_args.dc = arg_int0 ("c", "dc", "<n>", "DC GPIO");
     spiconfig_args.host = arg_int0 ("h", "host", "1|2", "SPI Host Number");
     spiconfig_args.end = arg_end (4);

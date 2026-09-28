@@ -62,10 +62,8 @@ cJSON * config_set_value_safe(nvs_type_t nvs_type, const char *key,const void * 
 static void vCallbackFunction( TimerHandle_t xTimer );
 void config_set_entry_changed_flag(cJSON * entry, cJSON_bool flag);
 #define IMPLEMENT_SET_DEFAULT(t,nt) void config_set_default_## t (const char *key, t  value){\
-	void * pval = malloc_init_external(sizeof(value));\
-	*((t *) pval) = value;\
-	config_set_default(nt, key,pval,0);\
-	free(pval); }
+	t val = value;\
+	config_set_default(nt, key, &val, 0); }
 #define IMPLEMENT_GET_NUM(t,nt) esp_err_t config_get_## t (const char *key, t *  value){\
 		void * pval = config_alloc_get(nt, key);\
 		if(pval!=NULL){ *value = *(t * )pval; free(pval); return ESP_OK; }\
@@ -96,6 +94,7 @@ void config_init(){
 
 	init_cJSON();
 	MEMTRACE_PRINT_DELTA();
+	config_lock(portMAX_DELAY);
 	if(nvs_json !=NULL){
 		cJSON_Delete(nvs_json);
 	}
@@ -106,6 +105,7 @@ void config_init(){
 	nvs_load_config();
 	MEMTRACE_PRINT_DELTA();
 	config_set_group_bit(CONFIG_LOAD_BIT,false);
+	config_unlock();
 	MEMTRACE_PRINT_DELTA();
 	esp_register_shutdown_handler(config_flush_now);
 	config_start_timer();
@@ -328,28 +328,44 @@ void * config_safe_alloc_get_entry_value(nvs_type_t nvs_type, cJSON * entry){
 	}
 	if (nvs_type == NVS_TYPE_I8) {
 		value=malloc_init_external(sizeof(int8_t));
-		*(int8_t *)value = (int8_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(int8_t *)value = (int8_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_U8) {
 		value=malloc_init_external(sizeof(uint8_t));
-		*(uint8_t *)value = (uint8_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(uint8_t *)value = (uint8_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_I16) {
 		value=malloc_init_external(sizeof(int16_t));
-		*(int16_t *)value = (int16_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(int16_t *)value = (int16_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_U16) {
 		value=malloc_init_external(sizeof(uint16_t));
-		*(uint16_t *)value = (uint16_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(uint16_t *)value = (uint16_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_I32) {
 		value=malloc_init_external(sizeof(int32_t));
-		*(int32_t *)value = (int32_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(int32_t *)value = (int32_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_U32) {
 		value=malloc_init_external(sizeof(uint32_t));
-		*(uint32_t *)value = (uint32_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(uint32_t *)value = (uint32_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_I64) {
 		value=malloc_init_external(sizeof(int64_t));
-		*(int64_t *)value = (int64_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(int64_t *)value = (int64_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_U64) {
 		value=malloc_init_external(sizeof(uint64_t));
-		*(uint64_t *)value = (uint64_t)entry_value->valuedouble;
+		if(value != NULL){
+			*(uint64_t *)value = (uint64_t)entry_value->valuedouble;
+		}
 	} else if (nvs_type == NVS_TYPE_STR) {
 		if(!cJSON_IsString(entry_value)){
 			char * entry_str = cJSON_PrintUnformatted(entry);
@@ -369,17 +385,23 @@ void * config_safe_alloc_get_entry_value(nvs_type_t nvs_type, cJSON * entry){
 			}
 		}
 		else {
-			size_t len=strlen(cJSON_GetStringValue(entry_value));
-			value=(void *)malloc_init_external(len+1);
-			memcpy(value,cJSON_GetStringValue(entry_value),len);
-			if(value==NULL){
-				char * entry_str = cJSON_PrintUnformatted(entry);
-				if(entry_str!=NULL){
-					ESP_LOGE(TAG, "strdup failed on value for object \n%s",entry_str);
-					free(entry_str);
+			const char *str_val = cJSON_GetStringValue(entry_value);
+			if(str_val != NULL){
+				size_t len = strlen(str_val);
+				value = (void *)malloc_init_external(len + 1);
+				if(value != NULL){
+					memcpy(value, str_val, len);
+					((char *)value)[len] = '\0';
 				}
 				else {
-					ESP_LOGE(TAG, "strdup failed on value");
+					char * entry_str = cJSON_PrintUnformatted(entry);
+					if(entry_str != NULL){
+						ESP_LOGE(TAG, "strdup failed on value for object \n%s", entry_str);
+						free(entry_str);
+					}
+					else {
+						ESP_LOGE(TAG, "strdup failed on value");
+					}
 				}
 			}
 		}
@@ -432,6 +454,7 @@ void config_commit_to_nvs(){
 	nvs_handle nvs = 0;
 	bool nvs_opened = false;
 	bool commit_needed = false;
+	bool all_committed = true;
 
 	while(entry!= NULL){
 		char * entry_str = cJSON_PrintUnformatted(entry);
@@ -458,6 +481,7 @@ void config_commit_to_nvs(){
 					esp_err_t err = config_nvs_set_value(nvs, type, entry->string, value);
 					if(err!=ESP_OK){
 						ESP_LOGE(TAG, "Error writing value to nvs for key %s: %s", entry->string, esp_err_to_name(err));
+						all_committed = false;
 					}
 					else {
 						commit_needed = true;
@@ -465,6 +489,7 @@ void config_commit_to_nvs(){
 				}
 				else {
 					ESP_LOGE(TAG, "Cannot commit entry with empty or NULL key name");
+					all_committed = false;
 				}
 				FREE_AND_NULL(value);
 			}
@@ -477,6 +502,7 @@ void config_commit_to_nvs(){
 				else {
 					ESP_LOGE(TAG, "Unable to retrieve value. Error committing value to nvs for key %s",entry->string);
 				}
+				all_committed = false;
 			}
 		}
 		else {
@@ -486,7 +512,6 @@ void config_commit_to_nvs(){
 		entry = entry->next;
 	}
 
-	bool all_committed = true;
 	if(nvs_opened){
 		if(commit_needed){
 			ESP_LOGI(TAG, "Executing single consolidated nvs_commit.");
@@ -534,11 +559,13 @@ bool wait_for_commit(){
 	if(config_has_changes()){
 		config_flush_now();
 	}
+	int retries = 5;
 	bool commit_pending=(xEventGroupGetBits(config_group) & CONFIG_NO_COMMIT_PENDING)==0;
-	while (commit_pending){
+	while (commit_pending && retries > 0){
 		ESP_LOGW(TAG,"Waiting for config commit ...");
 		commit_pending = (xEventGroupWaitBits(config_group, CONFIG_NO_COMMIT_PENDING,pdFALSE, pdTRUE, (CONFIG_COMMIT_DELAY*2) / portTICK_PERIOD_MS) & CONFIG_NO_COMMIT_PENDING)==0;
 		if(commit_pending){
+			retries--;
 			ESP_LOGW(TAG,"Timeout waiting for config commit.");
 	    }
 	    else {
@@ -565,11 +592,16 @@ void config_unlock() {
 	xSemaphoreGive( config_mutex );
 }
 
+static void config_commit_task(void *pvParameters) {
+	config_commit_to_nvs();
+	vTaskDelete(NULL);
+}
+
 static void vCallbackFunction( TimerHandle_t xTimer ) {
 	static int cnt=0;
 	if(config_has_changes()){
 		ESP_LOGI(TAG, "configuration has some uncommitted entries");
-		config_commit_to_nvs();
+		xTaskCreate(config_commit_task, "cfg_commit", 3072, NULL, ESP_TASK_PRIO_MIN + 1, NULL);
 	}
 	else{
 		if(++cnt>=15){
@@ -661,6 +693,9 @@ void config_delete_key(const char *key){
 				ESP_LOGE(TAG, "Unable to commit nvs erase operation for key [%s]. %s.",key,esp_err_to_name(err));
 			}
 		}
+		else if (err == ESP_ERR_NVS_NOT_FOUND) {
+			ESP_LOGD(TAG, "key [%s] not found in nvs.", key);
+		}
 		else {
 			ESP_LOGE(TAG, "Unable to delete nvs key [%s]. %s. ",key, esp_err_to_name(err));
 		}
@@ -669,25 +704,50 @@ void config_delete_key(const char *key){
 	else {
 		ESP_LOGE(TAG, "Error opening nvs: %s. Unable to delete nvs key [%s].",esp_err_to_name(err),key);
 	}
-	char * struc_str = cJSON_PrintUnformatted(nvs_json);
-	if(struc_str!=NULL){
-		ESP_LOGV(TAG, "Structure before delete \n%s", struc_str);
-		free(struc_str);
-	}
-	cJSON * entry = cJSON_DetachItemFromObjectCaseSensitive(nvs_json, key);
-	if(entry !=NULL){
-		ESP_LOGI(TAG, "Removing config key [%s]", entry->string);
-		cJSON_Delete(entry);
-		struc_str = cJSON_PrintUnformatted(nvs_json);
+
+	if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+		char * struc_str = cJSON_PrintUnformatted(nvs_json);
 		if(struc_str!=NULL){
-			ESP_LOGV(TAG, "Structure after delete \n%s", struc_str);
+			ESP_LOGV(TAG, "Structure before delete \n%s", struc_str);
 			free(struc_str);
 		}
-	}
-	else {
-		ESP_LOGW(TAG, "Unable to remove config key [%s]: not found.", key);
+		cJSON * entry = cJSON_DetachItemFromObjectCaseSensitive(nvs_json, key);
+		if(entry !=NULL){
+			ESP_LOGI(TAG, "Removing config key [%s]", entry->string);
+			cJSON_Delete(entry);
+			struc_str = cJSON_PrintUnformatted(nvs_json);
+			if(struc_str!=NULL){
+				ESP_LOGV(TAG, "Structure after delete \n%s", struc_str);
+				free(struc_str);
+			}
+		}
+		else {
+			ESP_LOGW(TAG, "Unable to remove config key [%s]: not found.", key);
+		}
+	} else {
+		ESP_LOGE(TAG, "NVS key deletion failed for [%s]; retaining in-memory cache.", key);
 	}
 	config_unlock();
+}
+
+void config_reset_cache(void) {
+	if (config_mutex == NULL) {
+		return;
+	}
+	if (!config_lock(LOCK_MAX_WAIT / portTICK_PERIOD_MS)) {
+		ESP_LOGE(TAG, "Unable to lock config for cache reset");
+		return;
+	}
+	if (nvs_json != NULL) {
+		cJSON_Delete(nvs_json);
+	}
+	nvs_json = cJSON_CreateObject();
+	config_raise_change(false);
+	config_unlock();
+}
+
+void config_invalidate_cache(void) {
+	config_reset_cache();
 }
 
 void * config_alloc_get(nvs_type_t nvs_type, const char *key) {
@@ -787,11 +847,17 @@ char * config_alloc_get_json(bool bFormatted){
 		ESP_LOGE(TAG, "Unable to lock config after %d ms",LOCK_MAX_WAIT);
 		return strdup_psram("{\"error\":\"Unable to lock configuration object.\"}");
 	}
-	if(bFormatted){
-		json_buffer= cJSON_Print(nvs_json);
-	}
-	else {
-		json_buffer= cJSON_PrintUnformatted(nvs_json);
+	cJSON *clone = cJSON_Duplicate(nvs_json, true);
+	if(clone != NULL){
+		cJSON_DeleteItemFromObject(clone, "telnet_pwd");
+		cJSON_DeleteItemFromObject(clone, "a2dp_spin");
+		if(bFormatted){
+			json_buffer= cJSON_Print(clone);
+		}
+		else {
+			json_buffer= cJSON_PrintUnformatted(clone);
+		}
+		cJSON_Delete(clone);
 	}
 	config_unlock();
 	return json_buffer;
@@ -803,8 +869,8 @@ esp_err_t config_set_value(nvs_type_t nvs_type, const char *key, const void * va
 		return ESP_ERR_INVALID_ARG;
 	}
 	if(!config_lock(LOCK_MAX_WAIT/portTICK_PERIOD_MS)){
-			ESP_LOGE(TAG, "Unable to lock config after %d ms",LOCK_MAX_WAIT);
-			result = ESP_FAIL;
+		ESP_LOGE(TAG, "Unable to lock config after %d ms",LOCK_MAX_WAIT);
+		return ESP_FAIL;
 	}
 	cJSON * entry = config_set_value_safe(nvs_type, key, value);
 	if(entry == NULL){
@@ -835,9 +901,17 @@ cJSON* cjson_update_string(cJSON** root, const char* key, const char* value) {
 		return *root;
 	}
 	cJSON* cjsonvalue = cJSON_GetObjectItemCaseSensitive(*root, key);
-	if (cjsonvalue && strcasecmp(cJSON_GetStringValue(cjsonvalue), value) != 0) {
-		ESP_LOGD(TAG, "Value %s changed from %s to %s", key, cJSON_GetStringValue(cjsonvalue), value);
-		cJSON_SetValuestring(cjsonvalue, value);
+	if (cjsonvalue) {
+		if (!cJSON_IsString(cjsonvalue)) {
+			ESP_LOGD(TAG, "Replacing non-string item %s with string: %s", key, value);
+			cJSON_ReplaceItemInObject(*root, key, cJSON_CreateString(value));
+		} else {
+			const char *cur = cJSON_GetStringValue(cjsonvalue);
+			if (cur == NULL || strcasecmp(cur, value) != 0) {
+				ESP_LOGD(TAG, "Value %s changed from %s to %s", key, STR_OR_ALT(cur, ""), value);
+				cJSON_SetValuestring(cjsonvalue, value);
+			}
+		}
 	} else if(!cjsonvalue){
 		ESP_LOGD(TAG, "Adding new value %s: %s", key, value);
 		cJSON_AddItemToObject(*root, key, cJSON_CreateString(value));
@@ -852,7 +926,12 @@ cJSON* cjson_update_number(cJSON** root, const char* key, int value) {
 	if (key  && strlen(key) != 0) {
 		cJSON* cjsonvalue = cJSON_GetObjectItemCaseSensitive(*root, key);
 		if (cjsonvalue) {
-			cJSON_SetNumberValue(cjsonvalue, value);
+			if (!cJSON_IsNumber(cjsonvalue)) {
+				ESP_LOGD(TAG, "Replacing non-number item %s with number: %d", key, value);
+				cJSON_ReplaceItemInObject(*root, key, cJSON_CreateNumber(value));
+			} else {
+				cJSON_SetNumberValue(cjsonvalue, value);
+			}
 		} else {
 			cJSON_AddNumberToObject(*root, key, value);
 		}

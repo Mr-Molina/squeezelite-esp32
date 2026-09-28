@@ -201,7 +201,7 @@ void set_sample_rate(int rate) {
  * Set normalized (0..100) volume
  */
 static void ac101_set_spk_volume(uint8_t volume) {
-	uint16_t value = max(volume, 100);
+	uint16_t value = min(volume, 100);
 	value = ((int) value * 0x1f) / 100;
 	value |= adac_read_word(AC101_ADDR, SPKOUT_CTRL) & ~0x1f;
 	adac_write_word(AC101_ADDR, SPKOUT_CTRL, value);
@@ -211,7 +211,7 @@ static void ac101_set_spk_volume(uint8_t volume) {
  * Set normalized (0..100) earphone volume
  */
 static void ac101_set_earph_volume(uint8_t volume) {
-	uint16_t value = max(volume, 100);
+	uint16_t value = min(volume, 100);
 	value = (((int) value * 0x3f) / 100) << 4;
 	value |= adac_read_word(AC101_ADDR, HPOUT_CTRL) & ~(0x3f << 4);
 	adac_write_word(AC101_ADDR, HPOUT_CTRL, value);

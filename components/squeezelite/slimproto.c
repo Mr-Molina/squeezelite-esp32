@@ -897,17 +897,20 @@ in_addr_t discover_server(char *default_server, int max) {
 			char readbuf[64], *p;
 			socklen_t slen = sizeof(s);
 			memset(readbuf, 0, sizeof(readbuf));
-			recvfrom(disc_sock, readbuf, sizeof(readbuf) - 1, 0, (struct sockaddr *)&s, &slen);
-			LOG_INFO("got response from: %s:%d", inet_ntoa(s.sin_addr), ntohs(s.sin_port));
+			ssize_t bytes_read = recvfrom(disc_sock, readbuf, sizeof(readbuf) - 1, 0, (struct sockaddr *)&s, &slen);
+			if (bytes_read > 0) {
+				readbuf[bytes_read] = '\0';
+				LOG_INFO("got response from: %s:%d", inet_ntoa(s.sin_addr), ntohs(s.sin_port));
 
-			 if ((p = strstr(readbuf, port_d)) != NULL) {
-				p += strlen(port_d);
-				slimproto_hport = atoi(p + 1);
-			}
+				if ((p = strstr(readbuf, port_d)) != NULL && (p + strlen(port_d) + 1 < readbuf + bytes_read)) {
+					p += strlen(port_d);
+					slimproto_hport = atoi(p + 1);
+				}
 
-			 if ((p = strstr(readbuf, clip_d)) != NULL) {
-				p += strlen(clip_d);
-				slimproto_cport = atoi(p + 1);
+				if ((p = strstr(readbuf, clip_d)) != NULL && (p + strlen(clip_d) + 1 < readbuf + bytes_read)) {
+					p += strlen(clip_d);
+					slimproto_cport = atoi(p + 1);
+				}
 			}
 		}
 
@@ -929,6 +932,7 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 	struct sockaddr_in serv_addr;
 	static char fixed_cap[FIXED_CAP_LEN], var_cap[VAR_CAP_LEN] = "";
 	bool reconnect = false;
+	unsigned reconnect_delay = 1;
 	unsigned failed_connect = 0;
 	unsigned slimproto_port = 0;
 	in_addr_t previous_server = 0;
@@ -986,7 +990,7 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 	if (!running) return;
 
 	LOCK_O;
-	snprintf(fixed_cap, FIXED_CAP_LEN, ",ModelName=%s,MaxSampleRate=%u", modelname ? modelname : MODEL_NAME_STRING,
+	snprintf(fixed_cap, sizeof(fixed_cap), ",ModelName=%s,MaxSampleRate=%u", modelname ? modelname : MODEL_NAME_STRING,
 #if RESAMPLE || RESAMPLE16	
 			 ((maxSampleRate > 0) ? maxSampleRate : output.supported_rates[0]));
 #else
@@ -994,9 +998,11 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 #endif
 	
 	for (i = 0; i < MAX_CODECS; i++) {
-		if (codecs[i] && codecs[i]->id && strlen(fixed_cap) < FIXED_CAP_LEN - 10) {
-			strcat(fixed_cap, ",");
-			strcat(fixed_cap, codecs[i]->types);
+		if (codecs[i] && codecs[i]->id && codecs[i]->types) {
+			size_t cur_len = strlen(fixed_cap);
+			if (cur_len + 1 < sizeof(fixed_cap)) {
+				snprintf(fixed_cap + cur_len, sizeof(fixed_cap) - cur_len, ",%s", codecs[i]->types);
+			}
 		}
 	}
 	UNLOCK_O;
@@ -1018,6 +1024,12 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 			LOG_INFO("switching server to %s:%d", inet_ntoa(serv_addr.sin_addr), ntohs(serv_addr.sin_port));
 			new_server = 0;
 			reconnect = false;
+			reconnect_delay = 1;
+		}
+
+		if (sock >= 0) {
+			closesocket(sock);
+			sock = -1;
 		}
 
 		sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1026,6 +1038,9 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 		set_nosigpipe(sock);
 
 		if (connect_timeout(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr), 5) != 0) {
+
+			closesocket(sock);
+			sock = -1;
 
 			if (previous_server) {
 				slimproto_ip = serv_addr.sin_addr.s_addr = previous_server;
@@ -1081,18 +1096,41 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 			if (server_notify) (*server_notify)(slimproto_ip, slimproto_hport, slimproto_cport);
 #endif
 
+			u32_t conn_start = gettime_ms();
+
 			slimproto_run();
 
 			if (!reconnect) {
 				reconnect = true;
 			}
 
-			usleep(100000);
+			if (gettime_ms() - conn_start > 30000) {
+				reconnect_delay = 1;
+			}
+
+			// Exponential reconnection backoff with jitter on server connection drops
+			unsigned jitter_ms = rand() % 1000;
+			unsigned delay_ms = (reconnect_delay * 1000) + jitter_ms;
+			LOG_INFO("server disconnected, reconnecting in %u ms (backoff %u s)", delay_ms, reconnect_delay);
+			if (reconnect_delay < 30) {
+				reconnect_delay *= 2;
+				if (reconnect_delay > 30) {
+					reconnect_delay = 30;
+				}
+			}
+			while (running && delay_ms > 0) {
+				unsigned step = delay_ms > 100 ? 100 : delay_ms;
+				usleep(step * 1000);
+				delay_ms -= step;
+			}
 		}
 
 		previous_server = 0;
 
-		closesocket(sock);
+		if (sock >= 0) {
+			closesocket(sock);
+			sock = -1;
+		}
 	}
 }
 

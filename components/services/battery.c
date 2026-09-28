@@ -23,6 +23,7 @@ static adc_oneshot_unit_handle_t s_adc1_handle = NULL;
 #include "driver/adc.h"
 #endif
 
+#include "esp_adc_cal.h"
 #include "battery.h"
 #include "platform_config.h"
 
@@ -34,8 +35,13 @@ static adc_oneshot_unit_handle_t s_adc1_handle = NULL;
 */ 
 
 #define BATTERY_TIMER	(10*1000)
+#define DEFAULT_VREF	1100
 
 static const char *TAG = "battery";
+
+static esp_adc_cal_characteristics_t s_adc_chars;
+static bool s_calibrated = false;
+static uint32_t s_v_full = 0;
 
 static struct {
 	int channel;
@@ -61,9 +67,13 @@ float battery_value_svc(void) {
  * 
  */
 uint8_t battery_level_svc(void) {
-	// TODO: this is vastly incorrect
-	int level = battery.avg ? (battery.avg - (3.0 * battery.cells)) / ((4.2 - 3.0) * battery.cells) * 100 : 0;
-	return level < 100 ? level : 100;
+	if (battery.cells <= 0 || battery.avg <= 0.0f) return 0;
+	float min_v = 3.0f * battery.cells;
+	float max_v = 4.2f * battery.cells;
+	if (battery.avg <= min_v) return 0;
+	if (battery.avg >= max_v) return 100;
+	int level = (int)(((battery.avg - min_v) / (max_v - min_v)) * 100.0f);
+	return (uint8_t)(level > 100 ? 100 : (level < 0 ? 0 : level));
 }
 
 /****************************************************************************************
@@ -81,11 +91,24 @@ static int get_adc_raw(int channel) {
 #endif
 }
 
+static float read_battery_voltage(void) {
+	int raw = get_adc_raw(battery.channel);
+	if (s_calibrated && s_v_full > 0) {
+		uint32_t voltage_mv = esp_adc_cal_raw_to_voltage(raw, &s_adc_chars);
+		if (battery.scale > 0.0f) {
+			return (float)voltage_mv * battery.scale / (float)s_v_full;
+		} else {
+			return (float)voltage_mv / 1000.0f;
+		}
+	}
+	return (float)raw * battery.scale / 4095.0f;
+}
+
 /****************************************************************************************
  * 
  */
 static void battery_callback(TimerHandle_t xTimer) {
-	battery.sum += get_adc_raw(battery.channel) * battery.scale / 4095.0;
+	battery.sum += read_battery_voltage();
 	if (++battery.count == 30) {
 		battery.avg = battery.sum / battery.count;
 		battery.sum = battery.count = 0;
@@ -130,7 +153,18 @@ void battery_svc_init(void) {
 		adc1_config_channel_atten(battery.channel, battery.attenuation);
 #endif
 
-		battery.avg = get_adc_raw(battery.channel) * battery.scale / 4095.0;    
+		if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK) {
+			ESP_LOGI(TAG, "ADC calibration: eFuse Two Point supported");
+		} else if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_VREF) == ESP_OK) {
+			ESP_LOGI(TAG, "ADC calibration: eFuse Vref supported");
+		} else {
+			ESP_LOGI(TAG, "ADC calibration: Default Vref used");
+		}
+		esp_adc_cal_characterize(ADC_UNIT_1, (adc_atten_t)battery.attenuation, ADC_WIDTH_BIT_12, DEFAULT_VREF, &s_adc_chars);
+		s_calibrated = true;
+		s_v_full = esp_adc_cal_raw_to_voltage(4095, &s_adc_chars);
+
+		battery.avg = read_battery_voltage();    
 		battery.timer = xTimerCreate("battery", pdMS_TO_TICKS(BATTERY_TIMER), pdTRUE, NULL, battery_callback);
 		xTimerStart(battery.timer, portMAX_DELAY);
 		

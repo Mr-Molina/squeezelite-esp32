@@ -157,6 +157,9 @@ unsigned process_newstream(bool *direct, unsigned raw_sample_rate, unsigned supp
 		
 		if (!process.inbuf || !process.outbuf) {
 			LOG_ERROR("malloc fail creating process buffers");
+			if (!process.inbuf) process.max_in_frames = 0;
+			if (!process.outbuf) process.max_out_frames = 0;
+			FLUSH_FUNC();
 			*direct = true;
 			return raw_sample_rate;
 		}

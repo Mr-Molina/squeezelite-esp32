@@ -26,6 +26,7 @@ static TaskHandle_t network_json_locked_task = NULL;
 static int network_json_lock_count = 0;
 SemaphoreHandle_t network_status_ip_address_mutex = NULL;
 static TaskHandle_t network_status_ip_address_locked_task = NULL;
+static int network_status_ip_address_lock_count = 0;
 char* release_url = NULL;
 char* network_status_ip_address = NULL;
 char* ip_info_json = NULL;
@@ -47,7 +48,7 @@ void init_network_status() {
     ESP_LOGD(TAG, "init_network_status.  Creating status json structure");
     ip_info_cjson = network_status_clear_ip_info_json(&ip_info_cjson);
     ESP_LOGD(TAG, "Getting release url ");
-    char* release_url = (char*)config_alloc_get_default(NVS_TYPE_STR, "release_url", QUOTE(CONFIG_SQUEEZELITE_ESP32_RELEASE_URL), 0);
+    release_url = (char*)config_alloc_get_default(NVS_TYPE_STR, "release_url", QUOTE(CONFIG_SQUEEZELITE_ESP32_RELEASE_URL), 0);
     if (release_url == NULL) {
         ESP_LOGE(TAG, "Unable to retrieve the release url from nvs");
     } else {
@@ -69,6 +70,8 @@ void destroy_network_status() {
     ip_info_cjson = NULL;
     network_json_lock_count = 0;
     network_json_locked_task = NULL;
+    network_status_ip_address_lock_count = 0;
+    network_status_ip_address_locked_task = NULL;
 }
 cJSON* network_status_get_new_json(cJSON** old) {
     ESP_LOGV(TAG, "network_status_get_new_json called");
@@ -150,12 +153,14 @@ bool network_status_lock_json_buffer(TickType_t xTicksToWait) {
 bool network_status_lock_sta_ip_string(TickType_t xTicksToWait) {
     TaskHandle_t calling_task = xTaskGetCurrentTaskHandle();
     if (calling_task == network_status_ip_address_locked_task) {
-        ESP_LOGD(TAG, "json buffer already locked to current task ");
+        ESP_LOGD(TAG, "sta ip string already locked to current task");
+        network_status_ip_address_lock_count++;
         return true;
     }
     if (network_status_ip_address_mutex) {
         if (xSemaphoreTake(network_status_ip_address_mutex, xTicksToWait) == pdTRUE) {
             network_status_ip_address_locked_task = calling_task;
+            network_status_ip_address_lock_count = 1;
             return true;
         } else {
             return false;
@@ -166,8 +171,14 @@ bool network_status_lock_sta_ip_string(TickType_t xTicksToWait) {
 }
 
 void network_status_unlock_sta_ip_string() {
-    network_status_ip_address_locked_task = NULL;
-    xSemaphoreGive(network_status_ip_address_mutex);
+    TaskHandle_t calling_task = xTaskGetCurrentTaskHandle();
+    if (calling_task == network_status_ip_address_locked_task) {
+        if (--network_status_ip_address_lock_count <= 0) {
+            network_status_ip_address_lock_count = 0;
+            network_status_ip_address_locked_task = NULL;
+            xSemaphoreGive(network_status_ip_address_mutex);
+        }
+    }
 }
 
 void network_status_safe_update_sta_ip_string(esp_ip4_addr_t* ip4) {
@@ -185,7 +196,14 @@ void network_status_safe_reset_sta_ip_string() {
     }
 }
 char* network_status_get_sta_ip_string() {
-    return network_status_ip_address;
+    static char ip_str[STA_IP_LEN] = "0.0.0.0";
+    if (network_status_lock_sta_ip_string(portMAX_DELAY)) {
+        if (network_status_ip_address) {
+            strlcpy(ip_str, network_status_ip_address, sizeof(ip_str));
+        }
+        network_status_unlock_sta_ip_string();
+    }
+    return ip_str;
 }
 void set_lms_server_details(in_addr_t ip, u16_t hport, u16_t cport) {
     strncpy(lms_server_ip, inet_ntoa(ip), sizeof(lms_server_ip));

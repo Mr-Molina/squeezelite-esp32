@@ -59,10 +59,12 @@ _sig_func_ptr signal(int sig, _sig_func_ptr func) {
 }
 
 void em_logprint(const char *fmt, ...) {
-    va_list args;
+    va_list args, args_copy;
 	va_start(args, fmt);
+	va_copy(args_copy, args);
 	vfprintf(stderr, fmt, args);    
-    vmessaging_post_message(MESSAGING_ERROR, MESSAGING_CLASS_SYSTEM, fmt, args); 
+    vmessaging_post_message(MESSAGING_ERROR, MESSAGING_CLASS_SYSTEM, fmt, args_copy); 
+	va_end(args_copy);
 	va_end(args);
 	fflush(stderr);
 }

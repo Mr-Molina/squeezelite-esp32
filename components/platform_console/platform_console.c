@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_vfs_dev.h"
@@ -21,6 +22,8 @@
 #include "nvs.h" 
 #include "nvs_flash.h"
 #include "pthread.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "platform_esp32.h"
 #include "cmd_decl.h"
 #include "trace.h"
@@ -59,6 +62,10 @@ const char* recovery_prompt = LOG_COLOR_E "recovery-squeezelite-esp32> " LOG_RES
 
 #define MOUNT_PATH "/data"
 #define HISTORY_PATH MOUNT_PATH "/history.txt"
+static bool is_fs_mounted(const char *path) {
+	struct stat st;
+	return (stat(path, &st) == 0);
+}
 static esp_err_t run_command(char * line);
 #define ADD_TO_JSON(o,t,n) if (t->n) cJSON_AddStringToObject(o,QUOTE(n),t->n);
 #define ADD_PARMS_TO_CMD(o,t,n) { cJSON * parms = ParmsToJSON(&t.n->hdr); if(parms) cJSON_AddItemToObject(o,QUOTE(n),parms); }
@@ -190,11 +197,12 @@ int arg_parse_msg(int argc, char **argv, struct arg_hdr ** args){
     	char *buf = NULL;
 		size_t buf_size = 0;
 		FILE *f = open_memstream(&buf, &buf_size);
-		if (f != NULL) {
-			arg_print_errors(f, getParmsEnd(args), argv[0]);
-			fflush (f);
-			cmd_send_messaging(argv[0],MESSAGING_ERROR,"%s", buf);
+		if (f == NULL) {
+			return ESP_ERR_NO_MEM;
 		}
+		arg_print_errors(f, getParmsEnd(args), argv[0]);
+		fflush (f);
+		cmd_send_messaging(argv[0],MESSAGING_ERROR,"%s", buf);
         fclose(f);
         FREE_AND_NULL(buf);
     }
@@ -217,7 +225,12 @@ void process_autoexec(){
 		autoexec_flag=atoi(str_flag);
 		ESP_LOGI(TAG,"autoexec is set to %s auto-process", autoexec_flag>0?"perform":"skip");
 		if(autoexec_flag == 1) {
+			int max_cmds = 50;
 			do {
+				if (--max_cmds < 0) {
+					ESP_LOGW(TAG, "Reached maximum autoexec command limit (%d)", 50);
+					break;
+				}
 				snprintf(autoexec_name,sizeof(autoexec_name)-1,"autoexec%u",i++);
 				ESP_LOGD(TAG,"Getting command name %s", autoexec_name);
 				autoexec_value= config_alloc_get(NVS_TYPE_STR, autoexec_name);
@@ -225,8 +238,8 @@ void process_autoexec(){
 					if(!bypass_network_manager && strstr(autoexec_value, "join ")!=NULL ){
 						ESP_LOGW(TAG,"Ignoring wifi join command.");
 					}
-					else if(is_recovery_running && !strstr(autoexec_value, "squeezelite " ) ){
-						ESP_LOGW(TAG,"Ignoring command. ");
+					else if(is_recovery_running && strstr(autoexec_value, "squeezelite " ) != NULL){
+						ESP_LOGW(TAG,"Ignoring squeezelite command in recovery mode.");
 					}
 					else {
 						ESP_LOGI(TAG,"Running command %s = %s", autoexec_name, autoexec_value);
@@ -234,6 +247,7 @@ void process_autoexec(){
 					}
 					ESP_LOGD(TAG,"Freeing memory for command %s name", autoexec_name);
 					free(autoexec_value);
+					vTaskDelay(pdMS_TO_TICKS(10));
 				}
 				else {
 					ESP_LOGD(TAG,"No matching command found for name %s", autoexec_name);
@@ -250,7 +264,7 @@ void process_autoexec(){
 }
 
 static ssize_t stdin_read(int fd, void* data, size_t size) {
-	size_t bytes = -1;
+	int bytes = -1;
 	
 	while (1) {
 		QueueSetMemberHandle_t activated = xQueueSelectFromSet(stdin_redir.queue_set, portMAX_DELAY);
@@ -263,16 +277,22 @@ static ssize_t stdin_read(int fd, void* data, size_t size) {
 			if (event.type == UART_DATA) {
 				bytes = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, data, size < event.size ? size : event.size, 0);
 				// we have to do our own line ending translation here 
-				for (int i = 0; i < bytes; i++) if (((char*)data)[i] == '\r') ((char*)data)[i] = '\n';
+				if (bytes > 0) {
+					for (int i = 0; i < bytes; i++) if (((char*)data)[i] == '\r') ((char*)data)[i] = '\n';
+				}
 				break;
 			}	
 		} else if (xRingbufferCanRead(stdin_redir.handle, activated)) {
-			char *p = xRingbufferReceiveUpTo(stdin_redir.handle, &bytes, 0, size);
-			// we might receive strings, replace null by \n
-			for (int i = 0; i < bytes; i++) if (p[i] == '\0' || p[i] == '\r') p[i] = '\n';						
-			memcpy(data, p, bytes);
-			vRingbufferReturnItem(stdin_redir.handle, p);
-			break;
+			size_t item_size = 0;
+			char *p = xRingbufferReceiveUpTo(stdin_redir.handle, &item_size, 0, size);
+			if (p != NULL) {
+				bytes = (int)item_size;
+				// we might receive strings, replace null by \n
+				for (int i = 0; i < bytes; i++) if (p[i] == '\0' || p[i] == '\r') p[i] = '\n';						
+				memcpy(data, p, bytes);
+				vRingbufferReturnItem(stdin_redir.handle, p);
+				break;
+			}
 		}
 	}	
 	
@@ -342,7 +362,9 @@ void initialize_console() {
 	linenoiseHistorySetMaxLen(100);
 
 	/* Load command history from filesystem */
-	//linenoiseHistoryLoad(HISTORY_PATH);
+	if (is_fs_mounted(MOUNT_PATH)) {
+		linenoiseHistoryLoad(HISTORY_PATH);
+	}
 }
 
 bool console_push(const char *data, size_t size) {
@@ -467,7 +489,9 @@ static void * console_thread() {
 		linenoiseHistoryAdd(line);
 
 		/* Save command history to filesystem */
-		linenoiseHistorySave(HISTORY_PATH);
+		if (is_fs_mounted(MOUNT_PATH)) {
+			linenoiseHistorySave(HISTORY_PATH);
+		}
 		printf("\n");
 		run_command(line);
 		/* linenoise allocates line buffer on the heap, so need to free it */

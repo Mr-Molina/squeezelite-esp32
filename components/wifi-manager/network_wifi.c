@@ -2,6 +2,9 @@
 #define LOG_LOCAL_LEVEL NETWORK_WIFI_LOG_LEVEL
 #endif
 #include "network_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include <mbedtls/sha256.h>
 #include <string.h>
 #include "cJSON.h"
 #include "dns_server.h"
@@ -67,9 +70,13 @@ static void get_wifi_device_key(uint8_t* key, size_t key_len) {
         0x57, 0x69, 0x46, 0x69, 0x4e, 0x56, 0x53, 0x4b,
         0x65, 0x79, 0x24, 0x53, 0x65, 0x63, 0x75, 0x72
     };
-    for (size_t i = 0; i < key_len && i < 16; i++) {
-        key[i] = salt[i] ^ mac[i % 6];
-    }
+    uint8_t combined[sizeof(salt) + sizeof(mac)];
+    memcpy(combined, salt, sizeof(salt));
+    memcpy(combined + sizeof(salt), mac, sizeof(mac));
+    uint8_t digest[32];
+    mbedtls_sha256(combined, sizeof(combined), digest, 0);
+    size_t copy_len = key_len < sizeof(digest) ? key_len : sizeof(digest);
+    memcpy(key, digest, copy_len);
 }
 
 static char* encrypt_wifi_credentials(const char* plaintext) {
@@ -144,6 +151,22 @@ typedef struct known_access_point {
 
 /** linked list of command structures */
 static EXT_RAM_ATTR SLIST_HEAD(ap_list, known_access_point) s_ap_list;
+static SemaphoreHandle_t s_ap_list_mutex = NULL;
+
+static void ap_list_lock(void) {
+    if (!s_ap_list_mutex) {
+        s_ap_list_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_ap_list_mutex) {
+        xSemaphoreTake(s_ap_list_mutex, portMAX_DELAY);
+    }
+}
+static void ap_list_unlock(void) {
+    if (s_ap_list_mutex) {
+        xSemaphoreGive(s_ap_list_mutex);
+    }
+}
+
 known_access_point_t* network_wifi_get_ap_entry(const char* ssid) {
     known_access_point_t* it;
 
@@ -152,20 +175,30 @@ known_access_point_t* network_wifi_get_ap_entry(const char* ssid) {
         return NULL;
     }
 
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         ESP_LOGD(TAG, "Looking for SSID %s = %s ?", ssid, it->ssid);
         if (strcmp(it->ssid, ssid) == 0) {
             ESP_LOGD(TAG, "network_wifi_get_ap_entry SSID %s found! ", ssid);
+            ap_list_unlock();
             return it;
         }
     }
+    ap_list_unlock();
     return NULL;
 }
-void network_wifi_remove_ap_entry(const char* ssid) {
+void network_wifi_erase_ap_item(const char* ssid) {
     if (!ssid || strlen(ssid) == 0) {
         ESP_LOGE(TAG, "network_wifi_remove_ap_entry error empty SSID");
+        return;
     }
-    known_access_point_t* it = network_wifi_get_ap_entry(ssid);
+    ap_list_lock();
+    known_access_point_t* it = NULL;
+    SLIST_FOREACH(it, &s_ap_list, next) {
+        if (it->ssid && strcmp(it->ssid, ssid) == 0) {
+            break;
+        }
+    }
     if (it) {
         ESP_LOGW(TAG, "Removing %s from known list of access points", ssid);
         FREE_AND_NULL(it->ssid);
@@ -173,12 +206,24 @@ void network_wifi_remove_ap_entry(const char* ssid) {
         SLIST_REMOVE(&s_ap_list, it, known_access_point, next);
         FREE_AND_NULL(it);
     }
+    ap_list_unlock();
 }
-void network_wifi_empty_known_list() {
+void network_wifi_remove_ap_entry(const char* ssid) {
+    network_wifi_erase_ap_item(ssid);
+}
+void network_wifi_clear_ap_list(void) {
+    ap_list_lock();
     known_access_point_t* it;
     while ((it = SLIST_FIRST(&s_ap_list)) != NULL) {
-        network_wifi_remove_ap_entry(it->ssid);
+        SLIST_REMOVE_HEAD(&s_ap_list, next);
+        FREE_AND_NULL(it->ssid);
+        FREE_AND_NULL(it->password);
+        FREE_AND_NULL(it);
     }
+    ap_list_unlock();
+}
+void network_wifi_empty_known_list() {
+    network_wifi_clear_ap_list();
 }
 
 const wifi_sta_config_t* network_wifi_get_active_config() {
@@ -196,17 +241,21 @@ const wifi_sta_config_t* network_wifi_get_active_config() {
 size_t network_wifi_get_known_count() {
     size_t count = 0;
     known_access_point_t* it;
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         count++;
     }
+    ap_list_unlock();
     return count;
 }
 size_t network_wifi_get_known_count_in_range() {
     size_t count = 0;
     known_access_point_t* it;
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         if(it->found) count++;
     }
+    ap_list_unlock();
     return count;
 }
 esp_err_t network_wifi_add_ap(known_access_point_t* item) {
@@ -248,7 +297,9 @@ esp_err_t network_wifi_add_ap_copy(const known_access_point_t* known_ap) {
     item->phy_11g = known_ap->phy_11g;
     item->phy_11n = known_ap->phy_11n;
     item->phy_lr = known_ap->phy_lr;
+    ap_list_lock();
     err = network_wifi_add_ap(item);
+    ap_list_unlock();
     return err;
 }
 const wifi_ap_record_t* network_wifi_get_ssid_info(const char* ssid) {
@@ -289,7 +340,9 @@ esp_err_t network_wifi_add_ap_from_sta_copy(const wifi_sta_config_t* sta) {
         item->phy_11n = seen->phy_11n;
         item->phy_lr = seen->phy_lr;
     }
+    ap_list_lock();
     err = network_wifi_add_ap(item);
+    ap_list_unlock();
     return err;
 }
 
@@ -310,6 +363,7 @@ static bool network_wifi_was_ssid_seen(const char* ssid) {
 }
 void network_wifi_set_found_ap() {
     known_access_point_t* it;
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         if (network_wifi_was_ssid_seen(it->ssid)) {
             it->found = true;
@@ -317,19 +371,25 @@ void network_wifi_set_found_ap() {
             it->found = false;
         }
     }
+    ap_list_unlock();
 }
 bool network_wifi_known_ap_in_range(){
     known_access_point_t* it;
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         if (it->found) {
+            ap_list_unlock();
             return true;
         }
     }
+    ap_list_unlock();
     return false;
 }
 const char * network_wifi_get_next_ap_in_range(){
     known_access_point_t* it;
     time_t last_try_min=(esp_timer_get_time() / 1000);
+    const char *found_ssid = NULL;
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         if (it->found && it->last_try < last_try_min) {
             last_try_min = it->last_try;
@@ -337,10 +397,12 @@ const char * network_wifi_get_next_ap_in_range(){
     }
     SLIST_FOREACH(it, &s_ap_list, next) {
         if (it->found && it->last_try == last_try_min) {
-            return it->ssid;
+            found_ssid = it->ssid;
+            break;
         }
     }
-    return NULL;
+    ap_list_unlock();
+    return found_ssid;
 }
 
 esp_err_t network_wifi_alloc_ap_json(known_access_point_t* item, char** json_string) {
@@ -388,6 +450,7 @@ bool network_wifi_str2mac(const char* mac, uint8_t* values) {
 esp_err_t network_wifi_add_json_entry(const char* json_text) {
     esp_err_t err = ESP_OK;
     known_access_point_t known_ap;
+    memset(&known_ap, 0, sizeof(known_ap));
     if (!json_text || strlen(json_text) == 0) {
         ESP_LOGE(TAG, "Invalid access point json");
         return ESP_ERR_INVALID_ARG;
@@ -437,6 +500,13 @@ esp_err_t network_wifi_add_json_entry(const char* json_text) {
                 network_wifi_str2mac(cJSON_GetStringValue(value), known_ap.bssid);
             }
             err = network_wifi_add_ap_copy(&known_ap);
+            if (known_ap.ssid) {
+                free(known_ap.ssid);
+            }
+            if (known_ap.password) {
+                memset(known_ap.password, 0, strlen(known_ap.password));
+                free(known_ap.password);
+            }
         } else {
             ESP_LOGE(TAG, "Duplicate ssid %s found in storage", cJSON_GetStringValue(value));
         }
@@ -551,6 +621,28 @@ esp_netif_t* network_wifi_get_interface() {
 esp_netif_t* network_wifi_get_ap_interface() {
     return wifi_ap_netif;
 }
+static void network_wifi_apply_country(void) {
+    char* country_code = config_alloc_get_default(NVS_TYPE_STR, "country_code", NULL, 0);
+    if (!country_code) {
+        country_code = config_alloc_get_default(NVS_TYPE_STR, "country", "01", 0);
+    }
+    wifi_country_t country = {
+        .cc = "01",
+        .schan = 1,
+        .nchan = 14,
+        .policy = WIFI_COUNTRY_POLICY_AUTO,
+    };
+    if (country_code && strlen(country_code) >= 2) {
+        strlcpy(country.cc, country_code, sizeof(country.cc));
+    }
+    FREE_AND_NULL(country_code);
+    esp_err_t err = esp_wifi_set_country(&country);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set wifi country (%s): %s", country.cc, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Wi-Fi country set to %s", country.cc);
+    }
+}
 esp_err_t network_wifi_set_sta_mode() {
     if (!wifi_netif) {
         ESP_LOGE(TAG, "Wifi not initialized. Cannot set sta mode");
@@ -565,6 +657,8 @@ esp_err_t network_wifi_set_sta_mode() {
         err = esp_wifi_start();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Error starting wifi: %s", esp_err_to_name(err));
+        } else {
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         }
     }
     return err;
@@ -587,6 +681,7 @@ esp_netif_t* network_wifi_start() {
                                                                           NULL));
         MEMTRACE_PRINT_DELTA_MESSAGE("Setting up wifi Storage");
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+        network_wifi_apply_country();
     }
     MEMTRACE_PRINT_DELTA_MESSAGE("Setting up wifi mode as STA");
     network_wifi_set_sta_mode();
@@ -709,9 +804,11 @@ const wifi_sta_config_t* network_wifi_load_active_config() {
             char* dec_pw = decrypt_wifi_credentials(raw_pwd);
             if (dec_pw) {
                 strlcpy((char*)config.password, dec_pw, sizeof(config.password));
+                memset(dec_pw, 0, strlen(dec_pw));
                 free(dec_pw);
             }
         }
+        memset(raw_pwd, 0, sizeof(raw_pwd));
     } else {
         if(network_wifi_get_known_count() > 0) {
             ESP_LOGW(TAG, "No wifi ssid found in nvs, but known access points found. Using first known access point.");
@@ -746,10 +843,15 @@ bool network_wifi_get_config_for_ssid(wifi_config_t* config, const char* ssid) {
         ESP_LOGE(TAG, "Unknown ssid %s", ssid);
         return false;
     }
-    memset(&config->ap, 0x00, sizeof(config->ap));
-    strncpy((char*)config->ap.ssid, item->ssid, sizeof(config->ap.ssid));
-    strncpy((char*)config->ap.password, item->password, sizeof(config->ap.ssid));
-    config->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_sta_config_t* sta = &config->sta;
+    memset(config, 0x00, sizeof(wifi_config_t));
+    if (item->ssid) {
+        strlcpy((char*)sta->ssid, item->ssid, sizeof(sta->ssid));
+    }
+    if (item->password) {
+        strlcpy((char*)sta->password, item->password, sizeof(sta->password));
+    }
+    sta->scan_method = WIFI_ALL_CHANNEL_SCAN;
     return true;
 }
 
@@ -993,6 +1095,7 @@ esp_netif_t* network_wifi_config_ap() {
     if (value != NULL) {
         strlcpy((char*)ap_config.ap.password, value, sizeof(ap_config.ap.password));
         ESP_LOGI(TAG, "AP Password: [REDACTED]");
+        memset(value, 0, strlen(value));
     }
     FREE_AND_NULL(value);
 
@@ -1013,6 +1116,7 @@ esp_netif_t* network_wifi_config_ap() {
     ESP_LOGD(TAG, "Max Connections: %d", ap_config.ap.max_connection);
     ESP_LOGD(TAG, "Beacon interval: %d", ap_config.ap.beacon_interval);
 
+    network_wifi_apply_country();
     const char* msg = "Setting wifi mode as WIFI_MODE_APSTA";
     ESP_LOGD(TAG, "%s", msg);
     if ((err = esp_wifi_set_mode(WIFI_MODE_APSTA)) != ESP_OK) {
@@ -1023,9 +1127,11 @@ esp_netif_t* network_wifi_config_ap() {
     ESP_LOGD(TAG, "%s", msg);
     if ((err = esp_wifi_set_config(WIFI_IF_AP, &ap_config)) != ESP_OK) /* stop AP DHCP server */
     {
+        memset(ap_config.ap.password, 0, sizeof(ap_config.ap.password));
         ESP_LOGE(TAG, "%s . Error %s", msg, esp_err_to_name(err));
         return wifi_ap_netif;
     }
+    memset(ap_config.ap.password, 0, sizeof(ap_config.ap.password));
 
     msg = "Setting wifi bandwidth";
     ESP_LOGD(TAG, "%s (%d)", msg, DEFAULT_AP_BANDWIDTH);
@@ -1232,7 +1338,7 @@ esp_err_t network_wifi_connect(const char* ssid, const char* password) {
         messaging_post_message(MESSAGING_WARNING, MESSAGING_CLASS_SYSTEM, "Wifi not started. Cannot connect");
         return ESP_FAIL;
     }
-    if (!ssid || !password || strlen(ssid) == 0) {
+    if (!ssid || strlen(ssid) == 0) {
         ESP_LOGE(TAG, "Cannot connect wifi. wifi config is null!");
         return ESP_ERR_INVALID_ARG;
     }
@@ -1265,6 +1371,7 @@ esp_err_t network_wifi_connect(const char* ssid, const char* password) {
     if ((err = esp_wifi_set_config(WIFI_IF_STA, &config)) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set STA configuration. Error %s", esp_err_to_name(err));
     }
+    memset(config.sta.password, 0, sizeof(config.sta.password));
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Wifi Connecting to %s...", ssid);
         if ((err = esp_wifi_connect()) != ESP_OK) {

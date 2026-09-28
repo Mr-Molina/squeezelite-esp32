@@ -68,7 +68,7 @@ typedef struct telnetUserData {
 } telnet_userdata_t;
 
 const static char TAG[] = "telnet";
-static int uart_fd;
+static int uart_fd = -1;
 static RingbufHandle_t buf_handle;
 static size_t send_chunk = 512;
 static size_t log_buf_size = 4*1024;
@@ -105,6 +105,7 @@ void init_telnet(){
 		// This isn't supposed to happen, as telnet won't start if wifi manager isn't
 		// started. So this is a safeguard only.
 		ESP_LOGW(TAG,"Wifi manager is not active.  Forcing console on Serial output.");
+		bMirrorToUART = true;
 	}
 
 	FREE_AND_NULL(val);
@@ -139,7 +140,7 @@ void init_telnet(){
 	vfs.open = &stdout_open;
 	vfs.fstat = &stdout_fstat;
 
-	if (bMirrorToUART) uart_fd = open("/dev/uart/0", O_RDWR);
+	uart_fd = open("/dev/uart/0", O_RDWR);
 
 	ESP_ERROR_CHECK(esp_vfs_register("/dev/pkspstdout", &vfs, NULL));
 	freopen("/dev/pkspstdout", "w", stdout);
@@ -162,6 +163,13 @@ void start_telnet(void * pvParameter){
 	StaticTask_t *xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	StackType_t *xStack = heap_caps_malloc(TELNET_STACK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	
+	if (!xTaskBuffer || !xStack) {
+		ESP_LOGE(TAG, "Failed to allocate memory for telnet task");
+		if (xTaskBuffer) free(xTaskBuffer);
+		if (xStack) free(xStack);
+		return;
+	}
+
 	xTaskCreateStatic( (TaskFunction_t) &telnet_task, "telnet", TELNET_STACK_SIZE, NULL, ESP_TASK_PRIO_MIN, xStack, xTaskBuffer);
 
 }
@@ -186,7 +194,15 @@ static void telnet_task(void *data) {
 		int sock = accept(serverSocket, (struct sockaddr *)&serverAddr, &len);
 
 		if (sock >= 0) {
+			int keepalive = 1;
+			setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+			struct timeval tv = { .tv_sec = 300, .tv_usec = 0 };
+			setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+			if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
 			partnerSocket = sock;
+			if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
+
 			ESP_LOGI(TAG, "We have a new client connection %d", sock);
 			handle_telnet_conn();
 			ESP_LOGI(TAG, "Telnet connection terminated %d", sock);
@@ -207,14 +223,18 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 	telnet_userdata_t *telnetUserData = (telnet_userdata_t *)userData;
 
 	switch(event->type) {
-	case TELNET_EV_SEND:
-		if (telnetUserData->sockfd > 0) {
-			send(telnetUserData->sockfd, event->data.buffer, event->data.size, 0);
+	case TELNET_EV_SEND: {
+		int sock = telnetUserData->sockfd;
+		if (sock > 0) {
+			send(sock, event->data.buffer, event->data.size, 0);
 		}
 		break;
+	}
 	case TELNET_EV_DATA:
 		if (telnetUserData->is_authenticated) {
-			console_push(event->data.buffer, event->data.size);
+			if (!console_push(event->data.buffer, event->data.size)) {
+				ESP_LOGW(TAG, "Console stdin ringbuffer full, dropping %u bytes", (unsigned)event->data.size);
+			}
 			break;
 		}
 
@@ -242,14 +262,16 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 						auth_ok = true;
 					}
 				} else {
-					// If no password is configured in NVS, default to requiring setting a password
-					if (telnetUserData->auth_buf_len > 0) {
-						config_set_value(NVS_TYPE_STR, "telnet_pwd", telnetUserData->auth_buf);
-						ESP_LOGI(TAG, "Telnet password configured and saved to NVS");
-						auth_ok = true;
-					}
+					ESP_LOGE(TAG, "Telnet disabled: set telnet_pwd via console first");
+					const char *err_msg = "\r\nTelnet disabled: set telnet_pwd via console first.\r\n";
+					telnet_send_text(thisTelnet, err_msg, strlen(err_msg));
+					auth_ok = false;
 				}
-				if (configured_pwd) free(configured_pwd);
+				if (configured_pwd) {
+					memset(configured_pwd, 0, strlen(configured_pwd));
+					free(configured_pwd);
+				}
+				memset(telnetUserData->auth_buf, 0, sizeof(telnetUserData->auth_buf));
 
 				if (auth_ok) {
 					if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
@@ -262,7 +284,10 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 					telnet_send_text(thisTelnet, welcome, strlen(welcome));
 
 					if (i + 1 < event->data.size) {
-						console_push(&event->data.buffer[i + 1], event->data.size - (i + 1));
+						size_t rem = event->data.size - (i + 1);
+						if (!console_push(&event->data.buffer[i + 1], rem)) {
+							ESP_LOGW(TAG, "Console stdin ringbuffer full, dropping %u bytes", (unsigned)rem);
+						}
 					}
 					return;
 				} else {
@@ -301,6 +326,21 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 	case TELNET_EV_TTYPE:
 		telnet_ttype_send(telnetUserData->tnHandle);
 		break;
+	case TELNET_EV_WARNING:
+		ESP_LOGW(TAG, "Telnet warning: %s (%s:%d)", event->error.msg,
+				event->error.func ? event->error.func : "", event->error.line);
+		break;
+	case TELNET_EV_ERROR:
+		ESP_LOGE(TAG, "Telnet fatal error: %s (%s:%d)", event->error.msg,
+				event->error.func ? event->error.func : "", event->error.line);
+		if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+		partnerSocket = -1;
+		if (telnetUserData) {
+			telnetUserData->sockfd = -1;
+		}
+		bIsAuthenticated = false;
+		if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
+		break;
 	default:
 		break;
 	}
@@ -314,20 +354,23 @@ static size_t process_logs(UBaseType_t bytes, bool make_room){
 	vRingbufferGetInfo(buf_handle, NULL, NULL, NULL, NULL, &pending);
 
 	// nothing to do or we can do 
-	if (partnerSocket <= 0 || !bIsAuthenticated || !tnHandle || (make_room && log_buf_size - pending > bytes)) return pending;
+	int cur_sock = partnerSocket;
+	if (cur_sock <= 0 || !bIsAuthenticated || !tnHandle || (make_room && log_buf_size - pending > bytes)) return pending;
 
 	// can't send more than what we have
 	if (bytes > pending) bytes = pending;
 
 	if (telnet_mutex && xSemaphoreTakeRecursive(telnet_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
 		while (bytes > 0) {
-			if (partnerSocket <= 0 || !bIsAuthenticated || !tnHandle) break;
+			cur_sock = partnerSocket;
+			if (cur_sock <= 0 || !bIsAuthenticated || !tnHandle) break;
 
 			size_t size;
 			char *item = (char *)xRingbufferReceiveUpTo(buf_handle, &size, pdMS_TO_TICKS(50), bytes);
 			
 			if (!item) break;
-			if (partnerSocket <= 0 || !bIsAuthenticated || !tnHandle) {
+			cur_sock = partnerSocket;
+			if (cur_sock <= 0 || !bIsAuthenticated || !tnHandle) {
 				vRingbufferReturnItem(buf_handle, (void *)item);
 				break;
 			}
@@ -344,14 +387,15 @@ static size_t process_logs(UBaseType_t bytes, bool make_room){
 }
 
 static void handle_telnet_conn() {
+	int client_sock = partnerSocket;
 	static const telnet_telopt_t my_telopts[] = {
 		{ TELNET_TELOPT_ECHO,      TELNET_WONT, TELNET_DO },
-		{ TELNET_TELOPT_TTYPE,     TELNET_WILL, TELNET_DONT },
+		{ TELNET_TELOPT_TTYPE,     TELNET_WONT, TELNET_DO },
 		{ TELNET_TELOPT_COMPRESS2, TELNET_WONT, TELNET_DO   },
 		{ TELNET_TELOPT_ZMP,       TELNET_WONT, TELNET_DO   },
 		{ TELNET_TELOPT_MSSP,      TELNET_WONT, TELNET_DO   },
 		{ TELNET_TELOPT_BINARY,    TELNET_WILL, TELNET_DO   },
-		{ TELNET_TELOPT_NAWS,      TELNET_WILL, TELNET_DONT },
+		{ TELNET_TELOPT_NAWS,      TELNET_WONT, TELNET_DO },
 		{TELNET_TELOPT_LINEMODE,   TELNET_WONT, TELNET_DO },
 		{ -1, 0, 0 }
 	};
@@ -359,8 +403,8 @@ static void handle_telnet_conn() {
 	if (!pTelnetUserData) {
 		ESP_LOGE(TAG, "Failed to allocate telnet user data");
 		if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
-		int sock = partnerSocket;
-		partnerSocket = 0;
+		int sock = (partnerSocket > 0) ? partnerSocket : client_sock;
+		partnerSocket = -1;
 		if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
 		if (sock > 0) close(sock);
 		return;
@@ -375,8 +419,8 @@ static void handle_telnet_conn() {
 		telnet_free(new_handle);
 		free(pTelnetUserData);
 		if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
-		int sock = partnerSocket;
-		partnerSocket = 0;
+		int sock = (partnerSocket > 0) ? partnerSocket : client_sock;
+		partnerSocket = -1;
 		if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
 		if (sock > 0) close(sock);
 		return;
@@ -454,8 +498,8 @@ static void handle_telnet_conn() {
 	if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
 	telnet_t *to_free = tnHandle;
 	tnHandle = NULL;
-	int to_close = partnerSocket;
-	partnerSocket = 0;
+	int to_close = (partnerSocket > 0) ? partnerSocket : client_sock;
+	partnerSocket = -1;
 	bIsAuthenticated = false;
 	pTelnetUserData->sockfd = -1;
 	if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
@@ -477,12 +521,20 @@ static void handle_telnet_conn() {
 static ssize_t stdout_write(int fd, const void * data, size_t size) {
 	// flush the buffer and send item
 	if (buf_handle) {
-		process_logs(size, true);
-		xRingbufferSend(buf_handle, data, size, 0);
+		if (xRingbufferSend(buf_handle, data, size, 0) != pdTRUE) {
+			// ringbuffer full: discard rather than hanging or overflowing
+		}
 	}
 	
-	// mirror to uart if required
-	return (bMirrorToUART || !buf_handle) ? write(uart_fd, data, size) : size;
+	// mirror to uart if required: ensure UART console remains active when telnet client is connected or disconnected
+	if (bMirrorToUART || partnerSocket <= 0 || !bIsAuthenticated || !buf_handle) {
+		if (uart_fd >= 0) {
+			write(uart_fd, data, size);
+		} else {
+			uart_write_bytes(CONFIG_ESP_CONSOLE_UART_NUM, data, size);
+		}
+	}
+	return size;
 }
 
 static int stdout_open(const char * path, int flags, int mode) {

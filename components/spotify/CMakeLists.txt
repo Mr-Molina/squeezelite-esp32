@@ -23,8 +23,11 @@ set(CSPOT_TARGET_ESP32 ON)
 
 set(_secret $ENV{SPOTIFY_SECRET})
 if(_secret)
-  separate_arguments(_secret)
-  set_source_files_properties(Shim.cpp PROPERTIES COMPILE_OPTIONS "${_secret}")
+  # Prevent Spotify client secret from being exposed on compiler command lines (Invariant 24)
+  # Pass definitions via response file so secrets are not visible in process listings
+  string(REPLACE ";" "\n" _secret_content "${_secret}")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spotify_secret.rsp" "${_secret_content}\n")
+  set_source_files_properties(Shim.cpp PROPERTIES COMPILE_OPTIONS "@${CMAKE_CURRENT_BINARY_DIR}/spotify_secret.rsp")
 endif()
 
 # because CMake is so broken, the cache set below overrides a normal "set" for the first build

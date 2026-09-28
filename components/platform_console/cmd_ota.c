@@ -28,7 +28,7 @@
 #include "messaging.h"
 
 static const char * TAG = "ota";
-extern esp_err_t start_ota(const char * bin_url);
+#include "squeezelite-ota.h"
 static struct {
     struct arg_str *url;
     struct arg_lit *confirm;
@@ -48,8 +48,8 @@ static int perform_ota_update(int argc, char **argv)
         return 1;
     }
 
-    if (strncasecmp(url, "http://", 7) != 0 && strncasecmp(url, "https://", 8) != 0) {
-        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid URL protocol (must begin with http:// or https://)\n");
+    if (strncasecmp(url, "https://", 8) != 0) {
+        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid URL protocol (must begin with https://)\n");
         return 1;
     }
 
@@ -64,7 +64,7 @@ static int perform_ota_update(int argc, char **argv)
     }
 
     ESP_LOGI(TAG, "Starting ota: %s", url);
-    esp_err_t err = start_ota(url);
+    esp_err_t err = start_ota(url, NULL, 0);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "%s", esp_err_to_name(err));

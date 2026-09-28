@@ -452,6 +452,11 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 
 		// need to pad the base64 string as apple device don't
 		base64_pad(buf, &buf_pad);
+		if (!buf_pad || strlen(buf_pad) > 44) {
+			if (buf_pad) free(buf_pad);
+			kd_free(headers);
+			return false;
+		}
 
 		int dlen = base64_decode(buf_pad, data);
 		if (dlen < 0 || dlen > (32 - 10)) {
@@ -519,8 +524,14 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		}
 
 		// on announce, search remote
-		if ((buf = kd_lookup(headers, "DACP-ID")) != NULL) strcpy(ctx->active_remote.DACPid, buf);
-		if ((buf = kd_lookup(headers, "Active-Remote")) != NULL) strcpy(ctx->active_remote.id, buf);
+		if ((buf = kd_lookup(headers, "DACP-ID")) != NULL) {
+			strncpy(ctx->active_remote.DACPid, buf, sizeof(ctx->active_remote.DACPid) - 1);
+			ctx->active_remote.DACPid[sizeof(ctx->active_remote.DACPid) - 1] = '\0';
+		}
+		if ((buf = kd_lookup(headers, "Active-Remote")) != NULL) {
+			strncpy(ctx->active_remote.id, buf, sizeof(ctx->active_remote.id) - 1);
+			ctx->active_remote.id[sizeof(ctx->active_remote.id) - 1] = '\0';
+		}
 
 #ifdef WIN32	
 		ctx->active_remote.handle = init_mDNS(false, ctx->host);
@@ -873,15 +884,23 @@ const static char base64_chars[] =
 /*----------------------------------------------------------------------------*/
 static int  base64_pad(char *src, char **padded)
 {
-	int n;
+	int len, pad, n;
 
-	n = strlen(src) + strlen(src) % 4;
+	if (!padded) return -1;
+	*padded = NULL;
+	if (!src) return -1;
+
+	len = strlen(src);
+	pad = (4 - (len % 4)) % 4;
+	n = len + pad;
 	*padded = malloc(n + 1);
-	memset(*padded, '=', n);
-	memcpy(*padded, src, strlen(src));
+	if (!*padded) return -1;
+	memset(*padded, 0, n + 1);
+	memcpy(*padded, src, len);
+	memset(*padded + len, '=', pad);
 	(*padded)[n] = '\0';
 
-	return strlen(*padded);
+	return n;
 }
 
 /*----------------------------------------------------------------------------*/

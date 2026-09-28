@@ -219,6 +219,6 @@ const struct GDS_FontDef Font_line_1 = {
     11,
     14,
     ' ',
-    '\xFF',
+    0xE8,
     false
 };

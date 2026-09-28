@@ -193,8 +193,13 @@ static decode_state mad_decode(void) {
 	}
 
 	if (m->stream.next_frame && m->readbuf_len) {
-		m->readbuf_len -= m->stream.next_frame - m->readbuf;
-		memmove(m->readbuf, m->stream.next_frame, m->readbuf_len);
+		ptrdiff_t consumed = m->stream.next_frame - m->readbuf;
+		if (consumed > 0 && (size_t)consumed <= m->readbuf_len) {
+			m->readbuf_len -= consumed;
+			memmove(m->readbuf, m->stream.next_frame, m->readbuf_len);
+		} else {
+			m->readbuf_len = 0;
+		}
 	}
 
 	bytes = min(bytes, READBUF_SIZE - m->readbuf_len);

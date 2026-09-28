@@ -6,28 +6,36 @@ import Cookies from 'js-cookie';
 
 
 if (!String.prototype.format) {
-  Object.assign(String.prototype, {
-    format() {
+  Object.defineProperty(String.prototype, 'format', {
+    value: function format() {
       const args = arguments;
       return this.replace(/{(\d+)}/g, function (match, number) {
         return typeof args[number] !== 'undefined' ? args[number] : match;
       });
     },
+    configurable: true,
+    writable: true,
   });
 }
 if (!String.prototype.encodeHTML) {
-  Object.assign(String.prototype, {
-    encodeHTML() {
+  Object.defineProperty(String.prototype, 'encodeHTML', {
+    value: function encodeHTML() {
       return he.encode(this).replace(/\n/g, '<br />');
     },
+    configurable: true,
+    writable: true,
   });
 }
-Object.assign(Date.prototype, {
-  toLocalShort() {
-    const opt = { dateStyle: 'short', timeStyle: 'short' };
-    return this.toLocaleString(undefined, opt);
-  },
-});
+if (!Date.prototype.toLocalShort) {
+  Object.defineProperty(Date.prototype, 'toLocalShort', {
+    value: function toLocalShort() {
+      const opt = { dateStyle: 'short', timeStyle: 'short' };
+      return this.toLocaleString(undefined, opt);
+    },
+    configurable: true,
+    writable: true,
+  });
+}
 function get_control_option_value(obj) {
   let ctrl,id,val,opt;
   let radio = false;
@@ -346,7 +354,7 @@ let flashState = {
     var changed = (this.statusText != txt);
     this.statusText = txt;
     if (changed) {
-      $('span#flash-status').html(this.statusText);
+      $('span#flash-status').text(this.statusText);
       this.ShowDialog();
     }
 
@@ -496,12 +504,14 @@ window.handleReboot = function (link) {
 }
 
 function parseSqueezeliteCommandLine(commandLine) {
+  if (!commandLine || typeof commandLine !== 'string') return {};
   const options = {};
   let output, name;
   let otherValues = '';
 
   const argRegex = /("[^"]+"|'[^']+'|\S+)/g;
   const args = commandLine.match(argRegex);
+  if (!args) return {};
 
   let i = 0;
 
@@ -1615,7 +1625,7 @@ function refreshAPHTML2(data) {
 function refreshETH() {
 
   if (ConnectedTo.urc === connectReturnCode.ETH) {
-    $('span#foot-if').html(`Network: Ethernet, IP: <strong>${ConnectedTo.ip}</strong>`);
+    $('span#foot-if').empty().append('Network: Ethernet, IP: ').append($('<strong>').text(ConnectedTo.ip));
   }
 }
 function showTask(task) {
@@ -1975,9 +1985,9 @@ function checkStatus() {
     if (data.version && data.version !== '') {
       versionName = data.version;
       $("#navtitle").html(`${board_model}${recovery ? '<br>[recovery]' : ''}`);
-      $('span#foot-fw').html(`fw: <strong>${versionName}</strong>, mode: <strong>${recovery ? "Recovery" : project_name}</strong>`);
+      $('span#foot-fw').empty().append('fw: ').append($('<strong>').text(versionName)).append(', mode: ').append($('<strong>').text(recovery ? "Recovery" : project_name));
     } else {
-      $('span#flash-status').html('');
+      $('span#flash-status').empty();
     }
     if (data.Voltage) {
       const bat_icon = batteryToIcon(data.Voltage);
@@ -2360,41 +2370,46 @@ function getConfig() {
 
 function processSqueezeliteCommandLine(val) {
   const parsed = parseSqueezeliteCommandLine(val);
+  if (!parsed || !parsed.output) {
+    return;
+  }
   if (parsed.output.toUpperCase().startsWith('I2S')) {
     handleTemplateTypeRadio('i2s');
   } else if (parsed.output.toUpperCase().startsWith('SPDIF')) {
     handleTemplateTypeRadio('spdif');
   } else if (parsed.output.toUpperCase().startsWith('BT')) {
-    if(parsed.otherOptions.btname){ 
+    if(parsed.otherOptions && parsed.otherOptions.btname){ 
       commandBTSinkName= parsed.otherOptions.btname;
     }
     handleTemplateTypeRadio('bt');
 
   }
-  Object.keys(parsed.options).forEach(function (key) {
-    const option = parsed.options[key];
-    if (!$(`#cmd_opt_${key}`).hasOwnProperty('checked')) {
-      $(`#cmd_opt_${key}`).val(option);
-    } else {
-      $(`#cmd_opt_${key}`)[0].checked = option;
+  if (parsed.options) {
+    Object.keys(parsed.options).forEach(function (key) {
+      const option = parsed.options[key];
+      if (!$(`#cmd_opt_${key}`).hasOwnProperty('checked')) {
+        $(`#cmd_opt_${key}`).val(option);
+      } else {
+        $(`#cmd_opt_${key}`)[0].checked = option;
+      }
+    });
+    if (Object.prototype.hasOwnProperty.call(parsed.options, 'u')) {
+      // parse -u v[:i] and check the appropriate radio button with id #resample_v
+      const [resampleValue, resampleInterpolation] = parsed.options.u.split(':');
+      $(`#resample_${resampleValue}`).prop('checked', true);
+      // if resampleinterpolation is set, check  resample_i checkbox
+      if (resampleInterpolation) {
+        $('#resample_i').prop('checked', true);
+      }
     }
-  });
-  if (parsed.options.hasOwnProperty('u')) {
-    // parse -u v[:i] and check the appropriate radio button with id #resample_v
-    const [resampleValue, resampleInterpolation] = parsed.options.u.split(':');
-    $(`#resample_${resampleValue}`).prop('checked', true);
-    // if resampleinterpolation is set, check  resample_i checkbox
-    if (resampleInterpolation) {
-      $('#resample_i').prop('checked', true);
-    }
-  }
-  if (parsed.options.hasOwnProperty('s')) {
-    // parse -u v[:i] and check the appropriate radio button with id #resample_v
-    if(parsed.options.s === '-disable'){
-      $('#disable-squeezelite')[0].checked = true;
-    }
-    else {
-      $('#disable-squeezelite')[0].checked = false;
+    if (Object.prototype.hasOwnProperty.call(parsed.options, 's')) {
+      // parse -u v[:i] and check the appropriate radio button with id #resample_v
+      if(parsed.options.s === '-disable'){
+        $('#disable-squeezelite')[0].checked = true;
+      }
+      else {
+        $('#disable-squeezelite')[0].checked = false;
+      }
     }
   }
 

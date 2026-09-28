@@ -367,7 +367,7 @@ static decode_state pcm_decode(void) {
 			if (bigendian) {
 				while (count--) {
 #if BYTES_PER_FRAME == 4				
-					*optr++ = *(iptr) << 8 | *(iptr+1);
+					*optr = *(iptr) << 8 | *(iptr+1);
 #else					
 					*optr = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8;
 #endif				
@@ -378,7 +378,7 @@ static decode_state pcm_decode(void) {
 			} else {
 				while (count--) {
 #if BYTES_PER_FRAME == 4														
-					*optr++ = *(iptr+1) | *(iptr+2) << 8;
+					*optr = *(iptr+1) | *(iptr+2) << 8;
 #else					
 					*optr = *(iptr) << 8 | *(iptr+1) << 16 | *(iptr+2) << 24;
 #endif				
@@ -391,9 +391,9 @@ static decode_state pcm_decode(void) {
 			if (bigendian) {
 				while (count--) {
 #if BYTES_PER_FRAME == 4														
-					*optr++ = *(iptr) << 8 | *(iptr+1);
+					*optr = *(iptr) << 8 | *(iptr+1);
 #else					
-					*optr++ = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8 | *(iptr+3);
+					*optr = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8 | *(iptr+3);
 #endif				
 					*(optr+1) = *optr;
 					iptr += 4;
@@ -402,9 +402,9 @@ static decode_state pcm_decode(void) {
 			} else {
 				while (count--) {
 #if BYTES_PER_FRAME == 4																			
-					*optr++ = *(iptr+2) | *(iptr+3) << 8;
+					*optr = *(iptr+2) | *(iptr+3) << 8;
 #else					
-					*optr++ = *(iptr) | *(iptr+1) << 8 | *(iptr+2) << 16 | *(iptr+3) << 24;
+					*optr = *(iptr) | *(iptr+1) << 8 | *(iptr+2) << 16 | *(iptr+3) << 24;
 #endif				
 					*(optr+1) = *optr;
 					iptr += 4;

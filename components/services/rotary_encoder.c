@@ -114,7 +114,7 @@
 #define H_CW_BEGIN_M  0x4
 #define H_CCW_BEGIN_M 0x5
 
-static const uint8_t _ttable_half[TABLE_ROWS][TABLE_COLS] = {
+static const DRAM_ATTR uint8_t _ttable_half[TABLE_ROWS][TABLE_COLS] = {
     // 00                  01              10            11                   // BA
     {H_START_M,            H_CW_BEGIN,     H_CCW_BEGIN,  R_START},            // R_START (00)
     {H_START_M | DIR_CCW,  R_START,        H_CCW_BEGIN,  R_START},            // H_CCW_BEGIN
@@ -132,7 +132,7 @@ static const uint8_t _ttable_half[TABLE_ROWS][TABLE_COLS] = {
 #  define F_CCW_FINAL 0x5
 #  define F_CCW_NEXT  0x6
 
-static const uint8_t _ttable_full[TABLE_ROWS][TABLE_COLS] = {
+static const DRAM_ATTR uint8_t _ttable_full[TABLE_ROWS][TABLE_COLS] = {
     // 00        01           10           11                  // BA
     {R_START,    F_CW_BEGIN,  F_CCW_BEGIN, R_START},           // R_START
     {F_CW_NEXT,  R_START,     F_CW_FINAL,  R_START | DIR_CW},  // F_CW_FINAL
@@ -143,7 +143,7 @@ static const uint8_t _ttable_full[TABLE_ROWS][TABLE_COLS] = {
     {F_CCW_NEXT, F_CCW_FINAL, F_CCW_BEGIN, R_START},           // F_CCW_NEXT
 };
 
-static uint8_t _process(rotary_encoder_info_t * info)
+static IRAM_ATTR uint8_t _process(rotary_encoder_info_t * info)
 {
     uint8_t event = 0;
     if (info != NULL)

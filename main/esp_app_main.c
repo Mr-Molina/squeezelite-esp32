@@ -207,11 +207,6 @@ bool wait_for_wifi(){
 char * process_ota_url(){
     ESP_LOGI(TAG,"Checking for update url");
     char * fwurl=config_alloc_get(NVS_TYPE_STR, "fwurl");
-	if(fwurl!=NULL)
-	{
-		ESP_LOGD(TAG,"Deleting nvs entry for Firmware URL %s", fwurl);
-		config_delete_key("fwurl");
-	}
 	return fwurl;
 }
 
@@ -357,7 +352,12 @@ void app_main()
 		cold_boot = false;
 	}
 	const esp_partition_t *running = esp_ota_get_running_partition();
-	is_recovery_running = (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY);
+	if (running) {
+		is_recovery_running = (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY);
+	} else {
+		ESP_LOGE(TAG, "Failed to get running partition");
+		is_recovery_running = false;
+	}
 
 	if(!is_recovery_running )  {
 		/* unscheduled restart (HW, Watchdog or similar) thus increment dynamic
@@ -484,15 +484,31 @@ void app_main()
 	MEMTRACE_PRINT_DELTA_MESSAGE("Console started");
 	if(fwurl && strlen(fwurl)>0){
 		if(is_recovery_running){
-			while(!bNetworkConnected){
+			int wait_retries = 30;
+			while(!bNetworkConnected && --wait_retries > 0){
 				wait_for_wifi();
-				taskYIELD();
+				vTaskDelay(pdMS_TO_TICKS(1000));
 			}
-			ESP_LOGI(TAG,"Updating firmware from link: %s",fwurl);
-			start_ota(fwurl, NULL, 0);
+			if(bNetworkConnected){
+				ESP_LOGI(TAG,"Updating firmware from link: %s",fwurl);
+				esp_err_t ota_res = start_ota(fwurl, NULL, 0);
+				if(ota_res == ESP_OK){
+					ESP_LOGD(TAG,"Deleting nvs entry for Firmware URL %s", fwurl);
+					config_delete_key("fwurl");
+				}
+				else {
+					ESP_LOGE(TAG,"Failed to start OTA (%s), deleting nvs entry for Firmware URL %s", esp_err_to_name(ota_res), fwurl);
+					config_delete_key("fwurl");
+				}
+			}
+			else {
+				ESP_LOGE(TAG,"Network connection failed. Aborting OTA and deleting nvs entry for Firmware URL %s", fwurl);
+				config_delete_key("fwurl");
+			}
 		}
 		else {
 			ESP_LOGE(TAG,"Restarted to application partition. We're not going to perform OTA!");
+			config_delete_key("fwurl");
 		}
 		free(fwurl);
 	}

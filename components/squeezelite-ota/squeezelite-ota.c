@@ -41,6 +41,7 @@
 #include "lwip/sockets.h"
 #include "globdefs.h"
 #include "tools.h"
+#include "esp_task_wdt.h"
 
 #define IF_DISPLAY(x) if(display) { x; }
 
@@ -51,6 +52,7 @@
 #endif
 
 static const char *TAG = "squeezelite-ota";
+static SemaphoreHandle_t display_mutex = NULL;
 esp_http_client_handle_t ota_http_client = NULL;
 #define IMAGE_HEADER_SIZE sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t) + 1
 #define BUFFSIZE 4096
@@ -75,6 +77,7 @@ typedef struct  {
 	ota_type_t ota_type;
 	char * ota_write_data;
 	char * bin_data;
+	size_t bin_data_size;
 	bool bOTAStarted;
 	size_t buffer_size;
 	uint8_t lastpct;
@@ -105,11 +108,11 @@ void _printMemStats(){
 			heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
 }
 uint8_t  ota_get_pct_complete(){
-	return ota_status->total_image_len==0?0:
+	return ota_status->total_image_len<=0?0:
 			(uint8_t)((float)ota_status->actual_image_len/ota_status->total_image_len*100.0f);
 }
 uint8_t  ota_get_pct_downloaded(){
-	return ota_status->total_image_len==0?0:
+	return ota_status->total_image_len<=0?0:
 			(uint8_t)(ota_status->downloaded_image_len/ota_status->total_image_len*100.0f);
 }
 typedef struct  {
@@ -158,22 +161,28 @@ static progress_t * loc_displayer_get_progress_dft(){
 }
 static void loc_displayer_progressbar(uint8_t pct){
 	static progress_t * progress_coordinates;
+	if (!display_mutex) {
+		display_mutex = xSemaphoreCreateRecursiveMutex();
+	}
 	if(display) {
-		if(!progress_coordinates) progress_coordinates = loc_displayer_get_progress_dft();
-		int filler_x=progress_coordinates->filler.x1+(int)((float)progress_coordinates->filler.width*(float)pct/(float)100);
+		if (display_mutex && xSemaphoreTakeRecursive(display_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+			if(!progress_coordinates) progress_coordinates = loc_displayer_get_progress_dft();
+			int filler_x=progress_coordinates->filler.x1+(int)((float)progress_coordinates->filler.width*(float)pct/(float)100);
 
-		ESP_LOGD(TAG,"Drawing %d,%d,%d,%d",progress_coordinates->border.x1,progress_coordinates->border.y1,progress_coordinates->border.x2,progress_coordinates->border.y2);
-		GDS_DrawBox(display,progress_coordinates->border.x1,progress_coordinates->border.y1,progress_coordinates->border.x2,progress_coordinates->border.y2,GDS_COLOR_WHITE,false);
-		ESP_LOGD(TAG,"Drawing %d,%d,%d,%d",progress_coordinates->filler.x1,progress_coordinates->filler.y1,filler_x,progress_coordinates->filler.y2);
-		if(filler_x > progress_coordinates->filler.x1){
-			GDS_DrawBox(display,progress_coordinates->filler.x1,progress_coordinates->filler.y1,filler_x,progress_coordinates->filler.y2,GDS_COLOR_WHITE,true);
+			ESP_LOGD(TAG,"Drawing %d,%d,%d,%d",progress_coordinates->border.x1,progress_coordinates->border.y1,progress_coordinates->border.x2,progress_coordinates->border.y2);
+			GDS_DrawBox(display,progress_coordinates->border.x1,progress_coordinates->border.y1,progress_coordinates->border.x2,progress_coordinates->border.y2,GDS_COLOR_WHITE,false);
+			ESP_LOGD(TAG,"Drawing %d,%d,%d,%d",progress_coordinates->filler.x1,progress_coordinates->filler.y1,filler_x,progress_coordinates->filler.y2);
+			if(filler_x > progress_coordinates->filler.x1){
+				GDS_DrawBox(display,progress_coordinates->filler.x1,progress_coordinates->filler.y1,filler_x,progress_coordinates->filler.y2,GDS_COLOR_WHITE,true);
+			}
+			else {
+				// Clear the inner box
+				GDS_DrawBox(display,progress_coordinates->filler.x1,progress_coordinates->filler.y1,progress_coordinates->filler.x2,progress_coordinates->filler.y2,GDS_COLOR_BLACK,true);
+			}
+			ESP_LOGD(TAG,"Updating Display");
+			GDS_Update(display);
+			xSemaphoreGiveRecursive(display_mutex);
 		}
-		else {
-			// Clear the inner box
-			GDS_DrawBox(display,progress_coordinates->filler.x1,progress_coordinates->filler.y1,progress_coordinates->filler.x2,progress_coordinates->filler.y2,GDS_COLOR_BLACK,true);
-		}
-		ESP_LOGD(TAG,"Updating Display");
-		GDS_Update(display);
 	}
 	if (led_display) {
 		led_vu_progress_bar(pct, LED_VU_BRIGHT);
@@ -186,10 +195,13 @@ void sendMessaging(messaging_types type,const char * fmt, ...){
     char * msg_str=NULL;
 
     va_start(args, fmt);
+    va_list args_copy;
+    va_copy(args_copy, args);
     str_len = vsnprintf(NULL,0,fmt,args)+1;
+    va_end(args);
     if(str_len>0){
     	msg_str = malloc_init_external(str_len);
-    	vsnprintf(msg_str,str_len,fmt,args);
+    	vsnprintf(msg_str,str_len,fmt,args_copy);
         if(type == MESSAGING_WARNING){
         	ESP_LOGW(TAG,"%s",msg_str);
         }
@@ -202,7 +214,7 @@ void sendMessaging(messaging_types type,const char * fmt, ...){
     else {
     	ESP_LOGW(TAG, "Sending empty string message");
     }
-    va_end(args);
+    va_end(args_copy);
     if(type!=MESSAGING_INFO){
     	IF_DISPLAY(GDS_TextLine(display, 2, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, msg_str));
     }
@@ -230,39 +242,76 @@ static void __attribute__((noreturn)) task_fatal_error(void)
 esp_err_t handle_http_on_data(esp_http_client_event_t *evt){
 
 	int http_status= esp_http_client_get_status_code(evt->client);
-	static char * recv_ptr=NULL;
 
 	if(http_status == 200){
-
+		bool is_chunked = esp_http_client_is_chunked_response(evt->client);
+		int content_len = esp_http_client_get_content_length(evt->client);
 
 		if(!ota_status->bOTAStarted)
 		{
 			sendMessaging(MESSAGING_INFO,"Downloading firmware");
 			ota_status->bOTAStarted = true;
-			ota_status->total_image_len=esp_http_client_get_content_length(evt->client);
 			ota_status->downloaded_image_len = 0;
 			ota_status->newdownloadpct = 0;
-		    ota_status->bin_data= malloc_init_external(ota_status->total_image_len);
-		    if(ota_status->bin_data==NULL){
+
+			if (!is_chunked && content_len > 0) {
+				ota_status->total_image_len = content_len;
+				ota_status->bin_data_size = content_len;
+			} else {
+				ota_status->total_image_len = -1;
+				ota_status->bin_data_size = 256 * 1024;
+			}
+
+			ota_status->bin_data = malloc_init_external(ota_status->bin_data_size);
+			if(ota_status->bin_data==NULL){
 				sendMessaging(MESSAGING_ERROR,"Error: buffer alloc error");
 				return ESP_FAIL;
-	   	    }
-		    recv_ptr=ota_status->bin_data;
+			}
 		}
 
 		// we're downloading the binary data file
-		if (!esp_http_client_is_chunked_response(evt->client)) {
-			memcpy(recv_ptr,evt->data,evt->data_len);
-			ota_status->downloaded_image_len +=evt->data_len;
-			recv_ptr+=evt->data_len;
+		size_t needed = (size_t)ota_status->downloaded_image_len + evt->data_len;
+		if (needed > ota_status->bin_data_size) {
+			if (!is_chunked && ota_status->total_image_len > 0) {
+				sendMessaging(MESSAGING_ERROR, "Error: download exceeded Content-Length");
+				return ESP_FAIL;
+			}
+			if (ota_status->update_partition && needed > ota_status->update_partition->size) {
+				sendMessaging(MESSAGING_ERROR, "Error: download exceeded partition size");
+				return ESP_FAIL;
+			}
+			size_t new_size = ota_status->bin_data_size * 2;
+			if (new_size < needed) {
+				new_size = needed + 64 * 1024;
+			}
+			char *new_buf = heap_caps_realloc(ota_status->bin_data, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+			if (!new_buf) {
+				new_buf = realloc(ota_status->bin_data, new_size);
+			}
+			if (!new_buf) {
+				sendMessaging(MESSAGING_ERROR, "Error: buffer alloc error");
+				return ESP_FAIL;
+			}
+			ota_status->bin_data = new_buf;
+			ota_status->bin_data_size = new_size;
 		}
-		if(ota_get_pct_downloaded()%5 == 0 && ota_get_pct_downloaded()%5!=ota_status->newdownloadpct) {
-			ota_status->newdownloadpct= ota_get_pct_downloaded();
-			loc_displayer_progressbar(ota_status->newdownloadpct);
+
+		memcpy(ota_status->bin_data + (size_t)ota_status->downloaded_image_len, evt->data, evt->data_len);
+		ota_status->downloaded_image_len += evt->data_len;
+
+		if (ota_status->total_image_len > 0) {
+			if(ota_get_pct_downloaded()%5 == 0 && ota_get_pct_downloaded()%5!=ota_status->newdownloadpct) {
+				ota_status->newdownloadpct= ota_get_pct_downloaded();
+				loc_displayer_progressbar(ota_status->newdownloadpct);
+				gettimeofday(&tv, NULL);
+				uint32_t elapsed_ms= (tv.tv_sec-ota_status->OTA_start.tv_sec )*1000+(tv.tv_usec-ota_status->OTA_start.tv_usec)/1000;
+				ESP_LOGI(TAG,"OTA download progress : %f/%f (%d pct), %f KB/s", ota_status->downloaded_image_len, ota_status->total_image_len, ota_status->newdownloadpct, elapsed_ms>0?ota_status->downloaded_image_len*1000/elapsed_ms/1024:0);
+				sendMessaging(MESSAGING_INFO,"Downloading firmware %%%3d.",ota_status->newdownloadpct);
+			}
+		} else {
 			gettimeofday(&tv, NULL);
-			uint32_t elapsed_ms= (tv.tv_sec-ota_status->OTA_start.tv_sec )*1000+(tv.tv_usec-ota_status->OTA_start.tv_usec)/1000;
-			ESP_LOGI(TAG,"OTA download progress : %f/%f (%d pct), %f KB/s", ota_status->downloaded_image_len, ota_status->total_image_len, ota_status->newdownloadpct, elapsed_ms>0?ota_status->downloaded_image_len*1000/elapsed_ms/1024:0);
-			sendMessaging(MESSAGING_INFO,"Downloading firmware %%%3d.",ota_status->newdownloadpct);
+			uint32_t elapsed_ms = (tv.tv_sec - ota_status->OTA_start.tv_sec)*1000 + (tv.tv_usec - ota_status->OTA_start.tv_usec)/1000;
+			ESP_LOGD(TAG, "OTA chunked download: %.0f bytes, %f KB/s", ota_status->downloaded_image_len, elapsed_ms > 0 ? ota_status->downloaded_image_len * 1000 / elapsed_ms / 1024 : 0);
 		}
 
 	}
@@ -366,6 +415,7 @@ esp_err_t init_config(ota_thread_parms_t * p_ota_thread_parms){
 	case OTA_TYPE_BUFFER:
 		ota_status->bin_data = p_ota_thread_parms->bin;
 		ota_status->total_image_len = p_ota_thread_parms->length;
+		ota_status->bin_data_size = p_ota_thread_parms->length;
 		break;
 	default:
 		return ESP_FAIL;
@@ -428,17 +478,22 @@ esp_err_t _erase_last_boot_app_partition(const esp_partition_t *ota_partition)
 	for(uint16_t i=0;i<num_passes;i++){
 		ESP_LOGD(TAG,"Erasing flash (%u%%)",i/num_passes);
 		ESP_LOGD(TAG,"Pass %d of %d, with chunks of %d bytes, from %d to %d", i+1, num_passes,single_pass_size,i*single_pass_size,i*single_pass_size+single_pass_size);
+		esp_task_wdt_reset();
 		err=esp_partition_erase_range(ota_partition, i*single_pass_size, single_pass_size);
+		esp_task_wdt_reset();
 		if(err!=ESP_OK) return err;
 		if(i%2) {
 			loc_displayer_progressbar((int)(((float)i/(float)num_passes)*100.0f));
 			sendMessaging(MESSAGING_INFO,"Erasing flash (%u/%u)",i,num_passes);
 		}
+		vTaskDelay(1);
 		vTaskDelay(100/ portTICK_PERIOD_MS);  // wait here for a short amount of time.  This will help with reducing WDT errors
 	}
 	if(remain_size>0){
+		esp_task_wdt_reset();
 		err=esp_partition_erase_range(ota_partition, ota_partition->size-remain_size, remain_size);
-
+		esp_task_wdt_reset();
+		vTaskDelay(1);
 		if(err!=ESP_OK) return err;
 	}
 	sendMessaging(MESSAGING_INFO,"Erasing flash complete.");
@@ -447,18 +502,20 @@ esp_err_t _erase_last_boot_app_partition(const esp_partition_t *ota_partition)
 	return ESP_OK;
 }
 
-void ota_task_cleanup(const char * message, ...){
+void ota_task_cleanup(const char * fmt, ...){
 	ota_status->bOTAThreadStarted=false;
 	loc_displayer_progressbar(0);
-	if(message!=NULL){
-	    va_list args;
-	    va_start(args, message);
-		sendMessaging(MESSAGING_ERROR,message, args);
-	    va_end(args);
+	if(fmt!=NULL){
+		char buf[256];
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(buf, sizeof(buf), fmt, args);
+		va_end(args);
+		sendMessaging(MESSAGING_ERROR, "%s", buf);
 		
-	    if (led_display) led_vu_color_red(LED_VU_BRIGHT);
+		if (led_display) led_vu_color_red(LED_VU_BRIGHT);
 	} else {
-	    if (led_display) led_vu_color_green(LED_VU_BRIGHT);
+		if (led_display) led_vu_color_green(LED_VU_BRIGHT);
 	}
 	FREE_RESET(ota_status->ota_write_data);
 	FREE_RESET(ota_status->bin_data);
@@ -485,6 +542,9 @@ esp_err_t ota_buffer_all(){
 			return ESP_FAIL;
 		}
 
+	    if (ota_status->total_image_len <= 0) {
+	    	ota_status->total_image_len = ota_status->downloaded_image_len;
+	    }
 	    if(ota_status->total_image_len<=0){
 	    	sendMessaging(MESSAGING_ERROR,"Error: Invalid image length");
 	    	return ESP_FAIL;
@@ -520,14 +580,14 @@ esp_err_t ota_header_check(){
     ota_status->last_invalid_app= esp_ota_get_last_invalid_partition();
     ota_status->ota_partition = _get_ota_partition(ESP_PARTITION_SUBTYPE_APP_OTA_0);
 
-    ESP_LOGD(TAG, "Running partition [%s] type %d subtype %d (offset 0x%08x)", ota_status->running->label, ota_status->running->type, ota_status->running->subtype, ota_status->running->address);
-    if (ota_status->total_image_len > ota_status->ota_partition->size){
-    	ota_task_cleanup("Error: Image size (%d) too large to fit in partition (%d).",ota_status->ota_partition->size,ota_status->total_image_len );
-        return ESP_FAIL;
-	}
 	if(ota_status->ota_partition == NULL){
 		ESP_LOGE(TAG,"Unable to locate OTA application partition. ");
         ota_task_cleanup("Error: OTA partition not found");
+        return ESP_FAIL;
+	}
+    ESP_LOGD(TAG, "Running partition [%s] type %d subtype %d (offset 0x%08x)", ota_status->running->label, ota_status->running->type, ota_status->running->subtype, ota_status->running->address);
+    if (ota_status->total_image_len > ota_status->ota_partition->size){
+    	ota_task_cleanup("Error: Image size (%d) too large to fit in partition (%d).",ota_status->ota_partition->size,ota_status->total_image_len );
         return ESP_FAIL;
 	}
     if (ota_status->configured != ota_status->running) {
@@ -537,12 +597,33 @@ esp_err_t ota_header_check(){
     ESP_LOGD(TAG, "Next ota update partition is: [%s] subtype %d at offset 0x%x",
     		ota_status->update_partition->label, ota_status->update_partition->subtype, ota_status->update_partition->address);
 
+    char *bin_buffer = ota_status ? ota_status->bin_data : NULL;
+    if (!bin_buffer) {
+        ota_task_cleanup("Error: Binary buffer is NULL");
+        return ESP_FAIL;
+    }
+
     if (ota_status->total_image_len >= IMAGE_HEADER_SIZE) {
+		esp_image_header_t *img_hdr = (esp_image_header_t *)bin_buffer;
+		if (!img_hdr || img_hdr->magic != ESP_IMAGE_HEADER_MAGIC) {
+			ota_task_cleanup("Error: Invalid image header magic");
+			return ESP_FAIL;
+		}
+
 		// check current version with downloading
-		memcpy(&new_app_info, &ota_status->bin_data[sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)], sizeof(esp_app_desc_t));
+		memcpy(&new_app_info, &bin_buffer[sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)], sizeof(esp_app_desc_t));
+		if (new_app_info.magic_word != ESP_APP_DESC_MAGIC_WORD) {
+			ota_task_cleanup("Error: Invalid app descriptor magic");
+			return ESP_FAIL;
+		}
+
 		ESP_LOGI(TAG, "New firmware version: %s", new_app_info.version);
 		if (esp_ota_get_partition_description(ota_status->running, &running_app_info) == ESP_OK) {
 			ESP_LOGD(TAG, "Running recovery version: %s", running_app_info.version);
+			if (memcmp(new_app_info.project_name, running_app_info.project_name, sizeof(new_app_info.project_name)) != 0) {
+				ota_task_cleanup("Error: Project name mismatch");
+				return ESP_FAIL;
+			}
 		}
 		sendMessaging(MESSAGING_INFO,"New version is : %s",new_app_info.version);
 		esp_app_desc_t invalid_app_info;
@@ -598,9 +679,15 @@ void ota_task(void *pvParameter)
 	/* Locate and erase ota application partition */
 	sendMessaging(MESSAGING_INFO,"Formatting OTA partition");
 	ESP_LOGW(TAG,"****************  Expecting WATCHDOG errors below during flash erase. This is OK and not to worry about **************** ");
-	IF_DISPLAY(GDS_TextLine(display, 2, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, "Formatting partition"));
+	if (display && display_mutex && xSemaphoreTakeRecursive(display_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+		GDS_TextLine(display, 2, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, "Formatting partition");
+		xSemaphoreGiveRecursive(display_mutex);
+	} else {
+		IF_DISPLAY(GDS_TextLine(display, 2, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, "Formatting partition"));
+	}
 
 	_printMemStats();
+	esp_task_wdt_reset();
 	err=_erase_last_boot_app_partition(ota_status->ota_partition);
 	if(err!=ESP_OK){
 		ota_task_cleanup("Error: Unable to erase last APP partition. (%s)",esp_err_to_name(err));
@@ -625,11 +712,13 @@ void ota_task(void *pvParameter)
 
     	data_read = ota_buffer_read();
         if (data_read <= 0) {
+            esp_ota_abort(update_handle);
             ota_task_cleanup("Error: Data read error");
             return;
         } else if (data_read > 0) {
             err = esp_ota_write( update_handle, (const void *)ota_status->ota_write_data, data_read);
             if (err != ESP_OK) {
+                esp_ota_abort(update_handle);
                 ota_task_cleanup("Error: OTA Partition write failure. (%s)",esp_err_to_name(err));
                 return;
             }
@@ -653,7 +742,8 @@ void ota_task(void *pvParameter)
     }
 
     ESP_LOGI(TAG, "Total Write binary data length: %d", ota_status->actual_image_len);
-    if (ota_status->total_image_len != ota_status->actual_image_len) {
+    if ((size_t)ota_status->total_image_len != ota_status->actual_image_len) {
+        esp_ota_abort(update_handle);
         ota_task_cleanup("Error: Error in receiving complete file");
         return;
     }
@@ -672,7 +762,14 @@ void ota_task(void *pvParameter)
     	IF_DISPLAY(GDS_TextLine(display, 2, GDS_TEXT_LEFT, GDS_TEXT_CLEAR | GDS_TEXT_UPDATE, "Success!"));
     	vTaskDelay(3500/ portTICK_PERIOD_MS);  // wait here to give the UI a chance to refresh
     	IF_DISPLAY(GDS_Clear(display,GDS_COLOR_BLACK));
-        esp_restart();
+        char *auto_reboot = config_alloc_get(NVS_TYPE_STR, "ota_auto_reboot");
+        bool do_restart = !auto_reboot || (atoi(auto_reboot) != 0);
+        free(auto_reboot);
+        if (do_restart) {
+            esp_restart();
+        } else {
+            ESP_LOGI(TAG, "Staged OTA complete. Manual reboot required to activate new firmware.");
+        }
     } else {
         ota_task_cleanup("Error: Unable to update boot partition [%s]",esp_err_to_name(err));
         return;
@@ -722,12 +819,12 @@ esp_err_t process_recovery_ota(const char * bin_url, char * bin_buffer, uint32_t
   	}
 
   	ESP_LOGD(TAG,"OTA task stack size %d, priority %d (%d %s ESP_TASK_MAIN_PRIO)",stack_size , task_priority, abs(task_priority-ESP_TASK_MAIN_PRIO), task_priority-ESP_TASK_MAIN_PRIO>0?"above":"below");
-//    ret=xTaskCreatePinnedToCore(&ota_task, "ota_task", stack_size , (void *)&ota_thread_parms, task_priority, NULL, OTA_CORE);
-    ret=xTaskCreate(&ota_task, "ota_task", stack_size , (void *)&ota_thread_parms, task_priority, NULL);
+    ret=xTaskCreatePinnedToCore(&ota_task, "ota_task", stack_size , (void *)&ota_thread_parms, task_priority, NULL, OTA_CORE);
     if (ret != pdPASS)  {
             ESP_LOGE(TAG, "create thread %s failed", "ota_task");
             return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "OTA task created and pinned to core %u", OTA_CORE);
     return ESP_OK;
 }
 
@@ -743,6 +840,10 @@ in_addr_t discover_ota_server(int max) {
 	uint16_t cport=9090;
 
 	int disc_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (disc_sock < 0) {
+		ESP_LOGE(TAG, "error creating discovery socket");
+		return 0;
+	}
 
 	socklen_t enable = 1;
 	setsockopt(disc_sock, SOL_SOCKET, SO_BROADCAST, (const void *)&enable, sizeof(enable));
@@ -771,19 +872,28 @@ in_addr_t discover_ota_server(int max) {
 				char readbuf[64], *p;
 				socklen_t slen = sizeof(s);
 				memset(readbuf, 0, sizeof(readbuf));
-				recvfrom(disc_sock, readbuf, sizeof(readbuf) - 1, 0, (struct sockaddr *)&s, &slen);
-				ESP_LOGI(TAG,"got response from: %s:%d - %s", inet_ntoa(s.sin_addr), ntohs(s.sin_port),readbuf);
+				ssize_t bytes_read = recvfrom(disc_sock, readbuf, sizeof(readbuf) - 1, 0, (struct sockaddr *)&s, &slen);
+				if (bytes_read > 0) {
+					readbuf[bytes_read] = '\0';
+					ESP_LOGI(TAG,"got response from: %s:%d - %s", inet_ntoa(s.sin_addr), ntohs(s.sin_port),readbuf);
 
-				if ((p = strstr(readbuf, port_d)) != NULL) {
-					p += strlen(port_d);
-					hport = atoi(p + 1);
-				}
+					if ((p = strstr(readbuf, port_d)) != NULL) {
+						p += strlen(port_d);
+						if (p + 1 < readbuf + bytes_read) {
+							hport = atoi(p + 1);
+						}
+					}
 
-				if ((p = strstr(readbuf, clip_d)) != NULL) {
-					p += strlen(clip_d);
-					cport = atoi(p + 1);
+					if ((p = strstr(readbuf, clip_d)) != NULL) {
+						p += strlen(clip_d);
+						if (p + 1 < readbuf + bytes_read) {
+							cport = atoi(p + 1);
+						}
+					}
+					if (server_notify) {
+						server_notify(s.sin_addr.s_addr, hport, cport);
+					}
 				}
-				server_notify(s.sin_addr.s_addr, hport, cport);
 			}
 		}
 

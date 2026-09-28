@@ -223,18 +223,32 @@ MercurySession::Response MercurySession::decodeResponse(
   Response response = {};
   response.parts = {};
 
+  if (data.size() < 15) {
+    response.fail = true;
+    return response;
+  }
+
   auto sequenceLength = ntohs(extract<uint16_t>(data, 0));
   response.sequenceId = hton64(extract<uint64_t>(data, 2));
 
   auto partsNumber = ntohs(extract<uint16_t>(data, 11));
 
   auto headerSize = ntohs(extract<uint16_t>(data, 13));
+  if (15 + headerSize > data.size()) {
+    response.fail = true;
+    return response;
+  }
   auto headerBytes =
       std::vector<uint8_t>(data.begin() + 15, data.begin() + 15 + headerSize);
 
   auto pos = 15 + headerSize;
   while (pos < data.size()) {
+    if (pos + 2 > data.size()) break;
     auto partSize = ntohs(extract<uint16_t>(data, pos));
+    if (pos + 2 + partSize > data.size()) {
+      response.fail = true;
+      return response;
+    }
 
     response.parts.push_back(std::vector<uint8_t>(
         data.begin() + pos + 2, data.begin() + pos + 2 + partSize));

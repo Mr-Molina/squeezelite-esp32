@@ -3,6 +3,7 @@
 #include <initializer_list>  // for initializer_list
 #include <map>               // for operator!=, operator==
 #include <memory>            // for allocator, unique_ptr
+#include <stdexcept>
 #include <string_view>       // for string_view
 #include <vector>            // for vector
 
@@ -30,10 +31,21 @@ std::string ApResolve::fetchFirstApAddress() {
 
   // parse json with nlohmann
 #ifdef BELL_ONLY_CJSON
+  std::string ap_string;
   cJSON* json = cJSON_Parse(responseStr.data());
-  auto ap_string = std::string(
-      cJSON_GetArrayItem(cJSON_GetObjectItem(json, "ap_list"), 0)->valuestring);
-  cJSON_Delete(json);
+  if (json != nullptr) {
+    cJSON* apList = cJSON_GetObjectItem(json, "ap_list");
+    if (apList != nullptr && cJSON_IsArray(apList) && cJSON_GetArraySize(apList) > 0) {
+      cJSON* item = cJSON_GetArrayItem(apList, 0);
+      if (item != nullptr && cJSON_IsString(item) && item->valuestring != nullptr) {
+        ap_string = std::string(item->valuestring);
+      }
+    }
+    cJSON_Delete(json);
+  }
+  if (ap_string.empty()) {
+    throw std::runtime_error("Failed to resolve Spotify access point");
+  }
   return ap_string;
 #else
   auto json = nlohmann::json::parse(responseStr);

@@ -111,10 +111,16 @@ void PlaybackState::setPlaybackState(const PlaybackState::State state) {
 }
 
 void PlaybackState::syncWithRemote() {
-  innerFrame.state.context_uri = (char*)realloc(
-      innerFrame.state.context_uri, strlen(remoteFrame.state.context_uri) + 1);
-
-  strcpy(innerFrame.state.context_uri, remoteFrame.state.context_uri);
+  if (remoteFrame.state.context_uri != nullptr) {
+    innerFrame.state.context_uri = (char*)realloc(
+        innerFrame.state.context_uri, strlen(remoteFrame.state.context_uri) + 1);
+    if (innerFrame.state.context_uri != nullptr) {
+      strcpy(innerFrame.state.context_uri, remoteFrame.state.context_uri);
+    }
+  } else if (innerFrame.state.context_uri != nullptr) {
+    free(innerFrame.state.context_uri);
+    innerFrame.state.context_uri = nullptr;
+  }
 
   innerFrame.state.has_playing_track_index = true;
   innerFrame.state.playing_track_index = remoteFrame.state.playing_track_index;

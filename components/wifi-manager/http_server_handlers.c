@@ -78,9 +78,15 @@ char * alloc_get_http_header(httpd_req_t * req, const char * key){
     buf_len = httpd_req_get_hdr_value_len(req, key) + 1;
     if (buf_len > 1) {
         buf = malloc_init_external(buf_len);
-        /* Copy null terminated value string into buffer */
-        if (httpd_req_get_hdr_value_str(req, "Host", buf, buf_len) == ESP_OK) {
-            ESP_LOGD_LOC(TAG, "Found header => %s: %s",key, buf);
+        if (buf) {
+            /* Copy null terminated value string into buffer */
+            if (httpd_req_get_hdr_value_str(req, key, buf, buf_len) == ESP_OK) {
+                ESP_LOGD_LOC(TAG, "Found header => %s: %s",key, buf);
+            }
+            else {
+                free(buf);
+                buf = NULL;
+            }
         }
     }
     return buf;
@@ -92,7 +98,6 @@ char * http_alloc_get_socket_address(httpd_req_t *req, u8_t local, in_port_t * p
 	socklen_t len;
 	union sockaddr_aligned addr;
 	len = sizeof(addr);
-	ip_addr_t * ip_addr=NULL;
 	char * ipstr = malloc_init_external(INET6_ADDRSTRLEN);
 	typedef int (*getaddrname_fn_t)(int s, struct sockaddr *name, socklen_t *namelen);
 	getaddrname_fn_t get_addr = NULL;
@@ -110,21 +115,22 @@ char * http_alloc_get_socket_address(httpd_req_t *req, u8_t local, in_port_t * p
 		sprintf(ipstr,"N/A (0.0.0.%u)",local);
 	}
 	else {
-		if (addr.sin.sin_family!= AF_INET) {
-			ip_addr = (ip_addr_t *)&(addr.sin6.sin6_addr);
-			inet_ntop(addr.sa.sa_family, ip_addr, ipstr, INET6_ADDRSTRLEN);
-			ESP_LOGV_LOC(TAG,"Processing an IPV6 address : %s", ipstr);
-			*portl =  addr.sin6.sin6_port;
-			unmap_ipv4_mapped_ipv6(ip_2_ip4(ip_addr), ip_2_ip6(ip_addr));
+		if (addr.st.ss_family == AF_INET) {
+			strncpy(ipstr, inet_ntoa(((struct sockaddr_in *)&addr)->sin_addr), INET6_ADDRSTRLEN - 1);
+			ipstr[INET6_ADDRSTRLEN - 1] = '\0';
+			if (portl) {
+				*portl = ntohs(((struct sockaddr_in *)&addr)->sin_port);
+			}
+			ESP_LOGV_LOC(TAG,"Processing an IPV4 address : %s", ipstr);
 		}
-		else {
-			ip_addr = (ip_addr_t *)&(addr.sin.sin_addr);
-			inet_ntop(addr.sa.sa_family, ip_addr, ipstr, INET6_ADDRSTRLEN);
+		else if (addr.st.ss_family == AF_INET6) {
+			inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)&addr)->sin6_addr), ipstr, INET6_ADDRSTRLEN);
+			if (portl) {
+				*portl = ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
+			}
 			ESP_LOGV_LOC(TAG,"Processing an IPV6 address : %s", ipstr);
-			*portl =  addr.sin.sin_port;
 		}
-		inet_ntop(AF_INET, ip_addr, ipstr, INET6_ADDRSTRLEN);
-		ESP_LOGV_LOC(TAG,"Retrieved ip address:port = %s:%u",ipstr, *portl);
+		ESP_LOGV_LOC(TAG,"Retrieved ip address:port = %s:%u",ipstr, portl ? *portl : 0);
 	}
 	return ipstr;
 }
@@ -222,6 +228,10 @@ session_context_t* get_session_context(httpd_req_t *req){
 
 bool is_user_authenticated(httpd_req_t *req){
 	session_context_t *ctx_data = get_session_context(req);
+	if(!ctx_data) return false;
+	char *pwd = (char *)config_alloc_get_str("web_pwd", NULL, NULL);
+	if (!pwd || !*pwd) { if(pwd) free(pwd); return true; }
+	free(pwd);
 
 	if(ctx_data->authenticated){
 		ESP_LOGD_LOC(TAG,"User is authenticated.");
@@ -336,9 +346,20 @@ static esp_err_t set_content_type_from_req(httpd_req_t *req)
 }
 
 int resource_get_index(const char * fileName){
+	if(!fileName || !*fileName){
+		return -1;
+	}
+	size_t fn_len = strlen(fileName);
 	for(int i=0;resource_lookups[i][0]!='\0';i++){
-		if(strstr(resource_lookups[i], fileName)){
-			return i;
+		const char *match = strstr(resource_lookups[i], fileName);
+		while(match){
+			if(match == resource_lookups[i] || *(match - 1) == '/'){
+				const char *end = match + fn_len;
+				if(*end == '\0' || strcmp(end, ".gz") == 0){
+					return i;
+				}
+			}
+			match = strstr(match + 1, fileName);
 		}
 	}
 	return -1;
@@ -348,6 +369,7 @@ esp_err_t root_get_handler(httpd_req_t *req){
     ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Accept-Encoding", "identity");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
 
     if(!is_user_authenticated(req)){
     	// todo:  send password entry page and return
@@ -356,9 +378,9 @@ esp_err_t root_get_handler(httpd_req_t *req){
 	if((idx=resource_get_index("index.html"))>=0){
 		const size_t file_size = (resource_map_end[idx] - resource_map_start[idx]);
 		httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-		err = set_content_type_from_req(req);
+		err = httpd_resp_set_type(req, "text/html");
 		if(err == ESP_OK){
-			httpd_resp_send(req, (const char *)resource_map_start[idx], file_size);
+			err = httpd_resp_send(req, (const char *)resource_map_start[idx], file_size);
 		} 
 	}
     else{
@@ -479,7 +501,7 @@ esp_err_t console_cmd_post_handler(httpd_req_t *req){
 		free(root_str);
 	}
 	cJSON *item=cJSON_GetObjectItemCaseSensitive(root, "command");
-	if(!item){
+	if(!cJSON_IsString(item) || !item->valuestring){
 		ESP_LOGE_LOC(TAG, "Command not found. Received content was: %s",command);
 		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed command json.  Unable to parse content.");
 		err = ESP_FAIL;
@@ -496,6 +518,7 @@ esp_err_t console_cmd_post_handler(httpd_req_t *req){
 		}
 	}
 
+	cJSON_Delete(root);
 	ESP_LOGD_LOC(TAG, "done serving [%s]", req->uri);
 	return err;
 }
@@ -546,6 +569,8 @@ esp_err_t config_get_handler(httpd_req_t *req){
 			if(cfg != NULL){
 				cJSON_DeleteItemFromObject(cfg, "password");
 				cJSON_DeleteItemFromObject(cfg, "ap_pwd");
+				cJSON_DeleteItemFromObject(cfg, "telnet_pwd");
+				cJSON_DeleteItemFromObject(cfg, "a2dp_spin");
 				char *filtered_json = cJSON_PrintUnformatted(cfg);
 				cJSON_Delete(cfg);
 				if(filtered_json != NULL){
@@ -611,7 +636,6 @@ esp_err_t post_handler_buff_receive(httpd_req_t * req){
     if(err == ESP_OK) {
     	buf[total_len] = '\0';
     }
-    http_server_unlock_scratch();
     return err;
 }
 
@@ -634,6 +658,7 @@ esp_err_t config_post_handler(httpd_req_t *req){
 
     char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
     cJSON *root = cJSON_Parse(buf);
+    http_server_unlock_scratch();
     if(root == NULL){
     	ESP_LOGE_LOC(TAG, "Parsing config json failed. Received content was: %s",buf);
     	httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed config json.  Unable to parse content.");
@@ -762,22 +787,23 @@ esp_err_t connect_post_handler(httpd_req_t *req){
 		return ESP_FAIL;
     }
 	cJSON *root = cJSON_Parse(buf);
+	http_server_unlock_scratch();
 
 	if(root==NULL){
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR , "JSON parsing error.");
 		return ESP_FAIL;
 	}
 
-	cJSON * ssid_object = cJSON_GetObjectItem(root, "ssid");
-	if(ssid_object !=NULL){
+	cJSON * ssid_object = cJSON_GetObjectItemCaseSensitive(root, "ssid");
+	if(cJSON_IsString(ssid_object) && ssid_object->valuestring != NULL){
 		ssid = strdup_psram(ssid_object->valuestring);
 	}
-	cJSON * password_object = cJSON_GetObjectItem(root, "pwd");
-	if(password_object !=NULL){
+	cJSON * password_object = cJSON_GetObjectItemCaseSensitive(root, "pwd");
+	if(cJSON_IsString(password_object) && password_object->valuestring != NULL){
 		password = strdup_psram(password_object->valuestring);
 	}
-	cJSON * host_name_object = cJSON_GetObjectItem(root, "host_name");
-	if(host_name_object !=NULL){
+	cJSON * host_name_object = cJSON_GetObjectItemCaseSensitive(root, "host_name");
+	if(cJSON_IsString(host_name_object) && host_name_object->valuestring != NULL){
 		host_name = strdup_psram(host_name_object->valuestring);
 	}
 	cJSON_Delete(root);
@@ -788,7 +814,7 @@ esp_err_t connect_post_handler(httpd_req_t *req){
 		}
 	}
 
-	if(ssid !=NULL && strlen(ssid) <= MAX_SSID_SIZE && strlen(password) <= MAX_PASSWORD_SIZE  ){
+	if(ssid !=NULL && strlen(ssid) <= MAX_SSID_SIZE && (!password || strlen(password) <= MAX_PASSWORD_SIZE)  ){
 		network_async_connect(ssid, password);
 		httpd_resp_send(req, (const char *)success, strlen(success));
 	}
@@ -867,6 +893,7 @@ esp_err_t recovery_post_handler(httpd_req_t *req){
 
 esp_err_t flash_post_handler(httpd_req_t *req){
 	esp_err_t err =ESP_OK;
+	char * binary_buffer = NULL;
 	if(is_recovery_running){
 		ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
 		char success[]="File uploaded. Flashing started.";
@@ -878,7 +905,7 @@ esp_err_t flash_post_handler(httpd_req_t *req){
 		if(err != ESP_OK){
 			return err;
 		}
-		char * binary_buffer = malloc_init_external(req->content_len);
+		binary_buffer = malloc_init_external(req->content_len);
 		if(binary_buffer == NULL){
 			ESP_LOGE(TAG, "File too large : %d bytes", req->content_len);
 			/* Respond with 400 Bad Request */
@@ -934,6 +961,7 @@ esp_err_t flash_post_handler(httpd_req_t *req){
 		ESP_LOGI(TAG, "File reception complete. Invoking OTA process.");
 		err = start_ota(NULL, binary_buffer, req->content_len);
 		if(err!=ESP_OK){
+			FREE_RESET(binary_buffer);
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA processing failed");
 			goto bail_out;
 		}
@@ -942,6 +970,9 @@ esp_err_t flash_post_handler(httpd_req_t *req){
 		httpd_resp_send(req, (const char *)success, strlen(success));
 	}
 bail_out:
+	if(err != ESP_OK && binary_buffer != NULL){
+		FREE_RESET(binary_buffer);
+	}
 	http_server_unlock_scratch();
 	return err;
 }

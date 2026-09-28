@@ -36,7 +36,7 @@ class TCPSocket : public bell::Socket {
   bool isClosed = true;
 
  public:
-  TCPSocket(){};
+  TCPSocket() : sockFd(-1), isClosed(true) {};
   ~TCPSocket() { close(); };
 
   int getFd() { return sockFd; }
@@ -65,9 +65,19 @@ class TCPSocket : public bell::Socket {
     }
 
     sockFd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+    if (sockFd < 0) {
+      if (addr != nullptr) {
+        freeaddrinfo(addr);
+      }
+      throw std::runtime_error("Socket creation failed");
+    }
+    isClosed = false;
 
     err = connect(sockFd, addr->ai_addr, addr->ai_addrlen);
     if (err < 0) {
+      if (addr != nullptr) {
+        freeaddrinfo(addr);
+      }
       close();
       BELL_LOG(error, "http", "Could not connect to %s. Error %d", host.c_str(),
                errno);
@@ -81,7 +91,9 @@ class TCPSocket : public bell::Socket {
                (char*)&flag, /* the cast is historical cruft */
                sizeof(int)); /* length of option value */
 
-    freeaddrinfo(addr);
+    if (addr != nullptr) {
+      freeaddrinfo(addr);
+    }
     isClosed = false;
   }
 
@@ -108,11 +120,11 @@ class TCPSocket : public bell::Socket {
   }
 
   void close() {
-    if (!isClosed) {
+    if (!isClosed || sockFd >= 0) {
 #ifdef _WIN32
-      closesocket(sockFd);
+      if (sockFd >= 0) closesocket(sockFd);
 #else
-      ::close(sockFd);
+      if (sockFd >= 0) ::close(sockFd);
 #endif
       sockFd = -1;
       isClosed = true;

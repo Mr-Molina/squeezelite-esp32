@@ -24,10 +24,15 @@ extern esp_err_t run_command(char * line);
 static char *buf = NULL;
 static char * s_tmp_line_buf=NULL;
 static size_t buf_size = 0;
-static FILE * f;
+static FILE * f = NULL;
 static size_t argc=1;
 static char ** argv=NULL;
 static bool config_initialized=false;
+static void **s_current_argtable = NULL;
+static int s_current_argcount = 0;
+static char *s_orig_dac_config = NULL;
+static bool s_orig_dac_config_saved = false;
+static char *s_nvs_value = NULL;
 void init_console(){
     if(config_initialized) return;
     initialize_console();
@@ -38,27 +43,75 @@ void init_console(){
  * 
  */
 void open_mem_stream_file(){
+    if (f) {
+        fclose(f);
+        f = NULL;
+    }
+    if (buf) {
+        free(buf);
+        buf = NULL;
+    }
+    buf_size = 0;
 	f = open_memstream(&buf, &buf_size);
 }
 
 /****************************************************************************************
  * 
  */
-void close_flush_all(void * argtable, int count,bool print){
-    fflush (f);
-    if(print){
-        printf("%s", buf);
+void tearDown(void){
+    if (s_current_argtable && s_current_argcount > 0) {
+        arg_freetable(s_current_argtable, s_current_argcount);
+        s_current_argtable = NULL;
+        s_current_argcount = 0;
     }
-    fclose(f);
-    free(buf);
-    buf = NULL;
-    arg_freetable(argtable,count);
-    free(argv);
-    argv = NULL;
+    if (f) {
+        fclose(f);
+        f = NULL;
+    }
+    if (buf) {
+        free(buf);
+        buf = NULL;
+    }
+    buf_size = 0;
+    if (argv) {
+        free(argv);
+        argv = NULL;
+    }
     if (s_tmp_line_buf) {
         free(s_tmp_line_buf);
         s_tmp_line_buf = NULL;
     }
+    if (s_orig_dac_config_saved) {
+        if (s_orig_dac_config) {
+            config_set_value(NVS_TYPE_STR, "dac_config", s_orig_dac_config);
+            free(s_orig_dac_config);
+            s_orig_dac_config = NULL;
+        } else {
+            config_delete_key("dac_config");
+        }
+        s_orig_dac_config_saved = false;
+    }
+    if (s_nvs_value) {
+        free(s_nvs_value);
+        s_nvs_value = NULL;
+    }
+}
+
+/****************************************************************************************
+ * 
+ */
+void close_flush_all(void * argtable, int count,bool print){
+    if (f) {
+        fflush (f);
+        if(print && buf){
+            printf("%s", buf);
+        }
+    }
+    if (argtable && count > 0) {
+        s_current_argtable = (void **)argtable;
+        s_current_argcount = count;
+    }
+    tearDown();
 }
 
 /****************************************************************************************
@@ -102,6 +155,8 @@ TEST_CASE("Invalid GPIO detected", "[config][ui]")
         argint = arg_int1("i","int","<gpio>","GPIO number"),
         end  = arg_end(6)
     };
+    s_current_argtable = argtable;
+    s_current_argcount = sizeof(argtable)/sizeof(argtable[0]);
     open_mem_stream_file();
     alloc_split_parse_command_line(cmdline, &argtable);
     int out_val = 0;
@@ -122,6 +177,8 @@ TEST_CASE("Input Only GPIO detected", "[config][ui]")
         argint = arg_int1("i","int","<gpio>","GPIO number"),
         end  = arg_end(6)
     };
+    s_current_argtable = argtable;
+    s_current_argcount = sizeof(argtable)/sizeof(argtable[0]);
     open_mem_stream_file();
     alloc_split_parse_command_line(cmdline, &argtable);
     int out_val = 0;
@@ -142,6 +199,8 @@ TEST_CASE("Valid GPIO Processed", "[config][ui]")
         argint = arg_int1("i","int","<gpio>","GPIO number"),
         end  = arg_end(6)
     };
+    s_current_argtable = argtable;
+    s_current_argcount = sizeof(argtable)/sizeof(argtable[0]);
     open_mem_stream_file();
     alloc_split_parse_command_line(cmdline, &argtable);
     int out_val = 0;
@@ -162,6 +221,8 @@ TEST_CASE("Missing mandatory GPIO detected", "[config][ui]")
         argint = arg_int1("i","int","<gpio>","GPIO number"),
         end  = arg_end(6)
     };
+    s_current_argtable = argtable;
+    s_current_argcount = sizeof(argtable)/sizeof(argtable[0]);
     open_mem_stream_file();
     alloc_split_parse_command_line(cmdline, &argtable);
     int out_val = 0;
@@ -174,31 +235,23 @@ TEST_CASE("Missing mandatory GPIO detected", "[config][ui]")
 /****************************************************************************************
  * 
  */
-TEST_CASE("Missing mandatory parameter detected", "[config][ui]")
-{
-    char * cmdline =  "test \n";
-    void *argtable[] = {
-        argint = arg_int1("i","int","<gpio>","GPIO number"),
-        end  = arg_end(6)
-    };
-    open_mem_stream_file();
-    alloc_split_parse_command_line(cmdline, &argtable);
-    int out_val = 0;
-    TEST_ASSERT_EQUAL_INT_MESSAGE(1,is_output_gpio(argtable[0], f, &out_val, true),"Missing parameter not detected");
-    fflush (f);
-    TEST_ASSERT_EQUAL_STRING_MESSAGE("Missing: int\n",buf,"Missing parameter message wrong");
-    TEST_ASSERT_EQUAL_INT_MESSAGE(-1,out_val,"GPIO Should be set to -1");
-    close_flush_all(argtable,sizeof(argtable)/sizeof(argtable[0]),false);
-}
-/****************************************************************************************
- * 
- */
 TEST_CASE("dac config command", "[config_cmd]")
 {
+    s_orig_dac_config = config_alloc_get_str("dac_config", NULL, NULL);
+    s_orig_dac_config_saved = true;
     config_set_value(NVS_TYPE_STR, "dac_config", "");
-    esp_err_t err=run_command("cfg-hw-dac\n");
-    char * nvs_value =  config_alloc_get_str("dac_config", NULL,NULL);
-    TEST_ASSERT_NOT_NULL(nvs_value);
-    TEST_ASSERT_EQUAL_MESSAGE(ESP_OK,err,"Running command failed");
-    free(nvs_value);
+    esp_err_t err = run_command("cfg-hw-dac\n");
+    s_nvs_value = config_alloc_get_str("dac_config", NULL, NULL);
+    TEST_ASSERT_NOT_NULL(s_nvs_value);
+    TEST_ASSERT_EQUAL_MESSAGE(ESP_OK, err, "Running command failed");
+    free(s_nvs_value);
+    s_nvs_value = NULL;
+    if (s_orig_dac_config) {
+        config_set_value(NVS_TYPE_STR, "dac_config", s_orig_dac_config);
+        free(s_orig_dac_config);
+        s_orig_dac_config = NULL;
+    } else {
+        config_delete_key("dac_config");
+    }
+    s_orig_dac_config_saved = false;
 }

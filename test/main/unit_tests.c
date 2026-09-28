@@ -66,6 +66,7 @@
 #include "cmd_config.h"
 #include "cmd_i2ctools.h"
 #include "cmd_nvs.h"
+#include "tools.h"
 const char unknown_string_placeholder[] = "unknown";
 const char null_string_placeholder[] = "null";
 // as an exception _init function don't need include
@@ -87,7 +88,7 @@ void init_commands(){
 void test_init()
 {
 	const esp_partition_t *running = esp_ota_get_running_partition();
-	is_recovery_running = (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY);
+	is_recovery_running = (running != NULL && running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY);
 	initialize_nvs();
 	config_init();
 	services_init();
@@ -494,7 +495,7 @@ static test_ota_err_t test_validate_ota_url(const char *url) {
     if (len < TEST_OTA_MIN_URL) return TEST_OTA_ERR_TOO_SHORT;
     if (len > TEST_OTA_MAX_URL) return TEST_OTA_ERR_TOO_LONG;
 
-    if (strncasecmp(url, "http://", 7) != 0 && strncasecmp(url, "https://", 8) != 0) {
+    if (strncasecmp(url, "https://", 8) != 0) {
         return TEST_OTA_ERR_BAD_SCHEME;
     }
 
@@ -898,7 +899,7 @@ TEST_CASE("OTA URL protocol scheme validation", "[ota][security]")
     TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("http://192.168.1.100/ota.bin"));
     TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("https://releases.firmware.org/v2.bin"));
 
-    TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("HTTP://SERVER/IMAGE.BIN"));
+    TEST_ASSERT_EQUAL(TEST_OTA_ERR_BAD_SCHEME, test_validate_ota_url("HTTP://SERVER/IMAGE.BIN"));
     TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("HTTPS://SERVER/IMAGE.BIN"));
 
     TEST_ASSERT_EQUAL(TEST_OTA_ERR_BAD_SCHEME, test_validate_ota_url("ftp://firmware.org/app.bin"));
@@ -911,7 +912,8 @@ TEST_CASE("OTA URL protocol scheme validation", "[ota][security]")
 
 TEST_CASE("OTA URL firmware binary extension validation", "[ota][security]")
 {
-    TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("http://domain.com/squeezelite-esp32.bin"));
+    TEST_ASSERT_EQUAL(TEST_OTA_ERR_BAD_SCHEME, test_validate_ota_url("http://domain.com/squeezelite-esp32.bin"));
+    TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("https://domain.com/squeezelite-esp32.bin"));
     TEST_ASSERT_EQUAL(TEST_OTA_VALID, test_validate_ota_url("https://github.com/v1.0/firmware.bin?token=xyz"));
 
     TEST_ASSERT_EQUAL(TEST_OTA_ERR_MISSING_BIN, test_validate_ota_url("http://domain.com/squeezelite-esp32.zip"));
@@ -919,6 +921,41 @@ TEST_CASE("OTA URL firmware binary extension validation", "[ota][security]")
     TEST_ASSERT_EQUAL(TEST_OTA_ERR_MISSING_BIN, test_validate_ota_url("http://domain.com/squeezelite-esp32.elf"));
     TEST_ASSERT_EQUAL(TEST_OTA_ERR_MISSING_BIN, test_validate_ota_url("http://domain.com/squeezelite-esp32.hex"));
     TEST_ASSERT_EQUAL(TEST_OTA_ERR_MISSING_BIN, test_validate_ota_url("http://domain.com/firmware-image"));
+}
+
+TEST_CASE("Platform tools utf8_decodeLatin1 and high-order byte decoding", "[tools][utf8]")
+{
+    char test_str[64];
+    // ASCII passthrough
+    strcpy(test_str, "Standard ASCII 123");
+    utf8_decode(test_str);
+    TEST_ASSERT_EQUAL_STRING("Standard ASCII 123", test_str);
+
+    // UTF-8 accented character (e.g. Café: C, a, f, 0xC3, 0xA9)
+    uint8_t cafe_utf8[] = {'C', 'a', 'f', 0xC3, 0xA9, '\0'};
+    strcpy(test_str, (char *)cafe_utf8);
+    utf8_decode(test_str);
+    // Should safely decode to ISO-8859-1 / CP1252 'é' (0xE9) without sign extension crash
+    TEST_ASSERT_EQUAL_HEX8(0xE9, (uint8_t)test_str[3]);
+}
+
+TEST_CASE("Platform config PARSE_PARAM macro boundary and NULL safety", "[config][macros]")
+{
+    int val = -1;
+    // NULL safety test (LOGIC-001)
+    PARSE_PARAM(NULL, "rate", '=', val);
+    TEST_ASSERT_EQUAL(-1, val);
+
+    // Boundary safety test: searching for "rate" must not match "bitrate"
+    const char *cfg = "bitrate=320,rate=44100";
+    val = -1;
+    PARSE_PARAM(cfg, "rate", '=', val);
+    TEST_ASSERT_EQUAL(44100, val);
+
+    // String parameter extraction with delimiter
+    char str_buf[32] = {0};
+    PARSE_PARAM_STR(cfg, "bitrate", '=', str_buf, sizeof(str_buf));
+    TEST_ASSERT_EQUAL_STRING("320", str_buf);
 }
 
 /* =========================================================================
@@ -958,7 +995,7 @@ static bool should_run_automated_mode(void)
     while (elapsed_ms < TEST_MENU_TIMEOUT_MS) {
         uint8_t ch = 0;
         int bytes = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, &ch, 1, pdMS_TO_TICKS(step_ms));
-        if (bytes > 0) {
+        if (bytes > 0 && isprint(ch) && ch != '\r' && ch != '\n') {
             printf("\nInteractive key pressed ('%c'). Starting interactive menu...\n", (char)ch);
             return false;
         }

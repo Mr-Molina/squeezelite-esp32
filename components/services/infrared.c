@@ -257,14 +257,16 @@ static esp_err_t nec_parser_get_scan_code(ir_parser_t *parser, uint32_t *address
         if (nec_parse_head(nec_parser)) {
             // for the forgetful, need to do a bitreverse
             for (int i = 15; i >= 0; i--) {
-                if (nec_parse_logic(parser, &logic_value) == ESP_OK) {
-                    addr |= (logic_value << i);
+                if (nec_parse_logic(parser, &logic_value) != ESP_OK) {
+                    return ESP_FAIL;
                 }
+                addr |= (logic_value << i);
             }
             for (int i = 15; i >= 0; i--) {
-                if (nec_parse_logic(parser, &logic_value) == ESP_OK) {
-                    cmd |= (logic_value << i);
+                if (nec_parse_logic(parser, &logic_value) != ESP_OK) {
+                    return ESP_FAIL;
                 }
+                cmd |= (logic_value << i);
             }
             *address = addr;
             *command = cmd;

@@ -131,7 +131,7 @@ uint16_t adac_read_word(int i2c_addr, uint8_t reg) {
 	
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (i2c_addr << 1) | I2C_MASTER_READ, I2C_MASTER_NACK);
-    i2c_master_read(cmd, data, 2, I2C_MASTER_NACK);
+    i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
 	
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(i2c_port, cmd, pdMS_TO_TICKS(100));

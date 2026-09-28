@@ -288,7 +288,7 @@ void network_start() {
         s_wifi_prioritized = false;
     }
     ESP_LOGD(TAG, " Creating message queue");
-    network_queue = xQueueCreate(3, sizeof(queue_message));
+    network_queue = xQueueCreate(16, sizeof(queue_message));
     ESP_LOGD(TAG, " Creating network manager task");
     network_task_handle = xTaskCreate(&network_task, "network", 4096, NULL, WIFI_MANAGER_TASK_PRIORITY, &task_network_manager);
 }
@@ -327,6 +327,18 @@ static void network_task(void* pvParameters) {
             NM.Machine.Event = msg.trigger;
             if (dispatch_event(SM, 1, event_logger, result_logger) == EVENT_UN_HANDLED) {
                 network_manager_format_from_to_states(ESP_LOG_ERROR,"Unhandled Event",NULL,NM.Machine.State,msg.trigger,false,"network manager");
+            }
+            if (msg.ssid) {
+                free(msg.ssid);
+            }
+            if (msg.password) {
+                free(msg.password);
+            }
+            if (msg.strval) {
+                free(msg.strval);
+            }
+            if (msg.disconnected_event) {
+                free(msg.disconnected_event);
             }
         } /* end of if status=pdPASS */
     }     /* end of for loop */
@@ -487,7 +499,7 @@ void network_async(network_event_t trigger) {
     memset(&msg,0x00,sizeof(msg));
     msg.trigger = trigger;
     ESP_LOGD(TAG, "Posting event %s directly", event_to_string(trigger));
-    xQueueSendToBack(network_queue, &msg, portMAX_DELAY);
+    xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500));
 }
 void network_async_fail() {
     network_async(EN_FAIL);

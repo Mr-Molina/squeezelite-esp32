@@ -68,6 +68,8 @@ static struct {
 	char ** argv;
 } thread_parms ;
 
+static bool isRunning = false;
+
 #define ADDITIONAL_SQUEEZELITE_ARGS 5
 static void squeezelite_thread(void *arg){  
 	ESP_LOGV(TAG ,"Number of args received: %u",thread_parms.argc );
@@ -88,19 +90,21 @@ static void squeezelite_thread(void *arg){
         esp_restart();
     } else {
 		cmd_send_messaging("cfg-audio-tmpl",MESSAGING_ERROR,"Correct command line and reboot\n");
-        vTaskSuspend(NULL);
     }
 
 	ESP_LOGV(TAG, "Exited from squeezelite's main(). Freeing argv structure.");
 
 	for(int i=0;i<thread_parms.argc;i++) free(thread_parms.argv[i]);
 	free(thread_parms.argv);
+	thread_parms.argv = NULL;
+	thread_parms.argc = 0;
+	isRunning = false;
+	vTaskDelete(NULL);
 }
 
 static int launchsqueezelite(int argc, char **argv) {
 	static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
 	static EXT_RAM_ATTR StackType_t xStack[SQUEEZELITE_THREAD_STACK_SIZE] __attribute__ ((aligned (4)));
-	static bool isRunning = false;
 
 	if (isRunning) {
 		ESP_LOGE(TAG,"Squeezelite already running. Exiting!");
@@ -118,6 +122,11 @@ static int launchsqueezelite(int argc, char **argv) {
 
     thread_parms.argc=0;
     thread_parms.argv = malloc_init_external(sizeof(char**)*(argc+ADDITIONAL_SQUEEZELITE_ARGS));
+	if (!thread_parms.argv) {
+		ESP_LOGE(TAG, "Failed to allocate memory for argv");
+		isRunning = false;
+		return -1;
+	}
 
 	for(int i=0;i<argc;i++){
 		ESP_LOGD(TAG ,"assigning parm %u : %s",i,argv[i]);
@@ -132,8 +141,17 @@ static int launchsqueezelite(int argc, char **argv) {
 	}
 
 	ESP_LOGD(TAG,"Starting Squeezelite Thread");
-	xTaskCreateStaticPinnedToCore(squeezelite_thread, "squeezelite", SQUEEZELITE_THREAD_STACK_SIZE, 
+	TaskHandle_t h = xTaskCreateStaticPinnedToCore(squeezelite_thread, "squeezelite", SQUEEZELITE_THREAD_STACK_SIZE, 
 					  NULL, CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT, xStack, &xTaskBuffer, CONFIG_PTHREAD_TASK_CORE_DEFAULT);
+	if (!h) {
+		ESP_LOGE(TAG, "Failed to start squeezelite thread");
+		for(int i=0;i<thread_parms.argc;i++) free(thread_parms.argv[i]);
+		free(thread_parms.argv);
+		thread_parms.argv = NULL;
+		thread_parms.argc = 0;
+		isRunning = false;
+		return -1;
+	}
 	ESP_LOGD(TAG ,"Back to console thread!");
 
     return 0;

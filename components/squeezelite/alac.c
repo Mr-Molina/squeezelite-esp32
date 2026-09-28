@@ -464,12 +464,18 @@ static decode_state alac_decode(void) {
 	// need to create a buffer with contiguous data
 	if (bytes < block_size) {
 		iptr = malloc(block_size);
+		if (!iptr) {
+			LOG_ERROR("malloc fail");
+			UNLOCK_S;
+			return DECODE_ERROR;
+		}
 		memcpy(iptr, streambuf->readp, bytes);
 		memcpy(iptr + bytes, streambuf->buf, block_size - bytes);
 	} else iptr = streambuf->readp;
 
 	if (!alac_to_pcm(l->decoder, iptr, l->writebuf, 2, &frames)) {
 		LOG_ERROR("decode error");
+		if (bytes < block_size) free(iptr);
 		UNLOCK_S;
 		return DECODE_ERROR;
 	}

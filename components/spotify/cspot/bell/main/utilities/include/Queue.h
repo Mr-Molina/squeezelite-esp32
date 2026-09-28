@@ -91,7 +91,7 @@ class Queue {
       m_queue.pop();
     }
     lk.unlock();
-    m_cv.notify_one();
+    m_cv.notify_all();
   }
   /// <summary> Check queue in forced exit state. </summary>
   bool isExit() const { return m_forceExit.load(); }

@@ -404,8 +404,7 @@ static void buffer_reset(abuf_t *audio_buffer) {
 // the sequence numbers will wrap pretty often.
 // this returns true if the second arg is after the first
 static int seq_order(seq_t a, seq_t b) {
-	s16_t d = b - a;
-	return d > 0;
+	return (int16_t)(a - b) < 0;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -567,7 +566,7 @@ static void buffer_push_packet(rtp_t *ctx) {
 				curframe->ready = 0;
 			} else {
 				LOG_DEBUG("[%p]: created zero frame (W:%hu R:%hu)", ctx, ctx->ab_write, ctx->ab_read);
-				ctx->data_cb(silence_frame, ctx->frame_size * 4, playtime);
+				ctx->data_cb(silence_frame, min(ctx->frame_size * 4, sizeof(silence_frame)), playtime);
 				ctx->silent_frames++;
                 curframe->missed = 1;
 			}
@@ -621,6 +620,7 @@ static void rtp_thread_func(void *arg) {
 	fd_set fds;
 	int i, sock = -1;
 	int count = 0;
+	int rr_start = 0;
 	bool ntp_sent;
 	char *packet = malloc(MAX_PACKET);
 	rtp_t *ctx = (rtp_t*) arg;
@@ -647,10 +647,12 @@ static void rtp_thread_func(void *arg) {
             continue;
         }
 
-		for (i = 0; i < 3; i++)
-			if (FD_ISSET(ctx->rtp_sockets[i].sock, &fds)) idx = i;
+		for (i = 0; i < 3 && ctx->running; i++) {
+			idx = (rr_start + i) % 3;
+			if (!FD_ISSET(ctx->rtp_sockets[idx].sock, &fds)) continue;
 
-		plen = recvfrom(ctx->rtp_sockets[idx].sock, packet, MAX_PACKET, MSG_DONTWAIT, (struct sockaddr*) &ctx->rtp_host, &rtp_client_len);
+			rtp_client_len = sizeof(struct sockaddr_in);
+			plen = recvfrom(ctx->rtp_sockets[idx].sock, packet, MAX_PACKET, MSG_DONTWAIT, (struct sockaddr*) &ctx->rtp_host, &rtp_client_len);
 
 		if (!ntp_sent) {
 			LOG_WARN("[%p]: NTP request not send yet", ctx);
@@ -788,6 +790,8 @@ static void rtp_thread_func(void *arg) {
 				break;
 			}
 		}
+		}
+		rr_start = (rr_start + 1) % 3;
 	}
 
 	free(packet);
@@ -840,7 +844,7 @@ static bool rtp_request_resend(rtp_t *ctx, seq_t first, seq_t last) {
 	unsigned char req[8];    // *not* a standard RTCP NACK
 
 	// do not request silly ranges (happens in case of network large blackouts)
-	if (seq_order(last, first) || last - first > buffer_frames / 2) return false;
+	if (seq_order(last, first) || (uint16_t)(last - first) > buffer_frames / 2) return false;
 	
 	ctx->resent_req += (seq_t) (last - first) + 1;
 

@@ -78,12 +78,12 @@ typedef struct
 	esp_netif_t *wifi_netif;
 	esp_netif_t *eth_netif;
 	esp_netif_t *wifi_ap_netif;
-    uint16_t sta_polling_min_ms;
-    uint16_t sta_polling_max_ms;
-    uint16_t ap_duration_ms;
-    uint16_t eth_link_down_reboot_ms;
-    uint16_t dhcp_timeout;
-    uint16_t wifi_dhcp_fail_ms;    
+    uint32_t sta_polling_min_ms;
+    uint32_t sta_polling_max_ms;
+    uint32_t ap_duration_ms;
+    uint32_t eth_link_down_reboot_ms;
+    uint32_t dhcp_timeout;
+    uint32_t wifi_dhcp_fail_ms;
 	queue_message * event_parameters;
     char * timer_tag;
 } network_t;

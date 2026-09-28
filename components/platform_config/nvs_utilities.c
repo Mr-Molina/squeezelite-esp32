@@ -40,10 +40,10 @@ static const type_str_pair_t type_str_pair[] = {
 };
 
 static const size_t TYPE_STR_PAIR_SIZE = sizeof(type_str_pair) / sizeof(type_str_pair[0]);
-void print_blob(const char *blob, size_t len)
+void print_blob(const char *data, size_t len)
 {
     for (int i = 0; i < len; i++) {
-        printf("%02x", blob[i]);
+        printf("%02X ", ((const uint8_t *)data)[i]);
     }
     printf("\n");
 }
@@ -73,6 +73,7 @@ void erase_settings_partition(){
 	ESP_LOGW(TAG,  "Erasing nvs on partition %s",settings_partition);
 	ESP_ERROR_CHECK(nvs_flash_erase_partition(settings_partition));
 	nvs_flash_init_partition(settings_partition);
+	config_reset_cache();
 }
 void initialize_nvs() {
 	ESP_LOGI(TAG,  "Initializing flash nvs ");
@@ -117,7 +118,7 @@ esp_err_t nvs_load_config() {
             if (strlen(info.key) == 0) {
                 ESP_LOGW(TAG, "empty key name in namespace %s. Removing it.", current_namespace);
                 nvs_handle_t nvs_handle;
-                err = nvs_open(settings_partition, NVS_READWRITE, &nvs_handle);
+                err = nvs_open_from_partition(settings_partition, current_namespace, NVS_READWRITE, &nvs_handle);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "nvs_open failed. %s", esp_err_to_name(err));
                 } else {
@@ -140,8 +141,9 @@ esp_err_t nvs_load_config() {
 			else {
 				void* value = get_nvs_value_alloc(info.type, info.key);
 				if (value == NULL) {
-					ESP_LOGE(TAG, "nvs read failed.");
-					return ESP_FAIL;
+					ESP_LOGW(TAG, "nvs read failed for key %s", info.key);
+					it = nvs_entry_next(it);
+					continue;
 				}
 				config_set_value(info.type, info.key, value);
 				free(value);
@@ -162,6 +164,9 @@ esp_err_t nvs_load_config() {
              heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
              malloc_spiram - heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (it != NULL) {
+        nvs_release_iterator(it);
+    }
     return err;
 }
 
@@ -173,8 +178,8 @@ esp_err_t store_nvs_value(nvs_type_t type, const char *key, void * data) {
 esp_err_t store_nvs_value_len_for_partition(const char * partition,const char * namespace,nvs_type_t type, const char *key, const void * data,size_t data_len) {
 	esp_err_t err;
 	nvs_handle nvs;
-	if(!key || key[0]=='\0'){
-		ESP_LOGE(TAG,  "Cannot store value to nvs: key is empty");
+	if(!key || key[0]=='\0' || !data){
+		ESP_LOGE(TAG,  "Cannot store value to nvs: invalid key or data");
 		return ESP_ERR_INVALID_ARG;
 	}
 	
@@ -207,12 +212,23 @@ esp_err_t store_nvs_value_len_for_partition(const char * partition,const char * 
 		err = nvs_set_str(nvs, key, data);
 	} else if (type == NVS_TYPE_BLOB) {
 		err = nvs_set_blob(nvs, key, (void *) data, data_len);
+	} else {
+		err = ESP_ERR_NVS_TYPE_MISMATCH;
 	}
 	if (err == ESP_OK) {
 		err = nvs_commit(nvs);
 		if (err == ESP_OK) {
 			ESP_LOGI(TAG,   "Value stored under key '%s'", key);
+			if (partition && strcmp(partition, settings_partition) == 0 &&
+			    namespace && strcmp(namespace, current_namespace) == 0 &&
+			    type != NVS_TYPE_BLOB && type != NVS_TYPE_I64 && type != NVS_TYPE_U64) {
+				config_set_value(type, key, data);
+			}
+		} else {
+			ESP_LOGE(TAG, "Failed to commit key '%s': %s", key, esp_err_to_name(err));
 		}
+	} else {
+		ESP_LOGE(TAG, "Failed to store key '%s': %s", key, esp_err_to_name(err));
 	}
 	nvs_close(nvs);
 	return err;
@@ -291,7 +307,7 @@ void * get_nvs_value_alloc_for_partition(const char * partition,const char * nam
 void * get_nvs_value_alloc(nvs_type_t type, const char *key) {
 		return get_nvs_value_alloc_for_partition(settings_partition, current_namespace,type,key,NULL);
 }
-esp_err_t get_nvs_value(nvs_type_t type, const char *key, void*value, const uint8_t buf_size) {
+esp_err_t get_nvs_value(nvs_type_t type, const char *key, void*value, const size_t buf_size) {
 	nvs_handle nvs;
 	esp_err_t err;
 
@@ -364,11 +380,12 @@ esp_err_t erase_nvs_for_partition(const char * partition, const char * namespace
 }
 esp_err_t erase_nvs(const char *key)
 {
-	return erase_nvs_for_partition(NVS_DEFAULT_PART_NAME, current_namespace,key);
+	const char *part = (settings_partition && settings_partition[0] != '\0') ? settings_partition : NVS_DEFAULT_PART_NAME;
+	return erase_nvs_for_partition(part, current_namespace, key);
 }
 
 esp_err_t erase_nvs_partition(const char * partition, const char * namespace){
-    nvs_handle nvs;
+    nvs_handle nvs = 0;
 	const char * step = "Opening";
     ESP_LOGD(TAG,"%s partition %s, namespace %s ",step,partition,namespace);
 	esp_err_t err = nvs_open_from_partition(partition,namespace, NVS_READWRITE, &nvs);
@@ -381,11 +398,11 @@ esp_err_t erase_nvs_partition(const char * partition, const char * namespace){
             ESP_LOGD(TAG,"%s",step);
 			err = nvs_commit(nvs);
 		}
+		ESP_LOGD(TAG,"Closing %s ",namespace);
+		nvs_close(nvs);
 	}
 	if(err !=ESP_OK){
 		ESP_LOGE(TAG,"%s partition %s, name space %s : %s",step,partition,namespace,esp_err_to_name(err));
 	}
-    ESP_LOGD(TAG,"Closing %s ",namespace);
-	nvs_close(nvs);
 	return err;
 }

@@ -55,13 +55,11 @@ void IRAM_ATTR GDS_DrawPixel( struct GDS_Device* Device, int X, int Y, int Color
 void GDS_DrawHLine( struct GDS_Device* Device, int x, int y, int Width, int Color ) {
     int XEnd = x + Width;
 
-	Device->Dirty = true;
-	
+	if (y < 0 || y >= Device->Height || x >= Device->Width || XEnd <= 0) return;
 	if (x < 0) x = 0;
-	if (XEnd >= Device->Width) XEnd = Device->Width - 1;
-	
-	if (y < 0) y = 0;
-	else if (y >= Device->Height) y = Device->Height - 1;
+	if (XEnd > Device->Width) XEnd = Device->Width;
+
+	Device->Dirty = true;
 
     for ( ; x < XEnd; x++ ) Device->DrawPixelFast( Device, x, y, Color );
 }
@@ -69,13 +67,11 @@ void GDS_DrawHLine( struct GDS_Device* Device, int x, int y, int Width, int Colo
 void GDS_DrawVLine( struct GDS_Device* Device, int x, int y, int Height, int Color ) {
     int YEnd = y + Height;
 
-	Device->Dirty = true;
-	
-	if (x < 0) x = 0;
-	if (x >= Device->Width) x = Device->Width - 1;
-	
+	if (x < 0 || x >= Device->Width || y >= Device->Height || YEnd <= 0) return;
 	if (y < 0) y = 0;
-	else if (YEnd >= Device->Height) YEnd = Device->Height - 1;
+	if (YEnd > Device->Height) YEnd = Device->Height;
+
+	Device->Dirty = true;
 
     for ( ; y < YEnd; y++ ) DrawPixel( Device, x, y, Color );
 }

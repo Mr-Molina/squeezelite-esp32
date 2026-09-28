@@ -106,6 +106,10 @@ std::vector<uint8_t> LoginBlob::decodeBlobSecondary(
 
   crypto->aesECBdecrypt(key, blobData);
 
+  if (blobData.size() < 17) {
+    return {};
+  }
+
   auto l = blobData.size();
 
   for (int i = 0; i < l - 16; i++) {

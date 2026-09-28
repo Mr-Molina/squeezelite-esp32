@@ -224,16 +224,17 @@ static state_machine_result_t NETWORK_INSTANTIATED_STATE_handler(state_machine_t
     network_t* const nm = (network_t *)State_Machine;
     State_Machine->State = &network_states[NETWORK_INSTANTIATED_STATE];
     State_Machine->Event = EN_START;
-    config_get_uint16t_from_str("pollmx",&nm->sta_polling_max_ms,600);
-    nm->sta_polling_max_ms = nm->sta_polling_max_ms * 1000;
-    config_get_uint16t_from_str("apdelay",&nm->ap_duration_ms,20);
-    nm->ap_duration_ms = nm->ap_duration_ms * 1000;
-    config_get_uint16t_from_str("pollmin",&nm->sta_polling_min_ms,15);
-    nm->sta_polling_min_ms = nm->sta_polling_min_ms*1000;
-    config_get_uint16t_from_str("ethtmout",&nm->eth_link_down_reboot_ms,30);
-    nm->eth_link_down_reboot_ms = nm->eth_link_down_reboot_ms*1000;
-    config_get_uint16t_from_str("dhcp_tmout",&nm->dhcp_timeout,30);
-    nm->dhcp_timeout = nm->dhcp_timeout*1000;
+    uint16_t val16 = 0;
+    config_get_uint16t_from_str("pollmx",&val16,600);
+    nm->sta_polling_max_ms = (uint32_t)val16 * 1000;
+    config_get_uint16t_from_str("apdelay",&val16,20);
+    nm->ap_duration_ms = (uint32_t)val16 * 1000;
+    config_get_uint16t_from_str("pollmin",&val16,15);
+    nm->sta_polling_min_ms = (uint32_t)val16 * 1000;
+    config_get_uint16t_from_str("ethtmout",&val16,30);
+    nm->eth_link_down_reboot_ms = (uint32_t)val16 * 1000;
+    config_get_uint16t_from_str("dhcp_tmout",&val16,30);
+    nm->dhcp_timeout = (uint32_t)val16 * 1000;
     ESP_LOGI(TAG,"Network manager configuration: polling max %d, polling min %d, ap delay %d, dhcp timeout %d, eth timeout %d",
         nm->sta_polling_max_ms,nm->sta_polling_min_ms,nm->ap_duration_ms,nm->dhcp_timeout, nm->eth_link_down_reboot_ms);
     HANDLE_GLOBAL_EVENT(State_Machine);
@@ -420,7 +421,11 @@ static state_machine_result_t ETH_CONNECTING_NEW_STATE_entry_handler(state_machi
     network_start_stop_dhcp_client(nm->wifi_netif, true);
     network_wifi_connect(nm->event_parameters->ssid,nm->event_parameters->password);
     FREE_AND_NULL(nm->event_parameters->ssid);
-    FREE_AND_NULL(nm->event_parameters->password);
+    if (nm->event_parameters->password) {
+        memset(nm->event_parameters->password, 0, strlen(nm->event_parameters->password));
+        free(nm->event_parameters->password);
+        nm->event_parameters->password = NULL;
+    }
     NETWORK_EXECUTE_CB(State_Machine);
     network_handler_entry_print(State_Machine,false);
     return EVENT_HANDLED;
@@ -461,6 +466,12 @@ static state_machine_result_t ETH_CONNECTING_NEW_STATE_exit_handler(state_machin
 static state_machine_result_t ETH_ACTIVE_LINKDOWN_STATE_entry_handler(state_machine_t* const State_Machine) {
     network_handler_entry_print(State_Machine,true);
     network_t* const nm = (network_t *)State_Machine;
+    nm->ethernet_connected = false;
+    esp_netif_t* sta = nm->wifi_netif ? nm->wifi_netif : network_wifi_get_interface();
+    if (sta && (nm->wifi_connected || network_is_interface_connected(sta))) {
+        ESP_LOGI(TAG, "Ethernet link down, falling back to STA default interface");
+        esp_netif_set_default_netif(sta);
+    }
     network_set_timer(nm->eth_link_down_reboot_ms, "Ethernet link down" );
     NETWORK_EXECUTE_CB(State_Machine);
     messaging_post_message(MESSAGING_WARNING, MESSAGING_CLASS_SYSTEM, "Ethernet link down.");
@@ -698,7 +709,11 @@ static state_machine_result_t WIFI_CONFIGURING_CONNECT_STATE_entry_handler(state
     network_start_stop_dhcp_client(nm->wifi_netif, true);
     network_wifi_connect(nm->event_parameters->ssid,nm->event_parameters->password);
     FREE_AND_NULL(nm->event_parameters->ssid);
-    FREE_AND_NULL(nm->event_parameters->password);
+    if (nm->event_parameters->password) {
+        memset(nm->event_parameters->password, 0, strlen(nm->event_parameters->password));
+        free(nm->event_parameters->password);
+        nm->event_parameters->password = NULL;
+    }
     NETWORK_EXECUTE_CB(State_Machine);
     network_handler_entry_print(State_Machine,false);
     return EVENT_HANDLED;
@@ -851,7 +866,11 @@ static state_machine_result_t WIFI_CONNECTING_NEW_STATE_entry_handler(state_mach
     network_start_stop_dhcp_client(nm->wifi_netif, true);
     network_wifi_connect(nm->event_parameters->ssid,nm->event_parameters->password);
     FREE_AND_NULL(nm->event_parameters->ssid);
-    FREE_AND_NULL(nm->event_parameters->password);
+    if (nm->event_parameters->password) {
+        memset(nm->event_parameters->password, 0, strlen(nm->event_parameters->password));
+        free(nm->event_parameters->password);
+        nm->event_parameters->password = NULL;
+    }
     NETWORK_EXECUTE_CB(State_Machine);
     network_handler_entry_print(State_Machine,false);
     return EVENT_HANDLED;
@@ -1111,6 +1130,11 @@ static state_machine_result_t ETH_ACTIVE_CONNECTED_STATE_entry_handler(state_mac
     network_handler_entry_print(State_Machine,true);
     network_status_update_ip_info(UPDATE_ETHERNET_CONNECTED);
     nm->ethernet_connected = true;
+    esp_netif_t* eth = nm->eth_netif ? nm->eth_netif : network_ethernet_get_interface();
+    if (eth) {
+        ESP_LOGI(TAG, "Ethernet connected, setting as default route");
+        esp_netif_set_default_netif(eth);
+    }
     // start a wifi Scan so web ui is populated with available entries
     NETWORK_EXECUTE_CB(State_Machine);
     network_handler_entry_print(State_Machine,false);
@@ -1167,7 +1191,11 @@ static void network_interface_coexistence(state_machine_t* state_machine) {
             ESP_LOGW(TAG, "Option eth_reboot set to reboot when ethernet is connected. Rebooting");
             simple_restart();
         } else {
-            ESP_LOGW(TAG, "Option eth_reboot set to not reboot when ethernet is connected. Using Wifi interface until next reboot");
+            ESP_LOGW(TAG, "Option eth_reboot set to not reboot when ethernet is connected. Setting Ethernet as default route");
+            esp_netif_t* eth = nm->eth_netif ? nm->eth_netif : network_ethernet_get_interface();
+            if (eth) {
+                esp_netif_set_default_netif(eth);
+            }
         }
         FREE_AND_NULL(eth_reboot);
     } else if (get_root(state_machine->State)->Id == NETWORK_ETH_ACTIVE_STATE){

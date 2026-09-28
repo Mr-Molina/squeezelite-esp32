@@ -113,6 +113,7 @@ static void initialise_wifi(void)
 
 static void wifi_join(void *arg)
 {
+	TimerHandle_t timer = (TimerHandle_t)arg;
 	const char *ssid = join_args.ssid->sval[0];
     const char *pass = join_args.password->sval[0];
 	int timeout_ms = join_args.timeout->ival[0];
@@ -137,6 +138,9 @@ static void wifi_join(void *arg)
 		ESP_LOGI(__func__, "Connected");	
     } else {
         ESP_LOGW(__func__, "Connection timed out");
+	}
+	if (timer) {
+		xTimerDelete(timer, portMAX_DELAY);
 	}
 }
 
@@ -181,7 +185,13 @@ static int connect(int argc, char **argv)
     }
 
 	// need to use that trick to make sure we use internal stack
-	xTimerStart(xTimerCreate("wifi_join", 1, pdFALSE, NULL, wifi_join), portMAX_DELAY);        
+	TimerHandle_t timer = xTimerCreate("wifi_join", 1, pdFALSE, NULL, wifi_join);
+	if (timer) {
+		xTimerStart(timer, portMAX_DELAY);
+	} else {
+		ESP_LOGE(__func__, "Failed to create wifi_join timer");
+		return 1;
+	}
 
     return 0;
 }
