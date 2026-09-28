@@ -107,6 +107,12 @@ std::vector<uint8_t> PlainConnection::recvPacket() {
   readBlock(packetBuffer.data(), 4);
   uint32_t packetSize = ntohl(extract<uint32_t>(packetBuffer, 0));
 
+  if (packetSize < 4) {
+    CSPOT_LOG(error, "Invalid packet size: %u (must be at least header size 4)",
+              packetSize);
+    throw std::runtime_error("Invalid packet size");
+  }
+
   packetBuffer.resize(packetSize, 0);
 
   // Read actual data

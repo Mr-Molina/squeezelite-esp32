@@ -219,25 +219,29 @@ char *strip_bt_name(char *opt_str) {
         ESP_LOGW(TAG, "strip_bt_name: opt_str is NULL");
         return NULL;
     }
-    char *result = malloc_init_external(strlen(opt_str) + 1);
     char *str = strdup_psram(opt_str);
     const char *output_marker = " -o";
 
-    if (!result) {
-        ESP_LOGE(TAG, "Error allocating memory for result.");
-        return opt_str;
-    }
     if (!str) {
         ESP_LOGE(TAG, "Error duplicating command line string.");
         return opt_str;
     }
+    char *result = malloc_init_external(strlen(str) + 1);
+    if (!result) {
+        ESP_LOGE(TAG, "Error allocating memory for result.");
+        free(str);
+        return opt_str;
+    }
+    result[0] = '\0';
     bool quoted = false;
     parse_state_t state = SEARCHING_FOR_BT;
     char *start = strstr(str, output_marker);
     if (start) {
         ESP_LOGV(TAG, "Found output option : %s\n", start);
         start += strlen(output_marker);
-        strncpy(result, str, (size_t)(start - str));
+        size_t prefix_len = (size_t)(start - str);
+        strncpy(result, str, prefix_len);
+        result[prefix_len] = '\0';
         char *pch = strtok(start, " ");
         while (pch) {
             ESP_LOGV(TAG, "Current output: %s\n[%s]", result, pch);

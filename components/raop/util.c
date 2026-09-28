@@ -358,6 +358,7 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 	unsigned j;
 	int i, timeout = 100;
 
+	if (body) *body = NULL;
 	rkd[0].key = NULL;
 
 	if ((i = read_line(sock, line, sizeof(line), timeout)) <= 0) {
@@ -367,7 +368,7 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 		return false;
 	}
 
-	if (!sscanf(line, "%s", method)) {
+	if (sscanf(line, "%15s", method) != 1) {
 		LOG_ERROR("missing method", NULL);
 		return false;
 	}
@@ -404,27 +405,52 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 		rkd[i].key = strdup(line);
 		rkd[i].data = strdup(ltrim(dp + 1));
 
-		if (!strcasecmp(rkd[i].key, "Content-Length")) *len = atol(rkd[i].data);
+		if (!strcasecmp(rkd[i].key, "Content-Length")) {
+			*len = atol(rkd[i].data);
+			if (*len < 0 || *len > 65536) {
+				LOG_ERROR("invalid Content-Length: %d", *len);
+				i++;
+				rkd[i].key = NULL;
+				kd_free(rkd);
+				return false;
+			}
+		}
 
 		i++;
 		rkd[i].key = NULL;
+	}
+
+	if (*len < 0 || *len > 65536) {
+		LOG_ERROR("invalid Content-Length: %d", *len);
+		kd_free(rkd);
+		return false;
 	}
 
 	if (*len) {
 		int size = 0;
 
 		*body = malloc(*len + 1);
-		while (*body && size < *len) {
+		if (!*body) {
+			LOG_ERROR("content length allocation error %d", *len);
+			kd_free(rkd);
+			return false;
+		}
+
+		while (size < *len) {
 			int bytes = recv(sock, *body + size, *len - size, 0);
 			if (bytes <= 0) break;
 			size += bytes;
 		}
 
-		(*body)[*len] = '\0';
-
-		if (!*body || size != *len) {
+		if (size != *len) {
 			LOG_ERROR("content length receive error %d %d", *len, size);
+			free(*body);
+			*body = NULL;
+			kd_free(rkd);
+			return false;
 		}
+
+		(*body)[*len] = '\0';
 	}
 
 	return true;

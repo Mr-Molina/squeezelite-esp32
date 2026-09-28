@@ -27,6 +27,8 @@
 #include <errno.h>
 #include <string.h>
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/ringbuf.h"
 #include "esp_app_trace.h"
 #include "telnet.h"
@@ -75,6 +77,7 @@ static int partnerSocket;
 static telnet_t *tnHandle;
 static bool bMirrorToUART;
 static bool bIsAuthenticated;
+static SemaphoreHandle_t telnet_mutex = NULL;
 
 /************************************
  * Forward declarations
@@ -141,6 +144,10 @@ void init_telnet(){
 	ESP_ERROR_CHECK(esp_vfs_register("/dev/pkspstdout", &vfs, NULL));
 	freopen("/dev/pkspstdout", "w", stdout);
 	freopen("/dev/pkspstdout", "w", stderr);
+
+	if (!telnet_mutex) {
+		telnet_mutex = xSemaphoreCreateRecursiveMutex();
+	}
 
 	bIsEnabled=true;
 }
@@ -245,8 +252,10 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 				if (configured_pwd) free(configured_pwd);
 
 				if (auth_ok) {
+					if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
 					telnetUserData->is_authenticated = true;
 					bIsAuthenticated = true;
+					if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
 					telnetUserData->auth_attempts = 0;
 					telnetUserData->auth_buf_len = 0;
 					const char *welcome = "\r\nWelcome to Squeezelite-ESP32 Console\r\n\r\n";
@@ -265,9 +274,11 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 						ESP_LOGW(TAG, "Maximum authentication attempts exceeded, disconnecting client");
 						const char *fail_msg = "\r\nAuthentication failed. Connection closed.\r\n";
 						telnet_send_text(thisTelnet, fail_msg, strlen(fail_msg));
-						close(partnerSocket);
+						if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
 						partnerSocket = -1;
 						telnetUserData->sockfd = -1;
+						bIsAuthenticated = false;
+						if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
 						return;
 					} else {
 						const char *retry_msg = "\r\nPassword: ";
@@ -303,21 +314,30 @@ static size_t process_logs(UBaseType_t bytes, bool make_room){
 	vRingbufferGetInfo(buf_handle, NULL, NULL, NULL, NULL, &pending);
 
 	// nothing to do or we can do 
-	if (partnerSocket <= 0 || !bIsAuthenticated || (make_room && log_buf_size - pending > bytes)) return pending;
+	if (partnerSocket <= 0 || !bIsAuthenticated || !tnHandle || (make_room && log_buf_size - pending > bytes)) return pending;
 
 	// can't send more than what we have
 	if (bytes > pending) bytes = pending;
 
-	while (bytes > 0) {
-		size_t size;
-		char *item = (char *)xRingbufferReceiveUpTo(buf_handle, &size, pdMS_TO_TICKS(50), bytes);
-		
-		if (!item || partnerSocket <= 0 || !bIsAuthenticated) break;
+	if (telnet_mutex && xSemaphoreTakeRecursive(telnet_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+		while (bytes > 0) {
+			if (partnerSocket <= 0 || !bIsAuthenticated || !tnHandle) break;
 
-		bytes -= size;
-		telnet_send_text(tnHandle, item, size);
+			size_t size;
+			char *item = (char *)xRingbufferReceiveUpTo(buf_handle, &size, pdMS_TO_TICKS(50), bytes);
+			
+			if (!item) break;
+			if (partnerSocket <= 0 || !bIsAuthenticated || !tnHandle) {
+				vRingbufferReturnItem(buf_handle, (void *)item);
+				break;
+			}
 
-		vRingbufferReturnItem(buf_handle, (void *)item);
+			bytes -= size;
+			telnet_send_text(tnHandle, item, size);
+
+			vRingbufferReturnItem(buf_handle, (void *)item);
+		}
+		xSemaphoreGiveRecursive(telnet_mutex);
 	}
 
 	return pending - bytes;
@@ -338,33 +358,42 @@ static void handle_telnet_conn() {
 	telnet_userdata_t *pTelnetUserData = (telnet_userdata_t *)heap_caps_malloc(sizeof(telnet_userdata_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!pTelnetUserData) {
 		ESP_LOGE(TAG, "Failed to allocate telnet user data");
-		close(partnerSocket);
+		if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+		int sock = partnerSocket;
 		partnerSocket = 0;
+		if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
+		if (sock > 0) close(sock);
 		return;
 	}
 	memset(pTelnetUserData, 0, sizeof(telnet_userdata_t));
 
-	tnHandle = telnet_init(my_telopts, telnet_event_handler, 0, pTelnetUserData);
+	telnet_t *new_handle = telnet_init(my_telopts, telnet_event_handler, 0, pTelnetUserData);
 
 	pTelnetUserData->rxbuf = (char *) heap_caps_malloc(TELNET_RX_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!pTelnetUserData->rxbuf) {
 		ESP_LOGE(TAG, "Failed to allocate telnet rx buffer");
-		telnet_free(tnHandle);
-		tnHandle = NULL;
+		telnet_free(new_handle);
 		free(pTelnetUserData);
-		close(partnerSocket);
+		if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+		int sock = partnerSocket;
 		partnerSocket = 0;
+		if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
+		if (sock > 0) close(sock);
 		return;
 	}
 
-	pTelnetUserData->tnHandle = tnHandle;
+	pTelnetUserData->tnHandle = new_handle;
 	pTelnetUserData->sockfd = partnerSocket;
 	pTelnetUserData->is_authenticated = false;
 	pTelnetUserData->auth_attempts = 0;
 	pTelnetUserData->auth_timer = (uint32_t)xTaskGetTickCount();
 	pTelnetUserData->auth_buf_len = 0;
 	pTelnetUserData->last_was_cr = false;
+
+	if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+	tnHandle = new_handle;
 	bIsAuthenticated = false;
+	if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
 
 	// Prompt client for password
 	char *pwd = (char *)config_alloc_get_str("telnet_pwd", NULL, NULL);
@@ -406,7 +435,11 @@ static void handle_telnet_conn() {
 		if (FD_ISSET(partnerSocket, &rfds)) { 
 			int len = recv(partnerSocket, pTelnetUserData->rxbuf, TELNET_RX_BUF, 0);
 			if (len <= 0) break;
-			telnet_recv(tnHandle, pTelnetUserData->rxbuf, len);
+			if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+			if (tnHandle) {
+				telnet_recv(tnHandle, pTelnetUserData->rxbuf, (size_t)len);
+			}
+			if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
 		}
 
 		if (partnerSocket < 0) break;
@@ -418,18 +451,26 @@ static void handle_telnet_conn() {
 		}
   	} 
 	
-	telnet_free(tnHandle);
+	if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+	telnet_t *to_free = tnHandle;
 	tnHandle = NULL;
+	int to_close = partnerSocket;
+	partnerSocket = 0;
+	bIsAuthenticated = false;
+	pTelnetUserData->sockfd = -1;
+	if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
+
+	if (to_free) {
+		telnet_free(to_free);
+	}
 
 	free(pTelnetUserData->rxbuf);
 	memset(pTelnetUserData->auth_buf, 0, sizeof(pTelnetUserData->auth_buf));
 	free(pTelnetUserData);
 
-	if (partnerSocket > 0) {
-		close(partnerSocket);
+	if (to_close > 0) {
+		close(to_close);
 	}
-	partnerSocket = 0;
-	bIsAuthenticated = false;
 }
 
 // ******************* stdout/stderr Redirection to ringbuffer

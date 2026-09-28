@@ -442,8 +442,14 @@ let flashState = {
   },
   EventOTAMessageClass: function (data) {
     this.logEvent(this.EventOTAMessageClass.name);
-    var otaData = JSON.parse(data);
-    this.SetStatusPercent(otaData.ota_pct).SetStatusText(otaData.ota_dsc);
+    try {
+      var otaData = JSON.parse(data);
+      if (otaData) {
+        this.SetStatusPercent(otaData.ota_pct).SetStatusText(otaData.ota_dsc);
+      }
+    } catch (e) {
+      console.error('Failed to parse OTA message:', e);
+    }
   },
   logEvent: function (fun) {
     console.log(`${fun}, flash state ${this.toString()}, recovery: ${this.recovery}, ota pct: ${this.statusPercent}, ota desc: ${this.statusText}`);
@@ -755,7 +761,13 @@ function getConfigJson(slimMode) {
 
 function handleHWPreset(allfields, reboot) {
 
-  const selJson = JSON.parse(allfields[0].value);
+  let selJson;
+  try {
+    selJson = JSON.parse(allfields[0].value);
+  } catch (e) {
+    console.error('Failed to parse HW preset JSON:', e);
+    return;
+  }
   var cmd = allfields[0].attributes.cmdname.value;
 
   console.log(`selected model: ${selJson.name}`);
@@ -826,7 +838,9 @@ function loadPresets() {
     { _: new Date().getTime() },
     function (data) {
       $.each(data, function (key, val) {
-        $('#cfg-hw-preset-model_config').append(`<option value='${JSON.stringify(val).replace(/"/g, '\"').replace(/\'/g, '\"')}'>${val.name}</option>`);
+        const safeName = (val.name ?? '').toString().encodeHTML();
+        const safeVal = JSON.stringify(val).encodeHTML();
+        $('#cfg-hw-preset-model_config').append(`<option value='${safeVal}'>${safeName}</option>`);
         if (preset_name !== '' && preset_name == val.name) {
           $('#cfg-hw-preset-model_config').val(preset_name);
         }
@@ -938,26 +952,34 @@ window.saveAutoexec1 = function (apply) {
     data: JSON.stringify(data),
     error: handleExceptionResponse,
     complete: function (response) {
+      let respJson = null;
+      try {
+        if (response.responseText) {
+          respJson = JSON.parse(response.responseText);
+        }
+      } catch (e) {
+        console.error('Failed to parse saveAutoexec1 response:', e);
+      }
       if (
-        response.responseText &&
-        JSON.parse(response.responseText).result === 'OK'
+        respJson &&
+        respJson.result === 'OK'
       ) {
         showCmdMessage('cfg-audio-tmpl', 'MESSAGING_INFO', 'Done.\n', true);
         if (apply) {
           delayReboot(1500, 'cfg-audio-tmpl');
         }
-      } else if (JSON.parse(response.responseText).result) {
+      } else if (respJson && (respJson.result || respJson.Result)) {
         showCmdMessage(
           'cfg-audio-tmpl',
           'MESSAGING_WARNING',
-          JSON.parse(response.responseText).Result + '\n',
+          (respJson.Result || respJson.result) + '\n',
           true
         );
       } else {
         showCmdMessage(
           'cfg-audio-tmpl',
           'MESSAGING_ERROR',
-          response.statusText + '\n'
+          (response.statusText || 'Error') + '\n'
         );
       }
       console.log(response.responseText);
@@ -1653,7 +1675,14 @@ function getMessages() {
           break;
         case 'MESSAGING_CLASS_STATS':
           // for task states, check structure : task_state_t
-          var statsData = JSON.parse(msg.message);
+          var statsData;
+          try {
+            statsData = JSON.parse(msg.message);
+          } catch (e) {
+            console.error('Failed to parse stats message:', e);
+            break;
+          }
+          if (!statsData) break;
           console.debug(
             msgTime.toLocalShort() +
             ' - Number of running tasks: ' +
@@ -1701,21 +1730,32 @@ function getMessages() {
               }
             }
             var curOpt = $("#cfg-audio-bt_source-sink_name")[0].value;
-            $("#cfg-audio-bt_source-sink_name").replaceWith(`<select id="cfg-audio-bt_source-sink_name" ${attrs}><option value="${curOpt}" data-bs-description="${curOpt}">${curOpt}</option></select> `);
+            var safeCurOpt = (curOpt ?? '').toString().encodeHTML();
+            $("#cfg-audio-bt_source-sink_name").replaceWith(`<select id="cfg-audio-bt_source-sink_name" ${attrs}><option value="${safeCurOpt}" data-bs-description="${safeCurOpt}">${safeCurOpt}</option></select> `);
           }
-          JSON.parse(msg.message).forEach(function (btEntry) {
-            //<input type="text" class="form-control bg-success" placeholder="name" hasvalue="true" longopts="sink_name" shortopts="n" checkbox="false" cmdname="cfg-audio-bt_source" id="cfg-audio-bt_source-sink_name" name="cfg-audio-bt_source-sink_name">
-            //<select hasvalue="true" longopts="jack_behavior" shortopts="j" checkbox="false" cmdname="cfg-audio-general" id="cfg-audio-general-jack_behavior" name="cfg-audio-general-jack_behavior" class="form-control "><option>--</option><option>Headphones</option><option>Subwoofer</option></select>            
-            if (!btExists(btEntry.name)) {
-              $("#cfg-audio-bt_source-sink_name").append(`<option>${btEntry.name}</option>`);
-              showMessage({ type: msg.type, message: `BT Audio device found: ${btEntry.name} RSSI: ${btEntry.rssi} ` }, msgTime);
-            }
-            getBTSinkOpt(btEntry.name).attr('data-bs-description', `${btEntry.name} (${btEntry.rssi}dB)`)
-              .attr('rssi', btEntry.rssi)
-              .attr('value', btEntry.name)
-              .text(`${btEntry.name} [${btEntry.rssi}dB]`).trigger('change');
+          var btEntries;
+          try {
+            btEntries = JSON.parse(msg.message);
+          } catch (e) {
+            console.error('Failed to parse BT message:', e);
+            break;
+          }
+          if (Array.isArray(btEntries)) {
+            btEntries.forEach(function (btEntry) {
+              //<input type="text" class="form-control bg-success" placeholder="name" hasvalue="true" longopts="sink_name" shortopts="n" checkbox="false" cmdname="cfg-audio-bt_source" id="cfg-audio-bt_source-sink_name" name="cfg-audio-bt_source-sink_name">
+              //<select hasvalue="true" longopts="jack_behavior" shortopts="j" checkbox="false" cmdname="cfg-audio-general" id="cfg-audio-general-jack_behavior" name="cfg-audio-general-jack_behavior" class="form-control "><option>--</option><option>Headphones</option><option>Subwoofer</option></select>            
+              var safeName = (btEntry.name ?? '').toString().encodeHTML();
+              if (!btExists(btEntry.name)) {
+                $("#cfg-audio-bt_source-sink_name").append(`<option value="${safeName}">${safeName}</option>`);
+                showMessage({ type: msg.type, message: `BT Audio device found: ${safeName} RSSI: ${btEntry.rssi} ` }, msgTime);
+              }
+              getBTSinkOpt(btEntry.name).attr('data-bs-description', `${safeName} (${btEntry.rssi}dB)`)
+                .attr('rssi', btEntry.rssi)
+                .attr('value', btEntry.name)
+                .text(`${btEntry.name} [${btEntry.rssi}dB]`).trigger('change');
 
-          });
+            });
+          }
           $(btSinkNamesOptSel).append($(`${btSinkNamesOptSel} option`).remove().sort(function (a, b) {
             console.log(`${parseInt($(a).attr('rssi'))} < ${parseInt($(b).attr('rssi'))} ? `);
             return parseInt($(a).attr('rssi')) < parseInt($(b).attr('rssi')) ? 1 : -1;
@@ -1813,7 +1853,7 @@ function handleWifiDialog(data) {
       $('#apName').text(SystemConfig.ap_ssid.value);
     }
     if (SystemConfig.ap_pwd) {
-      $('#apPass').text(SystemConfig.ap_pwd.value);
+      $('#apPass').text(SystemConfig.ap_pwd.value ? '••••••••' : '');
     }
     if (!data) {
       return;
@@ -2052,10 +2092,16 @@ window.runCommand = function (button, reboot) {
     contentType: 'application/json; charset=utf-8',
     data: JSON.stringify(data),
     error: function (xhr, _ajaxOptions, thrownError) {
-      var cmd = JSON.parse(this.data).command;
+      var cmd = '';
+      try {
+        cmd = JSON.parse(this.data).command || '';
+      } catch (e) {
+        console.error('Failed to parse command request data:', e);
+      }
+      var cmdPrefix = cmd.includes(' ') ? cmd.substr(0, cmd.indexOf(' ')) : cmd;
       if (xhr.status == 404) {
         showCmdMessage(
-          cmd.substr(0, cmd.indexOf(' ')),
+          cmdPrefix,
           'MESSAGING_ERROR',
           `${recovery ? 'Limited recovery mode active. Unsupported action ' : 'Unexpected error while processing command'}`,
           true
@@ -2064,7 +2110,7 @@ window.runCommand = function (button, reboot) {
       else {
         handleExceptionResponse(xhr, _ajaxOptions, thrownError);
         showCmdMessage(
-          cmd.substr(0, cmd.indexOf(' ') - 1),
+          cmdPrefix,
           'MESSAGING_ERROR',
           `Unexpected error ${(thrownError !== '') ? thrownError : 'with return status = ' + xhr.status}`,
           true
@@ -2074,8 +2120,15 @@ window.runCommand = function (button, reboot) {
     success: function (response) {
       $('.orec').show();
       console.log(response);
+      var respObj = null;
+      try {
+        respObj = (typeof response === 'string') ? JSON.parse(response) : response;
+      } catch (e) {
+        console.error('Failed to parse runCommand response:', e);
+      }
       if (
-        JSON.parse(response).Result === 'Success' &&
+        respObj &&
+        respObj.Result === 'Success' &&
         reboot
       ) {
         delayReboot(2500, button.attributes.cmdname.value);
@@ -2123,6 +2176,7 @@ function getCommands() {
             if (arg.glossary === 'hidden') {
               attributes += ' style="visibility: hidden;"';
             }
+            const isSecret = ctrlname.toLowerCase().includes('pwd') || ctrlname.toLowerCase().includes('password') || ctrlname.toLowerCase().includes('pin');
             if (arg.checkbox) {
               innerhtml += `<div class="form-check"><label class="form-check-label"><input type="checkbox" ${attributes} class="form-check-input ${extraclass}" value="" >${arg.glossary.encodeHTML()}</label>`;
             } else {
@@ -2140,11 +2194,13 @@ function getCommands() {
                 });
                 innerhtml += '</select>';
               } else {
-                innerhtml += `<input type="text" class="form-control ${extraclass}" placeholder="${placeholder}" ${attributes}>`;
+                const inputType = isSecret ? 'password' : 'text';
+                innerhtml += `<input type="${inputType}" class="form-control ${extraclass}" placeholder="${placeholder}" ${attributes}>`;
               }
             }
 
-            innerhtml += `${arg.checkbox ? '</div>' : ''}<small class="form-text text-muted">Previous value: ${arg.checkbox ? (curvalue ? 'Checked' : 'Unchecked') : (curvalue || '')}</small>${arg.checkbox ? '' : '</div>'}`;
+            const prevDisplay = isSecret ? (curvalue ? '••••••••' : '') : (curvalue || '');
+            innerhtml += `${arg.checkbox ? '</div>' : ''}<small class="form-text text-muted">Previous value: ${arg.checkbox ? (curvalue ? 'Checked' : 'Unchecked') : prevDisplay}</small>${arg.checkbox ? '' : '</div>'}`;
           });
         }
         innerhtml += `<div style="margin-top: 16px;">
@@ -2251,13 +2307,14 @@ function getConfig() {
           board_model = val;
         }
 
+        const isPwd = key.toLowerCase().includes('pwd') || key.toLowerCase().includes('password') || key.toLowerCase().includes('pin');
         $('tbody#nvsTable').append(
           '<tr>' +
           '<td>' +
           key +
           '</td>' +
           "<td class='value'>" +
-          "<input type='text' class='form-control nvs' id='" +
+          "<input type='" + (isPwd ? "password" : "text") + "' class='form-control nvs' id='" +
           key +
           "'  nvs_type=" +
           data[key].type +

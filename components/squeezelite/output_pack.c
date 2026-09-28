@@ -221,18 +221,18 @@ void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_
 					s32_t lsample = *(inputptr++);
 					s32_t rsample = *(inputptr++);
 					*(optr++) = 
-						(lsample & 0xff000000) >> 16 | (lsample & 0x00ff0000) | (lsample & 0x0000ff00 << 16);
+						((lsample & 0xff000000) >> 16) | (lsample & 0x00ff0000) | ((lsample & 0x0000ff00) << 16);
 					*(optr++) = 
-						(rsample & 0xff000000) >> 16 | (rsample & 0x00ff0000) | (rsample & 0x0000ff00 << 16);
+						((rsample & 0xff000000) >> 16) | (rsample & 0x00ff0000) | ((rsample & 0x0000ff00) << 16);
 				}
 			} else {
 				while (cnt--) {
 					s32_t lsample = gain(gainL, *(inputptr++));
 					s32_t rsample = gain(gainR, *(inputptr++));
 					*(optr++) = 
-						(lsample & 0xff000000) >> 16 | (lsample & 0x00ff0000) | (lsample & 0x0000ff00 << 16);
+						((lsample & 0xff000000) >> 16) | (lsample & 0x00ff0000) | ((lsample & 0x0000ff00) << 16);
 					*(optr++) = 
-						(rsample & 0xff000000) >> 16 | (rsample & 0x00ff0000) | (rsample & 0x0000ff00 << 16);
+						((rsample & 0xff000000) >> 16) | (rsample & 0x00ff0000) | ((rsample & 0x0000ff00) << 16);
 				}
 			}
 #endif
@@ -251,16 +251,16 @@ void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_
 							s32_t l1 = *(inputptr++); s32_t r1 = *(inputptr++);
 							s32_t l2 = *(inputptr++); s32_t r2 = *(inputptr++);
 #if SL_LITTLE_ENDIAN
-							*(o_ptr++) = (l1 & 0xffffff00) >>  8 | (r1 & 0x0000ff00) << 16;
-							*(o_ptr++) = (r1 & 0xffff0000) >> 16 | (l2 & 0x00ffff00) <<  8;
-							*(o_ptr++) = (l2 & 0xff000000) >> 24 | (r2 & 0xffffff00);
+							*(o_ptr++) = ((l1 & 0xffffff00) >>  8) | ((r1 & 0x0000ff00) << 16);
+							*(o_ptr++) = ((r1 & 0xffff0000) >> 16) | ((l2 & 0x00ffff00) <<  8);
+							*(o_ptr++) = ((l2 & 0xff000000) >> 24) | (r2 & 0xffffff00);
 #else
-							*(o_ptr++) = (l1 & 0x0000ff00) << 16 | (l1 & 0x00ff0000) | (l1 & 0xff000000) >> 16 |
-								(r1 & 0x0000ff00) >> 8; 
-							*(o_ptr++) = (r1 & 0x00ff0000) <<  8 | (r1 & 0xff000000) >> 8 | (l2 & 0x0000ff00) |
-								(l2 & 0x00ff0000) >> 16;
-							*(o_ptr++) = (l2 & 0xff000000) | (r2 & 0x0000ff00) << 8 | (r2 & 0x00ff0000) >> 8 |
-								(r2 & 0xff000000) >> 24;
+							*(o_ptr++) = ((l1 & 0x0000ff00) << 16) | (l1 & 0x00ff0000) | ((l1 & 0xff000000) >> 16) |
+								((r1 & 0x0000ff00) >> 8); 
+							*(o_ptr++) = ((r1 & 0x00ff0000) <<  8) | ((r1 & 0xff000000) >> 8) | (l2 & 0x0000ff00) |
+								((l2 & 0x00ff0000) >> 16);
+							*(o_ptr++) = (l2 & 0xff000000) | ((r2 & 0x0000ff00) << 8) | ((r2 & 0x00ff0000) >> 8) |
+								((r2 & 0xff000000) >> 24);
 #endif
 							optr += 12;
 							cnt  -=  2;
@@ -268,12 +268,12 @@ void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_
 					} else {
 						s32_t lsample = *(inputptr++);
 						s32_t rsample = *(inputptr++);
-						*(optr++) = (lsample & 0x0000ff00) >>  8;
-						*(optr++) = (lsample & 0x00ff0000) >> 16;
-						*(optr++) = (lsample & 0xff000000) >> 24;
-						*(optr++) = (rsample & 0x0000ff00) >>  8;
-						*(optr++) = (rsample & 0x00ff0000) >> 16;
-						*(optr++) = (rsample & 0xff000000) >> 24;
+						*(optr++) = ((lsample & 0x0000ff00) >>  8);
+						*(optr++) = ((lsample & 0x00ff0000) >> 16);
+						*(optr++) = ((lsample & 0xff000000) >> 24);
+						*(optr++) = ((rsample & 0x0000ff00) >>  8);
+						*(optr++) = ((rsample & 0x00ff0000) >> 16);
+						*(optr++) = ((rsample & 0xff000000) >> 24);
 						cnt--;
 					}
 				}
@@ -287,16 +287,16 @@ void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_
 							s32_t l1 = gain(gainL, *(inputptr++)); s32_t r1 = gain(gainR, *(inputptr++));
 							s32_t l2 = gain(gainL, *(inputptr++)); s32_t r2 = gain(gainR, *(inputptr++));
 #if SL_LITTLE_ENDIAN
-							*(o_ptr++) = (l1 & 0xffffff00) >>  8 | (r1 & 0x0000ff00) << 16;
-							*(o_ptr++) = (r1 & 0xffff0000) >> 16 | (l2 & 0x00ffff00) <<  8;
-							*(o_ptr++) = (l2 & 0xff000000) >> 24 | (r2 & 0xffffff00);
+							*(o_ptr++) = ((l1 & 0xffffff00) >>  8) | ((r1 & 0x0000ff00) << 16);
+							*(o_ptr++) = ((r1 & 0xffff0000) >> 16) | ((l2 & 0x00ffff00) <<  8);
+							*(o_ptr++) = ((l2 & 0xff000000) >> 24) | (r2 & 0xffffff00);
 #else
-							*(o_ptr++) = (l1 & 0x0000ff00) << 16 | (l1 & 0x00ff0000) | (l1 & 0xff000000) >> 16 |
-								(r1 & 0x0000ff00) >> 8; 
-							*(o_ptr++) = (r1 & 0x00ff0000) <<  8 | (r1 & 0xff000000) >> 8 | (l2 & 0x0000ff00) |
-								(l2 & 0x00ff0000) >> 16;
-							*(o_ptr++) = (l2 & 0xff000000) | (r2 & 0x0000ff00) << 8 | (r2 & 0x00ff0000) >> 8 |
-								(r2 & 0xff000000) >> 24;
+							*(o_ptr++) = ((l1 & 0x0000ff00) << 16) | (l1 & 0x00ff0000) | ((l1 & 0xff000000) >> 16) |
+								((r1 & 0x0000ff00) >> 8); 
+							*(o_ptr++) = ((r1 & 0x00ff0000) <<  8) | ((r1 & 0xff000000) >> 8) | (l2 & 0x0000ff00) |
+								((l2 & 0x00ff0000) >> 16);
+							*(o_ptr++) = (l2 & 0xff000000) | ((r2 & 0x0000ff00) << 8) | ((r2 & 0x00ff0000) >> 8) |
+								((r2 & 0xff000000) >> 24);
 #endif
 							optr += 12;
 							cnt  -=  2;
@@ -304,12 +304,12 @@ void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_
 					} else {
 						s32_t lsample = gain(gainL, *(inputptr++));
 						s32_t rsample = gain(gainR, *(inputptr++));
-						*(optr++) = (lsample & 0x0000ff00) >>  8;
-						*(optr++) = (lsample & 0x00ff0000) >> 16;
-						*(optr++) = (lsample & 0xff000000) >> 24;
-						*(optr++) = (rsample & 0x0000ff00) >>  8;
-						*(optr++) = (rsample & 0x00ff0000) >> 16;
-						*(optr++) = (rsample & 0xff000000) >> 24;
+						*(optr++) = ((lsample & 0x0000ff00) >>  8);
+						*(optr++) = ((lsample & 0x00ff0000) >> 16);
+						*(optr++) = ((lsample & 0xff000000) >> 24);
+						*(optr++) = ((rsample & 0x0000ff00) >>  8);
+						*(optr++) = ((rsample & 0x00ff0000) >> 16);
+						*(optr++) = ((rsample & 0xff000000) >> 24);
 						cnt--;
 					}
 				}

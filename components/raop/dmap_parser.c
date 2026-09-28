@@ -388,7 +388,7 @@ static int64_t dmap_read_i64(const char *buf) {
 	return (int64_t)dmap_read_u64(buf);
 }
 
-static int dmap_parse_internal(const dmap_settings *settings, const char *buf, size_t len, const dmap_field *parent) {
+static int dmap_parse_internal(const dmap_settings *settings, const char *buf, size_t len, const dmap_field *parent, int depth) {
 	const dmap_field *field;
 	DMAP_TYPE field_type;
 	size_t field_len;
@@ -400,6 +400,9 @@ static int dmap_parse_internal(const dmap_settings *settings, const char *buf, s
 	if (!settings || !buf)
 		return -1;
 
+	if (depth > 16)
+		return -1;
+
 	while (end - p >= 8) {
 		memcpy(code, p, 4);
 		field = dmap_field_from_code(code);
@@ -408,7 +411,7 @@ static int dmap_parse_internal(const dmap_settings *settings, const char *buf, s
 		field_len = dmap_read_u32(p);
 		p += 4;
 
-		if (p + field_len > end)
+		if (field_len > (size_t)(end - p))
 			return -1;
 
 		if (field) {
@@ -526,7 +529,7 @@ static int dmap_parse_internal(const dmap_settings *settings, const char *buf, s
 			case DMAP_DICT:
 				if (settings->on_dict_start)
 					settings->on_dict_start(settings->ctx, code, field_name);
-				if (dmap_parse_internal(settings, p, field_len, field) != 0)
+				if (dmap_parse_internal(settings, p, field_len, field, depth + 1) != 0)
 					return -1;
 				if (settings->on_dict_end)
 					settings->on_dict_end(settings->ctx, code, field_name);
@@ -548,5 +551,5 @@ static int dmap_parse_internal(const dmap_settings *settings, const char *buf, s
 }
 
 int dmap_parse(const dmap_settings *settings, const char *buf, size_t len) {
-	return dmap_parse_internal(settings, buf, len, NULL);
+	return dmap_parse_internal(settings, buf, len, NULL, 0);
 }

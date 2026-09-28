@@ -50,13 +50,20 @@ EXT_RAM_ATTR static struct {
 
 EXT_RAM_ATTR static struct {
     struct arg_str *key;
+    struct arg_lit *confirm;
     struct arg_end *end;
 } erase_args;
 
 EXT_RAM_ATTR static struct {
     struct arg_str *namespace;
+    struct arg_lit *confirm;
     struct arg_end *end;
 } erase_all_args;
+
+EXT_RAM_ATTR static struct {
+    struct arg_lit *confirm;
+    struct arg_end *end;
+} erase_networkmanager_args;
 
 EXT_RAM_ATTR static struct {
     struct arg_str *partition;
@@ -207,6 +214,14 @@ static esp_err_t set_value_in_nvs(const char *key, const char *str_type, const c
     return err;
 }
 
+static bool is_sensitive_key(const char *key) {
+    if (!key) return false;
+    return (strcasestr(key, "password") != NULL ||
+            strcasestr(key, "token") != NULL ||
+            strcasestr(key, "telnet_pwd") != NULL ||
+            strcasestr(key, "ap_pwd") != NULL);
+}
+
 static esp_err_t get_value_from_nvs(const char *key, const char *str_type)
 {
     nvs_handle nvs;
@@ -227,51 +242,87 @@ static esp_err_t get_value_from_nvs(const char *key, const char *str_type)
         int8_t value;
         err = nvs_get_i8(nvs, key, &value);
         if (err == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %d \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %d \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_U8) {
         uint8_t value;
         err = nvs_get_u8(nvs, key, &value);
         if (err == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %u \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %u \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_I16) {
         int16_t value;
         err = nvs_get_i16(nvs, key, &value);
         if (err == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %d \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %d \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_U16) {
         uint16_t value;
         if ((err = nvs_get_u16(nvs, key, &value)) == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %u", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %u", key, value);
+            }
         }
     } else if (type == NVS_TYPE_I32) {
         int32_t value;
         if ((err = nvs_get_i32(nvs, key, &value)) == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %d \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %d \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_U32) {
         uint32_t value;
         if ((err = nvs_get_u32(nvs, key, &value)) == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %u \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %u \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_I64) {
         int64_t value;
         if ((err = nvs_get_i64(nvs, key, &value)) == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %lld \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %lld \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_U64) {
         uint64_t value;
         if ( (err = nvs_get_u64(nvs, key, &value)) == ESP_OK) {
-        	log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %llu \n", key, value);
+            if (is_sensitive_key(key)) {
+                log_send_messaging(MESSAGING_INFO, "Value associated with key '%s' is [REDACTED] \n", key);
+            } else {
+                log_send_messaging(MESSAGING_INFO,"Value associated with key '%s' is %llu \n", key, value);
+            }
         }
     } else if (type == NVS_TYPE_STR) {
         size_t len=0;
         if ( (err = nvs_get_str(nvs, key, NULL, &len)) == ESP_OK) {
             char *str = (char *)malloc_init_external(len);
             if ( (err = nvs_get_str(nvs, key, str, &len)) == ESP_OK) {
-            	log_send_messaging(MESSAGING_INFO,"String associated with key '%s' is %s \n", key, str);
+                if (is_sensitive_key(key)) {
+                    log_send_messaging(MESSAGING_INFO, "String associated with key '%s' is [REDACTED] \n", key);
+                } else {
+                    log_send_messaging(MESSAGING_INFO,"String associated with key '%s' is %s \n", key, str);
+                }
             }
             free(str);
         }
@@ -280,8 +331,12 @@ static esp_err_t get_value_from_nvs(const char *key, const char *str_type)
         if ( (err = nvs_get_blob(nvs, key, NULL, &len)) == ESP_OK) {
             char *blob = (char *)malloc_init_external(len);
             if ( (err = nvs_get_blob(nvs, key, blob, &len)) == ESP_OK) {
-            	log_send_messaging(MESSAGING_INFO,"Blob associated with key '%s' is %d bytes long: \n", key, len);
-                print_blob(blob, len);
+                if (is_sensitive_key(key)) {
+                    log_send_messaging(MESSAGING_INFO, "Blob associated with key '%s' is [REDACTED] \n", key);
+                } else {
+                    log_send_messaging(MESSAGING_INFO,"Blob associated with key '%s' is %d bytes long: \n", key, len);
+                    print_blob(blob, len);
+                }
             }
             free(blob);
         }
@@ -293,6 +348,9 @@ static esp_err_t get_value_from_nvs(const char *key, const char *str_type)
 
 static esp_err_t erase(const char *key)
 {
+    if (!key || strlen(key) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     nvs_handle nvs;
 
     esp_err_t err = nvs_open_from_partition(settings_partition, current_namespace, NVS_READWRITE, &nvs);
@@ -312,19 +370,22 @@ static esp_err_t erase(const char *key)
 
 static esp_err_t erase_all(const char *name)
 {
+    if (!name || strlen(name) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     nvs_handle nvs;
 
-    esp_err_t err = nvs_open_from_partition(settings_partition, current_namespace, NVS_READWRITE, &nvs);
+    esp_err_t err = nvs_open_from_partition(settings_partition, name, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
         err = nvs_erase_all(nvs);
         if (err == ESP_OK) {
             err = nvs_commit(nvs);
         }
+        nvs_close(nvs);
     }
 
     log_send_messaging(MESSAGING_INFO, "Namespace '%s' was %s erased", name, (err == ESP_OK) ? "" : "not");
-    nvs_close(nvs);
-    return ESP_OK;
+    return err;
 }
 
 static int set_value(int argc, char **argv)
@@ -378,6 +439,15 @@ static int erase_value(int argc, char **argv)
     }
 
     const char *key = erase_args.key->sval[0];
+    if (!key || strlen(key) == 0) {
+        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid key specified\n");
+        return 1;
+    }
+
+    if (is_sensitive_key(key) && !erase_args.confirm->count) {
+        cmd_send_messaging(argv[0], MESSAGING_WARNING, "Erasing sensitive key '%s' requires confirmation. Use -c or --confirm\n", key);
+        return 1;
+    }
 
     esp_err_t err = erase(key);
 
@@ -397,6 +467,15 @@ static int erase_namespace(int argc, char **argv)
     }
 
     const char *name = erase_all_args.namespace->sval[0];
+    if (!name || strlen(name) == 0) {
+        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid namespace specified\n");
+        return 1;
+    }
+
+    if (!erase_all_args.confirm->count) {
+        cmd_send_messaging(argv[0], MESSAGING_WARNING, "Mass wipe of namespace '%s' requires confirmation. Use -c or --confirm\n", name);
+        return 1;
+    }
 
     esp_err_t err = erase_all(name);
     if (err != ESP_OK) {
@@ -409,6 +488,14 @@ static int erase_namespace(int argc, char **argv)
 
 static int erase_network_manager(int argc, char **argv)
 {
+    int nerrors = arg_parse_msg(argc, argv, (struct arg_hdr **)&erase_networkmanager_args);
+    if (nerrors != 0) {
+        return 1;
+    }
+    if (!erase_networkmanager_args.confirm->count) {
+        cmd_send_messaging(argv[0], MESSAGING_WARNING, "Mass wipe of system configuration requires confirmation. Use -c or --confirm\n");
+        return 1;
+    }
     nvs_handle nvs;
 	esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs);
 	if (err == ESP_OK) {
@@ -513,10 +600,15 @@ void register_nvs()
     get_args.end = arg_end(2);
 
     erase_args.key = arg_str1(NULL, NULL, "<key>", "key of the value to be erased");
+    erase_args.confirm = arg_lit0("c", "confirm", "Confirm erasing key");
     erase_args.end = arg_end(2);
 
     erase_all_args.namespace = arg_str1(NULL, NULL, "<namespace>", "namespace to be erased");
+    erase_all_args.confirm = arg_lit0("c", "confirm", "Confirm mass wipe of namespace");
     erase_all_args.end = arg_end(2);
+
+    erase_networkmanager_args.confirm = arg_lit0("c", "confirm", "Confirm mass wipe of system configuration");
+    erase_networkmanager_args.end = arg_end(1);
 
     wifi_erase_args.ap_list = arg_lit0("a","ap_list","Erases Known access points list");
     wifi_erase_args.legacy = arg_lit0("l","legacy","Erases legacy access point storage");
@@ -575,7 +667,7 @@ void register_nvs()
         .help = "Erases system's configuration",
         .hint = NULL,
         .func = &erase_network_manager,
-        .argtable = NULL
+        .argtable = &erase_networkmanager_args
     };
 
 

@@ -105,6 +105,10 @@ static int read_mp4_header(void) {
 		u32_t consume;
 
 		len = unpackN((u32_t *)streambuf->readp);
+		if (len < 8) {
+			LOG_ERROR("invalid atom length: %u", len);
+			return -1;
+		}
 		memcpy(type, streambuf->readp + 4, 4);
 		type[4] = '\0';
 
@@ -117,11 +121,25 @@ static int read_mp4_header(void) {
 		}
 
 		// extract audio config from within alac
-		if (!strcmp(type, "alac") && bytes > len) {
+		if (!strcmp(type, "alac") && bytes >= len) {
+			if (len < 36) {
+				LOG_ERROR("alac atom too short: %u", len);
+				return -1;
+			}
 			u8_t *ptr = streambuf->readp + 36;
-			unsigned int block_size;
-			l->play = l->trak;						
+			unsigned int block_size = 0;
+			l->play = l->trak;
+			if (l->decoder) alac_delete_decoder(l->decoder);
 			l->decoder = alac_create_decoder(len - 36, ptr, &l->sample_size, &l->sample_rate, &l->channels, &block_size);
+			if (!l->decoder) {
+				LOG_ERROR("alac_create_decoder failed");
+				return -1;
+			}
+			if (block_size == 0 || block_size > (UINT32_MAX - 256)) {
+				LOG_ERROR("invalid block_size in alac atom: %u", block_size);
+				return -1;
+			}
+			if (l->writebuf) free(l->writebuf);
 			l->writebuf = malloc(block_size + 256);
 			LOG_INFO("allocated write buffer of %u bytes", block_size);
 			if (!l->writebuf) {
@@ -131,13 +149,34 @@ static int read_mp4_header(void) {
 		}
 
 		// extract the total number of samples from stts
-		if (!strcmp(type, "stsz") && bytes > len) {
+		if (!strcmp(type, "stsz") && bytes >= len) {
+			if (len < 16) {
+				LOG_ERROR("stsz atom too short: %u", len);
+				return -1;
+			}
 			u32_t i;
 			u8_t *ptr = streambuf->readp + 12;
 			l->default_block_size = unpackN((u32_t *) ptr); ptr += 4;
 			if (!l->default_block_size) {
+				if (len < 20) {
+					LOG_ERROR("stsz atom missing entries count: %u", len);
+					return -1;
+				}
 				u32_t entries = unpackN((u32_t *)ptr); ptr += 4;
-				l->block_size = malloc((entries + 1)* 4);
+				if (entries > (len - 20) / 4) {
+					LOG_ERROR("stsz entries %u exceeds atom length %u", entries, len);
+					return -1;
+				}
+				if (entries > (UINT32_MAX / sizeof(u32_t)) - 1) {
+					LOG_ERROR("stsz entries integer overflow: %u", entries);
+					return -1;
+				}
+				if (l->block_size) free(l->block_size);
+				l->block_size = malloc((entries + 1) * sizeof(u32_t));
+				if (!l->block_size) {
+					LOG_WARN("malloc fail");
+					return -1;
+				}
 				for (i = 0; i < entries; i++) {
 					l->block_size[i] = unpackN((u32_t *)ptr); ptr += 4;
 				}
@@ -149,22 +188,40 @@ static int read_mp4_header(void) {
 		}
 
 		// extract the total number of samples from stts
-		if (!strcmp(type, "stts") && bytes > len) {
+		if (!strcmp(type, "stts") && bytes >= len) {
+			if (len < 16) {
+				LOG_ERROR("stts atom too short: %u", len);
+				return -1;
+			}
 			u32_t i;
 			u8_t *ptr = streambuf->readp + 12;
 			u32_t entries = unpackN((u32_t *)ptr);
 			ptr += 4;
+			if (entries > (len - 16) / 8) {
+				LOG_ERROR("stts entries %u exceeds atom length %u", entries, len);
+				return -1;
+			}
 			for (i = 0; i < entries; ++i) {
 				u32_t count = unpackN((u32_t *)ptr);
 				u32_t size = unpackN((u32_t *)(ptr + 4));
-				l->sttssamples += count * size;
+				l->sttssamples += (u64_t)count * size;
 				ptr += 8;
 			}
 			LOG_DEBUG("total number of samples contained in stts: " FMT_u64, l->sttssamples);
 		}
 
 		// stash sample to chunk info, assume it comes before stco
-		if (!strcmp(type, "stsc") && bytes > len && !l->chunkinfo) {
+		if (!strcmp(type, "stsc") && bytes >= len && !l->chunkinfo) {
+			if (len < 16) {
+				LOG_ERROR("stsc atom too short: %u", len);
+				return -1;
+			}
+			u32_t stsc_entries = unpackN((u32_t *)(streambuf->readp + 12));
+			if (stsc_entries > (len - 16) / 12) {
+				LOG_ERROR("stsc entries %u exceeds atom length %u", stsc_entries, len);
+				return -1;
+			}
+			if (l->stsc) free(l->stsc);
 			l->stsc = malloc(len - 12);
 			if (l->stsc == NULL) {
 				LOG_WARN("malloc fail");
@@ -174,12 +231,25 @@ static int read_mp4_header(void) {
 		}
 
 		// build offsets table from stco and stored stsc
-		if (!strcmp(type, "stco") && bytes > len && l->play == l->trak) {
+		if (!strcmp(type, "stco") && bytes >= len && l->play == l->trak) {
+			if (len < 16) {
+				LOG_ERROR("stco atom too short: %u", len);
+				return -1;
+			}
 			u32_t i;
 			// extract chunk offsets
 			u8_t *ptr = streambuf->readp + 12;
 			u32_t entries = unpackN((u32_t *)ptr);
 			ptr += 4;
+			if (entries > (len - 16) / 4) {
+				LOG_ERROR("stco entries %u exceeds atom length %u", entries, len);
+				return -1;
+			}
+			if (entries > (UINT32_MAX / sizeof(struct chunk_table)) - 1) {
+				LOG_ERROR("stco entries integer overflow: %u", entries);
+				return -1;
+			}
+			if (l->chunkinfo) free(l->chunkinfo);
 			l->chunkinfo = malloc(sizeof(struct chunk_table) * (entries + 1));
 			if (l->chunkinfo == NULL) {
 				LOG_WARN("malloc fail");
@@ -201,8 +271,12 @@ static int read_mp4_header(void) {
 				while (stsc_entries--) {
 					u32_t first = unpackN((u32_t *)ptr);
 					u32_t samples = unpackN((u32_t *)(ptr + 4));
+					if (first < 1 || first > entries + 1 || (last != 0 && first <= last)) {
+						LOG_WARN("invalid stsc entry: first=%u, last=%u, entries=%u", first, last, entries);
+						break;
+					}
 					if (last) {
-						for (i = last - 1; i < first - 1; ++i) {
+						for (i = last - 1; i < first - 1 && i < entries; ++i) {
 							l->chunkinfo[i].sample = sample;
 							sample += last_samples;
 						}
@@ -249,26 +323,32 @@ static int read_mp4_header(void) {
 		}
 
 		// parse key-value atoms within ilst ---- entries to get encoder padding within iTunSMPB entry for gapless
-		if (!strcmp(type, "----") && bytes > len) {
-			u8_t *ptr = streambuf->readp + 8;
-			u32_t remain = len - 8, size;
-			if (!memcmp(ptr + 4, "mean", 4) && (size = unpackN((u32_t *)ptr)) < remain) {
-				ptr += size; remain -= size;
-			}
-			if (!memcmp(ptr + 4, "name", 4) && (size = unpackN((u32_t *)ptr)) < remain && !memcmp(ptr + 12, "iTunSMPB", 8)) {
-				ptr += size; remain -= size;
-			}
-			if (!memcmp(ptr + 4, "data", 4) && remain > 16 + 48) {
-				// data is stored as hex strings: 0 start end samples
-				u32_t b, c; u64_t d;
-				if (sscanf((const char *)(ptr + 16), "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
-					LOG_DEBUG("iTunSMPB start: %u end: %u samples: " FMT_u64, b, c, d);
-					if (l->sttssamples && l->sttssamples < b + c + d) {
-						LOG_DEBUG("reducing samples as stts count is less");
-						d = l->sttssamples - (b + c);
+		if (!strcmp(type, "----") && bytes >= len) {
+			if (len >= 8) {
+				u8_t *ptr = streambuf->readp + 8;
+				u32_t remain = len - 8, size;
+				if (remain >= 8 && !memcmp(ptr + 4, "mean", 4) && (size = unpackN((u32_t *)ptr)) >= 8 && size <= remain) {
+					ptr += size; remain -= size;
+				}
+				if (remain >= 20 && !memcmp(ptr + 4, "name", 4) && (size = unpackN((u32_t *)ptr)) >= 20 && size <= remain && !memcmp(ptr + 12, "iTunSMPB", 8)) {
+					ptr += size; remain -= size;
+				}
+				if (remain > 16 + 48 && !memcmp(ptr + 4, "data", 4)) {
+					// data is stored as hex strings: 0 start end samples
+					u32_t b, c; u64_t d;
+					char smpb[64];
+					size_t copy_len = min((size_t)(remain - 16), sizeof(smpb) - 1);
+					memcpy(smpb, ptr + 16, copy_len);
+					smpb[copy_len] = '\0';
+					if (sscanf(smpb, "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
+						LOG_DEBUG("iTunSMPB start: %u end: %u samples: " FMT_u64, b, c, d);
+						if (l->sttssamples && l->sttssamples < b + c + d) {
+							LOG_DEBUG("reducing samples as stts count is less");
+							d = l->sttssamples - (b + c);
+						}
+						l->skip = b;
+						l->samples = d;
 					}
-					l->skip = b;
-					l->samples = d;
 				}
 			}
 		}
@@ -285,6 +365,8 @@ static int read_mp4_header(void) {
 		if (!strcmp(type, "stsd")) consume = 16;
 		if (!strcmp(type, "mp4a")) consume = 36;
 		if (!strcmp(type, "meta")) consume = 12;
+
+		if (consume > len) consume = len;
 
 		// consume rest of box if it has been parsed (all in the buffer) or is not one we want to parse
 		if (bytes >= consume) {

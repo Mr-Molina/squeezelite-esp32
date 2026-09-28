@@ -23,12 +23,12 @@ class BuildEventsHook {
             let buildRootPath = path.join(process.cwd(), '..', '..', '..');
             let wifiManagerPath = glob.sync(path.join(buildRootPath, 'components/**/wifi-manager*'))[0];
             let buildCRootPath = glob.sync(buildRootPath)[0];
-            fs.appendFileSync('./dist/index.html.gz',
+            fs.writeFileSync('./dist/index.html.gz',
               zlib.gzipSync(fs.readFileSync('./dist/index.html'),
                 {
-                  chunckSize: 65536,
+                  chunkSize: 65536,
                   level: zlib.constants.Z_BEST_COMPRESSION
-                }));
+                }), { flag: 'w' });
 
             let getDirectories = function getDirectories (src, callback) {
               let searchPath = path.posix.join(src, '/**/*(*.gz|favicon-32x32.png)');

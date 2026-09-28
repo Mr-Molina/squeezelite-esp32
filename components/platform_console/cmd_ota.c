@@ -31,6 +31,7 @@ static const char * TAG = "ota";
 extern esp_err_t start_ota(const char * bin_url);
 static struct {
     struct arg_str *url;
+    struct arg_lit *confirm;
     struct arg_end *end;
 } ota_args;
 /* 'heap' command prints minumum heap size */
@@ -42,10 +43,28 @@ static int perform_ota_update(int argc, char **argv)
     }
 
     const char *url = ota_args.url->sval[0];
+    if (!url || strlen(url) < 10 || strlen(url) > 256) {
+        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid URL length (must be between 10 and 256 characters)\n");
+        return 1;
+    }
 
-    esp_err_t err=ESP_OK;
+    if (strncasecmp(url, "http://", 7) != 0 && strncasecmp(url, "https://", 8) != 0) {
+        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid URL protocol (must begin with http:// or https://)\n");
+        return 1;
+    }
+
+    if (!strstr(url, ".bin")) {
+        cmd_send_messaging(argv[0], MESSAGING_ERROR, "Invalid firmware file (URL must point to a .bin file)\n");
+        return 1;
+    }
+
+    if (!ota_args.confirm->count) {
+        cmd_send_messaging(argv[0], MESSAGING_WARNING, "Firmware update requires confirmation. Use -c or --confirm\n");
+        return 1;
+    }
+
     ESP_LOGI(TAG, "Starting ota: %s", url);
-    start_ota(url);
+    esp_err_t err = start_ota(url);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "%s", esp_err_to_name(err));
@@ -58,6 +77,7 @@ static int perform_ota_update(int argc, char **argv)
  void register_ota_cmd()
 {
 	 ota_args.url= arg_str1(NULL, NULL, "<url>", "url of the binary app file");
+	 ota_args.confirm = arg_lit0("c", "confirm", "Confirm firmware flashing and update");
 	 ota_args.end = arg_end(2);
 
     const esp_console_cmd_t cmd = {

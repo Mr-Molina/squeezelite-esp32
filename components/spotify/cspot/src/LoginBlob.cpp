@@ -30,6 +30,12 @@ LoginBlob::LoginBlob(std::string name) {
 
 std::vector<uint8_t> LoginBlob::decodeBlob(
     const std::vector<uint8_t>& blob, const std::vector<uint8_t>& sharedKey) {
+  if (blob.size() < 36) {
+    CSPOT_LOG(error, "Blob size too small: %zu (minimum 36 bytes required)",
+              blob.size());
+    return {};
+  }
+
   // 0:16 - iv; 17:-20 - blob; -20:0 - checksum
   auto iv = std::vector<uint8_t>(blob.begin(), blob.begin() + 16);
   auto encrypted = std::vector<uint8_t>(blob.begin() + 16, blob.end() - 20);
@@ -57,6 +63,7 @@ std::vector<uint8_t> LoginBlob::decodeBlob(
   // Check checksum
   if (mac != checksum) {
     CSPOT_LOG(error, "Mac doesn't match!");
+    return {};
   }
 
   encryptionKey =
@@ -114,7 +121,15 @@ void LoginBlob::loadZeroconf(const std::vector<uint8_t>& blob,
                              const std::string& username) {
 
   auto partDecoded = this->decodeBlob(blob, sharedKey);
+  if (partDecoded.empty()) {
+    CSPOT_LOG(error, "Failed to decode blob");
+    return;
+  }
   auto loginData = this->decodeBlobSecondary(partDecoded, username, deviceId);
+  if (loginData.empty()) {
+    CSPOT_LOG(error, "Failed to decode secondary blob");
+    return;
+  }
 
   // Parse blob
   blobSkipPosition = 1;

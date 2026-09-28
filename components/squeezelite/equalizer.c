@@ -18,6 +18,19 @@
 
 static log_level loglevel = lINFO;
 
+static mutex_type eq_mutex;
+static bool eq_mutex_init = false;
+
+#define LOCK_EQ   mutex_lock(eq_mutex)
+#define UNLOCK_EQ mutex_unlock(eq_mutex)
+
+static inline void check_init_mutex(void) {
+	if (!eq_mutex_init) {
+		mutex_create(eq_mutex);
+		eq_mutex_init = true;
+	}
+}
+
 static EXT_RAM_ATTR struct {
 	void *handle;
     float loudness, volume;
@@ -85,6 +98,8 @@ static void calculate_loudness(void) {
  * initialize equalizer
  */
 void equalizer_init(void) {
+	check_init_mutex();
+	LOCK_EQ;
     // handle equalizer
 	char *config = config_alloc_get(NVS_TYPE_STR, "equalizer");
 	char *p = strtok(config, ", !");
@@ -101,12 +116,13 @@ void equalizer_init(void) {
     equalizer.loudness = atof(config) / 10.0;
 
 	free(config);
+	UNLOCK_EQ;
 }
 
 /****************************************************************************************
- * close equalizer
+ * close equalizer (internal, lock must be held)
  */
-void equalizer_close(void) {
+static void _equalizer_close(void) {
 	if (equalizer.handle) {
 		esp_equalizer_uninit(equalizer.handle);
 		equalizer.handle = NULL;
@@ -114,13 +130,26 @@ void equalizer_close(void) {
 }
 
 /****************************************************************************************
+ * close equalizer
+ */
+void equalizer_close(void) {
+	check_init_mutex();
+	LOCK_EQ;
+	_equalizer_close();
+	UNLOCK_EQ;
+}
+
+/****************************************************************************************
  * change sample rate
  */
 void equalizer_set_samplerate(uint32_t samplerate) {
 #if BYTES_PER_FRAME == 4
-    if (equalizer.samplerate != samplerate) equalizer_close();
+	check_init_mutex();
+	LOCK_EQ;
+    if (equalizer.samplerate != samplerate) _equalizer_close();
     equalizer.samplerate = samplerate;
     equalizer.update = true;
+	UNLOCK_EQ;
 
     LOG_INFO("equalizer sample rate %u", samplerate);
 #else
@@ -138,12 +167,15 @@ void equalizer_set_volume(unsigned left, unsigned right) {
 	if (volume) volume = log2(volume);
 	volume = volume / 16.0 * 100.0;
     
+	check_init_mutex();
+	LOCK_EQ;
     // LMS has the bad habit to send multiple volume commands
     if (volume != equalizer.volume && equalizer.loudness) {
         equalizer.volume = volume;
         calculate_loudness();
         equalizer.update = true;
     }
+	UNLOCK_EQ;
 #endif
 }
 
@@ -155,12 +187,15 @@ void equalizer_set_gain(int8_t *gain) {
     char config[EQ_BANDS * 4 + 1] = { };
 	int n = 0;
     
+	check_init_mutex();
+	LOCK_EQ;
     if (memcmp(equalizer.gain, gain, EQ_BANDS) != 0) equalizer.update = true;
     
     for (int i = 0; i < EQ_BANDS; i++) {
 		equalizer.gain[i] = gain[i];
 		n += sprintf(config + n, "%d,", gain[i]);
 	}
+	UNLOCK_EQ;
 
 	config[n-1] = '\0';
 	config_set_value(NVS_TYPE_STR, "equalizer", config);
@@ -180,12 +215,15 @@ void equalizer_set_loudness(uint8_t loudness) {
     itoa(loudness, p, 10);
     config_set_value(NVS_TYPE_STR, "loudness", p);
     
+	check_init_mutex();
+	LOCK_EQ;
     // update loudness gains as a factor of loudness and volume
     if (equalizer.loudness != loudness / 10.0) {
         equalizer.loudness = loudness / 10.0;
         calculate_loudness();
         equalizer.update = true;
     }
+	UNLOCK_EQ;
 
     LOG_INFO("loudness %u", (unsigned) loudness);
 #else
@@ -198,17 +236,20 @@ void equalizer_set_loudness(uint8_t loudness) {
  */
 void equalizer_process(uint8_t *buf, uint32_t bytes) {
 #if BYTES_PER_FRAME == 4    
-	// don't want to process with output locked, so take the small risk to miss one parametric update
+	check_init_mutex();
+	LOCK_EQ;
 	if (equalizer.update) {
         equalizer.update = false;
 
         if (equalizer.samplerate != 11025 && equalizer.samplerate != 22050 && equalizer.samplerate != 44100 && equalizer.samplerate != 48000) {
             LOG_WARN("equalizer only supports 11025, 22050, 44100 and 48000 sample rates, not %u", equalizer.samplerate);
+			UNLOCK_EQ;
             return;
         }
 
         if (!equalizer.handle && ((equalizer.handle = esp_equalizer_init(2, equalizer.samplerate, EQ_BANDS, 0)) == NULL)) {
             LOG_WARN("can't init equalizer");
+			UNLOCK_EQ;
             return;
         }
 
@@ -221,12 +262,13 @@ void equalizer_process(uint8_t *buf, uint32_t bytes) {
 		}
 
 		// at the end do not activate equalizer if all gain are 0
-		if (!active) equalizer_close();
+		if (!active) _equalizer_close();
 		LOG_INFO("equalizer %s", active ? "actived" : "deactivated");
 	}
 
 	if (equalizer.handle) {
 		esp_equalizer_process(equalizer.handle, buf, bytes, equalizer.samplerate, 2);
 	}
+	UNLOCK_EQ;
 #endif    
 }

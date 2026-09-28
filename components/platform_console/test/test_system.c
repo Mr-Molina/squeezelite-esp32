@@ -51,20 +51,35 @@ void close_flush_all(void * argtable, int count,bool print){
     }
     fclose(f);
     free(buf);
+    buf = NULL;
     arg_freetable(argtable,count);
-    free(argv);   
+    free(argv);
+    argv = NULL;
+    if (s_tmp_line_buf) {
+        free(s_tmp_line_buf);
+        s_tmp_line_buf = NULL;
+    }
 }
 
 /****************************************************************************************
  * 
  */
 int alloc_split_command_line(char * cmdline){
-    argv = (char **) calloc(22, sizeof(char *));
-    if(!s_tmp_line_buf){
-        s_tmp_line_buf= calloc(strlen(cmdline), 1);
+    if (argv) {
+        free(argv);
+        argv = NULL;
     }
-    strlcpy(s_tmp_line_buf, cmdline, 22);
-    argc = esp_console_split_argv(s_tmp_line_buf, argv,22);
+    argv = (char **) calloc(22, sizeof(char *));
+    if (s_tmp_line_buf) {
+        free(s_tmp_line_buf);
+        s_tmp_line_buf = NULL;
+    }
+    size_t cmd_len = strlen(cmdline);
+    s_tmp_line_buf = (char *) calloc(cmd_len + 1, sizeof(char));
+    if (s_tmp_line_buf && argv) {
+        strlcpy(s_tmp_line_buf, cmdline, cmd_len + 1);
+        argc = esp_console_split_argv(s_tmp_line_buf, argv, 22);
+    }
 
     return 0;
 }

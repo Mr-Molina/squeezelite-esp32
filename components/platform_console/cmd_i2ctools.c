@@ -692,6 +692,10 @@ static int do_i2cset_cmd (int argc, char** argv) {
 
     /* Check data: "-d" option */
     int len = i2cset_args.data->count;
+    if (len <= 0 || len > 128) {
+        cmd_send_messaging (argv[0], MESSAGING_ERROR, "Invalid data length (must be between 1 and 128 bytes)\n");
+        return 1;
+    }
 
     i2c_cmd_handle_t cmd = i2c_cmd_link_create ();
     i2c_master_start (cmd);
@@ -735,6 +739,10 @@ static int do_i2cget_cmd (int argc, char** argv) {
     if (i2cget_args.data_length->count) {
         len = i2cget_args.data_length->ival[0];
     }
+    if (len <= 0 || len > 128) {
+        cmd_send_messaging (argv[0], MESSAGING_ERROR, "Invalid length (must be between 1 and 128 bytes)\n");
+        return 1;
+    }
     i2c_port_t loc_i2c_port = i2c_port;
     if (i2cset_args.port->count && i2c_get_port (i2cset_args.port->ival[0], &loc_i2c_port) != ESP_OK) {
         return 1;
@@ -747,9 +755,15 @@ static int do_i2cget_cmd (int argc, char** argv) {
         cmd_send_messaging (argv[0], MESSAGING_ERROR, "Unable to open memory stream.\n");
         return 1;
     }
+    uint8_t* data = malloc_init_external (len);
+    if (!data) {
+        cmd_send_messaging (argv[0], MESSAGING_ERROR, "Failed to allocate memory.\n");
+        fclose (f);
+        FREE_AND_NULL (buf);
+        return 1;
+    }
     i2c_cmd_handle_t cmd = i2c_cmd_link_create ();
     i2c_master_start (cmd);
-    uint8_t* data = malloc_init_external (len);
     if (data_addr != -1) {
         i2c_master_write_byte (cmd, chip_addr << 1 | WRITE_BIT, ACK_CHECK_EN);
         i2c_master_write_byte (cmd, data_addr, ACK_CHECK_EN);

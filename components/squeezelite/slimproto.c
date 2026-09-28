@@ -296,6 +296,10 @@ void sendIR(u32_t code, u32_t ts) {
 #endif
 
 static void process_strm(u8_t *pkt, int len) {
+	if (len < (int)sizeof(struct strm_packet)) {
+		LOG_WARN("strm packet too small: %d < %d", len, (int)sizeof(struct strm_packet));
+		return;
+	}
 	struct strm_packet *strm = (struct strm_packet *)pkt;
 
 	LOG_DEBUG("strm command %c", strm->command);
@@ -379,6 +383,7 @@ static void process_strm(u8_t *pkt, int len) {
 				LOG_WARN("header too long: %u", header_len);
 				break;
 			}
+			header[header_len] = '\0';
 			if (strm->format != '?') {
 				codec_open(strm->format, strm->pcm_sample_size, strm->pcm_sample_rate, strm->pcm_channels, strm->pcm_endianness);
 			} else if (autostart >= 2) {
@@ -425,6 +430,10 @@ static void process_strm(u8_t *pkt, int len) {
 }
 
 static void process_cont(u8_t *pkt, int len) {
+	if (len < (int)sizeof(struct cont_packet)) {
+		LOG_WARN("cont packet too small: %d < %d", len, (int)sizeof(struct cont_packet));
+		return;
+	}
 	struct cont_packet *cont = (struct cont_packet *)pkt;
 	cont->metaint = unpackN(&cont->metaint);
 
@@ -443,6 +452,10 @@ static void process_cont(u8_t *pkt, int len) {
 }
 
 static void process_codc(u8_t *pkt, int len) {
+	if (len < (int)sizeof(struct codc_packet)) {
+		LOG_WARN("codc packet too small: %d < %d", len, (int)sizeof(struct codc_packet));
+		return;
+	}
 	struct codc_packet *codc = (struct codc_packet *)pkt;
 
 	LOG_DEBUG("codc: %c", codc->format);
@@ -450,6 +463,10 @@ static void process_codc(u8_t *pkt, int len) {
 }
 
 static void process_aude(u8_t *pkt, int len) {
+	if (len < (int)sizeof(struct aude_packet)) {
+		LOG_WARN("aude packet too small: %d < %d", len, (int)sizeof(struct aude_packet));
+		return;
+	}
 	struct aude_packet *aude = (struct aude_packet *)pkt;
 
 	LOG_DEBUG("enable spdif: %d dac: %d", aude->enable_spdif, aude->enable_dac);
@@ -470,6 +487,10 @@ static void process_aude(u8_t *pkt, int len) {
 }
 
 static void process_audg(u8_t *pkt, int len) {
+	if (len < (int)sizeof(struct audg_packet)) {
+		LOG_WARN("audg packet too small: %d < %d", len, (int)sizeof(struct audg_packet));
+		return;
+	}
 	struct audg_packet *audg = (struct audg_packet *)pkt;
 	audg->gainL = unpackN(&audg->gainL);
 	audg->gainR = unpackN(&audg->gainR);
@@ -480,11 +501,19 @@ static void process_audg(u8_t *pkt, int len) {
 }
 
 static void process_dsco(u8_t *pkt, int len) {
+	if (len < 4) {
+		LOG_WARN("dsco packet too small: %d < 4", len);
+		return;
+	}
 	LOG_INFO("got DSCO, switching from id %u to 12", (int) player_id);
 	player_id = 12;
 }
 
 static void process_setd(u8_t *pkt, int len) {
+	if (len < 5) {
+		LOG_WARN("setd packet too small: %d < 5", len);
+		return;
+	}
 	struct setd_packet *setd = (struct setd_packet *)pkt;
 
 	// handle player name query and change
@@ -494,11 +523,13 @@ static void process_setd(u8_t *pkt, int len) {
 				sendSETDName(player_name);
 			}
 		} else if (len > 5) {
-			strncpy(player_name, setd->data, PLAYER_NAME_LEN);
-			player_name[PLAYER_NAME_LEN] = '\0';
-			LOG_INFO("set name: %s", setd->data);
+			size_t dlen = len - 5;
+			if (dlen > PLAYER_NAME_LEN) dlen = PLAYER_NAME_LEN;
+			memcpy(player_name, setd->data, dlen);
+			player_name[dlen] = '\0';
+			LOG_INFO("set name: %s", player_name);
 			// confirm change to server
-			sendSETDName(setd->data);
+			sendSETDName(player_name);
 #if EMBEDDED
 			set_name(player_name);
 #endif			
@@ -521,6 +552,10 @@ static void process_setd(u8_t *pkt, int len) {
 #define SYNC_CAP_LEN 13
 
 static void process_serv(u8_t *pkt, int len) {
+	if (len < (int)sizeof(struct serv_packet)) {
+		LOG_WARN("serv packet too small: %d < %d", len, (int)sizeof(struct serv_packet));
+		return;
+	}
 	struct serv_packet *serv = (struct serv_packet *)pkt;
 
 	unsigned slimproto_port = 0;
@@ -534,13 +569,16 @@ static void process_serv(u8_t *pkt, int len) {
 
 	LOG_INFO("switch server");
 
-	if (len - sizeof(struct serv_packet) == 10) {
+	if (len - (int)sizeof(struct serv_packet) == 10) {
 		if (!new_server_cap) {
 			new_server_cap = malloc(SYNC_CAP_LEN + 10 + 1);
 		}
-		new_server_cap[0] = '\0';
-		strcat(new_server_cap, SYNC_CAP);
-		strncat(new_server_cap, (const char *)(pkt + sizeof(struct serv_packet)), 10);
+		if (new_server_cap) {
+			new_server_cap[0] = '\0';
+			strcat(new_server_cap, SYNC_CAP);
+			strncat(new_server_cap, (const char *)(pkt + sizeof(struct serv_packet)), 10);
+			new_server_cap[SYNC_CAP_LEN + 10] = '\0';
+		}
 	} else {
 		if (new_server_cap) {
 			free(new_server_cap);
@@ -567,6 +605,10 @@ static struct handler handlers[] = {
 };
 
 static void process(u8_t *pack, int len) {
+	if (len < 4) {
+		LOG_WARN("packet too small: %d < 4", len);
+		return;
+	}
 	struct handler *h = handlers;
 	while (h->handler && strncmp((char *)pack, h->opcode, 4)) { h++; }
 
@@ -574,8 +616,10 @@ static void process(u8_t *pack, int len) {
 		LOG_DEBUG("%s", h->opcode);
 		h->handler(pack, len);
 	} else if (!slimp_handler || !(*slimp_handler)(pack, len)) {
-		pack[4] = '\0';
-		LOG_WARN("unhandled %s", (char *)pack);
+		char opcode[5];
+		memcpy(opcode, pack, 4);
+		opcode[4] = '\0';
+		LOG_WARN("unhandled %s", opcode);
 	}
 }
 
@@ -613,6 +657,7 @@ static void slimproto_run() {
 					expect -= n;
 					got += n;
 					if (expect == 0) {
+						if (got < MAXBUF) buffer[got] = '\0';
 						process(buffer, got);
 						got = 0;
 					}
@@ -629,8 +674,8 @@ static void slimproto_run() {
 					if (got == 2) {
 						expect = buffer[0] << 8 | buffer[1]; // length pack 'n'
 						got = 0;
-						if (expect > MAXBUF) {
-							LOG_ERROR("FATAL: slimproto packet too big: %d > %d", expect, MAXBUF);
+						if (expect >= MAXBUF) {
+							LOG_ERROR("FATAL: slimproto packet too big: %d >= %d", expect, MAXBUF);
 							return;
 						}
 					}

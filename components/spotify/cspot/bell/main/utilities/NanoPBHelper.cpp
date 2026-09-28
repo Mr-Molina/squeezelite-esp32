@@ -51,9 +51,18 @@ pb_bytes_array_t* vectorToPbArray(const std::vector<uint8_t>& vectorToPack) {
   return result;
 }
 
+void pbPutString(const std::string& stringToPack, char* dst, size_t dstCapacity) {
+  if (!dst || dstCapacity == 0) return;
+  size_t toCopy = (stringToPack.size() >= dstCapacity) ? (dstCapacity - 1) : stringToPack.size();
+  stringToPack.copy(dst, toCopy);
+  dst[toCopy] = '\0';
+}
+
 void pbPutString(const std::string& stringToPack, char* dst) {
-  stringToPack.copy(dst, stringToPack.size());
-  dst[stringToPack.size()] = '\0';
+  if (!dst) return;
+  // Maximum string field capacity across Nanopb schemas in cspot is 256 bytes (Header.uri).
+  // Bound the copy to destination field capacity to prevent buffer overflow.
+  pbPutString(stringToPack, dst, 256);
 }
 
 void pbPutCharArray(const char* stringToPack, char* dst) {
