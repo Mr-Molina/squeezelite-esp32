@@ -172,10 +172,17 @@ function(NANOPB_GENERATE_CPP SRCS HDRS)
   # same build directory with different python/protobuf versions
   # as the binary build directory is discarded across builds.
   #
+  if(CMAKE_HOST_WIN32)
+    set(CHMOD_CMD "")
+  else()
+    set(CHMOD_CMD COMMAND chmod -R +x ${GENERATOR_PATH})
+  endif()
+
   add_custom_command(
       OUTPUT ${NANOPB_GENERATOR_EXECUTABLE} ${GENERATOR_CORE_SRC}
       COMMAND ${CMAKE_COMMAND} -E copy_directory
       ARGS ${NANOPB_GENERATOR_SOURCE_DIR} ${GENERATOR_PATH}
+      ${CHMOD_CMD}
       VERBATIM)
 
   set(GENERATOR_CORE_PYTHON_SRC)

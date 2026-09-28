@@ -21,6 +21,7 @@
 #include "esp_spi_flash.h"
 #include "esp_wifi.h"
 #include <esp_event.h>
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "freertos/event_groups.h"
@@ -149,7 +150,7 @@ bool is_network_connected(){
 void cb_connection_got_ip(nm_state_t new_state, int sub_state){
 	const char *hostname;
 	static ip4_addr_t ip;
-	tcpip_adapter_ip_info_t ipInfo; 
+	esp_netif_ip_info_t ipInfo; 
 	network_get_ip_info(&ipInfo);
 	if (ip.addr && ipInfo.ip.addr != ip.addr) {
 		ESP_LOGW(TAG, "IP change, need to reboot");

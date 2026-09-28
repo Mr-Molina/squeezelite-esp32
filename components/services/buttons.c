@@ -144,7 +144,7 @@ static void buttons_handler(struct button_s *button, int level) {
 	if (button->long_press && !button->long_timer && button->level == button->type) {
 		// detect a long press, so hold event generation
 		ESP_LOGD(TAG, "setting long timer gpio:%u level:%u", button->gpio, button->level);
-		xTimerChangePeriod(button->timer, button->long_press / portTICK_RATE_MS, 0);
+		xTimerChangePeriod(button->timer, pdMS_TO_TICKS(button->long_press), 0);
 		button->long_timer = true;
 	} else {
 		// send a button pressed/released event (content is copied in queue)
@@ -282,7 +282,7 @@ void button_create(void *client, int gpio, int type, bool pull, int debounce, bu
 	buttons[n_buttons].long_press = long_press;
 	buttons[n_buttons].shifter_gpio = shifter_gpio;
 	buttons[n_buttons].type = type;
-	buttons[n_buttons].timer = xTimerCreate("buttonTimer", buttons[n_buttons].debounce / portTICK_RATE_MS, pdFALSE, (void *) &buttons[n_buttons], buttons_timer_handler);
+	buttons[n_buttons].timer = xTimerCreate("buttonTimer", pdMS_TO_TICKS(buttons[n_buttons].debounce), pdFALSE, (void *) &buttons[n_buttons], buttons_timer_handler);
 	buttons[n_buttons].self = buttons + n_buttons;
 
 	for (int i = 0; i < n_buttons; i++) {
@@ -318,7 +318,7 @@ void button_create(void *client, int gpio, int type, bool pull, int debounce, bu
 	// nasty ESP32 bug: fire-up constantly INT on GPIO 36/39 if ADC1, AMP, Hall used which WiFi does when PS is activated
 	for (int i = 0; polled_gpio[i].gpio != -1; i++) if (polled_gpio[i].gpio == gpio) {
 		if (!polled_timer) {
-			polled_timer = xTimerCreate("buttonsPolling", 100 / portTICK_RATE_MS, pdTRUE, polled_gpio, buttons_polling);		
+			polled_timer = xTimerCreate("buttonsPolling", pdMS_TO_TICKS(100), pdTRUE, polled_gpio, buttons_polling);		
 			xTimerStart(polled_timer, portMAX_DELAY);
 		}	
 	

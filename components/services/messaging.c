@@ -13,6 +13,7 @@
 #include "config.h"
 #include "nvs_utilities.h"
 #include "platform_esp32.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "messaging.h"
 #include "tools.h"

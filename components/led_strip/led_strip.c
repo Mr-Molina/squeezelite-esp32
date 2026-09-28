@@ -17,6 +17,7 @@
     ------------------------------------------------------------------------- */
 
 #include "led_strip.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_task.h"
 

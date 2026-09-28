@@ -2,6 +2,7 @@
 #define LOG_LOCAL_LEVEL NETWORK_ETHERNET_LOG_LEVEL
 #endif
 #include "network_ethernet.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "messaging.h"
 #include "network_status.h"

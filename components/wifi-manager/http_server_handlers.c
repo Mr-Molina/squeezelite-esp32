@@ -25,6 +25,7 @@ Copyright (c) 2017-2021 Sebastien L
 #include "accessors.h"
 #include "webapp/webpack.h"
 #include "network_wifi.h"
+#include "esp_netif.h"
 #include "network_status.h"
 #include "tools.h"
 
@@ -134,31 +135,33 @@ bool is_captive_portal_host_name(httpd_req_t *req){
 	bool request_contains_hostname = false;
 	esp_err_t hn_err =ESP_OK, err=ESP_OK;
 	ESP_LOGD_LOC(TAG,  "Getting adapter host name");
-	if((err  = tcpip_adapter_get_hostname(TCPIP_ADAPTER_IF_STA, &host_name )) !=ESP_OK) {
+	esp_netif_t *sta_netif = network_wifi_get_interface();
+	if(sta_netif && (err  = esp_netif_get_hostname(sta_netif, &host_name )) !=ESP_OK) {
 		ESP_LOGE_LOC(TAG,  "Unable to get host name. Error: %s",esp_err_to_name(err));
 	}
-	else {
+	else if (host_name) {
 		ESP_LOGD_LOC(TAG,  "Host name is %s",host_name);
 	}
 
    ESP_LOGD_LOC(TAG,  "Getting host name from request");
 	char *req_host = alloc_get_http_header(req, "Host");
 
-	if(tcpip_adapter_is_netif_up(TCPIP_ADAPTER_IF_AP)){
+	esp_netif_t *ap_netif = network_wifi_get_ap_interface();
+	if(ap_netif && esp_netif_is_netif_up(ap_netif)){
 		ESP_LOGD_LOC(TAG,  "Soft AP is enabled. getting ip info");
 		// Access point is up and running. Get the current IP address
-		tcpip_adapter_ip_info_t ip_info;
-		esp_err_t ap_ip_err = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ip_info);
+		esp_netif_ip_info_t ip_info;
+		esp_err_t ap_ip_err = esp_netif_get_ip_info(ap_netif, &ip_info);
 		if(ap_ip_err != ESP_OK){
 			ESP_LOGE_LOC(TAG,  "Unable to get local AP ip address. Error: %s",esp_err_to_name(ap_ip_err));
 		}
 		else {
-			ESP_LOGD_LOC(TAG,  "getting host name for TCPIP_ADAPTER_IF_AP");
-			if((hn_err  = tcpip_adapter_get_hostname(TCPIP_ADAPTER_IF_AP, &ap_host_name )) !=ESP_OK) {
+			ESP_LOGD_LOC(TAG,  "getting host name for Soft AP");
+			if((hn_err  = esp_netif_get_hostname(ap_netif, &ap_host_name )) !=ESP_OK) {
 				ESP_LOGE_LOC(TAG,  "Unable to get host name. Error: %s",esp_err_to_name(hn_err));
 				err=err==ESP_OK?hn_err:err;
 			}
-			else {
+			else if (ap_host_name) {
 				ESP_LOGD_LOC(TAG,  "Soft AP Host name is %s",ap_host_name);
 			}
 
@@ -166,8 +169,8 @@ bool is_captive_portal_host_name(httpd_req_t *req){
 			memset(ap_ip_address, 0x00, IP4ADDR_STRLEN_MAX);
 			if(ap_ip_address){
 				ESP_LOGD_LOC(TAG,  "Converting soft ip address to string");
-				ip4addr_ntoa_r(&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
-				ESP_LOGD_LOC(TAG,"TCPIP_ADAPTER_IF_AP is up and has ip address %s ", ap_ip_address);
+				esp_ip4addr_ntoa(&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
+				ESP_LOGD_LOC(TAG,"Soft AP is up and has ip address %s ", ap_ip_address);
 			}
 		}
 
@@ -946,22 +949,23 @@ bail_out:
 char * get_ap_ip_address(){
 	static char ap_ip_address[IP4ADDR_STRLEN_MAX]={};
 
-	tcpip_adapter_ip_info_t ip_info;
+	esp_netif_ip_info_t ip_info;
 	esp_err_t err=ESP_OK;
 	memset(ap_ip_address, 0x00, sizeof(ap_ip_address));
 
 	ESP_LOGD_LOC(TAG,  "checking if soft AP is enabled");
-	if(tcpip_adapter_is_netif_up(TCPIP_ADAPTER_IF_AP)){
+	esp_netif_t *ap_netif = network_wifi_get_ap_interface();
+	if(ap_netif && esp_netif_is_netif_up(ap_netif)){
 		ESP_LOGD_LOC(TAG,  "Soft AP is enabled. getting ip info");
 		// Access point is up and running. Get the current IP address
-		err = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ip_info);
+		err = esp_netif_get_ip_info(ap_netif, &ip_info);
 		if(err != ESP_OK){
 			ESP_LOGE_LOC(TAG,  "Unable to get local AP ip address. Error: %s",esp_err_to_name(err));
 		}
 		else {
 			ESP_LOGV_LOC(TAG,  "Converting soft ip address to string");
-			ip4addr_ntoa_r(&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
-			ESP_LOGD_LOC(TAG,"TCPIP_ADAPTER_IF_AP is up and has ip address %s ", ap_ip_address);
+			esp_ip4addr_ntoa(&ip_info.ip, ap_ip_address, IP4ADDR_STRLEN_MAX);
+			ESP_LOGD_LOC(TAG,"AP netif is up and has ip address %s ", ap_ip_address);
 		}
 	}
 	else{
@@ -1055,11 +1059,12 @@ esp_err_t redirect_processor(httpd_req_t *req, httpd_err_code_t error){
 
 	esp_err_t hn_err = ESP_OK;
 	ESP_LOGV_LOC(TAG,  "Getting adapter host name");
-	if((hn_err  = tcpip_adapter_get_hostname(TCPIP_ADAPTER_IF_STA, &host_name )) !=ESP_OK) {
+	esp_netif_t *sta_netif = network_wifi_get_interface();
+	if(sta_netif && (hn_err  = esp_netif_get_hostname(sta_netif, &host_name )) !=ESP_OK) {
 		ESP_LOGE_LOC(TAG,  "Unable to get host name. Error: %s",esp_err_to_name(hn_err));
 		err=err==ESP_OK?hn_err:err;
 	}
-	else {
+	else if (host_name) {
 		ESP_LOGV_LOC(TAG,  "Host name is %s",host_name);
 	}
 

@@ -9,6 +9,7 @@
 #include "esp_console.h"
 #include "esp_pthread.h"
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "platform_config.h"
 #include "raop.h"

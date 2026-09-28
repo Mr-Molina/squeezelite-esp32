@@ -14,6 +14,7 @@
 #include "esp_pthread.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "argtable3/argtable3.h"
 #include "platform_config.h"
@@ -746,7 +747,7 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
 
         /* create and start heart beat timer */
         int tmr_id = 0;
-        s_tmr = xTimerCreate("connTmr", ( prev_duration/ portTICK_RATE_MS),pdFALSE, (void *)tmr_id, a2d_app_heart_beat);        
+        s_tmr = xTimerCreate("connTmr", pdMS_TO_TICKS(prev_duration), pdFALSE, (void *)tmr_id, a2d_app_heart_beat);        
         xTimerStart(s_tmr, portMAX_DELAY);
         break;
     }

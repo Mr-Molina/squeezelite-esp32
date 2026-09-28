@@ -147,7 +147,6 @@ endif()
 # target_compile_definitions(__idf_freertos PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 #target_compile_definitions(__idf_bt PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_ERROR)
 # target_compile_definitions(__idf_mdns PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
-# target_compile_definitions(__idf_tcpip_adapter PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 # target_compile_definitions(__idf_tcp_transport PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 
 #target_compile_definitions(__idf_app_squeezelite PRIVATE -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)

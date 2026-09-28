@@ -77,7 +77,7 @@ const state_t* get_root( const state_t* const state);
 static void network_task(void* pvParameters);
 
 void network_start_stop_dhcp_client(esp_netif_t* netif, bool start) {
-    tcpip_adapter_dhcp_status_t status;
+    esp_netif_dhcp_status_t status;
     esp_err_t err = ESP_OK;
     ESP_LOGD(TAG, "Checking if DHCP client for STA interface is running");
     if (!netif) {
@@ -137,7 +137,7 @@ void network_start_stop_dhcp_client(esp_netif_t* netif, bool start) {
     }
 }
 void network_start_stop_dhcps(esp_netif_t* netif, bool start) {
-    tcpip_adapter_dhcp_status_t status;
+    esp_netif_dhcp_status_t status;
     esp_err_t err = ESP_OK;
     ESP_LOGD(TAG, "Checking if DHCP server is running");
     if (!netif) {
@@ -601,7 +601,7 @@ esp_netif_t* network_get_active_interface() {
 }
 bool network_is_interface_connected(esp_netif_t* interface) {
     esp_err_t err = ESP_OK;
-    tcpip_adapter_ip_info_t ipInfo;
+    esp_netif_ip_info_t ipInfo;
     if(!interface){
         return false;
     }
@@ -639,9 +639,8 @@ static esp_netif_t* get_connected_interface() {
     ESP_LOGD(TAG,"No connected interface found");
     return NULL;
 }
-esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, tcpip_adapter_ip_info_t* ipInfo) {
-    esp_netif_ip_info_t loc_ip_info;
-    if (!ipInfo ) {
+esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, esp_netif_ip_info_t* ipInfo) {
+    if (!ipInfo) {
         ESP_LOGE(TAG, "Invalid pointer for ipInfo");
         return ESP_ERR_INVALID_ARG;
     }
@@ -649,19 +648,13 @@ esp_err_t network_get_ip_info_for_netif(esp_netif_t* netif, tcpip_adapter_ip_inf
         ESP_LOGE(TAG, "Invalid pointer for netif");
         return ESP_ERR_INVALID_ARG;
     }
-    memset(ipInfo,0x00,sizeof(tcpip_adapter_ip_info_t));
-    esp_err_t err= esp_netif_get_ip_info(netif, &loc_ip_info);
-    if(err==ESP_OK){
-        ip4_addr_set(&(ipInfo->ip),&loc_ip_info.ip);
-        ip4_addr_set(&(ipInfo->gw),&loc_ip_info.gw);
-        ip4_addr_set(&(ipInfo->netmask),&loc_ip_info.netmask);
-    }
-    return err;
+    memset(ipInfo, 0x00, sizeof(esp_netif_ip_info_t));
+    return esp_netif_get_ip_info(netif, ipInfo);
 }
-esp_err_t network_get_ip_info(tcpip_adapter_ip_info_t* ipInfo) {
-    esp_netif_t* netif= get_connected_interface();
+esp_err_t network_get_ip_info(esp_netif_ip_info_t* ipInfo) {
+    esp_netif_t* netif = get_connected_interface();
     if(netif){
-        return network_get_ip_info_for_netif(netif,ipInfo);
+        return network_get_ip_info_for_netif(netif, ipInfo);
     }
     return ESP_FAIL;
 }
