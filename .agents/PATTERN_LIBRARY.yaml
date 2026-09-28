@@ -1,0 +1,217 @@
+schema_version: 1
+patterns:
+- id: GLB-001
+  name: Mandatory Subagent and Task Cleanup
+  failure_type: behavioral
+  root_cause_category: cleanup
+  description: 'When concluding a session (e.g., executing the /goodbye macro), all
+    active subagents and background tasks MUST be explicitly reviewed and terminated
+    to prevent orphaned processes and hanging dependents.
+
+    '
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: C:\Users\jmolina\.gemini\config\skills\goodbye\SKILL.md
+  occurrences:
+  - session: conversation://9594ed66-2b40-4cb4-9b9a-5d3829ee8c39
+    date: '2026-08-13'
+    postmortem_ref: PM-2026-0813-001
+- id: GLB-002
+  name: Strict Artifact Bootstrapping & Postmortem Formulation
+  failure_type: behavioral
+  root_cause_category: protocol_skip
+  description: 'Agents must not jump to Phase 4 (Improvement Plan) without first explicitly
+    executing Phase 0 (bootstrapping artifacts) and Phase 1 (writing the postmortem
+    JSON log).
+
+    '
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: C:\Users\jmolina\.gemini\config\skills\improvement\SKILL.md
+  occurrences:
+  - session: conversation://9594ed66-2b40-4cb4-9b9a-5d3829ee8c39
+    date: '2026-08-13'
+    postmortem_ref: PM-2026-0813-002
+- id: GLB-003
+  name: Bash Command Restriction (ls)
+  failure_type: behavioral
+  root_cause_category: tool_constraint_violation
+  description: Before calling run_command, agents MUST verify that the command does
+    not use explicitly banned UNIX utilities (ls, cat, grep, sed). If directory listing
+    is needed, the list_dir tool MUST be used instead of delegating to the shell.
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: C:\Users\jmolina\.gemini\config\pattern-library.yaml
+  occurrences:
+  - session: conversation://411c5d3b-944c-4240-8f99-3eef88c7e5de
+    date: '2026-08-13'
+    postmortem_ref: PM-2026-0813-003
+- id: GLB-004
+  name: PowerShell Inline Python Escaping
+  failure_type: behavioral
+  root_cause_category: powershell_escaping
+  description: When executing inline python scripts (python -c) via run_command on
+    Windows PowerShell, agents MUST NOT use f-strings containing internal single quotes.
+    Agents MUST instead write Python code to a .py file and execute it.
+  escalation_level: 2
+  current_mitigation: 'mechanical_invariant — write to .py files, ban inline python
+    -c. Rule file: C:\Users\jmolina\.gemini\config\rules\python-scripts.md'
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\python-scripts.md
+  occurrences:
+  - session: conversation://411c5d3b-944c-4240-8f99-3eef88c7e5de
+    date: '2026-08-13'
+    postmortem_ref: PM-2026-0813-004
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-008
+- id: GLB-005
+  name: Evidence Before Assertions (Anti-Guessing)
+  failure_type: behavioral
+  root_cause_category: fabricated_root_cause
+  description: Agent fabricates plausible root causes instead of gathering evidence.
+    MUST cite specific evidence before any root cause claim. MUST check physical layer
+    before logical layer. MUST separate diagnosis from prescription.
+  escalation_level: 3
+  current_mitigation: automation - Infrastructure Invariants check script/gate
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\no-guessing.md
+  occurrences:
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-001
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-002
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-004
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-007
+  - session: conversation://e36506f3-5f42-46d3-8047-436bb01e9c8a
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-009
+- id: GLB-006
+  name: Autonomous Task Verification Gate
+  failure_type: behavioral
+  root_cause_category: skipped_verification
+  description: After autonomous batch operations, agent MUST run independent verification
+    confirming desired end-state for every target. MUST NOT treat HTTP 200 as proof.
+    MUST NOT report completion without verification.
+  escalation_level: 2
+  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\verify-autonomous-work.md
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\verify-autonomous-work.md
+  occurrences:
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-005
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-006
+- id: GLB-007
+  name: Wrong Health Metric Assumption
+  failure_type: behavioral
+  root_cause_category: assumed_success_criteria
+  description: Agent assumed what 'working' means without asking. Before classifying
+    system state, MUST define measurable success criteria verified against user intent
+    or documentation.
+  escalation_level: 1
+  current_mitigation: advisory — covered by no-guessing.md invariant
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\no-guessing.md
+  occurrences:
+  - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-004
+- id: GLB-008
+  name: Task Dropout on Context Switch
+  failure_type: behavioral
+  root_cause_category: distractibility
+  description: When interrupted by a user with a meta-task or tangent (e.g., /improvement,
+    /brainstorm), the agent MUST explicitly persist the state of the primary task
+    (using task.md or similar) and MUST resume and verify the primary task before
+    claiming completion.
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: C:\Users\jmolina\.gemini\config\pattern-library.yaml
+  occurrences:
+  - session: conversation://e36506f3-5f42-46d3-8047-436bb01e9c8a
+    date: '2026-08-14'
+    postmortem_ref: PM-2026-0814-010
+- id: GLB-009
+  name: Live Ground Truth Requirement (Anti-Stale Data)
+  failure_type: behavioral
+  root_cause_category: stale_data_assumption
+  description: When answering inquiries regarding active infrastructure state, switch
+    port assignments, link health, online status, or physical connections, the agent
+    MUST query live infrastructure (SSH, API, CLI, SNMP) rather than relying on static
+    documentation or CSV exports.
+  escalation_level: 2
+  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\live-ground-truth.md
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\live-ground-truth.md
+  occurrences:
+  - session: conversation://a2033ca6-1777-4661-a00f-de81d123b352
+    date: '2026-08-18'
+    postmortem_ref: PM-2026-0818-001
+- id: GLB-010
+  name: Anti-Simulated Tool & Browser Verification Gate
+  failure_type: behavioral
+  root_cause_category: simulated_tool_execution
+  description: Agent silently falls back to static code analysis when live browser/MCP
+    tools are unavailable, presenting results as if live testing occurred. Agents
+    MUST verify live tool attachment and halt/notify immediately if disconnected.
+  escalation_level: 2
+  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\live-browser-verification.md
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\live-browser-verification.md
+  occurrences:
+  - session: conversation://ba0d3e62-a2c8-4640-93bf-1efc1effb74b
+    date: '2026-08-19'
+    postmortem_ref: PM-2026-0819-001
+- id: GLB-011
+  name: Staged Deployment & Manual Upload Gate
+  failure_type: behavioral
+  root_cause_category: premature_device_restart
+  description: When deploying hardware configurations requiring external/manual staging
+    (FTP, TFTP, file servers), the agent MUST NOT trigger device reboots in the same
+    execution loop as file generation. File staging and reboot MUST be decoupled,
+    and the agent MUST halt to allow the user to complete and verify the upload before
+    issuing restart commands.
+  escalation_level: 2
+  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\staging-before-restart.md
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\staging-before-restart.md
+  occurrences:
+  - session: conversation://2d9609c4-f4d9-42aa-8316-48a5b6482439
+    date: '2026-08-26'
+    postmortem_ref: PM-2026-0826-001
+- id: GLB-012
+  name: Scope Creep - Modifying Working Components During Debugging
+  failure_type: behavioral
+  root_cause_category: scope_creep_during_debugging
+  description: When debugging a failing component alongside working components, agent
+    modified the working component and rewrote governance documents instead of isolating
+    the broken component. MUST identify which specific component fails, MUST use the
+    working component as a template, MUST only change the failing component content
+    (SQL, fields), MUST NEVER modify a file the user says is working.
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: C:\Users\jmolina\.gemini\config\pattern-library.yaml
+  occurrences:
+  - session: conversation://7ce4bb58-cddd-46b6-8aa1-8b93d7ac3d30
+    date: '2026-08-27'
+    postmortem_ref: PM-2026-0827-001
+- id: GLB-013
+  name: Institutional Identity & Acronym Ground Truth Requirement
+  failure_type: behavioral
+  root_cause_category: ungrounded_entity_branding
+  description: Agent fabricates plausible expansions for domain acronyms, organization
+    titles, or network subnets during scaffolding or UI authoring instead of searching
+    workspace records or querying the user. Agents MUST verify institutional names against
+    repository ground truth before generating UI templates or documentation, and CI/deployment
+    gates MUST enforce automated regression testing against hallucinated entities.
+  escalation_level: 3
+  current_mitigation: 'automation — automated test gate (TestInstitutionalGroundTruth in
+    run_tests.py) & pre-deployment blocker in deploy_production.sh; mechanical invariant
+    in C:\Users\jmolina\.gemini\config\rules\ground-truth-entity-verification.md'
+  mitigation_target: C:\Users\jmolina\.gemini\config\rules\ground-truth-entity-verification.md
+  occurrences:
+  - session: conversation://8a779460-b3e0-4c18-972f-af0baecb5405
+    date: '2026-09-10'
+    postmortem_ref: PM-2026-0910-001
