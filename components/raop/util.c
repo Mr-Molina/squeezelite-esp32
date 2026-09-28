@@ -394,6 +394,12 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 			return false;
 		}
 
+		if (i >= 15) {
+			LOG_ERROR("too many headers", NULL);
+			kd_free(rkd);
+			return false;
+		}
+
 		*dp = 0;
 		rkd[i].key = strdup(line);
 		rkd[i].data = strdup(ltrim(dp + 1));

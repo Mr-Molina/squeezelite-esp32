@@ -480,10 +480,10 @@ void service_handler(void *arg) {
 				xSemaphoreGive(expander->mutex);
 				ESP_LOGD(TAG, "Handling GPIO %d reads 0x%04x and has 0x%04x pending", expander->first, expander->shadow, pending);
 				
-				for (int gpio = 31, clz = 0; pending && clz < 31; pending <<= (clz + 1)) {
-					clz = __builtin_clz(pending);
-					gpio -= clz;
-					if (expander->isr[gpio].timer) xTimerReset(expander->isr[gpio].timer, 1);	// todo 0
+				while (pending) {
+					int gpio = __builtin_ctz(pending);
+					pending &= ~(1U << gpio);
+					if (expander->isr[gpio].timer) xTimerReset(expander->isr[gpio].timer, 1);
 					else if (expander->isr[gpio].handler) expander->isr[gpio].handler(expander->isr[gpio].arg);
 				}	
 			}

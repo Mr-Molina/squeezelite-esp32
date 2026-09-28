@@ -77,8 +77,6 @@ except ImportError as ex:
         ["%s==%s" % (i.key, i.version) for i in installed_packages])
     print(Logger.NEWLINE_CHAR.join(installed_packages_list))
     print(f'Environment: ')
-    envlist = "\n".join([f"{k}={v}" for k, v in sorted(os.environ.items())])
-    print(f'{envlist}')
     raise
 
 tool_version = "1.0.7"

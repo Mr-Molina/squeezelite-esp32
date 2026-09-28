@@ -98,15 +98,12 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
 	struct button_s *button = (struct button_s*) arg;
 	BaseType_t woken = pdFALSE;
 
-	if (xTimerGetPeriod(button->timer) > pdMS_TO_TICKS(button->debounce)) {
-		if (button->gpio < GPIO_NUM_MAX) xTimerChangePeriodFromISR(button->timer, pdMS_TO_TICKS(button->debounce), &woken); 
-		else xTimerChangePeriod(button->timer, pdMS_TO_TICKS(button->debounce), pdMS_TO_TICKS(10)); 
+	if (xPortInIsrContext()) {
+		xTimerResetFromISR(button->timer, &woken);
+		if (woken) portYIELD_FROM_ISR();
 	} else {
-		if (button->gpio < GPIO_NUM_MAX) xTimerResetFromISR(button->timer, &woken);
-		else xTimerReset(button->timer, portMAX_DELAY);
+		xTimerReset(button->timer, 0);
 	}
-
-	if (woken) portYIELD_FROM_ISR();
 
 	ESP_EARLY_LOGD(TAG, "INT gpio %u level %u", button->gpio, button->level);
 }

@@ -1,5 +1,6 @@
 #include "ShannonConnection.h"
 
+#include <stdexcept>
 #include <type_traits>  // for remove_extent_t
 
 #include "BellLogger.h"       // for AbstractLogger
@@ -82,6 +83,7 @@ cspot::Packet ShannonConnection::recvPacket() {
 
   if (mac != mac2) {
     CSPOT_LOG(error, "Shannon read: Mac doesn't match");
+    throw std::runtime_error("Shannon MAC verification failed");
   }
 
   // Update the nonce

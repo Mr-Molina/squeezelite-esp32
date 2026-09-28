@@ -199,7 +199,7 @@ static void _isr_rotenc(void * args)
                 .direction = info->state.direction,
             },
         };
-		if (info->pin_a < GPIO_NUM_MAX) {
+		if (xPortInIsrContext()) {
 			BaseType_t task_woken = pdFALSE;
 			xQueueOverwriteFromISR(info->queue, &queue_event, &task_woken);
 			if (task_woken)

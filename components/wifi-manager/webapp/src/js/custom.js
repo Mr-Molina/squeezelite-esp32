@@ -1552,8 +1552,9 @@ function refreshAP() {
 function formatAP(ssid, rssi, auth) {
   const rssi_icon = rssiToIcon(rssi);
   const auth_icon = { label: auth == 0 ? '🔓' : '🔒', icon: auth == 0 ? 'no_encryption' : 'lock' };
+  const sanitizedSsid = (ssid ?? '').toString().encodeHTML();
 
-  return `<tr data-bs-toggle="modal" data-bs-target="#WifiConnectDialog"><td></td><td>${ssid}</td><td>
+  return `<tr data-bs-toggle="modal" data-bs-target="#WifiConnectDialog"><td></td><td>${sanitizedSsid}</td><td>
   <span class="material-icons" style="fill:white; display: inline" aria-label="${rssi_icon.label}" icon="${rssi_icon.icon}" >${getIcon(rssi_icon)}</span>
   	</td><td>
     <span class="material-icons" aria-label="${auth_icon.label}" icon="${auth_icon.icon}">${getIcon(auth_icon)}</span>
@@ -1574,12 +1575,13 @@ function refreshAPHTML2(data) {
     $('#wifiTable tr:last').addClass('table-light text-dark').addClass('manual_add');
   }
   if (ConnectedTo.ssid && (ConnectedTo.urc === connectReturnCode.OK || ConnectedTo.urc === connectReturnCode.RESTORE)) {
-    const wifiSelector = `#wifiTable td:contains("${ConnectedTo.ssid}")`;
-    if ($(wifiSelector).filter(function () { return $(this).text() === ConnectedTo.ssid; }).length == 0) {
+    if ($('#wifiTable td').filter(function () { return $(this).text() === ConnectedTo.ssid; }).length == 0) {
       $('#wifiTable').prepend(`${formatAP(ConnectedTo.ssid, ConnectedTo.rssi ?? 0, 0)}`);
     }
-    $(wifiSelector).filter(function () { return $(this).text() === ConnectedTo.ssid; }).siblings().first().html('&check;').parent().addClass((ConnectedTo.urc === connectReturnCode.OK ? 'table-success' : 'table-warning'));
-    $('span#foot-if').html(`SSID: <strong>${ConnectedTo.ssid}</strong>, IP: <strong>${ConnectedTo.ip}</strong>`);
+    $('#wifiTable td').filter(function () { return $(this).text() === ConnectedTo.ssid; }).siblings().first().html('&check;').parent().addClass((ConnectedTo.urc === connectReturnCode.OK ? 'table-success' : 'table-warning'));
+    const sanitizedSsid = (ConnectedTo.ssid ?? '').toString().encodeHTML();
+    const sanitizedIp = (ConnectedTo.ip ?? '').toString().encodeHTML();
+    $('span#foot-if').html(`SSID: <strong>${sanitizedSsid}</strong>, IP: <strong>${sanitizedIp}</strong>`);
     $('#wifiStsIcon').html(rssiToIcon(ConnectedTo.rssi));
 
   }

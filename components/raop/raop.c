@@ -453,7 +453,13 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		// need to pad the base64 string as apple device don't
 		base64_pad(buf, &buf_pad);
 
-		p = data + min(base64_decode(buf_pad, data), 32-10);
+		int dlen = base64_decode(buf_pad, data);
+		if (dlen < 0 || dlen > (32 - 10)) {
+			free(buf_pad);
+			kd_free(headers);
+			return false;
+		}
+		p = data + dlen;
 		p = (char*) memcpy(p, &S_ADDR(ctx->host), 4) + 4;
 		p = (char*) memcpy(p, ctx->mac, 6) + 6;
 		memset(p, 0, 32 - (p - data));

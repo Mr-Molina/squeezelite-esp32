@@ -138,6 +138,9 @@ void _buf_unwrap(struct buffer *buf, size_t cont) {
 		} else {
 			buf->writep += buf->size - by;
 		}
+		if (buf->writep >= buf->wrap) {
+			buf->writep -= buf->size;
+		}
 		return;
 	}
 
@@ -149,7 +152,9 @@ void _buf_unwrap(struct buffer *buf, size_t cont) {
 		memmove(buf->readp - by, buf->readp, buf->wrap - buf->readp);
 		buf->readp -= by;
 		memcpy(buf->wrap - by, buf->buf, by);
-		memmove(buf->buf, buf->buf + by, len - by - size);
+		if (len >= by + size) {
+			memmove(buf->buf, buf->buf + by, len - by - size);
+		}
 		buf->writep -= by;
 		memcpy(buf->writep - size, scratch, size);
 		free(scratch);

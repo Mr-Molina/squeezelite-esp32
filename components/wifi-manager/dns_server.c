@@ -126,7 +126,7 @@ void  dns_server(void *pvParameters) {
 
         /*if the query is bigger than the buffer size we simply ignore it. This case should only happen in case of multiple
          * queries within the same DNS packet and is not supported by this simple DNS hijack. */
-        if ( length > 0   &&  ((length + sizeof(dns_answer_t)-1) < DNS_ANSWER_MAX_SIZE)   ) {
+        if ( length >= (int)sizeof(dns_header_t) && ((length + sizeof(dns_answer_t)-1) < DNS_ANSWER_MAX_SIZE) ) {
 
         	data[length] = '\0'; /*in case there's a bogus domain name that isn't null terminated */
 

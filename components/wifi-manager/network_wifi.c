@@ -406,7 +406,8 @@ esp_err_t network_wifi_delete_ap(const char* key) {
 }
 
 esp_err_t network_wifi_erase_legacy() {
-    esp_err_t err = erase_nvs_partition(NVS_DEFAULT_PART_NAME, network_wifi_nvs_namespace);
+    esp_err_t err = erase_nvs_for_partition(NVS_DEFAULT_PART_NAME, network_wifi_nvs_namespace, "ssid");
+    erase_nvs_for_partition(NVS_DEFAULT_PART_NAME, network_wifi_nvs_namespace, "password");
     if (err == ESP_OK) {
         ESP_LOGW(TAG, "Erased wifi configuration. Disconnecting from network");
         if ((err = esp_wifi_disconnect()) != ESP_OK) {

@@ -36,6 +36,7 @@
 #include "soc/uart_struct.h"
 #include "driver/uart.h"
 #include "config.h"
+#include "platform_config.h"
 #include "nvs_utilities.h"
 #include "platform_esp32.h"
 #include "messaging.h"
@@ -47,14 +48,22 @@
 
 #define TELNET_STACK_SIZE 4096
 #define TELNET_RX_BUF 1024
+#define TELNET_AUTH_TIMEOUT_MS 60000
+#define TELNET_AUTH_MAX_ATTEMPTS 3
 
 extern bool bypass_network_manager;
 
-struct telnetUserData {
+typedef struct telnetUserData {
 	int sockfd;
 	telnet_t *tnHandle;
 	char * rxbuf;
-};
+	bool is_authenticated;
+	int auth_attempts;
+	uint32_t auth_timer;
+	char auth_buf[64];
+	size_t auth_buf_len;
+	bool last_was_cr;
+} telnet_userdata_t;
 
 const static char TAG[] = "telnet";
 static int uart_fd;
@@ -65,6 +74,7 @@ static bool bIsEnabled=false;
 static int partnerSocket;
 static telnet_t *tnHandle;
 static bool bMirrorToUART;
+static bool bIsAuthenticated;
 
 /************************************
  * Forward declarations
@@ -75,6 +85,7 @@ static int 		stdout_fstat(int fd, struct stat * st);
 static ssize_t 	stdout_write(int fd, const void * data, size_t size);
 static void 	handle_telnet_conn();
 static size_t 	process_logs( UBaseType_t bytes, bool make_room);
+static void 	telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, void *userData);
 
 void init_telnet(){
 	char *val= get_nvs_value_alloc(NVS_TYPE_STR, "telnet_enable");
@@ -185,15 +196,96 @@ static void telnet_task(void *data) {
 /**
  * Telnet handler.
  */
-static void handle_telnet_events(telnet_t *thisTelnet, telnet_event_t *event, void *userData) {
-	struct telnetUserData *telnetUserData = (struct telnetUserData *)userData;
+static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, void *userData) {
+	telnet_userdata_t *telnetUserData = (telnet_userdata_t *)userData;
 
 	switch(event->type) {
 	case TELNET_EV_SEND:
-		send(telnetUserData->sockfd, event->data.buffer, event->data.size, 0);
+		if (telnetUserData->sockfd > 0) {
+			send(telnetUserData->sockfd, event->data.buffer, event->data.size, 0);
+		}
 		break;
 	case TELNET_EV_DATA:
-		console_push(event->data.buffer, event->data.size);
+		if (telnetUserData->is_authenticated) {
+			console_push(event->data.buffer, event->data.size);
+			break;
+		}
+
+		for (size_t i = 0; i < event->data.size; i++) {
+			char c = event->data.buffer[i];
+
+			if (c == '\r' || c == '\n') {
+				if (c == '\n' && telnetUserData->last_was_cr) {
+					telnetUserData->last_was_cr = false;
+					continue;
+				}
+				telnetUserData->last_was_cr = (c == '\r');
+
+				if (c == '\r' && i + 1 < event->data.size && (event->data.buffer[i + 1] == '\n' || event->data.buffer[i + 1] == '\0')) {
+					i++;
+					telnetUserData->last_was_cr = false;
+				}
+
+				telnetUserData->auth_buf[telnetUserData->auth_buf_len] = '\0';
+				char *configured_pwd = (char *)config_alloc_get_str("telnet_pwd", NULL, NULL);
+				bool auth_ok = false;
+
+				if (configured_pwd && *configured_pwd) {
+					if (strcmp(telnetUserData->auth_buf, configured_pwd) == 0) {
+						auth_ok = true;
+					}
+				} else {
+					// If no password is configured in NVS, default to requiring setting a password
+					if (telnetUserData->auth_buf_len > 0) {
+						config_set_value(NVS_TYPE_STR, "telnet_pwd", telnetUserData->auth_buf);
+						ESP_LOGI(TAG, "Telnet password configured and saved to NVS");
+						auth_ok = true;
+					}
+				}
+				if (configured_pwd) free(configured_pwd);
+
+				if (auth_ok) {
+					telnetUserData->is_authenticated = true;
+					bIsAuthenticated = true;
+					telnetUserData->auth_attempts = 0;
+					telnetUserData->auth_buf_len = 0;
+					const char *welcome = "\r\nWelcome to Squeezelite-ESP32 Console\r\n\r\n";
+					telnet_send_text(thisTelnet, welcome, strlen(welcome));
+
+					if (i + 1 < event->data.size) {
+						console_push(&event->data.buffer[i + 1], event->data.size - (i + 1));
+					}
+					return;
+				} else {
+					telnetUserData->auth_attempts++;
+					telnetUserData->auth_buf_len = 0;
+					ESP_LOGW(TAG, "Telnet authentication failed (attempt %d/%d)", telnetUserData->auth_attempts, TELNET_AUTH_MAX_ATTEMPTS);
+
+					if (telnetUserData->auth_attempts >= TELNET_AUTH_MAX_ATTEMPTS) {
+						ESP_LOGW(TAG, "Maximum authentication attempts exceeded, disconnecting client");
+						const char *fail_msg = "\r\nAuthentication failed. Connection closed.\r\n";
+						telnet_send_text(thisTelnet, fail_msg, strlen(fail_msg));
+						close(partnerSocket);
+						partnerSocket = -1;
+						telnetUserData->sockfd = -1;
+						return;
+					} else {
+						const char *retry_msg = "\r\nPassword: ";
+						telnet_send_text(thisTelnet, retry_msg, strlen(retry_msg));
+					}
+				}
+			} else if (c == '\b' || (unsigned char)c == 0x7F) {
+				telnetUserData->last_was_cr = false;
+				if (telnetUserData->auth_buf_len > 0) {
+					telnetUserData->auth_buf_len--;
+				}
+			} else if (c >= 32 && c <= 126) {
+				telnetUserData->last_was_cr = false;
+				if (telnetUserData->auth_buf_len < sizeof(telnetUserData->auth_buf) - 1) {
+					telnetUserData->auth_buf[telnetUserData->auth_buf_len++] = c;
+				}
+			}
+		}
 		break;
 	case TELNET_EV_TTYPE:
 		telnet_ttype_send(telnetUserData->tnHandle);
@@ -203,13 +295,15 @@ static void handle_telnet_events(telnet_t *thisTelnet, telnet_event_t *event, vo
 	}
 }
 
+#define handle_telnet_events telnet_event_handler
+
 static size_t process_logs(UBaseType_t bytes, bool make_room){
 	UBaseType_t pending;
 
 	vRingbufferGetInfo(buf_handle, NULL, NULL, NULL, NULL, &pending);
 
 	// nothing to do or we can do 
-	if (!partnerSocket || (make_room && log_buf_size - pending > bytes)) return pending;
+	if (partnerSocket <= 0 || !bIsAuthenticated || (make_room && log_buf_size - pending > bytes)) return pending;
 
 	// can't send more than what we have
 	if (bytes > pending) bytes = pending;
@@ -218,7 +312,7 @@ static size_t process_logs(UBaseType_t bytes, bool make_room){
 		size_t size;
 		char *item = (char *)xRingbufferReceiveUpTo(buf_handle, &size, pdMS_TO_TICKS(50), bytes);
 		
-		if (!item || !partnerSocket) break;
+		if (!item || partnerSocket <= 0 || !bIsAuthenticated) break;
 
 		bytes -= size;
 		telnet_send_text(tnHandle, item, size);
@@ -241,16 +335,53 @@ static void handle_telnet_conn() {
 		{TELNET_TELOPT_LINEMODE,   TELNET_WONT, TELNET_DO },
 		{ -1, 0, 0 }
 	};
-	struct telnetUserData *pTelnetUserData = (struct telnetUserData *)heap_caps_malloc(sizeof(struct telnetUserData), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	tnHandle = telnet_init(my_telopts, handle_telnet_events, 0, pTelnetUserData);
+	telnet_userdata_t *pTelnetUserData = (telnet_userdata_t *)heap_caps_malloc(sizeof(telnet_userdata_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!pTelnetUserData) {
+		ESP_LOGE(TAG, "Failed to allocate telnet user data");
+		close(partnerSocket);
+		partnerSocket = 0;
+		return;
+	}
+	memset(pTelnetUserData, 0, sizeof(telnet_userdata_t));
+
+	tnHandle = telnet_init(my_telopts, telnet_event_handler, 0, pTelnetUserData);
 
 	pTelnetUserData->rxbuf = (char *) heap_caps_malloc(TELNET_RX_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!pTelnetUserData->rxbuf) {
+		ESP_LOGE(TAG, "Failed to allocate telnet rx buffer");
+		telnet_free(tnHandle);
+		tnHandle = NULL;
+		free(pTelnetUserData);
+		close(partnerSocket);
+		partnerSocket = 0;
+		return;
+	}
+
 	pTelnetUserData->tnHandle = tnHandle;
 	pTelnetUserData->sockfd = partnerSocket;
+	pTelnetUserData->is_authenticated = false;
+	pTelnetUserData->auth_attempts = 0;
+	pTelnetUserData->auth_timer = (uint32_t)xTaskGetTickCount();
+	pTelnetUserData->auth_buf_len = 0;
+	pTelnetUserData->last_was_cr = false;
+	bIsAuthenticated = false;
+
+	// Prompt client for password
+	char *pwd = (char *)config_alloc_get_str("telnet_pwd", NULL, NULL);
+	if (pwd && *pwd) {
+		const char *prompt = "Password: ";
+		telnet_send_text(tnHandle, prompt, strlen(prompt));
+	} else {
+		const char *warn_prompt = "\r\n[SECURITY WARNING] No telnet password configured in NVS. Please set a password.\r\nPassword: ";
+		telnet_send_text(tnHandle, warn_prompt, strlen(warn_prompt));
+	}
+	FREE_AND_NULL(pwd);
 
 	bool pending = true;
 
 	while(1) {
+		if (partnerSocket < 0) break;
+
 		fd_set rfds, wfds;
 		struct timeval timeout = {0, 200*1000};
 
@@ -258,18 +389,29 @@ static void handle_telnet_conn() {
 		FD_SET(partnerSocket, &rfds);
 
 		FD_ZERO(&wfds);
-		if (pending) FD_SET(partnerSocket, &wfds);
+		if (pending && pTelnetUserData->is_authenticated) FD_SET(partnerSocket, &wfds);
 
 		int res = select(partnerSocket + 1, &rfds, &wfds, NULL, &timeout);
 		if (res < 0) break;
 
+		if (!pTelnetUserData->is_authenticated) {
+			if ((xTaskGetTickCount() - pTelnetUserData->auth_timer) > pdMS_TO_TICKS(TELNET_AUTH_TIMEOUT_MS)) {
+				ESP_LOGW(TAG, "Telnet authentication timed out, disconnecting");
+				const char *timeout_msg = "\r\nAuthentication timed out. Disconnecting.\r\n";
+				telnet_send_text(tnHandle, timeout_msg, strlen(timeout_msg));
+				break;
+			}
+		}
+
 		if (FD_ISSET(partnerSocket, &rfds)) { 
 			int len = recv(partnerSocket, pTelnetUserData->rxbuf, TELNET_RX_BUF, 0);
-			if (!len) break;
+			if (len <= 0) break;
 			telnet_recv(tnHandle, pTelnetUserData->rxbuf, len);
 		}
 
-		if (FD_ISSET(partnerSocket, &wfds)) {	
+		if (partnerSocket < 0) break;
+
+		if (pTelnetUserData->is_authenticated && FD_ISSET(partnerSocket, &wfds)) {	
 			pending = process_logs(send_chunk, false) > 0;
 		} else {
 			pending = true;
@@ -280,10 +422,14 @@ static void handle_telnet_conn() {
 	tnHandle = NULL;
 
 	free(pTelnetUserData->rxbuf);
+	memset(pTelnetUserData->auth_buf, 0, sizeof(pTelnetUserData->auth_buf));
 	free(pTelnetUserData);
 
-	close(partnerSocket);
+	if (partnerSocket > 0) {
+		close(partnerSocket);
+	}
 	partnerSocket = 0;
+	bIsAuthenticated = false;
 }
 
 // ******************* stdout/stderr Redirection to ringbuffer

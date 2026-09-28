@@ -176,6 +176,8 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 
 	LOCK_O_direct;
 
+	int retries = 0;
+
 	while (frames > 0) {
 		frames_t f;
 		frames_t count;
@@ -191,6 +193,19 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 		);
 
 		f = min(f, frames);
+
+		if (f == 0) {
+			if (++retries >= 50) {
+				LOG_WARN("output buffer full, dropping remaining %u frames", (unsigned)frames);
+				break;
+			}
+			UNLOCK_O_direct;
+			usleep(5000);
+			LOCK_O_direct;
+			continue;
+		}
+
+		retries = 0;
 
 		count = f;
 				

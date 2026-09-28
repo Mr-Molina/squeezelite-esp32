@@ -452,8 +452,8 @@ esp_err_t console_cmd_post_handler(httpd_req_t *req){
 		return err;
 	}
 	if(!is_user_authenticated(req)){
-		// todo:  redirect to login page
-		// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
 	}
 	err = set_content_type_from_req(req);
 	if(err != ESP_OK){
@@ -537,6 +537,17 @@ esp_err_t config_get_handler(httpd_req_t *req){
 			err=ESP_FAIL;
 		}
 		else {
+			cJSON *cfg = cJSON_Parse(json);
+			if(cfg != NULL){
+				cJSON_DeleteItemFromObject(cfg, "password");
+				cJSON_DeleteItemFromObject(cfg, "ap_pwd");
+				char *filtered_json = cJSON_PrintUnformatted(cfg);
+				cJSON_Delete(cfg);
+				if(filtered_json != NULL){
+					free(json);
+					json = filtered_json;
+				}
+			}
 			ESP_LOGD_LOC(TAG,  "config json : %s",json );
 			cJSON * gplist=get_gpio_list(false);
 			char * gpliststr=cJSON_PrintUnformatted(gplist);
@@ -593,8 +604,8 @@ esp_err_t config_post_handler(httpd_req_t *req){
         return err;
     }
     if(!is_user_authenticated(req)){
-    	// todo:  redirect to login page
-    	// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
     }
 	err = set_content_type_from_req(req);
 	if(err != ESP_OK){
@@ -727,8 +738,8 @@ esp_err_t connect_post_handler(httpd_req_t *req){
 
 	char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
     if(!is_user_authenticated(req)){
-    	// todo:  redirect to login page
-    	// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
     }
 	cJSON *root = cJSON_Parse(buf);
 
@@ -806,8 +817,8 @@ esp_err_t reboot_post_handler(httpd_req_t *req){
     ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
     char success[]="{}";
     if(!is_user_authenticated(req)){
-    	// todo:  redirect to login page
-    	// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
     }
     esp_err_t err = set_content_type_from_req(req);
 	if(err != ESP_OK){
@@ -840,8 +851,8 @@ esp_err_t flash_post_handler(httpd_req_t *req){
 		ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
 		char success[]="File uploaded. Flashing started.";
 		if(!is_user_authenticated(req)){
-			// todo:  redirect to login page
-			// return ESP_OK;
+			httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+			return ESP_FAIL;
 		}
 		err = httpd_resp_set_type(req, HTTPD_TYPE_TEXT);
 		if(err != ESP_OK){

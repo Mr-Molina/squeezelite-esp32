@@ -32,6 +32,15 @@
 #include "platform_config.h"
 #include "nvs_utilities.h"
 #include "tools.h"
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#ifdef ESP_PLATFORM
+#include "esp_system.h"
+#if __has_include("esp_mac.h")
+#include "esp_mac.h"
+#endif
+#endif
  
 #if !defined(CLIENT_ID) || !defined(CLIENT_SECRET)
 #if __has_include("client_info.h")
@@ -49,6 +58,76 @@ static const struct {
     const char *ns;
     const char *credentials;
 } spotify_ns = { .ns = "spotify", .credentials = "credentials" };
+
+static const char *ENC_PREFIX = "enc:";
+
+static std::vector<uint8_t> getDeviceKey() {
+    uint8_t mac[6] = {0};
+#ifdef ESP_PLATFORM
+    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    }
+#endif
+    // Derive 16-byte key combining unique hardware MAC and domain-specific salt
+    static const uint8_t salt[16] = {
+        0x53, 0x70, 0x6f, 0x74, 0x4e, 0x56, 0x53, 0x4b,
+        0x65, 0x79, 0x24, 0x53, 0x65, 0x63, 0x75, 0x72
+    };
+    std::vector<uint8_t> key(16);
+    for (size_t i = 0; i < 16; i++) {
+        key[i] = salt[i] ^ mac[i % 6];
+    }
+    return key;
+}
+
+static std::string encryptCredentials(const std::string& plaintext) {
+    if (plaintext.empty()) return "";
+    size_t prefixLen = strlen(ENC_PREFIX);
+    if (plaintext.compare(0, prefixLen, ENC_PREFIX) == 0) {
+        return plaintext; // Already encrypted
+    }
+    std::vector<uint8_t> key = getDeviceKey();
+    std::string hexStr;
+    hexStr.reserve(prefixLen + plaintext.size() * 2);
+    hexStr = ENC_PREFIX;
+
+    char hexBuf[3];
+    for (size_t i = 0; i < plaintext.size(); i++) {
+        uint8_t encByte = (uint8_t)plaintext[i] ^ key[i % key.size()];
+        snprintf(hexBuf, sizeof(hexBuf), "%02x", encByte);
+        hexStr.append(hexBuf, 2);
+    }
+    return hexStr;
+}
+
+static std::string decryptCredentials(const std::string& ciphertext) {
+    if (ciphertext.empty()) return "";
+    size_t prefixLen = strlen(ENC_PREFIX);
+    if (ciphertext.compare(0, prefixLen, ENC_PREFIX) == 0) {
+        std::string hexPayload = ciphertext.substr(prefixLen);
+        if (hexPayload.size() % 2 != 0) {
+            CSPOT_LOG(error, "Invalid encrypted credentials hex payload length");
+            return "";
+        }
+        std::vector<uint8_t> key = getDeviceKey();
+        std::string plaintext;
+        plaintext.reserve(hexPayload.size() / 2);
+
+        for (size_t i = 0; i < hexPayload.size(); i += 2) {
+            if (!isxdigit((unsigned char)hexPayload[i]) || !isxdigit((unsigned char)hexPayload[i + 1])) {
+                CSPOT_LOG(error, "Invalid hex character in encrypted credentials");
+                return "";
+            }
+            char byteChars[3] = { hexPayload[i], hexPayload[i + 1], '\0' };
+            unsigned long val = strtoul(byteChars, nullptr, 16);
+            uint8_t decByte = (uint8_t)val ^ key[(i / 2) % key.size()];
+            plaintext.push_back((char)decByte);
+        }
+        return plaintext;
+    }
+    // If not prefixed (legacy plaintext starting with '{'), accept directly
+    return ciphertext;
+}
 
 /****************************************************************************************
  * Player's main class  & task
@@ -117,7 +196,7 @@ cspotPlayer::cspotPlayer(const char* name, httpd_handle_t server, int port, cspo
     if (!zeroConf) {
         char *credentials = (char*) get_nvs_value_alloc_for_partition(NVS_DEFAULT_PART_NAME, spotify_ns.ns, NVS_TYPE_STR, spotify_ns.credentials, NULL);
         if (credentials) {
-            this->credentials = credentials;
+            this->credentials = decryptCredentials(credentials);
             free(credentials); 
         }
     }
@@ -181,6 +260,7 @@ esp_err_t cspotPlayer::handlePOST(httpd_req_t *request) {
 
             while (key) {
                 char *value = strchr(key, '=');
+                if (!value) { key = strtok(NULL, "&"); continue; }
                 *value++ = '\0';
                 queryMap[key] = value;
                 key = strtok(NULL, "&");
@@ -354,7 +434,7 @@ void cspotPlayer::runTask() {
     CSPOT_LOG(info, "CSpot instance service name %s (id %s)", blob->getDeviceName().c_str(), blob->getDeviceId().c_str());
     
     if (!zeroConf && !credentials.empty()) {
-        blob->loadJson(credentials);
+        blob->loadJson(decryptCredentials(credentials));
         CSPOT_LOG(info, "Reusable credentials mode");
     } else {      
         // whether we want it or not we must use ZeroConf
@@ -384,10 +464,11 @@ void cspotPlayer::runTask() {
             if (!zeroConf) {
                 useZeroConf = false;
                 // can't call store_nvs... from a task running on EXTRAM stack
-                TimerHandle_t timer = xTimerCreate( "credentials", 1, pdFALSE, strdup(ctx->getCredentialsJson().c_str()),
+                TimerHandle_t timer = xTimerCreate( "credentials", 1, pdFALSE, strdup(encryptCredentials(ctx->getCredentialsJson()).c_str()),
                             [](TimerHandle_t xTimer) {
                                 auto credentials = (char*) pvTimerGetTimerID(xTimer);
-                                store_nvs_value_len_for_partition(NVS_DEFAULT_PART_NAME, spotify_ns.ns, NVS_TYPE_STR, spotify_ns.credentials, credentials, 0);
+                                std::string enc = encryptCredentials(credentials);
+                                store_nvs_value_len_for_partition(NVS_DEFAULT_PART_NAME, spotify_ns.ns, NVS_TYPE_STR, spotify_ns.credentials, (char*)enc.c_str(), 0);
                                 free(credentials);
                                 xTimerDelete(xTimer, portMAX_DELAY);
                             } );
