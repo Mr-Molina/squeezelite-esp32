@@ -3,6 +3,7 @@
 #include "unity_test_runner.h"
 #endif
 #include "cyd_link_dispatch.h"
+#include "cyd_link.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -172,3 +173,101 @@ TEST_CASE("CYD Link Rejects Malformed or Oversized Command", "[cyd_link]") {
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cyd_link_parse_command("{\"cmd\":\"vol_step\"}\n", &cmd));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cyd_link_parse_command("{\"cmd\":\"vol_step\",\"dir\":\"up\"}\n", &cmd));
 }
+
+static bool s_toggle_called = false;
+static void test_cmd_callback(cyd_cmd_type_t type, int32_t param) {
+    (void)param;
+    if (type == CYD_CMD_TOGGLE) s_toggle_called = true;
+}
+
+TEST_CASE("CYD Link Processes Line and Dispatches", "[cyd_link]") {
+    s_toggle_called = false;
+    cyd_link_set_cmd_handler(test_cmd_callback);
+    const char *cmd_line = "{\"cmd\":\"toggle\"}\n";
+    cyd_link_feed_rx_bytes(cmd_line, strlen(cmd_line));
+    TEST_ASSERT_TRUE(s_toggle_called);
+}
+
+static int s_vol_val = -1;
+static void test_vol_callback(cyd_cmd_type_t type, int32_t param) {
+    (void)type;
+    if (type == CYD_CMD_VOLUME) s_vol_val = param;
+}
+
+TEST_CASE("CYD Link Accumulates Fragmented Chunks Across Feeds", "[cyd_link]") {
+    s_vol_val = -1;
+    cyd_link_set_cmd_handler(test_vol_callback);
+    const char *part1 = "{\"cmd\":\"vo";
+    const char *part2 = "l\",\"val\":42}\r";
+    const char *part3 = "\n";
+    cyd_link_feed_rx_bytes(part1, strlen(part1));
+    TEST_ASSERT_EQUAL(-1, s_vol_val);
+    cyd_link_feed_rx_bytes(part2, strlen(part2));
+    TEST_ASSERT_EQUAL(-1, s_vol_val);
+    cyd_link_feed_rx_bytes(part3, strlen(part3));
+    TEST_ASSERT_EQUAL(42, s_vol_val);
+}
+
+static int s_cmd_count = 0;
+static void test_multi_callback(cyd_cmd_type_t type, int32_t param) {
+    (void)type;
+    (void)param;
+    s_cmd_count++;
+}
+
+TEST_CASE("CYD Link Handles Multiple Commands In Single Buffer", "[cyd_link]") {
+    s_cmd_count = 0;
+    cyd_link_set_cmd_handler(test_multi_callback);
+    const char *batch = "{\"cmd\":\"play\"}\n{\"cmd\":\"pause\"}\n{\"cmd\":\"next\"}\n";
+    cyd_link_feed_rx_bytes(batch, strlen(batch));
+    TEST_ASSERT_EQUAL(3, s_cmd_count);
+}
+
+static bool s_overflow_recovers = false;
+static void test_overflow_callback(cyd_cmd_type_t type, int32_t param) {
+    (void)param;
+    if (type == CYD_CMD_PREV) s_overflow_recovers = true;
+}
+
+TEST_CASE("CYD Link Guards Against Buffer Overflow and Recovers", "[cyd_link]") {
+    s_overflow_recovers = false;
+    cyd_link_set_cmd_handler(test_overflow_callback);
+    // Send 600 characters without newline (exceeding CYD_LINE_BUF_SIZE of 512)
+    char junk[600];
+    memset(junk, 'a', sizeof(junk));
+    cyd_link_feed_rx_bytes(junk, sizeof(junk));
+    // Terminate junk line
+    cyd_link_feed_rx_bytes("\n", 1);
+    TEST_ASSERT_FALSE(s_overflow_recovers);
+
+    // Send a valid command now to verify receiver recovered cleanly
+    const char *valid_cmd = "{\"cmd\":\"prev\"}\n";
+    cyd_link_feed_rx_bytes(valid_cmd, strlen(valid_cmd));
+    TEST_ASSERT_TRUE(s_overflow_recovers);
+}
+
+TEST_CASE("CYD Link Handles Edge Cases and Null Inputs", "[cyd_link]") {
+    // Null inputs to feed
+    cyd_link_feed_rx_bytes(NULL, 10);
+    cyd_link_feed_rx_bytes("test", 0);
+
+    // Standalone CR/LF should not trigger empty callbacks
+    s_cmd_count = 0;
+    cyd_link_set_cmd_handler(test_multi_callback);
+    cyd_link_feed_rx_bytes("\n\n\r\r\n", 5);
+    TEST_ASSERT_EQUAL(0, s_cmd_count);
+
+    // Send raw uninitialized state check
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cyd_link_send_raw(NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cyd_link_send_raw("{\"test\":1}\n"));
+
+    // Direct execute command helper
+    cyd_command_t cmd = { .type = CYD_CMD_PLAY, .param = 0 };
+    s_cmd_count = 0;
+    cyd_link_set_cmd_handler(test_multi_callback);
+    cyd_link_execute_command(&cmd);
+    TEST_ASSERT_EQUAL(1, s_cmd_count);
+    cyd_link_execute_command(NULL);
+    TEST_ASSERT_EQUAL(1, s_cmd_count);
+}
+
