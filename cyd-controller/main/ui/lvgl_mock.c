@@ -127,6 +127,12 @@ void lv_obj_add_style(lv_obj_t *obj, lv_style_t *style, lv_style_selector_t sele
     (void)selector;
 }
 
+void lv_obj_set_style_text_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector) {
+    (void)obj;
+    (void)value;
+    (void)selector;
+}
+
 void lv_obj_add_event_cb(lv_obj_t *obj, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data) {
     if (!obj || !event_cb) return;
     if (obj->event_cb_count < LV_MAX_EVENT_CBS) {

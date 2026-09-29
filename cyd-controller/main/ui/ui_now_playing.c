@@ -6,7 +6,23 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t s_ui_mutex = NULL;
 #endif
+
+void cyd_ui_lock(void) {
+#if defined(ESP_PLATFORM)
+    if (!s_ui_mutex) s_ui_mutex = xSemaphoreCreateMutex();
+    if (s_ui_mutex) xSemaphoreTake(s_ui_mutex, portMAX_DELAY);
+#endif
+}
+
+void cyd_ui_unlock(void) {
+#if defined(ESP_PLATFORM)
+    if (s_ui_mutex) xSemaphoreGive(s_ui_mutex);
+#endif
+}
 
 /* UI Widget Handles */
 static lv_obj_t *s_status_bar = NULL;
@@ -64,7 +80,8 @@ static void on_next_btn_event(lv_event_t *e) {
 }
 
 static void on_volume_slider_event(lv_event_t *e) {
-    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_VALUE_CHANGED) {
         lv_obj_t *slider = lv_event_get_target(e);
         int32_t vol = lv_slider_get_value(slider);
         uint32_t now = get_now_ms();
@@ -74,6 +91,13 @@ static void on_volume_slider_event(lv_event_t *e) {
         }
 
         s_last_vol_sent_ms = now;
+        s_has_sent_first_vol = true;
+        cyd_client_send_cmd("vol", vol);
+    } else if (code == LV_EVENT_RELEASED) {
+        // Flush trailing edge value upon touch release
+        lv_obj_t *slider = lv_event_get_target(e);
+        int32_t vol = lv_slider_get_value(slider);
+        s_last_vol_sent_ms = get_now_ms();
         s_has_sent_first_vol = true;
         cyd_client_send_cmd("vol", vol);
     }
@@ -201,6 +225,7 @@ void ui_now_playing_create(void) {
     lv_obj_add_style(s_slider_vol, &style_slider_indic, LV_PART_INDICATOR);
     lv_obj_add_style(s_slider_vol, &style_slider_knob, LV_PART_KNOB);
     lv_obj_add_event_cb(s_slider_vol, on_volume_slider_event, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_slider_vol, on_volume_slider_event, LV_EVENT_RELEASED, NULL);
 }
 
 void ui_now_playing_format_time(uint32_t seconds, char *buf, size_t buf_len) {
@@ -227,6 +252,8 @@ bool ui_now_playing_should_throttle_volume(uint32_t now_ms, uint32_t last_sent_m
 void ui_now_playing_update(const cyd_telemetry_state_t *state) {
     if (!state) return;
 
+    cyd_ui_lock();
+
     // Cache copy of current telemetry
     s_cached_state = *state;
 
@@ -245,10 +272,10 @@ void ui_now_playing_update(const cyd_telemetry_state_t *state) {
     if (s_badge_link) {
         if (state->link_active) {
             lv_label_set_text(s_badge_link, LV_SYMBOL_OK " ONLINE");
-            lv_obj_add_style(s_badge_link, &style_badge_online, LV_PART_MAIN);
+            lv_obj_set_style_text_color(s_badge_link, lv_color_hex(UI_COLOR_HEX_ONLINE), LV_PART_MAIN);
         } else {
             lv_label_set_text(s_badge_link, LV_SYMBOL_WARNING " OFFLINE");
-            lv_obj_add_style(s_badge_link, &style_badge_offline, LV_PART_MAIN);
+            lv_obj_set_style_text_color(s_badge_link, lv_color_hex(UI_COLOR_HEX_OFFLINE), LV_PART_MAIN);
         }
     }
 
@@ -313,6 +340,8 @@ void ui_now_playing_update(const cyd_telemetry_state_t *state) {
     if (s_slider_vol) {
         lv_slider_set_value(s_slider_vol, state->vol, LV_ANIM_OFF);
     }
+
+    cyd_ui_unlock();
 }
 
 const cyd_telemetry_state_t *ui_now_playing_get_cached_state(void) {

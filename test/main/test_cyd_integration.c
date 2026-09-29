@@ -56,6 +56,7 @@ static void h_prev(bool p)    { mock_action_handler(p, ACTRLS_PREV); }
 static void h_volup(bool p)   { mock_action_handler(p, ACTRLS_VOLUP); }
 static void h_voldown(bool p) { mock_action_handler(p, ACTRLS_VOLDOWN); }
 
+#if !defined(ESP_PLATFORM)
 actrls_handler get_ctrl_handler(actrls_action_e action) {
     switch (action) {
         case ACTRLS_TOGGLE:  return h_toggle;
@@ -72,6 +73,7 @@ actrls_handler get_ctrl_handler(actrls_action_e action) {
 void output_volume(uint8_t val) {
     s_mock_volume = (int)val;
 }
+#endif
 
 /* =========================================================================
  * Simulated Bidirectional Wire Pipe

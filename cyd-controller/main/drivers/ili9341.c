@@ -21,7 +21,8 @@ static void ili9341_send_cmd(uint8_t cmd) {
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
     t.length = 8;
-    t.tx_buffer = &cmd;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = cmd;
     t.user = (void *)(intptr_t)0; // DC = 0 for command
     spi_device_polling_transmit(s_spi, &t);
 }

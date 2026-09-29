@@ -8,6 +8,11 @@
 #if defined(ESP_PLATFORM)
 #include "audio_controls.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "platform_config.h"
+#include "network_status.h"
+static SemaphoreHandle_t s_cache_mutex = NULL;
 #else
 // Host test stubs
 typedef enum {
@@ -51,7 +56,21 @@ static uint32_t s_cached_elapsed = 0;
 static uint32_t s_cached_duration = 0;
 static uint8_t s_cached_vol = 50;
 
+static void cache_lock(void) {
+#if defined(ESP_PLATFORM)
+    if (!s_cache_mutex) s_cache_mutex = xSemaphoreCreateMutex();
+    if (s_cache_mutex) xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+#endif
+}
+
+static void cache_unlock(void) {
+#if defined(ESP_PLATFORM)
+    if (s_cache_mutex) xSemaphoreGive(s_cache_mutex);
+#endif
+}
+
 void cyd_link_set_cached_meta(const char *title, const char *artist, const char *album) {
+    cache_lock();
     if (title) {
         strncpy(s_cached_title, title, sizeof(s_cached_title) - 1);
         s_cached_title[sizeof(s_cached_title) - 1] = '\0';
@@ -64,11 +83,14 @@ void cyd_link_set_cached_meta(const char *title, const char *artist, const char 
         strncpy(s_cached_album, album, sizeof(s_cached_album) - 1);
         s_cached_album[sizeof(s_cached_album) - 1] = '\0';
     }
+    cache_unlock();
 }
 
 void cyd_link_hook_metadata(const char *artist, const char *album, const char *title) {
     cyd_link_set_cached_meta(title, artist, album);
+    cache_lock();
     char *msg = cyd_link_format_meta(s_cached_title, s_cached_artist, s_cached_album);
+    cache_unlock();
     if (msg) {
         cyd_link_send_raw(msg);
         free(msg);
@@ -76,9 +98,11 @@ void cyd_link_hook_metadata(const char *artist, const char *album, const char *t
 }
 
 void cyd_link_hook_timer(uint32_t elapsed, uint32_t duration) {
+    cache_lock();
     s_cached_elapsed = elapsed;
     s_cached_duration = duration;
     char *msg = cyd_link_format_status(s_cached_state, s_cached_elapsed, s_cached_duration, s_cached_vol);
+    cache_unlock();
     if (msg) {
         cyd_link_send_raw(msg);
         free(msg);
@@ -86,30 +110,60 @@ void cyd_link_hook_timer(uint32_t elapsed, uint32_t duration) {
 }
 
 void cyd_link_hook_playback_state(const char *state) {
+    cache_lock();
     if (state) {
         strncpy(s_cached_state, state, sizeof(s_cached_state) - 1);
         s_cached_state[sizeof(s_cached_state) - 1] = '\0';
     }
-    cyd_link_hook_timer(s_cached_elapsed, s_cached_duration);
+    uint32_t el = s_cached_elapsed;
+    uint32_t dur = s_cached_duration;
+    cache_unlock();
+    cyd_link_hook_timer(el, dur);
 }
 
 void cyd_link_broadcast_full_sync(void) {
-    char *sys_msg = cyd_link_format_sys("LMS", "Squeezelite-ESP32", "0.0.0.0");
+    const char *mode = "LMS";
+    const char *player = "Squeezelite-ESP32";
+    char ip_buf[32] = "0.0.0.0";
+#if defined(ESP_PLATFORM)
+    char *sta_ip = network_status_get_sta_ip_string();
+    if (sta_ip) {
+        if (strlen(sta_ip) > 0) {
+            strncpy(ip_buf, sta_ip, sizeof(ip_buf) - 1);
+            ip_buf[sizeof(ip_buf) - 1] = '\0';
+        }
+        free(sta_ip);
+    }
+    char *name = config_alloc_get_str("player_name", NULL, NULL);
+    if (name) {
+        player = name;
+    }
+#endif
+
+    char *sys_msg = cyd_link_format_sys(mode, player, ip_buf);
+#if defined(ESP_PLATFORM)
+    if (name) free(name);
+#endif
     if (sys_msg) {
         cyd_link_send_raw(sys_msg);
         free(sys_msg);
     }
+
+    cache_lock();
     char *meta_msg = cyd_link_format_meta(s_cached_title, s_cached_artist, s_cached_album);
+    char *stat_msg = cyd_link_format_status(s_cached_state, s_cached_elapsed, s_cached_duration, s_cached_vol);
+    cache_unlock();
+
     if (meta_msg) {
         cyd_link_send_raw(meta_msg);
         free(meta_msg);
     }
-    char *stat_msg = cyd_link_format_status(s_cached_state, s_cached_elapsed, s_cached_duration, s_cached_vol);
     if (stat_msg) {
         cyd_link_send_raw(stat_msg);
         free(stat_msg);
     }
 }
+
 
 static void on_cyd_command(cyd_cmd_type_t type, int32_t param) {
     actrls_handler handler = NULL;

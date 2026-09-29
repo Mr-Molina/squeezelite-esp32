@@ -47,7 +47,9 @@ static void gui_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "CYD GUI Task running");
     while (1) {
+        cyd_ui_lock();
         lv_timer_handler();
+        cyd_ui_unlock();
         vTaskDelay(pdMS_TO_TICKS(10));
         lv_tick_inc(10);
     }

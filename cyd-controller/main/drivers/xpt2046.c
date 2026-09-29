@@ -13,20 +13,19 @@ static spi_device_handle_t s_touch_spi = NULL;
 #define XPT2046_SAMPLE_COUNT 5
 
 static uint16_t xpt2046_read_raw(uint8_t cmd) {
-    uint8_t tx_data[3] = { cmd, 0x00, 0x00 };
-    uint8_t rx_data[3] = { 0, 0, 0 };
-
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
     t.length = 24; // 3 bytes
-    t.tx_buffer = tx_data;
-    t.rx_buffer = rx_data;
+    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.tx_data[0] = cmd;
+    t.tx_data[1] = 0x00;
+    t.tx_data[2] = 0x00;
 
     esp_err_t ret = spi_device_polling_transmit(s_touch_spi, &t);
     if (ret != ESP_OK) return 0;
 
     // 12-bit ADC value in bits 14..3 of 16-bit response
-    uint16_t val = ((((uint16_t)rx_data[1]) << 8) | rx_data[2]) >> 3;
+    uint16_t val = ((((uint16_t)t.rx_data[1]) << 8) | t.rx_data[2]) >> 3;
     return val & 0x0FFF;
 }
 
@@ -77,7 +76,7 @@ esp_err_t xpt2046_init(void) {
     };
     gpio_config(&irq_conf);
 
-    // Initialize SPI bus on SPI3_HOST (VSPI)
+    // Initialize SPI bus on SPI3_HOST (VSPI) without DMA (not needed for 3-byte touch transfers)
     spi_bus_config_t buscfg = {
         .mosi_io_num = CYD_TOUCH_MOSI,
         .miso_io_num = CYD_TOUCH_MISO,
@@ -86,7 +85,7 @@ esp_err_t xpt2046_init(void) {
         .quadhd_io_num = -1,
         .max_transfer_sz = 32,
     };
-    esp_err_t ret = spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_DISABLED);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to initialize Touch SPI bus: %d", ret);
         return ret;
@@ -116,8 +115,8 @@ void xpt2046_calibrate_raw(int16_t raw_x, int16_t raw_y, int16_t *out_x, int16_t
     int32_t x_range = (int32_t)s_cal_x_max - (int32_t)s_cal_x_min;
     int32_t y_range = (int32_t)s_cal_y_max - (int32_t)s_cal_y_min;
 
-    if (x_range <= 0) x_range = 1;
-    if (y_range <= 0) y_range = 1;
+    if (x_range == 0) x_range = 1;
+    if (y_range == 0) y_range = 1;
 
     int32_t cal_x = (int32_t)(raw_x - s_cal_x_min) * (CYD_TFT_WIDTH - 1) / x_range;
     int32_t cal_y = (int32_t)(raw_y - s_cal_y_min) * (CYD_TFT_HEIGHT - 1) / y_range;

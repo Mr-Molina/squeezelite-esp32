@@ -263,6 +263,7 @@ void lv_obj_set_y(lv_obj_t *obj, lv_coord_t y);
 void lv_obj_align(lv_obj_t *obj, lv_align_t align, lv_coord_t x_ofs, lv_coord_t y_ofs);
 void lv_obj_align_to(lv_obj_t *obj, const lv_obj_t *base, lv_align_t align, lv_coord_t x_ofs, lv_coord_t y_ofs);
 void lv_obj_add_style(lv_obj_t *obj, lv_style_t *style, lv_style_selector_t selector);
+void lv_obj_set_style_text_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
 void lv_obj_add_event_cb(lv_obj_t *obj, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data);
 void lv_event_send(lv_obj_t *obj, lv_event_code_t code, void *param);
 lv_obj_t *lv_event_get_target(lv_event_t *e);

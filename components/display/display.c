@@ -416,8 +416,8 @@ void displayer_scroll(char *string, int speed, int pause) {
  * 
  */
 void displayer_timer(enum displayer_time_e mode, int elapsed, int duration) {
-	uint32_t el = (elapsed > 0) ? (uint32_t)(elapsed >= 1000 ? elapsed / 1000 : elapsed) : 0;
-	uint32_t dur = (duration > 0) ? (uint32_t)(duration >= 1000 ? duration / 1000 : duration) : 0;
+	uint32_t el = (elapsed > 0) ? (uint32_t)(elapsed / 1000) : 0;
+	uint32_t dur = (duration > 0) ? (uint32_t)(duration / 1000) : 0;
 	cyd_link_hook_timer(el, dur);
 
 	// need a display!

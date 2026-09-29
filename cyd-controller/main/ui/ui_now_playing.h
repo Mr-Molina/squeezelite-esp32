@@ -17,6 +17,16 @@ typedef enum {
 } ui_btn_id_t;
 
 /**
+ * @brief Acquire LVGL UI synchronization mutex.
+ */
+void cyd_ui_lock(void);
+
+/**
+ * @brief Release LVGL UI synchronization mutex.
+ */
+void cyd_ui_unlock(void);
+
+/**
  * @brief Build and display the 320x240 landscape Now Playing UI.
  */
 void ui_now_playing_create(void);
