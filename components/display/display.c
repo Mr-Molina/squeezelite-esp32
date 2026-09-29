@@ -22,6 +22,7 @@
 #include "gds_text.h"
 #include "gds_font.h"
 #include "gds_image.h"
+#include "cyd_link_hooks.h"
 
 static const char *TAG = "display";
 
@@ -321,6 +322,8 @@ bool displayer_can_artwork(void) {
  * 
  */
 void displayer_metadata(char *artist, char *album, char *title) {
+	cyd_link_hook_metadata(artist, album, title);
+
 	char *string = displayer.string, *p;
 	int len = SCROLLABLE_SIZE;
 	
@@ -413,6 +416,10 @@ void displayer_scroll(char *string, int speed, int pause) {
  * 
  */
 void displayer_timer(enum displayer_time_e mode, int elapsed, int duration) {
+	uint32_t el = (elapsed > 0) ? (uint32_t)(elapsed >= 1000 ? elapsed / 1000 : elapsed) : 0;
+	uint32_t dur = (duration > 0) ? (uint32_t)(duration >= 1000 ? duration / 1000 : duration) : 0;
+	cyd_link_hook_timer(el, dur);
+
 	// need a display!
 	if (!display) return;
 	

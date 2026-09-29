@@ -4,6 +4,7 @@
 #endif
 #include "cyd_link_dispatch.h"
 #include "cyd_link.h"
+#include "cyd_link_hooks.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -269,5 +270,170 @@ TEST_CASE("CYD Link Handles Edge Cases and Null Inputs", "[cyd_link]") {
     TEST_ASSERT_EQUAL(1, s_cmd_count);
     cyd_link_execute_command(NULL);
     TEST_ASSERT_EQUAL(1, s_cmd_count);
+}
+
+// Mock audio control handlers and output_volume for testing
+#if !defined(ESP_PLATFORM)
+typedef enum {
+    ACTRLS_NONE = -1, ACTRLS_POWER, ACTRLS_VOLUP, ACTRLS_VOLDOWN, ACTRLS_TOGGLE, ACTRLS_PLAY,
+    ACTRLS_PAUSE, ACTRLS_STOP, ACTRLS_REW, ACTRLS_FWD, ACTRLS_PREV, ACTRLS_NEXT,
+    BCTRLS_UP, BCTRLS_DOWN, BCTRLS_LEFT, BCTRLS_RIGHT,
+    BCTRLS_PS0,BCTRLS_PS1,BCTRLS_PS2,BCTRLS_PS3,BCTRLS_PS4,BCTRLS_PS5,BCTRLS_PS6,BCTRLS_PS7,BCTRLS_PS8,BCTRLS_PS9,
+    KNOB_LEFT, KNOB_RIGHT, KNOB_PUSH,
+    ACTRLS_SLEEP,
+    ACTRLS_REMAP, ACTRLS_MAX
+} actrls_action_e;
+typedef void (*actrls_handler)(bool pressed);
+#endif
+
+static bool s_mock_toggle = false;
+static bool s_mock_play = false;
+static bool s_mock_pause = false;
+static bool s_mock_next = false;
+static bool s_mock_prev = false;
+static bool s_mock_volup = false;
+static bool s_mock_voldown = false;
+static int s_mock_vol_val = -1;
+
+static void mock_toggle_handler(bool pressed) { if (pressed) s_mock_toggle = true; }
+static void mock_play_handler(bool pressed) { if (pressed) s_mock_play = true; }
+static void mock_pause_handler(bool pressed) { if (pressed) s_mock_pause = true; }
+static void mock_next_handler(bool pressed) { if (pressed) s_mock_next = true; }
+static void mock_prev_handler(bool pressed) { if (pressed) s_mock_prev = true; }
+static void mock_volup_handler(bool pressed) { if (pressed) s_mock_volup = true; }
+static void mock_voldown_handler(bool pressed) { if (pressed) s_mock_voldown = true; }
+
+actrls_handler get_ctrl_handler(actrls_action_e action) {
+    switch (action) {
+        case ACTRLS_TOGGLE: return mock_toggle_handler;
+        case ACTRLS_PLAY: return mock_play_handler;
+        case ACTRLS_PAUSE: return mock_pause_handler;
+        case ACTRLS_NEXT: return mock_next_handler;
+        case ACTRLS_PREV: return mock_prev_handler;
+        case ACTRLS_VOLUP: return mock_volup_handler;
+        case ACTRLS_VOLDOWN: return mock_voldown_handler;
+        default: return NULL;
+    }
+}
+
+void output_volume(uint8_t val) {
+    s_mock_vol_val = (int)val;
+}
+
+static char s_tx_log[16][256];
+static int s_tx_log_count = 0;
+static void test_capture_tx(const char *data, size_t len) {
+    if (s_tx_log_count < 16 && len < 256) {
+        memcpy(s_tx_log[s_tx_log_count], data, len);
+        s_tx_log[s_tx_log_count][len] = '\0';
+        s_tx_log_count++;
+    }
+}
+
+TEST_CASE("CYD Link Hooks Cache Metadata and Broadcast Full Sync", "[cyd_link]") {
+    cyd_link_init();
+    cyd_link_set_tx_spy(test_capture_tx);
+    s_tx_log_count = 0;
+
+    cyd_link_set_cached_meta("Bohemian Rhapsody", "Queen", "A Night at the Opera");
+    cyd_link_hook_playback_state("play");
+    cyd_link_hook_timer(120, 355);
+
+    // Verify timer hook emitted status event
+    TEST_ASSERT_TRUE(s_tx_log_count > 0);
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[s_tx_log_count - 1], "\"event\":\"status\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[s_tx_log_count - 1], "\"state\":\"play\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[s_tx_log_count - 1], "\"elapsed\":120"));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[s_tx_log_count - 1], "\"duration\":355"));
+
+    // Reset capture and test broadcast full sync
+    s_tx_log_count = 0;
+    cyd_link_broadcast_full_sync();
+
+    // Broadcast full sync sends sys, meta, status in order
+    TEST_ASSERT_EQUAL(3, s_tx_log_count);
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[0], "\"event\":\"sys\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[1], "\"event\":\"meta\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[1], "\"title\":\"Bohemian Rhapsody\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[1], "\"artist\":\"Queen\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[1], "\"album\":\"A Night at the Opera\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[2], "\"event\":\"status\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[2], "\"state\":\"play\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[2], "\"elapsed\":120"));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[2], "\"duration\":355"));
+
+    // Test hook_metadata updates cache and sends meta event
+    s_tx_log_count = 0;
+    cyd_link_hook_metadata("Pink Floyd", "The Dark Side", "Money");
+    TEST_ASSERT_EQUAL(1, s_tx_log_count);
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[0], "\"event\":\"meta\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[0], "\"title\":\"Money\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[0], "\"artist\":\"Pink Floyd\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[0], "\"album\":\"The Dark Side\""));
+
+    cyd_link_set_tx_spy(NULL);
+}
+
+TEST_CASE("CYD Link Hooks Dispatch Commands to Audio Control Handlers", "[cyd_link]") {
+    cyd_link_hooks_init();
+
+    // Toggle
+    s_mock_toggle = false;
+    const char *toggle_cmd = "{\"cmd\":\"toggle\"}\n";
+    cyd_link_feed_rx_bytes(toggle_cmd, strlen(toggle_cmd));
+    TEST_ASSERT_TRUE(s_mock_toggle);
+
+    // Play
+    s_mock_play = false;
+    const char *play_cmd = "{\"cmd\":\"play\"}\n";
+    cyd_link_feed_rx_bytes(play_cmd, strlen(play_cmd));
+    TEST_ASSERT_TRUE(s_mock_play);
+
+    // Pause
+    s_mock_pause = false;
+    const char *pause_cmd = "{\"cmd\":\"pause\"}\n";
+    cyd_link_feed_rx_bytes(pause_cmd, strlen(pause_cmd));
+    TEST_ASSERT_TRUE(s_mock_pause);
+
+    // Next
+    s_mock_next = false;
+    const char *next_cmd = "{\"cmd\":\"next\"}\n";
+    cyd_link_feed_rx_bytes(next_cmd, strlen(next_cmd));
+    TEST_ASSERT_TRUE(s_mock_next);
+
+    // Prev
+    s_mock_prev = false;
+    const char *prev_cmd = "{\"cmd\":\"prev\"}\n";
+    cyd_link_feed_rx_bytes(prev_cmd, strlen(prev_cmd));
+    TEST_ASSERT_TRUE(s_mock_prev);
+
+    // Vol Step Up
+    s_mock_volup = false;
+    const char *volup_cmd = "{\"cmd\":\"vol_step\",\"dir\":1}\n";
+    cyd_link_feed_rx_bytes(volup_cmd, strlen(volup_cmd));
+    TEST_ASSERT_TRUE(s_mock_volup);
+
+    // Vol Step Down
+    s_mock_voldown = false;
+    const char *voldown_cmd = "{\"cmd\":\"vol_step\",\"dir\":-1}\n";
+    cyd_link_feed_rx_bytes(voldown_cmd, strlen(voldown_cmd));
+    TEST_ASSERT_TRUE(s_mock_voldown);
+
+    // Volume Set
+    s_mock_vol_val = -1;
+    const char *vol_cmd = "{\"cmd\":\"vol\",\"val\":85}\n";
+    cyd_link_feed_rx_bytes(vol_cmd, strlen(vol_cmd));
+    TEST_ASSERT_EQUAL(85, s_mock_vol_val);
+
+    // Sync command from CYD triggers sync broadcast
+    cyd_link_set_tx_spy(test_capture_tx);
+    s_tx_log_count = 0;
+    const char *sync_cmd = "{\"cmd\":\"sync\"}\n";
+    cyd_link_feed_rx_bytes(sync_cmd, strlen(sync_cmd));
+    TEST_ASSERT_EQUAL(3, s_tx_log_count);
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[0], "\"event\":\"sys\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[1], "\"event\":\"meta\""));
+    TEST_ASSERT_NOT_NULL(strstr(s_tx_log[2], "\"event\":\"status\""));
+    cyd_link_set_tx_spy(NULL);
 }
 

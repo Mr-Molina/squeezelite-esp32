@@ -46,6 +46,8 @@
 #include "gds_font.h"
 #include "led_vu.h"
 #include "display.h"
+#include "cyd_link.h"
+#include "cyd_link_hooks.h"
 #include "accessors.h"
 #include "cmd_system.h"
 #include "tools.h"
@@ -412,6 +414,10 @@ void app_main()
 	MEMTRACE_PRINT_DELTA();
 	ESP_LOGI(TAG,"Initializing display");
 	display_init("SqueezeESP32");
+	MEMTRACE_PRINT_DELTA();
+	ESP_LOGI(TAG, "Initializing CYD UART management link");
+	cyd_link_init();
+	cyd_link_hooks_init();
 	MEMTRACE_PRINT_DELTA();
 	char *target = config_alloc_get_str("target", CONFIG_TARGET, NULL);
 	if (target) {

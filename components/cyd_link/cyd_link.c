@@ -76,11 +76,16 @@ static const char *TAG __attribute__((unused)) = "cyd_link";
 static uart_port_t s_uart_num = UART_NUM_1;
 static SemaphoreHandle_t s_tx_mutex = NULL;
 static cyd_link_cmd_cb_t s_cmd_handler = NULL;
+static cyd_link_tx_cb_t s_tx_spy = NULL;
 static char s_rx_line[CYD_LINE_BUF_SIZE];
 static size_t s_rx_idx = 0;
 
 void cyd_link_set_cmd_handler(cyd_link_cmd_cb_t handler) {
     s_cmd_handler = handler;
+}
+
+void cyd_link_set_tx_spy(cyd_link_tx_cb_t spy) {
+    s_tx_spy = spy;
 }
 
 void cyd_link_execute_command(const cyd_command_t *cmd) {
@@ -132,6 +137,10 @@ esp_err_t cyd_link_send_raw(const char *json_line) {
     if (!json_line || !s_tx_mutex) return ESP_ERR_INVALID_STATE;
     size_t len = strlen(json_line);
     if (len == 0) return ESP_OK;
+
+    if (s_tx_spy) {
+        s_tx_spy(json_line, len);
+    }
 
     if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         int written = uart_write_bytes(s_uart_num, json_line, len);

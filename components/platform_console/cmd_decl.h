@@ -18,6 +18,7 @@ extern "C" {
 #include "cmd_i2ctools.h"
 #include "cmd_ota.h"
 #include "cmd_config.h"
+void register_cyd(void);
 #ifdef __cplusplus
 }
 #endif

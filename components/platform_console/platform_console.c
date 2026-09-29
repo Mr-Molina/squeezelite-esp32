@@ -397,6 +397,8 @@ void console_start() {
 	}
 	MEMTRACE_PRINT_DELTA_MESSAGE("Registering i2c commands");
 	register_i2ctools();
+	MEMTRACE_PRINT_DELTA_MESSAGE("Registering cyd commands");
+	register_cyd();
 	
 	printf("\n");
 	if(is_recovery_running){
