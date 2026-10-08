@@ -20,6 +20,7 @@
  */
 
 #include "squeezelite.h"
+#include <esp_heap_caps.h>
 
 #include <mad.h>
 
@@ -344,7 +345,10 @@ static decode_state mad_decode(void) {
 
 static void mad_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
 	if (!m->readbuf) {
-		m->readbuf = malloc(READBUF_SIZE + MAD_BUFFER_GUARD);
+		m->readbuf = heap_caps_malloc(READBUF_SIZE + MAD_BUFFER_GUARD, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		if (!m->readbuf) {
+			m->readbuf = malloc(READBUF_SIZE + MAD_BUFFER_GUARD);
+		}
 	}
 	m->checktags = 1;
 	m->consume = 0;
@@ -407,7 +411,10 @@ struct codec *register_mad(void) {
 		mad_decode,   // decode
 	};
 
-	m = malloc(sizeof(struct mad));
+	m = heap_caps_malloc(sizeof(struct mad), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	if (!m) {
+		m = malloc(sizeof(struct mad));
+	}
 	if (!m) {
 		return NULL;
 	}
@@ -416,6 +423,8 @@ struct codec *register_mad(void) {
 	m->readbuf_len = 0;
 
 	if (!load_mad()) {
+		free(m);
+		m = NULL;
 		return NULL;
 	}
 

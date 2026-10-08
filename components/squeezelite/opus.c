@@ -53,6 +53,7 @@ struct opus {
 	int rate, gain, pre_skip;
 	size_t overframes;
 	u8_t *overbuf;
+	opus_int16 *pcmbuf;
 	int channels;
 };
 
@@ -277,28 +278,97 @@ static decode_state opus_decompress(void) {
 	);
     
     int packet, n = 0;
+
+	if (!u->pcmbuf || !u->overbuf) {
+		LOG_ERROR("opus buffers not allocated");
+		UNLOCK_O_direct;
+		return DECODE_ERROR;
+	}
 	
     // get some packets and decode them, or use the leftover from previous pass
     if (u->overframes) {
 		/* use potential leftover from previous encoding. We know that it will fit this time
 		 * as min_space is >=MAX_OPUS_FRAMES and we start from the beginning of the buffer */
-		memcpy(write_buf, u->overbuf, u->overframes * BYTES_PER_FRAME);
-		n = u->overframes;
-		u->overframes = 0;
+		size_t out_f = min(frames, u->overframes);
+		memcpy(write_buf, u->overbuf, out_f * BYTES_PER_FRAME);
+		u->overframes -= out_f;
+		if (u->overframes) {
+			memmove(u->overbuf, u->overbuf + (out_f * BYTES_PER_FRAME), u->overframes * BYTES_PER_FRAME);
+		}
+		frames = out_f;
+		n = out_f;
 	} else if ((packet = get_audio_packet()) > 0) {
-		if (frames < MAX_OPUS_FRAMES) {
-			// don't have enough contiguous space, use the overflow buffer
-			n = OP(&gu, decode, u->decoder, u->packet.packet, u->packet.bytes, (opus_int16*) u->overbuf, MAX_OPUS_FRAMES, 0);
-			if (n > 0) {
-				u->overframes = n - min(n, frames);
-				n = min(n, frames);
-				memcpy(write_buf, u->overbuf, n * BYTES_PER_FRAME);
-				memmove(u->overbuf, u->overbuf + (n * BYTES_PER_FRAME), u->overframes * BYTES_PER_FRAME);
+		n = OP(&gu, decode, u->decoder, u->packet.packet, u->packet.bytes, (opus_int16*) u->pcmbuf, MAX_OPUS_FRAMES, 0);
+		if (n > 0) {
+			size_t out_f = min((size_t)n, frames);
+			u->overframes = n - out_f;
+			s16_t *iptr = (s16_t *) u->pcmbuf;
+			ISAMPLE_T *optr = (ISAMPLE_T *) write_buf;
+
+			// Forward sequential unpack to write_buf (PSRAM)
+			if (u->channels == 2) {
+#if BYTES_PER_FRAME == 8
+				size_t count = out_f;
+#if SL_LITTLE_ENDIAN
+				while (count--) {
+					u32_t val = *(u32_t *) iptr;
+					iptr += 2;
+					*optr++ = (ISAMPLE_T) (val << 16);
+					*optr++ = (ISAMPLE_T) (val & 0xffff0000);
+				}
+#else
+				while (count--) {
+					*optr++ = ALIGN(*iptr++);
+					*optr++ = ALIGN(*iptr++);
+				}
+#endif
+#else
+				memcpy(optr, iptr, out_f * BYTES_PER_FRAME);
+				iptr += out_f * 2;
+#endif
+			} else if (u->channels == 1) {
+				size_t count = out_f;
+				while (count--) {
+					ISAMPLE_T s = ALIGN(*iptr++);
+					*optr++ = s;
+					*optr++ = s;
+				}
 			}
-		} else {
-			/* we just do one packet at a time, although we could loop on packets but that means locking the 
-			 * outputbuf and streambuf for maybe a long time while we process it all, so don't do that */
-			n = OP(&gu, decode, u->decoder, u->packet.packet, u->packet.bytes, (opus_int16*) write_buf, frames, 0);
+
+			// If any leftover frames, unpack remainder into u->overbuf for next pass
+			if (u->overframes) {
+				ISAMPLE_T *over_optr = (ISAMPLE_T *) u->overbuf;
+				if (u->channels == 2) {
+#if BYTES_PER_FRAME == 8
+					size_t count = u->overframes;
+#if SL_LITTLE_ENDIAN
+					while (count--) {
+						u32_t val = *(u32_t *) iptr;
+						iptr += 2;
+						*over_optr++ = (ISAMPLE_T) (val << 16);
+						*over_optr++ = (ISAMPLE_T) (val & 0xffff0000);
+					}
+#else
+					while (count--) {
+						*over_optr++ = ALIGN(*iptr++);
+						*over_optr++ = ALIGN(*iptr++);
+					}
+#endif
+#else
+					memcpy(over_optr, iptr, u->overframes * BYTES_PER_FRAME);
+#endif
+				} else if (u->channels == 1) {
+					size_t count = u->overframes;
+					while (count--) {
+						ISAMPLE_T s = ALIGN(*iptr++);
+						*over_optr++ = s;
+						*over_optr++ = s;
+					}
+				}
+			}
+
+			frames = out_f;
+			n = out_f;
 		}
 	} else if (!packet) {
 		UNLOCK_O_direct;
@@ -306,35 +376,6 @@ static decode_state opus_decompress(void) {
 	}
 			
 	if (n > 0) {
-		frames_t count;
-		s16_t *iptr;
-		ISAMPLE_T *optr;
-
-		frames = n;
-		count = frames * u->channels;
-
-		// work backward to unpack samples (if needed)
-		iptr = (s16_t *) write_buf + count;
-		IF_DIRECT(
-			optr = (ISAMPLE_T *) outputbuf->writep + frames * 2;
-		)
-		IF_PROCESS(
-			optr = (ISAMPLE_T *) write_buf + frames * 2;
-		)
-		
-		if (u->channels == 2) {
-#if BYTES_PER_FRAME == 8
-			while (count--) {
-				*--optr = ALIGN(*--iptr);
-			}
-#endif
-		} else if (u->channels == 1) {
-			while (count--) {
-				*--optr = ALIGN(*--iptr);
-				*--optr = ALIGN(*iptr);
-			}
-		}
-
 		IF_DIRECT(
 			_buf_inc_writep(outputbuf, frames * BYTES_PER_FRAME);
 		);
@@ -370,6 +411,7 @@ static void opus_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
     u->decoder = NULL;
     
 	if (!u->overbuf) u->overbuf = malloc(MAX_OPUS_FRAMES * BYTES_PER_FRAME);
+	if (!u->pcmbuf) u->pcmbuf = malloc(MAX_OPUS_FRAMES * 2 * sizeof(opus_int16));
     
     u->status = OGG_ID_HEADER;
 	u->overframes = 0;
@@ -383,8 +425,10 @@ static void opus_close(void) {
 	if (u->decoder) OP(&gu, decoder_destroy, u->decoder);
     u->decoder = NULL;
     
-	free(u->overbuf);
+	if (u->overbuf) free(u->overbuf);
     u->overbuf = NULL;
+	if (u->pcmbuf) free(u->pcmbuf);
+    u->pcmbuf = NULL;
     
     OG(&go, stream_clear, &u->state);
     OG(&go, sync_clear, &u->sync);

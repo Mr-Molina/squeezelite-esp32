@@ -45,6 +45,25 @@ struct buffer *streambuf = &buf;
 #define LOCK     mutex_lock(streambuf->mutex)
 #define UNLOCK   mutex_unlock(streambuf->mutex)
 
+#define STREAM_BUFFER_LOW_WATERMARK 512
+
+// PERF-13: When contiguous space drops below watermark while space is available across wrap,
+// unwrap (shift) the buffer so socket reads / recv() are not called repeatedly for tiny fragments.
+static inline size_t _stream_cont_write(struct buffer *buf) {
+	size_t cont = _buf_cont_write(buf);
+	if (cont < STREAM_BUFFER_LOW_WATERMARK && _buf_space(buf) > cont) {
+		if (buf->writep >= buf->readp && buf->readp > buf->buf) {
+			size_t used = buf->writep - buf->readp;
+			memmove(buf->buf, buf->readp, used);
+			buf->readp = buf->buf;
+			buf->writep = buf->buf + used;
+			cont = _buf_cont_write(buf);
+			LOG_SDEBUG("unwrapped streambuf write space to %u bytes", cont);
+		}
+	}
+	return cont;
+}
+
 /* 
 When LMS sends a close/open sequence very quickly, the stream thread might
 still be waiting in the poll() on the closed socket. It is never recommended
@@ -320,7 +339,7 @@ static void *stream_thread() {
 
 		LOCK;
 
-		space = min(_buf_space(streambuf), _buf_cont_write(streambuf));
+		space = min(_buf_space(streambuf), _stream_cont_write(streambuf));
 
 		if (fd < 0 || !space || stream.state <= STREAMING_WAIT) {
 			UNLOCK;
@@ -478,7 +497,7 @@ static void *stream_thread() {
 				} else {
 					int n;
 
-					space = min(_buf_space(streambuf), _buf_cont_write(streambuf));
+					space = min(_buf_space(streambuf), _stream_cont_write(streambuf));
 					if (stream.meta_interval) {
 						space = min(space, stream.meta_next);
 					}

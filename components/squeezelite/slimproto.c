@@ -25,6 +25,10 @@
 #include "squeezelite.h"
 #include "slimproto.h"
 
+#if !WIN
+#include <netinet/tcp.h>
+#endif
+
 static log_level loglevel;
 
 #define SQUEEZENETWORK "mysqueezebox.com:3483"
@@ -141,9 +145,14 @@ static void sendHELO(bool reconnect, const char *fixed_cap, const char *var_cap,
 
 	if (!reconnect) player_id = PLAYER_ID;
 
+	size_t base_len = strlen(base_cap);
+	size_t fixed_len = strlen(fixed_cap);
+	size_t var_len = strlen(var_cap);
+	size_t total_len = sizeof(pkt) + base_len + fixed_len + var_len;
+
 	memset(&pkt, 0, sizeof(pkt));
 	memcpy(&pkt.opcode, "HELO", 4);
-	pkt.length = htonl(sizeof(struct HELO_packet) - 8 + strlen(base_cap) + strlen(fixed_cap) + strlen(var_cap));
+	pkt.length = htonl(sizeof(struct HELO_packet) - 8 + base_len + fixed_len + var_len);
 	pkt.deviceid = player_id;
 	pkt.revision = 0;
 	packn(&pkt.wlan_channellist, reconnect ? 0x4000 : 0x0000);
@@ -154,12 +163,25 @@ static void sendHELO(bool reconnect, const char *fixed_cap, const char *var_cap,
 	LOG_INFO("mac: %02x:%02x:%02x:%02x:%02x:%02x", pkt.mac[0], pkt.mac[1], pkt.mac[2], pkt.mac[3], pkt.mac[4], pkt.mac[5]);
 
 	LOG_INFO("cap: %s%s%s", base_cap, fixed_cap, var_cap);
-	LOCK_P;
-	send_packet((u8_t *)&pkt, sizeof(pkt));
-	send_packet((u8_t *)base_cap, strlen(base_cap));
-	send_packet((u8_t *)fixed_cap, strlen(fixed_cap));
-	send_packet((u8_t *)var_cap, strlen(var_cap));
-	UNLOCK_P;
+	u8_t *buf = malloc(total_len);
+	if (buf) {
+		u8_t *p = buf;
+		memcpy(p, &pkt, sizeof(pkt)); p += sizeof(pkt);
+		memcpy(p, base_cap, base_len); p += base_len;
+		memcpy(p, fixed_cap, fixed_len); p += fixed_len;
+		memcpy(p, var_cap, var_len);
+		LOCK_P;
+		send_packet(buf, total_len);
+		UNLOCK_P;
+		free(buf);
+	} else {
+		LOCK_P;
+		send_packet((u8_t *)&pkt, sizeof(pkt));
+		send_packet((u8_t *)base_cap, base_len);
+		send_packet((u8_t *)fixed_cap, fixed_len);
+		send_packet((u8_t *)var_cap, var_len);
+		UNLOCK_P;
+	}
 }
 
 static void sendSTAT(const char *event, u32_t server_timestamp) {
@@ -233,6 +255,9 @@ static void sendDSCO(disconnect_code disconnect) {
 
 static void sendRESP(const char *header, size_t len) {
 	struct RESP_header pkt_header;
+	size_t total_len = sizeof(pkt_header) + len;
+	u8_t stack_buf[512];
+	u8_t *buf;
 
 	memset(&pkt_header, 0, sizeof(pkt_header));
 	memcpy(&pkt_header.opcode, "RESP", 4);
@@ -240,14 +265,27 @@ static void sendRESP(const char *header, size_t len) {
 
 	LOG_DEBUG("RESP");
 	
-	LOCK_P;
-	send_packet((u8_t *)&pkt_header, sizeof(pkt_header));
-	send_packet((u8_t *)header, len);
-	UNLOCK_P;
+	buf = (total_len <= sizeof(stack_buf)) ? stack_buf : malloc(total_len);
+	if (buf) {
+		memcpy(buf, &pkt_header, sizeof(pkt_header));
+		memcpy(buf + sizeof(pkt_header), header, len);
+		LOCK_P;
+		send_packet(buf, total_len);
+		UNLOCK_P;
+		if (buf != stack_buf) free(buf);
+	} else {
+		LOCK_P;
+		send_packet((u8_t *)&pkt_header, sizeof(pkt_header));
+		send_packet((u8_t *)header, len);
+		UNLOCK_P;
+	}
 }
 
 static void sendMETA(const char *meta, size_t len) {
 	struct META_header pkt_header;
+	size_t total_len = sizeof(pkt_header) + len;
+	u8_t stack_buf[512];
+	u8_t *buf;
 
 	memset(&pkt_header, 0, sizeof(pkt_header));
 	memcpy(&pkt_header.opcode, "META", 4);
@@ -255,27 +293,51 @@ static void sendMETA(const char *meta, size_t len) {
 
 	LOG_DEBUG("META");
 
-	LOCK_P;
-	send_packet((u8_t *)&pkt_header, sizeof(pkt_header));
-	send_packet((u8_t *)meta, len);
-	UNLOCK_P;
+	buf = (total_len <= sizeof(stack_buf)) ? stack_buf : malloc(total_len);
+	if (buf) {
+		memcpy(buf, &pkt_header, sizeof(pkt_header));
+		memcpy(buf + sizeof(pkt_header), meta, len);
+		LOCK_P;
+		send_packet(buf, total_len);
+		UNLOCK_P;
+		if (buf != stack_buf) free(buf);
+	} else {
+		LOCK_P;
+		send_packet((u8_t *)&pkt_header, sizeof(pkt_header));
+		send_packet((u8_t *)meta, len);
+		UNLOCK_P;
+	}
 }
 
 static void sendSETDName(const char *name) {
 	struct SETD_header pkt_header;
+	size_t name_len = strlen(name) + 1;
+	size_t total_len = sizeof(pkt_header) + name_len;
+	u8_t stack_buf[sizeof(pkt_header) + PLAYER_NAME_LEN + 1];
+	u8_t *buf;
 
 	memset(&pkt_header, 0, sizeof(pkt_header));
 	memcpy(&pkt_header.opcode, "SETD", 4);
 
 	pkt_header.id = 0; // id 0 is playername S:P:Squeezebox2
-	pkt_header.length = htonl(sizeof(pkt_header) + strlen(name) + 1 - 8);
+	pkt_header.length = htonl(sizeof(pkt_header) + name_len - 8);
 
 	LOG_DEBUG("set playername: %s", name);
 
-	LOCK_P;
-	send_packet((u8_t *)&pkt_header, sizeof(pkt_header));
-	send_packet((u8_t *)name, strlen(name) + 1);
-	UNLOCK_P;
+	buf = (total_len <= sizeof(stack_buf)) ? stack_buf : malloc(total_len);
+	if (buf) {
+		memcpy(buf, &pkt_header, sizeof(pkt_header));
+		memcpy(buf + sizeof(pkt_header), name, name_len);
+		LOCK_P;
+		send_packet(buf, total_len);
+		UNLOCK_P;
+		if (buf != stack_buf) free(buf);
+	} else {
+		LOCK_P;
+		send_packet((u8_t *)&pkt_header, sizeof(pkt_header));
+		send_packet((u8_t *)name, name_len);
+		UNLOCK_P;
+	}
 }
 
 #if IR
@@ -318,6 +380,7 @@ static void process_strm(u8_t *pkt, int len) {
 			if (stream_disconnect() || flushed) sendSTAT("STMf", 0);
 			buf_flush(streambuf);
             output.stop_time = gettime_ms();
+			wake_controller();
 			break;
 		}
 	case 'q':
@@ -327,6 +390,7 @@ static void process_strm(u8_t *pkt, int len) {
 		if (stream_disconnect() && strm->command == 'f') sendSTAT("STMf", 0);
 		buf_flush(streambuf);
 		output.stop_time = gettime_ms();
+		wake_controller();
 		break;
 	case 'p':
 		{
@@ -340,6 +404,7 @@ static void process_strm(u8_t *pkt, int len) {
 				output.stop_time = gettime_ms();
 			}
 			UNLOCK_O;
+			wake_controller();
 			if (!interval) sendSTAT("STMp", 0);
 			LOG_DEBUG("pause interval: %u", interval);
 		}
@@ -351,6 +416,7 @@ static void process_strm(u8_t *pkt, int len) {
 			output.skip_frames = interval * status.current_sample_rate / 1000;
 			output.state = OUTPUT_SKIP_FRAMES;				
 			UNLOCK_O;
+			wake_controller();
 			LOG_DEBUG("skip ahead interval: %u", interval);
 		}
 		break;
@@ -361,6 +427,7 @@ static void process_strm(u8_t *pkt, int len) {
 			output.state = jiffies ? OUTPUT_START_AT : OUTPUT_RUNNING;
 			output.start_at = jiffies;
 			UNLOCK_O;
+			wake_controller();
 
 			LOG_DEBUG("unpause at: %u now: %u", jiffies, gettime_ms());
 			sendSTAT("STMr", 0);
@@ -421,6 +488,7 @@ static void process_strm(u8_t *pkt, int len) {
 			output.invert = (strm->flags & 0x03) == 0x03;
 			output.channels = (strm->flags & 0x0c) >> 2;
 			UNLOCK_O;            
+			wake_controller();
 			LOG_DEBUG("set fade: %u, channels: %u, invert: %u", output.fade_mode, output.channels, output.invert);
 		}
 		break;
@@ -1045,6 +1113,10 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 		sock = socket(AF_INET, SOCK_STREAM, 0);
 		set_nonblock(sock);
 		set_nosigpipe(sock);
+		int nodelay = 1;
+		setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
+		int keepalive = 1;
+		setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&keepalive, sizeof(keepalive));
 		UNLOCK_P;
 
 		if (connect_timeout(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr), 5) != 0) {

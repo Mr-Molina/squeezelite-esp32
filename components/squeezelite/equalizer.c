@@ -86,11 +86,13 @@ static const float loudness_envelope_coefficients[EQ_BANDS][POLYNOME_COUNT] = {
 static void calculate_loudness(void) {
     char trace[128];
     size_t n = 0;
+    float v = equalizer.volume;
 	for (int i = 0; i < EQ_BANDS; i++) {
 		equalizer.loudness_gain[i] = 0.0f;
-		for (int j = 0; j < POLYNOME_COUNT && equalizer.loudness != 0; j++) {
-			equalizer.loudness_gain[i] +=
-				loudness_envelope_coefficients[i][j] * pow(equalizer.volume, j);
+		if (equalizer.loudness != 0) {
+			// Horner's method: c0 + v*(c1 + v*(c2 + v*(c3 + v*(c4 + v*c5))))
+			float const *c = loudness_envelope_coefficients[i];
+			equalizer.loudness_gain[i] = c[0] + v * (c[1] + v * (c[2] + v * (c[3] + v * (c[4] + v * c[5]))));
 		}
 		equalizer.loudness_gain[i] *= equalizer.loudness / 2;
         if (n < sizeof(trace)) {

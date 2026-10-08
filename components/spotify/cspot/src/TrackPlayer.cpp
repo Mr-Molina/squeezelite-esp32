@@ -51,7 +51,7 @@ static long vorbisTellCb(TrackPlayer* self) {
 TrackPlayer::TrackPlayer(std::shared_ptr<cspot::Context> ctx,
                          std::shared_ptr<cspot::TrackQueue> trackQueue,
                          EOFCallback eof, TrackLoadedCallback trackLoaded)
-    : bell::Task("cspot_player", 48 * 1024, 5, 1) {
+    : bell::Task("cspot_player", 32 * 1024, 5, 1, false) {
   this->ctx = ctx;
   this->eofCallback = eof;
   this->trackLoaded = trackLoaded;
@@ -243,7 +243,7 @@ void TrackPlayer::runTask() {
                                        toWrite, track->identifier);
               }
               if (written == 0) {
-                BELL_SLEEP_MS(50);
+                BELL_SLEEP_MS(10);
               }
               toWrite -= written;
             }

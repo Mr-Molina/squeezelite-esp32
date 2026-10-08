@@ -13,7 +13,7 @@ extern "C" {
 #define CYD_UART_NUM      UART_NUM_2
 #define CYD_UART_TX_PIN   27
 #define CYD_UART_RX_PIN   22
-#define CYD_UART_BAUD     115200
+#define CYD_UART_BAUD     460800
 
 /**
  * @brief Spy callback type for intercepting outbound UART transmission.
@@ -23,7 +23,7 @@ typedef void (*cyd_tx_spy_cb_t)(const char *data, size_t len);
 /**
  * @brief Initialize UART2 and start background receive task and heartbeat timer.
  *
- * Configures UART_NUM_2 on TX: GPIO 27, RX: GPIO 22 at 115200 8N1.
+ * Configures UART_NUM_2 on TX: GPIO 27, RX: GPIO 22 at 460800 8N1.
  *
  * @return ESP_OK on success, or an error code.
  */
@@ -72,7 +72,7 @@ void cyd_client_get_state_copy(cyd_telemetry_state_t *out);
 /**
  * @brief Feed raw bytes into the line receiver accumulator.
  *
- * Strips '\r', buffers up to 512 bytes, and parses/dispatches on '\n'.
+ * Strips '\r', buffers up to 1024 bytes, and parses/dispatches on '\n'.
  * Protects against buffer overrun by discarding corrupted lines.
  *
  * @param buf Pointer to byte buffer

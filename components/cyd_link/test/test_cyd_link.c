@@ -250,8 +250,8 @@ static void test_overflow_callback(cyd_cmd_type_t type, int32_t param) {
 TEST_CASE("CYD Link Guards Against Buffer Overflow and Recovers", "[cyd_link]") {
     s_overflow_recovers = false;
     cyd_link_set_cmd_handler(test_overflow_callback);
-    // Send 600 characters without newline (exceeding CYD_LINE_BUF_SIZE of 512)
-    char junk[600];
+    // Send 1200 characters without newline (exceeding CYD_LINE_BUF_SIZE of 1024)
+    char junk[1200];
     memset(junk, 'a', sizeof(junk));
     cyd_link_feed_rx_bytes(junk, sizeof(junk));
     // Terminate junk line
@@ -262,6 +262,19 @@ TEST_CASE("CYD Link Guards Against Buffer Overflow and Recovers", "[cyd_link]") 
     const char *valid_cmd = "{\"cmd\":\"prev\"}\n";
     cyd_link_feed_rx_bytes(valid_cmd, strlen(valid_cmd));
     TEST_ASSERT_TRUE(s_overflow_recovers);
+}
+
+TEST_CASE("CYD Link Handles Payloads Larger Than 512 Bytes Up To 1024", "[cyd_link]") {
+    s_cmd_count = 0;
+    cyd_link_set_cmd_handler(test_multi_callback);
+    // Construct ~800 byte valid JSON command line to verify MEM-01 support
+    char large_payload[850];
+    int offset = snprintf(large_payload, sizeof(large_payload), "{\"cmd\":\"play\",\"pad\":\"");
+    memset(large_payload + offset, 'X', 700);
+    snprintf(large_payload + offset + 700, sizeof(large_payload) - (offset + 700), "\"}\n");
+
+    cyd_link_feed_rx_bytes(large_payload, strlen(large_payload));
+    TEST_ASSERT_EQUAL(1, s_cmd_count);
 }
 
 TEST_CASE("CYD Link Handles Edge Cases and Null Inputs", "[cyd_link]") {

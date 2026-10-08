@@ -940,6 +940,8 @@ static void network_wifi_event_handler(void* arg, esp_event_base_t event_base, i
 
         case WIFI_EVENT_STA_STOP:
             ESP_LOGD(TAG, "WIFI_EVENT_STA_STOP");
+            /* LAT-07: Restore power save when station stops / idle */
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
             break;
 
         case WIFI_EVENT_STA_CONNECTED: {
@@ -952,6 +954,14 @@ static void network_wifi_event_handler(void* arg, esp_event_base_t event_base, i
             }
             FREE_AND_NULL(bssid);
             FREE_AND_NULL(ssid);
+            /* LAT-07: Disable modem sleep / WiFi power save during connected state
+             * to eliminate 100-300ms DTIM sleep latency and audio packet dropouts */
+            esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+            if (ps_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set WiFi power save to WIFI_PS_NONE: %s", esp_err_to_name(ps_err));
+            } else {
+                ESP_LOGI(TAG, "WiFi power save set to WIFI_PS_NONE (modem sleep disabled for low-latency streaming)");
+            }
             network_async(EN_CONNECTED);
 
         } break;
@@ -977,6 +987,8 @@ static void network_wifi_event_handler(void* arg, esp_event_base_t event_base, i
             char* bssid = network_manager_alloc_get_mac_string(s->bssid);
             ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED. From BSSID: %s, reason code: %d (%s)", STR_OR_BLANK(bssid), s->reason, get_disconnect_code_desc(s->reason));
             FREE_AND_NULL(bssid);
+            /* LAT-07: Restore power saving mode when disconnected / idle */
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
             if (s->reason == WIFI_REASON_ROAMING) {
                 ESP_LOGI(TAG, "WiFi Roaming to new access point");
             } else {
@@ -1440,6 +1452,8 @@ void network_wifi_clear_config() {
     if ((err = esp_wifi_disconnect()) != ESP_OK) {
         ESP_LOGW(TAG, "Could not disconnect from deleted network : %s", esp_err_to_name(err));
     }
+    /* LAT-07: Restore power save when explicitly disconnected / idle */
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 }
 
 char* get_disconnect_code_desc(uint8_t reason) {

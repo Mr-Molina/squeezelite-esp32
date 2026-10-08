@@ -74,8 +74,10 @@ static inline int xTaskCreate(TaskFunction_t fn, const char *n, int s, void *p, 
 #endif
 
 static const char *TAG __attribute__((unused)) = "cyd_link";
-#define CYD_LINE_BUF_SIZE 512
+#define CYD_LINE_BUF_SIZE 1024
 #define CYD_UART_BUF_SIZE 1024
+#define CYD_UART_RX_BUF_SIZE (CYD_UART_BUF_SIZE * 2)
+#define CYD_UART_TX_BUF_SIZE 1024
 
 static uart_port_t s_uart_num = UART_NUM_1;
 static SemaphoreHandle_t s_tx_mutex = NULL;
@@ -143,7 +145,7 @@ static void cyd_uart_rx_task(void *pvParameters) {
     (void)pvParameters;
     uint8_t data[128];
     while (1) {
-        int len = uart_read_bytes(s_uart_num, data, sizeof(data), pdMS_TO_TICKS(50));
+        int len = uart_read_bytes(s_uart_num, data, sizeof(data), pdMS_TO_TICKS(10));
         if (len > 0) {
             cyd_link_feed_rx_bytes((const char *)data, len);
         } else if (len < 0) {
@@ -201,9 +203,9 @@ esp_err_t cyd_link_init(void) {
 
     int uart_port = 1;
     int tx_pin = -1, rx_pin = -1;
-    int baud = 115200;
+    int baud = 460800;
 
-    // Parse cyd_config: e.g. "uart=1,tx=17,rx=16,baud=115200"
+    // Parse cyd_config: e.g. "uart=1,tx=17,rx=16,baud=460800"
     char *p = cyd_cfg;
     while (p && *p) {
         if (strncmp(p, "uart=", 5) == 0) {
@@ -249,7 +251,7 @@ esp_err_t cyd_link_init(void) {
         ESP_LOGE(TAG, "Failed to set UART pins: %d", err);
         return err;
     }
-    err = uart_driver_install(s_uart_num, CYD_UART_BUF_SIZE * 2, 0, 0, NULL, 0);
+    err = uart_driver_install(s_uart_num, CYD_UART_RX_BUF_SIZE, CYD_UART_TX_BUF_SIZE, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install UART driver: %d", err);
         return err;

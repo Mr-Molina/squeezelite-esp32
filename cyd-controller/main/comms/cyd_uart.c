@@ -79,7 +79,9 @@ static inline int64_t esp_timer_get_time(void) {
 
 static const char *TAG __attribute__((unused)) = "cyd_uart";
 
-#define CYD_LINE_BUF_SIZE 512
+#define CYD_LINE_BUF_SIZE 1024
+#define CYD_UART_RX_BUF_SIZE 2048
+#define CYD_UART_TX_BUF_SIZE 1024
 #define CYD_HEARTBEAT_TIMEOUT_US  5000000LL  // 5 seconds
 #define CYD_RESYNC_INTERVAL_US    3000000LL  // 3 seconds
 
@@ -276,7 +278,7 @@ static void cyd_client_rx_task(void *pvParameters) {
     (void)pvParameters;
     uint8_t data[128];
     while (1) {
-        int len = uart_read_bytes(CYD_UART_NUM, data, sizeof(data), pdMS_TO_TICKS(50));
+        int len = uart_read_bytes(CYD_UART_NUM, data, sizeof(data), pdMS_TO_TICKS(10));
         if (len > 0) {
             cyd_client_feed_rx_bytes((const char *)data, len);
         }
@@ -325,7 +327,7 @@ esp_err_t cyd_client_uart_init(void) {
     ESP_ERROR_CHECK(uart_param_config(CYD_UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(CYD_UART_NUM, CYD_UART_TX_PIN, CYD_UART_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(CYD_UART_NUM, 1024, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(CYD_UART_NUM, CYD_UART_RX_BUF_SIZE, CYD_UART_TX_BUF_SIZE, 0, NULL, 0));
 
     xTaskCreate(cyd_client_rx_task, "cyd_uart_rx", 3072, NULL, ESP_TASK_PRIO_MIN + 2, &s_rx_task_handle);
 

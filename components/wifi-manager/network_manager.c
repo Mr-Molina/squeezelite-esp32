@@ -288,7 +288,7 @@ void network_start() {
         s_wifi_prioritized = false;
     }
     ESP_LOGD(TAG, " Creating message queue");
-    network_queue = xQueueCreate(16, sizeof(queue_message));
+    network_queue = xQueueCreate(32, sizeof(queue_message));
     ESP_LOGD(TAG, " Creating network manager task");
     network_task_handle = xTaskCreate(&network_task, "network", 4096, NULL, WIFI_MANAGER_TASK_PRIORITY, &task_network_manager);
 }
@@ -499,7 +499,10 @@ void network_async(network_event_t trigger) {
     memset(&msg,0x00,sizeof(msg));
     msg.trigger = trigger;
     ESP_LOGD(TAG, "Posting event %s directly", event_to_string(trigger));
-    xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500));
+    if (xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to post event %s: queue full or timed out", event_to_string(trigger));
+        return;
+    }
 }
 void network_async_fail() {
     network_async(EN_FAIL);
@@ -555,7 +558,12 @@ void network_async_connect(const char * ssid, const char * password) {
         msg.password = strdup_psram(password);
     }
     ESP_LOGD(TAG, "Posting event %s", event_to_string(msg.trigger));
-    xQueueSendToBack(network_queue, &msg, portMAX_DELAY);
+    if (xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to submit connect event to queue (SSID: %s): queue full or timed out", STR_OR_BLANK(ssid));
+        FREE_AND_NULL(msg.ssid);
+        FREE_AND_NULL(msg.password);
+        return;
+    }
 }
 void network_async_lost_connection(wifi_event_sta_disconnected_t* disconnected_event) {
     queue_message msg;
@@ -564,7 +572,11 @@ void network_async_lost_connection(wifi_event_sta_disconnected_t* disconnected_e
     ESP_LOGD(TAG, "Posting event %s", event_to_string(msg.trigger));
     msg.disconnected_event =  clone_obj_psram(disconnected_event,sizeof(wifi_event_sta_disconnected_t));
     if(msg.disconnected_event){
-        xQueueSendToBack(network_queue, &msg, portMAX_DELAY);
+        if (xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500)) != pdTRUE) {
+            ESP_LOGE(TAG, "Failed to submit lost connection event: queue full or timed out");
+            free(msg.disconnected_event);
+            return;
+        }
     }
     else {
         ESP_LOGE(TAG,"Unable to post lost connection event.");
@@ -576,7 +588,10 @@ void network_async_reboot(reboot_type_t rtype) {
     msg.trigger = EN_REBOOT;
     msg.rtype = rtype;
     ESP_LOGD(TAG, "Posting event %s - type %d", event_to_string(msg.trigger),rtype);
-    xQueueSendToBack(network_queue, &msg, portMAX_DELAY);
+    if (xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to submit reboot event (type %d): queue full or timed out", rtype);
+        return;
+    }
 }
 
 void network_reboot_ota(char* url) {
@@ -593,7 +608,11 @@ void network_reboot_ota(char* url) {
         msg.strval = strdup_psram(url);
     }
     
-    xQueueSendToBack(network_queue, &msg, portMAX_DELAY);
+    if (xQueueSendToBack(network_queue, &msg, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to submit reboot OTA event: queue full or timed out");
+        FREE_AND_NULL(msg.strval);
+        return;
+    }
 }
 
 network_t* network_get_state_machine() {
@@ -715,10 +734,21 @@ void network_ip_event_handler(void* arg, esp_event_base_t event_base, int32_t ev
                      IP2STR(&ip_info->gw),
                      IP2STR(&ip_info->netmask),
                      s->ip_changed ? "Address was changed" : "Address unchanged");
+            if (event_id == IP_EVENT_STA_GOT_IP) {
+                /* LAT-07: Disable WiFi modem sleep when connected to prevent DTIM audio packet dropouts */
+                esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+                if (ps_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to set WiFi power save to WIFI_PS_NONE on IP acquisition: %s", esp_err_to_name(ps_err));
+                } else {
+                    ESP_LOGI(TAG, "WiFi power save set to WIFI_PS_NONE on IP acquisition (low-latency streaming enabled)");
+                }
+            }
             network_async(event_id == IP_EVENT_ETH_GOT_IP ? EN_ETH_GOT_IP : EN_GOT_IP);
             break;
         case IP_EVENT_STA_LOST_IP:
             ESP_LOGD(TAG, "IP_EVENT_STA_LOST_IP");
+            /* LAT-07: Restore power save when IP is lost / idle */
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
             break;
         case IP_EVENT_AP_STAIPASSIGNED:
             ESP_LOGD(TAG, "IP_EVENT_AP_STAIPASSIGNED");

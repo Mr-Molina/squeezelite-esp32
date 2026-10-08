@@ -10,6 +10,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_dsp.h"
 #include "squeezelite.h"
 #include "slimproto.h"
@@ -186,6 +187,7 @@ static struct scroller_s {
 static struct {
 	u8_t *data;
 	u32_t size;
+	u32_t capacity;
 	u16_t x, y;
 	bool enable, full;
 } artwork;
@@ -241,9 +243,34 @@ extern const struct {
 
 static log_level loglevel = lINFO;
 
+extern struct outputstate output;
+
 static bool (*slimp_handler_chain)(u8_t *data, int len);
 static void (*notify_chain)(in_addr_t ip, u16_t hport, u16_t cport);
 static bool (*display_bus_chain)(void *from, enum display_bus_cmd_e cmd);
+static void (*slimp_loop_chain)(void);
+
+static inline void displayer_wake(void) {
+	if (displayer.task) {
+		xTaskNotifyGive(displayer.task);
+		vTaskResume(displayer.task);
+	}
+}
+
+static void displayer_slimp_loop(void) {
+	static output_state last_state = OUTPUT_OFF;
+	static bool last_running = false;
+	output_state cur_state = output.state;
+	bool cur_running = visu_export.running;
+
+	if (cur_state != last_state || cur_running != last_running) {
+		last_state = cur_state;
+		last_running = cur_running;
+		displayer_wake();
+	}
+
+	if (slimp_loop_chain) slimp_loop_chain();
+}
 
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 
@@ -337,22 +364,33 @@ bool sb_displayer_init(void) {
 	
 		// allocate gray-color mapping if needed;
 		if (GDS_GetMode(display) > GDS_GRAYSCALE) {
-			grayMap = malloc(256*sizeof(*grayMap));
-			for (int i = 0; i < 256; i++) grayMap[i] = GDS_GrayMap(display, i);
+			grayMap = heap_caps_malloc(256*sizeof(*grayMap), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+			if (!grayMap) grayMap = malloc(256*sizeof(*grayMap));
+			if (grayMap) {
+				for (int i = 0; i < 256; i++) grayMap[i] = GDS_GrayMap(display, i);
+			}
 		}
 	
 		// create visu configuration
 		visu.bar_gap = 1;
-		visu.back.frame = calloc(1, (displayer.width * displayer.height) / 8);
+		size_t visu_back_sz = (displayer.width * displayer.height) / 8;
+		visu.back.frame = heap_caps_calloc(1, visu_back_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!visu.back.frame) visu.back.frame = calloc(1, visu_back_sz);
 		
 		// prepare the VU raw data in PSRAM
 		memcpy(vu_bitmap, vu_base, sizeof(vu_bitmap));
 		
-		// size scroller (width + current screen)
+		// size scroller (width + current screen) in external PSRAM to save internal DRAM (~150KB)
 		scroller.scroll.max = (displayer.width * displayer.height / 8) * (15 + 1);
-		scroller.scroll.frame = malloc(scroller.scroll.max);
-		scroller.back.frame = malloc(displayer.width * displayer.height / 8);
-		scroller.frame = malloc(displayer.width * displayer.height / 8);
+		scroller.scroll.frame = heap_caps_malloc(scroller.scroll.max, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!scroller.scroll.frame) scroller.scroll.frame = malloc(scroller.scroll.max);
+
+		size_t frame_sz = displayer.width * displayer.height / 8;
+		scroller.back.frame = heap_caps_malloc(frame_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!scroller.back.frame) scroller.back.frame = malloc(frame_sz);
+
+		scroller.frame = heap_caps_malloc(frame_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (!scroller.frame) scroller.frame = malloc(frame_sz);
 		
 		// chain handlers
 		display_bus_chain = display_bus;
@@ -381,6 +419,9 @@ bool sb_displayer_init(void) {
 	notify_chain = server_notify;
 	server_notify = server;
 	
+	slimp_loop_chain = slimp_loop;
+	slimp_loop = displayer_slimp_loop;
+	
 	return display != NULL;
 }
 
@@ -401,6 +442,7 @@ static bool display_bus_handler(void *from, enum display_bus_cmd_e cmd) {
 		break;
 	case DISPLAY_BUS_GIVE:
 		displayer.owned = true;
+		displayer_wake();
 		break;
 	}
 	
@@ -469,6 +511,7 @@ static void server(in_addr_t ip, u16_t hport, u16_t cport) {
 		
 	// inform new LMS server of our capabilities
 	sendSETD(GDS_GetWidth(display), GDS_GetHeight(display), led_visu.config);
+	displayer_wake();
 	
 	if (notify_chain) (*notify_chain)(ip, hport, cport);
 }
@@ -504,6 +547,8 @@ static bool handler(u8_t *data, int len){
 	// chain protocol handlers (bitwise or is fine)
 	if (*slimp_handler_chain) res |= (*slimp_handler_chain)(data, len);
 	
+	if (res) displayer_wake();
+
 	return res;
 }
 
@@ -859,7 +904,7 @@ static void grfg_handler(u8_t *data, int len) {
 	xSemaphoreGive(displayer.mutex);
 	
 	// resume task once we have background, not in grfs
-	vTaskResume(displayer.task);
+	displayer_wake();
 }
 
 
@@ -892,7 +937,7 @@ static void grfa_handler(u8_t *data, int len) {
 		return;
 	}
 	
-	// new grfa artwork, allocate memory
+	// new grfa artwork, allocate or grow reusable memory buffer
 	if (!offset) {	
 		// same trick to clean current/previous window
 		if (artwork.size) {
@@ -904,20 +949,32 @@ static void grfa_handler(u8_t *data, int len) {
 		artwork.x = htons(pkt->x);
 		artwork.y = htons(pkt->y);
 		artwork.full = artwork.enable && artwork.x == 0 && artwork.y == 0;
-		if (artwork.data) free(artwork.data);
-		artwork.data = malloc(length);		
+		if (length > artwork.capacity) {
+			void *new_buf = heap_caps_realloc(artwork.data, length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+			if (!new_buf) {
+				new_buf = realloc(artwork.data, length);
+			}
+			if (new_buf) {
+				artwork.data = (u8_t *)new_buf;
+				artwork.capacity = length;
+			} else {
+				LOG_ERROR("failed to allocate %u bytes for artwork", length);
+				return;
+			}
+		}
 	}	
 	
 	// copy artwork data
-	memcpy(artwork.data + offset, data + sizeof(struct grfa_packet), size);
-	artwork.size += size;
-	if (artwork.size == length) {
-		GDS_ClearWindow(display, artwork.x, artwork.y, -1, -1, GDS_COLOR_BLACK);
-		xSemaphoreTake(displayer.mutex, portMAX_DELAY);			
-		GDS_DrawJPEG(display, artwork.data, artwork.x, artwork.y, artwork.y < displayer.height ? (GDS_IMAGE_RIGHT | GDS_IMAGE_TOP) : GDS_IMAGE_CENTER);
-		xSemaphoreGive(displayer.mutex);		
-		free(artwork.data);
-		artwork.data = NULL;
+	if (artwork.data) {
+		memcpy(artwork.data + offset, data + sizeof(struct grfa_packet), size);
+		artwork.size += size;
+		if (artwork.size == length) {
+			GDS_ClearWindow(display, artwork.x, artwork.y, -1, -1, GDS_COLOR_BLACK);
+			xSemaphoreTake(displayer.mutex, portMAX_DELAY);			
+			GDS_DrawJPEG(display, artwork.data, artwork.x, artwork.y, artwork.y < displayer.height ? (GDS_IMAGE_RIGHT | GDS_IMAGE_TOP) : GDS_IMAGE_CENTER);
+			xSemaphoreGive(displayer.mutex);		
+			// Reusable buffer: retain artwork.data and artwork.capacity to prevent heap fragmentation
+		}
 	} 
 		
 	LOG_DEBUG("gfra l:%u x:%hu, y:%hu, o:%u s:%u", length, artwork.x, artwork.y, offset, size);
@@ -1258,7 +1315,7 @@ static void visu_handler( u8_t *data, int len) {
 		} else {
 			// de-activate scroller if we are taking main screen
 			if (visu.row < displayer.height) scroller.active = false;
-			vTaskResume(displayer.task);
+			displayer_wake();
 		}	
 		displayer.wake = 0;
 		
@@ -1273,6 +1330,7 @@ static void visu_handler( u8_t *data, int len) {
 	}	
 	
 	xSemaphoreGive(displayer.mutex);
+	displayer_wake();
 }	
 
 /****************************************************************************************
@@ -1313,7 +1371,7 @@ static void ledv_handler( u8_t *data, int len) {
 	xSemaphoreGive(displayer.mutex);
 	
 	// resume displayer task
-	vTaskResume(displayer.task);
+	displayer_wake();
 }	
 
 /****************************************************************************************
@@ -1334,6 +1392,7 @@ static void ledd_handler( u8_t *data, int len) {
 	displayer.wake = 1000; // wait a little while
 
 	xSemaphoreGive(displayer.mutex);
+	displayer_wake();
 }	
 
 /****************************************************************************************
@@ -1343,20 +1402,22 @@ static void ledd_handler( u8_t *data, int len) {
   */
 static void displayer_task(void *args) {
 	int sleep;
+	static output_state last_output_state = OUTPUT_OFF;
+	static bool last_running = false;
 
 	while (1) {
 		xSemaphoreTake(displayer.mutex, portMAX_DELAY);
 		
-		// suspend ourselves if nothing to do, grfg or visu will wake us up
-		if (!scroller.active && !visu.mode && !led_visu.mode)  {
-			xSemaphoreGive(displayer.mutex);
-			vTaskSuspend(NULL);
-			xSemaphoreTake(displayer.mutex, portMAX_DELAY);
-			scroller.wake = displayer.wake = 0;
-		}	
+		bool is_playing = (output.state == OUTPUT_RUNNING) && visu_export.running;
+		bool state_changed = (output.state != last_output_state) || (visu_export.running != last_running);
+		last_output_state = output.state;
+		last_running = visu_export.running;
 
-		// go for long sleep when either item is disabled
+		bool need_update = false;
+
+		// go for long sleep when visualizer is disabled or player is stopped/paused
 		if (!visu.mode && !led_visu.mode) displayer.wake = LONG_WAKE;
+		else if (!is_playing && !state_changed) displayer.wake = LONG_WAKE;
 		if (!scroller.active) scroller.wake = LONG_WAKE;
 								
 		// scroll required amount of columns (within the window)
@@ -1369,7 +1430,10 @@ static void displayer_task(void *args) {
 				memcpy(scroller.frame, scroller.back.frame, scroller.back.width * displayer.height / 8);
 				for (int i = 0; i < scroller.width * displayer.height / 8; i++) scroller.frame[i] |= scroller.scroll.frame[scroller.scrolled * displayer.height / 8 + i];
 				scroller.scrolled += scroller.by;
-				if (displayer.owned) GDS_DrawBitmapCBR(display, scroller.frame, scroller.width, displayer.height, GDS_COLOR_WHITE);	
+				if (displayer.owned) {
+					GDS_DrawBitmapCBR(display, scroller.frame, scroller.width, displayer.height, GDS_COLOR_WHITE);
+					need_update = true;
+				}
 				
 				// short sleep & don't need background update
 				scroller.wake = scroller.speed;
@@ -1391,22 +1455,35 @@ static void displayer_task(void *args) {
 			} 
 		}
 
-		// update visu if active
-		if ((visu.mode || led_visu.mode) && displayer.wake <= 0 && displayer.owned) {
+		// update visu if active and playing (or on state change to draw zero-levels)
+		if ((visu.mode || led_visu.mode) && displayer.owned && (is_playing || state_changed) && displayer.wake <= 0) {
 			displayer_update();
-			displayer.wake = 100;
+			need_update = (visu.mode != 0);
+			displayer.wake = is_playing ? 100 : LONG_WAKE;
 		}
 		
-		// need to make sure we own display
-		if (display && displayer.owned) GDS_Update(display);
-		else if (!led_display) displayer.wake = LONG_WAKE;
+		// need to make sure we own display and have updated pixels
+		if (display && displayer.owned && need_update) GDS_Update(display);
+		else if (!led_display && !is_playing) displayer.wake = LONG_WAKE;
 	
 		// release semaphore and sleep what's needed
 		xSemaphoreGive(displayer.mutex);
 		
-		sleep = min(displayer.wake, scroller.wake);
-		vTaskDelay(sleep / portTICK_PERIOD_MS);
-		scroller.wake -= sleep;
-		displayer.wake -= sleep;
+		if (!scroller.active && !is_playing) {
+			// When stopped/paused and no animations are active, sleep until a state change or new display event occurs
+			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+			scroller.wake = displayer.wake = 0;
+		} else {
+			sleep = min(displayer.wake, scroller.wake);
+			if (sleep <= 0) sleep = 10;
+			if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(sleep)) > 0) {
+				// Woken early by display event or state change
+				scroller.wake = 0;
+				displayer.wake = 0;
+			} else {
+				scroller.wake -= sleep;
+				displayer.wake -= sleep;
+			}
+		}
 	}	
 }	

@@ -62,24 +62,27 @@ static const struct {
 
 static const char *ENC_PREFIX = "enc:";
 
-static std::vector<uint8_t> getDeviceKey() {
-    uint8_t mac[6] = {0};
+static const std::vector<uint8_t>& getDeviceKey() {
+    static const std::vector<uint8_t> cachedKey = []() {
+        uint8_t mac[6] = {0};
 #ifdef ESP_PLATFORM
-    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
-        esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    }
+        if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        }
 #endif
-    // Derive 16-byte key combining unique hardware MAC and domain-specific salt
-    static const uint8_t salt[16] = {
-        0x53, 0x70, 0x6f, 0x74, 0x4e, 0x56, 0x53, 0x4b,
-        0x65, 0x79, 0x24, 0x53, 0x65, 0x63, 0x75, 0x72
-    };
-    uint8_t combined[sizeof(salt) + sizeof(mac)];
-    memcpy(combined, salt, sizeof(salt));
-    memcpy(combined + sizeof(salt), mac, sizeof(mac));
-    uint8_t digest[32];
-    mbedtls_sha256(combined, sizeof(combined), digest, 0);
-    return std::vector<uint8_t>(digest, digest + sizeof(digest));
+        // Derive 16-byte key combining unique hardware MAC and domain-specific salt
+        static const uint8_t salt[16] = {
+            0x53, 0x70, 0x6f, 0x74, 0x4e, 0x56, 0x53, 0x4b,
+            0x65, 0x79, 0x24, 0x53, 0x65, 0x63, 0x75, 0x72
+        };
+        uint8_t combined[sizeof(salt) + sizeof(mac)];
+        memcpy(combined, salt, sizeof(salt));
+        memcpy(combined + sizeof(salt), mac, sizeof(mac));
+        uint8_t digest[32];
+        mbedtls_sha256(combined, sizeof(combined), digest, 0);
+        return std::vector<uint8_t>(digest, digest + sizeof(digest));
+    }();
+    return cachedKey;
 }
 
 static std::string encryptCredentials(const std::string& plaintext) {
@@ -88,7 +91,7 @@ static std::string encryptCredentials(const std::string& plaintext) {
     if (plaintext.compare(0, prefixLen, ENC_PREFIX) == 0) {
         return plaintext; // Already encrypted
     }
-    std::vector<uint8_t> key = getDeviceKey();
+    const auto& key = getDeviceKey();
     std::string hexStr;
     hexStr.reserve(prefixLen + plaintext.size() * 2);
     hexStr = ENC_PREFIX;
@@ -111,7 +114,7 @@ static std::string decryptCredentials(const std::string& ciphertext) {
             CSPOT_LOG(error, "Invalid encrypted credentials hex payload length");
             return "";
         }
-        std::vector<uint8_t> key = getDeviceKey();
+        const auto& key = getDeviceKey();
         std::string plaintext;
         plaintext.reserve(hexPayload.size() / 2);
 
@@ -175,7 +178,7 @@ public:
 };
 
 cspotPlayer::cspotPlayer(const char* name, httpd_handle_t server, int port, cspot_cmd_cb_t cmdHandler, cspot_data_cb_t dataHandler) :
-                        bell::Task("playerInstance", 32 * 1024, 0, 0),
+                        bell::Task("playerInstance", 32 * 1024, 0, 0, false),
                         serverHandle(server), serverPort(port),
                         cmdHandler(cmdHandler), dataHandler(dataHandler) {
 
@@ -465,12 +468,12 @@ void cspotPlayer::runTask() {
             // we might have been forced to use zeroConf, so store credentials and reset zeroConf usage
             if (!zeroConf) {
                 useZeroConf = false;
-                // can't call store_nvs... from a task running on EXTRAM stack
-                TimerHandle_t timer = xTimerCreate( "credentials", 1, pdFALSE, strdup(encryptCredentials(ctx->getCredentialsJson()).c_str()),
+                // Save encrypted credentials once via timer callback to avoid blocking the audio task loop
+                std::string enc = encryptCredentials(ctx->getCredentialsJson());
+                TimerHandle_t timer = xTimerCreate( "credentials", 1, pdFALSE, strdup(enc.c_str()),
                             [](TimerHandle_t xTimer) {
                                 auto credentials = (char*) pvTimerGetTimerID(xTimer);
-                                std::string enc = encryptCredentials(credentials);
-                                store_nvs_value_len_for_partition(NVS_DEFAULT_PART_NAME, spotify_ns.ns, NVS_TYPE_STR, spotify_ns.credentials, (char*)enc.c_str(), 0);
+                                store_nvs_value_len_for_partition(NVS_DEFAULT_PART_NAME, spotify_ns.ns, NVS_TYPE_STR, spotify_ns.credentials, credentials, 0);
                                 free(credentials);
                                 xTimerDelete(xTimer, portMAX_DELAY);
                             } );

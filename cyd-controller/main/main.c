@@ -48,9 +48,20 @@ static void gui_task(void *pvParameters) {
     int64_t last_tick_us = esp_timer_get_time();
     while (1) {
         cyd_ui_lock();
-        lv_timer_handler();
+        uint32_t sleep_ms = lv_timer_handler();
         cyd_ui_unlock();
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        if (sleep_ms == 0) {
+            taskYIELD();
+        } else {
+            // Dynamic sleep when idle, capped to ensure touch and telemetry responsiveness
+            if (sleep_ms > 50) {
+                sleep_ms = 50;
+            }
+            TickType_t delay_ticks = pdMS_TO_TICKS(sleep_ms);
+            vTaskDelay(delay_ticks > 0 ? delay_ticks : 1);
+        }
+
         int64_t now_us = esp_timer_get_time();
         uint32_t elapsed_ms = (uint32_t)((now_us - last_tick_us) / 1000LL);
         if (elapsed_ms > 0) {

@@ -56,9 +56,10 @@ const char* str_or_null(const char * str);
 typedef void (*http_download_cb_t)(uint8_t* data, size_t len, void *context);
 void		http_download(char *url, size_t max, http_download_cb_t callback, void *context);
 
-/* Use these to dynamically create tasks whose stack is on EXTRAM. Be aware that it 
- * requires configNUM_THREAD_LOCAL_STORAGE_POINTERS to bet set to 2 at least (index 0
- * is used by pthread and this uses index 1, obviously
+/* Use these to dynamically create tasks whose stack is safely allocated in internal DRAM
+ * (to prevent cache-disabled panics during SPI flash ops). Requires
+ * configNUM_THREAD_LOCAL_STORAGE_POINTERS to be set to 2 at least (index 0 is used by
+ * pthread and index 1 is used here for context cleanup).
  */
 BaseType_t xTaskCreateEXTRAM( TaskFunction_t pvTaskCode,
                             const char * const pcName,

@@ -119,10 +119,18 @@ size_t _buf_limit(struct buffer *buf, size_t limit) {
 	return buf->base_size - buf->size;
 }
 
+static void _buf_reverse(u8_t *p, size_t len) {
+	if (!p || len < 2) return;
+	u8_t *q = p + len - 1;
+	while (p < q) {
+		u8_t t = *p;
+		*p++ = *q;
+		*q-- = t;
+	}
+}
+
 void _buf_unwrap(struct buffer *buf, size_t cont) {
-	ssize_t len, by = cont - (buf->wrap - buf->readp);
-	ssize_t size;
-	u8_t *scratch;
+	ssize_t by = cont - (buf->wrap - buf->readp);
 
 	// do nothing if we have enough space
 	if (by <= 0 || cont >= buf->size) return;
@@ -133,46 +141,24 @@ void _buf_unwrap(struct buffer *buf, size_t cont) {
 		buf->readp -= by;
 		buf->writep -= by;
 		return;
-	 }
-
-	// how much is overlapping
-	size = by - (buf->readp - buf->writep);
-	len = buf->writep - buf->buf;
-
-	// buffer is wrapped and enough free space to move data up directly
-	if (size <= 0) {
-		memmove(buf->readp - by, buf->readp, buf->wrap - buf->readp);
-		buf->readp -= by;
-		memcpy(buf->wrap - by, buf->buf, min(len, by));
-		if (len > by) {
-			memmove(buf->buf, buf->buf + by, len - by);
-			buf->writep -= by;
-		} else {
-			buf->writep += buf->size - by;
-		}
-		if (buf->writep >= buf->wrap) {
-			buf->writep -= buf->size;
-		}
-		return;
 	}
 
-	scratch = malloc(size);
+	// MEM-01: In-place 3-reversal rotation algorithm:
+	// reverse(A), reverse(B), reverse(AB) rotates buf by 'by' bytes to the left.
+	// This makes cont contiguous bytes available at readp without dynamic malloc
+	// or recursion on malloc failure in the audio path.
+	_buf_reverse(buf->buf, by);
+	_buf_reverse(buf->buf + by, buf->size - by);
+	_buf_reverse(buf->buf, buf->size);
 
-	// buffer is wrapped but not enough free room => use scratch zone
-	if (scratch) {
-		memcpy(scratch, buf->writep - size, size);
-		memmove(buf->readp - by, buf->readp, buf->wrap - buf->readp);
-		buf->readp -= by;
-		memcpy(buf->wrap - by, buf->buf, by);
-		if (len >= by + size) {
-			memmove(buf->buf, buf->buf + by, len - by - size);
-		}
+	buf->readp -= by;
+	if (buf->writep >= buf->buf + by) {
 		buf->writep -= by;
-		memcpy(buf->writep - size, scratch, size);
-		free(scratch);
 	} else {
-		_buf_unwrap(buf, cont / 2);
-        _buf_unwrap(buf, cont - cont / 2);
+		buf->writep += buf->size - by;
+	}
+	if (buf->writep >= buf->wrap) {
+		buf->writep -= buf->size;
 	}
 }
 

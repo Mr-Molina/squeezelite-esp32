@@ -74,9 +74,9 @@ esp_err_t ili9341_init(void) {
         return ret;
     }
 
-    // Attach ILI9341 SPI device
+    // Attach ILI9341 SPI device (80 MHz clock for maximum DMA throughput)
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 40 * 1000 * 1000, // 40 MHz clock
+        .clock_speed_hz = 80 * 1000 * 1000, // 80 MHz clock
         .mode = 0,                          // SPI mode 0 (CPOL=0, CPHA=0)
         .spics_io_num = CYD_TFT_CS,
         .queue_size = 7,

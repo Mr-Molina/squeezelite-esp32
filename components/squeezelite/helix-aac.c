@@ -21,6 +21,7 @@
  */
 
 #include "squeezelite.h"
+#include <esp_heap_caps.h>
 
 #include <aacdec.h>
 
@@ -614,8 +615,16 @@ static void helixaac_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
 		// always free decoder as flush only works when no parameter has changed
 		HAAC(a, FreeDecoder, a->hAac);			
 	} else {
-		a->write_buf = malloc(FRAME_BUF * 4);
-		a->wrap_buf = malloc(WRAPBUF_LEN);
+		// PERF-03: Allocate critical IMDCT workspace and synthesis scratch buffers in internal DRAM
+		// to prevent SPI bus latency from degrading real-time windowing and overlap-add decoding.
+		a->write_buf = heap_caps_malloc(FRAME_BUF * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		if (!a->write_buf) {
+			a->write_buf = malloc(FRAME_BUF * 4);
+		}
+		a->wrap_buf = heap_caps_malloc(WRAPBUF_LEN, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		if (!a->wrap_buf) {
+			a->wrap_buf = malloc(WRAPBUF_LEN);
+		}
 	}
 	
 	a->hAac = HAAC(a, InitDecoder);	
@@ -633,7 +642,9 @@ static void helixaac_close(void) {
 		a->stsc = NULL;
 	}
 	free(a->write_buf);
+	a->write_buf = NULL;
 	free(a->wrap_buf);
+	a->wrap_buf = NULL;
 }
 
 static bool load_helixaac() {
@@ -678,6 +689,8 @@ struct codec *register_helixaac(void) {
 	a->hAac = NULL;
 	a->chunkinfo = NULL;
 	a->stsc = NULL;
+	a->write_buf = NULL;
+	a->wrap_buf = NULL;
 
 	if (!load_helixaac()) {
 		return NULL;

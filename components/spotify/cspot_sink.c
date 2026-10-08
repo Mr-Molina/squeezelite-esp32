@@ -6,6 +6,9 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_console.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_pthread.h"
 #include "esp_system.h"
 #include "platform_config.h"
@@ -102,6 +105,24 @@ void got_artwork(uint8_t* data, size_t len, void *context) {
 	}
 }
 
+#define ARTWORK_STACK_SIZE (4 * 1024)
+static QueueHandle_t artwork_queue;
+
+static void artwork_task(void *arg) {
+	char *artwork_url = NULL;
+	while (1) {
+		if (xQueueReceive(artwork_queue, &artwork_url, portMAX_DELAY) == pdTRUE) {
+			if (artwork_url) {
+				if (displayer_can_artwork()) {
+					ESP_LOGI(TAG, "requesting artwork %s", artwork_url);
+					http_download(artwork_url, 128 * 1024, got_artwork, NULL);
+				}
+				free(artwork_url);
+			}
+		}
+	}
+}
+
 /****************************************************************************************
  * Command handler
  */
@@ -131,6 +152,12 @@ static bool cmd_handler(cspot_event_t event, ...) {
 	case CSPOT_DISC:
 		actrls_unset();
 		displayer_control(DISPLAYER_SUSPEND);
+		if (artwork_queue) {
+			char *pending_url = NULL;
+			while (xQueueReceive(artwork_queue, &pending_url, 0) == pdTRUE) {
+				if (pending_url) free(pending_url);
+			}
+		}
 		break;
 	case CSPOT_SEEK:
 		displayer_timer(DISPLAYER_ELAPSED, va_arg(args, int), -1);
@@ -138,12 +165,22 @@ static bool cmd_handler(cspot_event_t event, ...) {
 	case CSPOT_TRACK_INFO: {
 		uint32_t duration = va_arg(args, int), offset = va_arg(args, int);
 		char *artist = va_arg(args, char*), *album = va_arg(args, char*), *title = va_arg(args, char*), *artwork = va_arg(args, char*);
-		if (artwork && displayer_can_artwork()) {
-			ESP_LOGI(TAG, "requesting artwork %s", artwork);
-			http_download(artwork, 128*1024, got_artwork, NULL);
-		}	
 		displayer_metadata(artist, album, title);
 		displayer_timer(DISPLAYER_ELAPSED, offset, duration);
+		if (artwork && displayer_can_artwork() && artwork_queue) {
+			char *url_copy = strdup(artwork);
+			if (url_copy) {
+				if (xQueueSend(artwork_queue, &url_copy, 0) != pdTRUE) {
+					char *stale_url = NULL;
+					if (xQueueReceive(artwork_queue, &stale_url, 0) == pdTRUE) {
+						if (stale_url) free(stale_url);
+					}
+					if (xQueueSend(artwork_queue, &url_copy, 0) != pdTRUE) {
+						free(url_copy);
+					}
+				}
+			}
+		}	
 		break;
 	}	
 	// nothing to do on CSPOT_FLUSH
@@ -180,6 +217,11 @@ void cspot_sink_init(cspot_cmd_vcb_t cmd_cb, cspot_data_cb_t data_cb) {
 	cspot_cbs.cmd = cmd_cb;
 	cspot_cbs.data = data_cb;
 
+	if (!artwork_queue) {
+		artwork_queue = xQueueCreate(2, sizeof(char*));
+		xTaskCreate(artwork_task, "cspot_artwork", ARTWORK_STACK_SIZE, NULL, ESP_TASK_PRIO_MIN + 1, NULL);
+	}
+
 	network_register_state_callback(NETWORK_WIFI_ACTIVE_STATE, WIFI_CONNECTED_STATE, "cspot_sink_start", cspot_sink_start);
 	network_register_state_callback(NETWORK_ETH_ACTIVE_STATE, ETH_ACTIVE_CONNECTED_STATE, "cspot_sink_start", cspot_sink_start);
 }
@@ -192,4 +234,10 @@ void cspot_disconnect(void) {
 	displayer_control(DISPLAYER_SHUTDOWN);
 	cspot_cmd(cspot, CSPOT_DISC, NULL);
 	actrls_unset();
+	if (artwork_queue) {
+		char *pending_url = NULL;
+		while (xQueueReceive(artwork_queue, &pending_url, 0) == pdTRUE) {
+			if (pending_url) free(pending_url);
+		}
+	}
 }

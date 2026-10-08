@@ -254,16 +254,17 @@ char * alloc_get_string_with_mac(const char * val) {
     char* fullvalue = NULL;
     esp_read_mac((uint8_t*)&mac, ESP_MAC_WIFI_STA);
     snprintf(macStr, LOCAL_MAC_SIZE - 1, "-%x%x%x", mac[3], mac[4], mac[5]);
-	fullvalue = malloc_init_external(strlen(val)+sizeof(macStr)+1);
-	if(fullvalue){
-		strcpy(fullvalue, val);
-		strcat(fullvalue, macStr);
-	}
-	else {
-		ESP_LOGE(TAG,"Memory allocation failed when getting mac value for %s", val);
-	}
-	return fullvalue;	
-	
+    size_t len = strlen(val) + sizeof(macStr) + 1;
+    fullvalue = malloc(len);
+    if(fullvalue){
+        memset(fullvalue, 0x00, len);
+        strcpy(fullvalue, val);
+        strcat(fullvalue, macStr);
+    }
+    else {
+        ESP_LOGE(TAG,"Memory allocation failed when getting mac value for %s", val);
+    }
+    return fullvalue;	
 }
 void register_default_with_mac(const char* key,  char* defval) {
     char * fullvalue=alloc_get_string_with_mac(defval);

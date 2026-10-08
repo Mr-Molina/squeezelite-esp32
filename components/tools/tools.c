@@ -144,9 +144,18 @@ void url_decode(char *url) {
 
 void * malloc_init_external(size_t sz){
 	void * ptr=NULL;
+	if (sz < 64) {
+		ptr = malloc(sz);
+		if (ptr == NULL) {
+			ESP_LOGE(TAG, "malloc_init_external: unable to allocate %d bytes of DRAM!", (int)sz);
+		} else {
+			memset(ptr, 0x00, sz);
+		}
+		return ptr;
+	}
 	ptr = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if(ptr==NULL){
-		ESP_LOGE(TAG,"malloc_init_external:  unable to allocate %d bytes of PSRAM!",sz);
+		ESP_LOGE(TAG,"malloc_init_external:  unable to allocate %d bytes of PSRAM!",(int)sz);
 	}
 	else {
 		memset(ptr,0x00,sz);
@@ -156,9 +165,18 @@ void * malloc_init_external(size_t sz){
 
 void * clone_obj_psram(void * source, size_t source_sz){
 	void * ptr=NULL;
+	if (source_sz < 64) {
+		ptr = malloc(source_sz);
+		if (ptr == NULL) {
+			ESP_LOGE(TAG, "clone_obj_psram: unable to allocate %d bytes of DRAM!", (int)source_sz);
+		} else {
+			memcpy(ptr, source, source_sz);
+		}
+		return ptr;
+	}
 	ptr = heap_caps_malloc(source_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if(ptr==NULL){
-		ESP_LOGE(TAG,"clone_obj_psram:  unable to allocate %d bytes of PSRAM!",source_sz);
+		ESP_LOGE(TAG,"clone_obj_psram:  unable to allocate %d bytes of PSRAM!",(int)source_sz);
 	}
 	else {
 		memcpy(ptr,source,source_sz);
@@ -167,11 +185,18 @@ void * clone_obj_psram(void * source, size_t source_sz){
 }
 
 char * strdup_psram(const char * source){
-	void * ptr=NULL;
 	size_t source_sz = strlen(source)+1;
+	if (source_sz < 64) {
+		char *ptr = strdup(source);
+		if (ptr == NULL) {
+			ESP_LOGE(TAG, "strdup_psram: unable to allocate %d bytes of DRAM! Cannot clone string %s", (int)source_sz, source);
+		}
+		return ptr;
+	}
+	void * ptr=NULL;
 	ptr = heap_caps_malloc(source_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if(ptr==NULL){
-		ESP_LOGE(TAG,"strdup_psram:  unable to allocate %d bytes of PSRAM! Cannot clone string %s",source_sz,source);
+		ESP_LOGE(TAG,"strdup_psram:  unable to allocate %d bytes of PSRAM! Cannot clone string %s",(int)source_sz,source);
 	}
 	else {
 		memset(ptr,0x00,source_sz);
@@ -191,9 +216,11 @@ typedef struct {
 } task_context_t;
 
 static void task_cleanup(int index, task_context_t *context) {
-    free(context->xTaskBuffer);
-    free(context->xStack);
-    free(context);    
+    if (context) {
+        if (context->xTaskBuffer) free(context->xTaskBuffer);
+        if (context->xStack) free(context->xStack);
+        free(context);
+    }
 }
 
 BaseType_t xTaskCreateEXTRAM( TaskFunction_t pvTaskCode,
@@ -202,23 +229,32 @@ BaseType_t xTaskCreateEXTRAM( TaskFunction_t pvTaskCode,
                             void *pvParameters,
                             UBaseType_t uxPriority,
                             TaskHandle_t *pxCreatedTask) {
-    // create the worker task as a static
+    // Task stacks in external PSRAM trigger fatal cache-disabled panics during SPI flash ops (OTA, NVS commit).
+    // Allocate stack with MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT (or fall back to standard xTaskCreate)
     task_context_t *context = calloc(1, sizeof(task_context_t));
+    if (!context) {
+        return xTaskCreate(pvTaskCode, pcName, usStackDepth, pvParameters, uxPriority, pxCreatedTask);
+    }
     context->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), (MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
-	context->xStack = heap_caps_malloc(usStackDepth,(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
-    TaskHandle_t handle = xTaskCreateStatic(pvTaskCode, pcName, usStackDepth, pvParameters, uxPriority, context->xStack, context->xTaskBuffer);
+    context->xStack = (StackType_t*) heap_caps_malloc(usStackDepth, (MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
 
-    // store context in TCB or free everything in case of failure
+    TaskHandle_t handle = NULL;
+    if (context->xTaskBuffer && context->xStack) {
+        handle = xTaskCreateStatic(pvTaskCode, pcName, usStackDepth, pvParameters, uxPriority, context->xStack, context->xTaskBuffer);
+    }
+
+    // store context in TCB or fall back / free everything in case of failure
     if (!handle) {
-        free(context->xTaskBuffer);
-        free(context->xStack);
-        free(context);    
+        if (context->xTaskBuffer) free(context->xTaskBuffer);
+        if (context->xStack) free(context->xStack);
+        free(context);
+        return xTaskCreate(pvTaskCode, pcName, usStackDepth, pvParameters, uxPriority, pxCreatedTask);
     } else {
         vTaskSetThreadLocalStoragePointerAndDelCallback( handle, TASK_TLS_INDEX, context, (TlsDeleteCallbackFunction_t) task_cleanup);
     }
     
     if (pxCreatedTask) *pxCreatedTask = handle;
-    return handle != NULL ? pdPASS : pdFAIL;
+    return pdPASS;
 }
 
 void vTaskDeleteEXTRAM(TaskHandle_t xTask) {

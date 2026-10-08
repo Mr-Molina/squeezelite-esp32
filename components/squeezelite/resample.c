@@ -32,6 +32,8 @@ extern log_level loglevel;
 
 struct soxr {
 	soxr_t resampler;
+	unsigned raw_sample_rate;
+	unsigned outrate;
 	size_t old_clips;
 	unsigned long q_recipe;
 	unsigned long q_flags;
@@ -49,6 +51,7 @@ struct soxr {
 	soxr_t (* soxr_create)(double, double, unsigned, soxr_error_t *, 
 						   soxr_io_spec_t const *, soxr_quality_spec_t const *, soxr_runtime_spec_t const *);
 	void (* soxr_delete)(soxr_t);
+	soxr_error_t (* soxr_clear)(soxr_t);
 	soxr_error_t (* soxr_process)(soxr_t, soxr_in_t, size_t, size_t *, soxr_out_t, size_t olen, size_t *);
 	size_t *(* soxr_num_clips)(soxr_t);
 #if RESAMPLE_MP
@@ -98,10 +101,18 @@ void resample_samples(struct processstate *process) {
 bool resample_drain(struct processstate *process) {
 	size_t odone;
 	size_t clip_cnt;
-		
+
+	if (!r || !r->resampler) {
+		return true;
+	}
+
 	soxr_error_t error = SOXR(r, process, r->resampler, NULL, 0, NULL, process->outbuf, process->max_out_frames, &odone);
 	if (error) {
 		LOG_INFO("soxr_process error: %s", soxr_strerror(error));
+		SOXR(r, delete, r->resampler);
+		r->resampler = NULL;
+		r->raw_sample_rate = 0;
+		r->outrate = 0;
 		return true;
 	}
 	
@@ -118,8 +129,14 @@ bool resample_drain(struct processstate *process) {
 
 		LOG_INFO("resample track complete - total track clips: %u", r->old_clips);
 
-		SOXR(r, delete, r->resampler);
-		r->resampler = NULL;
+		error = SOXR(r, clear, r->resampler);
+		if (error) {
+			LOG_INFO("soxr_clear error: %s", soxr_strerror(error));
+			SOXR(r, delete, r->resampler);
+			r->resampler = NULL;
+			r->raw_sample_rate = 0;
+			r->outrate = 0;
+		}
 
 		return true;
 
@@ -172,13 +189,43 @@ bool resample_newstream(struct processstate *process, unsigned raw_sample_rate, 
 	process->in_sample_rate = raw_sample_rate;
 	process->out_sample_rate = outrate;
 
-	if (r->resampler) {
-		SOXR(r, delete, r->resampler);
-		r->resampler = NULL;
+	if (raw_sample_rate == outrate) {
+		if (r->resampler) {
+			LOG_INFO("rates match - deleting existing resampler");
+			SOXR(r, delete, r->resampler);
+			r->resampler = NULL;
+			r->raw_sample_rate = 0;
+			r->outrate = 0;
+		}
+		LOG_INFO("disable resampling - rates match");
+		return false;
 	}
 
-	if (raw_sample_rate != outrate) {
+	if (r->resampler) {
+		if (r->raw_sample_rate == raw_sample_rate && r->outrate == outrate) {
+			LOG_INFO("retaining existing resampler %u -> %u", raw_sample_rate, outrate);
+			soxr_error_t clear_err = SOXR(r, clear, r->resampler);
+			if (clear_err) {
+				LOG_WARN("soxr_clear error: %s - recreating resampler", soxr_strerror(clear_err));
+				SOXR(r, delete, r->resampler);
+				r->resampler = NULL;
+				r->raw_sample_rate = 0;
+				r->outrate = 0;
+			} else {
+				r->old_clips = 0;
+				return true;
+			}
+		} else {
+			LOG_INFO("destroying resampler %u -> %u to reconfigure for %u -> %u",
+					 r->raw_sample_rate, r->outrate, raw_sample_rate, outrate);
+			SOXR(r, delete, r->resampler);
+			r->resampler = NULL;
+			r->raw_sample_rate = 0;
+			r->outrate = 0;
+		}
+	}
 
+	{
 		soxr_io_spec_t io_spec;
 		soxr_quality_spec_t q_spec;
 		soxr_error_t error;
@@ -229,20 +276,19 @@ bool resample_newstream(struct processstate *process, unsigned raw_sample_rate, 
 			return false;
 		}
 
+		r->raw_sample_rate = raw_sample_rate;
+		r->outrate = outrate;
 		r->old_clips = 0;
 		return true;
-
-	} else {
-
-		LOG_INFO("disable resampling - rates match");
-		return false;
 	}
 }
 
 void resample_flush(void) {
-	if (r->resampler) {
+	if (r && r->resampler) {
 		SOXR(r, delete, r->resampler);
 		r->resampler = NULL;
+		r->raw_sample_rate = 0;
+		r->outrate = 0;
 	}
 }
 
@@ -260,6 +306,7 @@ static bool load_soxr(void) {
 	r->soxr_quality_spec = dlsym(handle, "soxr_quality_spec");
 	r->soxr_create = dlsym(handle, "soxr_create");
 	r->soxr_delete = dlsym(handle, "soxr_delete");
+	r->soxr_clear = dlsym(handle, "soxr_clear");
 	r->soxr_process = dlsym(handle, "soxr_process");
 	r->soxr_num_clips = dlsym(handle, "soxr_num_clips");
 #if RESAMPLE_MP
@@ -289,6 +336,8 @@ bool resample_init(char *opt) {
 	}
 
 	r->resampler = NULL;
+	r->raw_sample_rate = 0;
+	r->outrate = 0;
 	r->old_clips = 0;
 	r->max_rate = false;
 	r->exception = false;

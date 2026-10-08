@@ -159,10 +159,12 @@ esp_err_t nvs_load_config() {
         }
         it = nvs_entry_next(it);
     }
-    char* json_string = config_alloc_get_json(false);
-    if (json_string != NULL) {
-        ESP_LOGD(TAG, "config json : %s\n", json_string);
-        free(json_string);
+    if (LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG) {
+        char* json_string = config_alloc_get_json(false);
+        if (json_string != NULL) {
+            ESP_LOGD(TAG, "config json : %s\n", json_string);
+            free(json_string);
+        }
     }
 
     ESP_LOGW(TAG, "Configuration memory usage.  Heap internal:%zu (min:%zu) (used:%zu) external:%zu (min:%zu) (used:%zd)",

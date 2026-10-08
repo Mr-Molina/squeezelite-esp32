@@ -35,6 +35,7 @@ sure that using rate_delay would fix that
 #include "squeezelite.h"
 #include "slimproto.h"
 #include "esp_pthread.h"
+#include "esp_heap_caps.h"
 #include "driver/i2s.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
@@ -69,7 +70,7 @@ sure that using rate_delay would fix that
  * nicely in one DMA buffer and 2048/450 = 4 buffers + ~1/2 buffer which is acceptable.
  */
 #define DMA_BUF_FRAMES	512
-#define DMA_BUF_COUNT	12
+#define DMA_BUF_COUNT	6
 
 #define DMA_BUF_FRAMES_SPDIF	450
 #define DMA_BUF_COUNT_SPDIF     7
@@ -268,7 +269,7 @@ void output_init_i2s(log_level level, char *device, unsigned output_buf_size, ch
 
 	output.write_cb = &_i2s_write_frames;
 	
-	obuf = malloc(FRAME_BLOCK * BYTES_PER_FRAME);
+	obuf = heap_caps_malloc(FRAME_BLOCK * BYTES_PER_FRAME, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
 	if (!obuf) {
 		LOG_ERROR("Cannot allocate i2s buffer");
 		return;
@@ -654,16 +655,16 @@ static void output_thread_i2s(void *arg) {
 			while (running && count < oframes) {
 				size_t chunk = min(SPDIF_BLOCK, oframes - count);
                 spdif_convert((ISAMPLE_T*) obuf + count * 2, chunk, (u32_t*) spdif.buf);              
-				i2s_write(CONFIG_I2S_NUM, spdif.buf, chunk * 16, &obytes, pdMS_TO_TICKS(100));
+				i2s_write(CONFIG_I2S_NUM, spdif.buf, chunk * 16, &obytes, pdMS_TO_TICKS(10));
 				bytes += obytes / (16 / BYTES_PER_FRAME);
 				count += chunk;
 			}
 #if BYTES_PER_FRAME == 4		
 		} else if (i2s_config.bits_per_sample == 32) {  
-			i2s_write_expand(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, 16, 32, &bytes, pdMS_TO_TICKS(100));
+			i2s_write_expand(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, 16, 32, &bytes, pdMS_TO_TICKS(10));
 #endif			
 		} else {
-			i2s_write(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, &bytes, pdMS_TO_TICKS(100));
+			i2s_write(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, &bytes, pdMS_TO_TICKS(10));
 		}
 
 		fullness = gettime_ms();

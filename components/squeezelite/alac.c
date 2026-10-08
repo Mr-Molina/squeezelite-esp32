@@ -46,6 +46,8 @@ struct chunk_table {
 struct alac {
 	void *decoder;
 	u8_t *writebuf;
+	u8_t *scratch;
+	size_t scratch_size;
 	// following used for mp4 only
 	u32_t consume;
 	u32_t pos;
@@ -184,6 +186,10 @@ static int read_mp4_header(void) {
 				LOG_DEBUG("total blocksize contained in stsz %u", entries);
 			} else {
 				LOG_DEBUG("fixed blocksize in stsz %u", l->default_block_size);
+				if (!l->scratch && l->default_block_size > 0) {
+					l->scratch = malloc(l->default_block_size);
+					if (l->scratch) l->scratch_size = l->default_block_size;
+				}
             }
 		}
 
@@ -463,25 +469,26 @@ static decode_state alac_decode(void) {
 
 	// need to create a buffer with contiguous data
 	if (bytes < block_size) {
-		iptr = malloc(block_size);
-		if (!iptr) {
-			LOG_ERROR("malloc fail");
-			UNLOCK_S;
-			return DECODE_ERROR;
+		if (block_size > l->scratch_size) {
+			u8_t *new_scratch = realloc(l->scratch, block_size);
+			if (!new_scratch) {
+				LOG_ERROR("scratch realloc fail");
+				UNLOCK_S;
+				return DECODE_ERROR;
+			}
+			l->scratch = new_scratch;
+			l->scratch_size = block_size;
 		}
+		iptr = l->scratch;
 		memcpy(iptr, streambuf->readp, bytes);
 		memcpy(iptr + bytes, streambuf->buf, block_size - bytes);
 	} else iptr = streambuf->readp;
 
 	if (!alac_to_pcm(l->decoder, iptr, l->writebuf, 2, &frames)) {
 		LOG_ERROR("decode error");
-		if (bytes < block_size) free(iptr);
 		UNLOCK_S;
 		return DECODE_ERROR;
 	}
-
-	// and free it
-	if (bytes < block_size) free(iptr);
 
 	LOG_SDEBUG("block of %u bytes (%u frames)", block_size, frames);
 
@@ -530,7 +537,7 @@ static decode_state alac_decode(void) {
 		LOG_DEBUG("gapless: skipping %u frames at start", skip);
 		frames -= skip;
 		l->skip -= skip;
-		iptr += skip * l->channels * l->sample_size;
+		iptr += skip * l->channels * (l->sample_size / 8);
 	}
 
 	if (l->samples) {
@@ -557,6 +564,13 @@ static decode_state alac_decode(void) {
 		);
 
 		f = min(f, frames);
+		if (f == 0) {
+			UNLOCK_O_direct;
+			usleep(1000);
+			LOCK_O_direct;
+			continue;
+		}
+
 		count = f;
 
 		if (l->sample_size == 8) {
@@ -565,25 +579,49 @@ static decode_state alac_decode(void) {
 				*optr++ = ALIGN8(*iptr++);
 			}
 		} else if (l->sample_size == 16) {
-			u16_t *_iptr = (u16_t*) iptr;
+#if BYTES_PER_FRAME == 4
+			memcpy(optr, iptr, count * BYTES_PER_FRAME);
+			iptr += count * BYTES_PER_FRAME;
+#else
+			u16_t *_iptr = (u16_t *) iptr;
 			iptr += count * 4;
+#if SL_LITTLE_ENDIAN
+			while (count--) {
+				u32_t val = *(u32_t *) _iptr;
+				_iptr += 2;
+				*optr++ = (ISAMPLE_T) (val << 16);
+				*optr++ = (ISAMPLE_T) (val & 0xffff0000);
+			}
+#else
 			while (count--) {
 				*optr++ = ALIGN16(*_iptr++);
 				*optr++ = ALIGN16(*_iptr++);
 			}
+#endif
+#endif
 		} else if (l->sample_size == 24) {
 			while (count--) {
-				*optr++ = ALIGN24(*(u32_t*) iptr);
-				*optr++ = ALIGN24(*(u32_t*) (iptr + 3));
+#if BYTES_PER_FRAME == 4
+				*optr++ = (ISAMPLE_T) (iptr[1] | (iptr[2] << 8));
+				*optr++ = (ISAMPLE_T) (iptr[4] | (iptr[5] << 8));
+#else
+				*optr++ = (ISAMPLE_T) (((u32_t) iptr[0] << 8) | ((u32_t) iptr[1] << 16) | ((u32_t) iptr[2] << 24));
+				*optr++ = (ISAMPLE_T) (((u32_t) iptr[3] << 8) | ((u32_t) iptr[4] << 16) | ((u32_t) iptr[5] << 24));
+#endif
 				iptr += 6;
 			}
 		} else if (l->sample_size == 32) {
-			u32_t *_iptr = (u32_t*) iptr;
+#if BYTES_PER_FRAME == 8
+			memcpy(optr, iptr, count * BYTES_PER_FRAME);
+			iptr += count * BYTES_PER_FRAME;
+#else
+			u32_t *_iptr = (u32_t *) iptr;
 			iptr += count * 8;
 			while (count--) {
 				*optr++ = ALIGN32(*_iptr++);
 				*optr++ = ALIGN32(*_iptr++);
 			}
+#endif
 		} else {
 			LOG_ERROR("unsupported bits per sample: %u", l->sample_size);
 		}
@@ -608,6 +646,7 @@ static decode_state alac_decode(void) {
 static void alac_close(void) {
 	if (l->decoder) alac_delete_decoder(l->decoder);
 	if (l->writebuf) free(l->writebuf);	
+	if (l->scratch) free(l->scratch);
 	if (l->chunkinfo) free(l->chunkinfo);
 	if (l->block_size) free(l->block_size);
 	if (l->stsc) free(l->stsc);

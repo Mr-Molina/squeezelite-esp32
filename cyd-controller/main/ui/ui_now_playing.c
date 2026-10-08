@@ -265,30 +265,43 @@ void ui_now_playing_update(const cyd_telemetry_state_t *state) {
     if (s_label_mode) {
         char mode_str[32];
         snprintf(mode_str, sizeof(mode_str), "[%s]", state->mode[0] ? state->mode : "STANDBY");
-        lv_label_set_text(s_label_mode, mode_str);
+        const char *cur_mode = lv_label_get_text(s_label_mode);
+        if (!cur_mode || strcmp(cur_mode, mode_str) != 0) {
+            lv_label_set_text(s_label_mode, mode_str);
+        }
     }
 
     if (s_label_ip) {
-        lv_label_set_text(s_label_ip, state->ip[0] ? state->ip : "---.---.---.---");
+        const char *ip_str = state->ip[0] ? state->ip : "---.---.---.---";
+        const char *cur_ip = lv_label_get_text(s_label_ip);
+        if (!cur_ip || strcmp(cur_ip, ip_str) != 0) {
+            lv_label_set_text(s_label_ip, ip_str);
+        }
     }
 
     // 2. Update Link Status Badge
     if (s_badge_link) {
         if (state->link_active) {
-            lv_label_set_text(s_badge_link, LV_SYMBOL_OK " ONLINE");
-            lv_obj_set_style_text_color(s_badge_link, lv_color_hex(UI_COLOR_HEX_ONLINE), LV_PART_MAIN);
+            const char *cur_badge = lv_label_get_text(s_badge_link);
+            if (!cur_badge || strcmp(cur_badge, LV_SYMBOL_OK " ONLINE") != 0) {
+                lv_label_set_text(s_badge_link, LV_SYMBOL_OK " ONLINE");
+                lv_obj_set_style_text_color(s_badge_link, lv_color_hex(UI_COLOR_HEX_ONLINE), LV_PART_MAIN);
+            }
         } else {
-            lv_label_set_text(s_badge_link, LV_SYMBOL_WARNING " OFFLINE");
-            lv_obj_set_style_text_color(s_badge_link, lv_color_hex(UI_COLOR_HEX_OFFLINE), LV_PART_MAIN);
+            const char *cur_badge = lv_label_get_text(s_badge_link);
+            if (!cur_badge || strcmp(cur_badge, LV_SYMBOL_WARNING " OFFLINE") != 0) {
+                lv_label_set_text(s_badge_link, LV_SYMBOL_WARNING " OFFLINE");
+                lv_obj_set_style_text_color(s_badge_link, lv_color_hex(UI_COLOR_HEX_OFFLINE), LV_PART_MAIN);
+            }
         }
     }
 
     // 3. Update Title
     if (s_label_title) {
-        if (state->title[0] != '\0') {
-            lv_label_set_text(s_label_title, state->title);
-        } else {
-            lv_label_set_text(s_label_title, "No Track Playing");
+        const char *title_str = (state->title[0] != '\0') ? state->title : "No Track Playing";
+        const char *cur_title = lv_label_get_text(s_label_title);
+        if (!cur_title || strcmp(cur_title, title_str) != 0) {
+            lv_label_set_text(s_label_title, title_str);
         }
     }
 
@@ -305,7 +318,10 @@ void ui_now_playing_update(const cyd_telemetry_state_t *state) {
             strncpy(subtitle, "Ready to stream", sizeof(subtitle) - 1);
             subtitle[sizeof(subtitle) - 1] = '\0';
         }
-        lv_label_set_text(s_label_artist_album, subtitle);
+        const char *cur_sub = lv_label_get_text(s_label_artist_album);
+        if (!cur_sub || strcmp(cur_sub, subtitle) != 0) {
+            lv_label_set_text(s_label_artist_album, subtitle);
+        }
     }
 
     // 5. Update Progress Bar and Time Labels
@@ -316,33 +332,43 @@ void ui_now_playing_update(const cyd_telemetry_state_t *state) {
     }
 
     if (s_bar_progress) {
-        lv_bar_set_value(s_bar_progress, progress_pct, LV_ANIM_OFF);
+        if (lv_bar_get_value(s_bar_progress) != progress_pct) {
+            lv_bar_set_value(s_bar_progress, progress_pct, LV_ANIM_OFF);
+        }
     }
 
     if (s_label_time_elapsed) {
         char elapsed_buf[32];
         ui_now_playing_format_time(state->elapsed, elapsed_buf, sizeof(elapsed_buf));
-        lv_label_set_text(s_label_time_elapsed, elapsed_buf);
+        const char *cur_elapsed = lv_label_get_text(s_label_time_elapsed);
+        if (!cur_elapsed || strcmp(cur_elapsed, elapsed_buf) != 0) {
+            lv_label_set_text(s_label_time_elapsed, elapsed_buf);
+        }
     }
 
     if (s_label_time_total) {
         char total_buf[32];
         ui_now_playing_format_time(state->duration, total_buf, sizeof(total_buf));
-        lv_label_set_text(s_label_time_total, total_buf);
+        const char *cur_total = lv_label_get_text(s_label_time_total);
+        if (!cur_total || strcmp(cur_total, total_buf) != 0) {
+            lv_label_set_text(s_label_time_total, total_buf);
+        }
     }
 
     // 6. Update Play/Pause Dynamic Icon
     if (s_label_play_pause) {
-        if (strcmp(state->state, "play") == 0) {
-            lv_label_set_text(s_label_play_pause, LV_SYMBOL_PAUSE);
-        } else {
-            lv_label_set_text(s_label_play_pause, LV_SYMBOL_PLAY);
+        const char *symbol = (strcmp(state->state, "play") == 0) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY;
+        const char *cur_sym = lv_label_get_text(s_label_play_pause);
+        if (!cur_sym || strcmp(cur_sym, symbol) != 0) {
+            lv_label_set_text(s_label_play_pause, symbol);
         }
     }
 
     // 7. Update Volume Slider
     if (s_slider_vol) {
-        lv_slider_set_value(s_slider_vol, state->vol, LV_ANIM_OFF);
+        if (lv_slider_get_value(s_slider_vol) != state->vol) {
+            lv_slider_set_value(s_slider_vol, state->vol, LV_ANIM_OFF);
+        }
     }
 
     cyd_ui_unlock();
