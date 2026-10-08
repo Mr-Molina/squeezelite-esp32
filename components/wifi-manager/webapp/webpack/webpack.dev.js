@@ -159,9 +159,9 @@ module.exports ={
         open: true,
         compress: true,
         port: PORT, 
-        host: '0.0.0.0',
-        allowedHosts: "all",
-        headers: {'Access-Control-Allow-Origin': '*',    'Accept-Encoding': 'identity'},
+        host: '127.0.0.1',
+        allowedHosts: ["localhost", "127.0.0.1"],
+        headers: {'Access-Control-Allow-Origin': 'http://127.0.0.1:5000',    'Accept-Encoding': 'identity'},
     client: {
         logging: "verbose",
         // Can be used only for `errors`/`warnings`

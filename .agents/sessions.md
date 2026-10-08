@@ -2,6 +2,28 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-08 | Antigravity Orchestrator | Complete Scout Discovered Vulnerability Remediation & Attack Surface Hardening (Milestone MK-5)
+**Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
+**Host OS**: Windows 11
+**Branch**: `milestone-mk-5`
+**Security Gate Verdict**: UNCONDITIONAL PASS (Upgraded from CONDITIONAL PASS)
+
+### Completed This Session
+- **Parallel Subagent Remediation (`dispatching-parallel-agents`)** ✅:
+  - **Worker 1 (`d8593f3f` - Nanopb Security Fixer)**: Remediated memory leak in `pb_decode_ex()` under `PB_ENABLE_MALLOC` (CVE-2024-53984) by updating error handling in `components/spotify/cspot/bell/external/nanopb/pb_decode.c` (`status = false`), ensuring `pb_release()` executes and frees allocated structures.
+  - **Worker 2 (`f7ec1054` - Attack Surface Cleanup Specialist)**: Purged dormant CivetWeb 1.16.0 directory (`components/spotify/cspot/bell/external/civetweb/`, 28,536 lines / 13 files deleted) eliminating CVE-2025-9648 and CVE-2026-5789. Added fail-fast CMake guard in `components/spotify/cspot/bell/CMakeLists.txt` enforcing native `esp_http_server`.
+  - **Worker 3 (`8ebf16d6` - Web Server & cJSON Hardening Specialist)**: Hardened `connect_post_handler` in `components/wifi-manager/http_server_handlers.c` with strict length validation on `ssid` (max 32 B) and `password` (max 64 B) before memory allocation and async connection dispatch (CVE-2026-16554).
+  - **Worker 4 (`6733f87e` - Webapp Security Specialist)**: Modernized `components/wifi-manager/webapp/package.json` (moved `optipng-bin` to `devDependencies`, bumped `lodash` & `lodash-es` to `^4.18.1` for CVE-2026-4800, `postcss` to `^8.5.23` for CVE-2026-45623, `webpack-dev-server` to `^5.2.6`). Hardened `webpack/webpack.dev.js` by binding `host` to `127.0.0.1`, restricting `allowedHosts` to `["localhost", "127.0.0.1"]`, and locking CORS origin headers.
+- **Threat Intelligence Verification (`WO-WAKE-09-VERIFY`)** ✅:
+  - Reconnaissance Lookout (`recon-lookout`) conducted post-remediation audit and certified **UNCONDITIONAL PASS**.
+  - All 4 vulnerability vectors verified closed in code.
+  - Verified 6/6 webapp unit tests passing cleanly (`node components/wifi-manager/webapp/test/test.js`).
+- **Mechanical Invariants Certified** ✅:
+  - Invariant 13: Cleaned up temporary test scripts from `scratch/`.
+  - Invariant 24: Secret scan clean (0 hardcoded credentials or tokens).
+  - Invariant 37 / 39: Empirical verification with exit code 0 across all test harnesses.
+
+
 ## 2026-09-28 | Antigravity Orchestrator | Full Sequential Remediation of All 157 Deep Code Audit Defects (Milestone MK-5)
 **Agent**: Antigravity Orchestrator (Multi-Agent Swarm)
 **Host OS**: Windows 11

@@ -843,6 +843,7 @@ esp_err_t connect_post_handler(httpd_req_t *req){
     char * ssid=NULL;
     char * password=NULL;
     char * host_name=NULL;
+    wifi_sta_config_t network_config;
 
 	if (!validate_request_origin(req)) {
 		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
@@ -873,11 +874,23 @@ esp_err_t connect_post_handler(httpd_req_t *req){
 
 	cJSON * ssid_object = cJSON_GetObjectItemCaseSensitive(root, "ssid");
 	if(cJSON_IsString(ssid_object) && ssid_object->valuestring != NULL){
+		if (strlen(ssid_object->valuestring) >= sizeof(network_config.ssid)) {
+			ESP_LOGE_LOC(TAG, "SSID exceeds maximum buffer length: %zu", strlen(ssid_object->valuestring));
+			httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID too long");
+			cJSON_Delete(root);
+			return ESP_FAIL;
+		}
 		ssid = strdup_psram(ssid_object->valuestring);
 	}
-	cJSON * password_object = cJSON_GetObjectItemCaseSensitive(root, "pwd");
-	if(cJSON_IsString(password_object) && password_object->valuestring != NULL){
-		password = strdup_psram(password_object->valuestring);
+	cJSON * pwd_object = cJSON_GetObjectItemCaseSensitive(root, "pwd");
+	if(cJSON_IsString(pwd_object) && pwd_object->valuestring != NULL){
+		if (strlen(pwd_object->valuestring) >= sizeof(network_config.password)) {
+			ESP_LOGE_LOC(TAG, "Password exceeds maximum buffer length: %zu", strlen(pwd_object->valuestring));
+			httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password too long");
+			cJSON_Delete(root);
+			return ESP_FAIL;
+		}
+		password = strdup_psram(pwd_object->valuestring);
 	}
 	cJSON * host_name_object = cJSON_GetObjectItemCaseSensitive(root, "host_name");
 	if(cJSON_IsString(host_name_object) && host_name_object->valuestring != NULL){
