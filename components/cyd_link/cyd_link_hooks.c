@@ -58,7 +58,6 @@ static uint8_t s_cached_vol = 50;
 
 static void cache_lock(void) {
 #if defined(ESP_PLATFORM)
-    if (!s_cache_mutex) s_cache_mutex = xSemaphoreCreateMutex();
     if (s_cache_mutex) xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
 #endif
 }
@@ -132,7 +131,6 @@ void cyd_link_broadcast_full_sync(void) {
             strncpy(ip_buf, sta_ip, sizeof(ip_buf) - 1);
             ip_buf[sizeof(ip_buf) - 1] = '\0';
         }
-        free(sta_ip);
     }
     char *name = config_alloc_get_str("player_name", NULL, NULL);
     if (name) {
@@ -206,5 +204,10 @@ static void on_cyd_command(cyd_cmd_type_t type, int32_t param) {
 }
 
 void cyd_link_hooks_init(void) {
+#if defined(ESP_PLATFORM)
+    if (!s_cache_mutex) {
+        s_cache_mutex = xSemaphoreCreateMutex();
+    }
+#endif
     cyd_link_set_cmd_handler(on_cyd_command);
 }

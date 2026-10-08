@@ -20,6 +20,8 @@ class Logger:
     def print_message(cls,message,prefix=''):
         if not Logger.with_crlf:
             trimmed=re.sub(r'\n', r'%0A', message,flags=re.MULTILINE)
+        else:
+            trimmed=message
         print(f'{prefix}{trimmed}')
     @classmethod
     def debug(cls,message):
@@ -43,6 +45,7 @@ try:
     import copy
     import enum
     import glob
+    import uuid
 
     import json
     import re
@@ -106,7 +109,7 @@ artifacts_formats = [
     ['build/recovery.bin', '$OUTDIR/$PREFIX-recovery.bin'],
     ['build/ota_data_initial.bin', '$OUTDIR/$PREFIX-ota_data_initial.bin'],
     ['build/bootloader/bootloader.bin', '$OUTDIR/$PREFIX-bootloader.bin'],
-    ['build/partition_table/partition-table.bin ',
+    ['build/partition_table/partition-table.bin',
         '$OUTDIR/$PREFIX-partition-table.bin'],
 ]
 
@@ -179,7 +182,7 @@ parser_pushinstaller.add_argument('--url', type=str, help='Web Installer clone u
 parser_pushinstaller.add_argument(
     '--web_installer_branch', type=str, help='Web Installer branch to use ', default='main')
 parser_pushinstaller.add_argument(
-    '--token', type=str, help='Auth token for pushing changes')
+    '--token', type=str, help='Auth token for pushing changes', default=os.environ.get('WEB_INSTALLER_TOKEN'))
 parser_pushinstaller.add_argument(
     '--flash_file', type=str, help='Manifest json file path')
 parser_pushinstaller.add_argument(
@@ -390,7 +393,7 @@ class PlatformRelease():
         print(
             f'Artifacts for {self.name} extracted to {self.tempfolder}')
         flash_parms_file = os.path.relpath(
-            self.tempfolder+self.flash_file_path)
+            os.path.join(self.tempfolder, self.flash_file_path.lstrip(r'\/')))
         line: str
         with open(flash_parms_file) as fin:
             for line in fin:
@@ -404,8 +407,8 @@ class PlatformRelease():
                 base_name = os.path.basename(artifact[0]).rstrip().lstrip()
                 self.bin_files.append(BinFile(
                     self.tempfolder, artifact[0], self.flash_parms[base_name], self.release_details, self.build_dir))
-                has_artifacts = True
-        except Exception:
+                self.has_artifacts = True
+        except (KeyError, OSError, ValueError):
             self.has_artifacts = False
 
     def cleanup(self):
@@ -680,11 +683,24 @@ def write_github_env_file(values,env_file):
         print(f'Writing content to console...')
         env_file_stream = sys.stdout
     for attr in [attr for attr in dir(values) if not attr.startswith('_')]:
-        line = f'{attr}{"=" if attr != "description" else ""}{getattr(values,attr)}'
+        val = str(getattr(values, attr))
+        if val.startswith('<<~EOD\n') and val.endswith('\n~EOD'):
+            val = val[len('<<~EOD\n'):-len('\n~EOD')]
+        elif val.startswith('<<~EOD') and val.endswith('~EOD'):
+            val = val[len('<<~EOD'):-len('~EOD')].strip('\r\n')
+
+        if '\n' in val or '\r' in val or attr == 'description':
+            delimiter = f'DELIMITER_{uuid.uuid4().hex}'
+            while delimiter in val:
+                delimiter = f'DELIMITER_{uuid.uuid4().hex}'
+            line = f'{attr}<<{delimiter}\n{val}\n{delimiter}'
+        else:
+            line = f'{attr}={val}'
+
         if env_file is not None:
             print(line)
         env_file_stream.write(f'{line}\n')
-        os.environ[attr] = str(getattr(values, attr))
+        os.environ[attr] = val
     if env_file is not None:
         print(f'Done writing to {env_file}!')
         env_file_stream.close()
@@ -904,7 +920,6 @@ def push_with_method(auth_method:str,token:str,remote: Remote,reference):
 def push_if_change(repo: Repository, token: str, source_path: str, manif_json):
     if is_dirty(repo):
         print(f'Changes found. Preparing commit')
-        env = AttributeDict(os.environ)
         index: Index = repo.index
         index.add_all()
         index.write()
@@ -971,8 +986,13 @@ def extract_files_from_archive(url):
     platform:Response = requests.get(url)
     Logger.debug(f'Downloading {url} to {tempfolder}')
     Logger.debug(f'Transfer status code: {platform.status_code}. Expanding content')
-    z = zipfile.ZipFile(io.BytesIO(platform.content))
-    z.extractall(tempfolder)
+    real_tempfolder = os.path.realpath(tempfolder)
+    with zipfile.ZipFile(io.BytesIO(platform.content)) as z:
+        for member in z.infolist():
+            target_path = os.path.realpath(os.path.join(real_tempfolder, member.filename))
+            if not (target_path == real_tempfolder or target_path.startswith(real_tempfolder + os.sep)):
+                raise Exception(f'Attempted Path Traversal in Zip File: {member.filename}')
+            z.extract(member, real_tempfolder)
     return tempfolder
 
 

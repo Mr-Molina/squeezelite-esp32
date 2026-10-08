@@ -564,8 +564,8 @@ static void register_setdevicename()
 
 static int tasks_info(int argc, char **argv)
 {
-    const size_t bytes_per_task = 40; /* see vTaskList description */
-    char *task_list_buffer = malloc_init_external(uxTaskGetNumberOfTasks() * bytes_per_task);
+    const size_t bytes_per_task = 64; /* see vTaskList description */
+    char *task_list_buffer = malloc_init_external((uxTaskGetNumberOfTasks() + 8) * bytes_per_task);
     if (task_list_buffer == NULL) {
     	cmd_send_messaging(argv[0],MESSAGING_ERROR, "failed to allocate buffer for vTaskList output");
         return 1;

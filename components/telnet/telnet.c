@@ -158,8 +158,6 @@ void start_telnet(void * pvParameter){
 
 	if (isStarted || !bIsEnabled) return;
 
-	isStarted=true;	
-
 	StaticTask_t *xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	StackType_t *xStack = heap_caps_malloc(TELNET_STACK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	
@@ -170,8 +168,15 @@ void start_telnet(void * pvParameter){
 		return;
 	}
 
-	xTaskCreateStatic( (TaskFunction_t) &telnet_task, "telnet", TELNET_STACK_SIZE, NULL, ESP_TASK_PRIO_MIN, xStack, xTaskBuffer);
+	TaskHandle_t th = xTaskCreateStatic( (TaskFunction_t) &telnet_task, "telnet", TELNET_STACK_SIZE, NULL, ESP_TASK_PRIO_MIN, xStack, xTaskBuffer);
+	if (!th) {
+		ESP_LOGE(TAG, "Failed to create telnet task");
+		free(xTaskBuffer);
+		free(xStack);
+		return;
+	}
 
+	isStarted = true;
 }
 
 static void telnet_task(void *data) {
@@ -324,7 +329,7 @@ static void telnet_event_handler(telnet_t *thisTelnet, telnet_event_t *event, vo
 		}
 		break;
 	case TELNET_EV_TTYPE:
-		telnet_ttype_send(telnetUserData->tnHandle);
+		telnet_ttype_is(telnetUserData->tnHandle, "VT100");
 		break;
 	case TELNET_EV_WARNING:
 		ESP_LOGW(TAG, "Telnet warning: %s (%s:%d)", event->error.msg,
@@ -412,6 +417,16 @@ static void handle_telnet_conn() {
 	memset(pTelnetUserData, 0, sizeof(telnet_userdata_t));
 
 	telnet_t *new_handle = telnet_init(my_telopts, telnet_event_handler, 0, pTelnetUserData);
+	if (!new_handle) {
+		ESP_LOGE(TAG, "Failed to initialize telnet");
+		free(pTelnetUserData);
+		if (telnet_mutex) xSemaphoreTakeRecursive(telnet_mutex, portMAX_DELAY);
+		int sock = (partnerSocket > 0) ? partnerSocket : client_sock;
+		partnerSocket = -1;
+		if (telnet_mutex) xSemaphoreGiveRecursive(telnet_mutex);
+		if (sock > 0) close(sock);
+		return;
+	}
 
 	pTelnetUserData->rxbuf = (char *) heap_caps_malloc(TELNET_RX_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!pTelnetUserData->rxbuf) {

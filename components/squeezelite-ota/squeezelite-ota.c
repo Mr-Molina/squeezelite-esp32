@@ -401,6 +401,11 @@ esp_err_t init_config(ota_thread_parms_t * p_ota_thread_parms){
 		}
 	switch (ota_status->ota_type) {
 	case OTA_TYPE_HTTP:
+		if (strncasecmp(p_ota_thread_parms->url, "https://", 8) != 0) {
+			ESP_LOGE(TAG, "Insecure URL scheme rejected. HTTPS is required: %s", p_ota_thread_parms->url);
+			sendMessaging(MESSAGING_ERROR, "Error: HTTPS required for OTA");
+			return ESP_ERR_INVALID_ARG;
+		}
 		http_client_config.crt_bundle_attach = esp_crt_bundle_attach;
 		http_client_config.event_handler = _http_event_handler;
 		http_client_config.disable_auto_redirect=false;
@@ -503,7 +508,10 @@ esp_err_t _erase_last_boot_app_partition(const esp_partition_t *ota_partition)
 }
 
 void ota_task_cleanup(const char * fmt, ...){
-	ota_status->bOTAThreadStarted=false;
+	if (ota_status) {
+		ota_status->bOTAThreadStarted = false;
+		ota_status->bOTAStarted = false;
+	}
 	loc_displayer_progressbar(0);
 	if(fmt!=NULL){
 		char buf[256];
@@ -517,13 +525,17 @@ void ota_task_cleanup(const char * fmt, ...){
 	} else {
 		if (led_display) led_vu_color_green(LED_VU_BRIGHT);
 	}
-	FREE_RESET(ota_status->ota_write_data);
-	FREE_RESET(ota_status->bin_data);
+	if (ota_status) {
+		FREE_RESET(ota_status->ota_write_data);
+		FREE_RESET(ota_status->bin_data);
+		FREE_RESET(ota_status);
+	}
+	FREE_RESET(http_client_config.url);
+	FREE_RESET(ota_thread_parms.url);
 	if(ota_http_client!=NULL) {
 		esp_http_client_cleanup(ota_http_client);
 		ota_http_client=NULL;
 	}
-	ota_status->bOTAStarted = false;
 	task_fatal_error();
 }
 esp_err_t ota_buffer_all(){
@@ -575,15 +587,26 @@ esp_err_t ota_header_check(){
 	esp_app_desc_t new_app_info;
     esp_app_desc_t running_app_info;
 
+	memset(&running_app_info, 0, sizeof(running_app_info));
+	memset(&new_app_info, 0, sizeof(new_app_info));
+
     ota_status->configured = esp_ota_get_boot_partition();
     ota_status->running = esp_ota_get_running_partition();
     ota_status->last_invalid_app= esp_ota_get_last_invalid_partition();
-    ota_status->ota_partition = _get_ota_partition(ESP_PARTITION_SUBTYPE_APP_OTA_0);
 
-	if(ota_status->ota_partition == NULL){
-		ESP_LOGE(TAG,"Unable to locate OTA application partition. ");
-        ota_task_cleanup("Error: OTA partition not found");
-        return ESP_FAIL;
+	if (ota_status->update_partition != NULL && ota_status->update_partition != ota_status->running) {
+		ota_status->ota_partition = ota_status->update_partition;
+	} else {
+		ota_status->ota_partition = _get_ota_partition(ESP_PARTITION_SUBTYPE_APP_OTA_0);
+		if (ota_status->ota_partition == ota_status->running) {
+			ota_status->ota_partition = _get_ota_partition(ESP_PARTITION_SUBTYPE_APP_OTA_1);
+		}
+	}
+
+	if (ota_status->ota_partition == NULL || ota_status->ota_partition == ota_status->running) {
+		ESP_LOGE(TAG, "Cannot overwrite active running partition [%s]!", ota_status->running ? ota_status->running->label : "unknown");
+		ota_task_cleanup("Error: Target OTA partition is active running partition");
+		return ESP_FAIL;
 	}
     ESP_LOGD(TAG, "Running partition [%s] type %d subtype %d (offset 0x%08x)", ota_status->running->label, ota_status->running->type, ota_status->running->subtype, ota_status->running->address);
     if (ota_status->total_image_len > ota_status->ota_partition->size){
@@ -594,8 +617,12 @@ esp_err_t ota_header_check(){
         ESP_LOGW(TAG, "Configured OTA boot partition at offset 0x%08x, but running from offset 0x%08x", ota_status->configured->address, ota_status->running->address);
         ESP_LOGW(TAG, "(This can happen if either the OTA boot data or preferred boot image become corrupted somehow.)");
     }
-    ESP_LOGD(TAG, "Next ota update partition is: [%s] subtype %d at offset 0x%x",
-    		ota_status->update_partition->label, ota_status->update_partition->subtype, ota_status->update_partition->address);
+	if (ota_status->update_partition != NULL) {
+		ESP_LOGD(TAG, "Next ota update partition is: [%s] subtype %d at offset 0x%x",
+				ota_status->update_partition->label, ota_status->update_partition->subtype, ota_status->update_partition->address);
+	} else {
+		ESP_LOGW(TAG, "Next ota update partition is NULL");
+	}
 
     char *bin_buffer = ota_status ? ota_status->bin_data : NULL;
     if (!bin_buffer) {
@@ -622,6 +649,11 @@ esp_err_t ota_header_check(){
 			ESP_LOGD(TAG, "Running recovery version: %s", running_app_info.version);
 			if (memcmp(new_app_info.project_name, running_app_info.project_name, sizeof(new_app_info.project_name)) != 0) {
 				ota_task_cleanup("Error: Project name mismatch");
+				return ESP_FAIL;
+			}
+			if (new_app_info.secure_version < running_app_info.secure_version) {
+				ota_task_cleanup("Error: Anti-rollback violation (new secure_version %u < running %u)",
+					new_app_info.secure_version, running_app_info.secure_version);
 				return ESP_FAIL;
 			}
 		}
@@ -701,7 +733,7 @@ void ota_task(void *pvParameter)
 	// which was already done above
     esp_ota_handle_t update_handle = 0 ;
     gettimeofday(&ota_status->OTA_start, NULL);
-	err = esp_ota_begin(ota_status->ota_partition, 512, &update_handle);
+	err = esp_ota_begin(ota_status->ota_partition, (size_t)ota_status->total_image_len, &update_handle);
 	if (err != ESP_OK) {
 		ota_task_cleanup("esp_ota_begin failed (%s)", esp_err_to_name(err));
 		return;

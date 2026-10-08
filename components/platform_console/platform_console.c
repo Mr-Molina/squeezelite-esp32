@@ -69,8 +69,26 @@ static bool is_fs_mounted(const char *path) {
 static esp_err_t run_command(char * line);
 #define ADD_TO_JSON(o,t,n) if (t->n) cJSON_AddStringToObject(o,QUOTE(n),t->n);
 #define ADD_PARMS_TO_CMD(o,t,n) { cJSON * parms = ParmsToJSON(&t.n->hdr); if(parms) cJSON_AddItemToObject(o,QUOTE(n),parms); }
+#define MAX_VAL_FN_ENTRIES 32
+typedef struct {
+	char command[32];
+	parm_values_fn_t fn;
+} cmd_val_fn_entry_t;
+
+static cmd_val_fn_entry_t cmd_val_fn_table[MAX_VAL_FN_ENTRIES];
+static size_t cmd_val_fn_count = 0;
+
+static parm_values_fn_t find_val_fn(const char *command) {
+	if (!command) return NULL;
+	for (size_t i = 0; i < cmd_val_fn_count; i++) {
+		if (strcmp(cmd_val_fn_table[i].command, command) == 0) {
+			return cmd_val_fn_table[i].fn;
+		}
+	}
+	return NULL;
+}
+
 cJSON * cmdList;
-cJSON * values_fn_list;
 cJSON * get_cmd_list(){
 	cJSON * element;
 	cJSON * values=cJSON_CreateObject();
@@ -79,10 +97,8 @@ cJSON * get_cmd_list(){
 	cJSON_AddItemToObject(list,"values",values);
 	cJSON_ArrayForEach(element,cmdList){
 		cJSON * name = cJSON_GetObjectItem(element,"name");
-		cJSON * vals_fn = cJSON_GetObjectItem(values_fn_list,cJSON_GetStringValue(name));
-		if(vals_fn!=NULL ){
-			parm_values_fn_t *parm_values_fn = (parm_values_fn_t *)strtoul(cJSON_GetStringValue(vals_fn), NULL, 16);;
-
+		if(name && cJSON_GetStringValue(name)){
+			parm_values_fn_t parm_values_fn = find_val_fn(cJSON_GetStringValue(name));
 			if(parm_values_fn){
 				cJSON_AddItemToObject(values,cJSON_GetStringValue(name),parm_values_fn());
 			}
@@ -142,9 +158,6 @@ esp_err_t cmd_to_json_with_cb(const esp_console_cmd_t *cmd, parm_values_fn_t par
 	if(!cmdList){
 		cmdList=cJSON_CreateArray();
 	}
-	if(!values_fn_list){
-		values_fn_list=cJSON_CreateObject();
-	}
 
     if (cmd->command == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -155,10 +168,13 @@ esp_err_t cmd_to_json_with_cb(const esp_console_cmd_t *cmd, parm_values_fn_t par
     cJSON * jsoncmd = cJSON_CreateObject();
     ADD_TO_JSON(jsoncmd,cmd,help);
     ADD_TO_JSON(jsoncmd,cmd,hint);
-	if(parm_values_fn){
-		char addr[11]={0};
-		snprintf(addr,sizeof(addr),"%lx",(unsigned long)parm_values_fn);
-		cJSON_AddStringToObject(values_fn_list,cmd->command,addr);
+	if(parm_values_fn && cmd->command){
+		if (cmd_val_fn_count < MAX_VAL_FN_ENTRIES) {
+			strncpy(cmd_val_fn_table[cmd_val_fn_count].command, cmd->command, sizeof(cmd_val_fn_table[cmd_val_fn_count].command) - 1);
+			cmd_val_fn_table[cmd_val_fn_count].command[sizeof(cmd_val_fn_table[cmd_val_fn_count].command) - 1] = '\0';
+			cmd_val_fn_table[cmd_val_fn_count].fn = parm_values_fn;
+			cmd_val_fn_count++;
+		}
 	}
 	cJSON_AddBoolToObject(jsoncmd,"hascb",parm_values_fn!=NULL);
 
@@ -323,7 +339,7 @@ void initialize_console() {
 	esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
 		
 	/* re-direct stdin to our own driver so we can gather data from various sources */
-	stdin_redir.queue_set = xQueueCreateSet(2);
+	stdin_redir.queue_set = xQueueCreateSet(5);
 	stdin_redir.handle = xRingbufferCreateStatic(sizeof(stdin_redir._buf), RINGBUF_TYPE_BYTEBUF, stdin_redir._buf, &stdin_redir._ringbuf);
 	xRingbufferAddToQueueSetRead(stdin_redir.handle, stdin_redir.queue_set);
 	xQueueAddToSet(uart_queue, stdin_redir.queue_set);
@@ -485,6 +501,7 @@ static void * console_thread() {
 		 */
 		char* line = linenoise(prompt);
 		if (line == NULL) { /* Ignore empty lines */
+			vTaskDelay(pdMS_TO_TICKS(50));
 			continue;
 		}
 		/* Add the command to the history */

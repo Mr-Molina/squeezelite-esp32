@@ -23,6 +23,7 @@
 #include "platform_esp32.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_console.h"
@@ -84,7 +85,7 @@ void init_cJSON(){
 void config_init(){
 	ESP_LOGD(TAG, "Creating mutex for Config");
 	MEMTRACE_PRINT_DELTA();
-	config_mutex = xSemaphoreCreateMutex();
+	config_mutex = xSemaphoreCreateRecursiveMutex();
 	MEMTRACE_PRINT_DELTA();
 	ESP_LOGD(TAG, "Creating event group");
 	MEMTRACE_PRINT_DELTA();
@@ -577,7 +578,7 @@ bool wait_for_commit(){
 
 bool config_lock(TickType_t xTicksToWait) {
 	ESP_LOGV(TAG, "Locking config json object");
-	if( xSemaphoreTake( config_mutex, xTicksToWait ) == pdTRUE ) {
+	if( xSemaphoreTakeRecursive( config_mutex, xTicksToWait ) == pdTRUE ) {
 		ESP_LOGV(TAG, "config Json object locked!");
 		return true;
 	}
@@ -589,19 +590,28 @@ bool config_lock(TickType_t xTicksToWait) {
 
 void config_unlock() {
 	ESP_LOGV(TAG, "Unlocking json buffer!");
-	xSemaphoreGive( config_mutex );
+	xSemaphoreGiveRecursive( config_mutex );
 }
+
+static volatile bool s_commit_task_running = false;
 
 static void config_commit_task(void *pvParameters) {
 	config_commit_to_nvs();
+	s_commit_task_running = false;
 	vTaskDelete(NULL);
 }
 
 static void vCallbackFunction( TimerHandle_t xTimer ) {
 	static int cnt=0;
 	if(config_has_changes()){
-		ESP_LOGI(TAG, "configuration has some uncommitted entries");
-		xTaskCreate(config_commit_task, "cfg_commit", 3072, NULL, ESP_TASK_PRIO_MIN + 1, NULL);
+		if(!s_commit_task_running){
+			ESP_LOGI(TAG, "configuration has some uncommitted entries");
+			s_commit_task_running = true;
+			if(xTaskCreate(config_commit_task, "cfg_commit", 3072, NULL, ESP_TASK_PRIO_MIN + 1, NULL) != pdPASS){
+				ESP_LOGE(TAG, "Failed to create cfg_commit task");
+				s_commit_task_running = false;
+			}
+		}
 	}
 	else{
 		if(++cnt>=15){
@@ -771,6 +781,7 @@ esp_err_t config_set_cjson_str_and_free(const char *key, cJSON *value){
 	char * value_str = cJSON_PrintUnformatted(value);
 	if(value_str==NULL){
 		ESP_LOGE(TAG, "Unable to print cJSON for key [%s]", key);
+		cJSON_Delete(value);
 		return ESP_ERR_INVALID_ARG;
 	}
 	esp_err_t err = config_set_value(NVS_TYPE_STR,key, value_str);
@@ -784,7 +795,15 @@ void config_get_uint16t_from_str(const char *key, uint16_t *value, uint16_t defa
 		*value = default_value;
 		return ;
 	}
-	*value = atoi(str_value);
+	char *endptr = NULL;
+	errno = 0;
+	unsigned long val = strtoul(str_value, &endptr, 10);
+	if (endptr == str_value || (*endptr != '\0' && *endptr != '\r' && *endptr != '\n') || errno != 0 || val > 65535) {
+		ESP_LOGW(TAG, "Invalid uint16 string '%s' for key [%s], using default %u", str_value, key, default_value);
+		*value = default_value;
+	} else {
+		*value = (uint16_t)val;
+	}
 	free(str_value);
 }
 

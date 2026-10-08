@@ -109,7 +109,7 @@ static uint32_t i2s_idle_since;
 static void (*pseudo_idle_chain)(uint32_t);
 static bool (*slimp_handler_chain)(u8_t *data, int len);
 static bool jack_mutes_amp;
-static bool running, isI2SStarted, ended;
+static volatile bool running, isI2SStarted, ended;
 static i2s_config_t i2s_config;
 static u8_t *obuf;
 static frames_t oframes;
@@ -578,9 +578,11 @@ static void output_thread_i2s(void *arg) {
 		output.updated = gettime_ms();
 		output.frames_played_dmp = output.frames_played;
 		// try to estimate how much we have consumed from the DMA buffer (calculation is incorrect at the very beginning ...)
-		long consumed = ((output.updated - fullness) * output.current_sample_rate) / 1000;
-		if (consumed >= dma_buf_frames) {
+		int64_t consumed = ((int64_t)(output.updated - fullness) * (int64_t)output.current_sample_rate) / 1000;
+		if (consumed >= (int64_t)dma_buf_frames) {
 			output.device_frames = 0;
+		} else if (consumed < 0) {
+			output.device_frames = dma_buf_frames;
 		} else {
 			output.device_frames = (frames_t)(dma_buf_frames - consumed);
 		}
@@ -601,8 +603,8 @@ static void output_thread_i2s(void *arg) {
 			discard = output.frames_played_dmp ? 0 : output.device_frames;
 			synced = true;
 		} else if (discard) {
-            discard -= min(oframes, discard);
-            iframes = discard ? min(FRAME_BLOCK, discard) : FRAME_BLOCK;
+             discard -= min(oframes, discard);
+             iframes = discard ? min(FRAME_BLOCK, discard) : FRAME_BLOCK;
 			UNLOCK;
 			continue;
 		}
@@ -632,7 +634,10 @@ static void output_thread_i2s(void *arg) {
 			*/		
 			}	
 			i2s_config.sample_rate = output.current_sample_rate;
-			i2s_set_sample_rates(CONFIG_I2S_NUM, spdif.enabled ? i2s_config.sample_rate * 2 : i2s_config.sample_rate);
+			esp_err_t rate_err = i2s_set_sample_rates(CONFIG_I2S_NUM, spdif.enabled ? i2s_config.sample_rate * 2 : i2s_config.sample_rate);
+			if (rate_err != ESP_OK) {
+				LOG_ERROR("i2s_set_sample_rates failed: %s", esp_err_to_name(rate_err));
+			}
 			i2s_zero_dma_buffer(CONFIG_I2S_NUM);
 
             equalizer_set_samplerate(output.current_sample_rate);
@@ -646,19 +651,19 @@ static void output_thread_i2s(void *arg) {
 			size_t obytes, count = 0;
 			bytes = 0;
 			// need IRAM for speed but can't allocate a FRAME_BLOCK * 16, so process by smaller chunks
-			while (count < oframes) {
+			while (running && count < oframes) {
 				size_t chunk = min(SPDIF_BLOCK, oframes - count);
                 spdif_convert((ISAMPLE_T*) obuf + count * 2, chunk, (u32_t*) spdif.buf);              
-				i2s_write(CONFIG_I2S_NUM, spdif.buf, chunk * 16, &obytes, portMAX_DELAY);
+				i2s_write(CONFIG_I2S_NUM, spdif.buf, chunk * 16, &obytes, pdMS_TO_TICKS(100));
 				bytes += obytes / (16 / BYTES_PER_FRAME);
 				count += chunk;
 			}
 #if BYTES_PER_FRAME == 4		
 		} else if (i2s_config.bits_per_sample == 32) {  
-			i2s_write_expand(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, 16, 32, &bytes, portMAX_DELAY);
+			i2s_write_expand(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, 16, 32, &bytes, pdMS_TO_TICKS(100));
 #endif			
 		} else {
-			i2s_write(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, &bytes, portMAX_DELAY);
+			i2s_write(CONFIG_I2S_NUM, obuf, oframes * BYTES_PER_FRAME, &bytes, pdMS_TO_TICKS(100));
 		}
 
 		fullness = gettime_ms();

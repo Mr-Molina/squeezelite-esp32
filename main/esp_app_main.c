@@ -516,6 +516,8 @@ void app_main()
 			ESP_LOGE(TAG,"Restarted to application partition. We're not going to perform OTA!");
 			config_delete_key("fwurl");
 		}
+	}
+	if (fwurl) {
 		free(fwurl);
 	}
     services_sleep_init();

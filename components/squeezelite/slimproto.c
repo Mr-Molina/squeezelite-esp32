@@ -105,6 +105,7 @@ void slimproto_send_packet(u8_t *packet, size_t len) {
 	ssize_t n;
 
 	while (len) {
+		if (sock < 0) return;
 		n = send(sock, ptr, len, MSG_NOSIGNAL);
 		if (n <= 0) {
 			if (n < 0 && last_error() == ERROR_WOULDBLOCK && try < 10) {
@@ -953,7 +954,10 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 #if EMBEDDED        
         // on first attempt, try really hard to connect before exiting (and only exit if we are not on another sink)
 		slimproto_ip = discover_server(server, MAX_SERVER_RETRIES * 5);
-        if (!slimproto_ip && !output.external) return;
+        if (!slimproto_ip && !output.external) {
+			wake_close(wake_e);
+			return;
+		}
 #else        
     	slimproto_ip = discover_server(server, 0);
 #endif    
@@ -987,7 +991,10 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 		}
 	}
 
-	if (!running) return;
+	if (!running) {
+		wake_close(wake_e);
+		return;
+	}
 
 	LOCK_O;
 	snprintf(fixed_cap, sizeof(fixed_cap), ",ModelName=%s,MaxSampleRate=%u", modelname ? modelname : MODEL_NAME_STRING,
@@ -1028,19 +1035,24 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 		}
 
 		if (sock >= 0) {
+			LOCK_P;
 			closesocket(sock);
 			sock = -1;
+			UNLOCK_P;
 		}
 
+		LOCK_P;
 		sock = socket(AF_INET, SOCK_STREAM, 0);
-
 		set_nonblock(sock);
 		set_nosigpipe(sock);
+		UNLOCK_P;
 
 		if (connect_timeout(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr), 5) != 0) {
 
+			LOCK_P;
 			closesocket(sock);
 			sock = -1;
+			UNLOCK_P;
 
 			if (previous_server) {
 				slimproto_ip = serv_addr.sin_addr.s_addr = previous_server;
@@ -1054,8 +1066,8 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 			// in embedded we give up after a while no matter what
 			if (++failed_connect > MAX_SERVER_RETRIES && !server) {
 				slimproto_ip = serv_addr.sin_addr.s_addr = discover_server(NULL, MAX_SERVER_RETRIES);
-				if (!slimproto_ip && !output.external) return;
-			} else if (reconnect && MAX_SERVER_RETRIES && failed_connect > 5 * MAX_SERVER_RETRIES && !output.external) return;
+				if (!slimproto_ip && !output.external) break;
+			} else if (reconnect && MAX_SERVER_RETRIES && failed_connect > 5 * MAX_SERVER_RETRIES && !output.external) break;
 #else
 			// rediscover server if it was not set at startup or exit 
 			if (!server && ++failed_connect > 5) {
@@ -1128,10 +1140,21 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 		previous_server = 0;
 
 		if (sock >= 0) {
+			LOCK_P;
 			closesocket(sock);
 			sock = -1;
+			UNLOCK_P;
 		}
 	}
+
+	if (sock >= 0) {
+		LOCK_P;
+		closesocket(sock);
+		sock = -1;
+		UNLOCK_P;
+	}
+
+	wake_close(wake_e);
 }
 
 void slimproto_stop(void) {

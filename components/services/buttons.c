@@ -37,7 +37,7 @@ static EXT_RAM_ATTR uint32_t buttons_idle_since;
 #define DEBOUNCE			50
 #define BUTTON_QUEUE_LEN	10
 
-static EXT_RAM_ATTR struct button_s {
+static DRAM_ATTR struct button_s {
 	void *client;
 	int gpio;
 	int debounce;
@@ -58,7 +58,7 @@ static struct {
 
 static TimerHandle_t polled_timer;
 
-static EXT_RAM_ATTR struct encoder {
+static DRAM_ATTR struct encoder {
 	QueueHandle_t queue;
 	void *client;
 	rotary_encoder_info_t info;
@@ -141,12 +141,15 @@ static void buttons_handler(struct button_s *button, int level) {
 
 	if (button->shifter && button->shifter->type == button->shifter->level) button->shifter->shifting = true;
 
-	if (button->long_press && !button->long_timer && button->level == button->type) {
+	if (button->long_press > 0 && !button->long_timer && button->level == button->type) {
 		// detect a long press, so hold event generation
 		ESP_LOGD(TAG, "setting long timer gpio:%u level:%u", button->gpio, button->level);
 		xTimerChangePeriod(button->timer, pdMS_TO_TICKS(button->long_press), 0);
 		button->long_timer = true;
 	} else {
+		if (button->long_timer) {
+			xTimerChangePeriod(button->timer, pdMS_TO_TICKS(button->debounce), 0);
+		}
 		// send a button pressed/released event (content is copied in queue)
 		ESP_LOGD(TAG, "sending event for gpio:%u level:%u", button->gpio, button->level);
 		// queue will have a copy of button's context

@@ -2,6 +2,23 @@
 #if !defined(TEST_CASE) && __has_include("unity_test_runner.h")
 #include "unity_test_runner.h"
 #endif
+
+#if !defined(TEST_CASE)
+typedef struct {
+    const char *name;
+    void (*fn)(void);
+} cyd_test_t;
+static cyd_test_t s_tests[32];
+static int s_test_count = 0;
+#define TEST_CONCAT_INNER(a, b) a##b
+#define TEST_CONCAT(a, b) TEST_CONCAT_INNER(a, b)
+#define TEST_CASE(name, tag) \
+    static void TEST_CONCAT(test_fn_, __LINE__)(void); \
+    __attribute__((constructor)) static void TEST_CONCAT(reg_, __LINE__)(void) { \
+        s_tests[s_test_count++] = (cyd_test_t){ name, TEST_CONCAT(test_fn_, __LINE__) }; \
+    } \
+    static void TEST_CONCAT(test_fn_, __LINE__)(void)
+#endif
 #include "cyd_link_dispatch.h"
 #include "cyd_link.h"
 #include "cyd_link_hooks.h"
@@ -436,4 +453,17 @@ TEST_CASE("CYD Link Hooks Dispatch Commands to Audio Control Handlers", "[cyd_li
     TEST_ASSERT_NOT_NULL(strstr(s_tx_log[2], "\"event\":\"status\""));
     cyd_link_set_tx_spy(NULL);
 }
+
+#if !defined(ESP_PLATFORM)
+void setUp(void) {}
+void tearDown(void) {}
+
+int main(void) {
+    UNITY_BEGIN();
+    for (int i = s_test_count - 1; i >= 0; i--) {
+        UnityDefaultTestRun(s_tests[i].fn, s_tests[i].name, s_test_count - i);
+    }
+    return UNITY_END();
+}
+#endif
 

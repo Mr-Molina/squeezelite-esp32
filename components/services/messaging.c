@@ -22,11 +22,13 @@
  */
 
 const static char tag[] = "messaging";
-typedef struct {
+typedef struct messaging_list_t {
 	struct messaging_list_t * next;
 	char * subscriber_name;
 	size_t max_count;
 	RingbufHandle_t buf_handle;
+	StaticRingbuffer_t *buffer_struct;
+	uint8_t *buffer_storage;
 } messaging_list_t;
 static messaging_list_t top;
 static SemaphoreHandle_t messaging_mutex = NULL;
@@ -54,18 +56,20 @@ messaging_handle_t  get_handle_ptr(messaging_list_t * handle){
 	return (messaging_handle_t )handle;
 }
 
-RingbufHandle_t messaging_create_ring_buffer(uint8_t max_count){
+RingbufHandle_t messaging_create_ring_buffer(messaging_list_t *entry, uint8_t max_count){
 	RingbufHandle_t buf_handle = NULL;
-	StaticRingbuffer_t *buffer_struct = malloc_init_external(sizeof(StaticRingbuffer_t));
-	if (buffer_struct != NULL) {
+	entry->buffer_struct = malloc_init_external(sizeof(StaticRingbuffer_t));
+	if (entry->buffer_struct != NULL) {
 		size_t buf_size = (size_t )(sizeof(single_message_t)+8+MSG_LENGTH_AVG)*(size_t )(max_count>0?max_count:5); // no-split buffer requires an additional 8 bytes
 		buf_size = buf_size - (buf_size % 4);
-		uint8_t *buffer_storage = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_32BIT);
-		if (buffer_storage== NULL) {
+		entry->buffer_storage = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_32BIT);
+		if (entry->buffer_storage== NULL) {
 			ESP_LOGE(tag,"buff alloc failed");
+			free(entry->buffer_struct);
+			entry->buffer_struct = NULL;
 		}
 		else {
-			buf_handle = xRingbufferCreateStatic(buf_size, RINGBUF_TYPE_NOSPLIT, buffer_storage, buffer_struct);
+			buf_handle = xRingbufferCreateStatic(buf_size, RINGBUF_TYPE_NOSPLIT, entry->buffer_storage, entry->buffer_struct);
 		}
 	}
 	else {
@@ -107,7 +111,7 @@ messaging_handle_t messaging_register_subscriber(uint8_t max_count, char * name)
 	cur = get_struct_ptr(cur->next);
 	cur->max_count=max_count;
 	cur->subscriber_name=strdup_psram(name);
-	cur->buf_handle = messaging_create_ring_buffer(max_count);
+	cur->buf_handle = messaging_create_ring_buffer(cur, max_count);
 	if(cur->buf_handle){
 		messaging_fill_messages(cur);
 	}
@@ -124,6 +128,12 @@ esp_err_t messaging_unregister_subscriber(messaging_handle_t subscriber_handle){
 			cur->next = target->next;
 			if (target->buf_handle) {
 				vRingbufferDelete(target->buf_handle);
+			}
+			if (target->buffer_storage) {
+				free(target->buffer_storage);
+			}
+			if (target->buffer_struct) {
+				free(target->buffer_struct);
 			}
 			if (target->subscriber_name) {
 				free(target->subscriber_name);
@@ -142,7 +152,7 @@ void messaging_service_init(){
 	if (!messaging_mutex) {
 		messaging_mutex = xSemaphoreCreateRecursiveMutex();
 	}
-	top.buf_handle = messaging_create_ring_buffer(max_count);
+	top.buf_handle = messaging_create_ring_buffer(&top, max_count);
 	if(!top.buf_handle){
 		ESP_LOGE(tag, "messaging service init failed.");
 	}
@@ -290,6 +300,10 @@ void vmessaging_post_message(messaging_types type,messaging_classes msg_class, c
 	ln = vsnprintf(NULL, 0, fmt, va)+1;
 	msg_size = sizeof(single_message_t)+ln;
 	message = (single_message_t *)malloc_init_external(msg_size);
+	if (!message) {
+		ESP_LOGE(tag, "Memory allocation failed for message (%u bytes)", (unsigned int)msg_size);
+		return;
+	}
 	vsprintf(message->message, fmt, va);
 	message->msg_size = msg_size;
 	message->type = type;
@@ -338,7 +352,7 @@ void log_send_messaging(messaging_types msgtype,const char *fmt, ...) {
 		vsprintf(message_txt, fmt, va);
 		va_end(va);
 		ESP_LOG_LEVEL_LOCAL(messaging_type_to_err_type(msgtype),tag, "%s",message_txt);
-		messaging_post_message(msgtype, MESSAGING_CLASS_SYSTEM, message_txt );
+		messaging_post_message(msgtype, MESSAGING_CLASS_SYSTEM, "%s", message_txt );
 		free(message_txt);
 	}
 	else{
@@ -358,7 +372,7 @@ void cmd_send_messaging(const char * cmdname,messaging_types msgtype, const char
 		vsprintf((message_txt+cmd_len), fmt, va);
 		va_end(va);
 		ESP_LOG_LEVEL_LOCAL(messaging_type_to_err_type(msgtype),tag, "%s",message_txt);
-		messaging_post_message(msgtype, MESSAGING_CLASS_CFGCMD, message_txt );
+		messaging_post_message(msgtype, MESSAGING_CLASS_CFGCMD, "%s", message_txt );
 		free(message_txt);
 	}
 	else{

@@ -679,6 +679,7 @@ void network_set_timer(uint16_t duration, const char * tag) {
     if (duration > 0) {
         if(tag){
             ESP_LOGD(TAG, "Setting timer tag to %s", tag);
+            FREE_AND_NULL(NM.timer_tag);
             NM.timer_tag = strdup_psram(tag);
         }
         if (!NM.state_timer) {

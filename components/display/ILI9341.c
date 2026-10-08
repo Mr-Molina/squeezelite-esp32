@@ -269,7 +269,7 @@ static bool Init( struct GDS_Device* Device ) {
 		free(Private->Shadowbuffer);
 		Private->Shadowbuffer = NULL;
 	}
-	Private->Shadowbuffer = malloc( Device->FramebufferSize );	
+	Private->Shadowbuffer = heap_caps_malloc( Device->FramebufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA );	
 	if (!Private->Shadowbuffer) {
 		ESP_LOGE(TAG, "failed to allocate %d bytes for shadow buffer", Device->FramebufferSize);
 		return false;

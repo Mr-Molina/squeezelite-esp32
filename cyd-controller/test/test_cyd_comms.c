@@ -103,6 +103,14 @@ void test_protocol_parse_status_event(void) {
     TEST_ASSERT_EQUAL_UINT32(360, state.duration);
     TEST_ASSERT_EQUAL_UINT8(85, state.vol);
     TEST_ASSERT_TRUE(state.link_active);
+
+    // Negative elapsed and duration should clamp to 0 rather than wrap around to 2^32-1
+    const char *line_neg = "{\"event\":\"status\",\"state\":\"play\",\"elapsed\":-1,\"duration\":-10,\"vol\":-5}\n";
+    err = cyd_client_parse_event(line_neg, &state);
+    TEST_ASSERT_EQUAL(ESP_OK, err);
+    TEST_ASSERT_EQUAL_UINT32(0, state.elapsed);
+    TEST_ASSERT_EQUAL_UINT32(0, state.duration);
+    TEST_ASSERT_EQUAL_UINT8(0, state.vol);
 }
 
 void test_protocol_parse_sys_event(void) {
@@ -366,6 +374,20 @@ void test_uart_send_cmd_and_raw(void) {
     TEST_ASSERT_EQUAL(ESP_OK, cyd_client_send_raw(""));
 }
 
+void test_client_get_state_copy(void) {
+    const char *line = "{\"event\":\"meta\",\"title\":\"Snapshot Track\",\"artist\":\"Snapshot Artist\",\"album\":\"Snapshot Album\"}\n";
+    cyd_client_feed_rx_bytes(line, strlen(line));
+
+    cyd_telemetry_state_t copy;
+    memset(&copy, 0, sizeof(copy));
+    cyd_client_get_state_copy(&copy);
+
+    TEST_ASSERT_EQUAL_STRING("Snapshot Track", copy.title);
+    TEST_ASSERT_EQUAL_STRING("Snapshot Artist", copy.artist);
+    TEST_ASSERT_EQUAL_STRING("Snapshot Album", copy.album);
+    TEST_ASSERT_TRUE(copy.link_active);
+}
+
 /* =========================================================================
  * Test Runners
  * ========================================================================= */
@@ -407,6 +429,9 @@ TEST_CASE("CYD Client UART Heartbeat and Timeout Resync", "[cyd_comms]") {
 TEST_CASE("CYD Client UART Send Cmd and Raw", "[cyd_comms]") {
     test_uart_send_cmd_and_raw();
 }
+TEST_CASE("CYD Client Get State Copy", "[cyd_comms]") {
+    test_client_get_state_copy();
+}
 #else
 int main(void) {
     UNITY_BEGIN();
@@ -422,6 +447,7 @@ int main(void) {
     RUN_TEST(test_uart_feed_buffer_overflow_protection);
     RUN_TEST(test_uart_heartbeat_and_timeout_resync);
     RUN_TEST(test_uart_send_cmd_and_raw);
+    RUN_TEST(test_client_get_state_copy);
     return UNITY_END();
 }
 #endif

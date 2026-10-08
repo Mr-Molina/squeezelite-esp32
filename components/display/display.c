@@ -81,6 +81,7 @@ static void displayer_task(void *args);
 static void display_sleep(void);
 
 struct GDS_Device *display;   
+bool (*display_bus)(void *from, enum display_bus_cmd_e cmd);
 extern GDS_DetectFunc SSD1306_Detect, SSD132x_Detect, SH1106_Detect, SH1122_Detect, SSD1675_Detect, SSD1322_Detect, SSD1351_Detect, ST77xx_Detect, ILI9341_Detect;
 GDS_DetectFunc *drivers[] = { SH1106_Detect, SH1122_Detect, SSD1306_Detect, SSD132x_Detect, SSD1675_Detect, SSD1322_Detect, SSD1351_Detect, ST77xx_Detect, ILI9341_Detect, NULL };
 
@@ -146,7 +147,7 @@ void display_init(char *welcome) {
 	
 	if (init) {
 		static DRAM_ATTR StaticTask_t xTaskBuffer __attribute__ ((aligned (4)));
-		static EXT_RAM_ATTR StackType_t xStack[DISPLAYER_STACK_SIZE] __attribute__ ((aligned (4)));
+		static DRAM_ATTR StackType_t xStack[DISPLAYER_STACK_SIZE] __attribute__ ((aligned (4)));
 		struct GDS_Layout Layout = {
 			.HFlip = strcasestr(config, "HFlip"), 
 			.VFlip = strcasestr(config, "VFlip"), 
@@ -287,7 +288,7 @@ static void displayer_task(void *args) {
 		int sleep = min(scroll_sleep, timer_sleep);
 		ESP_LOGD(TAG, "timers s:%d t:%d", scroll_sleep, timer_sleep);
 		scroll_sleep -= sleep;
-		vTaskDelay(sleep / portTICK_PERIOD_MS);
+		vTaskDelay(pdMS_TO_TICKS(sleep) ? pdMS_TO_TICKS(sleep) : 1);
 	}
 }	
 
@@ -330,13 +331,15 @@ void displayer_metadata(char *artist, char *album, char *title) {
 	// need a display!
 	if (!display) return;
 	
+	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
+
 	// just do title if there is no config set
 	if (!displayer.metadata_config) {
 		strncpy(displayer.string, title ? title : "", SCROLLABLE_SIZE);
+		displayer.string[SCROLLABLE_SIZE] = '\0';
+		xSemaphoreGiveRecursive(displayer.mutex);
 		return;
 	}
-	
-	xSemaphoreTakeRecursive(displayer.mutex, portMAX_DELAY);
 	
 	// format metadata parameters and write them directly
 	if ((p = strcasestr(displayer.metadata_config, "format")) != NULL) {
@@ -349,7 +352,7 @@ void displayer_metadata(char *artist, char *album, char *title) {
 			
 		while (p++) {
 			// find token and copy what's after when reaching last one
-			if (sscanf(p, "%*[^%%]%%%[^%]%%", token) < 0) {
+			if (sscanf(p, "%*[^%%]%%%15[^%]%%", token) < 0) {
 				q = strchr(p, ',');
 				strncat(string, p, q ? min(q - p, space) : space);
 				break;
@@ -380,6 +383,7 @@ void displayer_metadata(char *artist, char *album, char *title) {
 	} else {
 		strncpy(string, title ? title : "", SCROLLABLE_SIZE);
 	}
+	displayer.string[SCROLLABLE_SIZE] = '\0';
 	
 	// get optional scroll speed & pause
 	PARSE_PARAM(displayer.metadata_config, "speed", '=', displayer.speed);
@@ -474,7 +478,7 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 		displayer.elapsed = displayer.duration.value = 0;
 		displayer.duration.visible = false;
 		displayer.offset = displayer.boundary = 0;
-		display_bus(&displayer, DISPLAY_BUS_TAKE);
+		if (display_bus) display_bus(&displayer, DISPLAY_BUS_TAKE);
 		if (displayer.artwork.active) GDS_SetTextWidth(display, displayer.artwork.offset);
 		vTaskResume(displayer.task);
 		break;
@@ -483,18 +487,18 @@ void displayer_control(enum displayer_cmd_e cmd, ...) {
 		// task will display the line 2 from beginning and suspend
 		displayer.state = DISPLAYER_IDLE;
 		displayer_artwork(NULL);
-		display_bus(&displayer, DISPLAY_BUS_GIVE);
+		if (display_bus) display_bus(&displayer, DISPLAY_BUS_GIVE);
 		break;		
 	case DISPLAYER_SHUTDOWN:
 		// let the task self-suspend (we might be doing i2c_write)
 		GDS_SetTextWidth(display, 0);
 		displayer_artwork(NULL);
 		displayer.state = DISPLAYER_DOWN;
-		display_bus(&displayer, DISPLAY_BUS_GIVE);
+		if (display_bus) display_bus(&displayer, DISPLAY_BUS_GIVE);
 		break;
 	case DISPLAYER_TIMER_RUN:
 		if (!displayer.timer) {
-			display_bus(&displayer, DISPLAY_BUS_TAKE);
+			if (display_bus) display_bus(&displayer, DISPLAY_BUS_TAKE);
 			displayer.timer = true;		
 			displayer.tick = xTaskGetTickCount();		
 		}	

@@ -126,14 +126,20 @@ static void vCallbackFunction( TimerHandle_t xTimer ) {
 	if (!led->on && led->offtime == -1) return;
 
 	// regular blinking
-	xTimerChangePeriod(xTimer, pdMS_TO_TICKS(led->on ? led->ontime : led->offtime), BLOCKTIME);
+	int period_ms = led->on ? led->ontime : led->offtime;
+	if (period_ms > 0) {
+		TickType_t ticks = pdMS_TO_TICKS(period_ms);
+		if (ticks == 0) ticks = 1;
+		xTimerChangePeriod(xTimer, ticks, BLOCKTIME);
+	}
 }
 
 /****************************************************************************************
  *
  */
 bool led_blink_core(int idx, int ontime, int offtime, bool pushed) {
-	if (!leds[idx].gpio || leds[idx].gpio < 0 ) return false;
+	if (idx < 0 || idx >= MAX_LED) return false;
+	if (leds[idx].gpio < 0) return false;
 
 	ESP_LOGD(TAG,"led_blink_core %d on:%d off:%d, pushed:%u", idx, ontime, offtime, pushed);
 	if (leds[idx].timer) {
@@ -164,9 +170,17 @@ bool led_blink_core(int idx, int ontime, int offtime, bool pushed) {
 		ESP_LOGD(TAG,"led %d, setting level", idx);
 		set_level(leds + idx, true);
 	} else {
+		TickType_t ticks = pdMS_TO_TICKS(ontime);
+		if (ticks == 0) ticks = 1;
 		if (!leds[idx].timer) {
 			ESP_LOGD(TAG,"led %d, Creating timer", idx);
-			leds[idx].timer = xTimerCreate("ledTimer", pdMS_TO_TICKS(ontime), pdFALSE, (void *)&leds[idx], vCallbackFunction);
+			leds[idx].timer = xTimerCreate("ledTimer", ticks, pdFALSE, (void *)&leds[idx], vCallbackFunction);
+			if (!leds[idx].timer) {
+				ESP_LOGE(TAG, "failed to create timer for led %d", idx);
+				return false;
+			}
+		} else {
+			xTimerChangePeriod(leds[idx].timer, ticks, BLOCKTIME);
 		}
         leds[idx].on = true;
 		set_level(leds + idx, true);
@@ -183,6 +197,9 @@ bool led_blink_core(int idx, int ontime, int offtime, bool pushed) {
  *
  */
 bool led_brightness(int idx, int bright) {
+	if (idx < 0 || idx >= MAX_LED) return false;
+	if (leds[idx].gpio < 0) return false;
+
 	if (bright > 100) bright = 100;
 
     if (leds[idx].rmt) {
@@ -202,7 +219,8 @@ bool led_brightness(int idx, int bright) {
  *
  */
 bool led_unpush(int idx) {
-	if (!leds[idx].gpio || leds[idx].gpio<0) return false;
+	if (idx < 0 || idx >= MAX_LED) return false;
+	if (leds[idx].gpio < 0) return false;
 
 	led_blink_core(idx, leds[idx].pushedon, leds[idx].pushedoff, true);
 	leds[idx].pushed = false;
@@ -227,7 +245,7 @@ bool led_config(int idx, gpio_num_t gpio, int color, int bright, led_type_t type
 		return false;
 	}
 
-	if (idx >= MAX_LED) return false;
+	if (idx < 0 || idx >= MAX_LED) return false;
 
     if (bright > 100) bright = 100;
 
@@ -315,6 +333,9 @@ void set_led_gpio(int gpio, char *value) {
 }
 
 void led_svc_init(void) {
+	for (int i = 0; i < MAX_LED; i++) {
+		leds[i].gpio = -1;
+	}
 #ifdef CONFIG_LED_GREEN_GPIO_LEVEL
 	green.color = CONFIG_LED_GREEN_GPIO_LEVEL;
 #endif

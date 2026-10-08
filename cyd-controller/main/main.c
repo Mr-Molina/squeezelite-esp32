@@ -20,7 +20,6 @@ static const char *TAG = "cyd_main";
 
 #define DISP_BUF_SIZE (CYD_TFT_WIDTH * 20)
 static lv_color_t s_buf1[DISP_BUF_SIZE];
-static lv_color_t s_buf2[DISP_BUF_SIZE];
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t s_disp_drv;
 static lv_indev_drv_t s_indev_drv;
@@ -46,12 +45,18 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 static void gui_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "CYD GUI Task running");
+    int64_t last_tick_us = esp_timer_get_time();
     while (1) {
         cyd_ui_lock();
         lv_timer_handler();
         cyd_ui_unlock();
         vTaskDelay(pdMS_TO_TICKS(10));
-        lv_tick_inc(10);
+        int64_t now_us = esp_timer_get_time();
+        uint32_t elapsed_ms = (uint32_t)((now_us - last_tick_us) / 1000LL);
+        if (elapsed_ms > 0) {
+            lv_tick_inc(elapsed_ms);
+            last_tick_us += (int64_t)elapsed_ms * 1000LL;
+        }
     }
 }
 
@@ -67,7 +72,7 @@ void app_main(void) {
 
     // 3. Initialize LVGL Graphic Library and Drivers
     lv_init();
-    lv_disp_draw_buf_init(&s_disp_buf, s_buf1, s_buf2, DISP_BUF_SIZE);
+    lv_disp_draw_buf_init(&s_disp_buf, s_buf1, NULL, DISP_BUF_SIZE);
 
     lv_disp_drv_init(&s_disp_drv);
     s_disp_drv.hor_res = CYD_TFT_WIDTH;

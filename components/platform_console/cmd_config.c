@@ -214,6 +214,15 @@ int check_missing_parm(struct arg_int *int_parm, FILE *f) {
     }
     return res;
 }
+static inline void safe_strcat_space(char *dest, const char *src, size_t max_size) {
+    size_t cur_len = strlen(dest);
+    size_t src_len = strlen(src);
+    if (cur_len + src_len + 2 < max_size) {
+        dest[cur_len] = ' ';
+        strcpy(dest + cur_len + 1, src);
+    }
+}
+
 char *strip_bt_name(char *opt_str) {
     if (!opt_str || strlen(opt_str) == 0) {
         ESP_LOGW(TAG, "strip_bt_name: opt_str is NULL");
@@ -224,13 +233,14 @@ char *strip_bt_name(char *opt_str) {
 
     if (!str) {
         ESP_LOGE(TAG, "Error duplicating command line string.");
-        return opt_str;
+        return NULL;
     }
-    char *result = malloc_init_external(strlen(str) + 1);
+    size_t result_size = strlen(str) + 64;
+    char *result = malloc_init_external(result_size);
     if (!result) {
         ESP_LOGE(TAG, "Error allocating memory for result.");
         free(str);
-        return opt_str;
+        return NULL;
     }
     result[0] = '\0';
     bool quoted = false;
@@ -254,18 +264,15 @@ char *strip_bt_name(char *opt_str) {
                 } else {
                     ESP_LOGV(TAG, " - Searching for BT, Ignoring");
                 }
-                strcat(result, " ");
-                strcat(result, pch);
+                safe_strcat_space(result, pch, result_size);
                 break;
             case SEARCHING_FOR_NAME:
                 if (strcasestr(pch, "name") || strcasestr(pch, "n")) {
                     ESP_LOGV(TAG, " - Found name tag");
                     state = SEARCHING_FOR_NAME_START;
                 } else {
-                    strcat(result, " ");
-                    strcat(result, pch);
+                    safe_strcat_space(result, pch, result_size);
                     ESP_LOGV(TAG, " - Searching for name - added ");
-                    ;
                 }
                 break;
             case SEARCHING_FOR_NAME_START:
@@ -277,8 +284,7 @@ char *strip_bt_name(char *opt_str) {
                     ESP_LOGV(TAG, " - got quoted string");
                     state = FINISHING;
                 } else if (pch[0] == '-') {
-                    strcat(result, " ");
-                    strcat(result, pch);
+                    safe_strcat_space(result, pch, result_size);
                     ESP_LOGV(TAG, " - got parameter marker");
                     state = quoted ? SEARCHING_FOR_BT_CMD_END : FINISHING;
                 } else {
@@ -291,15 +297,12 @@ char *strip_bt_name(char *opt_str) {
                     ESP_LOGV(TAG, " - got quote termination");
                     state = FINISHING;
                 }
-                strcat(result, " ");
-                strcat(result, pch);
+                safe_strcat_space(result, pch, result_size);
                 break;
             case FINISHING:
-                strcat(result, " ");
-                strcat(result, pch);
+                safe_strcat_space(result, pch, result_size);
                 break;
             default:
-
                 break;
             }
             pch = strtok(NULL, " ");
@@ -307,7 +310,8 @@ char *strip_bt_name(char *opt_str) {
         }
     } else {
         ESP_LOGE(TAG, "output option not found in %s\n", str);
-        strcpy(result, str);
+        strncpy(result, str, result_size - 1);
+        result[result_size - 1] = '\0';
     }
 
     ESP_LOGV(TAG, "Result commmand : %s\n", result);
@@ -342,16 +346,20 @@ static int do_bt_source_cmd(int argc, char **argv) {
         char *squeezelite_cmd = config_alloc_get_default(NVS_TYPE_STR, "autoexec1", NULL, 0);
         if (squeezelite_cmd && strstr(squeezelite_cmd, " -o ")) {
             char *new_cmd = strip_bt_name(squeezelite_cmd);
-            if (strcmp(new_cmd, squeezelite_cmd) != 0) {
-                fprintf(f, "Replacing old squeezelite command [%s] with [%s].\n", squeezelite_cmd, new_cmd);
-                config_set_value(NVS_TYPE_STR, "autoexec1", new_cmd);
-                if (err != ESP_OK) {
-                    nerrors++;
-                    fprintf(f, "Error updating squeezelite command line options . %s\n", esp_err_to_name(err));
+            if (new_cmd) {
+                if (new_cmd != squeezelite_cmd && strcmp(new_cmd, squeezelite_cmd) != 0) {
+                    fprintf(f, "Replacing old squeezelite command [%s] with [%s].\n", squeezelite_cmd, new_cmd);
+                    config_set_value(NVS_TYPE_STR, "autoexec1", new_cmd);
+                    if (err != ESP_OK) {
+                        nerrors++;
+                        fprintf(f, "Error updating squeezelite command line options . %s\n", esp_err_to_name(err));
+                    }
+                }
+                if (new_cmd != squeezelite_cmd) {
+                    free(new_cmd);
                 }
             }
             free(squeezelite_cmd);
-            free(new_cmd);
         }
     }
     if (bt_source_args.pin_code->count > 0) {
@@ -739,8 +747,13 @@ static int do_i2s_cmd(int argc, char **argv) {
         ESP_LOGE(TAG, "do_i2s_cmd: %d errors parsing arguments", nerrors);
         arg_print_errors(f, i2s_args.end, desc_dac);
     } else {
-        strncpy(i2s_dac_pin.model, i2s_args.model_name->sval[0], sizeof(i2s_dac_pin.model));
-        i2s_dac_pin.model[sizeof(i2s_dac_pin.model) - 1] = '\0';
+        if (i2s_args.model_name->count > 0 && i2s_args.model_name->sval[0] != NULL) {
+            strncpy(i2s_dac_pin.model, i2s_args.model_name->sval[0], sizeof(i2s_dac_pin.model));
+            i2s_dac_pin.model[sizeof(i2s_dac_pin.model) - 1] = '\0';
+        } else {
+            strncpy(i2s_dac_pin.model, "I2S", sizeof(i2s_dac_pin.model));
+            i2s_dac_pin.model[sizeof(i2s_dac_pin.model) - 1] = '\0';
+        }
         nerrors += is_output_gpio(i2s_args.clock, f, &i2s_dac_pin.pin.bck_io_num, true);
         nerrors += is_output_gpio(i2s_args.wordselect, f, &i2s_dac_pin.pin.ws_io_num, true);
         nerrors += is_output_gpio(i2s_args.data, f, &i2s_dac_pin.pin.data_out_num, true);
@@ -1217,6 +1230,7 @@ static int do_register_known_templates_config(int argc, char **argv) {
         } else {
             fprintf(f, "Registered known config %s.\n", known_model_args.model_config->sval[0]);
         }
+        free(model_config);
     }
 
     if (!nerrors) {
@@ -1339,7 +1353,6 @@ void register_ledvu_config(void) {
 void register_audio_config(void) {
     audio_args.jack_behavior = arg_str0("j", "jack_behavior", "Headphones|Subwoofer", "On supported DAC, determines the audio jack behavior. Selecting headphones will cause the external amp to be muted on insert, while selecting Subwoofer will keep the amp active all the time.");
     audio_args.loudness = arg_int0("l", "loudness", "0-10", "Sets a loudness level, from 0 to 10. 0 will disable the loudness completely. Note that LMS has priority over setting this value, so use it only when away from your server.");
-    audio_args.end = arg_end(6);
     audio_args.end = arg_end(6);
     const esp_console_cmd_t cmd = {
         .command = CFG_TYPE_AUDIO("general"),

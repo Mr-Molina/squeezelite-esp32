@@ -232,7 +232,15 @@ static bool Init( struct GDS_Device* Device ) {
 	Private->PageSize = min(8, PAGE_BLOCK / (Device->Width * Depth));
 
 #ifdef SHADOW_BUFFER	
-	Private->Shadowbuffer = malloc( Device->FramebufferSize );	
+	if (Private->Shadowbuffer) {
+		free(Private->Shadowbuffer);
+		Private->Shadowbuffer = NULL;
+	}
+	Private->Shadowbuffer = heap_caps_malloc( Device->FramebufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA );	
+	if (!Private->Shadowbuffer) {
+		ESP_LOGE(TAG, "failed to allocate %d bytes for shadow buffer", Device->FramebufferSize);
+		return false;
+	}
 	memset(Private->Shadowbuffer, 0xFF, Device->FramebufferSize);
 #endif
 #ifdef USE_IRAM
@@ -275,7 +283,7 @@ static const struct GDS_Device ST77xx = {
 
 struct GDS_Device* ST77xx_Detect(char *Driver, struct GDS_Device* Device) {
 	uint8_t Model;
-	int Depth;
+	int Depth = 16;
 		
 	if (strcasestr(Driver, "ST7735")) Model = ST7735;
 	else if (strcasestr(Driver, "ST7789")) Model = ST7789;

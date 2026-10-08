@@ -93,6 +93,9 @@ static int get_adc_raw(int channel) {
 
 static float read_battery_voltage(void) {
 	int raw = get_adc_raw(battery.channel);
+	if (raw < 0) {
+		return 0.0f;
+	}
 	if (s_calibrated && s_v_full > 0) {
 		uint32_t voltage_mv = esp_adc_cal_raw_to_voltage(raw, &s_adc_chars);
 		if (battery.scale > 0.0f) {

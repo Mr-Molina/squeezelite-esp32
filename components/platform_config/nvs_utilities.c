@@ -80,25 +80,33 @@ void initialize_nvs() {
 	esp_err_t err = nvs_flash_init();
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 		ESP_LOGW(TAG,  "%s. Erasing nvs flash", esp_err_to_name(err));
-		ESP_ERROR_CHECK(nvs_flash_erase());
+		nvs_flash_erase();
 		err = nvs_flash_init();
 	}
-	if(err != ESP_OK){
-		ESP_LOGE(TAG,  "nvs_flash_init failed. %s.", esp_err_to_name(err));
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG,  "nvs_flash_init failed (%s), erasing and retrying...", esp_err_to_name(err));
+		nvs_flash_erase();
+		err = nvs_flash_init();
 	}
-	ESP_ERROR_CHECK(err);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG,  "nvs_flash_init persistent failure (%s); continuing with volatile defaults", esp_err_to_name(err));
+	}
 	ESP_LOGI(TAG,  "Initializing nvs partition %s",settings_partition);
 	err = nvs_flash_init_partition(settings_partition);
-	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND || err != ESP_OK) {
 		ESP_LOGW(TAG,  "%s. Erasing nvs on partition %s",esp_err_to_name(err),settings_partition);
-		ESP_ERROR_CHECK(nvs_flash_erase_partition(settings_partition));
-		err = nvs_flash_init_partition(settings_partition);
+		esp_err_t erase_err = nvs_flash_erase_partition(settings_partition);
+		if (erase_err == ESP_OK) {
+			err = nvs_flash_init_partition(settings_partition);
+		} else {
+			ESP_LOGE(TAG, "nvs_flash_erase_partition failed: %s", esp_err_to_name(erase_err));
+		}
 	}
-	if(err!=ESP_OK){
-		ESP_LOGE(TAG,  "nvs_flash_init_partition failed. %s",esp_err_to_name(err));
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG,  "nvs_flash_init_partition persistent failure (%s); falling back to volatile defaults", esp_err_to_name(err));
+	} else {
+		ESP_LOGD(TAG,  "nvs init completed");
 	}
-	ESP_ERROR_CHECK(err);
-	ESP_LOGD(TAG,  "nvs init completed");
 }
 
 esp_err_t nvs_load_config() {
@@ -310,6 +318,32 @@ void * get_nvs_value_alloc(nvs_type_t type, const char *key) {
 esp_err_t get_nvs_value(nvs_type_t type, const char *key, void*value, const size_t buf_size) {
 	nvs_handle nvs;
 	esp_err_t err;
+
+	if (value == NULL) {
+		ESP_LOGE(TAG, "get_nvs_value: NULL value buffer for key [%s]", STR_OR_ALT(key, "unknown"));
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	switch (type) {
+		case NVS_TYPE_I8:
+		case NVS_TYPE_U8:
+			if (buf_size < sizeof(uint8_t)) return ESP_ERR_INVALID_SIZE;
+			break;
+		case NVS_TYPE_I16:
+		case NVS_TYPE_U16:
+			if (buf_size < sizeof(uint16_t)) return ESP_ERR_INVALID_SIZE;
+			break;
+		case NVS_TYPE_I32:
+		case NVS_TYPE_U32:
+			if (buf_size < sizeof(uint32_t)) return ESP_ERR_INVALID_SIZE;
+			break;
+		case NVS_TYPE_I64:
+		case NVS_TYPE_U64:
+			if (buf_size < sizeof(uint64_t)) return ESP_ERR_INVALID_SIZE;
+			break;
+		default:
+			break;
+	}
 
 	err = nvs_open_from_partition(settings_partition, current_namespace, NVS_READONLY, &nvs);
 	if (err != ESP_OK) {

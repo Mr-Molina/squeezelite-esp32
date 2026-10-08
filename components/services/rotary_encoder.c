@@ -149,7 +149,19 @@ static IRAM_ATTR uint8_t _process(rotary_encoder_info_t * info)
     if (info != NULL)
     {
         // Get state of input pins.
-        uint8_t pin_state = (gpio_get_level_x(info->pin_b) << 1) | gpio_get_level_x(info->pin_a);
+        int val_b, val_a;
+        if (xPortInIsrContext()) {
+            if (info->pin_b >= GPIO_NUM_MAX || info->pin_a >= GPIO_NUM_MAX) {
+                // Prevent blocking I2C expander calls from ISR context
+                return 0;
+            }
+            val_b = gpio_get_level(info->pin_b);
+            val_a = gpio_get_level(info->pin_a);
+        } else {
+            val_b = gpio_get_level_x(info->pin_b);
+            val_a = gpio_get_level_x(info->pin_a);
+        }
+        uint8_t pin_state = (val_b << 1) | val_a;
 
         // Determine new state from the pins and state table.
 #ifdef ROTARY_ENCODER_DEBUG
@@ -167,7 +179,7 @@ static IRAM_ATTR uint8_t _process(rotary_encoder_info_t * info)
     return event;
 }
 
-static void _isr_rotenc(void * args)
+static IRAM_ATTR void _isr_rotenc(void * args)
 {
     rotary_encoder_info_t * info = (rotary_encoder_info_t *)args;
     uint8_t event = _process(info);

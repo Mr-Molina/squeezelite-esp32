@@ -92,6 +92,51 @@ char * alloc_get_http_header(httpd_req_t * req, const char * key){
     return buf;
 }
 
+static bool validate_request_origin(httpd_req_t *req) {
+    char *origin = alloc_get_http_header(req, "Origin");
+    char *referer = NULL;
+    if (!origin) {
+        referer = alloc_get_http_header(req, "Referer");
+    }
+    const char *header_val = origin ? origin : referer;
+    if (!header_val) {
+        return true;
+    }
+
+    char *host = alloc_get_http_header(req, "Host");
+    if (!host) {
+        ESP_LOGW_LOC(TAG, "Origin/Referer present (%s) but Host header missing", header_val);
+        FREE_AND_NULL(origin);
+        FREE_AND_NULL(referer);
+        return false;
+    }
+
+    const char *source_host = header_val;
+    const char *scheme_sep = strstr(header_val, "://");
+    if (scheme_sep) {
+        source_host = scheme_sep + 3;
+    }
+
+    size_t source_host_len = strcspn(source_host, ":/?#");
+    size_t req_host_len = strcspn(host, ":/?#");
+
+    bool match = false;
+    if (source_host_len > 0 && source_host_len == req_host_len) {
+        if (strncasecmp(source_host, host, source_host_len) == 0) {
+            match = true;
+        }
+    }
+
+    if (!match) {
+        ESP_LOGW_LOC(TAG, "CSRF origin mismatch: header [%s] vs Host [%s]", header_val, host);
+    }
+
+    FREE_AND_NULL(origin);
+    FREE_AND_NULL(referer);
+    FREE_AND_NULL(host);
+    return match;
+}
+
 
 char * http_alloc_get_socket_address(httpd_req_t *req, u8_t local, in_port_t * portl) {
 
@@ -337,7 +382,8 @@ static esp_err_t set_content_type_from_req(httpd_req_t *req)
    }
 
    /* If name has trailing '/', respond with directory contents */
-   if (filename[strlen(filename) - 1] == '/' && strlen(filename)>1) {
+   size_t fn_len = strlen(filename);
+   if (fn_len > 0 && filename[fn_len - 1] == '/') {
 	   httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Browsing files forbidden.");
 	   return ESP_FAIL;
    }
@@ -405,7 +451,8 @@ esp_err_t resource_filehandler(httpd_req_t *req){
    }
 
    /* If name has trailing '/', respond with directory contents */
-   if (filename[strlen(filename) - 1] == '/') {
+   size_t fn_len = strlen(filename);
+   if (fn_len > 0 && filename[fn_len - 1] == '/') {
 	   httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Browsing files forbidden.");
 	   return ESP_FAIL;
    }
@@ -472,46 +519,49 @@ esp_err_t console_cmd_get_handler(httpd_req_t *req){
 esp_err_t console_cmd_post_handler(httpd_req_t *req){
 	char success[]="{\"Result\" : \"Success\" }";
 	ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
-	//bool bOTA=false;
-	//char * otaURL=NULL;
-	esp_err_t err = post_handler_buff_receive(req);
-	if(err!=ESP_OK){
-		return err;
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
 	}
-	if(!is_user_authenticated(req)){
+	if (!is_user_authenticated(req)) {
 		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
 		return ESP_FAIL;
 	}
+	esp_err_t err = post_handler_buff_receive(req);
+	if (err != ESP_OK) {
+		return err;
+	}
 	err = set_content_type_from_req(req);
-	if(err != ESP_OK){
+	if (err != ESP_OK) {
+		http_server_unlock_scratch();
 		return err;
 	}
 
-	char *command= ((rest_server_context_t *)(req->user_ctx))->scratch;
-
+	char *command = ((rest_server_context_t *)(req->user_ctx))->scratch;
 	cJSON *root = cJSON_Parse(command);
-	if(root == NULL){
-		ESP_LOGE_LOC(TAG, "Parsing command. Received content was: %s",command);
+	http_server_unlock_scratch();
+	if (root == NULL) {
+		ESP_LOGE_LOC(TAG, "Parsing command. Received content was: %s", command);
 		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed command json.  Unable to parse content.");
 		return ESP_FAIL;
 	}
-	char * root_str = cJSON_Print(root);
-	if(root_str!=NULL){
+	char *root_str = cJSON_Print(root);
+	if (root_str != NULL) {
 		ESP_LOGD(TAG, "Processing command item: \n%s", root_str);
 		free(root_str);
 	}
-	cJSON *item=cJSON_GetObjectItemCaseSensitive(root, "command");
-	if(!cJSON_IsString(item) || !item->valuestring){
-		ESP_LOGE_LOC(TAG, "Command not found. Received content was: %s",command);
+	cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "command");
+	if (!cJSON_IsString(item) || !item->valuestring) {
+		ESP_LOGE_LOC(TAG, "Command not found. Received content was: %s", command);
 		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed command json.  Unable to parse content.");
 		err = ESP_FAIL;
-
 	}
-	else{
+	else {
 		// navigate to the first child of the config structure
 		char *cmd = cJSON_GetStringValue(item);
-		if(!console_push(cmd, strlen(cmd) + 1)){
+		if (!console_push(cmd, strlen(cmd) + 1)) {
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unable to push command for execution");
+			err = ESP_FAIL;
 		}
 		else {
 			httpd_resp_send(req, (const char *)success, strlen(success));
@@ -571,6 +621,7 @@ esp_err_t config_get_handler(httpd_req_t *req){
 				cJSON_DeleteItemFromObject(cfg, "ap_pwd");
 				cJSON_DeleteItemFromObject(cfg, "telnet_pwd");
 				cJSON_DeleteItemFromObject(cfg, "a2dp_spin");
+				cJSON_DeleteItemFromObject(cfg, "web_pwd");
 				char *filtered_json = cJSON_PrintUnformatted(cfg);
 				cJSON_Delete(cfg);
 				if(filtered_json != NULL){
@@ -635,6 +686,8 @@ esp_err_t post_handler_buff_receive(httpd_req_t * req){
 
     if(err == ESP_OK) {
     	buf[total_len] = '\0';
+    } else {
+        http_server_unlock_scratch();
     }
     return err;
 }
@@ -643,16 +696,21 @@ esp_err_t config_post_handler(httpd_req_t *req){
     ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
 	bool bOTA=false;
 	char * otaURL=NULL;
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
+	if (!is_user_authenticated(req)) {
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
+	}
     esp_err_t err = post_handler_buff_receive(req);
     if(err!=ESP_OK){
         return err;
     }
-    if(!is_user_authenticated(req)){
-		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
-		return ESP_FAIL;
-    }
 	err = set_content_type_from_req(req);
 	if(err != ESP_OK){
+		http_server_unlock_scratch();
 		return err;
 	}
 
@@ -660,7 +718,7 @@ esp_err_t config_post_handler(httpd_req_t *req){
     cJSON *root = cJSON_Parse(buf);
     http_server_unlock_scratch();
     if(root == NULL){
-    	ESP_LOGE_LOC(TAG, "Parsing config json failed. Received content was: %s",buf);
+    	ESP_LOGE_LOC(TAG, "Parsing config json failed.");
     	httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed config json.  Unable to parse content.");
     	return ESP_FAIL;
     }
@@ -673,7 +731,7 @@ esp_err_t config_post_handler(httpd_req_t *req){
 
     cJSON *item=cJSON_GetObjectItemCaseSensitive(root, "config");
     if(!item){
-    	ESP_LOGE_LOC(TAG, "Parsing config json failed. Received content was: %s",buf);
+    	ESP_LOGE_LOC(TAG, "Parsing config json failed. Missing 'config' object.");
     	httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed config json.  Unable to parse content.");
     	err = ESP_FAIL;
     }
@@ -707,6 +765,16 @@ esp_err_t config_post_handler(httpd_req_t *req){
 						if(item_type!=NVS_TYPE_STR){
 							ESP_LOGE_LOC(TAG,"Firmware url should be type %d. Found type %d instead.",NVS_TYPE_STR,item_type );
 							httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed config json.  Wrong type for firmware URL.");
+							err = ESP_FAIL;
+						}
+						else if (strncmp((char*)val, "https://", 8) != 0) {
+							ESP_LOGE_LOC(TAG, "Firmware URL must use HTTPS: %s", (char*)val);
+							httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Firmware URL must use HTTPS.");
+							err = ESP_FAIL;
+						}
+						else if (!is_user_authenticated(req)) {
+							ESP_LOGW_LOC(TAG, "Unauthenticated OTA attempt rejected");
+							httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required for OTA");
 							err = ESP_FAIL;
 						}
 						else {
@@ -750,7 +818,7 @@ esp_err_t config_post_handler(httpd_req_t *req){
 		messaging_post_message(MESSAGING_INFO,MESSAGING_CLASS_SYSTEM,"Save Success");
 	}
     cJSON_Delete(root);
-	if(bOTA) {
+	if(bOTA && is_user_authenticated(req) && otaURL != NULL) {
 
 		if(is_recovery_running){
 			ESP_LOGW_LOC(TAG,   "Starting process OTA for url %s",otaURL);
@@ -761,6 +829,10 @@ esp_err_t config_post_handler(httpd_req_t *req){
 
 		network_reboot_ota(otaURL);
 		free(otaURL);
+		otaURL = NULL;
+	} else if (otaURL) {
+		free(otaURL);
+		otaURL = NULL;
 	}
     return err;
 
@@ -772,20 +844,25 @@ esp_err_t connect_post_handler(httpd_req_t *req){
     char * password=NULL;
     char * host_name=NULL;
 
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
+	if (!is_user_authenticated(req)) {
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
+	}
 	esp_err_t err = post_handler_buff_receive(req);
 	if(err!=ESP_OK){
 		return err;
 	}
 	err = set_content_type_from_req(req);
 	if(err != ESP_OK){
+		http_server_unlock_scratch();
 		return err;
 	}
 
 	char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
-    if(!is_user_authenticated(req)){
-		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
-		return ESP_FAIL;
-    }
 	cJSON *root = cJSON_Parse(buf);
 	http_server_unlock_scratch();
 
@@ -809,6 +886,14 @@ esp_err_t connect_post_handler(httpd_req_t *req){
 	cJSON_Delete(root);
 
 	if(host_name!=NULL){
+		if(strlen(host_name) > 32){
+			ESP_LOGE_LOC(TAG, "Host name too long (%d > 32)", strlen(host_name));
+			httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Host name too long (max 32 characters)");
+			FREE_AND_NULL(ssid);
+			FREE_AND_NULL(password);
+			FREE_AND_NULL(host_name);
+			return ESP_FAIL;
+		}
 		if(config_set_value(NVS_TYPE_STR, "host_name", host_name) != ESP_OK){
 			ESP_LOGW_LOC(TAG,  "Unable to save host name configuration");
 		}
@@ -830,9 +915,13 @@ esp_err_t connect_post_handler(httpd_req_t *req){
 esp_err_t connect_delete_handler(httpd_req_t *req){
 	char success[]="{}";
     ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
     if(!is_user_authenticated(req)){
-    	// todo:  redirect to login page
-    	// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
     }
 	esp_err_t err = set_content_type_from_req(req);
 	if(err != ESP_OK){
@@ -846,9 +935,13 @@ esp_err_t connect_delete_handler(httpd_req_t *req){
 esp_err_t reboot_ota_post_handler(httpd_req_t *req){
 	char success[]="{}";
 	ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
     if(!is_user_authenticated(req)){
-    	// todo:  redirect to login page
-    	// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
     }
     esp_err_t err = set_content_type_from_req(req);
 	if(err != ESP_OK){
@@ -862,6 +955,10 @@ esp_err_t reboot_ota_post_handler(httpd_req_t *req){
 esp_err_t reboot_post_handler(httpd_req_t *req){
     ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
     char success[]="{}";
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
     if(!is_user_authenticated(req)){
 		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
 		return ESP_FAIL;
@@ -877,9 +974,13 @@ esp_err_t reboot_post_handler(httpd_req_t *req){
 esp_err_t recovery_post_handler(httpd_req_t *req){
     ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
     char success[]="{}";
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
     if(!is_user_authenticated(req)){
-    	// todo:  redirect to login page
-    	// return ESP_OK;
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
     }
     esp_err_t err = set_content_type_from_req(req);
 	if(err != ESP_OK){
@@ -892,88 +993,108 @@ esp_err_t recovery_post_handler(httpd_req_t *req){
 
 
 esp_err_t flash_post_handler(httpd_req_t *req){
-	esp_err_t err =ESP_OK;
+	esp_err_t err = ESP_OK;
 	char * binary_buffer = NULL;
-	if(is_recovery_running){
-		ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
-		char success[]="File uploaded. Flashing started.";
-		if(!is_user_authenticated(req)){
-			httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
-			return ESP_FAIL;
-		}
-		err = httpd_resp_set_type(req, HTTPD_TYPE_TEXT);
-		if(err != ESP_OK){
-			return err;
-		}
-		binary_buffer = malloc_init_external(req->content_len);
-		if(binary_buffer == NULL){
-			ESP_LOGE(TAG, "File too large : %d bytes", req->content_len);
-			/* Respond with 400 Bad Request */
-			httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-								"Binary file too large. Unable to allocate memory!");
-			return ESP_FAIL;
-		}
-		ESP_LOGI(TAG, "Receiving ota binary file");
-		if (!http_server_lock_scratch(pdMS_TO_TICKS(5000))) {
-			FREE_RESET(binary_buffer);
-			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Server busy");
-			return ESP_FAIL;
-		}
-		/* Retrieve the pointer to scratch buffer for temporary storage */
-		char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
+	bool scratch_locked = false;
 
-		char *head=binary_buffer;
-		int received;
+	if(!is_recovery_running){
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recovery mode not running");
+		return ESP_FAIL;
+	}
 
-		/* Content length of the request gives
-		 * the size of the file being uploaded */
-		int remaining = req->content_len;
+	ESP_LOGD_LOC(TAG, "serving [%s]", req->uri);
+	char success[]="File uploaded. Flashing started.";
+	if (!validate_request_origin(req)) {
+		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-origin request rejected");
+		return ESP_FAIL;
+	}
+	if(!is_user_authenticated(req)){
+		httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+		return ESP_FAIL;
+	}
+	err = httpd_resp_set_type(req, HTTPD_TYPE_TEXT);
+	if(err != ESP_OK){
+		return err;
+	}
+	binary_buffer = malloc_init_external(req->content_len);
+	if(binary_buffer == NULL){
+		ESP_LOGE(TAG, "File too large : %d bytes", req->content_len);
+		/* Respond with 400 Bad Request */
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+							"Binary file too large. Unable to allocate memory!");
+		return ESP_FAIL;
+	}
+	ESP_LOGI(TAG, "Receiving ota binary file");
+	if (!http_server_lock_scratch(pdMS_TO_TICKS(5000))) {
+		FREE_RESET(binary_buffer);
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Server busy");
+		return ESP_FAIL;
+	}
+	scratch_locked = true;
+	/* Retrieve the pointer to scratch buffer for temporary storage */
+	char *buf = ((rest_server_context_t *)(req->user_ctx))->scratch;
 
-		while (remaining > 0) {
+	char *head=binary_buffer;
+	int received;
 
-			ESP_LOGI(TAG, "Remaining size : %d", remaining);
-			/* Receive the file part by part into a buffer */
-			if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0) {
-				if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+	/* Content length of the request gives
+	 * the size of the file being uploaded */
+	int remaining = req->content_len;
+	int timeout_retries = 0;
+	const int max_retries = 5;
+
+	while (remaining > 0) {
+
+		ESP_LOGI(TAG, "Remaining size : %d", remaining);
+		/* Receive the file part by part into a buffer */
+		if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0) {
+			if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+				if (++timeout_retries <= max_retries) {
 					/* Retry if timeout occurred */
+					ESP_LOGW(TAG, "Socket timeout on OTA upload, retry %d/%d", timeout_retries, max_retries);
 					continue;
 				}
-				FREE_RESET(binary_buffer);
-				ESP_LOGE(TAG, "File reception failed!");
-				/* Respond with 500 Internal Server Error */
-				httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
-				err = ESP_FAIL;
-				goto bail_out;
+				ESP_LOGE(TAG, "Max timeout retries reached during OTA upload");
 			}
-
-			/* Write buffer content to file on storage */
-			if (received ) {
-				memcpy(head,buf,received );
-				head+=received;
-			}
-
-			/* Keep track of remaining size of
-			 * the file left to be uploaded */
-			remaining -= received;
-		}
-
-		/* Close file upon upload completion */
-		ESP_LOGI(TAG, "File reception complete. Invoking OTA process.");
-		err = start_ota(NULL, binary_buffer, req->content_len);
-		if(err!=ESP_OK){
 			FREE_RESET(binary_buffer);
-			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA processing failed");
+			ESP_LOGE(TAG, "File reception failed!");
+			/* Respond with 500 Internal Server Error */
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+			err = ESP_FAIL;
 			goto bail_out;
 		}
+		timeout_retries = 0;
 
-		//todo:  handle this in ajax.  For now, just send the root page
-		httpd_resp_send(req, (const char *)success, strlen(success));
+		/* Write buffer content to file on storage */
+		if (received ) {
+			memcpy(head,buf,received );
+			head+=received;
+		}
+
+		/* Keep track of remaining size of
+		 * the file left to be uploaded */
+		remaining -= received;
 	}
+
+	/* Close file upon upload completion */
+	ESP_LOGI(TAG, "File reception complete. Invoking OTA process.");
+	err = start_ota(NULL, binary_buffer, req->content_len);
+	if(err!=ESP_OK){
+		FREE_RESET(binary_buffer);
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA processing failed");
+		goto bail_out;
+	}
+
+	//todo:  handle this in ajax.  For now, just send the root page
+	httpd_resp_send(req, (const char *)success, strlen(success));
+
 bail_out:
 	if(err != ESP_OK && binary_buffer != NULL){
 		FREE_RESET(binary_buffer);
 	}
-	http_server_unlock_scratch();
+	if (scratch_locked) {
+		http_server_unlock_scratch();
+	}
 	return err;
 }
 

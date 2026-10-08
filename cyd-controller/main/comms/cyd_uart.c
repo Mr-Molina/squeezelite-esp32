@@ -51,6 +51,10 @@ typedef void *TaskHandle_t;
 #define ESP_TASK_PRIO_MIN 1
 #endif
 
+#ifndef portMAX_DELAY
+#define portMAX_DELAY 0xFFFFFFFFUL
+#endif
+
 static inline SemaphoreHandle_t xSemaphoreCreateMutex(void) {
     static int dummy = 1;
     return (SemaphoreHandle_t)&dummy;
@@ -80,6 +84,8 @@ static const char *TAG __attribute__((unused)) = "cyd_uart";
 #define CYD_RESYNC_INTERVAL_US    3000000LL  // 3 seconds
 
 static SemaphoreHandle_t s_tx_mutex = NULL;
+static SemaphoreHandle_t s_state_mutex = NULL;
+static TaskHandle_t s_rx_task_handle __attribute__((unused)) = NULL;
 static cyd_event_cb_t s_event_cb = NULL;
 static cyd_tx_spy_cb_t s_tx_spy = NULL;
 
@@ -104,6 +110,10 @@ void cyd_client_reset_state(void) {
     if (s_tx_mutex == NULL) {
         s_tx_mutex = xSemaphoreCreateMutex();
     }
+    if (s_state_mutex == NULL) {
+        s_state_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_state_mutex) xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     memset(&s_state, 0, sizeof(s_state));
     strncpy(s_state.state, "stop", sizeof(s_state.state) - 1);
     s_state.link_active = false;
@@ -111,6 +121,7 @@ void cyd_client_reset_state(void) {
     s_rx_overflow = false;
     s_last_rx_time_us = 0;
     s_last_sync_time_us = -1LL;
+    if (s_state_mutex) xSemaphoreGive(s_state_mutex);
 }
 
 void cyd_client_register_event_callback(cyd_event_cb_t cb) {
@@ -123,6 +134,13 @@ void cyd_client_set_tx_spy(cyd_tx_spy_cb_t spy) {
 
 const cyd_telemetry_state_t *cyd_client_get_state(void) {
     return &s_state;
+}
+
+void cyd_client_get_state_copy(cyd_telemetry_state_t *out) {
+    if (!out) return;
+    if (s_state_mutex) xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    *out = s_state;
+    if (s_state_mutex) xSemaphoreGive(s_state_mutex);
 }
 
 esp_err_t cyd_client_send_raw(const char *json_line) {
@@ -182,11 +200,20 @@ void cyd_client_feed_rx_bytes(const char *buf, size_t len) {
             }
             if (s_rx_idx > 0) {
                 s_rx_line[s_rx_idx] = '\0';
+                bool parsed_ok = false;
+                cyd_telemetry_state_t state_copy;
+                if (s_state_mutex) xSemaphoreTake(s_state_mutex, portMAX_DELAY);
                 if (cyd_client_parse_event(s_rx_line, &s_state) == ESP_OK) {
                     s_last_rx_time_us = esp_timer_get_time();
                     s_state.link_active = true;
+                    parsed_ok = true;
+                    state_copy = s_state;
+                }
+                if (s_state_mutex) xSemaphoreGive(s_state_mutex);
+
+                if (parsed_ok) {
                     if (s_event_cb) {
-                        s_event_cb(&s_state);
+                        s_event_cb(&state_copy);
                     }
                 } else {
                     ESP_LOGW(TAG, "Malformed or unhandled CYD event: %s", s_rx_line);
@@ -214,21 +241,33 @@ void cyd_client_poll_heartbeat(int64_t current_time_us) {
     s_mock_time_us = current_time_us;
 #endif
 
+    bool need_sync = false;
+    bool notify_state = false;
+    cyd_telemetry_state_t state_copy;
+
+    if (s_state_mutex) xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (s_state.link_active) {
         if ((current_time_us - s_last_rx_time_us) > CYD_HEARTBEAT_TIMEOUT_US) {
             s_state.link_active = false;
             s_last_sync_time_us = current_time_us;
-            cyd_client_send_cmd("sync", 0);
-            if (s_event_cb) {
-                s_event_cb(&s_state);
-            }
+            need_sync = true;
+            notify_state = true;
+            state_copy = s_state;
         }
     } else {
         // Link is inactive: retransmit sync command every 3s
         if (s_last_sync_time_us < 0 || (current_time_us - s_last_sync_time_us) >= CYD_RESYNC_INTERVAL_US) {
             s_last_sync_time_us = current_time_us;
-            cyd_client_send_cmd("sync", 0);
+            need_sync = true;
         }
+    }
+    if (s_state_mutex) xSemaphoreGive(s_state_mutex);
+
+    if (need_sync) {
+        cyd_client_send_cmd("sync", 0);
+    }
+    if (notify_state && s_event_cb) {
+        s_event_cb(&state_copy);
     }
 }
 
@@ -241,12 +280,17 @@ static void cyd_client_rx_task(void *pvParameters) {
         if (len > 0) {
             cyd_client_feed_rx_bytes((const char *)data, len);
         }
+        if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+            cyd_client_poll_heartbeat(esp_timer_get_time());
+        }
     }
 }
 
 static void cyd_heartbeat_timer_cb(void *arg) {
     (void)arg;
-    cyd_client_poll_heartbeat(esp_timer_get_time());
+    if (s_rx_task_handle) {
+        xTaskNotifyGive(s_rx_task_handle);
+    }
 }
 #endif
 
@@ -258,6 +302,13 @@ esp_err_t cyd_client_uart_init(void) {
     if (s_tx_mutex == NULL) {
         s_tx_mutex = xSemaphoreCreateMutex();
         if (s_tx_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_state_mutex == NULL) {
+        s_state_mutex = xSemaphoreCreateMutex();
+        if (s_state_mutex == NULL) {
             return ESP_ERR_NO_MEM;
         }
     }
@@ -276,7 +327,7 @@ esp_err_t cyd_client_uart_init(void) {
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(CYD_UART_NUM, 1024, 0, 0, NULL, 0));
 
-    xTaskCreate(cyd_client_rx_task, "cyd_uart_rx", 3072, NULL, ESP_TASK_PRIO_MIN + 2, NULL);
+    xTaskCreate(cyd_client_rx_task, "cyd_uart_rx", 3072, NULL, ESP_TASK_PRIO_MIN + 2, &s_rx_task_handle);
 
     const esp_timer_create_args_t timer_args = {
         .callback = cyd_heartbeat_timer_cb,

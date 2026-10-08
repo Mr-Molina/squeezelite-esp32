@@ -34,7 +34,11 @@ inline unsigned _buf_used(struct buffer *buf) {
 }
 
 unsigned _buf_space(struct buffer *buf) {
-	return buf->size - _buf_used(buf) - 1; // reduce by one as full same as empty otherwise
+	unsigned used = _buf_used(buf);
+	if (buf->size <= used + 1) {
+		return 0;
+	}
+	return buf->size - used - 1; // reduce by one as full same as empty otherwise
 }
 
 unsigned _buf_cont_read(struct buffer *buf) {
@@ -42,7 +46,15 @@ unsigned _buf_cont_read(struct buffer *buf) {
 }
 
 unsigned _buf_cont_write(struct buffer *buf) {
-	return buf->writep >= buf->readp ? buf->wrap - buf->writep : buf->readp - buf->writep;
+	if (buf->writep >= buf->readp) {
+		unsigned space = buf->wrap - buf->writep;
+		if (buf->readp == buf->buf && space > 0) {
+			space--;
+		}
+		return space;
+	} else {
+		return (buf->readp > buf->writep) ? (buf->readp - buf->writep - 1) : 0;
+	}
 }
 
 void _buf_inc_readp(struct buffer *buf, unsigned by) {
@@ -109,7 +121,7 @@ size_t _buf_limit(struct buffer *buf, size_t limit) {
 
 void _buf_unwrap(struct buffer *buf, size_t cont) {
 	ssize_t len, by = cont - (buf->wrap - buf->readp);
-	size_t size;
+	ssize_t size;
 	u8_t *scratch;
 
 	// do nothing if we have enough space

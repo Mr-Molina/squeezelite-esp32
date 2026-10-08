@@ -26,8 +26,6 @@
 static void network_wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static char* get_disconnect_code_desc(uint8_t reason);
 esp_err_t network_wifi_get_blob(void* target, size_t size, const char* key);
-static inline const char* ssid_string(const wifi_sta_config_t* sta);
-static inline const char* password_string(const wifi_sta_config_t* sta);
 cJSON* accessp_cjson = NULL;
 
 static const char TAG[] = "network_wifi";
@@ -42,21 +40,10 @@ esp_netif_t* wifi_netif;
 esp_netif_t* wifi_ap_netif;
 
 wifi_ap_record_t* accessp_records = NULL;
-#define UINT_TO_STRING(val)                \
-    static char loc[sizeof(val) + 1];      \
-    memset(loc, 0x00, sizeof(loc));        \
-    strlcpy(loc, (char*)val, sizeof(loc)); \
-    return loc;
-
-static inline const char* ssid_string(const wifi_sta_config_t* sta) {
-    UINT_TO_STRING(sta->ssid);
-}
-static inline const char* password_string(const wifi_sta_config_t* sta) {
-    UINT_TO_STRING(sta->password);
-}
-static inline const char* ap_ssid_string(const wifi_ap_record_t* ap) {
-    UINT_TO_STRING(ap->ssid);
-}
+#define UINT_TO_STRING(buf, val) do { \
+    memset((buf), 0x00, sizeof(buf)); \
+    strlcpy((buf), (const char*)(val), sizeof(buf)); \
+} while(0)
 
 static const char ENC_PREFIX[] = "enc:";
 
@@ -305,8 +292,10 @@ esp_err_t network_wifi_add_ap_copy(const known_access_point_t* known_ap) {
 const wifi_ap_record_t* network_wifi_get_ssid_info(const char* ssid) {
     if (!accessp_records)
         return NULL;
+    char ap_ssid[sizeof(accessp_records[0].ssid) + 1];
     for (int i = 0; i < ap_num; i++) {
-        if (strcmp(ap_ssid_string(&accessp_records[i]), ssid) == 0) {
+        UINT_TO_STRING(ap_ssid, accessp_records[i].ssid);
+        if (strcmp(ap_ssid, ssid) == 0) {
             return &accessp_records[i];
         }
     }
@@ -328,8 +317,12 @@ esp_err_t network_wifi_add_ap_from_sta_copy(const wifi_sta_config_t* sta) {
         ESP_LOGE(TAG, "Memory allocation failed");
         return ESP_ERR_NO_MEM;
     }
-    item->ssid = strdup_psram(ssid_string(sta));
-    item->password = strdup_psram(password_string(sta));
+    char sta_ssid[sizeof(sta->ssid) + 1];
+    char sta_pwd[sizeof(sta->password) + 1];
+    UINT_TO_STRING(sta_ssid, sta->ssid);
+    UINT_TO_STRING(sta_pwd, sta->password);
+    item->ssid = strdup_psram(sta_ssid);
+    item->password = strdup_psram(sta_pwd);
     memcpy(&item->bssid, sta->bssid, sizeof(item->bssid));
     item->primary = sta->channel;
     const wifi_ap_record_t* seen = network_wifi_get_ssid_info(item->ssid);
@@ -351,11 +344,13 @@ bool network_wifi_is_known_ap(const char* ssid) {
 }
 
 static bool network_wifi_was_ssid_seen(const char* ssid) {
-    if (!accessp_records || ap_num == 0 || ap_num == MAX_AP_NUM) {
+    if (!accessp_records || ap_num == 0 || ap_num > MAX_AP_NUM) {
         return false;
     }
+    char ap_ssid[sizeof(accessp_records[0].ssid) + 1];
     for (int i = 0; i < ap_num; i++) {
-        if (strcmp(ap_ssid_string(&accessp_records[i]), ssid) == 0) {
+        UINT_TO_STRING(ap_ssid, accessp_records[i].ssid);
+        if (strcmp(ap_ssid, ssid) == 0) {
             return true;
         }
     }
@@ -457,12 +452,12 @@ esp_err_t network_wifi_add_json_entry(const char* json_text) {
     }
     cJSON* cjson_item = cJSON_Parse(json_text);
     if (!cjson_item) {
-        ESP_LOGE(TAG, "Invalid JSON %s", json_text);
+        ESP_LOGE(TAG, "Invalid JSON in storage");
         return ESP_ERR_INVALID_ARG;
     }
     cJSON* value = cJSON_GetObjectItemCaseSensitive(cjson_item, "ssid");
     if (!value || !cJSON_IsString(value) || strlen(cJSON_GetStringValue(value)) == 0) {
-        ESP_LOGE(TAG, "Missing ssid in : %s", json_text);
+        ESP_LOGE(TAG, "Missing ssid in access point entry");
         err = ESP_ERR_INVALID_ARG;
     } else {
         if (!network_wifi_get_ap_entry(cJSON_GetStringValue(value))) {
@@ -532,7 +527,11 @@ esp_err_t network_wifi_delete_ap(const char* key) {
      */
     ESP_LOGD(TAG, "Deleting AP %s. Checking if this is the active AP", key);
     const wifi_sta_config_t* config = network_wifi_load_active_config();
-    if (config && strlen(ssid_string(config)) > 0 && strcmp(ssid_string(config), it->ssid) == 0) {
+    char config_ssid[sizeof(config->ssid) + 1];
+    if (config) {
+        UINT_TO_STRING(config_ssid, config->ssid);
+    }
+    if (config && strlen(config_ssid) > 0 && strcmp(config_ssid, it->ssid) == 0) {
         ESP_LOGD(TAG, "Confirmed %s to be the active network. Removing it from flash.", key);
         esp_err = network_wifi_erase_legacy();
         if (esp_err != ESP_OK) {
@@ -596,16 +595,22 @@ esp_err_t network_wifi_store_ap_json(known_access_point_t* item) {
         if (!existing || strncmp(existing, json_string, strlen(json_string)) != 0) {
             ESP_LOGI(TAG, "SSID %s was changed or is new. Committing to flash", item->ssid);
             err = network_wifi_write_ap(item->ssid, json_string, 0);
-            if (sta && strlen(ssid_string(sta)) > 0 && strcmp(ssid_string(sta), item->ssid) == 0) {
-                ESP_LOGI(TAG, "Committing active access point");
-                err = network_wifi_write_nvs("ssid", ssid_string(sta), 0);
-                if (err == ESP_OK) {
-                    char* enc_pw = encrypt_wifi_credentials(STR_OR_BLANK(password_string(sta)));
-                    err = network_wifi_write_nvs("password", enc_pw ? enc_pw : "", 0);
-                    FREE_AND_NULL(enc_pw);
-                }
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "Error committing active access point : %s", esp_err_to_name(err));
+            if (sta) {
+                char sta_ssid[sizeof(sta->ssid) + 1];
+                UINT_TO_STRING(sta_ssid, sta->ssid);
+                if (strlen(sta_ssid) > 0 && strcmp(sta_ssid, item->ssid) == 0) {
+                    ESP_LOGI(TAG, "Committing active access point");
+                    err = network_wifi_write_nvs("ssid", sta_ssid, 0);
+                    if (err == ESP_OK) {
+                        char sta_pwd[sizeof(sta->password) + 1];
+                        UINT_TO_STRING(sta_pwd, sta->password);
+                        char* enc_pw = encrypt_wifi_credentials(STR_OR_BLANK(sta_pwd));
+                        err = network_wifi_write_nvs("password", enc_pw ? enc_pw : "", 0);
+                        FREE_AND_NULL(enc_pw);
+                    }
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "Error committing active access point : %s", esp_err_to_name(err));
+                    }
                 }
             }
         }
@@ -698,12 +703,18 @@ void destroy_network_wifi() {
 bool network_wifi_sta_config_changed() {
     bool changed = true;
     const wifi_sta_config_t* sta = network_wifi_get_active_config();
-    if (!sta || strlen(ssid_string(sta)) == 0)
+    if (!sta)
+        return false;
+    char sta_ssid[sizeof(sta->ssid) + 1];
+    char sta_pwd[sizeof(sta->password) + 1];
+    UINT_TO_STRING(sta_ssid, sta->ssid);
+    UINT_TO_STRING(sta_pwd, sta->password);
+    if (strlen(sta_ssid) == 0)
         return false;
 
-    known_access_point_t* known = network_wifi_get_ap_entry(ssid_string(sta));
-    if (known && strcmp(known->ssid, ssid_string(sta)) == 0 &&
-        strcmp((char*)known->password, password_string(sta)) == 0) {
+    known_access_point_t* known = network_wifi_get_ap_entry(sta_ssid);
+    if (known && strcmp(known->ssid, sta_ssid) == 0 &&
+        strcmp((char*)known->password, sta_pwd) == 0) {
         changed = false;
     } else {
         ESP_LOGI(TAG, "New network configuration found");
@@ -717,24 +728,30 @@ esp_err_t network_wifi_save_sta_config() {
     MEMTRACE_PRINT_DELTA_MESSAGE("Config Save");
 
     const wifi_sta_config_t* sta = network_wifi_get_active_config();
-    if (sta && strlen(ssid_string(sta)) > 0) {
-        MEMTRACE_PRINT_DELTA_MESSAGE("Checking if current SSID is known");
-        item = network_wifi_get_ap_entry(ssid_string(sta));
-        if (!item) {
-            ESP_LOGD(TAG,"New SSID %s found", ssid_string(sta));
-            // this is a new access point. First add it to the end of the AP list
-            esp_err = network_wifi_add_ap_from_sta_copy(sta);
+    if (sta) {
+        char sta_ssid[sizeof(sta->ssid) + 1];
+        UINT_TO_STRING(sta_ssid, sta->ssid);
+        if (strlen(sta_ssid) > 0) {
+            MEMTRACE_PRINT_DELTA_MESSAGE("Checking if current SSID is known");
+            item = network_wifi_get_ap_entry(sta_ssid);
+            if (!item) {
+                ESP_LOGD(TAG,"New SSID %s found", sta_ssid);
+                // this is a new access point. First add it to the end of the AP list
+                esp_err = network_wifi_add_ap_from_sta_copy(sta);
+            }
         }
     }
     // now traverse the list and commit
     MEMTRACE_PRINT_DELTA_MESSAGE("Saving all known ap as json strings");
     known_access_point_t* it;
+    ap_list_lock();
     SLIST_FOREACH(it, &s_ap_list, next) {
         if ((esp_err = network_wifi_store_ap_json(it)) != ESP_OK) {
             ESP_LOGW(TAG, "Error saving wifi ap entry %s : %s", it->ssid, esp_err_to_name(esp_err));
             break;
         }
     }
+    ap_list_unlock();
     return esp_err;
 }
 
@@ -758,7 +775,7 @@ void network_wifi_load_known_access_points() {
             if (value == NULL) {
                 ESP_LOGE(TAG, "nvs read failed for %s.", info.key);
             } else if ((esp_err = network_wifi_add_json_entry(value)) != ESP_OK) {
-                ESP_LOGE(TAG, "Invalid entry or error for %s.", (char*)value);
+                ESP_LOGE(TAG, "Invalid entry or error for %s.", info.key);
             }
             FREE_AND_NULL(value);
         }
@@ -795,7 +812,9 @@ const wifi_sta_config_t* network_wifi_load_active_config() {
     MEMTRACE_PRINT_DELTA_MESSAGE("Fetching wifi sta config - ssid.");
     esp_err = network_wifi_get_blob(&config.ssid, sizeof(config.ssid), "ssid");
     if (esp_err == ESP_OK && strlen((char*)config.ssid) > 0) {
-        ESP_LOGD(TAG,"network_wifi_load_active_config: ssid:%s. Fetching password (if any) ", ssid_string(&config));
+        char cfg_ssid[sizeof(config.ssid) + 1];
+        UINT_TO_STRING(cfg_ssid, config.ssid);
+        ESP_LOGD(TAG,"network_wifi_load_active_config: ssid:%s. Fetching password (if any) ", cfg_ssid);
         char raw_pwd[sizeof(config.password) * 2 + 32];
         memset(raw_pwd, 0, sizeof(raw_pwd));
         if (network_wifi_get_blob(raw_pwd, sizeof(raw_pwd) - 1, "password") != ESP_OK) {
@@ -829,7 +848,9 @@ bool network_wifi_load_wifi_sta_config() {
     network_wifi_load_known_access_points();
     const wifi_sta_config_t* config = network_wifi_load_active_config();
     if (config) {
-        known_access_point_t* item = network_wifi_get_ap_entry(ssid_string(config));
+        char cfg_ssid[sizeof(config->ssid) + 1];
+        UINT_TO_STRING(cfg_ssid, config->ssid);
+        known_access_point_t* item = network_wifi_get_ap_entry(cfg_ssid);
         if (!item) {
             ESP_LOGI(TAG, "Adding legacy/active wifi connection to the known list");
             network_wifi_add_ap_from_sta_copy(config);
@@ -979,6 +1000,9 @@ cJSON* network_wifi_get_new_array_json(cJSON** old) {
     return cJSON_CreateArray();
 }
 void network_wifi_global_init() {
+    if (!s_ap_list_mutex) {
+        s_ap_list_mutex = xSemaphoreCreateMutex();
+    }
     network_wifi_get_new_array_json(&accessp_cjson);
     ESP_LOGD(TAG, "Loading existing wifi configuration (if any)");
     network_wifi_load_wifi_sta_config();
@@ -995,8 +1019,10 @@ void network_wifi_add_access_point_json(cJSON* ap_list, wifi_ap_record_t* ap_rec
         cJSON_Delete(ap);
         return;
     }
-    cJSON_AddItemToObject(ap, "ssid", cJSON_CreateString(ap_ssid_string(ap_rec)));
-    cJSON_AddBoolToObject(ap, "known", network_wifi_is_known_ap(ap_ssid_string(ap_rec)));
+    char ap_rec_ssid[sizeof(ap_rec->ssid) + 1];
+    UINT_TO_STRING(ap_rec_ssid, ap_rec->ssid);
+    cJSON_AddItemToObject(ap, "ssid", cJSON_CreateString(ap_rec_ssid));
+    cJSON_AddBoolToObject(ap, "known", network_wifi_is_known_ap(ap_rec_ssid));
     if (ap_rec->rssi != 0) {
         // only add the rest of the details when record doesn't come from
         // "known" access points that aren't in range
@@ -1016,11 +1042,7 @@ void network_wifi_add_access_point_json(cJSON* ap_list, wifi_ap_record_t* ap_rec
         cJSON_AddItemToObject(ap, "radio", radio);
     }
     cJSON_AddItemToArray(ap_list, ap);
-    char* ap_json = cJSON_PrintUnformatted(ap);
-    if (ap_json != NULL) {
-        ESP_LOGD(TAG, "New access point found: %s", ap_json);
-        free(ap_json);
-    }
+    ESP_LOGD(TAG, "New access point added: %s", ap_rec_ssid);
 }
 void network_wifi_generate_access_points_json(cJSON** ap_list) {
     *ap_list = network_wifi_get_new_array_json(ap_list);
@@ -1398,14 +1420,22 @@ esp_err_t network_wifi_connect_ssid(const char* ssid) {
 esp_err_t network_wifi_connect_active_ssid() {
     const wifi_sta_config_t* config = network_wifi_load_active_config();
     if (config) {
-        return network_wifi_connect(ssid_string(config), password_string(config));
+        char cfg_ssid[sizeof(config->ssid) + 1];
+        char cfg_pwd[sizeof(config->password) + 1];
+        UINT_TO_STRING(cfg_ssid, config->ssid);
+        UINT_TO_STRING(cfg_pwd, config->password);
+        return network_wifi_connect(cfg_ssid, cfg_pwd);
     }
     return ESP_FAIL;
 }
 void network_wifi_clear_config() {
     /* erase configuration */
     const wifi_sta_config_t* sta = network_wifi_get_active_config();
-    network_wifi_delete_ap(ssid_string(sta));
+    if (sta) {
+        char sta_ssid[sizeof(sta->ssid) + 1];
+        UINT_TO_STRING(sta_ssid, sta->ssid);
+        network_wifi_delete_ap(sta_ssid);
+    }
     esp_err_t err = ESP_OK;
     if ((err = esp_wifi_disconnect()) != ESP_OK) {
         ESP_LOGW(TAG, "Could not disconnect from deleted network : %s", esp_err_to_name(err));

@@ -2,6 +2,7 @@
 #define EMBEDDED_H
 #include <ctype.h>
 #include <inttypes.h>
+#include <pthread.h>
 
 /* 	must provide 
 		- mutex_create_p
@@ -59,7 +60,13 @@ void em_logprint(const char *fmt, ...);
 void embedded_exit(int code);
 #define exit(code) do { embedded_exit(code); } while (0)
 #define gettime_ms _gettime_ms_
-#define mutex_create_p(m) mutex_create(m)
+#define mutex_create_p(m) do { \
+	pthread_mutexattr_t attr; \
+	pthread_mutexattr_init(&attr); \
+	pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT); \
+	pthread_mutex_init(&(m), &attr); \
+	pthread_mutexattr_destroy(&attr); \
+} while (0)
 
 uint32_t 	_gettime_ms_(void);
 

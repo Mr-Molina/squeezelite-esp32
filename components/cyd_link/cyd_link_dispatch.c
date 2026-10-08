@@ -9,13 +9,13 @@ static char *append_newline(char *json) {
     size_t len = strlen(json);
     char *out = malloc(len + 2);
     if (!out) {
-        free(json);
+        cJSON_free(json);
         return NULL;
     }
     memcpy(out, json, len);
     out[len] = '\n';
     out[len + 1] = '\0';
-    free(json);
+    cJSON_free(json);
     return out;
 }
 
@@ -32,16 +32,22 @@ char *cyd_link_format_meta(const char *title, const char *artist, const char *al
 }
 
 char *cyd_link_format_status(const char *state, uint32_t elapsed, uint32_t duration, uint8_t vol) {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) return NULL;
-    cJSON_AddStringToObject(root, "event", "status");
-    cJSON_AddStringToObject(root, "state", state ? state : "stop");
-    cJSON_AddNumberToObject(root, "elapsed", elapsed);
-    cJSON_AddNumberToObject(root, "duration", duration);
-    cJSON_AddNumberToObject(root, "vol", vol);
-    char *rendered = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    return append_newline(rendered);
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"event\":\"status\",\"state\":\"%s\",\"elapsed\":%u,\"duration\":%u,\"vol\":%u}\n",
+                       state ? state : "stop",
+                       (unsigned int)elapsed,
+                       (unsigned int)duration,
+                       (unsigned int)vol);
+    if (len <= 0 || (size_t)len >= sizeof(buf)) {
+        return NULL;
+    }
+    char *out = (char *)malloc((size_t)len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, buf, (size_t)len + 1);
+    return out;
 }
 
 char *cyd_link_format_sys(const char *mode, const char *name, const char *ip) {

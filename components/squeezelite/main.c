@@ -764,6 +764,13 @@ int squeezelite_main(int argc, char **argv) {
 	winsock_init();
 #endif
 
+#if EMBEDDED
+    if (server && !strcasecmp(server, "-disable")) {
+        LOG_ERROR("LMS is disabled");
+        while (1) sleep(3600);
+    }
+#endif
+
 	stream_init(log_stream, stream_buf_size);
 
 #if EMBEDDED
@@ -811,12 +818,6 @@ int squeezelite_main(int argc, char **argv) {
 		exit(1);
 	}
 
-#if EMBEDDED
-    if (server && !strcasecmp(server, "-disable")) {
-        LOG_ERROR("LMS is disabled");
-        while (1) sleep(3600);
-    }
-#endif
 	slimproto(log_slimproto, server, mac, name, namefile, modelname, maxSampleRate);
 
 	decode_close();

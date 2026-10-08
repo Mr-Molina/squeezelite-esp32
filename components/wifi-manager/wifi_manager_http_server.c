@@ -224,6 +224,8 @@ void adder_free_func(void *ctx)
 }
 
 
+esp_err_t messaging_unregister_subscriber(messaging_handle_t subscriber_handle);
+
 void stop_webserver(httpd_handle_t server)
 {
     // Stop the httpd server
@@ -233,6 +235,14 @@ void stop_webserver(httpd_handle_t server)
         scratch_mutex = NULL;
         scratch_locked_task = NULL;
         scratch_lock_count = 0;
+    }
+    if (messaging) {
+        messaging_unregister_subscriber((messaging_handle_t)messaging);
+        messaging = NULL;
+    }
+    if (rest_context) {
+        free(rest_context);
+        rest_context = NULL;
     }
 }
 

@@ -39,6 +39,7 @@ u8_t custom_player_id = 12;
 
 mutex_type slimp_mutex;
 static jmp_buf jumpbuf;
+static pthread_t main_thread;
 
 #ifndef POWER_LOCKED
 static void set_power_gpio(int gpio, char *value) {
@@ -102,11 +103,18 @@ int embedded_init(void) {
 		ESP_LOGI(TAG, "setting power GPIO %d (active:%d)", power_control.gpio, power_control.active);	
 	}	    
     
+	main_thread = pthread_self();
     return setjmp(jumpbuf);
 }
 
 void embedded_exit(int code) {
-    longjmp(jumpbuf, code + 1);
+    if (pthread_equal(pthread_self(), main_thread)) {
+        longjmp(jumpbuf, code + 1);
+    } else {
+        ESP_LOGW(TAG, "embedded_exit called from worker thread; stopping slimproto and exiting thread");
+        slimproto_stop();
+        pthread_exit(NULL);
+    }
 }    
 
 void powering(bool on) {
@@ -133,6 +141,8 @@ u16_t get_battery(void) {
 }	 
 
 void set_name(char *name) {
+	if (!name) return;
+
 	char *cmd = config_alloc_get(NVS_TYPE_STR, "autoexec1");
 	char *p, *q;
 	
@@ -149,9 +159,23 @@ void set_name(char *name) {
 		else *p = '\0';
 	}
 
-	asprintf(&q, "%s -n \"%s\"", cmd, name);
-    config_set_value(NVS_TYPE_STR, "autoexec1", q);
+	char clean_name[128];
+	size_t j = 0;
+	for (size_t i = 0; name[i] != '\0' && j < sizeof(clean_name) - 1; i++) {
+		unsigned char c = (unsigned char)name[i];
+		if (c >= 32 && c != 127 && c != '"') {
+			clean_name[j++] = (char)c;
+		}
+	}
+	clean_name[j] = '\0';
+
+	if (j > 0) {
+		int res = asprintf(&q, "%s -n \"%s\"", cmd, clean_name);
+		if (res > 0 && q != NULL) {
+			config_set_value(NVS_TYPE_STR, "autoexec1", q);
+			free(q);
+		}
+	}
 	
-	free(q);
 	free(cmd);
 }

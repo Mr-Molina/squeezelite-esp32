@@ -3,7 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#if defined(ESP_PLATFORM)
 #include "esp_err.h"
+#endif
 #include "cyd_link_dispatch.h"
 
 #ifdef __cplusplus

@@ -61,6 +61,15 @@ void cyd_client_register_event_callback(cyd_event_cb_t cb);
 const cyd_telemetry_state_t *cyd_client_get_state(void);
 
 /**
+ * @brief Retrieve a thread-safe snapshot copy of current cached telemetry state.
+ *
+ * Copies current state into the provided destination buffer under s_state_mutex protection.
+ *
+ * @param out Pointer to output telemetry state structure
+ */
+void cyd_client_get_state_copy(cyd_telemetry_state_t *out);
+
+/**
  * @brief Feed raw bytes into the line receiver accumulator.
  *
  * Strips '\r', buffers up to 512 bytes, and parses/dispatches on '\n'.

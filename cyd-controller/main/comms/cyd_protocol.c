@@ -9,13 +9,13 @@ static char *append_newline(char *json) {
     size_t len = strlen(json);
     char *out = (char *)malloc(len + 2);
     if (!out) {
-        free(json);
+        cJSON_free(json);
         return NULL;
     }
     memcpy(out, json, len);
     out[len] = '\n';
     out[len + 1] = '\0';
-    free(json);
+    cJSON_free(json);
     return out;
 }
 
@@ -62,12 +62,16 @@ esp_err_t cyd_client_parse_event(const char *line, cyd_telemetry_state_t *state)
             state->state[sizeof(state->state) - 1] = '\0';
         }
         cJSON *elapsed = cJSON_GetObjectItem(root, "elapsed");
-        if (cJSON_IsNumber(elapsed)) {
-            state->elapsed = (uint32_t)elapsed->valueint;
+        if (cJSON_IsNumber(elapsed) && elapsed->valuedouble >= 0.0) {
+            state->elapsed = (uint32_t)elapsed->valuedouble;
+        } else if (cJSON_IsNumber(elapsed)) {
+            state->elapsed = 0;
         }
         cJSON *duration = cJSON_GetObjectItem(root, "duration");
-        if (cJSON_IsNumber(duration)) {
-            state->duration = (uint32_t)duration->valueint;
+        if (cJSON_IsNumber(duration) && duration->valuedouble >= 0.0) {
+            state->duration = (uint32_t)duration->valuedouble;
+        } else if (cJSON_IsNumber(duration)) {
+            state->duration = 0;
         }
         cJSON *vol = cJSON_GetObjectItem(root, "vol");
         if (cJSON_IsNumber(vol)) {

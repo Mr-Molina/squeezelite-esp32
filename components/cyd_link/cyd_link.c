@@ -146,6 +146,10 @@ static void cyd_uart_rx_task(void *pvParameters) {
         int len = uart_read_bytes(s_uart_num, data, sizeof(data), pdMS_TO_TICKS(50));
         if (len > 0) {
             cyd_link_feed_rx_bytes((const char *)data, len);
+        } else if (len < 0) {
+            ESP_LOGW(TAG, "UART read error, flushing input buffer");
+            uart_flush_input(s_uart_num);
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
@@ -220,6 +224,10 @@ esp_err_t cyd_link_init(void) {
         ESP_LOGW(TAG, "CYD link disabled: tx or rx pin missing in cyd_config");
         return ESP_OK;
     }
+    if (baud <= 0 || tx_pin > 39 || rx_pin > 39) {
+        ESP_LOGE(TAG, "CYD link invalid configuration: tx=%d rx=%d baud=%d", tx_pin, rx_pin, baud);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     s_uart_num = (uart_port == 2) ? UART_NUM_2 : UART_NUM_1;
 
@@ -231,11 +239,26 @@ esp_err_t cyd_link_init(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
 
-    ESP_ERROR_CHECK(uart_param_config(s_uart_num, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(s_uart_num, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(s_uart_num, CYD_UART_BUF_SIZE * 2, 0, 0, NULL, 0));
+    esp_err_t err = uart_param_config(s_uart_num, &uart_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure UART params: %d", err);
+        return err;
+    }
+    err = uart_set_pin(s_uart_num, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set UART pins: %d", err);
+        return err;
+    }
+    err = uart_driver_install(s_uart_num, CYD_UART_BUF_SIZE * 2, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install UART driver: %d", err);
+        return err;
+    }
 
-    xTaskCreate(cyd_uart_rx_task, "cyd_uart_rx", 3072, NULL, ESP_TASK_PRIO_MIN + 2, NULL);
+    if (xTaskCreate(cyd_uart_rx_task, "cyd_uart_rx", 4096, NULL, ESP_TASK_PRIO_MIN + 2, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create cyd_uart_rx task");
+        return ESP_ERR_NO_MEM;
+    }
     s_uart_active = true;
     ESP_LOGI(TAG, "CYD link UART initialized on port %d (TX:%d, RX:%d, baud:%d)", s_uart_num, tx_pin, rx_pin, baud);
 #else

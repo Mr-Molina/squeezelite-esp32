@@ -13,7 +13,6 @@ static SemaphoreHandle_t s_ui_mutex = NULL;
 
 void cyd_ui_lock(void) {
 #if defined(ESP_PLATFORM)
-    if (!s_ui_mutex) s_ui_mutex = xSemaphoreCreateMutex();
     if (s_ui_mutex) xSemaphoreTake(s_ui_mutex, portMAX_DELAY);
 #endif
 }
@@ -104,6 +103,11 @@ static void on_volume_slider_event(lv_event_t *e) {
 }
 
 void ui_now_playing_create(void) {
+#if defined(ESP_PLATFORM)
+    if (!s_ui_mutex) {
+        s_ui_mutex = xSemaphoreCreateMutex();
+    }
+#endif
     memset(&s_cached_state, 0, sizeof(s_cached_state));
     s_last_vol_sent_ms = 0;
     s_has_sent_first_vol = false;
