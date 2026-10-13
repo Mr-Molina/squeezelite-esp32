@@ -46,5 +46,16 @@ fn main() {
     println!("  - Sample Rate: {} Hz", pipeline.sample_rate);
     println!("  - Buffers:     {} bytes stream, {} bytes output", pipeline.stream_buffer_available(), pipeline.output_buffer_available());
     println!("--------------------------------------------------------");
+
+    // Initialize Wi-Fi Manager and check persistent configuration
+    let wifi = louder_esp32_app::wifi::WifiManager::new();
+    println!("Wi-Fi Subsystem (Key-Value NVS):");
+    println!("  - State:       {}", wifi.state());
+    if !wifi.config.ssid.is_empty() {
+        println!("  - Stored SSID: {}", wifi.config.ssid);
+    } else {
+        println!("  - Stored SSID: [None - Ready for CYD / Serial Provisioning]");
+    }
+    println!("--------------------------------------------------------");
     println!("Ready for LMS auto-discovery on UDP 3483...");
 }

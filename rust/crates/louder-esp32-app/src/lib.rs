@@ -19,6 +19,7 @@ pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
 
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
+pub use squeezelite_config::{AudioConfig, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials};
 pub use network::{LmsDiscovery, SlimprotoClient};
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};

@@ -5,6 +5,7 @@ members = [
     "crates/squeezelite-tas58xx",
     "crates/squeezelite-decoders",
     "crates/squeezelite-cyd-link",
+    "crates/squeezelite-config",
     "crates/louder-esp32-app",
 ]
 resolver = "2"

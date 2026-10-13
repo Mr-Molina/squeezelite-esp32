@@ -2,6 +2,33 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-13 | Antigravity Orchestrator | Pure-Rust Key-Value Storage & NVS Flash Journal (MK5-Rust)
+**Agent**: Antigravity Orchestrator
+**Host OS**: Windows 11
+**Branch**: `MK5-Rust`
+**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8) & Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8)
+**Verification Suite**: 61/61 Automated Tests Passing (including 19 proptest fuzz suites with 9,500 randomized cases) + 0 Clippy Warnings (`cargo clippy -D warnings`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
+
+### Completed This Session
+- **`squeezelite-config` Crate Creation (`no_std`, Zero Heap)**:
+  - `KeyValueStorage` trait: Standardized get/set/remove interface with type-safe accessors (`get_str`, `set_str`, `get_u32`, `set_u32`, `get_u8`, `set_u8`, `get_bool`, `set_bool`).
+  - `MemConfigStore`: In-memory zero-allocation storage backed by bounded `heapless::Vec`.
+  - `FlashJournal`: Dual-CRC32 validated Flash journal serializer covering header metadata and payload data, protecting against partial sector writes and Flash bit-rot.
+  - `WifiCredentials`: Strongly typed Wi-Fi configuration model (`ssid`, `passphrase`, `autoconnect`, `static_ip`, `gateway`, `subnet`, `dns`) with `save_to`, `load_from`, and `clear`.
+  - `AudioConfig`: Audio device preferences (`player_name`, `volume`, `equalizer_preset`, `lms_server_ip`, `lms_server_port`).
+- **Property-Based Fuzz Testing (`config_fuzz.rs`)**:
+  - 4 fuzz suites (2,000 cases) verifying memory store roundtrip, Wi-Fi credentials serialization, FlashJournal sector roundtrip, and 100% bit-flip corruption detection.
+- **`louder-esp32-app` Wi-Fi Integration**:
+  - Connected `WifiManager` to `squeezelite_config::KeyValueStorage`.
+  - Automatically loads saved credentials and autoconnects on boot.
+  - Persists credentials upon `connect()` and clears on `forget_credentials()`.
+  - Verified cross-instance reboot simulation in unit tests.
+- **Workspace Verification & Quality Gate**:
+  - 61/61 automated tests passing (`cargo test --workspace`).
+  - Strict Clippy check: 0 errors, 0 warnings (`cargo clippy --workspace --all-targets -- -D warnings`).
+  - Dual board profile verification (`board-louder-esp32` and `board-louder-esp32-s3`) running cleanly.
+
 ## 2026-10-13 | Antigravity Orchestrator | Property-Based Fuzzing (proptest) Suite for SlimProto & CYD Link (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11

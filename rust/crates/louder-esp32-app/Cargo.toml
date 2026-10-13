@@ -17,6 +17,7 @@ squeezelite-audio-core = { path = "../squeezelite-audio-core" }
 squeezelite-tas58xx = { path = "../squeezelite-tas58xx" }
 squeezelite-decoders = { path = "../squeezelite-decoders" }
 squeezelite-cyd-link = { path = "../squeezelite-cyd-link" }
+squeezelite-config = { path = "../squeezelite-config" }
 embedded-hal = { workspace = true }
 heapless = { workspace = true }
 thiserror = { workspace = true }

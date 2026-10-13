@@ -281,6 +281,7 @@ dependencies = [
  "heapless",
  "log",
  "squeezelite-audio-core",
+ "squeezelite-config",
  "squeezelite-cyd-link",
  "squeezelite-decoders",
  "squeezelite-proto",
@@ -554,6 +555,16 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "log",
+ "thiserror",
+]
+
+[[package]]
+name = "squeezelite-config"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "log",
+ "proptest",
  "thiserror",
 ]
 
