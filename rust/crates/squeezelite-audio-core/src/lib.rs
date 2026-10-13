@@ -8,9 +8,11 @@
 #![no_std]
 
 pub mod equalizer;
+pub mod output;
 pub mod ringbuffer;
 pub mod volume;
 
 pub use equalizer::{BiquadCoeffs, Equalizer};
+pub use output::{AudioOutputSink, MockAudioSink, OutputError};
 pub use ringbuffer::{AudioRingBuffer, RingBufferError};
 pub use volume::{scale_samples_inplace, VolumeScale};

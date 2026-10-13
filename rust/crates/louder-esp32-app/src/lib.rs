@@ -4,6 +4,9 @@
 
 pub mod board;
 pub mod network;
+pub mod pipeline;
+
+pub use pipeline::{ActiveDecoder, StreamPipeline};
 
 pub use squeezelite_audio_core::{AudioRingBuffer, Equalizer, VolumeScale};
 pub use squeezelite_cyd_link::{CydLinkProtocol, CydMessage, PlayState};
