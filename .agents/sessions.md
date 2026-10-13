@@ -2,6 +2,26 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-13 | Antigravity Orchestrator | Dual-Pass Enterprise Deep Code Audit & Adversarial Hardening (MK5-Rust)
+**Agent**: Antigravity Orchestrator
+**Host OS**: Windows 11
+**Branch**: `MK5-Rust`
+**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8) & Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8)
+**Verification Suite**: 136/136 Automated Tests Passing (Unit, Integration, 1M-Sample Stress, and 29 Proptest Fuzz Suites) + 0 Clippy Warnings (`cargo clippy --workspace --all-targets --all-features -- -D warnings`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
+
+### Completed This Session
+- **Pass 1 Deep Code Audit (`78` Findings Remediated across 4 Parallel Waves)**:
+  - Hardened `squeezelite-proto`, `squeezelite-audio-core`, `squeezelite-tas58xx`, `squeezelite-decoders`, `squeezelite-cyd-link`, `squeezelite-config`, and `louder-esp32-app` (commits `ba8d0944`, `9aaef257`), expanding the test suite from 61 to 84 tests.
+- **Pass 2 Post-Remediation Deep Code Audit (`67` Second-Order Findings Remediated across 11 Disjoint Clusters, Commit `d7a3284b`)**:
+  - **`squeezelite-audio-core` (`CONC-501`, `CONC-502`, `LOGIC-501`, `CONC-503`, `SEC-601`, `QA-601`, `LOGIC-605`)**: Removed unsound `unsafe impl Sync for AudioRingBuffer`; required `&mut self` on direct mutators (`write`, `read`, `consume`, `rewind_read`, `flush`, `split`); isolated SPSC concurrency to `Send + !Sync` `Producer`/`Consumer` handles; clamped `consume` and `rewind_read` against available bounds; encapsulated `Equalizer::filters` and added `is_finite()` NaN/Inf guards to `BiquadCoeffs::is_stable`.
+  - **`squeezelite-decoders` (`LOGIC-201`, `LOGIC-202`, `PERF-201`, `LOGIC-203`, `LOGIC-204`, `LOGIC-205`)**: Preserved `0..header_len` stream headers across `decode()` calls in `FlacDecoder` and `VorbisDecoder` (`stream_buf.drain(self.header_len..consumed)`); enforced `MAX_STREAM_BUF = 65536` pre-append cap; added 8-bit PCM and Little-Endian 24-bit/32-bit stereo/mono support to `PcmDecoder`; guarded `AacDecoder` buffer overflow; zeroed `Mp3Decoder::sample_buf` on `flush()`.
+  - **`squeezelite-proto` & `network.rs` (`LOGIC-101`, `LOGIC-102`, `LOGIC-103`, `LOGIC-104`, `LOGIC-105`, `CONC-101`, `PERF-101`, `PERF-102`)**: Added 6-byte server-to-client frame header parsing (`[2-byte BE length][4-byte opcode]`) alongside 8-byte headers; implemented official 53-byte `STAT` payload (`61` bytes total); added 1-byte `setd` setting ID support and 1-byte TLV length-prefixed UDP discovery parsing; configured TCP socket timeouts; eliminated `poll_command` double-parsing and drained oversized frames before returning `InvalidInput`.
+  - **`squeezelite-config` (`LOGIC-301`, `LOGIC-302`, `LOGIC-303`, `SEC-301`, `SEC-302`, `LOGIC-304`)**: Implemented RFC 1982 serial number arithmetic (`is_seq_newer_or_equal`) for `u32::MAX -> 0` sequence wraparound in `FlashJournal`; added automatic fallback to the older valid sector on entry-level corruption; rejected duplicate keys in sector loads; enforced `AudioConfig::validate()` and removed stale optional IP keys when `None` is saved in `WifiCredentials`.
+  - **`louder-esp32-app` (`LOGIC-601..604`, `LOGIC-701..707`, `LOGIC-801..806`, `SEC-801`, `INFRA-501`, `INFRA-601`, `INFRA-801`)**: Expanded `PCM_SCRATCH_SAMPLES` to `2304` and implemented lossless pending-PCM draining under backpressure in `StreamPipeline`; replaced destructive `read()` with `peek()` + `consume()` around `sink.write_frames()`; unconditionally programmed `DIG_VOL_CTRL` (`0x4C`) in `Standby` before unmuting into `Play` and integrated post-reset Book/Page confirmation & fault clearing in `AmpManager`; clamped `buffer_threshold_bytes` to ringbuffer capacity, normalized SlimProto PCM wire codes, and respected `autostart` in `PlayerCoordinator`; configured `CONFIG_SPIRAM=y` and `CONFIG_ESPTOOLPY_FLASHMODE_QIO=y` in `sdkconfig.defaults*`.
+- **Red-Team vs. Blue-Team Adversarial Bypass Duels**:
+  - All 37 `CRITICAL` and `HIGH` remediations underwent adversarial bypass audits (`34/37` verified in Round 1; `3/3` bypasses in `LOGIC-701`, `LOGIC-703`, and `LOGIC-707` remediated and verified in Round 2).
+
 ## 2026-10-13 | Antigravity Orchestrator | Pure-Rust Key-Value Storage & NVS Flash Journal (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11
