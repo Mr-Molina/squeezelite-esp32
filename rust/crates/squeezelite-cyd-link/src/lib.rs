@@ -33,6 +33,18 @@ pub enum CydMessage {
     },
 }
 
+/// Incoming interactive commands sent from the CYD display touch controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CydCommand {
+    Play,
+    Pause,
+    Toggle,
+    Next,
+    Previous,
+    SetVolume(u8),
+    QueryStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkError {
     BufferTooShort,
@@ -131,6 +143,58 @@ impl CydLinkProtocol {
             Err(LinkError::InvalidFrame)
         }
     }
+
+    /// Encodes an interactive touch command into a delimited frame (`\n` terminated).
+    pub fn encode_command(
+        cmd: &CydCommand,
+        out: &mut Vec<u8, 64>,
+    ) -> Result<(), LinkError> {
+        out.clear();
+        match cmd {
+            CydCommand::Play => out.extend_from_slice(b"CMD=PLAY\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Pause => out.extend_from_slice(b"CMD=PAUSE\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Toggle => out.extend_from_slice(b"CMD=TOGGLE\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Next => out.extend_from_slice(b"CMD=NEXT\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Previous => out.extend_from_slice(b"CMD=PREV\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::QueryStatus => out.extend_from_slice(b"CMD=STATUS\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::SetVolume(vol) => {
+                out.extend_from_slice(b"CMD=VOL:").map_err(|_| LinkError::BufferOverflow)?;
+                let mut num_buf = [0u8; 3];
+                let s = format_u8(*vol, &mut num_buf);
+                out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
+                out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses an incoming interactive command from the CYD display.
+    pub fn parse_command(line: &[u8]) -> Result<CydCommand, LinkError> {
+        let trimmed = if line.ends_with(b"\n") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+
+        if let Some(rest) = trimmed.strip_prefix(b"CMD=") {
+            match rest {
+                b"PLAY" => Ok(CydCommand::Play),
+                b"PAUSE" => Ok(CydCommand::Pause),
+                b"TOGGLE" => Ok(CydCommand::Toggle),
+                b"NEXT" => Ok(CydCommand::Next),
+                b"PREV" => Ok(CydCommand::Previous),
+                b"STATUS" => Ok(CydCommand::QueryStatus),
+                other if other.starts_with(b"VOL:") => {
+                    let s = core::str::from_utf8(&other[4..]).map_err(|_| LinkError::InvalidFrame)?;
+                    let vol: u8 = parse_u8(s).ok_or(LinkError::InvalidFrame)?;
+                    Ok(CydCommand::SetVolume(vol))
+                }
+                _ => Err(LinkError::InvalidFrame),
+            }
+        } else {
+            Err(LinkError::InvalidFrame)
+        }
+    }
 }
 
 fn format_u8(mut val: u8, buf: &mut [u8; 3]) -> &[u8] {
@@ -217,5 +281,38 @@ mod tests {
 
         let parsed = CydLinkProtocol::parse_line(&buf).unwrap();
         assert_eq!(parsed, CydMessage::Volume(85));
+    }
+
+    #[test]
+    fn test_encode_and_parse_commands() {
+        let mut buf = Vec::new();
+
+        CydLinkProtocol::encode_command(&CydCommand::Play, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=PLAY\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Play);
+
+        CydLinkProtocol::encode_command(&CydCommand::Pause, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=PAUSE\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Pause);
+
+        CydLinkProtocol::encode_command(&CydCommand::Toggle, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=TOGGLE\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Toggle);
+
+        CydLinkProtocol::encode_command(&CydCommand::Next, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=NEXT\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Next);
+
+        CydLinkProtocol::encode_command(&CydCommand::Previous, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=PREV\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Previous);
+
+        CydLinkProtocol::encode_command(&CydCommand::SetVolume(75), &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=VOL:75\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::SetVolume(75));
+
+        CydLinkProtocol::encode_command(&CydCommand::QueryStatus, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"CMD=STATUS\n");
+        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::QueryStatus);
     }
 }
