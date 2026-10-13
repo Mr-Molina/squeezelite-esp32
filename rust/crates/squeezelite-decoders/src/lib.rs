@@ -310,6 +310,167 @@ impl AudioDecoder for FlacDecoder {
     fn flush(&mut self) {}
 }
 
+#[cfg(feature = "std")]
+/// Pure-Rust AAC (ADTS / LC / HE-AAC) Decoder using syom.
+pub struct AacDecoder {
+    decoder: syom::Decoder,
+    pub sample_rate: u32,
+    pub channels: u32,
+}
+
+#[cfg(feature = "std")]
+impl Default for AacDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
+impl AacDecoder {
+    pub fn new() -> Self {
+        Self {
+            decoder: syom::Decoder::new(syom::DecodeOptions::default()),
+            sample_rate: 44100,
+            channels: 2,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AudioDecoder for AacDecoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        if encoded_in.len() < 7 {
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let mut frames_out = 0;
+        let max_frames = pcm_out.len() / 2;
+
+        let feed_res = self.decoder.feed(encoded_in, |frame| {
+            self.sample_rate = frame.sample_rate;
+            self.channels = frame.planar.len() as u32;
+
+            let samples = frame.samples;
+            let to_copy = core::cmp::min(samples, max_frames.saturating_sub(frames_out));
+
+            let left = frame.planar[0];
+            let right = if frame.planar.len() > 1 { frame.planar[1] } else { left };
+
+            for i in 0..to_copy {
+                let l_f = left[i].clamp(-1.0, 1.0);
+                let r_f = right[i].clamp(-1.0, 1.0);
+                let l = (l_f * 2147483647.0) as i32;
+                let r = (r_f * 2147483647.0) as i32;
+                pcm_out[(frames_out + i) * 2] = l;
+                pcm_out[(frames_out + i) * 2 + 1] = r;
+            }
+
+            frames_out += to_copy;
+            Ok(())
+        });
+
+        match feed_res {
+            Ok(_) => {
+                if frames_out == 0 {
+                    Err(DecoderError::NeedMoreData)
+                } else {
+                    Ok((encoded_in.len(), frames_out))
+                }
+            }
+            Err(_) => Err(DecoderError::CorruptedFrame),
+        }
+    }
+
+    fn flush(&mut self) {
+        self.decoder = syom::Decoder::new(syom::DecodeOptions::default());
+    }
+}
+
+#[cfg(feature = "std")]
+/// Pure-Rust Ogg Vorbis Decoder using lewton.
+pub struct VorbisDecoder {
+    pub sample_rate: u32,
+    pub channels: u32,
+}
+
+#[cfg(feature = "std")]
+impl Default for VorbisDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
+impl VorbisDecoder {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 44100,
+            channels: 2,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AudioDecoder for VorbisDecoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        if encoded_in.len() < 4 {
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let cursor = std::io::Cursor::new(encoded_in);
+        match lewton::inside_ogg::OggStreamReader::new(cursor) {
+            Ok(mut reader) => {
+                self.sample_rate = reader.ident_hdr.audio_sample_rate;
+                self.channels = reader.ident_hdr.audio_channels as u32;
+
+                let mut frames_out = 0;
+                let max_frames = pcm_out.len() / 2;
+
+                while let Ok(Some(samples_itl)) = reader.read_dec_packet_itl() {
+                    let packet_frames = if self.channels == 2 {
+                        samples_itl.len() / 2
+                    } else {
+                        samples_itl.len()
+                    };
+                    let to_copy = core::cmp::min(packet_frames, max_frames.saturating_sub(frames_out));
+
+                    if self.channels == 2 {
+                        for i in 0..to_copy {
+                            pcm_out[(frames_out + i) * 2] = (samples_itl[i * 2] as i32) << 16;
+                            pcm_out[(frames_out + i) * 2 + 1] = (samples_itl[i * 2 + 1] as i32) << 16;
+                        }
+                    } else {
+                        for i in 0..to_copy {
+                            let s = (samples_itl[i] as i32) << 16;
+                            pcm_out[(frames_out + i) * 2] = s;
+                            pcm_out[(frames_out + i) * 2 + 1] = s;
+                        }
+                    }
+
+                    frames_out += to_copy;
+                    if frames_out >= max_frames {
+                        break;
+                    }
+                }
+
+                let consumed = encoded_in.len();
+                Ok((consumed, frames_out))
+            }
+            Err(_) => Err(DecoderError::NeedMoreData),
+        }
+    }
+
+    fn flush(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +521,24 @@ mod tests {
     #[cfg(feature = "std")]
     fn test_flac_insufficient_data() {
         let mut decoder = FlacDecoder::new();
+        let encoded = [0u8; 3];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_aac_insufficient_data() {
+        let mut decoder = AacDecoder::new();
+        let encoded = [0u8; 5];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_vorbis_insufficient_data() {
+        let mut decoder = VorbisDecoder::new();
         let encoded = [0u8; 3];
         let mut pcm_out = [0i32; 32];
         assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));

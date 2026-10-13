@@ -13,6 +13,8 @@ pub enum ActiveDecoder {
     Pcm(PcmDecoder),
     Mp3(Box<squeezelite_decoders::Mp3Decoder>),
     Flac(Box<squeezelite_decoders::FlacDecoder>),
+    Aac(Box<squeezelite_decoders::AacDecoder>),
+    Vorbis(Box<squeezelite_decoders::VorbisDecoder>),
 }
 
 impl AudioDecoder for ActiveDecoder {
@@ -25,6 +27,8 @@ impl AudioDecoder for ActiveDecoder {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
+            Self::Aac(d) => d.decode(encoded_in, pcm_out),
+            Self::Vorbis(d) => d.decode(encoded_in, pcm_out),
         }
     }
 
@@ -33,6 +37,8 @@ impl AudioDecoder for ActiveDecoder {
             Self::Pcm(d) => d.flush(),
             Self::Mp3(d) => d.flush(),
             Self::Flac(d) => d.flush(),
+            Self::Aac(d) => d.flush(),
+            Self::Vorbis(d) => d.flush(),
         }
     }
 }

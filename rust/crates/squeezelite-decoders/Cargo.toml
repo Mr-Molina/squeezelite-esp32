@@ -8,11 +8,13 @@ description = "Pure-Rust audio decoders (PCM, FLAC, MP3) for squeezelite-esp32"
 
 [features]
 default = ["std"]
-std = ["dep:claxon"]
+std = ["dep:claxon", "dep:lewton", "dep:syom"]
 
 [dependencies]
 squeezelite-audio-core = { path = "../squeezelite-audio-core" }
 claxon = { version = "0.4", default-features = false, optional = true }
+lewton = { version = "0.10", default-features = false, features = ["ogg"], optional = true }
+syom = { version = "0.7", optional = true }
 nanomp3-core = "0.2"
 thiserror = { workspace = true }
 log = { workspace = true, optional = true }
