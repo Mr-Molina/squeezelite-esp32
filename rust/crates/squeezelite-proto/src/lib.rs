@@ -72,6 +72,23 @@ impl AudioFormat {
     }
 }
 
+/// Converts LMS SlimProto sample rate index into Hz.
+pub const fn sample_rate_from_index(index: u8) -> u32 {
+    match index {
+        0 => 11025,
+        1 => 22050,
+        2 => 32000,
+        3 => 44100,
+        4 => 48000,
+        5 => 8000,
+        6 => 12000,
+        7 => 16000,
+        8 => 24000,
+        9 => 96000,
+        _ => 44100,
+    }
+}
+
 /// PCM sample endianness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endianness {

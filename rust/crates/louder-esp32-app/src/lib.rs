@@ -2,46 +2,20 @@
 //!
 //! Main application engine for Louder-ESP32-Plus audio streamer.
 
+pub mod amp;
 pub mod board;
+pub mod coordinator;
 pub mod network;
 pub mod pipeline;
+pub mod sink;
 
+pub use amp::{AmpManager, AmpMode};
+pub use coordinator::{PlayerCoordinator, PlayerState};
 pub use pipeline::{ActiveDecoder, StreamPipeline};
+pub use sink::{NullAudioSink, SimulatedSink};
 
-pub use squeezelite_audio_core::{AudioRingBuffer, Equalizer, VolumeScale};
+pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
+pub use network::{LmsDiscovery, SlimprotoClient};
 pub use squeezelite_cyd_link::{CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};
-pub use squeezelite_tas58xx::{Tas58xx, PowerDown, Standby, Play};
-
-/// High-level player playback state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlayerState {
-    Disconnected,
-    Connected,
-    Streaming,
-    Paused,
-}
-
-/// Orchestrates audio pipeline components.
-pub struct PlayerCoordinator<'a> {
-    pub state: PlayerState,
-    pub volume: VolumeScale,
-    pub equalizer: Equalizer<10>,
-    pub ringbuffer: AudioRingBuffer<'a>,
-}
-
-impl<'a> PlayerCoordinator<'a> {
-    pub fn new(storage: &'a mut [u8]) -> Self {
-        Self {
-            state: PlayerState::Disconnected,
-            volume: VolumeScale::unity(),
-            equalizer: Equalizer::new(),
-            ringbuffer: AudioRingBuffer::new(storage),
-        }
-    }
-
-    pub fn set_volume(&mut self, left_gain: u32, right_gain: u32) {
-        self.volume.gain_left = left_gain;
-        self.volume.gain_right = right_gain;
-    }
-}
+pub use squeezelite_tas58xx::{Play, PowerDown, Standby, Tas58xx};

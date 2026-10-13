@@ -144,6 +144,27 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.volume.gain_right = right_gain;
     }
 
+    /// Sets the active audio decoder.
+    pub fn set_decoder(&mut self, decoder: ActiveDecoder) {
+        self.decoder = decoder;
+    }
+
+    /// Sets sample rate on pipeline and output sink.
+    pub fn set_sample_rate(&mut self, rate: u32) -> Result<(), S::Error> {
+        self.sample_rate = rate;
+        self.sink.set_sample_rate(rate)
+    }
+
+    /// Returns the number of bytes available in the stream ringbuffer.
+    pub fn stream_buffer_available(&self) -> usize {
+        self.stream_buffer.available_read()
+    }
+
+    /// Returns the number of bytes available in the output ringbuffer.
+    pub fn output_buffer_available(&self) -> usize {
+        self.output_buffer.available_read()
+    }
+
     /// Flushes both stream and output ringbuffers and resets the decoder state.
     pub fn flush(&mut self) {
         self.stream_buffer.flush();
