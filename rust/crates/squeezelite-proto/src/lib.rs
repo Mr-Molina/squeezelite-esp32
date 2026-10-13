@@ -222,7 +222,10 @@ impl SlimprotoParser {
 
         let opcode = [buf[0], buf[1], buf[2], buf[3]];
         let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        let total_frame_len = 8 + length;
+        let total_frame_len = match 8usize.checked_add(length) {
+            Some(l) => l,
+            None => return Err(ParseError::PayloadTooLarge),
+        };
 
         if buf.len() < total_frame_len {
             return Err(ParseError::BufferTooShort);
@@ -486,6 +489,9 @@ impl DiscoveryParser {
 }
 
 fn parse_u16(s: &str) -> Result<u16, ()> {
+    if s.is_empty() {
+        return Err(());
+    }
     let mut res: u16 = 0;
     for b in s.bytes() {
         if !b.is_ascii_digit() {

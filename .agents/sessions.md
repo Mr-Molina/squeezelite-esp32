@@ -2,6 +2,38 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-13 | Antigravity Orchestrator | Property-Based Fuzzing (proptest) Suite for SlimProto & CYD Link (MK5-Rust)
+**Agent**: Antigravity Orchestrator
+**Host OS**: Windows 11
+**Branch**: `MK5-Rust`
+**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8) & Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8)
+**Verification Suite**: 52/52 Automated Tests Passing (including 15 proptest fuzz suites with 7,500 randomized cases) + 0 Clippy Warnings (`cargo clippy -D warnings`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
+
+### Completed This Session
+- **`squeezelite-proto` Fuzz Suite (`proto_fuzz.rs`)**:
+  - Added property-based fuzz testing via `proptest`:
+    - `fuzz_parse_frame_arbitrary_bytes`: 500 cases of arbitrary adversarial byte streams verifying bounded consumption and zero panics.
+    - `fuzz_parse_mutated_strm_frame`: 500 cases of mutated `strm` frames testing parameter extraction.
+    - `fuzz_parse_mutated_audg_frame`: 500 cases of mutated `audg` frames verifying gain and attenuation decoding.
+    - `fuzz_discovery_parser_arbitrary_bytes`: 500 cases verifying LMS UDP discovery parser panic resistance.
+    - `fuzz_stat_builder_soundness`: 500 cases verifying roundtrip 28-byte `STAT` telemetry serialization.
+    - `fuzz_sample_rate_all_indices`: Exhaustive bounds test for sample rate index conversion.
+  - Hardened `SlimprotoParser::parse_frame` with `8usize.checked_add(length)` to prevent integer overflow in debug mode.
+  - Guarded `parse_u16` against empty strings.
+- **`squeezelite-cyd-link` Fuzz Suite (`cyd_fuzz.rs`)**:
+  - Added property-based fuzz testing via `proptest`:
+    - `fuzz_parse_line_arbitrary_bytes` & `fuzz_parse_command_arbitrary_bytes`: 1,000 cases verifying panic-free UART line parsing.
+    - `fuzz_parse_command_arbitrary_strings`: Arbitrary UTF-8 strings.
+    - `fuzz_volume_roundtrip` & `fuzz_command_set_volume_roundtrip`: Roundtrip preservation of volume levels across serial link.
+    - `fuzz_playback_state_roundtrip` & `fuzz_touch_commands_roundtrip`: Roundtrip preservation of UI touch events.
+    - `fuzz_progress_encoding` & `fuzz_wifi_status_encoding`: Bounded serial formatting verification.
+  - Guarded `parse_u8` against empty strings.
+- **Workspace Verification & Quality Gate**:
+  - 52/52 automated tests passing (`cargo test --workspace`).
+  - Strict Clippy audit: 0 errors, 0 warnings (`cargo clippy --workspace --all-targets -- -D warnings`).
+  - Session ledger and walkthrough updated.
+
 ## 2026-10-13 | Antigravity Orchestrator | Pure-Rust AAC (syom) & Ogg-Vorbis (lewton) Decoders (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11

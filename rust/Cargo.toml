@@ -21,6 +21,7 @@ embedded-hal = "1.0"
 embedded-io = "0.6"
 thiserror = { version = "1.0", default-features = false }
 log = { version = "0.4", default-features = false }
+proptest = "1.5"
 
 [profile.release]
 opt-level = 3

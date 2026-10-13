@@ -249,6 +249,9 @@ fn format_i8(val: i8, buf: &mut [u8; 5]) -> &[u8] {
 }
 
 fn parse_u8(s: &str) -> Option<u8> {
+    if s.is_empty() {
+        return None;
+    }
     let mut res: u8 = 0;
     for b in s.bytes() {
         if !b.is_ascii_digit() {
