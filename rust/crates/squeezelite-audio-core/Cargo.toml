@@ -1,0 +1,14 @@
+[package]
+name = "squeezelite-audio-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "no_std lock-free audio ringbuffers, Horner loudness curve, and biquad equalizer"
+
+[dependencies]
+heapless = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]

@@ -1,0 +1,14 @@
+[package]
+name = "squeezelite-cyd-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "no_std serial telemetry and display link protocol for CYD controller"
+
+[dependencies]
+heapless = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]

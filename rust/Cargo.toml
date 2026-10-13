@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/squeezelite-proto",
+    "crates/squeezelite-audio-core",
+    "crates/squeezelite-tas58xx",
+    "crates/squeezelite-decoders",
+    "crates/squeezelite-cyd-link",
+    "crates/louder-esp32-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Squeezelite-ESP32 Team"]
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+heapless = "0.8"
+embedded-hal = "1.0"
+embedded-io = "0.6"
+thiserror = { version = "1.0", default-features = false }
+log = { version = "0.4", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

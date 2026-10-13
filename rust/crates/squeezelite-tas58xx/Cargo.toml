@@ -1,0 +1,15 @@
+[package]
+name = "squeezelite-tas58xx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "no_std, type-state embedded-hal driver for TI TAS5805M and TAS5825M Class-D digital amplifiers"
+
+[dependencies]
+embedded-hal = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
+embedded-hal-mock = { version = "0.11", features = ["eh1"] }

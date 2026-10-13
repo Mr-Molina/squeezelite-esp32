@@ -1,0 +1,24 @@
+[package]
+name = "louder-esp32-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Clean-slate Rust firmware application for Louder-ESP32-Plus audio streamer"
+
+[features]
+default = ["board-louder-esp32"]
+board-louder-esp32 = []
+board-louder-esp32-s3 = []
+
+[dependencies]
+squeezelite-proto = { path = "../squeezelite-proto" }
+squeezelite-audio-core = { path = "../squeezelite-audio-core" }
+squeezelite-tas58xx = { path = "../squeezelite-tas58xx" }
+squeezelite-decoders = { path = "../squeezelite-decoders" }
+squeezelite-cyd-link = { path = "../squeezelite-cyd-link" }
+heapless = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
