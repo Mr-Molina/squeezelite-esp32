@@ -1,0 +1,11 @@
+[target.xtensa-esp32-espidf]
+runner = "espflash flash --monitor"
+rustflags = ["-C", "default-linker-libraries"]
+
+[target.xtensa-esp32s3-espidf]
+runner = "espflash flash --monitor"
+rustflags = ["-C", "default-linker-libraries"]
+
+[env]
+MCU = "esp32"
+ESP_IDF_VERSION = "v5.4.1"

@@ -8,11 +8,13 @@ pub mod coordinator;
 pub mod network;
 pub mod pipeline;
 pub mod sink;
+pub mod wifi;
 
 pub use amp::{AmpManager, AmpMode};
 pub use coordinator::{PlayerCoordinator, PlayerState};
 pub use pipeline::{ActiveDecoder, StreamPipeline};
 pub use sink::{NullAudioSink, SimulatedSink};
+pub use wifi::{WifiConfig, WifiManager, WifiState};
 
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
 pub use network::{LmsDiscovery, SlimprotoClient};
