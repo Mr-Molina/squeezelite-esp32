@@ -7,6 +7,7 @@ use louder_esp32_app::board::{pins, BoardModel};
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
 use louder_esp32_app::sink::NullAudioSink;
 use louder_esp32_app::PlayerCoordinator;
+use squeezelite_config::{AudioConfig, MemConfigStore};
 use squeezelite_decoders::PcmDecoder;
 
 fn main() {
@@ -20,9 +21,9 @@ fn main() {
     println!("  - TAS58xx Power:    PWDN={}, FAULT={}", pins::TAS58XX_PWDN, pins::TAS58XX_FAULT);
     println!("--------------------------------------------------------");
 
-    // Allocate statically-sized audio stream and output buffers
-    let mut stream_storage = [0u8; 64 * 1024]; // 64 KB stream buffer
-    let mut output_storage = [0u8; 64 * 1024]; // 64 KB output buffer
+    // Allocate heap-backed audio stream and output buffers (APP-001: avoid FreeRTOS task stack overflow)
+    let mut stream_storage = vec![0u8; 64 * 1024]; // 64 KB heap stream buffer
+    let mut output_storage = vec![0u8; 64 * 1024]; // 64 KB heap output buffer
 
     // Initialize audio sink (Null sink for host / fallback, hardware I2S on target)
     let sink = NullAudioSink::new(44100);
@@ -36,19 +37,31 @@ fn main() {
         44100,
     );
 
-    // Initialize player coordinator with device MAC
-    let mac = [0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56]; // Sonocotta OUI prefix
+    // Deterministic node initialization and configuration storage (INFRA-801)
+    let mut config_store = MemConfigStore::<16>::new();
+    let mut audio_cfg = AudioConfig::default();
+    audio_cfg.player_name.clear();
+    let _ = audio_cfg.player_name.push_str(board.name());
+    let _ = audio_cfg.save_to(&mut config_store);
+
+    // Derive deterministic MAC address from Sonocotta OUI prefix (24:0A:C4) and board hardware model (INFRA-801)
+    let suffix = match board {
+        BoardModel::LouderEsp32Wrover => 0x01,
+        BoardModel::LouderEsp32PlusS3 => 0x02,
+    };
+    let mac = [0x24, 0x0A, 0xC4, 0x12, 0x34, suffix];
     let coordinator = PlayerCoordinator::new(mac, board.name());
 
     println!("Player Coordinator initialized:");
     println!("  - State:       {:?}", coordinator.state);
+    println!("  - Node Name:   {}", audio_cfg.player_name);
     println!("  - MAC Address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     println!("  - Sample Rate: {} Hz", pipeline.sample_rate);
     println!("  - Buffers:     {} bytes stream, {} bytes output", pipeline.stream_buffer_available(), pipeline.output_buffer_available());
     println!("--------------------------------------------------------");
 
     // Initialize Wi-Fi Manager and check persistent configuration
-    let wifi = louder_esp32_app::wifi::WifiManager::new();
+    let wifi = louder_esp32_app::wifi::WifiManager::with_store(config_store);
     println!("Wi-Fi Subsystem (Key-Value NVS):");
     println!("  - State:       {}", wifi.state());
     if !wifi.config.ssid.is_empty() {

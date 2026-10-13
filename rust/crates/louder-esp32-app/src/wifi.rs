@@ -7,7 +7,7 @@
 //! - Active ESP-IDF Wi-Fi STA driver on ESP32 target hardware (`target_os = "espidf"`).
 
 use core::fmt;
-use squeezelite_config::{KeyValueStorage, MemConfigStore, WifiCredentials};
+use squeezelite_config::{KeyValueStorage, MemConfigStore, StorageError, WifiCredentials};
 
 /// Wi-Fi connection status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,9 @@ pub struct WifiManager<S = MemConfigStore<32>> {
     state: WifiState,
     pub config: WifiConfig,
     store: S,
+    retry_count: u32,
+    base_backoff_ms: u32,
+    max_backoff_ms: u32,
 }
 
 impl Default for WifiManager<MemConfigStore<32>> {
@@ -73,6 +76,9 @@ impl<S: KeyValueStorage> WifiManager<S> {
             state: WifiState::Disconnected,
             config: WifiConfig::default(),
             store,
+            retry_count: 0,
+            base_backoff_ms: 500,
+            max_backoff_ms: 30000,
         };
 
         // Attempt to auto-load saved credentials from store
@@ -82,8 +88,8 @@ impl<S: KeyValueStorage> WifiManager<S> {
             mgr.config.password.clear();
             let _ = mgr.config.password.push_str(creds.passphrase.as_str());
 
-            if creds.autoconnect {
-                mgr.state = WifiState::Connected;
+            if creds.autoconnect && !creds.ssid.is_empty() {
+                mgr.state = WifiState::Connecting;
             }
         }
 
@@ -106,19 +112,52 @@ impl<S: KeyValueStorage> WifiManager<S> {
     }
 
     /// Connects to a Wi-Fi network and persists the credentials to storage.
-    pub fn connect(&mut self, ssid: &str, password: &str) -> Result<(), &'static str> {
-        self.config.ssid.clear();
-        self.config.ssid.push_str(ssid).map_err(|_| "SSID exceeds 32 bytes")?;
-        self.config.password.clear();
-        self.config.password.push_str(password).map_err(|_| "Password exceeds 64 bytes")?;
-
-        // Persist to key-value storage
-        if let Ok(creds) = WifiCredentials::new(ssid, password) {
-            let _ = creds.save_to(&mut self.store);
+    pub fn connect(&mut self, ssid: &str, password: &str) -> Result<(), StorageError> {
+        if ssid.is_empty() || ssid.len() > 32 {
+            return Err(StorageError::InvalidFormat);
+        }
+        if !password.is_empty() && !(8..=63).contains(&password.len()) {
+            return Err(StorageError::InvalidFormat);
         }
 
-        self.state = WifiState::Connected;
+        self.config.ssid.clear();
+        self.config.ssid.push_str(ssid).map_err(|_| StorageError::CapacityExceeded)?;
+        self.config.password.clear();
+        self.config.password.push_str(password).map_err(|_| StorageError::CapacityExceeded)?;
+
+        // Persist to key-value storage
+        let creds = WifiCredentials::new(ssid, password)?;
+        creds.save_to(&mut self.store)?;
+
+        self.record_success();
         Ok(())
+    }
+
+    /// Returns the exponential backoff delay in milliseconds based on consecutive failures (APP-002).
+    pub fn current_backoff_ms(&self) -> u32 {
+        if self.retry_count == 0 {
+            return 0;
+        }
+        let shift = core::cmp::min(self.retry_count - 1, 6);
+        let delay = self.base_backoff_ms.saturating_mul(1 << shift);
+        core::cmp::min(delay, self.max_backoff_ms)
+    }
+
+    /// Records a failed connection attempt and increments backoff counter.
+    pub fn record_failure(&mut self) {
+        self.state = WifiState::Failed;
+        self.retry_count = self.retry_count.saturating_add(1);
+    }
+
+    /// Records a successful connection, resetting the retry counter.
+    pub fn record_success(&mut self) {
+        self.state = WifiState::Connected;
+        self.retry_count = 0;
+    }
+
+    /// Confirms that Wi-Fi connection has been established.
+    pub fn confirm_connected(&mut self) {
+        self.record_success();
     }
 
     /// Disconnects from Wi-Fi without forgetting credentials.
@@ -127,11 +166,12 @@ impl<S: KeyValueStorage> WifiManager<S> {
     }
 
     /// Forgets saved credentials and clears them from persistent storage.
-    pub fn forget_credentials(&mut self) -> Result<(), &'static str> {
+    pub fn forget_credentials(&mut self) -> Result<(), StorageError> {
         self.config.ssid.clear();
         self.config.password.clear();
         self.state = WifiState::Disconnected;
-        WifiCredentials::clear(&mut self.store).map_err(|_| "Failed to erase credentials from store")
+        self.retry_count = 0;
+        WifiCredentials::clear(&mut self.store)
     }
 }
 
@@ -169,10 +209,14 @@ mod tests {
         // Scope 2: Simulate reboot - new WifiManager instance loading from same store
         {
             let mut wifi = WifiManager::with_store(store);
-            // Must have autoconnected from saved credentials
-            assert_eq!(wifi.state(), WifiState::Connected);
+            // Must have autoconnected from saved credentials into Connecting state
+            assert_eq!(wifi.state(), WifiState::Connecting);
             assert_eq!(wifi.config.ssid.as_str(), "Office_5G");
             assert_eq!(wifi.config.password.as_str(), "EnterprisePass123");
+
+            // Transition to connected once link is confirmed
+            wifi.confirm_connected();
+            assert_eq!(wifi.state(), WifiState::Connected);
 
             // Forget credentials
             wifi.forget_credentials().unwrap();
@@ -187,5 +231,59 @@ mod tests {
             assert_eq!(wifi.state(), WifiState::Disconnected);
             assert!(wifi.config.ssid.is_empty());
         }
+    }
+
+    #[test]
+    fn test_wifi_manager_connect_validation() {
+        let mut wifi = WifiManager::new();
+
+        // Empty SSID fails
+        assert_eq!(wifi.connect("", "ValidPass123"), Err(StorageError::InvalidFormat));
+
+        // SSID > 32 bytes fails
+        let long_ssid = "This_SSID_Is_Way_Too_Long_Because_It_Exceeds_32_Bytes!";
+        assert_eq!(wifi.connect(long_ssid, "ValidPass123"), Err(StorageError::InvalidFormat));
+
+        // Short WPA2 passphrase (1..=7 bytes) fails
+        assert_eq!(wifi.connect("ValidSSID", "short"), Err(StorageError::InvalidFormat));
+        assert_eq!(wifi.connect("ValidSSID", "1234567"), Err(StorageError::InvalidFormat));
+
+        // Long WPA2 passphrase (> 63 bytes) fails
+        let long_pass = "1234567890123456789012345678901234567890123456789012345678901234";
+        assert_eq!(wifi.connect("ValidSSID", long_pass), Err(StorageError::InvalidFormat));
+
+        // Open network (empty password) succeeds
+        assert!(wifi.connect("OpenNetwork", "").is_ok());
+
+        // Valid WPA2 passphrase (8..=63 bytes) succeeds
+        assert!(wifi.connect("SecuredNet", "validpass").is_ok());
+    }
+
+    #[test]
+    fn test_wifi_exponential_backoff() {
+        let mut wifi = WifiManager::new();
+        assert_eq!(wifi.current_backoff_ms(), 0);
+
+        wifi.record_failure();
+        assert_eq!(wifi.current_backoff_ms(), 500);
+
+        wifi.record_failure();
+        assert_eq!(wifi.current_backoff_ms(), 1000);
+
+        wifi.record_failure();
+        assert_eq!(wifi.current_backoff_ms(), 2000);
+
+        wifi.record_failure();
+        assert_eq!(wifi.current_backoff_ms(), 4000);
+
+        // Advance to max backoff
+        for _ in 0..10 {
+            wifi.record_failure();
+        }
+        assert_eq!(wifi.current_backoff_ms(), 30000);
+
+        // Success resets backoff
+        wifi.record_success();
+        assert_eq!(wifi.current_backoff_ms(), 0);
     }
 }

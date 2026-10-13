@@ -7,5 +7,5 @@ runner = "espflash flash --monitor"
 rustflags = ["-C", "default-linker-libraries"]
 
 [env]
-MCU = "esp32"
+# MCU is target-specific and selected per-target (esp32 vs esp32s3) during build
 ESP_IDF_VERSION = "v5.4.1"

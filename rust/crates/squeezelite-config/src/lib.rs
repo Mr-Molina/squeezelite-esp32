@@ -44,9 +44,8 @@ impl fmt::Display for StorageError {
     }
 }
 
-/// Standard IEEE 802.3 CRC32 checksum calculator (polynomial 0xEDB88320).
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
+/// Updates a running IEEE 802.3 CRC32 checksum accumulator (polynomial 0xEDB88320).
+pub fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
@@ -54,7 +53,12 @@ pub fn crc32(data: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    !crc
+    crc
+}
+
+/// Standard IEEE 802.3 CRC32 checksum calculator (polynomial 0xEDB88320).
+pub fn crc32(data: &[u8]) -> u32 {
+    !crc32_update(0xFFFF_FFFF, data)
 }
 
 /// Generic trait for key-value storage backends.
@@ -97,7 +101,7 @@ pub trait KeyValueStorage {
         let mut buf = [0u8; 4];
         match self.get(key, &mut buf) {
             Ok(4) => Ok(Some(u32::from_be_bytes(buf))),
-            Ok(_) => Err(StorageError::InvalidFormat),
+            Ok(_) | Err(StorageError::BufferTooSmall) => Err(StorageError::InvalidFormat),
             Err(StorageError::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
         }
@@ -113,7 +117,7 @@ pub trait KeyValueStorage {
         let mut buf = [0u8; 1];
         match self.get(key, &mut buf) {
             Ok(1) => Ok(Some(buf[0])),
-            Ok(_) => Err(StorageError::InvalidFormat),
+            Ok(_) | Err(StorageError::BufferTooSmall) => Err(StorageError::InvalidFormat),
             Err(StorageError::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
         }
@@ -238,13 +242,21 @@ pub struct FlashJournal;
 impl FlashJournal {
     pub const MAGIC: [u8; 4] = *b"SLNV"; // Squeezelite NVS
     pub const VERSION: u8 = 1;
-    pub const HEADER_SIZE: usize = 12; // 4 magic + 1 ver + 2 count + 1 rsvd + 4 crc
+    pub const HEADER_SIZE: usize = 16; // 4 magic + 1 ver + 2 count + 1 rsvd + 4 seq + 4 crc
 
-    /// Serializes all entries from `store` into `sector` with sector and per-entry CRC32.
+    /// Returns true if sequence number `a` is newer than or equal to `b`,
+    /// accounting for modular serial number wraparound.
+    #[inline]
+    pub fn is_seq_newer_or_equal(a: u32, b: u32) -> bool {
+        (a.wrapping_sub(b) as i32) >= 0
+    }
+
+    /// Serializes all entries from `store` into `sector` with sector and per-entry CRC32 using `sequence`.
     /// Returns total bytes written.
-    pub fn save_to_sector<const MAX_ENTRIES: usize>(
+    pub fn save_to_sector_with_seq<const MAX_ENTRIES: usize>(
         store: &MemConfigStore<MAX_ENTRIES>,
         sector: &mut [u8],
+        sequence: u32,
     ) -> Result<usize, StorageError> {
         if sector.len() < Self::HEADER_SIZE {
             return Err(StorageError::BufferTooSmall);
@@ -255,6 +267,7 @@ impl FlashJournal {
         sector[4] = Self::VERSION;
         sector[5..7].copy_from_slice(&(store.len() as u16).to_be_bytes());
         sector[7] = 0; // Reserved
+        sector[8..12].copy_from_slice(&sequence.to_be_bytes());
 
         let mut offset = Self::HEADER_SIZE;
 
@@ -271,10 +284,14 @@ impl FlashJournal {
             sector[offset] = key_bytes.len() as u8;
             sector[offset + 1..offset + 3].copy_from_slice(&(val_bytes.len() as u16).to_be_bytes());
 
-            // Compute entry CRC over key and val
-            let mut entry_crc_acc = crc32(key_bytes);
-            entry_crc_acc ^= crc32(val_bytes);
-            sector[offset + 3..offset + 7].copy_from_slice(&entry_crc_acc.to_be_bytes());
+            // Compute robust, non-commutative entry CRC over lengths and payload
+            let mut crc = 0xFFFF_FFFF;
+            crc = crc32_update(crc, &[key_bytes.len() as u8]);
+            crc = crc32_update(crc, &(val_bytes.len() as u16).to_be_bytes());
+            crc = crc32_update(crc, key_bytes);
+            crc = crc32_update(crc, val_bytes);
+            let entry_crc = !crc;
+            sector[offset + 3..offset + 7].copy_from_slice(&entry_crc.to_be_bytes());
 
             offset += 7;
             sector[offset..offset + key_bytes.len()].copy_from_slice(key_bytes);
@@ -283,40 +300,37 @@ impl FlashJournal {
             offset += val_bytes.len();
         }
 
-        // Sector CRC over header (0..8) combined with payload bytes (HEADER_SIZE..offset)
-        let header_crc = crc32(&sector[0..8]);
-        let payload_crc = crc32(&sector[Self::HEADER_SIZE..offset]);
-        let sector_crc = header_crc ^ payload_crc;
-        sector[8..12].copy_from_slice(&sector_crc.to_be_bytes());
+        // Sector CRC over header (0..12) combined with payload bytes (HEADER_SIZE..offset)
+        let mut crc = 0xFFFF_FFFF;
+        crc = crc32_update(crc, &sector[0..12]);
+        crc = crc32_update(crc, &sector[Self::HEADER_SIZE..offset]);
+        let sector_crc = !crc;
+        sector[12..16].copy_from_slice(&sector_crc.to_be_bytes());
 
         Ok(offset)
     }
 
-    /// Deserializes entries from `sector` into `store` after validating CRCs.
-    /// Returns total entries restored.
-    pub fn load_from_sector<const MAX_ENTRIES: usize>(
-        sector: &[u8],
-        store: &mut MemConfigStore<MAX_ENTRIES>,
+    /// Serializes all entries from `store` into a single `sector` with default sequence 1.
+    pub fn save_to_sector<const MAX_ENTRIES: usize>(
+        store: &MemConfigStore<MAX_ENTRIES>,
+        sector: &mut [u8],
     ) -> Result<usize, StorageError> {
+        Self::save_to_sector_with_seq(store, sector, 1)
+    }
+
+    /// Reads and validates sector metadata (sequence, entry_count, data_len) without mutating store.
+    pub fn read_sector_meta(sector: &[u8]) -> Result<(u32, usize, usize), StorageError> {
         if sector.len() < Self::HEADER_SIZE {
-            return Err(StorageError::InvalidFormat);
+            return Err(StorageError::BufferTooSmall);
         }
 
-        if sector[0..4] != Self::MAGIC {
+        if sector[0..4] != Self::MAGIC || sector[4] != Self::VERSION || sector[7] != 0 {
             return Err(StorageError::InvalidFormat);
-        }
-
-        let version = sector[4];
-        if version != Self::VERSION {
-            return Err(StorageError::InvalidFormat);
-        }
-
-        if sector[7] != 0 {
-            return Err(StorageError::CorruptedData);
         }
 
         let entry_count = u16::from_be_bytes([sector[5], sector[6]]) as usize;
-        let expected_sector_crc = u32::from_be_bytes([sector[8], sector[9], sector[10], sector[11]]);
+        let sequence = u32::from_be_bytes([sector[8], sector[9], sector[10], sector[11]]);
+        let expected_sector_crc = u32::from_be_bytes([sector[12], sector[13], sector[14], sector[15]]);
 
         // First pass: validate entry structure and find total data length
         let mut offset = Self::HEADER_SIZE;
@@ -326,6 +340,9 @@ impl FlashJournal {
             }
             let key_len = sector[offset] as usize;
             let val_len = u16::from_be_bytes([sector[offset + 1], sector[offset + 2]]) as usize;
+            if key_len == 0 || key_len > 32 || val_len > 128 {
+                return Err(StorageError::InvalidFormat);
+            }
             offset += 7;
 
             if offset + key_len + val_len > sector.len() {
@@ -335,15 +352,29 @@ impl FlashJournal {
         }
 
         // Verify sector CRC over header and payload
-        let actual_header_crc = crc32(&sector[0..8]);
-        let actual_payload_crc = crc32(&sector[Self::HEADER_SIZE..offset]);
-        let actual_sector_crc = actual_header_crc ^ actual_payload_crc;
-        if actual_sector_crc != expected_sector_crc {
+        let mut crc = 0xFFFF_FFFF;
+        crc = crc32_update(crc, &sector[0..12]);
+        crc = crc32_update(crc, &sector[Self::HEADER_SIZE..offset]);
+        if !crc != expected_sector_crc {
             return Err(StorageError::CorruptedData);
         }
 
-        // Second pass: unpack entries and verify per-entry CRC
-        store.clear();
+        Ok((sequence, entry_count, offset))
+    }
+
+    /// Deserializes entries from `sector` into `store` after validating CRCs.
+    /// Uses temporary staging to avoid wiping `store` on partial failure (non-destructive).
+    pub fn load_from_sector<const MAX_ENTRIES: usize>(
+        sector: &[u8],
+        store: &mut MemConfigStore<MAX_ENTRIES>,
+    ) -> Result<usize, StorageError> {
+        let (_sequence, entry_count, data_len) = Self::read_sector_meta(sector)?;
+
+        if entry_count > MAX_ENTRIES {
+            return Err(StorageError::CapacityExceeded);
+        }
+
+        let mut staging = MemConfigStore::<MAX_ENTRIES>::new();
         let mut read_offset = Self::HEADER_SIZE;
         for _ in 0..entry_count {
             let key_len = sector[read_offset] as usize;
@@ -361,23 +392,95 @@ impl FlashJournal {
             let val_slice = &sector[read_offset..read_offset + val_len];
             read_offset += val_len;
 
-            let mut actual_entry_crc = crc32(key_slice);
-            actual_entry_crc ^= crc32(val_slice);
+            let mut crc = 0xFFFF_FFFF;
+            crc = crc32_update(crc, &[key_len as u8]);
+            crc = crc32_update(crc, &(val_len as u16).to_be_bytes());
+            crc = crc32_update(crc, key_slice);
+            crc = crc32_update(crc, val_slice);
 
-            if actual_entry_crc != expected_entry_crc {
+            if !crc != expected_entry_crc {
                 return Err(StorageError::CorruptedData);
             }
 
             let key_str = core::str::from_utf8(key_slice).map_err(|_| StorageError::InvalidUtf8)?;
-            store.set(key_str, val_slice)?;
+            if staging.contains(key_str) {
+                return Err(StorageError::InvalidFormat);
+            }
+            staging.set(key_str, val_slice)?;
         }
 
+        if read_offset != data_len {
+            return Err(StorageError::InvalidFormat);
+        }
+
+        // Commit all entries atomically into destination store
+        *store = staging;
         Ok(entry_count)
+    }
+
+    /// Loads configuration from dual ping-pong sectors (A/B), selecting the valid sector with
+    /// the newest sequence counter. Provides power-loss resilience.
+    pub fn load_from_dual_sectors<const MAX_ENTRIES: usize>(
+        sector_a: &[u8],
+        sector_b: &[u8],
+        store: &mut MemConfigStore<MAX_ENTRIES>,
+    ) -> Result<usize, StorageError> {
+        let meta_a = Self::read_sector_meta(sector_a);
+        let meta_b = Self::read_sector_meta(sector_b);
+
+        match (meta_a, meta_b) {
+            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
+                let (primary, fallback) = if Self::is_seq_newer_or_equal(seq_a, seq_b) {
+                    (sector_a, sector_b)
+                } else {
+                    (sector_b, sector_a)
+                };
+                match Self::load_from_sector(primary, store) {
+                    Ok(count) => Ok(count),
+                    Err(_) => Self::load_from_sector(fallback, store),
+                }
+            }
+            (Ok(_), Err(_)) => Self::load_from_sector(sector_a, store),
+            (Err(_), Ok(_)) => Self::load_from_sector(sector_b, store),
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+
+    /// Saves configuration to the alternate ping-pong sector with an incremented sequence counter.
+    /// Returns a tuple of `(wrote_to_b: bool, bytes_written: usize)`.
+    pub fn save_to_dual_sectors<const MAX_ENTRIES: usize>(
+        store: &MemConfigStore<MAX_ENTRIES>,
+        sector_a: &mut [u8],
+        sector_b: &mut [u8],
+    ) -> Result<(bool, usize), StorageError> {
+        let meta_a = Self::read_sector_meta(sector_a);
+        let meta_b = Self::read_sector_meta(sector_b);
+
+        let (write_to_b, next_seq) = match (meta_a, meta_b) {
+            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
+                if Self::is_seq_newer_or_equal(seq_a, seq_b) {
+                    (true, seq_a.wrapping_add(1))
+                } else {
+                    (false, seq_b.wrapping_add(1))
+                }
+            }
+            (Ok((seq_a, _, _)), Err(_)) => (true, seq_a.wrapping_add(1)),
+            (Err(_), Ok((seq_b, _, _))) => (false, seq_b.wrapping_add(1)),
+            (Err(_), Err(_)) => (false, 1),
+        };
+
+        if write_to_b {
+            let n = Self::save_to_sector_with_seq(store, sector_b, next_seq)?;
+            Ok((true, n))
+        } else {
+            let n = Self::save_to_sector_with_seq(store, sector_a, next_seq)?;
+            Ok((false, n))
+        }
     }
 }
 
 /// Strongly typed Wi-Fi station credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WifiCredentials {
     pub ssid: String<32>,
     pub passphrase: String<64>,
@@ -386,6 +489,20 @@ pub struct WifiCredentials {
     pub gateway: Option<[u8; 4]>,
     pub subnet: Option<[u8; 4]>,
     pub dns: Option<[u8; 4]>,
+}
+
+impl core::fmt::Debug for WifiCredentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WifiCredentials")
+            .field("ssid", &self.ssid)
+            .field("passphrase", &"[REDACTED]")
+            .field("autoconnect", &self.autoconnect)
+            .field("static_ip", &self.static_ip)
+            .field("gateway", &self.gateway)
+            .field("subnet", &self.subnet)
+            .field("dns", &self.dns)
+            .finish()
+    }
 }
 
 impl WifiCredentials {
@@ -412,6 +529,26 @@ impl WifiCredentials {
             subnet: None,
             dns: None,
         })
+    }
+
+    /// Validates Wi-Fi configuration invariants.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if let Some(ip) = self.static_ip {
+            if ip == [0, 0, 0, 0] || ip == [255, 255, 255, 255] {
+                return Err(StorageError::InvalidFormat);
+            }
+        }
+        if let Some(gw) = self.gateway {
+            if gw == [0, 0, 0, 0] || gw == [255, 255, 255, 255] {
+                return Err(StorageError::InvalidFormat);
+            }
+        }
+        if let Some(mask) = self.subnet {
+            if mask == [0, 0, 0, 0] {
+                return Err(StorageError::InvalidFormat);
+            }
+        }
+        Ok(())
     }
 
     /// Saves Wi-Fi credentials into `store`.
@@ -517,7 +654,27 @@ impl AudioConfig {
     pub const KEY_VOL: &'static str = "audio.vol";
     pub const KEY_EQ: &'static str = "audio.eq";
 
+    /// Validates player audio configuration invariants.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.player_name.is_empty() {
+            return Err(StorageError::InvalidFormat);
+        }
+        if self.volume > 100 {
+            return Err(StorageError::InvalidFormat);
+        }
+        if self.lms_server_port == Some(0) {
+            return Err(StorageError::InvalidFormat);
+        }
+        if let Some(ip) = self.lms_server_ip {
+            if ip == [0, 0, 0, 0] || ip == [255, 255, 255, 255] {
+                return Err(StorageError::InvalidFormat);
+            }
+        }
+        Ok(())
+    }
+
     pub fn save_to<S: KeyValueStorage>(&self, store: &mut S) -> Result<(), StorageError> {
+        self.validate()?;
         store.set_str(Self::KEY_NAME, self.player_name.as_str())?;
         store.set_u8(Self::KEY_VOL, self.volume)?;
         store.set_u8(Self::KEY_EQ, self.equalizer_preset)?;
@@ -555,9 +712,11 @@ impl AudioConfig {
         config.lms_server_ip = read_ip_opt(store, Self::KEY_LMS_IP)?;
 
         if let Some(port) = store.get_u32(Self::KEY_LMS_PORT)? {
-            config.lms_server_port = Some(port as u16);
+            let port_u16 = u16::try_from(port).map_err(|_| StorageError::InvalidFormat)?;
+            config.lms_server_port = Some(port_u16);
         }
 
+        config.validate()?;
         Ok(config)
     }
 }
@@ -566,7 +725,7 @@ fn read_ip_opt<S: KeyValueStorage>(store: &S, key: &str) -> Result<Option<[u8; 4
     let mut buf = [0u8; 4];
     match store.get(key, &mut buf) {
         Ok(4) => Ok(Some(buf)),
-        Ok(_) => Err(StorageError::InvalidFormat),
+        Ok(_) | Err(StorageError::BufferTooSmall) => Err(StorageError::InvalidFormat),
         Err(StorageError::KeyNotFound) => Ok(None),
         Err(e) => Err(e),
     }
@@ -574,6 +733,8 @@ fn read_ip_opt<S: KeyValueStorage>(store: &S, key: &str) -> Result<Option<[u8; 4
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::format;
     use super::*;
 
     #[test]
@@ -652,5 +813,161 @@ mod tests {
         let mut restored_store = MemConfigStore::<16>::new();
         let res = FlashJournal::load_from_sector(&sector[..bytes_written], &mut restored_store);
         assert_eq!(res, Err(StorageError::CorruptedData));
+    }
+
+    #[test]
+    fn test_wifi_credentials_debug_masks_passphrase() {
+        let creds = WifiCredentials::new("GuestWiFi", "SuperSecretPass").unwrap();
+        let formatted = format!("{:?}", creds);
+        assert!(formatted.contains("[REDACTED]"));
+        assert!(!formatted.contains("SuperSecretPass"));
+    }
+
+    #[test]
+    fn test_dual_sector_ping_pong_power_cut_resilience() {
+        let mut store = MemConfigStore::<16>::new();
+        store.set_str("setting.k1", "v1").unwrap();
+
+        let mut sector_a = [0u8; 512];
+        let mut sector_b = [0u8; 512];
+
+        // First write -> goes to sector A (sequence 1)
+        let (wrote_b, n1) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        assert!(!wrote_b);
+        assert!(n1 > FlashJournal::HEADER_SIZE);
+
+        // Second write -> goes to sector B (sequence 2)
+        store.set_str("setting.k1", "v2").unwrap();
+        let (wrote_b2, n2) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        assert!(wrote_b2);
+        assert!(n2 > FlashJournal::HEADER_SIZE);
+
+        // Load selects sector B (seq 2 > seq 1)
+        let mut loaded = MemConfigStore::<16>::new();
+        FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut loaded).unwrap();
+        assert_eq!(loaded.get_str::<32>("setting.k1").unwrap().unwrap().as_str(), "v2");
+
+        // Simulate power cut during write to B by corrupting sector B
+        sector_b[FlashJournal::HEADER_SIZE + 2] ^= 0xFF;
+
+        // Fallback loads cleanly from intact sector A (v1)
+        let mut fallback = MemConfigStore::<16>::new();
+        FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut fallback).unwrap();
+        assert_eq!(fallback.get_str::<32>("setting.k1").unwrap().unwrap().as_str(), "v1");
+    }
+
+    #[test]
+    fn test_non_destructive_load_on_corruption() {
+        let mut store = MemConfigStore::<16>::new();
+        store.set_str("existing", "preserved").unwrap();
+
+        let mut bad_sector = [0u8; 256];
+        bad_sector[0..4].copy_from_slice(b"SLNV");
+        bad_sector[4] = 1;
+        bad_sector[5..7].copy_from_slice(&1u16.to_be_bytes()); // 1 entry
+        bad_sector[8..12].copy_from_slice(&1u32.to_be_bytes()); // seq 1
+        // Bad CRC
+        bad_sector[12..16].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+
+        let res = FlashJournal::load_from_sector(&bad_sector, &mut store);
+        assert!(res.is_err());
+        // Store must NOT have been cleared!
+        assert_eq!(store.get_str::<32>("existing").unwrap().unwrap().as_str(), "preserved");
+    }
+
+    #[test]
+    fn test_sequence_number_wraparound_logic() {
+        assert!(FlashJournal::is_seq_newer_or_equal(0, u32::MAX));
+        assert!(!FlashJournal::is_seq_newer_or_equal(u32::MAX, 0));
+        assert!(FlashJournal::is_seq_newer_or_equal(5, 5));
+        assert!(FlashJournal::is_seq_newer_or_equal(10, 5));
+        assert!(!FlashJournal::is_seq_newer_or_equal(5, 10));
+        assert!(FlashJournal::is_seq_newer_or_equal(1, 0));
+    }
+
+    #[test]
+    fn test_scalar_accessor_error_mapping() {
+        let mut store = MemConfigStore::<16>::new();
+        // Store 5 bytes under u32 key -> get_u32 must return InvalidFormat (BufferTooSmall mapped)
+        store.set("bad.u32", &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(store.get_u32("bad.u32"), Err(StorageError::InvalidFormat));
+
+        // Store 3 bytes under u32 key -> get_u32 must return InvalidFormat
+        store.set("short.u32", &[1, 2, 3]).unwrap();
+        assert_eq!(store.get_u32("short.u32"), Err(StorageError::InvalidFormat));
+
+        // Store 2 bytes under u8 key -> get_u8 must return InvalidFormat
+        store.set("bad.u8", &[1, 2]).unwrap();
+        assert_eq!(store.get_u8("bad.u8"), Err(StorageError::InvalidFormat));
+
+        // Store 5 bytes under IP key -> read_ip_opt must return InvalidFormat
+        store.set("bad.ip", &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(read_ip_opt(&store, "bad.ip"), Err(StorageError::InvalidFormat));
+
+        // Store 3 bytes under IP key -> read_ip_opt must return InvalidFormat
+        store.set("short.ip", &[1, 2, 3]).unwrap();
+        assert_eq!(read_ip_opt(&store, "short.ip"), Err(StorageError::InvalidFormat));
+    }
+
+    #[test]
+    fn test_audio_config_validation() {
+        let mut valid_config = AudioConfig::default();
+        assert!(valid_config.validate().is_ok());
+
+        // Volume > 100 invalid
+        valid_config.volume = 101;
+        assert_eq!(valid_config.validate(), Err(StorageError::InvalidFormat));
+        valid_config.volume = 100;
+        assert!(valid_config.validate().is_ok());
+
+        // Empty player name invalid
+        valid_config.player_name.clear();
+        assert_eq!(valid_config.validate(), Err(StorageError::InvalidFormat));
+        valid_config.player_name.push_str("ValidPlayer").unwrap();
+        assert!(valid_config.validate().is_ok());
+
+        // Port == 0 invalid
+        valid_config.lms_server_port = Some(0);
+        assert_eq!(valid_config.validate(), Err(StorageError::InvalidFormat));
+        valid_config.lms_server_port = Some(9000);
+        assert!(valid_config.validate().is_ok());
+
+        // IP [0,0,0,0] or [255,255,255,255] invalid
+        valid_config.lms_server_ip = Some([0, 0, 0, 0]);
+        assert_eq!(valid_config.validate(), Err(StorageError::InvalidFormat));
+        valid_config.lms_server_ip = Some([255, 255, 255, 255]);
+        assert_eq!(valid_config.validate(), Err(StorageError::InvalidFormat));
+        valid_config.lms_server_ip = Some([192, 168, 1, 50]);
+        assert!(valid_config.validate().is_ok());
+
+        // AudioConfig save_to validates config
+        let mut store = MemConfigStore::<16>::new();
+        valid_config.volume = 105;
+        assert_eq!(valid_config.save_to(&mut store), Err(StorageError::InvalidFormat));
+    }
+
+    #[test]
+    fn test_wifi_credentials_validation() {
+        let mut creds = WifiCredentials::new("SSID", "PASS").unwrap();
+        assert!(creds.validate().is_ok());
+
+        creds.static_ip = Some([0, 0, 0, 0]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.static_ip = Some([255, 255, 255, 255]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.static_ip = Some([192, 168, 1, 10]);
+        assert!(creds.validate().is_ok());
+
+        creds.gateway = Some([0, 0, 0, 0]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.gateway = Some([255, 255, 255, 255]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.gateway = Some([192, 168, 1, 1]);
+        assert!(creds.validate().is_ok());
+
+        creds.subnet = Some([0, 0, 0, 0]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.subnet = Some([255, 255, 255, 0]);
+        assert!(creds.validate().is_ok());
     }
 }

@@ -28,16 +28,13 @@ impl LmsDiscovery {
         // Broadcast to port 3483
         socket.send_to(&query[..qlen], "255.255.255.255:3483")?;
 
-        let mut buf = [0u8; 128];
-        let (bytes_read, src_addr) = socket.recv_from(&mut buf)?;
+        let mut resp_buf = [0u8; 512];
+        loop {
+            let (bytes_read, src_addr) = socket.recv_from(&mut resp_buf)?;
 
-        if let Some(server) = DiscoveryParser::parse_response(&buf[..bytes_read]) {
-            Ok((src_addr, server))
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Unrecognized discovery response",
-            ))
+            if let Some(server) = DiscoveryParser::parse_response(&resp_buf[..bytes_read]) {
+                return Ok((src_addr, server));
+            }
         }
     }
 }
@@ -47,6 +44,7 @@ pub struct SlimprotoClient {
     stream: TcpStream,
     mac: [u8; 6],
     model: &'static str,
+    acc_buf: Vec<u8>,
 }
 
 impl SlimprotoClient {
@@ -54,6 +52,9 @@ impl SlimprotoClient {
     pub fn connect(server_addr: SocketAddr, mac: [u8; 6], model: &'static str) -> std::io::Result<Self> {
         let mut stream = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))?;
         stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_nonblocking(true)?;
 
         // Build and send initial HELO packet
         let mut helo_buf = [0u8; 256];
@@ -63,7 +64,12 @@ impl SlimprotoClient {
 
         stream.write_all(&helo_buf[..helo_len])?;
 
-        Ok(Self { stream, mac, model })
+        Ok(Self {
+            stream,
+            mac,
+            model,
+            acc_buf: Vec::with_capacity(8192),
+        })
     }
 
     /// Returns the player MAC address.
@@ -85,7 +91,7 @@ impl SlimprotoClient {
         frames_played: u32,
         timestamp_ms: u32,
     ) -> std::io::Result<()> {
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 64];
         let len = SlimprotoBuilder::build_stat(
             event,
             stream_buf_fullness,
@@ -99,22 +105,101 @@ impl SlimprotoClient {
         self.stream.write_all(&buf[..len])
     }
 
-    /// Reads from the socket and attempts to parse a complete server command.
-    pub fn poll_command<'a>(&mut self, rx_buf: &'a mut [u8]) -> std::io::Result<Option<ServerCommand<'a>>> {
-        let bytes_read = match self.stream.read(rx_buf) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Server disconnected")),
-            Ok(n) => n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                return Ok(None)
+    /// Inspects the frame header in the buffer to determine expected frame length without borrowing scratch.
+    fn peek_frame_len(buf: &[u8]) -> Result<usize, ParseError> {
+        if buf.len() < 6 {
+            return Err(ParseError::BufferTooShort);
+        }
+
+        if !buf[0].is_ascii_alphabetic() && buf[2..6].iter().all(|b| b.is_ascii_alphabetic()) {
+            let length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+            if length < 4 {
+                return Err(ParseError::InvalidFormat);
             }
-            Err(e) => return Err(e),
+            if length - 4 > SlimprotoParser::MAX_FRAME_LENGTH {
+                return Err(ParseError::PayloadTooLarge);
+            }
+            2usize.checked_add(length).ok_or(ParseError::PayloadTooLarge)
+        } else {
+            if buf.len() < 8 {
+                return Err(ParseError::BufferTooShort);
+            }
+            let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+            if length > SlimprotoParser::MAX_FRAME_LENGTH {
+                return Err(ParseError::PayloadTooLarge);
+            }
+            8usize.checked_add(length).ok_or(ParseError::PayloadTooLarge)
+        }
+    }
+
+    /// Polls the network stream, accumulating incoming TCP chunks,
+    /// and parses the next available Slimproto frame (PROTO-001, PROTO-002).
+    ///
+    /// Copies the active frame into `scratch` so that `ServerCommand<'a>` borrows
+    /// from `scratch` rather than `self`, avoiding borrow-checker contention.
+    pub fn poll_command<'a>(&mut self, scratch: &'a mut [u8]) -> std::io::Result<Option<ServerCommand<'a>>> {
+        const MAX_ACC_BUF: usize = 8192;
+
+        // 1. If self.acc_buf does not yet have a complete frame, read available bytes from self.stream
+        let has_complete_frame = match Self::peek_frame_len(&self.acc_buf) {
+            Ok(len) => self.acc_buf.len() >= len,
+            Err(_) => false,
         };
 
-        match SlimprotoParser::parse_frame(&rx_buf[..bytes_read]) {
-            Ok((cmd, _consumed)) => Ok(Some(cmd)),
-            Err(ParseError::BufferTooShort) => Ok(None),
-            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed frame")),
+        if !has_complete_frame {
+            let mut temp_buf = [0u8; 1024];
+            match self.stream.read(&mut temp_buf) {
+                Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Server disconnected")),
+                Ok(n) => {
+                    if self.acc_buf.len() + n > MAX_ACC_BUF {
+                        self.acc_buf.clear();
+                        return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Accumulation buffer overflow"));
+                    }
+                    self.acc_buf.extend_from_slice(&temp_buf[..n]);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Non-blocking would block or timed out
+                }
+                Err(e) => return Err(e),
+            }
         }
+
+        if self.acc_buf.is_empty() {
+            return Ok(None);
+        }
+
+        // 2. Determine frame length from self.acc_buf
+        let consumed = match Self::peek_frame_len(&self.acc_buf) {
+            Ok(len) => {
+                if self.acc_buf.len() < len {
+                    return Ok(None);
+                }
+                len
+            }
+            Err(ParseError::BufferTooShort) => return Ok(None),
+            Err(_) => {
+                self.acc_buf.clear();
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed frame"));
+            }
+        };
+
+        // If scratch buffer is too small, drain the oversized frame FIRST to unwedge
+        if scratch.len() < consumed {
+            self.acc_buf.drain(..consumed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Scratch buffer too small for frame",
+            ));
+        }
+
+        // Copy active frame into scratch and drain from accumulation buffer
+        scratch[..consumed].copy_from_slice(&self.acc_buf[..consumed]);
+        self.acc_buf.drain(..consumed);
+
+        // Single parse site at the end!
+        let (cmd, _) = SlimprotoParser::parse_frame(&scratch[..consumed])
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed frame"))?;
+        Ok(Some(cmd))
     }
 }
 
@@ -133,6 +218,7 @@ mod tests {
         // Spawn client thread
         let handle = std::thread::spawn(move || {
             let mut client = SlimprotoClient::connect(server_addr, mac, "TestModel").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
             client
                 .send_stat(StatEvent::Heartbeat, 1000, 2000, 44100, 500)
                 .unwrap();
@@ -148,11 +234,104 @@ mod tests {
         assert_eq!(&buf[0..4], b"HELO");
         assert_eq!(&buf[10..16], &mac);
 
-        // 2. Read STAT packet
+        // 2. Read STAT packet (61 bytes: 8 header + 53 payload)
         let n2 = server_stream.read(&mut buf).unwrap();
-        assert_eq!(n2, 28);
+        assert_eq!(n2, 61);
         assert_eq!(&buf[0..4], b"STAT");
         assert_eq!(&buf[8..12], b"STMt");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_slimproto_client_partial_reads_and_multi_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+        let handle = std::thread::spawn(move || {
+            let mut client = SlimprotoClient::connect(server_addr, mac, "TestModel").unwrap();
+            let mut scratch = [0u8; 1024];
+
+            // 1. First poll with partial data should yield None
+            let cmd1 = client.poll_command(&mut scratch).unwrap();
+            assert!(cmd1.is_none());
+
+            // Give server thread time to send second chunk
+            std::thread::sleep(Duration::from_millis(100));
+
+            // 2. Second poll after completion of frame should yield Flush
+            let cmd2 = client.poll_command(&mut scratch).unwrap();
+            assert_eq!(cmd2, Some(ServerCommand::Flush));
+
+            // 3. Third poll should yield the second concatenated frame (Flush) from buffer
+            let cmd3 = client.poll_command(&mut scratch).unwrap();
+            assert_eq!(cmd3, Some(ServerCommand::Flush));
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 128];
+        let _ = server_stream.read(&mut buf).unwrap(); // Consume HELO
+
+        // Send half of a flsh frame (flsh packet is 4 bytes "flsh" + 4 bytes length 0)
+        let flsh_frame = [b'f', b'l', b's', b'h', 0, 0, 0, 0];
+        server_stream.write_all(&flsh_frame[..4]).unwrap();
+
+        // Give client thread time to poll partial
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Send second half + another full flsh frame concatenated
+        let mut second_chunk = Vec::new();
+        second_chunk.extend_from_slice(&flsh_frame[4..]); // Complete first frame
+        second_chunk.extend_from_slice(&flsh_frame);       // Second concatenated frame
+        server_stream.write_all(&second_chunk).unwrap();
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_slimproto_client_recovery_when_scratch_too_small() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x77];
+
+        let handle = std::thread::spawn(move || {
+            let mut client = SlimprotoClient::connect(server_addr, mac, "TestModel").unwrap();
+
+            // Give server time to send data
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Scratch buffer of 16 bytes is too small for a 26-byte audg frame
+            let mut small_scratch = [0u8; 16];
+            let err = client.poll_command(&mut small_scratch).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.to_string(), "Scratch buffer too small for frame");
+
+            // Following frame is an 8-byte flsh frame, which should now be recoverable!
+            let cmd = client.poll_command(&mut small_scratch).unwrap();
+            assert_eq!(cmd, Some(ServerCommand::Flush));
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 128];
+        let _ = server_stream.read(&mut buf).unwrap(); // Consume HELO
+
+        // Prepare a 26-byte audg frame followed by an 8-byte flsh frame
+        let mut audg_frame = [0u8; 26];
+        audg_frame[0..4].copy_from_slice(b"audg");
+        audg_frame[4..8].copy_from_slice(&18u32.to_be_bytes()); // length = 18
+        audg_frame[16] = 255;
+        audg_frame[18..22].copy_from_slice(&0x00010000u32.to_be_bytes());
+        audg_frame[22..26].copy_from_slice(&0x00010000u32.to_be_bytes());
+
+        let flsh_frame = [b'f', b'l', b's', b'h', 0, 0, 0, 0];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&audg_frame);
+        data.extend_from_slice(&flsh_frame);
+        server_stream.write_all(&data).unwrap();
 
         handle.join().unwrap();
     }

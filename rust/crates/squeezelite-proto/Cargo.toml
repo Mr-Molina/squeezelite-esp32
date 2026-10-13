@@ -7,8 +7,6 @@ authors.workspace = true
 description = "no_std, zero-allocation SlimProto protocol engine for Logitech Media Server"
 
 [dependencies]
-heapless = { workspace = true }
-thiserror = { workspace = true }
 log = { workspace = true, optional = true }
 
 [dev-dependencies]

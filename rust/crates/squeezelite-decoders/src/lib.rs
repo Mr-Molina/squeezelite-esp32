@@ -2,26 +2,53 @@
 //!
 //! Pure-Rust audio decoding pipeline for squeezelite-esp32:
 //! - Defines unified `AudioDecoder` trait
-//! - High-speed zero-copy `PcmDecoder`
-//! - Extensible frame routing and sample normalization
+//! - Zero-copy `PcmDecoder` with mono channel duplication and multi-depth PCM
+//! - Heap-isolated `Mp3Decoder` using nanomp3-core (zero task stack explosion)
+//! - Stateful streaming `FlacDecoder` using claxon
+//! - ADTS/AAC decoder using syom with exact byte consumption
+//! - Ogg/Vorbis decoder using lewton with header/audio packet differentiation
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(feature = "std")]
+use std::boxed::Box;
+#[cfg(feature = "std")]
+use std::vec;
+
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+
+#[cfg(not(feature = "std"))]
 use core::fmt;
+
+/// Maximum stream buffer size for compressed audio decoders (FLAC, Vorbis) (PERF-201).
+pub const MAX_STREAM_BUF: usize = 65536;
 
 /// Unified Audio Decoder Error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(thiserror::Error))]
 pub enum DecoderError {
+    #[cfg_attr(feature = "std", error("Input buffer needs more encoded bytes"))]
     NeedMoreData,
+    #[cfg_attr(feature = "std", error("Audio stream header is invalid"))]
     InvalidHeader,
+    #[cfg_attr(feature = "std", error("Corrupted audio frame detected"))]
     CorruptedFrame,
+    #[cfg_attr(feature = "std", error("Unsupported sample depth or channels"))]
     UnsupportedSampleFormat,
+    #[cfg_attr(feature = "std", error("Target PCM buffer too small for decoded frame"))]
     BufferOverflow,
 }
 
+#[cfg(not(feature = "std"))]
 impl fmt::Display for DecoderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -49,7 +76,7 @@ pub trait AudioDecoder {
     fn flush(&mut self);
 }
 
-/// PCM Passthrough Decoder (16-bit / 24-bit / 32-bit, Big or Little Endian).
+/// PCM Passthrough Decoder (16-bit / 24-bit / 32-bit, Big or Little Endian, Mono or Stereo).
 pub struct PcmDecoder {
     pub bits_per_sample: u8,
     pub channels: u8,
@@ -73,26 +100,50 @@ impl AudioDecoder for PcmDecoder {
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
         let bytes_per_sample = match self.bits_per_sample {
+            8 => 1,
             16 => 2,
             24 => 3,
             32 => 4,
             _ => return Err(DecoderError::UnsupportedSampleFormat),
         };
 
-        let bytes_per_frame = bytes_per_sample * self.channels as usize;
-        if bytes_per_frame == 0 {
+        if self.channels != 1 && self.channels != 2 {
             return Err(DecoderError::UnsupportedSampleFormat);
         }
 
-        let max_frames = pcm_out.len() / self.channels as usize;
-        let available_frames = encoded_in.len() / bytes_per_frame;
-        let frames_to_decode = core::cmp::min(max_frames, available_frames);
+        let bytes_per_frame = bytes_per_sample * self.channels as usize;
+        let max_output_frames = pcm_out.len() / 2; // Always stereo interleaved output
+        if max_output_frames == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
 
-        if frames_to_decode == 0 {
+        let available_frames = encoded_in.len() / bytes_per_frame;
+        if available_frames == 0 {
             return Err(DecoderError::NeedMoreData);
         }
 
+        let frames_to_decode = core::cmp::min(max_output_frames, available_frames);
+
         match (self.bits_per_sample, self.big_endian, self.channels) {
+            // 8-bit Stereo (unsigned PCM centered at 128)
+            (8, _, 2) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 2;
+                    let l = ((encoded_in[off] as i32) - 128) << 24;
+                    let r = ((encoded_in[off + 1] as i32) - 128) << 24;
+                    pcm_out[i * 2] = l;
+                    pcm_out[i * 2 + 1] = r;
+                }
+            }
+            // 8-bit Mono (unsigned PCM centered at 128, duplicated to stereo)
+            (8, _, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i;
+                    let s = ((encoded_in[off] as i32) - 128) << 24;
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
             // 16-bit Stereo Big-Endian (Common Squeezebox PCM format)
             (16, true, 2) => {
                 for i in 0..frames_to_decode {
@@ -103,6 +154,15 @@ impl AudioDecoder for PcmDecoder {
                     pcm_out[i * 2 + 1] = r << 16;
                 }
             }
+            // 16-bit Mono Big-Endian (DEC-010: Mono duplication)
+            (16, true, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 2;
+                    let s = (i16::from_be_bytes([encoded_in[off], encoded_in[off + 1]]) as i32) << 16;
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
             // 16-bit Stereo Little-Endian
             (16, false, 2) => {
                 for i in 0..frames_to_decode {
@@ -111,6 +171,15 @@ impl AudioDecoder for PcmDecoder {
                     let r = i16::from_le_bytes([encoded_in[off + 2], encoded_in[off + 3]]) as i32;
                     pcm_out[i * 2] = l << 16;
                     pcm_out[i * 2 + 1] = r << 16;
+                }
+            }
+            // 16-bit Mono Little-Endian (DEC-010)
+            (16, false, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 2;
+                    let s = (i16::from_le_bytes([encoded_in[off], encoded_in[off + 1]]) as i32) << 16;
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
                 }
             }
             // 24-bit Stereo Big-Endian
@@ -125,6 +194,42 @@ impl AudioDecoder for PcmDecoder {
                         | ((encoded_in[off + 5] as i32) << 8);
                     pcm_out[i * 2] = l;
                     pcm_out[i * 2 + 1] = r;
+                }
+            }
+            // 24-bit Mono Big-Endian (DEC-010)
+            (24, true, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 3;
+                    let s = ((encoded_in[off] as i32) << 24)
+                        | ((encoded_in[off + 1] as i32) << 16)
+                        | ((encoded_in[off + 2] as i32) << 8);
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
+            // 24-bit Stereo Little-Endian
+            (24, false, 2) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 6;
+                    let l = ((encoded_in[off] as i32) << 8)
+                        | ((encoded_in[off + 1] as i32) << 16)
+                        | ((encoded_in[off + 2] as i32) << 24);
+                    let r = ((encoded_in[off + 3] as i32) << 8)
+                        | ((encoded_in[off + 4] as i32) << 16)
+                        | ((encoded_in[off + 5] as i32) << 24);
+                    pcm_out[i * 2] = l;
+                    pcm_out[i * 2 + 1] = r;
+                }
+            }
+            // 24-bit Mono Little-Endian (DEC-010)
+            (24, false, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 3;
+                    let s = ((encoded_in[off] as i32) << 8)
+                        | ((encoded_in[off + 1] as i32) << 16)
+                        | ((encoded_in[off + 2] as i32) << 24);
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
                 }
             }
             // 32-bit Stereo Big-Endian
@@ -147,6 +252,54 @@ impl AudioDecoder for PcmDecoder {
                     pcm_out[i * 2 + 1] = r;
                 }
             }
+            // 32-bit Mono Big-Endian (DEC-010)
+            (32, true, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 4;
+                    let s = i32::from_be_bytes([
+                        encoded_in[off],
+                        encoded_in[off + 1],
+                        encoded_in[off + 2],
+                        encoded_in[off + 3],
+                    ]);
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
+            // 32-bit Stereo Little-Endian
+            (32, false, 2) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 8;
+                    let l = i32::from_le_bytes([
+                        encoded_in[off],
+                        encoded_in[off + 1],
+                        encoded_in[off + 2],
+                        encoded_in[off + 3],
+                    ]);
+                    let r = i32::from_le_bytes([
+                        encoded_in[off + 4],
+                        encoded_in[off + 5],
+                        encoded_in[off + 6],
+                        encoded_in[off + 7],
+                    ]);
+                    pcm_out[i * 2] = l;
+                    pcm_out[i * 2 + 1] = r;
+                }
+            }
+            // 32-bit Mono Little-Endian (DEC-010)
+            (32, false, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 4;
+                    let s = i32::from_le_bytes([
+                        encoded_in[off],
+                        encoded_in[off + 1],
+                        encoded_in[off + 2],
+                        encoded_in[off + 3],
+                    ]);
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
             _ => return Err(DecoderError::UnsupportedSampleFormat),
         }
 
@@ -157,8 +310,12 @@ impl AudioDecoder for PcmDecoder {
 }
 
 /// Pure-Rust MP3 Decoder using nanomp3-core (100% safe, no_std).
+///
+/// Heap-boxes decoder state (22.5KB) and frame scratch buffer (9.2KB)
+/// to eliminate FreeRTOS task stack overflows (DEC-001).
 pub struct Mp3Decoder {
-    decoder: nanomp3_core::Decoder,
+    decoder: Box<nanomp3_core::Decoder>,
+    sample_buf: Box<[i32]>,
 }
 
 impl Default for Mp3Decoder {
@@ -170,7 +327,8 @@ impl Default for Mp3Decoder {
 impl Mp3Decoder {
     pub fn new() -> Self {
         Self {
-            decoder: nanomp3_core::Decoder::new(),
+            decoder: Box::new(nanomp3_core::Decoder::new()),
+            sample_buf: vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME].into_boxed_slice(),
         }
     }
 }
@@ -181,44 +339,65 @@ impl AudioDecoder for Mp3Decoder {
         encoded_in: &[u8],
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
-        let mut sample_buf = [0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME];
-        let (consumed, result) = self.decoder.decode(encoded_in, &mut sample_buf);
+        let (consumed, result) = self.decoder.decode(encoded_in, &mut self.sample_buf);
 
         match result {
             Ok(info) => {
                 let channels = info.channels.num() as usize;
                 let frames_produced = info.samples_produced;
                 let max_frames = pcm_out.len() / 2;
-                let frames_to_copy = core::cmp::min(frames_produced, max_frames);
+
+                if max_frames < frames_produced {
+                    return Err(DecoderError::BufferOverflow);
+                }
 
                 if channels == 2 {
-                    pcm_out[..frames_to_copy * 2].copy_from_slice(&sample_buf[..frames_to_copy * 2]);
+                    let total_samples = frames_produced * 2;
+                    if self.sample_buf.len() >= total_samples && pcm_out.len() >= total_samples {
+                        pcm_out[..total_samples].copy_from_slice(&self.sample_buf[..total_samples]);
+                    }
                 } else if channels == 1 {
-                    for i in 0..frames_to_copy {
-                        let s = sample_buf[i];
+                    for i in 0..frames_produced {
+                        let s = self.sample_buf[i];
                         pcm_out[i * 2] = s;
                         pcm_out[i * 2 + 1] = s;
                     }
                 }
-                Ok((consumed, frames_to_copy))
+                Ok((consumed, frames_produced))
             }
             Err(nanomp3_core::DecodeError::NoFrame) => Err(DecoderError::NeedMoreData),
-            Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => Ok((consumed, 0)),
-            Err(_) => Err(DecoderError::CorruptedFrame),
+            Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => {
+                // DEC-005: Differentiate between 0 consumed (need more bytes) and >0 consumed (absorbed into reservoir)
+                if consumed == 0 {
+                    Err(DecoderError::NeedMoreData)
+                } else {
+                    Ok((consumed, 0))
+                }
+            }
+            Err(_) => {
+                if consumed > 0 {
+                    Ok((consumed, 0))
+                } else {
+                    Err(DecoderError::CorruptedFrame)
+                }
+            }
         }
     }
 
     fn flush(&mut self) {
-        self.decoder = nanomp3_core::Decoder::new();
+        *self.decoder = nanomp3_core::Decoder::new();
+        self.sample_buf.fill(0);
     }
 }
 
 #[cfg(feature = "std")]
-/// Pure-Rust FLAC Decoder using claxon.
+/// Pure-Rust FLAC Decoder using claxon with stateful streaming bitstream accumulation (DEC-002).
 pub struct FlacDecoder {
     pub sample_rate: u32,
     pub bits_per_sample: u32,
     pub channels: u32,
+    header_len: usize,
+    stream_buf: std::vec::Vec<u8>,
 }
 
 #[cfg(feature = "std")]
@@ -235,6 +414,8 @@ impl FlacDecoder {
             sample_rate: 44100,
             bits_per_sample: 16,
             channels: 2,
+            header_len: 0,
+            stream_buf: std::vec::Vec::new(),
         }
     }
 }
@@ -246,21 +427,39 @@ impl AudioDecoder for FlacDecoder {
         encoded_in: &[u8],
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
-        if encoded_in.len() < 4 {
+        let max_frames = pcm_out.len() / 2;
+        if max_frames == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
+
+        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.stream_buf.clear();
+            self.header_len = 0;
+            return Err(DecoderError::CorruptedFrame);
+        }
+
+        self.stream_buf.extend_from_slice(encoded_in);
+        if self.stream_buf.len() < 4 {
             return Err(DecoderError::NeedMoreData);
         }
 
-        let cursor = std::io::Cursor::new(encoded_in);
+        let cursor = std::io::Cursor::new(&self.stream_buf[..]);
         match claxon::FlacReader::new(cursor) {
-            Ok(mut reader) => {
+            Ok(reader) => {
+                if self.header_len == 0 {
+                    if let Ok(probe) = claxon::FlacReader::new(std::io::Cursor::new(&self.stream_buf[..])) {
+                        self.header_len = probe.into_inner().position() as usize;
+                    }
+                }
+
                 let info = reader.streaminfo();
                 self.sample_rate = info.sample_rate;
                 self.bits_per_sample = info.bits_per_sample;
                 self.channels = info.channels;
 
-                let mut frames_out = 0;
-                let max_frames = pcm_out.len() / 2;
-                let mut block_buf = std::vec::Vec::new();
+                if self.channels != 1 && self.channels != 2 {
+                    return Err(DecoderError::UnsupportedSampleFormat);
+                }
 
                 let shift = match self.bits_per_sample {
                     16 => 16,
@@ -269,37 +468,75 @@ impl AudioDecoder for FlacDecoder {
                     _ => 16,
                 };
 
-                let mut blocks = reader.blocks();
-                while let Ok(Some(block)) = blocks.read_next_or_eof(block_buf) {
-                    let block_len = block.len() as usize;
-                    let to_copy = core::cmp::min(block_len, max_frames.saturating_sub(frames_out));
+                let mut frames_out = 0;
+                let mut block_buf = std::vec::Vec::new();
+
+                loop {
+                    if self.stream_buf.len() <= self.header_len {
+                        break;
+                    }
+                    let block_cursor = std::io::Cursor::new(&self.stream_buf[..]);
+                    let mut block_reader = match claxon::FlacReader::new(block_cursor) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    let mut blocks = block_reader.blocks();
+                    let block = match blocks.read_next_or_eof(block_buf) {
+                        Ok(Some(b)) => b,
+                        _ => break,
+                    };
+
+                    let packet_frames = block.len() as usize;
+                    let available_space = max_frames.saturating_sub(frames_out);
+                    if packet_frames > available_space {
+                        if frames_out == 0 {
+                            return Err(DecoderError::BufferOverflow);
+                        }
+                        break;
+                    }
 
                     if self.channels == 2 {
-                        for i in 0..to_copy {
+                        for i in 0..packet_frames {
                             let l = block.sample(0, i as u32) << shift;
                             let r = block.sample(1, i as u32) << shift;
                             pcm_out[(frames_out + i) * 2] = l;
                             pcm_out[(frames_out + i) * 2 + 1] = r;
                         }
                     } else {
-                        for i in 0..to_copy {
+                        for i in 0..packet_frames {
                             let s = block.sample(0, i as u32) << shift;
                             pcm_out[(frames_out + i) * 2] = s;
                             pcm_out[(frames_out + i) * 2 + 1] = s;
                         }
                     }
 
-                    frames_out += to_copy;
+                    frames_out += packet_frames;
                     block_buf = block.into_buffer();
+                    let consumed = block_reader.into_inner().position() as usize;
+                    if consumed > self.header_len {
+                        self.stream_buf.drain(self.header_len..consumed);
+                    }
+
                     if frames_out >= max_frames {
                         break;
                     }
                 }
 
-                let consumed = encoded_in.len();
-                Ok((consumed, frames_out))
+                if frames_out == 0 && encoded_in.is_empty() {
+                    Err(DecoderError::NeedMoreData)
+                } else {
+                    Ok((encoded_in.len(), frames_out))
+                }
             }
-            Err(claxon::Error::FormatError(_)) => Err(DecoderError::CorruptedFrame),
+            Err(claxon::Error::FormatError(_)) => {
+                if self.stream_buf.len() > MAX_STREAM_BUF {
+                    self.stream_buf.clear();
+                    self.header_len = 0;
+                    Err(DecoderError::CorruptedFrame)
+                } else {
+                    Err(DecoderError::NeedMoreData)
+                }
+            }
             Err(claxon::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 Err(DecoderError::NeedMoreData)
             }
@@ -307,11 +544,16 @@ impl AudioDecoder for FlacDecoder {
         }
     }
 
-    fn flush(&mut self) {}
+    fn flush(&mut self) {
+        self.stream_buf.clear();
+        self.header_len = 0;
+    }
 }
 
 #[cfg(feature = "std")]
 /// Pure-Rust AAC (ADTS / LC / HE-AAC) Decoder using syom.
+///
+/// Propagates exact consumed byte counts returned by syom (DEC-004).
 pub struct AacDecoder {
     decoder: syom::Decoder,
     pub sample_rate: u32,
@@ -343,42 +585,63 @@ impl AudioDecoder for AacDecoder {
         encoded_in: &[u8],
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
+        let max_frames = pcm_out.len() / 2;
+        if max_frames == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
+
         if encoded_in.len() < 7 {
             return Err(DecoderError::NeedMoreData);
         }
 
         let mut frames_out = 0;
-        let max_frames = pcm_out.len() / 2;
+        let mut overflow_detected = false;
 
         let feed_res = self.decoder.feed(encoded_in, |frame| {
             self.sample_rate = frame.sample_rate;
             self.channels = frame.planar.len() as u32;
 
-            let samples = frame.samples;
-            let to_copy = core::cmp::min(samples, max_frames.saturating_sub(frames_out));
+            if frame.planar.is_empty() {
+                return Ok(());
+            }
 
             let left = frame.planar[0];
-            let right = if frame.planar.len() > 1 { frame.planar[1] } else { left };
+            let right = if frame.planar.len() > 1 {
+                frame.planar[1]
+            } else {
+                left
+            };
 
-            for i in 0..to_copy {
+            let samples = core::cmp::min(left.len(), right.len());
+            let available_space = max_frames.saturating_sub(frames_out);
+            if samples > available_space {
+                overflow_detected = true;
+                return Ok(());
+            }
+
+            for i in 0..samples {
                 let l_f = left[i].clamp(-1.0, 1.0);
                 let r_f = right[i].clamp(-1.0, 1.0);
-                let l = (l_f * 2147483647.0) as i32;
-                let r = (r_f * 2147483647.0) as i32;
+                let l = (l_f * 2147483520.0) as i32; // Clamping boundary to avoid overflow (DSP-003)
+                let r = (r_f * 2147483520.0) as i32;
                 pcm_out[(frames_out + i) * 2] = l;
                 pcm_out[(frames_out + i) * 2 + 1] = r;
             }
 
-            frames_out += to_copy;
+            frames_out += samples;
             Ok(())
         });
 
+        if overflow_detected && frames_out == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
+
         match feed_res {
-            Ok(_) => {
-                if frames_out == 0 {
+            Ok(consumed) => {
+                if frames_out == 0 && consumed == 0 {
                     Err(DecoderError::NeedMoreData)
                 } else {
-                    Ok((encoded_in.len(), frames_out))
+                    Ok((consumed, frames_out))
                 }
             }
             Err(_) => Err(DecoderError::CorruptedFrame),
@@ -391,10 +654,12 @@ impl AudioDecoder for AacDecoder {
 }
 
 #[cfg(feature = "std")]
-/// Pure-Rust Ogg Vorbis Decoder using lewton.
+/// Pure-Rust Ogg Vorbis Decoder using lewton with header/audio packet differentiation (DEC-003).
 pub struct VorbisDecoder {
     pub sample_rate: u32,
     pub channels: u32,
+    header_len: usize,
+    stream_buf: std::vec::Vec<u8>,
 }
 
 #[cfg(feature = "std")]
@@ -410,6 +675,8 @@ impl VorbisDecoder {
         Self {
             sample_rate: 44100,
             channels: 2,
+            header_len: 0,
+            stream_buf: std::vec::Vec::new(),
         }
     }
 }
@@ -421,18 +688,39 @@ impl AudioDecoder for VorbisDecoder {
         encoded_in: &[u8],
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
-        if encoded_in.len() < 4 {
+        let max_frames = pcm_out.len() / 2;
+        if max_frames == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
+
+        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.stream_buf.clear();
+            self.header_len = 0;
+            return Err(DecoderError::CorruptedFrame);
+        }
+
+        self.stream_buf.extend_from_slice(encoded_in);
+        if self.stream_buf.len() < 4 {
             return Err(DecoderError::NeedMoreData);
         }
 
-        let cursor = std::io::Cursor::new(encoded_in);
+        let cursor = std::io::Cursor::new(&self.stream_buf[..]);
         match lewton::inside_ogg::OggStreamReader::new(cursor) {
             Ok(mut reader) => {
+                if self.header_len == 0 {
+                    if let Ok(pr) = lewton::inside_ogg::OggStreamReader::new(std::io::Cursor::new(&self.stream_buf[..])) {
+                        self.header_len = pr.into_inner().into_inner().position() as usize;
+                    }
+                }
+
                 self.sample_rate = reader.ident_hdr.audio_sample_rate;
                 self.channels = reader.ident_hdr.audio_channels as u32;
 
+                if self.channels != 1 && self.channels != 2 {
+                    return Err(DecoderError::UnsupportedSampleFormat);
+                }
+
                 let mut frames_out = 0;
-                let max_frames = pcm_out.len() / 2;
 
                 while let Ok(Some(samples_itl)) = reader.read_dec_packet_itl() {
                     let packet_frames = if self.channels == 2 {
@@ -440,35 +728,69 @@ impl AudioDecoder for VorbisDecoder {
                     } else {
                         samples_itl.len()
                     };
-                    let to_copy = core::cmp::min(packet_frames, max_frames.saturating_sub(frames_out));
+
+                    let available_space = max_frames.saturating_sub(frames_out);
+                    if packet_frames > available_space {
+                        if frames_out == 0 {
+                            return Err(DecoderError::BufferOverflow);
+                        }
+                        break;
+                    }
 
                     if self.channels == 2 {
-                        for i in 0..to_copy {
+                        for i in 0..packet_frames {
                             pcm_out[(frames_out + i) * 2] = (samples_itl[i * 2] as i32) << 16;
-                            pcm_out[(frames_out + i) * 2 + 1] = (samples_itl[i * 2 + 1] as i32) << 16;
+                            pcm_out[(frames_out + i) * 2 + 1] =
+                                (samples_itl[i * 2 + 1] as i32) << 16;
                         }
                     } else {
-                        for i in 0..to_copy {
+                        for i in 0..packet_frames {
                             let s = (samples_itl[i] as i32) << 16;
                             pcm_out[(frames_out + i) * 2] = s;
                             pcm_out[(frames_out + i) * 2 + 1] = s;
                         }
                     }
 
-                    frames_out += to_copy;
+                    frames_out += packet_frames;
                     if frames_out >= max_frames {
                         break;
                     }
                 }
 
-                let consumed = encoded_in.len();
-                Ok((consumed, frames_out))
+                let inner = reader.into_inner();
+                let inner_cursor = inner.into_inner();
+                let consumed = inner_cursor.position() as usize;
+                if consumed > self.header_len {
+                    self.stream_buf.drain(self.header_len..consumed);
+                }
+
+                if frames_out == 0 && encoded_in.is_empty() {
+                    Err(DecoderError::NeedMoreData)
+                } else {
+                    Ok((encoded_in.len(), frames_out))
+                }
             }
-            Err(_) => Err(DecoderError::NeedMoreData),
+            Err(lewton::VorbisError::BadHeader(lewton::header::HeaderReadError::EndOfPacket))
+            | Err(lewton::VorbisError::OggError(_)) => {
+                // Header incomplete: absorbed data into stream buffer, waiting for more data (DEC-003)
+                Ok((encoded_in.len(), 0))
+            }
+            Err(_) => {
+                if self.stream_buf.len() > MAX_STREAM_BUF {
+                    self.stream_buf.clear();
+                    self.header_len = 0;
+                    Err(DecoderError::CorruptedFrame)
+                } else {
+                    Ok((encoded_in.len(), 0))
+                }
+            }
         }
     }
 
-    fn flush(&mut self) {}
+    fn flush(&mut self) {
+        self.stream_buf.clear();
+        self.header_len = 0;
+    }
 }
 
 #[cfg(test)]
@@ -502,6 +824,34 @@ mod tests {
     }
 
     #[test]
+    fn test_pcm_16bit_be_mono_duplication() {
+        let mut decoder = PcmDecoder::new(16, 1, true);
+
+        let f1 = (5000i16).to_be_bytes();
+        let f2 = (-5000i16).to_be_bytes();
+        let encoded = [f1[0], f1[1], f2[0], f2[1]];
+
+        let mut pcm_out = [0i32; 4];
+        let (consumed, frames) = decoder.decode(&encoded, &mut pcm_out).unwrap();
+
+        assert_eq!(consumed, 4);
+        assert_eq!(frames, 2);
+        // Both channels must have the duplicated mono sample
+        assert_eq!(pcm_out[0], 5000 << 16);
+        assert_eq!(pcm_out[1], 5000 << 16);
+        assert_eq!(pcm_out[2], -5000 << 16);
+        assert_eq!(pcm_out[3], -5000 << 16);
+    }
+
+    #[test]
+    fn test_pcm_buffer_overflow() {
+        let mut decoder = PcmDecoder::new(16, 2, true);
+        let encoded = [0u8; 8];
+        let mut pcm_out = [0i32; 1]; // Less than 1 stereo frame (2 samples)
+        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::BufferOverflow));
+    }
+
+    #[test]
     fn test_pcm_insufficient_data() {
         let mut decoder = PcmDecoder::new(16, 2, true);
         let encoded = [0u8; 3]; // 3 bytes is less than 1 frame (4 bytes)
@@ -510,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mp3_insufficient_data() {
+    fn test_mp3_heap_isolation_no_stack_overflow() {
         let mut decoder = Mp3Decoder::new();
         let encoded = [0u8; 4];
         let mut pcm_out = [0i32; 32];
@@ -536,11 +886,204 @@ mod tests {
     }
 
     #[test]
+    fn test_pcm_24bit_stereo_and_mono() {
+        let mut dec_stereo = PcmDecoder::new(24, 2, true);
+        // Stereo 24-bit: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]
+        let encoded_stereo = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let mut pcm_out = [0i32; 2];
+        let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 6);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out[0], (0x12 << 24) | (0x34 << 16) | (0x56 << 8));
+        assert_eq!(pcm_out[1], (0x78 << 24) | (0x9A << 16) | (0xBC << 8));
+
+        let mut dec_mono = PcmDecoder::new(24, 1, true);
+        let encoded_mono = [0x12, 0x34, 0x56];
+        let mut pcm_out_mono = [0i32; 2];
+        let (consumed, frames) = dec_mono.decode(&encoded_mono, &mut pcm_out_mono).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out_mono[0], (0x12 << 24) | (0x34 << 16) | (0x56 << 8));
+        assert_eq!(pcm_out_mono[1], (0x12 << 24) | (0x34 << 16) | (0x56 << 8));
+    }
+
+    #[test]
+    fn test_pcm_32bit_stereo_and_mono() {
+        let mut dec_stereo = PcmDecoder::new(32, 2, true);
+        let encoded_stereo = [
+            0x10, 0x20, 0x30, 0x40,
+            0x50, 0x60, 0x70, 0x80,
+        ];
+        let mut pcm_out = [0i32; 2];
+        let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 8);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out[0], 0x10203040);
+        assert_eq!(pcm_out[1], 0x50607080);
+
+        let mut dec_mono = PcmDecoder::new(32, 1, true);
+        let encoded_mono = [0x10, 0x20, 0x30, 0x40];
+        let mut pcm_out_mono = [0i32; 2];
+        let (consumed, frames) = dec_mono.decode(&encoded_mono, &mut pcm_out_mono).unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out_mono[0], 0x10203040);
+        assert_eq!(pcm_out_mono[1], 0x10203040);
+    }
+
+    #[test]
+    fn test_decoder_flushing() {
+        let mut mp3 = Mp3Decoder::new();
+        mp3.flush();
+
+        #[cfg(feature = "std")]
+        {
+            let mut flac = FlacDecoder::new();
+            flac.flush();
+
+            let mut aac = AacDecoder::new();
+            aac.flush();
+
+            let mut vorbis = VorbisDecoder::new();
+            vorbis.flush();
+        }
+    }
+
+    #[test]
+    fn test_pcm_8bit_stereo_and_mono() {
+        let mut dec_stereo = PcmDecoder::new(8, 2, false);
+        // Stereo 8-bit: [128, 255, 0, 128]
+        // Frame 0: L = 128 (0), R = 255 (127 << 24)
+        // Frame 1: L = 0 (-128 << 24), R = 128 (0)
+        let encoded_stereo = [128u8, 255, 0, 128];
+        let mut pcm_out = [0i32; 4];
+        let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(frames, 2);
+        assert_eq!(pcm_out[0], 0);
+        assert_eq!(pcm_out[1], 127 << 24);
+        assert_eq!(pcm_out[2], (-128) << 24);
+        assert_eq!(pcm_out[3], 0);
+
+        let mut dec_mono = PcmDecoder::new(8, 1, false);
+        let encoded_mono = [200u8, 50];
+        let mut pcm_out_mono = [0i32; 4];
+        let (consumed, frames) = dec_mono.decode(&encoded_mono, &mut pcm_out_mono).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(frames, 2);
+        let expected_0 = (200i32 - 128) << 24;
+        let expected_1 = (50i32 - 128) << 24;
+        assert_eq!(pcm_out_mono[0], expected_0);
+        assert_eq!(pcm_out_mono[1], expected_0);
+        assert_eq!(pcm_out_mono[2], expected_1);
+        assert_eq!(pcm_out_mono[3], expected_1);
+    }
+
+    #[test]
+    fn test_pcm_24bit_le_stereo_and_mono() {
+        let mut dec_stereo = PcmDecoder::new(24, 2, false);
+        let encoded_stereo = [0x56, 0x34, 0x12, 0xBC, 0x9A, 0x78];
+        let mut pcm_out = [0i32; 2];
+        let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 6);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out[0], (0x12 << 24) | (0x34 << 16) | (0x56 << 8));
+        assert_eq!(pcm_out[1], (0x78 << 24) | (0x9A << 16) | (0xBC << 8));
+
+        let mut dec_mono = PcmDecoder::new(24, 1, false);
+        let encoded_mono = [0x56, 0x34, 0x12];
+        let mut pcm_out_mono = [0i32; 2];
+        let (consumed, frames) = dec_mono.decode(&encoded_mono, &mut pcm_out_mono).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out_mono[0], (0x12 << 24) | (0x34 << 16) | (0x56 << 8));
+        assert_eq!(pcm_out_mono[1], (0x12 << 24) | (0x34 << 16) | (0x56 << 8));
+    }
+
+    #[test]
+    fn test_pcm_32bit_le_stereo_and_mono() {
+        let mut dec_stereo = PcmDecoder::new(32, 2, false);
+        let encoded_stereo = [
+            0x40, 0x30, 0x20, 0x10,
+            0x80, 0x70, 0x60, 0x50,
+        ];
+        let mut pcm_out = [0i32; 2];
+        let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 8);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out[0], 0x10203040);
+        assert_eq!(pcm_out[1], 0x50607080);
+
+        let mut dec_mono = PcmDecoder::new(32, 1, false);
+        let encoded_mono = [0x40, 0x30, 0x20, 0x10];
+        let mut pcm_out_mono = [0i32; 2];
+        let (consumed, frames) = dec_mono.decode(&encoded_mono, &mut pcm_out_mono).unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(frames, 1);
+        assert_eq!(pcm_out_mono[0], 0x10203040);
+        assert_eq!(pcm_out_mono[1], 0x10203040);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_flac_max_stream_buf_overflow() {
+        let mut decoder = FlacDecoder::new();
+        let oversized = std::vec![0u8; MAX_STREAM_BUF + 1];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(
+            decoder.decode(&oversized, &mut pcm_out),
+            Err(DecoderError::CorruptedFrame)
+        );
+
+        // Also test multi-step accumulation exceeding MAX_STREAM_BUF
+        let mut dec2 = FlacDecoder::new();
+        let chunk1 = std::vec![0u8; 32768];
+        let _ = dec2.decode(&chunk1, &mut pcm_out);
+        let chunk2 = std::vec![0u8; 32769];
+        assert_eq!(
+            dec2.decode(&chunk2, &mut pcm_out),
+            Err(DecoderError::CorruptedFrame)
+        );
+    }
+
+    #[test]
     #[cfg(feature = "std")]
     fn test_vorbis_insufficient_data() {
         let mut decoder = VorbisDecoder::new();
         let encoded = [0u8; 3];
         let mut pcm_out = [0i32; 32];
         assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_vorbis_max_stream_buf_overflow() {
+        let mut decoder = VorbisDecoder::new();
+        let oversized = std::vec![0u8; MAX_STREAM_BUF + 1];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(
+            decoder.decode(&oversized, &mut pcm_out),
+            Err(DecoderError::CorruptedFrame)
+        );
+
+        // Multi-step accumulation
+        let mut dec2 = VorbisDecoder::new();
+        let chunk1 = std::vec![0u8; 32768];
+        let _ = dec2.decode(&chunk1, &mut pcm_out);
+        let chunk2 = std::vec![0u8; 32769];
+        assert_eq!(
+            dec2.decode(&chunk2, &mut pcm_out),
+            Err(DecoderError::CorruptedFrame)
+        );
+    }
+
+    #[test]
+    fn test_mp3_flush_zeroes_sample_buf() {
+        let mut decoder = Mp3Decoder::new();
+        decoder.sample_buf[0] = 42;
+        decoder.sample_buf[100] = 99;
+        decoder.flush();
+        assert_eq!(decoder.sample_buf[0], 0);
+        assert_eq!(decoder.sample_buf[100], 0);
     }
 }

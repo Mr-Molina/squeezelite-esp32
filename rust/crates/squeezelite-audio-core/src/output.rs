@@ -74,7 +74,8 @@ impl<const CAPACITY: usize> AudioOutputSink for MockAudioSink<CAPACITY> {
     type Error = OutputError;
 
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
-        let samples_to_copy = core::cmp::min(frames.len(), CAPACITY - (self.frames_written * 2));
+        let space_left = CAPACITY.saturating_sub(self.frames_written * 2);
+        let samples_to_copy = core::cmp::min(frames.len(), space_left);
         let frames_to_copy = samples_to_copy / 2;
 
         let start = self.frames_written * 2;
@@ -85,6 +86,9 @@ impl<const CAPACITY: usize> AudioOutputSink for MockAudioSink<CAPACITY> {
     }
 
     fn set_sample_rate(&mut self, rate_hz: u32) -> Result<(), Self::Error> {
+        if !(8000..=192000).contains(&rate_hz) {
+            return Err(OutputError::UnsupportedSampleRate(rate_hz));
+        }
         self.sample_rate = rate_hz;
         Ok(())
     }

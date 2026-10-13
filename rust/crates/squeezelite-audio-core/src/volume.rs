@@ -46,13 +46,21 @@ pub fn scale_samples_inplace(samples: &mut [i32], volume: VolumeScale) {
         return;
     }
 
+    // Remainder guard: zero out trailing odd sample to prevent channel phase swap (DSP-007)
+    if !samples.len().is_multiple_of(2) {
+        if let Some(last) = samples.last_mut() {
+            *last = 0;
+        }
+    }
+
     if volume.gain_left == 0x00010000 && volume.gain_right == 0x00010000 {
         return; // Unity gain fast path
     }
 
-    for chunk in samples.chunks_exact_mut(2) {
-        let l = (chunk[0] as i64 * volume.gain_left as i64) >> 16;
-        let r = (chunk[1] as i64 * volume.gain_right as i64) >> 16;
+    let mut chunks = samples.chunks_exact_mut(2);
+    for chunk in &mut chunks {
+        let l = ((chunk[0] as i64 * volume.gain_left as i64) + 0x8000) >> 16;
+        let r = ((chunk[1] as i64 * volume.gain_right as i64) + 0x8000) >> 16;
         chunk[0] = l.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         chunk[1] = r.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
@@ -68,6 +76,13 @@ mod tests {
         let original = samples;
         scale_samples_inplace(&mut samples, VolumeScale::unity());
         assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn test_volume_unity_gain_odd_remainder() {
+        let mut samples = [1000, -1000, 2000, -2000, 9999];
+        scale_samples_inplace(&mut samples, VolumeScale::unity());
+        assert_eq!(samples, [1000, -1000, 2000, -2000, 0]);
     }
 
     #[test]

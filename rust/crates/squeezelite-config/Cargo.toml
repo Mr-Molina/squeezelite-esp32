@@ -8,8 +8,6 @@ description = "no_std, zero-allocation pure-Rust key-value configuration storage
 
 [dependencies]
 heapless = { workspace = true }
-thiserror = { workspace = true }
-log = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

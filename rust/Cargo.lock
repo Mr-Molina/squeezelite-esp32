@@ -276,6 +276,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "louder-esp32-app"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "embedded-hal 1.0.0",
  "embedded-hal-mock",
  "heapless",
@@ -563,9 +564,7 @@ name = "squeezelite-config"
 version = "0.1.0"
 dependencies = [
  "heapless",
- "log",
  "proptest",
- "thiserror",
 ]
 
 [[package]]
@@ -575,7 +574,6 @@ dependencies = [
  "heapless",
  "log",
  "proptest",
- "thiserror",
 ]
 
 [[package]]
@@ -595,10 +593,8 @@ dependencies = [
 name = "squeezelite-proto"
 version = "0.1.0"
 dependencies = [
- "heapless",
  "log",
  "proptest",
- "thiserror",
 ]
 
 [[package]]
@@ -608,7 +604,6 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-mock",
  "log",
- "thiserror",
 ]
 
 [[package]]

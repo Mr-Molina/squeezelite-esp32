@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Pure-Rust audio decoders (PCM, FLAC, MP3) for squeezelite-esp32"
+description = "Pure-Rust audio decoders (PCM, MP3, FLAC, AAC, Vorbis) for squeezelite-esp32"
 
 [features]
 default = ["std"]

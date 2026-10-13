@@ -8,7 +8,6 @@ description = "no_std serial telemetry and display link protocol for CYD control
 
 [dependencies]
 heapless = { workspace = true }
-thiserror = { workspace = true }
 log = { workspace = true, optional = true }
 
 [dev-dependencies]

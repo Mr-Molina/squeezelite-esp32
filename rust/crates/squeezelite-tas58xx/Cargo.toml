@@ -8,7 +8,6 @@ description = "no_std, type-state embedded-hal driver for TI TAS5805M and TAS582
 
 [dependencies]
 embedded-hal = { workspace = true }
-thiserror = { workspace = true }
 log = { workspace = true, optional = true }
 
 [dev-dependencies]

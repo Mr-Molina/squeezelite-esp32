@@ -77,7 +77,7 @@ fn test_equalizer_numerical_stability() {
             a1: -0.4,
             a2: 0.2,
         };
-        eq.filters[i] = coeffs;
+        eq.set_filter(i, coeffs).unwrap();
     }
     eq.enabled = true;
 
@@ -125,4 +125,51 @@ fn test_volume_scaling_stress_boundaries() {
     for &s in &samples {
         assert_eq!(s, 0, "Mute must zero all samples");
     }
+}
+
+#[test]
+fn test_ringbuffer_concurrent_threads_stress() {
+    let mut storage = vec![0u8; 1024];
+    let mut rb = AudioRingBuffer::new(&mut storage);
+    let (producer, consumer) = rb.split();
+
+    const TOTAL_ITEMS: u32 = 10_000;
+
+    std::thread::scope(|s| {
+        let p_handle = s.spawn(move || {
+            let mut seq = 0u32;
+            let mut buf = [0u8; 4];
+            while seq < TOTAL_ITEMS {
+                buf.copy_from_slice(&seq.to_le_bytes());
+                let mut written = 0;
+                while written < 4 {
+                    match producer.write(&buf[written..]) {
+                        Ok(n) => written += n,
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+                seq += 1;
+            }
+        });
+
+        let c_handle = s.spawn(move || {
+            let mut expected = 0u32;
+            let mut buf = [0u8; 4];
+            while expected < TOTAL_ITEMS {
+                let mut read = 0;
+                while read < 4 {
+                    match consumer.read(&mut buf[read..]) {
+                        Ok(n) => read += n,
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+                let val = u32::from_le_bytes(buf);
+                assert_eq!(val, expected, "Concurrent SPSC item out of order!");
+                expected += 1;
+            }
+        });
+
+        p_handle.join().unwrap();
+        c_handle.join().unwrap();
+    });
 }

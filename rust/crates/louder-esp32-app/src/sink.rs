@@ -39,6 +39,9 @@ impl AudioOutputSink for NullAudioSink {
     }
 
     fn set_sample_rate(&mut self, rate: u32) -> Result<(), Self::Error> {
+        if !(8_000..=192_000).contains(&rate) {
+            return Err(OutputError::UnsupportedSampleRate(rate));
+        }
         self.sample_rate = rate;
         Ok(())
     }
@@ -67,6 +70,10 @@ impl SimulatedSink {
         }
     }
 
+    pub fn frames_written(&self) -> usize {
+        self.frames_written
+    }
+
     pub fn recorded_samples(&self) -> &[i32] {
         &self.buffer
     }
@@ -80,19 +87,27 @@ impl SimulatedSink {
 impl AudioOutputSink for SimulatedSink {
     type Error = OutputError;
 
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
-        let frame_count = frames.len() / 2;
-        for &s in frames {
-            if self.buffer.is_full() {
+        let mut stored_frames = 0;
+        for pair in frames.chunks_exact(2) {
+            if self.buffer.capacity() - self.buffer.len() < 2 {
                 break;
             }
-            let _ = self.buffer.push(s);
+            let l = if self.muted { 0 } else { pair[0] };
+            let r = if self.muted { 0 } else { pair[1] };
+            let _ = self.buffer.push(l);
+            let _ = self.buffer.push(r);
+            stored_frames += 1;
         }
-        self.frames_written += frame_count;
-        Ok(frame_count)
+        self.frames_written += stored_frames;
+        Ok(stored_frames)
     }
 
     fn set_sample_rate(&mut self, rate: u32) -> Result<(), Self::Error> {
+        if !(8_000..=192_000).contains(&rate) {
+            return Err(OutputError::UnsupportedSampleRate(rate));
+        }
         self.sample_rate = rate;
         Ok(())
     }
@@ -119,14 +134,63 @@ mod tests {
     }
 
     #[test]
+    fn test_null_sink_sample_rate_bounds() {
+        let mut sink = NullAudioSink::new(44100);
+        assert!(sink.set_sample_rate(8000).is_ok());
+        assert!(sink.set_sample_rate(192000).is_ok());
+        assert_eq!(
+            sink.set_sample_rate(7999),
+            Err(OutputError::UnsupportedSampleRate(7999))
+        );
+        assert_eq!(
+            sink.set_sample_rate(192001),
+            Err(OutputError::UnsupportedSampleRate(192001))
+        );
+    }
+
+    #[test]
     fn test_simulated_sink_recording() {
         let mut sink = SimulatedSink::new(48000);
         let samples = [10i32, -10, 20, -20];
         let written = sink.write_frames(&samples).unwrap();
         assert_eq!(written, 2);
+        assert_eq!(sink.frames_written(), 2);
         assert_eq!(sink.recorded_samples(), &[10, -10, 20, -20]);
 
         sink.set_mute(true);
         assert!(sink.muted);
+    }
+
+    #[test]
+    fn test_simulated_sink_sample_rate_bounds() {
+        let mut sink = SimulatedSink::new(48000);
+        assert!(sink.set_sample_rate(8000).is_ok());
+        assert!(sink.set_sample_rate(192000).is_ok());
+        assert_eq!(
+            sink.set_sample_rate(7999),
+            Err(OutputError::UnsupportedSampleRate(7999))
+        );
+        assert_eq!(
+            sink.set_sample_rate(256000),
+            Err(OutputError::UnsupportedSampleRate(256000))
+        );
+    }
+
+    #[test]
+    fn test_simulated_sink_mute_zeroing_and_accounting() {
+        let mut sink = SimulatedSink::new(44100);
+        sink.set_mute(true);
+
+        let samples = [100i32, -100, 200, -200];
+        let written = sink.write_frames(&samples).unwrap();
+        assert_eq!(written, 2);
+        assert_eq!(sink.frames_written(), 2);
+        assert_eq!(sink.recorded_samples(), &[0, 0, 0, 0]);
+
+        sink.set_mute(false);
+        let written2 = sink.write_frames(&samples).unwrap();
+        assert_eq!(written2, 2);
+        assert_eq!(sink.frames_written(), 4);
+        assert_eq!(sink.recorded_samples(), &[0, 0, 0, 0, 100, -100, 200, -200]);
     }
 }
