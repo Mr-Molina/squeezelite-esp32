@@ -2,6 +2,26 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-13 | Antigravity Orchestrator | Pure-Rust MP3/FLAC Decoders & LMS Streaming Engine (MK5-Rust)
+**Agent**: Antigravity Orchestrator
+**Host OS**: Windows 11
+**Branch**: `MK5-Rust`
+**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8) & Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8)
+**Verification Suite**: 22/22 Automated Tests Passing + 0 Clippy Warnings (`cargo clippy -D warnings`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
+
+### Completed This Session
+- **Pure-Rust Audio Decoders**:
+  - `squeezelite-decoders`: Integrated `nanomp3-core` (`#![forbid(unsafe_code)]`, `no_std`, SIMD wide execution) into `Mp3Decoder`, decoding MP3 frames directly to 32-bit PCM without C dependencies.
+  - Added pure-Rust `claxon` FLAC decoder support.
+- **LMS Network Auto-Discovery & TCP Streaming**:
+  - `squeezelite-proto`: Implemented `DiscoveryBuilder` (`eJSON\0CLIP\0`) and `DiscoveryParser` for LMS UDP broadcast discovery on port 3483.
+  - `louder-esp32-app`: Implemented `LmsDiscovery` (UDP socket broadcaster) and `SlimprotoClient` (TCP connection management, `HELO` handshake, `STAT` telemetry loop, and command polling).
+  - Added TCP network loopback integration test validating full handshake and `STAT` dispatch.
+- **Verification & Lints**:
+  - 22/22 tests passing across all workspace crates.
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 warnings, 0 errors.
+
 ## 2026-10-13 | Antigravity Orchestrator | Louder-ESP32-Plus Clean-Slate Pure-Rust Architecture Delivery (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11

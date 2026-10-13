@@ -6,8 +6,14 @@ license.workspace = true
 authors.workspace = true
 description = "Pure-Rust audio decoders (PCM, FLAC, MP3) for squeezelite-esp32"
 
+[features]
+default = ["std"]
+std = ["dep:claxon"]
+
 [dependencies]
 squeezelite-audio-core = { path = "../squeezelite-audio-core" }
+claxon = { version = "0.4", default-features = false, optional = true }
+nanomp3-core = "0.2"
 thiserror = { workspace = true }
 log = { workspace = true, optional = true }
 

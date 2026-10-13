@@ -153,6 +153,63 @@ impl AudioDecoder for PcmDecoder {
     fn flush(&mut self) {}
 }
 
+/// Pure-Rust MP3 Decoder using nanomp3-core (100% safe, no_std).
+pub struct Mp3Decoder {
+    decoder: nanomp3_core::Decoder,
+}
+
+impl Default for Mp3Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Mp3Decoder {
+    pub fn new() -> Self {
+        Self {
+            decoder: nanomp3_core::Decoder::new(),
+        }
+    }
+}
+
+impl AudioDecoder for Mp3Decoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        let mut sample_buf = [0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME];
+        let (consumed, result) = self.decoder.decode(encoded_in, &mut sample_buf);
+
+        match result {
+            Ok(info) => {
+                let channels = info.channels.num() as usize;
+                let frames_produced = info.samples_produced;
+                let max_frames = pcm_out.len() / 2;
+                let frames_to_copy = core::cmp::min(frames_produced, max_frames);
+
+                if channels == 2 {
+                    pcm_out[..frames_to_copy * 2].copy_from_slice(&sample_buf[..frames_to_copy * 2]);
+                } else if channels == 1 {
+                    for i in 0..frames_to_copy {
+                        let s = sample_buf[i];
+                        pcm_out[i * 2] = s;
+                        pcm_out[i * 2 + 1] = s;
+                    }
+                }
+                Ok((consumed, frames_to_copy))
+            }
+            Err(nanomp3_core::DecodeError::NoFrame) => Err(DecoderError::NeedMoreData),
+            Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => Ok((consumed, 0)),
+            Err(_) => Err(DecoderError::CorruptedFrame),
+        }
+    }
+
+    fn flush(&mut self) {
+        self.decoder = nanomp3_core::Decoder::new();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +245,14 @@ mod tests {
         let mut decoder = PcmDecoder::new(16, 2, true);
         let encoded = [0u8; 3]; // 3 bytes is less than 1 frame (4 bytes)
         let mut pcm_out = [0i32; 4];
+        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+    }
+
+    #[test]
+    fn test_mp3_insufficient_data() {
+        let mut decoder = Mp3Decoder::new();
+        let encoded = [0u8; 4];
+        let mut pcm_out = [0i32; 32];
         assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
     }
 }

@@ -402,6 +402,83 @@ impl SlimprotoBuilder {
     }
 }
 
+/// Discovered Logitech Media Server details from UDP broadcast query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveredServer {
+    pub json_port: u16,
+    pub cli_port: u16,
+}
+
+pub struct DiscoveryBuilder;
+
+impl DiscoveryBuilder {
+    /// Formats the standard LMS UDP discovery query payload: `b"eJSON\0CLIP\0"`.
+    pub fn build_query(out: &mut [u8]) -> Result<usize, ParseError> {
+        const QUERY: &[u8] = b"eJSON\0CLIP\0";
+        if out.len() < QUERY.len() {
+            return Err(ParseError::PayloadTooLarge);
+        }
+        out[..QUERY.len()].copy_from_slice(QUERY);
+        Ok(QUERY.len())
+    }
+}
+
+pub struct DiscoveryParser;
+
+impl DiscoveryParser {
+    /// Parses an LMS discovery response (starts with `b'E'` or `b'e'`).
+    pub fn parse_response(buf: &[u8]) -> Option<DiscoveredServer> {
+        if buf.is_empty() || (buf[0] != b'E' && buf[0] != b'e') {
+            return None;
+        }
+
+        let mut json_port = 9000;
+        let mut cli_port = 9090;
+
+        let payload = &buf[1..];
+        let mut i = 0;
+        while i < payload.len() {
+            if payload[i..].starts_with(b"JSON") {
+                let start = i + 4;
+                if let Some(end) = payload[start..].iter().position(|&b| b == 0) {
+                    if let Ok(s) = core::str::from_utf8(&payload[start..start + end]) {
+                        if let Ok(port) = parse_u16(s) {
+                            json_port = port;
+                        }
+                    }
+                    i = start + end + 1;
+                    continue;
+                }
+            } else if payload[i..].starts_with(b"CLIP") {
+                let start = i + 4;
+                if let Some(end) = payload[start..].iter().position(|&b| b == 0) {
+                    if let Ok(s) = core::str::from_utf8(&payload[start..start + end]) {
+                        if let Ok(port) = parse_u16(s) {
+                            cli_port = port;
+                        }
+                    }
+                    i = start + end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        Some(DiscoveredServer { json_port, cli_port })
+    }
+}
+
+fn parse_u16(s: &str) -> Result<u16, ()> {
+    let mut res: u16 = 0;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() {
+            return Err(());
+        }
+        res = res.checked_mul(10).ok_or(())?.checked_add((b - b'0') as u16).ok_or(())?;
+    }
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +583,18 @@ mod tests {
         assert_eq!(len, 28);
         assert_eq!(&buf[0..4], b"STAT");
         assert_eq!(&buf[8..12], b"STMs");
+    }
+
+    #[test]
+    fn test_discovery_query_and_response() {
+        let mut query = [0u8; 32];
+        let qlen = DiscoveryBuilder::build_query(&mut query).unwrap();
+        assert_eq!(&query[..qlen], b"eJSON\0CLIP\0");
+
+        // Server response packet
+        let response = b"EJSON9000\0CLIP9090\0";
+        let server = DiscoveryParser::parse_response(response).unwrap();
+        assert_eq!(server.json_port, 9000);
+        assert_eq!(server.cli_port, 9090);
     }
 }

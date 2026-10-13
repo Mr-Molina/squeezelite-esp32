@@ -3,6 +3,7 @@
 //! Main application engine for Louder-ESP32-Plus audio streamer.
 
 pub mod board;
+pub mod network;
 
 pub use squeezelite_audio_core::{AudioRingBuffer, Equalizer, VolumeScale};
 pub use squeezelite_cyd_link::{CydLinkProtocol, CydMessage, PlayState};
