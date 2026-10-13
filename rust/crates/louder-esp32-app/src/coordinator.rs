@@ -6,7 +6,7 @@
 use squeezelite_audio_core::output::AudioOutputSink;
 use squeezelite_audio_core::VolumeScale;
 use squeezelite_cyd_link::{CydMessage, PlayState};
-use squeezelite_decoders::{Mp3Decoder, PcmDecoder};
+use squeezelite_decoders::{FlacDecoder, Mp3Decoder, PcmDecoder};
 use squeezelite_proto::{
     sample_rate_from_index, AudioFormat, Endianness, ServerCommand,
     StatEvent, StreamCommandType,
@@ -87,6 +87,9 @@ impl PlayerCoordinator {
                             }
                             AudioFormat::Mp3 => {
                                 pipeline.set_decoder(ActiveDecoder::Mp3(Box::new(Mp3Decoder::new())));
+                            }
+                            AudioFormat::Flac => {
+                                pipeline.set_decoder(ActiveDecoder::Flac(Box::new(FlacDecoder::new())));
                             }
                             _ => {
                                 // Default to PCM decoder

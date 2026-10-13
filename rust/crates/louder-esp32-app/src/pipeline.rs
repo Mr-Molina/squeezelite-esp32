@@ -12,6 +12,7 @@ use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 pub enum ActiveDecoder {
     Pcm(PcmDecoder),
     Mp3(Box<squeezelite_decoders::Mp3Decoder>),
+    Flac(Box<squeezelite_decoders::FlacDecoder>),
 }
 
 impl AudioDecoder for ActiveDecoder {
@@ -23,6 +24,7 @@ impl AudioDecoder for ActiveDecoder {
         match self {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
+            Self::Flac(d) => d.decode(encoded_in, pcm_out),
         }
     }
 
@@ -30,6 +32,7 @@ impl AudioDecoder for ActiveDecoder {
         match self {
             Self::Pcm(d) => d.flush(),
             Self::Mp3(d) => d.flush(),
+            Self::Flac(d) => d.flush(),
         }
     }
 }

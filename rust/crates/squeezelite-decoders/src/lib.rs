@@ -5,7 +5,10 @@
 //! - High-speed zero-copy `PcmDecoder`
 //! - Extensible frame routing and sample normalization
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(feature = "std")]
+extern crate std;
 
 use core::fmt;
 
@@ -210,6 +213,103 @@ impl AudioDecoder for Mp3Decoder {
     }
 }
 
+#[cfg(feature = "std")]
+/// Pure-Rust FLAC Decoder using claxon.
+pub struct FlacDecoder {
+    pub sample_rate: u32,
+    pub bits_per_sample: u32,
+    pub channels: u32,
+}
+
+#[cfg(feature = "std")]
+impl Default for FlacDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
+impl FlacDecoder {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            channels: 2,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AudioDecoder for FlacDecoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        if encoded_in.len() < 4 {
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let cursor = std::io::Cursor::new(encoded_in);
+        match claxon::FlacReader::new(cursor) {
+            Ok(mut reader) => {
+                let info = reader.streaminfo();
+                self.sample_rate = info.sample_rate;
+                self.bits_per_sample = info.bits_per_sample;
+                self.channels = info.channels;
+
+                let mut frames_out = 0;
+                let max_frames = pcm_out.len() / 2;
+                let mut block_buf = std::vec::Vec::new();
+
+                let shift = match self.bits_per_sample {
+                    16 => 16,
+                    24 => 8,
+                    32 => 0,
+                    _ => 16,
+                };
+
+                let mut blocks = reader.blocks();
+                while let Ok(Some(block)) = blocks.read_next_or_eof(block_buf) {
+                    let block_len = block.len() as usize;
+                    let to_copy = core::cmp::min(block_len, max_frames.saturating_sub(frames_out));
+
+                    if self.channels == 2 {
+                        for i in 0..to_copy {
+                            let l = block.sample(0, i as u32) << shift;
+                            let r = block.sample(1, i as u32) << shift;
+                            pcm_out[(frames_out + i) * 2] = l;
+                            pcm_out[(frames_out + i) * 2 + 1] = r;
+                        }
+                    } else {
+                        for i in 0..to_copy {
+                            let s = block.sample(0, i as u32) << shift;
+                            pcm_out[(frames_out + i) * 2] = s;
+                            pcm_out[(frames_out + i) * 2 + 1] = s;
+                        }
+                    }
+
+                    frames_out += to_copy;
+                    block_buf = block.into_buffer();
+                    if frames_out >= max_frames {
+                        break;
+                    }
+                }
+
+                let consumed = encoded_in.len();
+                Ok((consumed, frames_out))
+            }
+            Err(claxon::Error::FormatError(_)) => Err(DecoderError::CorruptedFrame),
+            Err(claxon::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(DecoderError::NeedMoreData)
+            }
+            Err(_) => Err(DecoderError::NeedMoreData),
+        }
+    }
+
+    fn flush(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +352,15 @@ mod tests {
     fn test_mp3_insufficient_data() {
         let mut decoder = Mp3Decoder::new();
         let encoded = [0u8; 4];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_flac_insufficient_data() {
+        let mut decoder = FlacDecoder::new();
+        let encoded = [0u8; 3];
         let mut pcm_out = [0i32; 32];
         assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
     }
