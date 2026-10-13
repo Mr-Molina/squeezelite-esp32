@@ -2,6 +2,26 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-13 | Antigravity Orchestrator | Pure-Rust AAC (syom) & Ogg-Vorbis (lewton) Decoders (MK5-Rust)
+**Agent**: Antigravity Orchestrator
+**Host OS**: Windows 11
+**Branch**: `MK5-Rust`
+**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8) & Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8)
+**Verification Suite**: 37/37 Automated Tests Passing + 0 Clippy Warnings (`cargo clippy -D warnings`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
+
+### Completed This Session
+- **Pure-Rust AAC Decoder Integration**:
+  - `squeezelite-decoders`: Implemented `AacDecoder` using `syom` (zero dependencies, 100% safe pure Rust) with ADTS frame parsing, planar float normalization to 32-bit interleaved PCM, and unit test `test_aac_insufficient_data`.
+- **Pure-Rust Ogg Vorbis Decoder Integration**:
+  - `squeezelite-decoders`: Implemented `VorbisDecoder` using `lewton` (`#![forbid(unsafe_code)]`, pure Rust) with interleaved sample unpacking to 32-bit PCM and unit test `test_vorbis_insufficient_data`.
+- **Pipeline & Coordinator Routing**:
+  - `louder-esp32-app`: Added `ActiveDecoder::Aac` and `ActiveDecoder::Vorbis` to `StreamPipeline` and mapped `AudioFormat::Aac` and `AudioFormat::Ogg` in `PlayerCoordinator`.
+- **Workspace Verification & Quality Gate**:
+  - 37/37 unit, integration, and stress tests passing (`cargo test --workspace`).
+  - Strict Clippy check: 0 errors, 0 warnings (`cargo clippy --workspace --all-targets -- -D warnings`).
+  - Walkthrough artifact updated at `walkthrough.md`.
+
 ## 2026-10-13 | Antigravity Orchestrator | Interactive CydController & 1,000,000-Sample Stress Suite (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11
