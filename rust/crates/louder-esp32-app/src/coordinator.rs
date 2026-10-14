@@ -12,7 +12,9 @@ use squeezelite_proto::{
     StatEvent, StreamCommandType,
 };
 
-use crate::network::SlimprotoClient;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use crate::network::{HttpAudioStream, SlimprotoClient};
 use crate::pipeline::{ActiveDecoder, StreamPipeline};
 
 /// Helper trait to construct `PcmDecoder` with standard configuration.
@@ -55,6 +57,7 @@ pub struct PlayerCoordinator {
     pub current_sample_rate: u32,
     pub buffer_threshold_bytes: usize,
     pub autostart: bool,
+    pub audio_stream: Option<HttpAudioStream>,
 }
 
 impl PlayerCoordinator {
@@ -72,6 +75,7 @@ impl PlayerCoordinator {
             current_sample_rate: 44100,
             buffer_threshold_bytes: 0,
             autostart: true,
+            audio_stream: None,
         }
     }
 
@@ -136,11 +140,33 @@ impl PlayerCoordinator {
                 pcm_channels,
                 pcm_endianness,
                 threshold_kb,
+                server_port,
+                server_ip,
+                http_headers,
                 ..
             } => {
                 match command {
                     StreamCommandType::Start => {
+                        self.audio_stream = None;
                         self.autostart = autostart;
+
+                        if server_port > 0 && !http_headers.is_empty() {
+                            let ip = if server_ip == [0, 0, 0, 0] {
+                                client
+                                    .peer_addr()
+                                    .map(|a| a.ip())
+                                    .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                            } else {
+                                IpAddr::V4(Ipv4Addr::from(server_ip))
+                            };
+                            if let Ok(headers_str) = core::str::from_utf8(http_headers) {
+                                if let Ok(http_stream) =
+                                    HttpAudioStream::connect(SocketAddr::new(ip, server_port), headers_str)
+                                {
+                                    self.audio_stream = Some(http_stream);
+                                }
+                            }
+                        }
 
                         let sample_rate = Self::decode_pcm_sample_rate_hz(pcm_sample_rate)
                             .unwrap_or_else(|| sample_rate_from_index(pcm_sample_rate));
@@ -248,6 +274,7 @@ impl PlayerCoordinator {
                     StreamCommandType::Stop => {
                         self.state = PlayerState::Stopped;
                         self.buffer_threshold_bytes = 0;
+                        self.audio_stream = None;
                         pipeline.sink.set_mute(true);
                         client.send_stat(
                             StatEvent::TrackStopped,
@@ -261,6 +288,7 @@ impl PlayerCoordinator {
                     }
                     StreamCommandType::Flush => {
                         self.buffer_threshold_bytes = 0;
+                        self.audio_stream = None;
                         if self.state == PlayerState::Buffering {
                             self.state = PlayerState::Stopped;
                         }
@@ -300,6 +328,7 @@ impl PlayerCoordinator {
             }
             ServerCommand::Flush => {
                 self.buffer_threshold_bytes = 0;
+                self.audio_stream = None;
                 if self.state == PlayerState::Buffering {
                     self.state = PlayerState::Stopped;
                 }
@@ -323,6 +352,27 @@ impl PlayerCoordinator {
         }
     }
 
+    /// Polls incoming HTTP audio bytes from the active `HttpAudioStream` and pushes them into the pipeline stream buffer.
+    pub fn poll_http_stream<S: AudioOutputSink>(
+        &mut self,
+        pipeline: &mut StreamPipeline<S>,
+    ) -> std::io::Result<usize> {
+        if let Some(ref mut http) = self.audio_stream {
+            let avail_write = pipeline.stream_buffer.available_write();
+            if avail_write == 0 {
+                return Ok(0);
+            }
+            let mut chunk = [0u8; 1024];
+            let max_read = avail_write.min(chunk.len());
+            let n = http.poll_audio_bytes(&mut chunk[..max_read])?;
+            if n > 0 {
+                let written = pipeline.ingest_stream_data(&chunk[..n]).unwrap_or(0);
+                return Ok(written);
+            }
+        }
+        Ok(0)
+    }
+
     /// Evaluates buffering threshold and state transitions.
     pub fn tick<S: AudioOutputSink>(&mut self, pipeline: &mut StreamPipeline<S>) {
         if self.state == PlayerState::Buffering
@@ -342,6 +392,7 @@ impl PlayerCoordinator {
         &mut self,
         pipeline: &mut StreamPipeline<S>,
     ) -> usize {
+        let _ = self.poll_http_stream(pipeline);
         self.tick(pipeline);
 
         if self.state != PlayerState::Playing {
@@ -434,7 +485,7 @@ impl PlayerCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use squeezelite_audio_core::MockAudioSink;
     use squeezelite_proto::TransitionType;
@@ -818,5 +869,159 @@ mod tests {
 
         assert_eq!(coordinator.state, PlayerState::Stopped);
         assert_eq!(coordinator.buffer_threshold_bytes, 0);
+    }
+
+    #[test]
+    fn test_coordinator_end_to_end_http_audio_streaming() {
+        use std::time::Duration;
+
+        // 1. Mock SlimProto server
+        let slim_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slim_addr = slim_listener.local_addr().unwrap();
+
+        // 2. Mock HTTP audio server
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x88];
+
+        // HTTP server thread
+        let http_handle = std::thread::spawn(move || {
+            let (mut stream, _) = http_listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = stream.read(&mut req).unwrap();
+
+            // Prepare 4 stereo frames of 16-bit Big-Endian PCM:
+            // Frame 0: (100, -100)
+            // Frame 1: (200, -200)
+            // Frame 2: (300, -300)
+            // Frame 3: (400, -400)
+            let f0 = [(100i16).to_be_bytes(), (-100i16).to_be_bytes()].concat();
+            let f1 = [(200i16).to_be_bytes(), (-200i16).to_be_bytes()].concat();
+            let f2 = [(300i16).to_be_bytes(), (-300i16).to_be_bytes()].concat();
+            let f3 = [(400i16).to_be_bytes(), (-400i16).to_be_bytes()].concat();
+
+            let mut pcm_payload = Vec::new();
+            pcm_payload.extend_from_slice(&f0);
+            pcm_payload.extend_from_slice(&f1);
+            pcm_payload.extend_from_slice(&f2);
+            pcm_payload.extend_from_slice(&f3);
+
+            let header = b"HTTP/1.0 200 OK\r\nContent-Type: audio/basic\r\n\r\n";
+            stream.write_all(header).unwrap();
+            stream.write_all(&pcm_payload).unwrap();
+            stream.flush().unwrap();
+
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        // Client thread
+        let client_handle = std::thread::spawn(move || {
+            let mut client = SlimprotoClient::connect(slim_addr, mac, "TestPlayer").unwrap();
+            let mut coordinator = PlayerCoordinator::new(mac, "TestPlayer");
+
+            let mut stream_storage = [0u8; 4096];
+            let mut output_storage = [0u8; 4096];
+            let pcm_dec = PcmDecoder::new(16, 2, true);
+            let sink = MockAudioSink::<64>::new();
+            let mut pipeline = StreamPipeline::new(
+                &mut stream_storage,
+                &mut output_storage,
+                ActiveDecoder::Pcm(pcm_dec),
+                sink,
+                44100,
+            );
+
+            let http_get_req = format!(
+                "GET /stream.pcm HTTP/1.0\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                http_addr.port()
+            );
+
+            let start_cmd = ServerCommand::Stream {
+                command: StreamCommandType::Start,
+                autostart: true,
+                format: AudioFormat::Pcm,
+                pcm_sample_size: 16,
+                pcm_sample_rate: 3, // 44100 Hz
+                pcm_channels: 2,
+                pcm_endianness: Endianness::BigEndian,
+                threshold_kb: 0,
+                spdif_enable: false,
+                trans_duration: 0,
+                trans_type: TransitionType::None,
+                flags: 0,
+                output_threshold: 0,
+                replay_gain: 0,
+                server_port: http_addr.port(),
+                server_ip: [127, 0, 0, 1],
+                http_headers: http_get_req.as_bytes(),
+            };
+
+            let cyd_msg = coordinator
+                .handle_command(start_cmd, &mut pipeline, &mut client, 100)
+                .unwrap();
+            assert_eq!(cyd_msg, Some(CydMessage::PlaybackState(PlayState::Playing)));
+            assert_eq!(coordinator.state, PlayerState::Playing);
+            assert!(coordinator.audio_stream.is_some());
+
+            // Process audio steps until all 4 frames are decoded and recorded
+            let start = std::time::Instant::now();
+            let mut total_frames = 0;
+            while total_frames < 4 && start.elapsed() < Duration::from_secs(3) {
+                let frames = coordinator.process_audio_step(&mut pipeline);
+                total_frames += frames;
+                if frames == 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+
+            assert_eq!(total_frames, 4);
+            let samples = pipeline.sink.recorded_samples();
+            assert!(samples.len() >= 8);
+            assert_eq!(samples[0], 100 << 16);
+            assert_eq!(samples[1], -100 << 16);
+            assert_eq!(samples[2], 200 << 16);
+            assert_eq!(samples[3], -200 << 16);
+            assert_eq!(samples[4], 300 << 16);
+            assert_eq!(samples[5], -300 << 16);
+            assert_eq!(samples[6], 400 << 16);
+            assert_eq!(samples[7], -400 << 16);
+
+            // Test Stop command clears audio_stream
+            let stop_cmd = ServerCommand::Stream {
+                command: StreamCommandType::Stop,
+                autostart: false,
+                format: AudioFormat::Pcm,
+                pcm_sample_size: 16,
+                pcm_sample_rate: 3,
+                pcm_channels: 2,
+                pcm_endianness: Endianness::BigEndian,
+                threshold_kb: 0,
+                spdif_enable: false,
+                trans_duration: 0,
+                trans_type: TransitionType::None,
+                flags: 0,
+                output_threshold: 0,
+                replay_gain: 0,
+                server_port: 0,
+                server_ip: [0, 0, 0, 0],
+                http_headers: &[],
+            };
+            let _ = coordinator
+                .handle_command(stop_cmd, &mut pipeline, &mut client, 200)
+                .unwrap();
+            assert!(coordinator.audio_stream.is_none());
+            assert_eq!(coordinator.state, PlayerState::Stopped);
+        });
+
+        // Mock SlimProto server: accept HELO and STAT
+        let (mut server_stream, _) = slim_listener.accept().unwrap();
+        let mut buf = [0u8; 128];
+        let _ = server_stream.read(&mut buf).unwrap(); // HELO
+        let _ = server_stream.read(&mut buf).unwrap(); // STAT STMs
+
+        http_handle.join().unwrap();
+        client_handle.join().unwrap();
     }
 }

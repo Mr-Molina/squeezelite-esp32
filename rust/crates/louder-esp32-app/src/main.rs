@@ -1,13 +1,16 @@
 //! Louder-ESP32-Plus Application Entrypoint
 //!
 //! Initializes board hardware profiles, starts audio streaming pipeline,
-//! and orchestrates SlimProto network connection with TAS5825M digital amplifier.
+//! and orchestrates SlimProto network connection with TAS5805M/TAS5825M digital amplifier.
 
 use louder_esp32_app::board::{pins, BoardModel};
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
-use louder_esp32_app::sink::NullAudioSink;
-use louder_esp32_app::PlayerCoordinator;
-use squeezelite_config::{AudioConfig, MemConfigStore};
+use louder_esp32_app::sink::{BitDepth, EspI2sSink, LoopbackI2sDma};
+use louder_esp32_app::{
+    AmpManager, CydMessage, CydUartBridge, LoopbackUartPort, MemConfigStore,
+    MemFlashPartition, NvsFlashBackend, PlayState, PlayerCoordinator, TargetI2cBus,
+};
+use squeezelite_config::AudioConfig;
 use squeezelite_decoders::PcmDecoder;
 
 fn main() {
@@ -21,12 +24,48 @@ fn main() {
     println!("  - TAS58xx Power:    PWDN={}, FAULT={}", pins::TAS58XX_PWDN, pins::TAS58XX_FAULT);
     println!("--------------------------------------------------------");
 
-    // Allocate heap-backed audio stream and output buffers (APP-001: avoid FreeRTOS task stack overflow)
+    // 1. Dual-Sector Flash NVS Backend & Configuration Storage (INFRA-801)
+    let flash_partition = MemFlashPartition::new();
+    let mut nvs_backend = NvsFlashBackend::new(flash_partition);
+    let mut config_store = MemConfigStore::<16>::new();
+
+    let mut audio_cfg = AudioConfig::default();
+    audio_cfg.player_name.clear();
+    let raw_name = board.name();
+    let safe_len = raw_name.floor_char_boundary(32.min(raw_name.len()));
+    let _ = audio_cfg.player_name.push_str(&raw_name[..safe_len]);
+    audio_cfg.save_to(&mut config_store).expect("Failed to serialize AudioConfig");
+
+    let initial_seq = nvs_backend.commit_store(&config_store).expect("Failed to commit dual-sector NVS");
+    println!("Dual-Sector Flash NVS Backend:");
+    println!("  - Active Sector Sequence: {}", initial_seq);
+    println!("  - Key-Value Entries:      {}", config_store.len());
+
+    // Verify persistence across dual-sector flash journal
+    let mut verify_store = MemConfigStore::<16>::new();
+    nvs_backend.load_store(&mut verify_store).expect("Failed to reload from dual-sector flash");
+    let verified_audio = AudioConfig::load_from(&verify_store).expect("Failed to deserialize AudioConfig");
+    println!("  - Verified Node Name:     {}", verified_audio.player_name);
+    println!("--------------------------------------------------------");
+
+    // 2. Hardware/Target I2C Bus Adapter and TAS5805M Amplifier Lifecycle Manager
+    let i2c_bus = TargetI2cBus::new();
+    let mut amp = AmpManager::for_active_board(i2c_bus);
+    amp.initialize(BitDepth::Bits32.bits()).expect("Failed to initialize TAS5805M amplifier");
+    amp.start_playback().expect("Failed to start playback mode on TAS5805M");
+    println!("TAS5805M Digital Amplifier Subsystem:");
+    println!("  - Mode:         {:?}", amp.mode());
+    println!("  - Volume:       -24 dB (0x{:02X})", amp.current_volume());
+    println!("  - Fault Status: {:?}", amp.check_faults().unwrap_or(None));
+    println!("--------------------------------------------------------");
+
+    // 3. Allocate heap-backed audio stream and output buffers (APP-001: avoid FreeRTOS task stack overflow)
     let mut stream_storage = vec![0u8; 64 * 1024]; // 64 KB heap stream buffer
     let mut output_storage = vec![0u8; 64 * 1024]; // 64 KB heap output buffer
 
-    // Initialize audio sink (Null sink for host / fallback, hardware I2S on target)
-    let sink = NullAudioSink::new(44100);
+    // Initialize pure-Rust I2S DMA Audio Sink
+    let i2s_driver = LoopbackI2sDma::new(44100);
+    let sink = EspI2sSink::for_active_board(i2s_driver, 44100);
     let pcm_dec = PcmDecoder::new(16, 2, true);
 
     let pipeline = StreamPipeline::new(
@@ -37,14 +76,7 @@ fn main() {
         44100,
     );
 
-    // Deterministic node initialization and configuration storage (INFRA-801)
-    let mut config_store = MemConfigStore::<16>::new();
-    let mut audio_cfg = AudioConfig::default();
-    audio_cfg.player_name.clear();
-    let _ = audio_cfg.player_name.push_str(board.name());
-    let _ = audio_cfg.save_to(&mut config_store);
-
-    // Derive deterministic MAC address from Sonocotta OUI prefix (24:0A:C4) and board hardware model (INFRA-801)
+    // 4. Derive deterministic MAC address from Sonocotta OUI prefix (24:0A:C4) and board hardware model (INFRA-801)
     let suffix = match board {
         BoardModel::LouderEsp32Wrover => 0x01,
         BoardModel::LouderEsp32PlusS3 => 0x02,
@@ -60,7 +92,7 @@ fn main() {
     println!("  - Buffers:     {} bytes stream, {} bytes output", pipeline.stream_buffer_available(), pipeline.output_buffer_available());
     println!("--------------------------------------------------------");
 
-    // Initialize Wi-Fi Manager and check persistent configuration
+    // 5. Initialize Wi-Fi Manager and check persistent configuration
     let wifi = louder_esp32_app::wifi::WifiManager::with_store(config_store);
     println!("Wi-Fi Subsystem (Key-Value NVS):");
     println!("  - State:       {}", wifi.state());
@@ -69,6 +101,16 @@ fn main() {
     } else {
         println!("  - Stored SSID: [None - Ready for CYD / Serial Provisioning]");
     }
+    println!("--------------------------------------------------------");
+
+    // 6. CYD UART Bridge initialization and initial frame transmission
+    let uart_port = LoopbackUartPort::new();
+    let mut cyd_bridge = CydUartBridge::new(uart_port);
+    let tx_bytes = cyd_bridge
+        .send_message(&CydMessage::PlaybackState(PlayState::Stopped))
+        .expect("Failed to send initial playback state to CYD");
+    println!("CYD Display UART Bridge:");
+    println!("  - Sent Initial Frame: STATE=S ({} bytes)", tx_bytes);
     println!("--------------------------------------------------------");
     println!("Ready for LMS auto-discovery on UDP 3483...");
 }

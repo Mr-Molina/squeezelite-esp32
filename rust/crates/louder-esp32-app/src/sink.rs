@@ -7,6 +7,8 @@
 
 use squeezelite_audio_core::output::{AudioOutputSink, OutputError};
 
+pub use crate::hal::{BitDepth, EspI2sSink, I2sDmaDriver, I2sFormat, LoopbackI2sDma};
+
 /// A sink that silently discards audio frames while counting throughput.
 #[derive(Debug, Default)]
 pub struct NullAudioSink {
