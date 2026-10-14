@@ -2,6 +2,30 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-14 | Antigravity Orchestrator | Pass 3 `/deep-code-audit` (88 Findings Remediated), Bare-Metal Xtensa ESP32 Build & Live CYD Hardware Verification on `COM13` (MK5-Rust)
+**Agent**: Antigravity Orchestrator
+**Host OS**: Windows 11
+**Branch**: `MK5-Rust`
+**Hardware Targets**: Cheap Yellow Display (`ESP32-2432S028R` v3.1 on `COM13`, MAC `68:09:47:f8:a1:90`), Louder-ESP32 (`ESP32-WROVER-N8R8`), & Louder-ESP32-Plus (`ESP32-S3-WROOM-N8R8`)
+**Verification Suite**: 206/206 Automated Tests Passing across all 8 Workspace Crates + 0 Clippy Warnings on Host (`cargo clippy --workspace --all-targets --all-features -- -D warnings`) and Xtensa (`cargo +esp clippy --workspace -- -D warnings`) + Live `COM13` HIL 5/5 Pass
+**Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
+
+### Completed This Session
+- **Espressif Xtensa Rust Toolchain & Bare-Metal Target Enablement (`xtensa-esp32-none-elf`)**:
+  - Installed the Espressif Xtensa Rust toolchain (`espup` + `espflash` + `cargo +esp`, `rustc 1.97.0-nightly`) and wired bare-metal `esp-hal 1.0.0`, `esp-backtrace`, and `esp-println` into `cyd-controller-app` for the physical `ESP32-2432S028R` (`COM13`).
+- **Full 6-Phase `/deep-code-audit` & Complete 88-Finding Remediation (`16 CRITICAL`, `36 HIGH`, `23 MEDIUM`, `13 LOW`)**:
+  - **CYD Display, Touch, Bitmap Font UI & UART2 (`cyd-controller-app`, `squeezelite-cyd-link`)**:
+    - Embedded a 95-glyph **8×8 ASCII Bitmap Font** (`FONT_8X8`) and zero-heap scanline text rasterizer (`draw_text_box` at `1×` and `2×` scale) in `ui.rs` so all status pills (`[STANDBY]`, `IP: 0.0.0.0`, `ONLINE`/`OFFLINE`), track metadata, timestamps, transport icons (`|<<`, `PLAY`/`PAUSE`, `>>|`), and `VOL: XXX%` render as sharp, readable characters (`UI-201..202`).
+    - Implemented dirty-region incremental redrawing (`DIRTY_STATUS`, `DIRTY_TRACK`, `DIRTY_PROGRESS`, `DIRTY_TRANSPORT`, `DIRTY_VOLUME`, `render_dirty_regions`) and optimistic standalone touch feedback (`UI-204..208`).
+    - Hardened `Ili9341Display::flush` against partial scanline buffer starvation (`DRV-101`), added explicit `INVOFF (0x20)` / `set_display_inversion` / `set_bgr_order` (`DRV-102..103`), and implemented `Xpt2046Touch` landscape calibration, median/trimmed-mean outlier filtering, and 2 µs SAR ADC SCLK settling (`DRV-104..106`).
+    - Initialized physical `peripherals.UART2` (`TX=GPIO27`, `RX=GPIO22` with internal pull-up `Pull::Up` to prevent floating-pin framing interrupts when CN1 is unconnected, `460,800` baud), cleared synthetic `"Bohemian Rhapsody"` test data after `[HIL 5/5]` (`UI-203`), and implemented dual `CMD=` / NDJSON wire-format interoperability (`COMMS-301..313`).
+  - **Louder-ESP32 Player, Audio Core, Pure-Rust Decoders, SlimProto & Flash Config**:
+    - Fixed `EspI2sSink::write_frames` partial 8-byte stereo frame completion (`HALNET-402`), blocking `write_all` before `set_nonblocking(true)` in `SlimprotoClient` and `HttpAudioStream` (`HALNET-403..406`), 8192-sample `PCM_SCRATCH_SAMPLES` & corrupt frame 1-byte resync (`PIPE-501..502`), and short-clip EOF buffering exit + `STMs`/`STMu` emissions in `PlayerCoordinator` (`COORD-501..510`).
+    - Added `AmpManager::set_volume_percent` (`0% -> 0xFF Mute`, `1..=100% -> 0xCF..=0x30 Unity 0 dB`, `PERIPH-601`), TI TAS5805M fault bitmasks & 3-step `Hi-Z -> FAULT_CLEAR -> Play` recovery (`PERIPH-602..604`), and `Debug` password redaction (`PERIPH-608`, `PROTOCFG-810`).
+    - Fixed MP3 synchsafe ID3v2 header skipping & `NoFrame` progress advancement (`AUDIO-702`), AAC/Vorbis overflow sample retention (`AUDIO-703`, `AUDIO-705`), single-pass `FlacByteReader` block decoding (`AUDIO-704`, `AUDIO-709`), `AudioRingBuffer` `rewindable` clamping (`AUDIO-706`), and SlimProto `setd` / `STMr` / 53-byte `StatBuilder` + NVS `validate()` enforcement (`PROTOCFG-801..809`).
+- **Live Hardware Verification on `COM13` (`ESP32-2432S028R`)**:
+  - Cross-compiled `cyd-controller-app` (`162,320` bytes / `3.93%` flash), flashed `COM13` via `espflash`, and verified live `115,200` baud telemetry confirming `5/5 HARDWARE-IN-THE-LOOP TESTS PASSED ON ESP32 CYD` (`cmds=2219, spi_bytes=707978, flushes=732, bl=100%`) and `[READY] CYD Display Reset to STANDBY/OFFLINE — Entering Real-Time UART2 & Touch Loop`.
+
 ## 2026-10-14 | Antigravity Orchestrator | Complete 8-Crate Pure-Rust Stack: Player (`louder-esp32-app`), CYD Display (`cyd-controller-app`), HTTP Audio Stream, HAL Bridges & Dual-Pass Audit (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11
