@@ -120,6 +120,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyd-controller-app"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "heapless",
+ "squeezelite-cyd-link",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,12 @@
+[package]
+name = "cyd-controller-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure-Rust display and touch firmware for CYD (Cheap Yellow Display ESP32-2432S028R)"
+
+[dependencies]
+squeezelite-cyd-link = { path = "../squeezelite-cyd-link" }
+heapless = { workspace = true }
+embedded-hal = { workspace = true }

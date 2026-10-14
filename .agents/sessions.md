@@ -2,15 +2,21 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
-## 2026-10-14 | Antigravity Orchestrator | End-to-End Pure-Rust Stack: HTTP Audio Stream, HAL Bridges & Dual-Pass Audit (MK5-Rust)
+## 2026-10-14 | Antigravity Orchestrator | Complete 8-Crate Pure-Rust Stack: Player (`louder-esp32-app`), CYD Display (`cyd-controller-app`), HTTP Audio Stream, HAL Bridges & Dual-Pass Audit (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11
 **Branch**: `MK5-Rust`
-**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8) & Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8)
-**Verification Suite**: 143/143 Automated Tests Passing (Unit, Integration, 1M-Sample Stress, and 29 Proptest Fuzz Suites) + 0 Clippy Warnings (`cargo clippy --workspace --all-targets --all-features -- -D warnings`)
+**Hardware Targets**: Louder-ESP32 (ESP32-WROVER-N8R8), Louder-ESP32-Plus (ESP32-S3-WROOM-N8R8), & Cheap Yellow Display (`ESP32-2432S028R`)
+**Verification Suite**: 176/176 Automated Tests Passing across all 8 Workspace Crates (Unit, Integration, 1M-Sample Stress, and 29 Proptest Fuzz Suites) + 0 Clippy Warnings (`cargo clippy --workspace --all-targets --all-features -- -D warnings`)
 **Code Hygiene Gates**: UNCONDITIONAL PASS (Invariants 13, 24, 37, 39 Certified)
 
 ### Completed This Session
+- **Pure-Rust CYD Display Controller Firmware (`crates/cyd-controller-app`)**:
+  - Ported the legacy C `cyd-controller/` project (`ili9341`, `xpt2046`, `cyd_uart`, `ui_theme`, `ui_now_playing`, `main.c`) into a `#![forbid(unsafe_code)]`, `#![no_std]` crate (`cyd-controller-app`) in the `rust/` Cargo workspace.
+  - `drivers.rs`: `Ili9341Display<B: SpiDisplayBus>` (320×240 TFT HSPI `MOSI=13, MISO=12, SCLK=14, CS=15, DC=2, BL=21`, 21-command init sequence, inverted coordinate normalization, viewport clamping, 4096-byte chunked `CASET`/`PASET`/`RAMWR` flush, 10-bit PWM backlight) and `Xpt2046Touch<B: TouchSpiBus>` (Touch VSPI `MOSI=32, MISO=39, SCLK=25, CS=33, IRQ=36`, 5-sample filtering `100..=4050`, calibration to 320×240).
+  - `comms.rs`: `CydDisplayLink` & `CydTelemetryState` (UART2 `TX=27, RX=22` at `460,800` baud, consuming `squeezelite-cyd-link` frames and legacy JSON telemetry, 256-byte line overflow discard protection, 5s heartbeat timeout detection, and 3s `CMD=STATUS\n` resync polling).
+  - `ui.rs`: `NowPlayingUi` (320×240 dark theme with `0x1DB954` Spotify green accent, `MM:SS`/`HH:MM:SS` formatting, 10 Hz / 100ms volume slider throttling with wraparound safety and release-edge flush, and touch hit-box routing for `Prev`, `PlayPause`, `Next`, and `VolumeSlider`).
+  - Verified 33/33 unit tests passing in `cyd-controller-app`.
 - **Pure-Rust HTTP Audio Stream Client & Coordinator Integration (`network.rs`, `coordinator.rs`)**:
   - Implemented `HttpAudioStream` in `network.rs` with non-blocking `TcpStream`, HTTP GET request dispatch, bounded 4 KB HTTP/ICY 200 header parser/stripper, and `poll_audio_bytes` streaming.
   - Integrated `HttpAudioStream` into `PlayerCoordinator`: automatically connects on `StreamCommandType::Start` (using `server_ip`/`server_port` or falling back to `client.peer_addr()`), pumps audio chunks into `pipeline.stream_buffer` via `poll_http_stream()`, and closes on `Stop`/`Flush`.
@@ -21,7 +27,7 @@
   - `NvsFlashBackend<F: FlashPartition>` & `MemFlashPartition`: Atomic dual-sector (`Sector A` / `Sector B`) NVS persistence backed by `FlashJournal`.
   - `TargetI2cBus`: `embedded-hal` I2C bus adapter driving `AmpManager` (`PowerDown -> Standby -> Play`) in `main.rs`.
 - **Pass 1 (`78` Findings) & Pass 2 (`67` Findings) Deep Code Audit**:
-  - Remediated all 145 findings across all 7 workspace crates and verified all 37 `CRITICAL`/`HIGH` Pass-2 patches via Red-Team vs. Blue-Team Adversarial Bypass Duels.
+  - Remediated all 145 findings across the workspace and verified all 37 `CRITICAL`/`HIGH` Pass-2 patches via Red-Team vs. Blue-Team Adversarial Bypass Duels.
 
 ## 2026-10-13 | Antigravity Orchestrator | Pure-Rust Key-Value Storage & NVS Flash Journal (MK5-Rust)
 **Agent**: Antigravity Orchestrator
