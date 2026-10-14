@@ -39,6 +39,7 @@ pub trait SpiDisplayBus {
 #[derive(Debug, Clone)]
 pub struct MockSpiDisplayBus {
     pub commands: heapless::Vec<u8, 64>,
+    pub last_data: heapless::Vec<u8, 64>,
     pub total_data_bytes: usize,
     pub duty_10bit: u16,
 }
@@ -47,6 +48,7 @@ impl Default for MockSpiDisplayBus {
     fn default() -> Self {
         Self {
             commands: heapless::Vec::new(),
+            last_data: heapless::Vec::new(),
             total_data_bytes: 0,
             duty_10bit: 1023,
         }
@@ -60,6 +62,10 @@ impl SpiDisplayBus for MockSpiDisplayBus {
 
     fn send_data(&mut self, data: &[u8]) {
         self.total_data_bytes += data.len();
+        self.last_data.clear();
+        for &b in data.iter().take(64) {
+            let _ = self.last_data.push(b);
+        }
     }
 
     fn set_backlight_duty(&mut self, duty_10bit: u16) {
@@ -103,7 +109,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         self.bus
     }
 
-    /// Whether display has been initialized with the 21-command sequence.
+    /// Whether display has been initialized with the initialization sequence.
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
@@ -123,7 +129,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         self.backlight_percent
     }
 
-    /// Execute the full 21-command ILI9341 initialization sequence for 320x240 landscape mode.
+    /// Execute the full ILI9341 initialization sequence for 320x240 landscape mode.
     pub fn init(&mut self) {
         // 1. Software Reset
         self.bus.send_cmd(0x01);
@@ -189,9 +195,11 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
             0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36,
             0x0F,
         ]);
-        // 21. Sleep OUT
+        // 21. Display Inversion OFF (INVOFF)
+        self.bus.send_cmd(0x20);
+        // 22. Sleep OUT (SLPOUT)
         self.bus.send_cmd(0x11);
-        // 22. Display ON
+        // 23. Display ON (DISPON)
         self.bus.send_cmd(0x29);
 
         // Turn backlight on to 100% duty
@@ -199,10 +207,30 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         self.initialized = true;
     }
 
+    /// Configure hardware display color inversion (`0x21` = INVON, `0x20` = INVOFF).
+    pub fn set_display_inversion(&mut self, inverted: bool) {
+        if inverted {
+            self.bus.send_cmd(0x21);
+        } else {
+            self.bus.send_cmd(0x20);
+        }
+    }
+
+    /// Configure MADCTL RGB/BGR color channel order in landscape mode (`0x28` = BGR, `0x20` = RGB).
+    pub fn set_bgr_order(&mut self, bgr: bool) {
+        self.bus.send_cmd(0x36);
+        if bgr {
+            self.bus.send_data(&[0x28]);
+        } else {
+            self.bus.send_data(&[0x20]);
+        }
+    }
+
     /// Flush a rectangular pixel buffer to the display memory.
     ///
     /// Validates and normalizes coordinates, rejects fully out-of-bounds windows,
-    /// clamps to screen boundaries, and transmits CASET, PASET, and RAMWR chunks.
+    /// clamps to screen boundaries and available `color_data.len()`, and transmits
+    /// CASET, PASET, and RAMWR chunks.
     pub fn flush(&mut self, mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, color_data: &[u16]) {
         if color_data.is_empty() {
             return;
@@ -239,6 +267,16 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
             return;
         }
 
+        let width = x2 - x1 + 1;
+        let height = y2 - y1 + 1;
+        let pixel_count = (width * height) as usize;
+        if color_data.len() < pixel_count {
+            y2 = y1 + (color_data.len() as i32 / width) - 1;
+            if y2 < y1 {
+                return;
+            }
+        }
+
         self.last_flush_window = (x1, y1, x2, y2);
         self.flush_count += 1;
 
@@ -265,8 +303,8 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         // Memory Write (RAMWR: 0x2C)
         self.bus.send_cmd(0x2C);
 
-        let pixel_count = ((x2 - x1 + 1) as usize) * ((y2 - y1 + 1) as usize);
-        let count_to_send = color_data.len().min(pixel_count);
+        let clamped_pixel_count = ((x2 - x1 + 1) as usize) * ((y2 - y1 + 1) as usize);
+        let count_to_send = color_data.len().min(clamped_pixel_count);
 
         // Transmit in chunks of up to 1024 bytes (<= 4096 bytes)
         const CHUNK_SIZE: usize = 1024;
@@ -408,6 +446,9 @@ pub struct Xpt2046Touch<B: TouchSpiBus> {
     cal_x_max: i16,
     cal_y_min: i16,
     cal_y_max: i16,
+    swap_xy: bool,
+    invert_x: bool,
+    invert_y: bool,
 }
 
 impl<B: TouchSpiBus> Xpt2046Touch<B> {
@@ -419,6 +460,9 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
             cal_x_max: XPT2046_RAW_X_MAX,
             cal_y_min: XPT2046_RAW_Y_MIN,
             cal_y_max: XPT2046_RAW_Y_MAX,
+            swap_xy: false,
+            invert_x: false,
+            invert_y: false,
         }
     }
 
@@ -445,8 +489,36 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
         (self.cal_x_min, self.cal_x_max, self.cal_y_min, self.cal_y_max)
     }
 
+    /// Configure axis swapping and inversion for touch coordinate transformation.
+    pub fn set_orientation(&mut self, swap_xy: bool, invert_x: bool, invert_y: bool) {
+        self.swap_xy = swap_xy;
+        self.invert_x = invert_x;
+        self.invert_y = invert_y;
+    }
+
+    /// Configure physical orientation for the ESP32-2432S028R (CYD) 320x240 landscape mount.
+    ///
+    /// Matches `cyd-controller/main/drivers/xpt2046.c` where command `0xD0` (`raw_x`) maps
+    /// directly to `x` (`0..319`) and command `0x90` (`raw_y`) maps directly to `y` (`0..239`).
+    pub fn configure_cyd_landscape(&mut self) {
+        self.swap_xy = false;
+        self.invert_x = false;
+        self.invert_y = false;
+    }
+
+    /// Retrieve current orientation configuration: `(swap_xy, invert_x, invert_y)`.
+    pub fn orientation(&self) -> (bool, bool, bool) {
+        (self.swap_xy, self.invert_x, self.invert_y)
+    }
+
     /// Map raw 12-bit ADC coordinates into calibrated 320x240 landscape screen coordinates.
     pub fn calibrate_raw(&self, raw_x: i16, raw_y: i16) -> (i16, i16) {
+        let (rx, ry) = if self.swap_xy {
+            (raw_y, raw_x)
+        } else {
+            (raw_x, raw_y)
+        };
+
         let mut x_range = (self.cal_x_max as i32) - (self.cal_x_min as i32);
         let mut y_range = (self.cal_y_max as i32) - (self.cal_y_min as i32);
 
@@ -457,8 +529,8 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
             y_range = 1;
         }
 
-        let mut cal_x = ((raw_x as i32) - (self.cal_x_min as i32)) * (CYD_TFT_WIDTH - 1) / x_range;
-        let mut cal_y = ((raw_y as i32) - (self.cal_y_min as i32)) * (CYD_TFT_HEIGHT - 1) / y_range;
+        let mut cal_x = ((rx as i32) - (self.cal_x_min as i32)) * (CYD_TFT_WIDTH - 1) / x_range;
+        let mut cal_y = ((ry as i32) - (self.cal_y_min as i32)) * (CYD_TFT_HEIGHT - 1) / y_range;
 
         // Clamp to screen boundaries
         if cal_x < 0 {
@@ -475,29 +547,38 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
             cal_y = CYD_TFT_HEIGHT - 1;
         }
 
+        if self.invert_x {
+            cal_x = (CYD_TFT_WIDTH - 1) - cal_x;
+        }
+        if self.invert_y {
+            cal_y = (CYD_TFT_HEIGHT - 1) - cal_y;
+        }
+
         (cal_x as i16, cal_y as i16)
     }
 
-    /// Read touch sensor with multi-sample filtering.
+    /// Read touch sensor with multi-sample median / trimmed-mean filtering.
     ///
     /// Reads 5 samples, discards invalid values outside [100, 4050],
-    /// requires at least 3 valid samples, averages them, and returns calibrated coordinates.
+    /// requires at least 3 valid samples, sorts valid X and Y samples, drops the
+    /// min and max outliers, averages the remaining middle samples, and returns
+    /// calibrated screen coordinates.
     pub fn read(&mut self) -> Option<(i16, i16)> {
         if !self.bus.is_irq_low() {
             return None;
         }
 
-        let mut sum_x: i32 = 0;
-        let mut sum_y: i32 = 0;
-        let mut valid_count = 0;
+        let mut valid_x = [0i16; XPT2046_SAMPLE_COUNT];
+        let mut valid_y = [0i16; XPT2046_SAMPLE_COUNT];
+        let mut valid_count = 0usize;
 
         for _ in 0..XPT2046_SAMPLE_COUNT {
             let sx = self.bus.read_raw_12bit(0xD0);
             let sy = self.bus.read_raw_12bit(0x90);
 
             if (100..=4050).contains(&sx) && (100..=4050).contains(&sy) {
-                sum_x += sx as i32;
-                sum_y += sy as i32;
+                valid_x[valid_count] = sx as i16;
+                valid_y[valid_count] = sy as i16;
                 valid_count += 1;
             }
         }
@@ -506,8 +587,33 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
             return None;
         }
 
-        let avg_x = (sum_x / valid_count) as i16;
-        let avg_y = (sum_y / valid_count) as i16;
+        // Sort valid_x and valid_y samples via insertion sort
+        for i in 1..valid_count {
+            let mut j = i;
+            while j > 0 && valid_x[j - 1] > valid_x[j] {
+                valid_x.swap(j - 1, j);
+                j -= 1;
+            }
+            let mut k = i;
+            while k > 0 && valid_y[k - 1] > valid_y[k] {
+                valid_y.swap(k - 1, k);
+                k -= 1;
+            }
+        }
+
+        // Drop min (index 0) and max (index valid_count - 1) outliers
+        let mut sum_x: i32 = 0;
+        let mut sum_y: i32 = 0;
+        for &vx in &valid_x[1..valid_count - 1] {
+            sum_x += vx as i32;
+        }
+        for &vy in &valid_y[1..valid_count - 1] {
+            sum_y += vy as i32;
+        }
+
+        let trimmed_count = (valid_count - 2) as i32;
+        let avg_x = (sum_x / trimmed_count) as i16;
+        let avg_y = (sum_y / trimmed_count) as i16;
         Some(self.calibrate_raw(avg_x, avg_y))
     }
 }
@@ -584,7 +690,34 @@ mod tests {
     }
 
     #[test]
-    fn test_xpt2046_read_mock() {
+    fn test_xpt2046_cyd_landscape_orientation() {
+        let bus = MockTouchSpiBus::default();
+        let mut touch = Xpt2046Touch::new(bus);
+        assert_eq!(touch.orientation(), (false, false, false));
+
+        // C-firmware xpt2046.c parity: direct mapping (swap_xy=false, invert_x=false, invert_y=false)
+        touch.configure_cyd_landscape();
+        assert_eq!(touch.orientation(), (false, false, false));
+        let (out_x, out_y) = touch.calibrate_raw(3800, 3800);
+        assert_eq!(out_x, 319);
+        assert_eq!(out_y, 239);
+
+        // Verify custom axis swap & inversion (swap_xy=true, invert_x=false, invert_y=true)
+        touch.set_orientation(true, false, true);
+        assert_eq!(touch.orientation(), (true, false, true));
+        let (out_x, out_y) = touch.calibrate_raw(300, 3800);
+        assert_eq!(out_x, 319);
+        assert_eq!(out_y, 239);
+
+        // Custom orientation with invert_x=true
+        touch.set_orientation(false, true, false);
+        let (out_x, out_y) = touch.calibrate_raw(300, 300);
+        assert_eq!(out_x, 319);
+        assert_eq!(out_y, 0);
+    }
+
+    #[test]
+    fn test_xpt2046_read_mock_and_outlier_filtering() {
         let mut bus = MockTouchSpiBus::default();
         bus.set_touch(false, 0, 0);
         let mut touch = Xpt2046Touch::new(bus);
@@ -599,10 +732,45 @@ mod tests {
         // When raw ADC values are out-of-range (< 100), filter rejects them
         touch.bus_mut().set_touch(true, 50, 50);
         assert_eq!(touch.read(), None);
+
+        // Verify min/max outlier filtering using scripted 5-sample bus
+        struct ScriptedTouchBus {
+            samples_x: [u16; 5],
+            samples_y: [u16; 5],
+            idx_x: usize,
+            idx_y: usize,
+        }
+        impl TouchSpiBus for ScriptedTouchBus {
+            fn is_irq_low(&self) -> bool {
+                true
+            }
+            fn read_raw_12bit(&mut self, cmd: u8) -> u16 {
+                if cmd == 0xD0 {
+                    let v = self.samples_x[self.idx_x % 5];
+                    self.idx_x += 1;
+                    v
+                } else {
+                    let v = self.samples_y[self.idx_y % 5];
+                    self.idx_y += 1;
+                    v
+                }
+            }
+        }
+
+        // Inject extreme low (300) and extreme high (3800) noise spikes around 2050
+        let scripted = ScriptedTouchBus {
+            samples_x: [2050, 3800, 2050, 300, 2050],
+            samples_y: [3800, 2050, 300, 2050, 2050],
+            idx_x: 0,
+            idx_y: 0,
+        };
+        let mut filtered_touch = Xpt2046Touch::new(scripted);
+        // Trimmed mean drops 300 and 3800, leaving exact (2050, 2050) -> (159, 119)
+        assert_eq!(filtered_touch.read(), Some((159, 119)));
     }
 
     #[test]
-    fn test_ili9341_init_sequence() {
+    fn test_ili9341_init_sequence_and_color_config() {
         let bus = MockSpiDisplayBus::default();
         let mut display = Ili9341Display::new(bus);
         assert!(!display.is_initialized());
@@ -611,31 +779,49 @@ mod tests {
         assert!(display.is_initialized());
         assert_eq!(display.backlight_percent(), 100);
         assert_eq!(display.bus().duty_10bit, 1023);
-        assert!(display.bus().commands.len() >= 21);
+        assert!(display.bus().commands.len() >= 22);
         assert_eq!(display.bus().commands[0], 0x01); // Reset
         assert_eq!(display.bus().commands[1], 0x28); // Display OFF
-        assert_eq!(*display.bus().commands.last().unwrap(), 0x29); // Display ON
+        // Verify 0x20 (INVOFF) is sent right before 0x11 (SLPOUT) and 0x29 (DISPON)
+        let len = display.bus().commands.len();
+        assert_eq!(display.bus().commands[len - 3], 0x20); // INVOFF
+        assert_eq!(display.bus().commands[len - 2], 0x11); // SLPOUT
+        assert_eq!(display.bus().commands[len - 1], 0x29); // DISPON
+
+        // Verify set_display_inversion
+        display.set_display_inversion(true);
+        assert_eq!(*display.bus().commands.last().unwrap(), 0x21);
+        display.set_display_inversion(false);
+        assert_eq!(*display.bus().commands.last().unwrap(), 0x20);
+
+        // Verify set_bgr_order
+        display.set_bgr_order(false);
+        assert_eq!(*display.bus().commands.last().unwrap(), 0x36);
+        assert_eq!(display.bus().last_data.as_slice(), &[0x20]);
+        display.set_bgr_order(true);
+        assert_eq!(*display.bus().commands.last().unwrap(), 0x36);
+        assert_eq!(display.bus().last_data.as_slice(), &[0x28]);
     }
 
     #[test]
     fn test_ili9341_flush_normal_window() {
         let bus = MockSpiDisplayBus::default();
         let mut display = Ili9341Display::new(bus);
-        let dummy_pixels = [0x1DB9u16; 640];
+        let dummy_pixels = [0x1DB9u16; 91 * 131];
 
         let count_before = display.flush_count();
         display.flush(10, 20, 100, 150, &dummy_pixels);
 
         assert_eq!(display.last_flush_window(), (10, 20, 100, 150));
         assert_eq!(display.flush_count(), count_before + 1);
-        assert!(display.bus().total_data_bytes > 0);
+        assert_eq!(display.bus().total_data_bytes, 4 + 4 + (91 * 131 * 2));
     }
 
     #[test]
     fn test_ili9341_flush_bounds_clamping() {
         let bus = MockSpiDisplayBus::default();
         let mut display = Ili9341Display::new(bus);
-        let dummy_pixels = [0xFFFFu16; 640];
+        let dummy_pixels = [0xFFFFu16; 320 * 240];
         let count_before = display.flush_count();
 
         // Negative coordinates clamped to 0
@@ -654,10 +840,28 @@ mod tests {
     }
 
     #[test]
+    fn test_ili9341_flush_partial_buffer_clamping() {
+        let bus = MockSpiDisplayBus::default();
+        let mut display = Ili9341Display::new(bus);
+
+        // Window width is 100 (x: 0..=99), requested height is 50 (y: 10..=59),
+        // but buffer only has 350 pixels -> enough for 3 full rows (y: 10..=12).
+        let partial_pixels = [0x1234u16; 350];
+        display.flush(0, 10, 99, 59, &partial_pixels);
+        assert_eq!(display.last_flush_window(), (0, 10, 99, 12));
+        assert_eq!(display.flush_count(), 1);
+
+        // Buffer smaller than 1 single row (50 pixels for width 100) -> rejected early!
+        let tiny_pixels = [0x1234u16; 50];
+        display.flush(0, 10, 99, 59, &tiny_pixels);
+        assert_eq!(display.flush_count(), 1);
+    }
+
+    #[test]
     fn test_ili9341_flush_inverted_coordinates() {
         let bus = MockSpiDisplayBus::default();
         let mut display = Ili9341Display::new(bus);
-        let dummy_pixels = [0x0000u16; 100];
+        let dummy_pixels = [0x0000u16; 131 * 151];
 
         display.flush(150, 180, 20, 30, &dummy_pixels);
         assert_eq!(display.last_flush_window(), (20, 30, 150, 180));

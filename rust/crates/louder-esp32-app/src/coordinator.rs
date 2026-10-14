@@ -58,6 +58,8 @@ pub struct PlayerCoordinator {
     pub buffer_threshold_bytes: usize,
     pub autostart: bool,
     pub audio_stream: Option<HttpAudioStream>,
+    pub pending_track_started: bool,
+    pub pending_underrun: bool,
 }
 
 impl PlayerCoordinator {
@@ -76,6 +78,8 @@ impl PlayerCoordinator {
             buffer_threshold_bytes: 0,
             autostart: true,
             audio_stream: None,
+            pending_track_started: false,
+            pending_underrun: false,
         }
     }
 
@@ -147,10 +151,18 @@ impl PlayerCoordinator {
             } => {
                 match command {
                     StreamCommandType::Start => {
+                        // COORD-509 & COORD-506: Flush pipeline and reset frame counters at track start
+                        pipeline.flush();
+                        pipeline.frames_played = 0;
+                        self.frames_played = 0;
+                        self.pending_track_started = false;
+                        self.pending_underrun = false;
                         self.audio_stream = None;
                         self.autostart = autostart;
 
-                        if server_port > 0 && !http_headers.is_empty() {
+                        // COORD-503: Allow empty http_headers by defaulting to GET /stream.mp3 HTTP/1.0
+                        // and convert non-UTF8 (e.g. Latin-1) header bytes lossily into a stack buffer.
+                        if server_port > 0 {
                             let ip = if server_ip == [0, 0, 0, 0] {
                                 client
                                     .peer_addr()
@@ -159,12 +171,28 @@ impl PlayerCoordinator {
                             } else {
                                 IpAddr::V4(Ipv4Addr::from(server_ip))
                             };
-                            if let Ok(headers_str) = core::str::from_utf8(http_headers) {
-                                if let Ok(http_stream) =
-                                    HttpAudioStream::connect(SocketAddr::new(ip, server_port), headers_str)
+
+                            let mut stack_hdr_buf = [0u8; 1024];
+                            let headers_str: &str = if http_headers.is_empty() {
+                                "GET /stream.mp3 HTTP/1.0\r\n\r\n"
+                            } else if let Ok(valid_str) = core::str::from_utf8(http_headers) {
+                                valid_str
+                            } else {
+                                let copy_len = http_headers.len().min(stack_hdr_buf.len());
+                                for (dst, &src) in stack_hdr_buf[..copy_len]
+                                    .iter_mut()
+                                    .zip(http_headers[..copy_len].iter())
                                 {
-                                    self.audio_stream = Some(http_stream);
+                                    *dst = if src.is_ascii() { src } else { b'?' };
                                 }
+                                core::str::from_utf8(&stack_hdr_buf[..copy_len])
+                                    .unwrap_or("GET /stream.mp3 HTTP/1.0\r\n\r\n")
+                            };
+
+                            if let Ok(http_stream) =
+                                HttpAudioStream::connect(SocketAddr::new(ip, server_port), headers_str)
+                            {
+                                self.audio_stream = Some(http_stream);
                             }
                         }
 
@@ -275,6 +303,8 @@ impl PlayerCoordinator {
                         self.state = PlayerState::Stopped;
                         self.buffer_threshold_bytes = 0;
                         self.audio_stream = None;
+                        self.pending_track_started = false;
+                        self.pending_underrun = false;
                         pipeline.sink.set_mute(true);
                         client.send_stat(
                             StatEvent::TrackStopped,
@@ -289,6 +319,8 @@ impl PlayerCoordinator {
                     StreamCommandType::Flush => {
                         self.buffer_threshold_bytes = 0;
                         self.audio_stream = None;
+                        self.pending_track_started = false;
+                        self.pending_underrun = false;
                         if self.state == PlayerState::Buffering {
                             self.state = PlayerState::Stopped;
                         }
@@ -315,9 +347,9 @@ impl PlayerCoordinator {
                 self.volume.gain_right = gain_right;
                 pipeline.set_volume(gain_left, gain_right);
 
-                // Map 16.16 fixed-point (65536 = 100%) to 0-100 percentage
+                // COORD-507: Map 16.16 fixed-point (65536 = 100%) to 0-100 percentage using u64 to prevent u32 overflow
                 let avg_gain = ((gain_left as u64 + gain_right as u64) / 2) as u32;
-                let pct = core::cmp::min(100, (avg_gain * 100) / 65536) as u8;
+                let pct = core::cmp::min(100, ((avg_gain as u64 * 100) / 65536).min(100) as u8);
 
                 Ok(Some(CydMessage::Volume(pct)))
             }
@@ -329,6 +361,8 @@ impl PlayerCoordinator {
             ServerCommand::Flush => {
                 self.buffer_threshold_bytes = 0;
                 self.audio_stream = None;
+                self.pending_track_started = false;
+                self.pending_underrun = false;
                 if self.state == PlayerState::Buffering {
                     self.state = PlayerState::Stopped;
                 }
@@ -353,37 +387,68 @@ impl PlayerCoordinator {
     }
 
     /// Polls incoming HTTP audio bytes from the active `HttpAudioStream` and pushes them into the pipeline stream buffer.
+    ///
+    /// Breaks out of the loop when `n == 0` (`HALNET-405`), and drops `self.audio_stream = None`
+    /// if `poll_audio_bytes` returns an error (`COORD-508`).
     pub fn poll_http_stream<S: AudioOutputSink>(
         &mut self,
         pipeline: &mut StreamPipeline<S>,
     ) -> std::io::Result<usize> {
-        if let Some(ref mut http) = self.audio_stream {
+        let mut total_written = 0;
+        let mut chunk = [0u8; 1024];
+        while let Some(ref mut http) = self.audio_stream {
             let avail_write = pipeline.stream_buffer.available_write();
             if avail_write == 0 {
-                return Ok(0);
+                break;
             }
-            let mut chunk = [0u8; 1024];
             let max_read = avail_write.min(chunk.len());
-            let n = http.poll_audio_bytes(&mut chunk[..max_read])?;
-            if n > 0 {
-                let written = pipeline.ingest_stream_data(&chunk[..n]).unwrap_or(0);
-                return Ok(written);
+            match http.poll_audio_bytes(&mut chunk[..max_read]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let written = pipeline.ingest_stream_data(&chunk[..n]).unwrap_or(0);
+                    total_written += written;
+                    if written < n {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    self.audio_stream = None;
+                    return Err(e);
+                }
             }
         }
-        Ok(0)
+        Ok(total_written)
     }
 
-    /// Evaluates buffering threshold and state transitions.
+    /// Evaluates buffering threshold, short-stream EOF transitions (`COORD-501`),
+    /// and end-of-track stream underrun transitions (`COORD-502`, `COORD-504`).
     pub fn tick<S: AudioOutputSink>(&mut self, pipeline: &mut StreamPipeline<S>) {
+        self.frames_played = pipeline.frames_played;
+        let is_eof = self
+            .audio_stream
+            .as_ref()
+            .map(|s| s.is_eof())
+            .unwrap_or(false);
+
         if self.state == PlayerState::Buffering
             && (pipeline.stream_buffer.available_read() >= self.buffer_threshold_bytes
-                || pipeline.stream_buffer.available_write() == 0)
+                || pipeline.stream_buffer.available_write() == 0
+                || (is_eof && pipeline.stream_buffer.available_read() > 0))
         {
-            self.state = if self.autostart {
-                PlayerState::Playing
+            if self.autostart {
+                self.state = PlayerState::Playing;
+                self.pending_track_started = true;
             } else {
-                PlayerState::Paused
-            };
+                self.state = PlayerState::Paused;
+            }
+        } else if self.state == PlayerState::Playing
+            && is_eof
+            && pipeline.stream_buffer.available_read() == 0
+            && pipeline.output_buffer.available_read() == 0
+            && !pipeline.has_pending_pcm()
+        {
+            self.state = PlayerState::Stopped;
+            self.pending_underrun = true;
         }
     }
 
@@ -403,7 +468,39 @@ impl PlayerCoordinator {
         let _ = pipeline.process_decode_step();
 
         // Write frames to the output sink
-        pipeline.process_output_step().unwrap_or(0)
+        let written = pipeline.process_output_step().unwrap_or(0);
+        self.frames_played = pipeline.frames_played;
+
+        // Re-evaluate EOF / underrun transition after draining output buffer
+        self.tick(pipeline);
+
+        written
+    }
+
+    /// Builds the full set of CYD telemetry messages (`PlaybackState`, `Volume`, and `Progress`)
+    /// for status synchronization (`COORD-505`).
+    pub fn sync_cyd_telemetry<S: AudioOutputSink>(
+        &self,
+        pipeline: &StreamPipeline<S>,
+    ) -> heapless::Vec<CydMessage, 4> {
+        let mut msgs = heapless::Vec::new();
+        let _ = msgs.push(CydMessage::PlaybackState(self.cyd_playback_state()));
+
+        let avg_gain = ((self.volume.gain_left as u64 + self.volume.gain_right as u64) / 2) as u32;
+        let pct = core::cmp::min(100, ((avg_gain as u64 * 100) / 65536).min(100) as u8);
+        let _ = msgs.push(CydMessage::Volume(pct));
+
+        let elapsed_secs = if self.current_sample_rate > 0 {
+            (pipeline.frames_played / (self.current_sample_rate as u64)) as u32
+        } else {
+            0
+        };
+        let _ = msgs.push(CydMessage::Progress {
+            elapsed_secs,
+            duration_secs: 0,
+        });
+
+        msgs
     }
 
     /// Handles an interactive command from the CYD front panel display.
@@ -452,13 +549,36 @@ impl PlayerCoordinator {
         }
     }
 
-    /// Emits periodic STAT heartbeats if interval has elapsed (APP-004: wrapping_sub handles 49.7d timer wrap).
+    /// Emits pending deferred `STAT` transition events (`STMs` / `STMu`) and periodic `STAT` heartbeats
+    /// if the heartbeat interval has elapsed (APP-004: `wrapping_sub` handles 49.7d timer wrap; `COORD-502`, `COORD-504`).
     pub fn check_heartbeat<S: AudioOutputSink>(
         &mut self,
         pipeline: &StreamPipeline<S>,
         client: &mut SlimprotoClient,
         now_ms: u32,
     ) -> std::io::Result<()> {
+        if self.pending_track_started {
+            self.pending_track_started = false;
+            client.send_stat(
+                StatEvent::TrackStarted,
+                pipeline.stream_buffer_available() as u32,
+                pipeline.output_buffer_available() as u32,
+                pipeline.frames_played as u32,
+                now_ms,
+            )?;
+        }
+
+        if self.pending_underrun {
+            self.pending_underrun = false;
+            client.send_stat(
+                StatEvent::StreamUnderrun,
+                pipeline.stream_buffer_available() as u32,
+                pipeline.output_buffer_available() as u32,
+                pipeline.frames_played as u32,
+                now_ms,
+            )?;
+        }
+
         if now_ms.wrapping_sub(self.last_heartbeat_ms) >= self.heartbeat_interval_ms {
             self.last_heartbeat_ms = now_ms;
             client.send_stat(
@@ -1024,4 +1144,273 @@ mod tests {
         http_handle.join().unwrap();
         client_handle.join().unwrap();
     }
+
+    #[test]
+    fn test_short_eof_stream_exits_buffering_and_emits_stms_stmu() {
+        // COORD-501, COORD-502, COORD-504:
+        // A short track smaller than threshold_kb that hits HTTP EOF must:
+        // 1. Transition out of Buffering -> Playing and set pending_track_started = true
+        // 2. Emit STMs via check_heartbeat
+        // 3. Once all decoded PCM frames are played out, transition Playing -> Stopped and set pending_underrun = true
+        // 4. Emit STMu via check_heartbeat
+        use std::time::Duration;
+
+        let slim_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slim_addr = slim_listener.local_addr().unwrap();
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+
+        let mac = [0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+
+        // HTTP server sends only 2 stereo frames (8 bytes), well below 1024-byte threshold, then closes (EOF)
+        let http_handle = std::thread::spawn(move || {
+            let (mut stream, _) = http_listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = stream.read(&mut req).unwrap();
+
+            let header = b"HTTP/1.0 200 OK\r\nContent-Type: audio/basic\r\n\r\n";
+            let pcm = [0x01, 0x00, 0xFF, 0x00, 0x02, 0x00, 0xFE, 0x00];
+            stream.write_all(header).unwrap();
+            stream.write_all(&pcm).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        let client_handle = std::thread::spawn(move || {
+            let mut client = SlimprotoClient::connect(slim_addr, mac, "TestPlayer").unwrap();
+            let mut coordinator = PlayerCoordinator::new(mac, "TestPlayer");
+
+            let mut stream_storage = [0u8; 4096];
+            let mut output_storage = [0u8; 4096];
+            let pcm_dec = PcmDecoder::new(16, 2, true);
+            let sink = MockAudioSink::<64>::new();
+            let mut pipeline = StreamPipeline::new(
+                &mut stream_storage,
+                &mut output_storage,
+                ActiveDecoder::Pcm(pcm_dec),
+                sink,
+                44100,
+            );
+
+            // Start with threshold_kb = 2 (2048 bytes) and empty http_headers (COORD-503 default header test)
+            let start_cmd = ServerCommand::Stream {
+                command: StreamCommandType::Start,
+                autostart: true,
+                format: AudioFormat::Pcm,
+                pcm_sample_size: 16,
+                pcm_sample_rate: 3,
+                pcm_channels: 2,
+                pcm_endianness: Endianness::BigEndian,
+                threshold_kb: 2,
+                spdif_enable: false,
+                trans_duration: 0,
+                trans_type: TransitionType::None,
+                flags: 0,
+                output_threshold: 0,
+                replay_gain: 0,
+                server_port: http_addr.port(),
+                server_ip: [127, 0, 0, 1],
+                http_headers: &[],
+            };
+
+            coordinator
+                .handle_command(start_cmd, &mut pipeline, &mut client, 10)
+                .unwrap();
+            assert_eq!(coordinator.state, PlayerState::Buffering);
+
+            // Wait until short HTTP stream hits EOF and drains all 2 frames
+            let start = std::time::Instant::now();
+            while coordinator.state != PlayerState::Stopped && start.elapsed() < Duration::from_secs(3) {
+                let _ = coordinator.process_audio_step(&mut pipeline);
+                if coordinator.pending_track_started || coordinator.pending_underrun {
+                    coordinator
+                        .check_heartbeat(&pipeline, &mut client, 20)
+                        .unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            assert_eq!(coordinator.state, PlayerState::Stopped);
+            assert_eq!(pipeline.frames_played, 2);
+            assert_eq!(coordinator.frames_played, 2);
+        });
+
+        let (mut server_stream, _) = slim_listener.accept().unwrap();
+        let mut buf = [0u8; 64];
+        // 1. HELO (10 header + 12 fixed + 63 caps = 85 bytes)
+        let mut helo_buf = [0u8; 128];
+        let _ = server_stream.read(&mut helo_buf).unwrap();
+        assert_eq!(&helo_buf[0..4], b"HELO");
+
+        let mut expected_stms = [0u8; 64];
+        squeezelite_proto::SlimprotoBuilder::build_stat(StatEvent::TrackStarted, 0, 0, 0, 0, &mut expected_stms).unwrap();
+        let mut expected_underrun = [0u8; 64];
+        squeezelite_proto::SlimprotoBuilder::build_stat(StatEvent::StreamUnderrun, 0, 0, 0, 0, &mut expected_underrun).unwrap();
+
+        // 2. STAT TrackStarted (61 bytes)
+        server_stream.read_exact(&mut buf[..61]).unwrap();
+        assert_eq!(&buf[0..4], b"STAT");
+        assert_eq!(&buf[8..12], &expected_stms[8..12]);
+
+        // 3. STAT StreamUnderrun (61 bytes)
+        server_stream.read_exact(&mut buf[..61]).unwrap();
+        assert_eq!(&buf[0..4], b"STAT");
+        assert_eq!(&buf[8..12], &expected_underrun[8..12]);
+
+        http_handle.join().unwrap();
+        client_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_audio_gain_u64_no_overflow_and_sync_cyd_telemetry() {
+        // COORD-505, COORD-507: Verify u32::MAX gain does not overflow and sync_cyd_telemetry
+        // returns PlaybackState, Volume, and Progress.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x99];
+
+        let server_handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 128];
+            let _ = s.read(&mut buf).unwrap();
+        });
+
+        let mut client = SlimprotoClient::connect(server_addr, mac, "TestPlayer").unwrap();
+        let mut coordinator = PlayerCoordinator::new(mac, "TestPlayer");
+
+        let mut stream_storage = [0u8; 512];
+        let mut output_storage = [0u8; 512];
+        let pcm_dec = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_dec),
+            sink,
+            44100,
+        );
+
+        let max_gain_cmd = ServerCommand::AudioGain {
+            gain_left: u32::MAX,
+            gain_right: u32::MAX,
+            digital_atten: 0,
+            preamp: 0,
+        };
+        let msg = coordinator
+            .handle_command(max_gain_cmd, &mut pipeline, &mut client, 50)
+            .unwrap();
+        assert_eq!(msg, Some(CydMessage::Volume(100)));
+
+        coordinator.state = PlayerState::Playing;
+        pipeline.frames_played = 44100 * 12; // 12 seconds at 44.1 kHz
+        let telemetry = coordinator.sync_cyd_telemetry(&pipeline);
+        assert_eq!(telemetry.len(), 3);
+        assert_eq!(telemetry[0], CydMessage::PlaybackState(PlayState::Playing));
+        assert_eq!(telemetry[1], CydMessage::Volume(100));
+        assert_eq!(
+            telemetry[2],
+            CydMessage::Progress {
+                elapsed_secs: 12,
+                duration_secs: 0
+            }
+        );
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_latin1_headers_and_poll_http_error_drops_stream() {
+        // COORD-503, COORD-508, COORD-509:
+        // Verify non-UTF8 (Latin-1) headers connect via stack lossy conversion, and if the HTTP
+        // server returns a 404 error, poll_http_stream drops self.audio_stream = None.
+        use std::time::Duration;
+
+        let slim_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slim_addr = slim_listener.local_addr().unwrap();
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+
+        let mac = [0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        let http_handle = std::thread::spawn(move || {
+            let (mut stream, _) = http_listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = stream.read(&mut req).unwrap();
+            stream
+                .write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let slim_handle = std::thread::spawn(move || {
+            let (mut stream, _) = slim_listener.accept().unwrap();
+            let mut buf = [0u8; 128];
+            let _ = stream.read(&mut buf).unwrap(); // HELO
+            let _ = stream.read(&mut buf).unwrap(); // STAT STMs
+        });
+
+        let mut client = SlimprotoClient::connect(slim_addr, mac, "TestPlayer").unwrap();
+        let mut coordinator = PlayerCoordinator::new(mac, "TestPlayer");
+
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let pcm_dec = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_dec),
+            sink,
+            44100,
+        );
+
+        // Pre-populate pipeline with dirty state to verify Start flushes and resets frames_played (COORD-506, COORD-509)
+        pipeline.ingest_stream_data(&[1, 2, 3, 4]).unwrap();
+        pipeline.frames_played = 999;
+        coordinator.frames_played = 999;
+
+        // Latin-1 invalid UTF-8 byte 0xE9 ('é') in HTTP request header (COORD-503)
+        let latin1_headers = b"GET /caf\xe9.pcm HTTP/1.0\r\n\r\n";
+        let start_cmd = ServerCommand::Stream {
+            command: StreamCommandType::Start,
+            autostart: true,
+            format: AudioFormat::Pcm,
+            pcm_sample_size: 16,
+            pcm_sample_rate: 3,
+            pcm_channels: 2,
+            pcm_endianness: Endianness::BigEndian,
+            threshold_kb: 0,
+            spdif_enable: false,
+            trans_duration: 0,
+            trans_type: TransitionType::None,
+            flags: 0,
+            output_threshold: 0,
+            replay_gain: 0,
+            server_port: http_addr.port(),
+            server_ip: [127, 0, 0, 1],
+            http_headers: latin1_headers,
+        };
+
+        coordinator
+            .handle_command(start_cmd, &mut pipeline, &mut client, 100)
+            .unwrap();
+        assert_eq!(pipeline.frames_played, 0);
+        assert_eq!(coordinator.frames_played, 0);
+        assert_eq!(pipeline.stream_buffer_available(), 0);
+        assert!(coordinator.audio_stream.is_some());
+
+        // Poll until 404 response triggers error and drops self.audio_stream = None (COORD-508)
+        let start = std::time::Instant::now();
+        while coordinator.audio_stream.is_some() && start.elapsed() < Duration::from_secs(3) {
+            let _ = coordinator.poll_http_stream(&mut pipeline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(coordinator.audio_stream.is_none());
+
+        http_handle.join().unwrap();
+        slim_handle.join().unwrap();
+    }
 }
+

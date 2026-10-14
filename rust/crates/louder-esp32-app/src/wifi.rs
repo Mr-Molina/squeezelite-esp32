@@ -30,10 +30,19 @@ impl fmt::Display for WifiState {
 }
 
 /// Wi-Fi configuration credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WifiConfig {
     pub ssid: heapless::String<32>,
     pub password: heapless::String<64>,
+}
+
+impl fmt::Debug for WifiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WifiConfig")
+            .field("ssid", &self.ssid)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Default for WifiConfig {
@@ -101,6 +110,11 @@ impl<S: KeyValueStorage> WifiManager<S> {
         self.state
     }
 
+    /// Returns the current consecutive retry count.
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
     /// Access reference to the underlying key-value store.
     pub fn store(&self) -> &S {
         &self.store
@@ -111,8 +125,10 @@ impl<S: KeyValueStorage> WifiManager<S> {
         &mut self.store
     }
 
-    /// Connects to a Wi-Fi network and persists the credentials to storage.
-    pub fn connect(&mut self, ssid: &str, password: &str) -> Result<(), StorageError> {
+    /// Initiates a Wi-Fi connection handshake and persists credentials to storage,
+    /// transitioning into [`WifiState::Connecting`] until [`Self::confirm_connected`]
+    /// or [`Self::on_connected`] is invoked upon link/DHCP completion (PERIPH-605).
+    pub fn begin_connect(&mut self, ssid: &str, password: &str) -> Result<WifiState, StorageError> {
         if ssid.is_empty() || ssid.len() > 32 {
             return Err(StorageError::InvalidFormat);
         }
@@ -129,6 +145,13 @@ impl<S: KeyValueStorage> WifiManager<S> {
         let creds = WifiCredentials::new(ssid, password)?;
         creds.save_to(&mut self.store)?;
 
+        self.state = WifiState::Connecting;
+        Ok(self.state)
+    }
+
+    /// Connects to a Wi-Fi network and persists the credentials to storage.
+    pub fn connect(&mut self, ssid: &str, password: &str) -> Result<(), StorageError> {
+        self.begin_connect(ssid, password)?;
         self.record_success();
         Ok(())
     }
@@ -143,9 +166,16 @@ impl<S: KeyValueStorage> WifiManager<S> {
         core::cmp::min(delay, self.max_backoff_ms)
     }
 
-    /// Records a failed connection attempt and increments backoff counter.
+    /// Records a failed connection attempt and increments backoff counter using saturating arithmetic.
     pub fn record_failure(&mut self) {
         self.state = WifiState::Failed;
+        self.retry_count = self.retry_count.saturating_add(1);
+    }
+
+    /// Handles an unexpected link disconnection event, transitioning state and incrementing retry count
+    /// with saturating arithmetic (PERIPH-611).
+    pub fn on_disconnected(&mut self) {
+        self.state = WifiState::Disconnected;
         self.retry_count = self.retry_count.saturating_add(1);
     }
 
@@ -157,6 +187,11 @@ impl<S: KeyValueStorage> WifiManager<S> {
 
     /// Confirms that Wi-Fi connection has been established.
     pub fn confirm_connected(&mut self) {
+        self.record_success();
+    }
+
+    /// Callback invoked when the station link and IP lease are acquired (PERIPH-605).
+    pub fn on_connected(&mut self) {
         self.record_success();
     }
 
@@ -184,12 +219,37 @@ mod tests {
         let mut wifi = WifiManager::new();
         assert_eq!(wifi.state(), WifiState::Disconnected);
 
-        wifi.connect("Home_Network", "SecretPass").unwrap();
+        // Two-step asynchronous connection lifecycle (PERIPH-605)
+        let state = wifi.begin_connect("Home_Network", "SecretPass").unwrap();
+        assert_eq!(state, WifiState::Connecting);
+        assert_eq!(wifi.state(), WifiState::Connecting);
+
+        wifi.on_connected();
         assert_eq!(wifi.state(), WifiState::Connected);
         assert_eq!(wifi.config.ssid.as_str(), "Home_Network");
 
+        wifi.on_disconnected();
+        assert_eq!(wifi.state(), WifiState::Disconnected);
+        assert_eq!(wifi.retry_count(), 1);
+
+        wifi.connect("Home_Network", "SecretPass").unwrap();
+        assert_eq!(wifi.state(), WifiState::Connected);
+        assert_eq!(wifi.retry_count(), 0);
+
         wifi.disconnect();
         assert_eq!(wifi.state(), WifiState::Disconnected);
+    }
+
+    #[test]
+    fn test_wifi_config_debug_redacts_password() {
+        let mut cfg = WifiConfig::default();
+        cfg.ssid.push_str("MyNetwork").unwrap();
+        cfg.password.push_str("SuperSecretPassword123").unwrap();
+
+        let formatted = std::format!("{:?}", cfg);
+        assert!(formatted.contains("MyNetwork"));
+        assert!(formatted.contains("[REDACTED]"));
+        assert!(!formatted.contains("SuperSecretPassword123"));
     }
 
     #[test]

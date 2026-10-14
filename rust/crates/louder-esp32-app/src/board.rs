@@ -74,4 +74,44 @@ impl BoardModel {
     pub const fn tas5805m_i2c_addr(self) -> u8 {
         self.default_amp_address()
     }
+
+    pub const fn i2s_pins(self) -> I2sPinConfig {
+        match self {
+            Self::LouderEsp32Wrover => I2sPinConfig {
+                bclk_pin: 26,
+                lrclk_pin: 25,
+                dout_pin: 22,
+                mclk_pin: None,
+            },
+            Self::LouderEsp32PlusS3 => I2sPinConfig {
+                bclk_pin: 14,
+                lrclk_pin: 15,
+                dout_pin: 16,
+                mclk_pin: None,
+            },
+        }
+    }
 }
+
+/// Hardware I2S pin assignment configuration (`HALNET-412`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct I2sPinConfig {
+    pub bclk_pin: u8,
+    pub lrclk_pin: u8,
+    pub dout_pin: u8,
+    /// Optional master clock (MCLK) pin (`None` on Louder-ESP32 3-wire BCLK PLL mode).
+    pub mclk_pin: Option<u8>,
+}
+
+impl I2sPinConfig {
+    /// Returns the I2S pin configuration for the active board target.
+    pub const fn for_active_board() -> Self {
+        Self {
+            bclk_pin: pins::I2S_BCLK as u8,
+            lrclk_pin: pins::I2S_LRCLK as u8,
+            dout_pin: pins::I2S_DOUT as u8,
+            mclk_pin: None,
+        }
+    }
+}
+

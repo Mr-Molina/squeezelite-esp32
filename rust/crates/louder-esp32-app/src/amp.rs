@@ -7,7 +7,7 @@
 use embedded_hal::i2c::I2c;
 use squeezelite_tas58xx::{
     DriverError, FaultStatus, Play, PowerDown, Standby, Tas58xx,
-    VOL_DEFAULT_MINUS_24DB, VOL_UNITY_0DB,
+    VOL_DEFAULT_M20DB, VOL_DEFAULT_MINUS_24DB, VOL_MUTE, VOL_UNITY_0DB,
 };
 
 /// Current operational state of the amplifier.
@@ -16,6 +16,47 @@ pub enum AmpMode {
     PowerDown,
     Standby,
     Play,
+}
+
+/// Configuration parameters for the TAS58xx amplifier manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmpConfig {
+    /// Target 7-bit I2C slave address.
+    pub i2c_addr: u8,
+    /// Initial digital volume register value applied before entering Play mode.
+    ///
+    /// Defaults to [`VOL_DEFAULT_M20DB`] (`0x58`, `-20.0 dB` safe startup attenuation)
+    /// to prevent unexpected high-SPL output bursts on boot (PERIPH-612).
+    pub initial_volume: u8,
+    /// I2S audio word length in bits (16, 20, 24, or 32).
+    pub word_length_bits: u8,
+}
+
+impl Default for AmpConfig {
+    /// Returns a safe default amplifier configuration:
+    /// - `i2c_addr`: Active board TAS58xx I2C address.
+    /// - `initial_volume`: [`VOL_DEFAULT_M20DB`] (`0x58` = `-20.0 dB` safe startup attenuation, PERIPH-612).
+    /// - `word_length_bits`: `32`-bit I2S frames.
+    fn default() -> Self {
+        Self {
+            i2c_addr: crate::board::ACTIVE_BOARD.tas5805m_i2c_addr(),
+            initial_volume: VOL_DEFAULT_M20DB,
+            word_length_bits: 32,
+        }
+    }
+}
+
+/// Maps a logical `0..=100%` volume percentage to a TAS58xx hardware digital volume
+/// attenuation register value (`0x30..=0xFF`) (PERIPH-601):
+/// - `0%` returns [`VOL_MUTE`] (`0xFF`, hardware mute).
+/// - `1..=100%` (clamped at `100%`) maps linearly from `0xCF` (`-79.5 dB`) to [`VOL_UNITY_0DB`] (`0x30`, `0.0 dB` unity gain).
+pub const fn percent_to_attenuation(percent: u8) -> u8 {
+    if percent == 0 {
+        VOL_MUTE
+    } else {
+        let clamped = if percent > 100 { 100 } else { percent };
+        0xCF - (((clamped as u16 - 1) * (0xCF - VOL_UNITY_0DB) as u16) / 99) as u8
+    }
 }
 
 /// Dynamic manager for the TAS58xx amplifier.
@@ -52,6 +93,14 @@ where
         }
     }
 
+    /// Creates a new amplifier manager from an explicit [`AmpConfig`].
+    pub fn with_config(i2c: I2C, config: AmpConfig) -> Self {
+        Self {
+            inner: Some(AmpInner::PowerDown(Tas58xx::new(i2c, config.i2c_addr))),
+            current_volume: config.initial_volume.max(VOL_UNITY_0DB),
+        }
+    }
+
     /// Returns the current configured digital volume attenuation.
     pub fn current_volume(&self) -> u8 {
         self.current_volume
@@ -78,18 +127,36 @@ where
     }
 
     /// Initializes the amplifier from PowerDown into Standby mode.
+    /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
     pub fn initialize(&mut self, word_length_bits: u8) -> Result<(), DriverError<E>> {
         match self.inner.take() {
-            Some(AmpInner::PowerDown(driver)) => {
-                let mut standby = driver.init_into_standby()?;
-                standby.reconfirm_book_page_and_clear_faults()?;
-                standby.configure_audio_format(word_length_bits)?;
-                self.inner = Some(AmpInner::Standby(standby));
-                Ok(())
-            }
+            Some(AmpInner::PowerDown(driver)) => match driver.try_init_into_standby() {
+                Ok(mut standby) => {
+                    if let Err(e) = standby.reconfirm_book_page_and_clear_faults() {
+                        self.inner = Some(AmpInner::Standby(standby));
+                        return Err(e);
+                    }
+                    if let Err(e) = standby.configure_audio_format(word_length_bits) {
+                        self.inner = Some(AmpInner::Standby(standby));
+                        return Err(e);
+                    }
+                    self.inner = Some(AmpInner::Standby(standby));
+                    Ok(())
+                }
+                Err((power_down, e)) => {
+                    self.inner = Some(AmpInner::PowerDown(power_down));
+                    Err(e)
+                }
+            },
             Some(AmpInner::Standby(mut standby)) => {
-                standby.reconfirm_book_page_and_clear_faults()?;
-                standby.configure_audio_format(word_length_bits)?;
+                if let Err(e) = standby.reconfirm_book_page_and_clear_faults() {
+                    self.inner = Some(AmpInner::Standby(standby));
+                    return Err(e);
+                }
+                if let Err(e) = standby.configure_audio_format(word_length_bits) {
+                    self.inner = Some(AmpInner::Standby(standby));
+                    return Err(e);
+                }
                 self.inner = Some(AmpInner::Standby(standby));
                 Ok(())
             }
@@ -102,13 +169,24 @@ where
     }
 
     /// Transitions the amplifier from Standby into active Play mode.
+    /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
     pub fn start_playback(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.take() {
             Some(AmpInner::Standby(mut driver)) => {
-                driver.set_digital_volume(self.current_volume)?;
-                let play = driver.start_playback()?;
-                self.inner = Some(AmpInner::Play(play));
-                Ok(())
+                if let Err(e) = driver.set_digital_volume(self.current_volume) {
+                    self.inner = Some(AmpInner::Standby(driver));
+                    return Err(e);
+                }
+                match driver.try_start_playback() {
+                    Ok(play) => {
+                        self.inner = Some(AmpInner::Play(play));
+                        Ok(())
+                    }
+                    Err((standby, e)) => {
+                        self.inner = Some(AmpInner::Standby(standby));
+                        Err(e)
+                    }
+                }
             }
             Some(AmpInner::Play(play)) => {
                 self.inner = Some(AmpInner::Play(play));
@@ -122,13 +200,19 @@ where
     }
 
     /// Transitions the amplifier from Play back to Standby mode (muting power stage).
+    /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
     pub fn stop_playback(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.take() {
-            Some(AmpInner::Play(driver)) => {
-                let standby = driver.stop_playback()?;
-                self.inner = Some(AmpInner::Standby(standby));
-                Ok(())
-            }
+            Some(AmpInner::Play(driver)) => match driver.try_stop_playback() {
+                Ok(standby) => {
+                    self.inner = Some(AmpInner::Standby(standby));
+                    Ok(())
+                }
+                Err((play, e)) => {
+                    self.inner = Some(AmpInner::Play(play));
+                    Err(e)
+                }
+            },
             Some(AmpInner::Standby(standby)) => {
                 self.inner = Some(AmpInner::Standby(standby));
                 Ok(())
@@ -140,16 +224,17 @@ where
         }
     }
 
-    /// Sets the digital volume attenuation (clamped to prevent hazardous overdrive < 0dB).
+    /// Sets the raw digital volume attenuation (`0x30..=0xFF`, clamped to prevent hazardous overdrive < 0dB).
+    /// Borrows `self.inner` via `as_mut()` so a transient I2C error never drops the driver (PERIPH-604).
     pub fn set_volume(&mut self, volume: u8) -> Result<(), DriverError<E>> {
         let safe_vol = volume.max(VOL_UNITY_0DB);
-        match self.inner {
-            Some(AmpInner::Play(ref mut driver)) => {
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => {
                 driver.set_digital_volume(safe_vol)?;
                 self.current_volume = safe_vol;
                 Ok(())
             }
-            Some(AmpInner::Standby(ref mut driver)) => {
+            Some(AmpInner::Standby(driver)) => {
                 driver.set_digital_volume(safe_vol)?;
                 self.current_volume = safe_vol;
                 Ok(())
@@ -158,20 +243,36 @@ where
         }
     }
 
+    /// Sets the amplifier volume from a logical percentage (`0..=100%`) by converting it to
+    /// a TAS58xx register attenuation code before writing to `DIG_VOL_CTRL` (PERIPH-601).
+    pub fn set_volume_percent(&mut self, percent: u8) -> Result<(), DriverError<E>> {
+        let attenuation = percent_to_attenuation(percent);
+        self.set_volume(attenuation)
+    }
+
     /// Clears latched hardware faults in Standby or Play mode.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
-        match self.inner {
-            Some(AmpInner::Play(ref mut driver)) => driver.clear_faults(),
-            Some(AmpInner::Standby(ref mut driver)) => driver.clear_faults(),
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => driver.clear_faults(),
+            Some(AmpInner::Standby(driver)) => driver.clear_faults(),
+            Some(AmpInner::PowerDown(_)) | None => Err(DriverError::InvalidParameter),
+        }
+    }
+
+    /// Executes the 3-step TI datasheet hardware fault recovery sequence in Play mode (PERIPH-603).
+    pub fn recover_from_fault(&mut self) -> Result<(), DriverError<E>> {
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => driver.recover_from_fault(),
+            Some(AmpInner::Standby(driver)) => driver.clear_faults(),
             Some(AmpInner::PowerDown(_)) | None => Err(DriverError::InvalidParameter),
         }
     }
 
     /// Reads fault status from the amplifier in Standby or Play mode.
     pub fn check_faults(&mut self) -> Result<Option<FaultStatus>, DriverError<E>> {
-        match self.inner {
-            Some(AmpInner::Play(ref mut driver)) => Ok(Some(driver.check_faults()?)),
-            Some(AmpInner::Standby(ref mut driver)) => Ok(Some(driver.check_faults()?)),
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => Ok(Some(driver.check_faults()?)),
+            Some(AmpInner::Standby(driver)) => Ok(Some(driver.check_faults()?)),
             _ => Ok(None),
         }
     }
@@ -180,6 +281,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embedded_hal::i2c::ErrorKind;
     use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
     use squeezelite_tas58xx::registers;
 
@@ -336,6 +438,77 @@ mod tests {
         amp.start_playback().unwrap();
         assert_eq!(amp.mode(), AmpMode::Play);
         amp.clear_faults().unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_percent_to_attenuation_and_set_volume_percent() {
+        assert_eq!(percent_to_attenuation(0), VOL_MUTE);
+        assert_eq!(percent_to_attenuation(1), 0xCF);
+        assert_eq!(percent_to_attenuation(100), VOL_UNITY_0DB);
+        assert_eq!(percent_to_attenuation(150), VOL_UNITY_0DB);
+
+        let addr = crate::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // init_into_standby
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            // reconfirm_book_page_and_clear_faults
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            // configure_audio_format(32)
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // set_volume_percent(0) -> 0xFF
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_MUTE]),
+            // set_volume_percent(100) -> 0x30
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut amp = AmpManager::with_config(&mut i2c, AmpConfig::default());
+        assert_eq!(amp.current_volume(), VOL_DEFAULT_M20DB);
+        amp.initialize(32).unwrap();
+
+        amp.set_volume_percent(0).unwrap();
+        assert_eq!(amp.current_volume(), VOL_MUTE);
+
+        amp.set_volume_percent(100).unwrap();
+        assert_eq!(amp.current_volume(), VOL_UNITY_0DB);
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_transient_i2c_error_does_not_drop_driver() {
+        let addr = crate::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // First initialize attempt fails on first I2C write
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00])
+                .with_error(ErrorKind::Bus),
+            // Second initialize attempt succeeds because inner was preserved
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut amp = AmpManager::new(&mut i2c);
+        assert!(amp.initialize(32).is_err());
+        assert_eq!(amp.mode(), AmpMode::PowerDown);
+
+        // Retry after transient error succeeds because self.inner was not dropped
+        amp.initialize(32).unwrap();
+        assert_eq!(amp.mode(), AmpMode::Standby);
+        assert!(amp.into_inner().is_some());
 
         i2c.done();
     }

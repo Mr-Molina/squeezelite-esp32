@@ -10,6 +10,7 @@
 //! - Domain configuration models: `WifiCredentials` and `AudioConfig`.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 use core::fmt;
 use heapless::{String, Vec};
@@ -17,6 +18,8 @@ use heapless::{String, Vec};
 /// Errors encountered in key-value configuration operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageError {
+    /// Configuration key cannot be empty.
+    EmptyKey,
     /// Requested key does not exist in the store.
     KeyNotFound,
     /// Destination buffer is too small to receive the value.
@@ -31,9 +34,13 @@ pub enum StorageError {
     InvalidUtf8,
 }
 
+/// Alias for [`StorageError`] used by configuration callers.
+pub type ConfigError = StorageError;
+
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyKey => write!(f, "Configuration key must not be empty"),
             Self::KeyNotFound => write!(f, "Configuration key not found"),
             Self::BufferTooSmall => write!(f, "Destination buffer too small"),
             Self::CapacityExceeded => write!(f, "Storage entry capacity exceeded"),
@@ -195,6 +202,9 @@ impl<const MAX_ENTRIES: usize> KeyValueStorage for MemConfigStore<MAX_ENTRIES> {
     }
 
     fn set(&mut self, key: &str, val: &[u8]) -> Result<(), StorageError> {
+        if key.is_empty() {
+            return Err(StorageError::EmptyKey);
+        }
         if val.len() > 128 {
             return Err(StorageError::CapacityExceeded);
         }
@@ -233,6 +243,31 @@ impl<const MAX_ENTRIES: usize> KeyValueStorage for MemConfigStore<MAX_ENTRIES> {
 
     fn contains(&self, key: &str) -> bool {
         self.entries.iter().any(|(k, _)| k.as_str() == key)
+    }
+}
+
+/// Helper for dual-sector Flash ping-pong sector selection.
+pub struct DualSectorFlashStore;
+
+impl DualSectorFlashStore {
+    /// Determines the active sector index (`0` for `sector_a`, `1` for `sector_b`)
+    /// using wrapping 32-bit sequence comparison `(seq_b.wrapping_sub(seq_a) as i32) >= 0`.
+    pub fn active_sector(sector_a: &[u8], sector_b: &[u8]) -> Result<usize, StorageError> {
+        let meta_a = FlashJournal::read_sector_meta(sector_a);
+        let meta_b = FlashJournal::read_sector_meta(sector_b);
+
+        match (meta_a, meta_b) {
+            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
+                if (seq_b.wrapping_sub(seq_a) as i32) >= 0 {
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
+            }
+            (Ok(_), Err(_)) => Ok(0),
+            (Err(_), Ok(_)) => Ok(1),
+            (Err(e), Err(_)) => Err(e),
+        }
     }
 }
 
@@ -496,6 +531,7 @@ impl core::fmt::Debug for WifiCredentials {
         f.debug_struct("WifiCredentials")
             .field("ssid", &self.ssid)
             .field("passphrase", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
             .field("autoconnect", &self.autoconnect)
             .field("static_ip", &self.static_ip)
             .field("gateway", &self.gateway)
@@ -533,6 +569,9 @@ impl WifiCredentials {
 
     /// Validates Wi-Fi configuration invariants.
     pub fn validate(&self) -> Result<(), StorageError> {
+        if self.ssid.is_empty() {
+            return Err(StorageError::InvalidFormat);
+        }
         if let Some(ip) = self.static_ip {
             if ip == [0, 0, 0, 0] || ip == [255, 255, 255, 255] {
                 return Err(StorageError::InvalidFormat);
@@ -553,6 +592,7 @@ impl WifiCredentials {
 
     /// Saves Wi-Fi credentials into `store`.
     pub fn save_to<S: KeyValueStorage>(&self, store: &mut S) -> Result<(), StorageError> {
+        self.validate()?;
         store.set_str(Self::KEY_SSID, self.ssid.as_str())?;
         store.set_str(Self::KEY_PASS, self.passphrase.as_str())?;
         store.set_bool(Self::KEY_AUTO, self.autoconnect)?;
@@ -599,7 +639,7 @@ impl WifiCredentials {
         let subnet = read_ip_opt(store, Self::KEY_MASK)?;
         let dns = read_ip_opt(store, Self::KEY_DNS)?;
 
-        Ok(Some(Self {
+        let creds = Self {
             ssid,
             passphrase,
             autoconnect,
@@ -607,7 +647,9 @@ impl WifiCredentials {
             gateway,
             subnet,
             dns,
-        }))
+        };
+        creds.validate()?;
+        Ok(Some(creds))
     }
 
     /// Removes Wi-Fi credentials from `store`.
@@ -969,5 +1011,36 @@ mod tests {
         assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
         creds.subnet = Some([255, 255, 255, 0]);
         assert!(creds.validate().is_ok());
+
+        // PROTOCFG-808: save_to and load_from enforce validation
+        let mut store = MemConfigStore::<16>::new();
+        let mut bad_creds = WifiCredentials::new("", "PASS").unwrap();
+        assert_eq!(bad_creds.save_to(&mut store), Err(ConfigError::InvalidFormat));
+
+        bad_creds = WifiCredentials::new("ValidSSID", "PASS").unwrap();
+        bad_creds.static_ip = Some([0, 0, 0, 0]);
+        assert_eq!(bad_creds.save_to(&mut store), Err(ConfigError::InvalidFormat));
+
+        // Corrupt stored IP in store and verify load_from rejects it via validate()
+        store.set_str(WifiCredentials::KEY_SSID, "ValidSSID").unwrap();
+        store.set(WifiCredentials::KEY_IP, &[0, 0, 0, 0]).unwrap();
+        assert_eq!(WifiCredentials::load_from(&store), Err(ConfigError::InvalidFormat));
+    }
+
+    #[test]
+    fn test_empty_key_rejected_and_dual_sector_active_sector_wraparound() {
+        // PROTOCFG-807: EmptyKey rejected in MemConfigStore::set
+        let mut store = MemConfigStore::<16>::new();
+        assert_eq!(store.set("", b"value"), Err(ConfigError::EmptyKey));
+        assert_eq!(store.set_str("", "value"), Err(StorageError::EmptyKey));
+
+        // PROTOCFG-809: DualSectorFlashStore::active_sector wrapping arithmetic
+        store.set_str("k", "v").unwrap();
+        let mut sector_a = [0u8; 256];
+        let mut sector_b = [0u8; 256];
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_a, u32::MAX).unwrap();
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 0).unwrap();
+        assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_b), Ok(1));
+        assert_eq!(DualSectorFlashStore::active_sector(&sector_b, &sector_a), Ok(0));
     }
 }

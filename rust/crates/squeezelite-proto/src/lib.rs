@@ -7,6 +7,7 @@
 //! and encoding of client telemetry packets (`HELO`, `STAT`, `RESP`).
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 use core::fmt;
 
@@ -142,11 +143,19 @@ pub enum StreamCommandType {
     Stop,
     /// Flush audio buffer immediately.
     Flush,
-    /// Undefined or proprietary stream command.
+    /// Undefined or extended stream command (including `'t'` timestamp and `'a'` skip-ahead).
     Unknown(u8),
 }
 
 impl StreamCommandType {
+    /// Query current playback timestamp (`'t'`).
+    #[allow(non_upper_case_globals)]
+    pub const Timestamp: Self = Self::Unknown(b't');
+
+    /// Skip ahead in output buffer (`'a'`).
+    #[allow(non_upper_case_globals)]
+    pub const SkipAhead: Self = Self::Unknown(b'a');
+
     pub const fn from_byte(b: u8) -> Self {
         match b {
             b's' => Self::Start,
@@ -154,9 +163,39 @@ impl StreamCommandType {
             b'u' => Self::Resume,
             b'q' => Self::Stop,
             b'f' => Self::Flush,
+            b't' => Self::Timestamp,
+            b'a' => Self::SkipAhead,
             other => Self::Unknown(other),
         }
     }
+
+    pub const fn to_byte(self) -> u8 {
+        match self {
+            Self::Start => b's',
+            Self::Pause => b'p',
+            Self::Resume => b'u',
+            Self::Stop => b'q',
+            Self::Flush => b'f',
+            Self::Unknown(b) => b,
+        }
+    }
+
+    /// Returns `true` if this stream command is a timestamp query (`'t'`).
+    pub const fn is_timestamp(self) -> bool {
+        matches!(self, Self::Unknown(b't'))
+    }
+
+    /// Returns `true` if this stream command is a skip-ahead request (`'a'`).
+    pub const fn is_skip_ahead(self) -> bool {
+        matches!(self, Self::Unknown(b'a'))
+    }
+}
+
+/// Parsed LMS `setd` device setting payload (`[id: u8, data...]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceSetting<'a> {
+    pub id: u8,
+    pub data: &'a [u8],
 }
 
 /// Parsed commands received from the Logitech Media Server.
@@ -189,7 +228,7 @@ pub enum ServerCommand<'a> {
         digital_atten: u8,
         preamp: u8,
     },
-    /// Set audio output device sample rate (`setd`).
+    /// Set audio output device setting or sample rate (`setd`).
     SetDevice {
         sample_rate: u32,
     },
@@ -199,11 +238,97 @@ pub enum ServerCommand<'a> {
     Body {
         data: &'a [u8],
     },
-    /// Unrecognized packet opcode.
+    /// Extended or unrecognized packet opcode (`setd` variable data, `aude`, `cont`, `serv`, `vers`, `dsco`, etc.).
     Unknown {
         opcode: [u8; 4],
         payload: &'a [u8],
     },
+}
+
+impl<'a> ServerCommand<'a> {
+    /// Extracts the `setd` device setting `(id, data)` if this command is a `setd` frame.
+    pub fn device_setting(&self) -> Option<DeviceSetting<'a>> {
+        match *self {
+            Self::Unknown {
+                opcode: [b's', b'e', b't', b'd'],
+                payload,
+            } if !payload.is_empty() => Some(DeviceSetting {
+                id: payload[0],
+                data: &payload[1..],
+            }),
+            Self::SetDevice { sample_rate } if sample_rate <= u8::MAX as u32 => Some(DeviceSetting {
+                id: sample_rate as u8,
+                data: &[],
+            }),
+            _ => None,
+        }
+    }
+
+    /// Extracts `(spdif_enable, dac_enable)` if this command is an `aude` frame.
+    pub const fn audio_enable(&self) -> Option<(bool, bool)> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'a', b'u', b'd', b'e'],
+                payload,
+            } if payload.len() >= 2 => Some((payload[0] != 0, payload[1] != 0)),
+            _ => None,
+        }
+    }
+
+    /// Extracts the `metaint` metadata interval if this command is a `cont` frame.
+    pub fn stream_continue(&self) -> Option<u32> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'c', b'o', b'n', b't'],
+                payload,
+            } => {
+                if payload.len() >= 4 {
+                    Some(u32::from_be_bytes([
+                        payload[0], payload[1], payload[2], payload[3],
+                    ]))
+                } else {
+                    Some(0)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts `(server_ip, sync_group)` if this command is a `serv` frame.
+    pub fn switch_server(&self) -> Option<([u8; 4], &'a [u8])> {
+        match *self {
+            Self::Unknown {
+                opcode: [b's', b'e', b'r', b'v'],
+                payload,
+            } if payload.len() >= 4 => {
+                let ip = [payload[0], payload[1], payload[2], payload[3]];
+                Some((ip, &payload[4..]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts the server version string if this command is a `vers` frame.
+    pub fn server_version(&self) -> Option<&'a str> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'v', b'e', b'r', b's'],
+                payload,
+            } if !payload.is_empty() => core::str::from_utf8(payload).ok(),
+            _ => None,
+        }
+    }
+
+    /// Extracts the disconnect reason code if this command is a `dsco` frame.
+    pub const fn stream_disconnected(&self) -> Option<u8> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'd', b's', b'c', b'o'],
+                payload,
+            } if !payload.is_empty() => Some(payload[0]),
+            _ => None,
+        }
+    }
 }
 
 /// Zero-allocation parser for SlimProto frame sequences.
@@ -272,6 +397,11 @@ impl SlimprotoParser {
             b"setd" => Self::parse_setd(payload)?,
             b"flsh" => ServerCommand::Flush,
             b"body" => ServerCommand::Body { data: payload },
+            b"aude" => Self::parse_aude(payload)?,
+            b"cont" => Self::parse_cont(payload)?,
+            b"serv" => Self::parse_serv(payload)?,
+            b"vers" => Self::parse_vers(payload)?,
+            b"dsco" => Self::parse_dsco(payload)?,
             _ => ServerCommand::Unknown { opcode, payload },
         };
 
@@ -327,10 +457,16 @@ impl SlimprotoParser {
         if payload.len() < 18 {
             return Err(ParseError::InvalidFormat);
         }
+        let old_left = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let old_right = i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let digital_atten = payload[8];
         let preamp = payload[9];
-        let gain_left = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
-        let gain_right = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
+        let raw_left = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
+        let raw_right = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
+
+        // Legacy negative dB value in old_gain_left/right indicates mute when 16.16 fixed-point gain is zero
+        let gain_left = if old_left < 0 { 0 } else { raw_left };
+        let gain_right = if old_right < 0 { 0 } else { raw_right };
 
         Ok(ServerCommand::AudioGain {
             gain_left,
@@ -340,16 +476,85 @@ impl SlimprotoParser {
         })
     }
 
+    /// Parses a raw `setd` payload into `(setting_id, data)` according to the LMS `setd` specification.
+    pub fn parse_setd_setting(payload: &[u8]) -> Result<DeviceSetting<'_>, ParseError> {
+        if payload.is_empty() {
+            return Err(ParseError::InvalidFormat);
+        }
+        Ok(DeviceSetting {
+            id: payload[0],
+            data: &payload[1..],
+        })
+    }
+
     fn parse_setd(payload: &[u8]) -> Result<ServerCommand<'_>, ParseError> {
         if payload.is_empty() {
             return Err(ParseError::InvalidFormat);
         }
-        let sample_rate = if payload.len() >= 4 {
-            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-        } else {
-            payload[0] as u32
-        };
-        Ok(ServerCommand::SetDevice { sample_rate })
+        // Only interpret 4-byte payloads (or 1-byte setting ID queries) via SetDevice;
+        // variable-length device setting frames (e.g. id=0 player name strings) must not
+        // corrupt sample_rate with ASCII name bytes.
+        match payload.len() {
+            4 => {
+                let sample_rate =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(ServerCommand::SetDevice { sample_rate })
+            }
+            1 => Ok(ServerCommand::SetDevice {
+                sample_rate: payload[0] as u32,
+            }),
+            _ => Ok(ServerCommand::Unknown {
+                opcode: *b"setd",
+                payload,
+            }),
+        }
+    }
+
+    fn parse_aude(payload: &[u8]) -> Result<ServerCommand<'_>, ParseError> {
+        if payload.len() < 2 {
+            return Err(ParseError::InvalidFormat);
+        }
+        Ok(ServerCommand::Unknown {
+            opcode: *b"aude",
+            payload,
+        })
+    }
+
+    fn parse_cont(payload: &[u8]) -> Result<ServerCommand<'_>, ParseError> {
+        Ok(ServerCommand::Unknown {
+            opcode: *b"cont",
+            payload,
+        })
+    }
+
+    fn parse_serv(payload: &[u8]) -> Result<ServerCommand<'_>, ParseError> {
+        if payload.len() < 4 {
+            return Err(ParseError::InvalidFormat);
+        }
+        Ok(ServerCommand::Unknown {
+            opcode: *b"serv",
+            payload,
+        })
+    }
+
+    fn parse_vers(payload: &[u8]) -> Result<ServerCommand<'_>, ParseError> {
+        if payload.is_empty() {
+            return Err(ParseError::InvalidFormat);
+        }
+        Ok(ServerCommand::Unknown {
+            opcode: *b"vers",
+            payload,
+        })
+    }
+
+    fn parse_dsco(payload: &[u8]) -> Result<ServerCommand<'_>, ParseError> {
+        if payload.is_empty() {
+            return Err(ParseError::InvalidFormat);
+        }
+        Ok(ServerCommand::Unknown {
+            opcode: *b"dsco",
+            payload,
+        })
     }
 }
 
@@ -362,11 +567,11 @@ pub enum StatEvent {
     TrackStarted,
     /// Track playback paused (`STMp`).
     TrackPaused,
-    /// Track playback resumed (`STMu`).
+    /// Track playback resumed (`STMr`).
     TrackResumed,
     /// Playback stopped (`STMq`).
     TrackStopped,
-    /// Stream buffer underrun / starving (`STMu`).
+    /// Stream buffer underrun / threshold reached (`STMl`).
     StreamUnderrun,
     /// Output buffer underrun (`STMo`).
     OutputUnderrun,
@@ -374,6 +579,12 @@ pub enum StatEvent {
     StreamFlushed,
     /// Track connection established (`STMc`).
     Connected,
+    /// Track connection established alias (`STMc`).
+    ConnectEstablished,
+    /// Decoder ready for next track (`STMd`).
+    DecodeReady,
+    /// Format or stream not supported (`STMn`).
+    NotSupported,
 }
 
 impl StatEvent {
@@ -382,13 +593,76 @@ impl StatEvent {
             Self::Heartbeat => *b"STMt",
             Self::TrackStarted => *b"STMs",
             Self::TrackPaused => *b"STMp",
-            Self::TrackResumed => *b"STMu",
+            Self::TrackResumed => *b"STMr",
             Self::TrackStopped => *b"STMq",
             Self::StreamUnderrun => *b"STMl",
             Self::OutputUnderrun => *b"STMo",
             Self::StreamFlushed => *b"STMf",
-            Self::Connected => *b"STMc",
+            Self::Connected | Self::ConnectEstablished => *b"STMc",
+            Self::DecodeReady => *b"STMd",
+            Self::NotSupported => *b"STMn",
         }
+    }
+}
+
+/// Standard 53-byte payload size of a SlimProto `STAT` frame.
+pub const STAT_PAYLOAD_SIZE: usize = 53;
+
+/// Total wire size (8-byte header + 53-byte payload) of a SlimProto `STAT` frame.
+pub const STAT_FRAME_SIZE: usize = 8 + STAT_PAYLOAD_SIZE;
+
+/// Full structured telemetry report for SlimProto `STAT` packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatReport {
+    pub event: StatEvent,
+    pub stream_buffer_size: u32,
+    pub stream_buffer_fullness: u32,
+    pub bytes_received: u64,
+    pub signal_strength: u16,
+    pub jiffies: u32,
+    pub output_buffer_size: u32,
+    pub output_buffer_fullness: u32,
+    pub elapsed_seconds: u32,
+    pub voltage: u16,
+    pub elapsed_ms: u32,
+    pub server_timestamp: u32,
+}
+
+/// Dedicated `STAT` packet builder supporting both full `StatReport` structs and compact telemetry counters.
+pub struct StatBuilder;
+
+impl StatBuilder {
+    /// Serializes a complete `StatReport` into a 61-byte `STAT` wire frame.
+    pub fn build_stat_report(report: &StatReport, out: &mut [u8]) -> Result<usize, ParseError> {
+        SlimprotoBuilder::build_stat_report(report, out)
+    }
+
+    /// Formats a `STAT` telemetry packet estimating `elapsed_seconds` and `elapsed_ms` from `frames_played` at 44.1 kHz.
+    pub fn build_stat(
+        event: StatEvent,
+        stream_buffer_fullness: u32,
+        output_buffer_fullness: u32,
+        frames_played: u32,
+        timestamp_ms: u32,
+        out: &mut [u8],
+    ) -> Result<usize, ParseError> {
+        let elapsed_ms = ((frames_played as u64) * 1000 / 44_100) as u32;
+        let elapsed_seconds = frames_played / 44_100;
+        let report = StatReport {
+            event,
+            stream_buffer_size: 65536,
+            stream_buffer_fullness,
+            bytes_received: frames_played as u64,
+            signal_strength: 0xFFFF,
+            jiffies: timestamp_ms,
+            output_buffer_size: 65536,
+            output_buffer_fullness,
+            elapsed_seconds,
+            voltage: 0,
+            elapsed_ms,
+            server_timestamp: 0,
+        };
+        Self::build_stat_report(&report, out)
     }
 }
 
@@ -428,6 +702,37 @@ impl SlimprotoBuilder {
         Ok(total_len)
     }
 
+    /// Serializes a complete `StatReport` into a 61-byte `STAT` wire frame, populating all wire offsets.
+    pub fn build_stat_report(report: &StatReport, out: &mut [u8]) -> Result<usize, ParseError> {
+        if out.len() < STAT_FRAME_SIZE {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        // Header (8 bytes)
+        out[0..4].copy_from_slice(b"STAT");
+        out[4..8].copy_from_slice(&(STAT_PAYLOAD_SIZE as u32).to_be_bytes());
+
+        // Payload (53 bytes, offsets relative to frame start = 8 + payload_offset)
+        out[8..12].copy_from_slice(&report.event.opcode_bytes());
+        out[12] = 0; // num_crlf
+        out[13] = 0; // mas_initialized
+        out[14] = 0; // mas_mode
+        out[15..19].copy_from_slice(&report.stream_buffer_size.to_be_bytes());
+        out[19..23].copy_from_slice(&report.stream_buffer_fullness.to_be_bytes());
+        out[23..31].copy_from_slice(&report.bytes_received.to_be_bytes());
+        out[31..33].copy_from_slice(&report.signal_strength.to_be_bytes());
+        out[33..37].copy_from_slice(&report.jiffies.to_be_bytes());
+        out[37..41].copy_from_slice(&report.output_buffer_size.to_be_bytes());
+        out[41..45].copy_from_slice(&report.output_buffer_fullness.to_be_bytes());
+        out[45..49].copy_from_slice(&report.elapsed_seconds.to_be_bytes());
+        out[49..51].copy_from_slice(&report.voltage.to_be_bytes());
+        out[51..55].copy_from_slice(&report.elapsed_ms.to_be_bytes());
+        out[55..59].copy_from_slice(&report.server_timestamp.to_be_bytes());
+        out[59..61].copy_from_slice(&0u16.to_be_bytes()); // error_code
+
+        Ok(STAT_FRAME_SIZE)
+    }
+
     /// Formats a STAT telemetry heartbeat packet into a provided byte buffer.
     /// Returns the total bytes written (61 bytes).
     pub fn build_stat(
@@ -458,37 +763,21 @@ impl SlimprotoBuilder {
         timestamp_ms: u32,
         out: &mut [u8],
     ) -> Result<usize, ParseError> {
-        const PAYLOAD_LEN: usize = 53;
-        const TOTAL_LEN: usize = 8 + PAYLOAD_LEN;
-
-        if out.len() < TOTAL_LEN {
-            return Err(ParseError::PayloadTooLarge);
-        }
-
-        // Header
-        out[0..4].copy_from_slice(b"STAT");
-        out[4..8].copy_from_slice(&(PAYLOAD_LEN as u32).to_be_bytes());
-
-        // Payload (53 bytes)
-        out[8..12].copy_from_slice(&event.opcode_bytes());
-        out[12] = 0; // num_crlf
-        out[13] = 0; // mas_initialized
-        out[14] = 0; // mas_mode
-        out[15..19].copy_from_slice(&65536u32.to_be_bytes()); // stream_buffer_size
-        out[19..23].copy_from_slice(&stream_buffer_fullness.to_be_bytes());
-        out[23..27].copy_from_slice(&0u32.to_be_bytes()); // bytes_received_H
-        out[27..31].copy_from_slice(&frames_played.to_be_bytes()); // bytes_received_L (frames counter)
-        out[31..33].copy_from_slice(&0xFFFFu16.to_be_bytes()); // signal_strength
-        out[33..37].copy_from_slice(&timestamp_ms.to_be_bytes()); // jiffies
-        out[37..41].copy_from_slice(&65536u32.to_be_bytes()); // output_buffer_size
-        out[41..45].copy_from_slice(&output_buffer_fullness.to_be_bytes());
-        out[45..49].copy_from_slice(&(timestamp_ms / 1000).to_be_bytes()); // elapsed_seconds
-        out[49..51].copy_from_slice(&0u16.to_be_bytes()); // voltage
-        out[51..55].copy_from_slice(&timestamp_ms.to_be_bytes()); // elapsed_milliseconds
-        out[55..59].copy_from_slice(&0u32.to_be_bytes()); // server_timestamp
-        out[59..61].copy_from_slice(&0u16.to_be_bytes()); // error_code
-
-        Ok(TOTAL_LEN)
+        let report = StatReport {
+            event,
+            stream_buffer_size: 65536,
+            stream_buffer_fullness,
+            bytes_received: frames_played as u64,
+            signal_strength: 0xFFFF,
+            jiffies: timestamp_ms,
+            output_buffer_size: 65536,
+            output_buffer_fullness,
+            elapsed_seconds: timestamp_ms / 1000,
+            voltage: 0,
+            elapsed_ms: timestamp_ms,
+            server_timestamp: 0,
+        };
+        Self::build_stat_report(&report, out)
     }
 }
 
@@ -516,12 +805,17 @@ impl DiscoveryBuilder {
 pub struct DiscoveryParser;
 
 impl DiscoveryParser {
+    /// Alias for [`Self::parse_response`] that parses an LMS UDP discovery response.
+    pub fn parse_discovery_response(buf: &[u8]) -> Option<DiscoveredServer> {
+        Self::parse_response(buf)
+    }
+
     /// Parses an LMS discovery response (must start with uppercase `b'E'`).
     /// Rejects client reflection queries starting with `b'e'`.
     ///
-    /// Supports both standard LMS 1-byte TLV length-prefixed tags
-    /// (`JSON`/`CLIP` + 1-byte len + `port_str`) and null-terminated fallback
-    /// (`JSON`/`CLIP` + `port_str\0`).
+    /// Supports standard LMS 1-byte TLV length-prefixed tags (`JSON`, `CLIP`, `PORT`,
+    /// skipping informational tags like `NAME`, `VERS`, `UUID`), null-terminated fallback
+    /// (`JSON`/`CLIP` + `port_str\0`), and 2-byte big-endian binary port responses.
     pub fn parse_response(buf: &[u8]) -> Option<DiscoveredServer> {
         if buf.is_empty() || buf[0] != b'E' {
             return None;
@@ -532,20 +826,43 @@ impl DiscoveryParser {
         let mut tag_found = false;
 
         let payload = &buf[1..];
+
+        // Legacy 2-byte big-endian port right after 'E'
+        if payload.len() == 2 {
+            let port = u16::from_be_bytes([payload[0], payload[1]]);
+            if port > 0 {
+                return Some(DiscoveredServer {
+                    json_port: port,
+                    cli_port,
+                });
+            }
+        }
+
         let mut i = 0;
         while i < payload.len() {
-            let is_json = payload[i..].starts_with(b"JSON");
-            let is_clip = payload[i..].starts_with(b"CLIP");
+            let rem = &payload[i..];
+            let is_json = rem.starts_with(b"JSON");
+            let is_clip = rem.starts_with(b"CLIP");
+            let is_port = rem.starts_with(b"PORT");
 
-            if is_json || is_clip {
+            if is_json || is_clip || is_port {
                 let tag_end = i + 4;
-                // Try standard LMS 1-byte TLV length-prefixed tag first
                 let tlv_parsed = if tag_end < payload.len() {
                     let tlv_len = payload[tag_end] as usize;
                     if (1..=5).contains(&tlv_len) && tag_end + 1 + tlv_len <= payload.len() {
                         let val_bytes = &payload[tag_end + 1..tag_end + 1 + tlv_len];
                         if let Ok(s) = core::str::from_utf8(val_bytes) {
-                            parse_u16(s.trim_end_matches('\0')).ok().map(|port| (port, tag_end + 1 + tlv_len))
+                            if let Ok(port) = parse_u16(s.trim_end_matches('\0')) {
+                                Some((port, tag_end + 1 + tlv_len))
+                            } else if tlv_len == 2 {
+                                let port = u16::from_be_bytes([val_bytes[0], val_bytes[1]]);
+                                (port > 0).then_some((port, tag_end + 1 + tlv_len))
+                            } else {
+                                None
+                            }
+                        } else if tlv_len == 2 {
+                            let port = u16::from_be_bytes([val_bytes[0], val_bytes[1]]);
+                            (port > 0).then_some((port, tag_end + 1 + tlv_len))
                         } else {
                             None
                         }
@@ -557,10 +874,10 @@ impl DiscoveryParser {
                 };
 
                 if let Some((port, next_i)) = tlv_parsed {
-                    if is_json {
-                        json_port = port;
-                    } else {
+                    if is_clip {
                         cli_port = port;
+                    } else {
+                        json_port = port;
                     }
                     tag_found = true;
                     i = next_i;
@@ -569,15 +886,28 @@ impl DiscoveryParser {
                     // Fallback to null-terminated: Tag + port_str\0
                     if let Ok(s) = core::str::from_utf8(&payload[tag_end..tag_end + end]) {
                         if let Ok(port) = parse_u16(s) {
-                            if is_json {
-                                json_port = port;
-                            } else {
+                            if is_clip {
                                 cli_port = port;
+                            } else {
+                                json_port = port;
                             }
                             tag_found = true;
                             i = tag_end + end + 1;
                             continue;
                         }
+                    }
+                }
+            } else if rem.starts_with(b"NAME")
+                || rem.starts_with(b"VERS")
+                || rem.starts_with(b"UUID")
+                || rem.starts_with(b"IPAD")
+            {
+                let tag_end = i + 4;
+                if tag_end < payload.len() {
+                    let tlv_len = payload[tag_end] as usize;
+                    if tag_end + 1 + tlv_len <= payload.len() {
+                        i = tag_end + 1 + tlv_len;
+                        continue;
                     }
                 }
             }
@@ -856,5 +1186,152 @@ mod tests {
         let server_tlv = DiscoveryParser::parse_response(response_tlv).unwrap();
         assert_eq!(server_tlv.json_port, 9000);
         assert_eq!(server_tlv.cli_port, 9090);
+
+        // Discovery response with leading NAME/VERS TLV tags and PORT tag (PROTOCFG-806)
+        let response_multi_tlv = b"ENAME\x06MyLMS1VERS\x058.5.0PORT\x043483CLIP\x049091";
+        let server_multi = DiscoveryParser::parse_discovery_response(response_multi_tlv).unwrap();
+        assert_eq!(server_multi.json_port, 3483);
+        assert_eq!(server_multi.cli_port, 9091);
+
+        // Legacy 2-byte big-endian port response after 'E'
+        let response_2byte = [b'E', 0x23, 0x28]; // 0x2328 = 9000
+        let server_2b = DiscoveryParser::parse_discovery_response(&response_2byte).unwrap();
+        assert_eq!(server_2b.json_port, 9000);
+        assert_eq!(server_2b.cli_port, 9090);
+    }
+
+    #[test]
+    fn test_setd_device_setting_player_name_and_dac(
+    ) {
+        // Player name update (id = 0, data = "StudioPlayer\0") must NOT be parsed as sample_rate (PROTOCFG-801)
+        let payload = b"\x00StudioPlayer\0";
+        let len = (4 + payload.len()) as u16;
+        let mut frame = [0u8; 32];
+        frame[0..2].copy_from_slice(&len.to_be_bytes());
+        frame[2..6].copy_from_slice(b"setd");
+        frame[6..6 + payload.len()].copy_from_slice(payload);
+
+        let (cmd, consumed) = SlimprotoParser::parse_frame(&frame[..6 + payload.len()]).unwrap();
+        assert_eq!(consumed, 6 + payload.len());
+        let setting = cmd.device_setting().expect("Expected device setting");
+        assert_eq!(setting.id, 0);
+        assert_eq!(setting.data, b"StudioPlayer\0");
+
+        let direct = SlimprotoParser::parse_setd_setting(payload).unwrap();
+        assert_eq!(direct.id, 0);
+        assert_eq!(direct.data, b"StudioPlayer\0");
+
+        // Disable DAC query (1-byte id = 4)
+        let frame_dac = [0x00, 0x05, b's', b'e', b't', b'd', 0x04];
+        let (cmd_dac, _) = SlimprotoParser::parse_frame(&frame_dac).unwrap();
+        let dac_setting = cmd_dac.device_setting().expect("Expected 1-byte device setting");
+        assert_eq!(dac_setting.id, 4);
+        assert!(dac_setting.data.is_empty());
+    }
+
+    #[test]
+    fn test_stat_event_opcodes_and_stat_report_wire_offsets() {
+        // PROTOCFG-802: TrackResumed is STMr; DecodeReady, NotSupported, ConnectEstablished supported
+        assert_eq!(&StatEvent::TrackResumed.opcode_bytes(), b"STMr");
+        assert_eq!(&StatEvent::DecodeReady.opcode_bytes(), b"STMd");
+        assert_eq!(&StatEvent::NotSupported.opcode_bytes(), b"STMn");
+        assert_eq!(&StatEvent::ConnectEstablished.opcode_bytes(), b"STMc");
+        assert_eq!(&StatEvent::Connected.opcode_bytes(), b"STMc");
+
+        let report = StatReport {
+            event: StatEvent::TrackResumed,
+            stream_buffer_size: 262_144,
+            stream_buffer_fullness: 131_072,
+            bytes_received: 0x0000_0001_8000_0000,
+            signal_strength: 0x1234,
+            jiffies: 55_000,
+            output_buffer_size: 131_072,
+            output_buffer_fullness: 65_536,
+            elapsed_seconds: 42,
+            voltage: 3300,
+            elapsed_ms: 42_500,
+            server_timestamp: 99_887_766,
+        };
+
+        let mut frame = [0u8; STAT_FRAME_SIZE];
+        let written = StatBuilder::build_stat_report(&report, &mut frame).unwrap();
+        assert_eq!(written, STAT_FRAME_SIZE);
+        assert_eq!(&frame[0..4], b"STAT");
+        assert_eq!(u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]), 53);
+        assert_eq!(&frame[8..12], b"STMr");
+
+        // Verify payload offsets relative to payload start (&frame[8..])
+        let payload = &frame[8..];
+        assert_eq!(u64::from_be_bytes(payload[15..23].try_into().unwrap()), 0x0000_0001_8000_0000);
+        assert_eq!(u32::from_be_bytes(payload[37..41].try_into().unwrap()), 42);
+        assert_eq!(u16::from_be_bytes(payload[41..43].try_into().unwrap()), 3300);
+        assert_eq!(u32::from_be_bytes(payload[43..47].try_into().unwrap()), 42_500);
+        assert_eq!(u32::from_be_bytes(payload[47..51].try_into().unwrap()), 99_887_766);
+
+        // StatBuilder::build_stat estimates elapsed_seconds and elapsed_ms from frames_played / 44_100
+        let mut frame2 = [0u8; STAT_FRAME_SIZE];
+        StatBuilder::build_stat(StatEvent::DecodeReady, 4096, 2048, 88_200, 5000, &mut frame2).unwrap();
+        let payload2 = &frame2[8..];
+        assert_eq!(&payload2[0..4], b"STMd");
+        assert_eq!(u32::from_be_bytes(payload2[37..41].try_into().unwrap()), 2); // 88200 / 44100 = 2s
+        assert_eq!(u32::from_be_bytes(payload2[43..47].try_into().unwrap()), 2000); // 2000ms
+    }
+
+    #[test]
+    fn test_strm_timestamp_and_skip_ahead_and_extended_opcodes() {
+        // PROTOCFG-803: 't' and 'a' stream commands
+        assert_eq!(StreamCommandType::from_byte(b't'), StreamCommandType::Timestamp);
+        assert!(StreamCommandType::from_byte(b't').is_timestamp());
+        assert_eq!(StreamCommandType::Timestamp.to_byte(), b't');
+
+        assert_eq!(StreamCommandType::from_byte(b'a'), StreamCommandType::SkipAhead);
+        assert!(StreamCommandType::from_byte(b'a').is_skip_ahead());
+        assert_eq!(StreamCommandType::SkipAhead.to_byte(), b'a');
+
+        // PROTOCFG-804: aude, cont, serv, vers, dsco frames
+        let aude_frame = [0x00, 0x06, b'a', b'u', b'd', b'e', 1, 0];
+        let (cmd_aude, _) = SlimprotoParser::parse_frame(&aude_frame).unwrap();
+        assert_eq!(cmd_aude.audio_enable(), Some((true, false)));
+
+        let cont_frame = [0x00, 0x08, b'c', b'o', b'n', b't', 0, 0, 0x40, 0x00];
+        let (cmd_cont, _) = SlimprotoParser::parse_frame(&cont_frame).unwrap();
+        assert_eq!(cmd_cont.stream_continue(), Some(16384));
+
+        let serv_frame = [0x00, 0x08, b's', b'e', b'r', b'v', 192, 168, 1, 99];
+        let (cmd_serv, _) = SlimprotoParser::parse_frame(&serv_frame).unwrap();
+        assert_eq!(cmd_serv.switch_server(), Some(([192, 168, 1, 99], &[][..])));
+
+        let vers_frame = b"\x00\x09vers8.5.1";
+        let (cmd_vers, _) = SlimprotoParser::parse_frame(vers_frame).unwrap();
+        assert_eq!(cmd_vers.server_version(), Some("8.5.1"));
+
+        let dsco_frame = [0x00, 0x05, b'd', b's', b'c', b'o', 0];
+        let (cmd_dsco, _) = SlimprotoParser::parse_frame(&dsco_frame).unwrap();
+        assert_eq!(cmd_dsco.stream_disconnected(), Some(0));
+    }
+
+    #[test]
+    fn test_audg_negative_db_mute_indicator() {
+        // PROTOCFG-805: negative old_gain_left/right mutes channel
+        let mut frame = [0u8; 26];
+        frame[0..4].copy_from_slice(b"audg");
+        frame[4..8].copy_from_slice(&18u32.to_be_bytes());
+        frame[8..12].copy_from_slice(&(-30i32).to_be_bytes()); // old_left < 0
+        frame[12..16].copy_from_slice(&(-30i32).to_be_bytes()); // old_right < 0
+        frame[16] = 1;
+        frame[17] = 255;
+        frame[18..22].copy_from_slice(&0x00010000u32.to_be_bytes());
+        frame[22..26].copy_from_slice(&0x00010000u32.to_be_bytes());
+
+        let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
+        assert_eq!(
+            cmd,
+            ServerCommand::AudioGain {
+                gain_left: 0,
+                gain_right: 0,
+                digital_atten: 1,
+                preamp: 255,
+            }
+        );
     }
 }

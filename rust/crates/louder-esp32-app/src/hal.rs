@@ -187,7 +187,38 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
             }
 
             let chunk_bytes = offset;
-            let written_bytes = self.driver.write_dma(&self.dma_scratch[..chunk_bytes])?;
+            if chunk_bytes == 0 {
+                break;
+            }
+
+            let mut written_bytes = self.driver.write_dma(&self.dma_scratch[..chunk_bytes])?;
+            if written_bytes > chunk_bytes {
+                written_bytes = chunk_bytes;
+            }
+
+            // HALNET-402: An I2S 32-bit stereo frame is 8 bytes (4 bytes Left + 4 bytes Right).
+            // If the DMA driver returned a partial frame (written_bytes % 8 != 0), loop to write
+            // the remaining 8 - (written_bytes % 8) bytes of that stereo frame so Left/Right
+            // channels never split or swap!
+            if written_bytes % 8 != 0 {
+                let aligned_end = written_bytes + (8 - (written_bytes % 8));
+                let mut retries = 0u8;
+                while written_bytes < aligned_end {
+                    let w = self
+                        .driver
+                        .write_dma(&self.dma_scratch[written_bytes..aligned_end])?;
+                    if w == 0 {
+                        retries += 1;
+                        if retries >= 64 {
+                            return Err(OutputError::HardwareFault);
+                        }
+                        continue;
+                    }
+                    retries = 0;
+                    written_bytes = (written_bytes + w).min(aligned_end);
+                }
+            }
+
             let frames_from_chunk = written_bytes / 8;
             total_frames_written += frames_from_chunk;
             self.frames_written += frames_from_chunk;
@@ -328,11 +359,25 @@ impl<U: UartPort> CydUartBridge<U> {
         self.controller.feed_bytes(&rx_buf[..n])
     }
 
-    /// Encodes and transmits a telemetry message to the display over UART.
+    /// Encodes and transmits a telemetry message to the display over UART,
+    /// looping over partial TX writes (`HALNET-407`).
     pub fn send_message(&mut self, msg: &CydMessage) -> Result<usize, LinkError> {
-        let bytes = self.controller.format_message(msg)?;
-        let written = self.port.write_tx(bytes);
-        Ok(written)
+        let buf = self.controller.format_message(msg)?;
+        let len = buf.len();
+        let mut offset = 0;
+        while offset < len {
+            let w = self.port.write_tx(&buf[offset..len]);
+            if w == 0 {
+                break;
+            }
+            offset += w;
+        }
+        Ok(offset)
+    }
+
+    /// Flushes an outbound telemetry message to the UART TX port across partial writes (`HALNET-407`).
+    pub fn flush_outbound(&mut self, msg: &CydMessage) -> Result<usize, LinkError> {
+        self.send_message(msg)
     }
 }
 
@@ -340,20 +385,23 @@ impl<U: UartPort> CydUartBridge<U> {
 // C. Dual-Sector Raw Flash NVS Backend
 // ============================================================================
 
+/// Standard 4 KB flash sector size (`HALNET-408`).
+pub const FLASH_SECTOR_SIZE: usize = 4096;
+
 /// Trait abstracting raw 4KB flash partition read and write access.
 pub trait FlashPartition {
     /// Reads a 4096-byte sector (0 for Sector A, 1 for Sector B).
-    fn read_sector(&self, sector_idx: u8) -> Result<&[u8; 4096], StorageError>;
+    fn read_sector(&self, sector_idx: u8) -> Result<&[u8; FLASH_SECTOR_SIZE], StorageError>;
 
     /// Writes a 4096-byte sector (0 for Sector A, 1 for Sector B).
-    fn write_sector(&mut self, sector_idx: u8, data: &[u8; 4096]) -> Result<(), StorageError>;
+    fn write_sector(&mut self, sector_idx: u8, data: &[u8; FLASH_SECTOR_SIZE]) -> Result<(), StorageError>;
 }
 
 /// In-memory dual-sector flash partition for simulation and verification.
 #[derive(Debug, Clone)]
 pub struct MemFlashPartition {
-    pub sector_a: [u8; 4096],
-    pub sector_b: [u8; 4096],
+    pub sector_a: [u8; FLASH_SECTOR_SIZE],
+    pub sector_b: [u8; FLASH_SECTOR_SIZE],
 }
 
 impl Default for MemFlashPartition {
@@ -365,14 +413,14 @@ impl Default for MemFlashPartition {
 impl MemFlashPartition {
     pub const fn new() -> Self {
         Self {
-            sector_a: [0u8; 4096],
-            sector_b: [0u8; 4096],
+            sector_a: [0u8; FLASH_SECTOR_SIZE],
+            sector_b: [0u8; FLASH_SECTOR_SIZE],
         }
     }
 }
 
 impl FlashPartition for MemFlashPartition {
-    fn read_sector(&self, sector_idx: u8) -> Result<&[u8; 4096], StorageError> {
+    fn read_sector(&self, sector_idx: u8) -> Result<&[u8; FLASH_SECTOR_SIZE], StorageError> {
         match sector_idx {
             0 => Ok(&self.sector_a),
             1 => Ok(&self.sector_b),
@@ -380,7 +428,7 @@ impl FlashPartition for MemFlashPartition {
         }
     }
 
-    fn write_sector(&mut self, sector_idx: u8, data: &[u8; 4096]) -> Result<(), StorageError> {
+    fn write_sector(&mut self, sector_idx: u8, data: &[u8; FLASH_SECTOR_SIZE]) -> Result<(), StorageError> {
         match sector_idx {
             0 => {
                 self.sector_a.copy_from_slice(data);
@@ -395,15 +443,20 @@ impl FlashPartition for MemFlashPartition {
     }
 }
 
-/// Dual-sector non-volatile storage flash journal backend.
+/// Dual-sector non-volatile storage flash journal backend (`HALNET-408`).
 pub struct NvsFlashBackend<F: FlashPartition> {
     flash: F,
     last_seq: u32,
+    scratch: [u8; FLASH_SECTOR_SIZE],
 }
 
 impl<F: FlashPartition> NvsFlashBackend<F> {
     pub const fn new(flash: F) -> Self {
-        Self { flash, last_seq: 0 }
+        Self {
+            flash,
+            last_seq: 0,
+            scratch: [0u8; FLASH_SECTOR_SIZE],
+        }
     }
 
     pub fn last_seq(&self) -> u32 {
@@ -448,19 +501,22 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
     }
 
     /// Commits the in-memory store atomically to the alternate flash sector with incremented sequence.
+    ///
+    /// Uses `self.scratch` to avoid allocating two 4KB sector buffers (8KB) on the call stack (`HALNET-408`).
     pub fn commit_store<const N: usize>(&mut self, store: &MemConfigStore<N>) -> Result<u32, StorageError> {
-        let mut a = *self.flash.read_sector(0)?;
+        self.scratch.copy_from_slice(self.flash.read_sector(0)?);
         let mut b = *self.flash.read_sector(1)?;
 
-        let (wrote_to_b, _bytes_written) = FlashJournal::save_to_dual_sectors(store, &mut a, &mut b)?;
+        let (wrote_to_b, _bytes_written) =
+            FlashJournal::save_to_dual_sectors(store, &mut self.scratch, &mut b)?;
 
         let new_seq = if wrote_to_b {
             self.flash.write_sector(1, &b)?;
             let (seq, _, _) = FlashJournal::read_sector_meta(&b)?;
             seq
         } else {
-            self.flash.write_sector(0, &a)?;
-            let (seq, _, _) = FlashJournal::read_sector_meta(&a)?;
+            self.flash.write_sector(0, &self.scratch)?;
+            let (seq, _, _) = FlashJournal::read_sector_meta(&self.scratch)?;
             seq
         };
 
@@ -597,6 +653,91 @@ impl I2c for TargetI2cBus {
 }
 
 // ============================================================================
+// E. Wi-Fi Hardware Driver & Adapter (`HALNET-411`)
+// ============================================================================
+
+/// Low-level hardware Wi-Fi driver abstraction.
+pub trait WifiDriver {
+    /// Initiates a station connection to the given SSID and passphrase.
+    fn start_connect(&mut self, ssid: &str, passphrase: &str) -> Result<(), &'static str>;
+
+    /// Returns `Some(ipv4_octets)` when the Wi-Fi station link is associated and has an IPv4 lease.
+    fn is_connected(&self) -> Option<[u8; 4]>;
+
+    /// Disconnects the Wi-Fi station interface.
+    fn disconnect(&mut self);
+}
+
+/// Deterministic loopback Wi-Fi driver for host simulation and testing.
+#[derive(Debug, Clone, Default)]
+pub struct LoopbackWifiDriver {
+    pub connected_ip: Option<[u8; 4]>,
+    pub last_ssid: heapless::String<32>,
+}
+
+impl LoopbackWifiDriver {
+    pub const fn new() -> Self {
+        Self {
+            connected_ip: None,
+            last_ssid: heapless::String::new(),
+        }
+    }
+}
+
+impl WifiDriver for LoopbackWifiDriver {
+    fn start_connect(&mut self, ssid: &str, _passphrase: &str) -> Result<(), &'static str> {
+        self.last_ssid.clear();
+        let _ = self.last_ssid.push_str(ssid);
+        Ok(())
+    }
+
+    fn is_connected(&self) -> Option<[u8; 4]> {
+        self.connected_ip
+    }
+
+    fn disconnect(&mut self) {
+        self.connected_ip = None;
+    }
+}
+
+/// Bridges `WifiManager` state machine with a hardware `WifiDriver` (`HALNET-411`).
+pub struct EspWifiAdapter<D: WifiDriver, S = MemConfigStore<32>> {
+    pub driver: D,
+    pub manager: crate::wifi::WifiManager<S>,
+    pub ip_addr: Option<[u8; 4]>,
+}
+
+impl<D: WifiDriver, S: squeezelite_config::KeyValueStorage> EspWifiAdapter<D, S> {
+    pub fn new(driver: D, manager: crate::wifi::WifiManager<S>) -> Self {
+        Self {
+            driver,
+            manager,
+            ip_addr: None,
+        }
+    }
+
+    pub fn ip_addr(&self) -> Option<[u8; 4]> {
+        self.ip_addr
+    }
+
+    /// Polls the hardware Wi-Fi link status and advances the `WifiManager` state machine (`HALNET-411`).
+    pub fn poll_connection(&mut self) -> crate::wifi::WifiState {
+        if self.manager.state() == crate::wifi::WifiState::Connecting {
+            if let Some(ip) = self.driver.is_connected() {
+                self.ip_addr = Some(ip);
+                self.manager.on_connected();
+            }
+        } else if self.manager.state() == crate::wifi::WifiState::Connected
+            && self.driver.is_connected().is_none()
+        {
+            self.ip_addr = None;
+            self.manager.on_disconnected();
+        }
+        self.manager.state()
+    }
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
@@ -605,6 +746,98 @@ mod tests {
     use super::*;
     use crate::amp::{AmpManager, AmpMode};
     use squeezelite_config::{AudioConfig, WifiCredentials};
+
+    struct PartialDmaDriver {
+        step_sizes: Vec<usize>,
+        call_idx: usize,
+        written: Vec<u8>,
+    }
+
+    impl PartialDmaDriver {
+        fn new(step_sizes: Vec<usize>) -> Self {
+            Self {
+                step_sizes,
+                call_idx: 0,
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl I2sDmaDriver for PartialDmaDriver {
+        fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
+            let limit = self
+                .step_sizes
+                .get(self.call_idx)
+                .copied()
+                .unwrap_or(data.len());
+            self.call_idx += 1;
+            let n = data.len().min(limit);
+            self.written.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+
+        fn set_clock_rate(&mut self, _sample_rate_hz: u32) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn set_tx_enabled(&mut self, _enabled: bool) {}
+    }
+
+    struct PartialTxUartPort {
+        max_bytes_per_write: usize,
+        tx_log: Vec<u8>,
+    }
+
+    impl PartialTxUartPort {
+        fn new(max_bytes_per_write: usize) -> Self {
+            Self {
+                max_bytes_per_write,
+                tx_log: Vec::new(),
+            }
+        }
+    }
+
+    impl UartPort for PartialTxUartPort {
+        fn read_rx(&mut self, _buf: &mut [u8]) -> usize {
+            0
+        }
+
+        fn write_tx(&mut self, data: &[u8]) -> usize {
+            let n = data.len().min(self.max_bytes_per_write);
+            self.tx_log.extend_from_slice(&data[..n]);
+            n
+        }
+    }
+
+    #[test]
+    fn test_esp_i2s_sink_partial_dma_frame_completion() {
+        // HALNET-402: Simulate DMA driver returning 3 bytes, then 3 bytes, then 2 bytes
+        // for the first 8-byte stereo frame. Verify EspI2sSink loops to complete the full
+        // 8-byte frame so Left/Right channels are never split or swapped.
+        let driver = PartialDmaDriver::new(vec![3, 3, 2]);
+        let mut sink = EspI2sSink::for_active_board(driver, 44100);
+
+        let frames = [0x11223344i32, 0x55667788i32, 0x10203040i32, 0x50607080i32];
+        let written_frames = sink.write_frames(&frames).unwrap();
+        assert_eq!(written_frames, 1);
+        assert_eq!(sink.frames_written(), 1);
+        assert_eq!(sink.driver.written.len(), 8);
+        assert_eq!(&sink.driver.written[0..4], &0x11223344i32.to_le_bytes());
+        assert_eq!(&sink.driver.written[4..8], &0x55667788i32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_cyd_uart_bridge_partial_tx_flush() {
+        // HALNET-407: Simulate UART TX FIFO accepting only 3 bytes per write_tx call.
+        let port = PartialTxUartPort::new(3);
+        let mut bridge = CydUartBridge::new(port);
+
+        let written = bridge
+            .flush_outbound(&CydMessage::PlaybackState(squeezelite_cyd_link::PlayState::Playing))
+            .unwrap();
+        assert_eq!(written, 8);
+        assert_eq!(bridge.port.tx_log.as_slice(), b"STATE=P\n");
+    }
 
     #[test]
     fn test_esp_i2s_sink_dma_conversion_and_mute() {
@@ -765,4 +998,35 @@ mod tests {
         amp.stop_playback().unwrap();
         assert_eq!(amp.mode(), AmpMode::Standby);
     }
+
+    #[test]
+    fn test_esp_wifi_adapter_connecting_to_connected_transition() {
+        // HALNET-411: Verify EspWifiAdapter::poll_connection transitions from Connecting -> Connected
+        let mut driver = LoopbackWifiDriver::new();
+        let mut store = MemConfigStore::<32>::new();
+        let creds = WifiCredentials::new("TestNet", "SecretPass123").unwrap();
+        creds.save_to(&mut store).unwrap();
+        let manager = crate::wifi::WifiManager::with_store(store);
+        assert_eq!(manager.state(), crate::wifi::WifiState::Connecting);
+
+        driver.connected_ip = Some([192, 168, 1, 42]);
+        let mut adapter = EspWifiAdapter::new(driver, manager);
+
+        let state = adapter.poll_connection();
+        assert_eq!(state, crate::wifi::WifiState::Connected);
+        assert_eq!(adapter.ip_addr(), Some([192, 168, 1, 42]));
+    }
+
+    #[test]
+    fn test_i2s_pin_config_mclk_pin_none_for_3wire_bclk_pll() {
+        // HALNET-412: Louder-ESP32 uses 3-wire BCLK PLL mode with mclk_pin = None
+        let cfg = crate::board::I2sPinConfig::for_active_board();
+        assert_eq!(cfg.mclk_pin, None);
+        assert_eq!(cfg.bclk_pin, crate::board::pins::I2S_BCLK as u8);
+        assert_eq!(cfg.lrclk_pin, crate::board::pins::I2S_LRCLK as u8);
+        assert_eq!(cfg.dout_pin, crate::board::pins::I2S_DOUT as u8);
+    }
 }
+
+
+

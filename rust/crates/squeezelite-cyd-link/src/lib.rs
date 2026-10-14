@@ -8,6 +8,7 @@
 //! human inspection, and serial terminal compatibility.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 use core::fmt;
 use heapless::{String, Vec};
@@ -56,6 +57,7 @@ pub enum CydCommand {
 pub enum LinkError {
     BufferOverflow,
     InvalidFrame,
+    ValueOutOfRange,
 }
 
 impl fmt::Display for LinkError {
@@ -63,6 +65,7 @@ impl fmt::Display for LinkError {
         match self {
             Self::BufferOverflow => write!(f, "Buffer capacity exceeded"),
             Self::InvalidFrame => write!(f, "Invalid frame format or delimiter"),
+            Self::ValueOutOfRange => write!(f, "Value out of valid range (0..=100)"),
         }
     }
 }
@@ -226,9 +229,42 @@ impl CydLinkProtocol {
         Ok(())
     }
 
-    /// Parses an incoming interactive command from the CYD display (supports `\n` and `\r\n`).
-    pub fn parse_command(line: &[u8]) -> Result<CydCommand, LinkError> {
-        let trimmed = Self::trim_crlf(line);
+    /// Encodes an interactive touch command into C-firmware compatible NDJSON (`\n` terminated).
+    pub fn encode_json_command(
+        cmd: &CydCommand,
+        buf: &mut [u8],
+    ) -> Result<usize, LinkError> {
+        match cmd {
+            CydCommand::Toggle => copy_slice(b"{\"cmd\":\"toggle\"}\n", buf),
+            CydCommand::Play => copy_slice(b"{\"cmd\":\"play\"}\n", buf),
+            CydCommand::Pause => copy_slice(b"{\"cmd\":\"pause\"}\n", buf),
+            CydCommand::Next => copy_slice(b"{\"cmd\":\"next\"}\n", buf),
+            CydCommand::Previous => copy_slice(b"{\"cmd\":\"prev\"}\n", buf),
+            CydCommand::QueryStatus => copy_slice(b"{\"cmd\":\"sync\"}\n", buf),
+            CydCommand::SetVolume(vol) => {
+                if *vol > 100 {
+                    return Err(LinkError::ValueOutOfRange);
+                }
+                let prefix = b"{\"cmd\":\"vol\",\"val\":";
+                let suffix = b"}\n";
+                let mut num_buf = [0u8; 3];
+                let digits = format_u8(*vol, &mut num_buf);
+                let total = prefix.len() + digits.len() + suffix.len();
+                if buf.len() < total {
+                    return Err(LinkError::BufferOverflow);
+                }
+                buf[..prefix.len()].copy_from_slice(prefix);
+                buf[prefix.len()..prefix.len() + digits.len()].copy_from_slice(digits);
+                buf[prefix.len() + digits.len()..total].copy_from_slice(suffix);
+                Ok(total)
+            }
+        }
+    }
+
+    /// Parses an incoming interactive command from the CYD display (supports `\n` and `\r\n`,
+    /// both `CMD=...` wire format and C-firmware NDJSON `{"cmd":...}` format).
+    pub fn parse_command<B: AsRef<[u8]> + ?Sized>(line: &B) -> Result<CydCommand, LinkError> {
+        let trimmed = Self::trim_crlf(line.as_ref());
 
         if let Some(rest) = trimmed.strip_prefix(b"CMD=") {
             match rest {
@@ -245,9 +281,88 @@ impl CydLinkProtocol {
                 }
                 _ => Err(LinkError::InvalidFrame),
             }
+        } else if let Ok(s) = core::str::from_utf8(trimmed) {
+            let s = s.trim();
+            if s.starts_with('{') && s.ends_with('}') {
+                parse_json_command(s)
+            } else {
+                Err(LinkError::InvalidFrame)
+            }
         } else {
             Err(LinkError::InvalidFrame)
         }
+    }
+}
+
+fn copy_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, LinkError> {
+    if dst.len() < src.len() {
+        return Err(LinkError::BufferOverflow);
+    }
+    dst[..src.len()].copy_from_slice(src);
+    Ok(src.len())
+}
+
+fn find_json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let mut pattern = [0u8; 32];
+    let k_bytes = key.as_bytes();
+    if k_bytes.len() + 2 > pattern.len() {
+        return None;
+    }
+    pattern[0] = b'"';
+    pattern[1..1 + k_bytes.len()].copy_from_slice(k_bytes);
+    pattern[1 + k_bytes.len()] = b'"';
+    let pat = core::str::from_utf8(&pattern[..2 + k_bytes.len()]).ok()?;
+
+    let mut search = json;
+    while let Some(idx) = search.find(pat) {
+        let after_key = &search[idx + pat.len()..];
+        let after_ws = after_key.trim_start();
+        if let Some(after_colon) = after_ws.strip_prefix(':') {
+            return Some(after_colon.trim_start());
+        }
+        search = after_key;
+    }
+    None
+}
+
+fn parse_json_command(json: &str) -> Result<CydCommand, LinkError> {
+    let cmd_rest = find_json_field(json, "cmd").ok_or(LinkError::InvalidFrame)?;
+    let cmd_inner = cmd_rest.strip_prefix('"').ok_or(LinkError::InvalidFrame)?;
+    let end_quote = cmd_inner.find('"').ok_or(LinkError::InvalidFrame)?;
+    let cmd_name = &cmd_inner[..end_quote];
+
+    match cmd_name {
+        "toggle" => Ok(CydCommand::Toggle),
+        "play" => Ok(CydCommand::Play),
+        "pause" => Ok(CydCommand::Pause),
+        "next" => Ok(CydCommand::Next),
+        "prev" => Ok(CydCommand::Previous),
+        "sync" | "status" => Ok(CydCommand::QueryStatus),
+        "vol" => {
+            let val_rest = find_json_field(json, "val").ok_or(LinkError::InvalidFrame)?;
+            let end = val_rest
+                .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+                .unwrap_or(val_rest.len());
+            let num_str = &val_rest[..end];
+            if num_str.is_empty() {
+                return Err(LinkError::InvalidFrame);
+            }
+            if let Some(neg) = num_str.strip_prefix('-') {
+                if !neg.is_empty() && neg.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(LinkError::ValueOutOfRange);
+                }
+                return Err(LinkError::InvalidFrame);
+            }
+            if !num_str.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(LinkError::InvalidFrame);
+            }
+            let vol = parse_u32(num_str).ok_or(LinkError::ValueOutOfRange)?;
+            if vol > 100 {
+                return Err(LinkError::ValueOutOfRange);
+            }
+            Ok(CydCommand::SetVolume(vol as u8))
+        }
+        _ => Err(LinkError::InvalidFrame),
     }
 }
 
@@ -492,5 +607,59 @@ mod tests {
         let w_msg = CydMessage::WifiStatus { connected: true, rssi: -65 };
         CydLinkProtocol::encode_message(&w_msg, &mut buf).unwrap();
         assert_eq!(CydLinkProtocol::parse_line(&buf).unwrap(), w_msg);
+    }
+
+    #[test]
+    fn test_parse_and_encode_json_commands() {
+        // Parse C-firmware NDJSON commands (&str and &[u8])
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"toggle\"}\n"), Ok(CydCommand::Toggle));
+        assert_eq!(CydLinkProtocol::parse_command(b"{\"cmd\":\"play\"}\r\n"), Ok(CydCommand::Play));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"pause\"}"), Ok(CydCommand::Pause));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"next\"}"), Ok(CydCommand::Next));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"prev\"}"), Ok(CydCommand::Previous));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"sync\"}"), Ok(CydCommand::QueryStatus));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"status\"}"), Ok(CydCommand::QueryStatus));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":0}"), Ok(CydCommand::SetVolume(0)));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":80}\n"), Ok(CydCommand::SetVolume(80)));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":100}"), Ok(CydCommand::SetVolume(100)));
+
+        // Out-of-range volume returns ValueOutOfRange
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":101}"), Err(LinkError::ValueOutOfRange));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":255}"), Err(LinkError::ValueOutOfRange));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":-1}"), Err(LinkError::ValueOutOfRange));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":99999}"), Err(LinkError::ValueOutOfRange));
+
+        // Malformed JSON commands return InvalidFrame
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\"}"), Err(LinkError::InvalidFrame));
+        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"unknown\"}"), Err(LinkError::InvalidFrame));
+        assert_eq!(CydLinkProtocol::parse_command("{\"val\":50}"), Err(LinkError::InvalidFrame));
+
+        // Encode NDJSON commands and roundtrip
+        let mut raw = [0u8; 64];
+        let cases = [
+            (CydCommand::Toggle, &b"{\"cmd\":\"toggle\"}\n"[..]),
+            (CydCommand::Play, &b"{\"cmd\":\"play\"}\n"[..]),
+            (CydCommand::Pause, &b"{\"cmd\":\"pause\"}\n"[..]),
+            (CydCommand::Next, &b"{\"cmd\":\"next\"}\n"[..]),
+            (CydCommand::Previous, &b"{\"cmd\":\"prev\"}\n"[..]),
+            (CydCommand::QueryStatus, &b"{\"cmd\":\"sync\"}\n"[..]),
+            (CydCommand::SetVolume(80), &b"{\"cmd\":\"vol\",\"val\":80}\n"[..]),
+        ];
+        for (cmd, expected) in cases {
+            let n = CydLinkProtocol::encode_json_command(&cmd, &mut raw).unwrap();
+            assert_eq!(&raw[..n], expected);
+            assert_eq!(CydLinkProtocol::parse_command(&raw[..n]), Ok(cmd));
+        }
+
+        // Encode out-of-range volume and small buffer
+        assert_eq!(
+            CydLinkProtocol::encode_json_command(&CydCommand::SetVolume(101), &mut raw),
+            Err(LinkError::ValueOutOfRange)
+        );
+        let mut tiny = [0u8; 4];
+        assert_eq!(
+            CydLinkProtocol::encode_json_command(&CydCommand::Toggle, &mut tiny),
+            Err(LinkError::BufferOverflow)
+        );
     }
 }

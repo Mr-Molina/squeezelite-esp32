@@ -79,7 +79,12 @@ impl<const CAPACITY: usize> AudioOutputSink for MockAudioSink<CAPACITY> {
         let frames_to_copy = samples_to_copy / 2;
 
         let start = self.frames_written * 2;
-        self.buffer[start..start + frames_to_copy * 2].copy_from_slice(&frames[..frames_to_copy * 2]);
+        if self.muted {
+            self.buffer[start..start + frames_to_copy * 2].fill(0);
+        } else {
+            self.buffer[start..start + frames_to_copy * 2]
+                .copy_from_slice(&frames[..frames_to_copy * 2]);
+        }
         self.frames_written += frames_to_copy;
 
         Ok(frames_to_copy)
@@ -116,5 +121,10 @@ mod tests {
 
         sink.set_sample_rate(96000).unwrap();
         assert_eq!(sink.sample_rate, 96000);
+
+        sink.set_mute(true);
+        let written2 = sink.write_frames(&stereo_frames).unwrap();
+        assert_eq!(written2, 2);
+        assert_eq!(sink.recorded_samples(), &[100, -100, 200, -200, 0, 0, 0, 0]);
     }
 }

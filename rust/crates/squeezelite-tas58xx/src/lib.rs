@@ -7,6 +7,7 @@
 //! `PowerDown` -> `Standby` -> `Play`.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -20,11 +21,36 @@ pub const TAS5805M_I2C_ADDR: u8 = 0x2D;
 /// Volume presets aligned with TI TAS5805M / TAS5825M register map (0x4C).
 /// - 0x00 is +24dB overdrive (dangerous).
 /// - 0x30 is 0.0dB (unity gain / maximum clean volume).
+/// - 0x58 is -20.0dB (safe startup attenuation).
 /// - 0x60 is -24.0dB (default moderate volume).
 /// - 0xFF is hardware muted.
 pub const VOL_UNITY_0DB: u8 = 0x30;
+pub const VOL_DEFAULT_M20DB: u8 = 0x58;
 pub const VOL_DEFAULT_MINUS_24DB: u8 = 0x60;
 pub const VOL_MUTE: u8 = 0xFF;
+
+/// Channel fault bitmasks (`CHAN_FAULT = 0x70`).
+pub const CHAN_FAULT_OC_MASK: u8 = 0x03;
+pub const CHAN_FAULT_DC_MASK: u8 = 0x0C;
+pub const FAULT1_DC_FAULT: u8 = 0x03;
+
+/// Global fault 1 bitmasks (`GLOBAL_FAULT1 = 0x71`, TI TAS5805M datasheet section 7.6.1.24).
+pub const FAULT1_CLOCK_FAULT: u8 = 0x04;
+pub const FAULT1_PVDD_UV: u8 = 0x20;
+pub const FAULT1_PVDD_OV: u8 = 0x40;
+pub const FAULT1_BQ_WR_ERROR: u8 = 0x80;
+
+/// Global fault 2 and over-temperature warning bitmasks (`GLOBAL_FAULT2 = 0x72`, `OTW = 0x73`).
+pub const FAULT2_OTSD: u8 = 0x01;
+pub const FAULT2_OTW: u8 = 0x04;
+
+/// `DEVICE_CTRL_2 (0x03)` operating modes and fault clear constants.
+pub const CTRL2_MODE_DEEP_SLEEP: u8 = 0x00;
+pub const CTRL2_MODE_STANDBY: u8 = 0x01;
+pub const CTRL2_MODE_HIZ: u8 = 0x02;
+pub const CTRL2_MODE_PLAY: u8 = 0x03;
+pub const CTRL2_MODE_PLAY_MUTE: u8 = 0x0B;
+pub const FAULT_CLEAR_ANALOG: u8 = 0x80;
 
 /// Register addresses from the TI TAS5805M / TAS5825M datasheets.
 pub mod registers {
@@ -45,10 +71,26 @@ pub mod registers {
     pub const BOOK_SELECT: u8 = 0x7F;
 }
 
+pub const REG_DEVICE_CTRL2: u8 = registers::DEVICE_CTRL_2;
+pub const REG_CHAN_FAULT: u8 = registers::CHAN_FAULT;
+pub const REG_GLOBAL_FAULT1: u8 = registers::GLOBAL_FAULT1;
+pub const REG_GLOBAL_FAULT2: u8 = registers::GLOBAL_FAULT2;
+pub const REG_AGAINST_FAULT: u8 = registers::FAULT_CLEAR;
+
 // Compile-time state markers
 pub struct PowerDown;
 pub struct Standby;
 pub struct Play;
+
+/// Runtime power state representation for amplifier lifecycle tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmpPowerState {
+    Uninitialized,
+    DeepSleep,
+    Standby,
+    HiZ,
+    Playing,
+}
 
 /// Decoded hardware fault indicators across all 4 TI fault registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,31 +107,35 @@ impl FaultStatus {
     }
 
     pub fn has_overtemperature(&self) -> bool {
-        (self.global_fault2 & 0x01) != 0 || (self.otw & 0x01) != 0
+        (self.global_fault2 & FAULT2_OTSD) != 0 || self.has_ot_warning()
     }
 
     pub fn has_overcurrent(&self) -> bool {
-        (self.chan_fault & 0x03) != 0
+        (self.chan_fault & CHAN_FAULT_OC_MASK) != 0
     }
 
     pub fn has_dc_fault(&self) -> bool {
-        (self.chan_fault & 0x0C) != 0
+        (self.chan_fault & CHAN_FAULT_DC_MASK) != 0
     }
 
     pub fn has_clock_fault(&self) -> bool {
-        (self.global_fault1 & 0x01) != 0
+        (self.global_fault1 & FAULT1_CLOCK_FAULT) != 0
     }
 
     pub fn has_pvdd_uvlo(&self) -> bool {
-        (self.global_fault1 & 0x02) != 0
+        (self.global_fault1 & FAULT1_PVDD_UV) != 0
     }
 
     pub fn has_pvdd_ovlo(&self) -> bool {
-        (self.global_fault1 & 0x04) != 0
+        (self.global_fault1 & FAULT1_PVDD_OV) != 0
+    }
+
+    pub fn has_bq_wr_error(&self) -> bool {
+        (self.global_fault1 & FAULT1_BQ_WR_ERROR) != 0
     }
 
     pub fn has_ot_warning(&self) -> bool {
-        (self.otw & 0x01) != 0
+        (self.otw & (FAULT2_OTW | 0x01)) != 0 || (self.global_fault2 & FAULT2_OTW) != 0
     }
 }
 
@@ -147,32 +193,36 @@ where
         }
     }
 
-    /// Resets the TAS58xx and transitions it into `Standby` mode.
-    /// Selects Book 0 / Page 0, asserts digital/register reset, and enters Standby.
-    pub fn init_into_standby(mut self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
-        // Ensure Book 0 and Page 0 are selected
-        self.i2c
-            .write(self.addr, &[registers::BOOK_SELECT, 0x00])
-            .map_err(DriverError::I2cError)?;
-        self.i2c
-            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
-            .map_err(DriverError::I2cError)?;
-
-        // Full software reset (write 0x11 to RESET_CTRL)
-        self.i2c
-            .write(self.addr, &[registers::RESET_CTRL, 0x11])
-            .map_err(DriverError::I2cError)?;
-
-        // Place into Standby mode (write 0x01 to DEVICE_CTRL_2)
-        self.i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, 0x01])
-            .map_err(DriverError::I2cError)?;
+    /// Resets the TAS58xx and transitions it into `Standby` mode, returning `Self` on I2C error
+    /// so the caller never loses ownership of the I2C peripheral (PERIPH-604).
+    pub fn try_init_into_standby(mut self) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
+        if let Err(e) = self.i2c.write(self.addr, &[registers::BOOK_SELECT, 0x00]) {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self.i2c.write(self.addr, &[registers::RESET_CTRL, 0x11]) {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_STANDBY])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
 
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
             _state: PhantomData,
         })
+    }
+
+    /// Resets the TAS58xx and transitions it into `Standby` mode.
+    /// Selects Book 0 / Page 0, asserts digital/register reset, and enters Standby.
+    pub fn init_into_standby(self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
+        self.try_init_into_standby().map_err(|(_, e)| e)
     }
 }
 
@@ -212,7 +262,7 @@ where
     /// Clears any latched hardware faults.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
         self.i2c
-            .write(self.addr, &[registers::FAULT_CLEAR, 0x80])
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
             .map_err(DriverError::I2cError)
     }
 
@@ -239,28 +289,54 @@ where
             .write(self.addr, &[registers::PAGE_SELECT, 0x00])
             .map_err(DriverError::I2cError)?;
         self.i2c
-            .write(self.addr, &[registers::FAULT_CLEAR, 0x80])
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
             .map_err(DriverError::I2cError)
+    }
+
+    /// Transitions into `Play` mode, returning `Self` on I2C error (PERIPH-604).
+    pub fn try_start_playback(mut self) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY_MUTE])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+
+        Ok(Tas58xx {
+            i2c: self.i2c,
+            addr: self.addr,
+            _state: PhantomData,
+        })
     }
 
     /// Transitions into `Play` mode, activating the Class-D PWM power stage with
     /// soft-mute unmuting ramp to prevent acoustic pop/thump transients.
-    pub fn start_playback(mut self) -> Result<Tas58xx<I2C, Play>, DriverError<E>> {
-        // Clear any power-up fault flags
-        self.i2c
-            .write(self.addr, &[registers::FAULT_CLEAR, 0x80])
-            .map_err(DriverError::I2cError)?;
+    pub fn start_playback(self) -> Result<Tas58xx<I2C, Play>, DriverError<E>> {
+        self.try_start_playback().map_err(|(_, e)| e)
+    }
 
-        // Set Play mode with Soft Mute asserted first (0x0B = MUTE:1, CTRL:11)
-        self.i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, 0x0B])
-            .map_err(DriverError::I2cError)?;
-
-        // Unmute with soft ramp (0x03 = MUTE:0, CTRL:11)
-        self.i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, 0x03])
-            .map_err(DriverError::I2cError)?;
-
+    /// Places the amplifier into Deep Sleep (`PowerDown`), returning `Self` on I2C error.
+    pub fn try_enter_deep_sleep(
+        mut self,
+    ) -> Result<Tas58xx<I2C, PowerDown>, (Self, DriverError<E>)> {
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_DEEP_SLEEP])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
@@ -304,27 +380,51 @@ where
     /// Clears any latched hardware faults during Play.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
         self.i2c
-            .write(self.addr, &[registers::FAULT_CLEAR, 0x80])
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
             .map_err(DriverError::I2cError)
     }
 
-    /// Transitions back to `Standby` mode with soft-mute ramp down to prevent click/pop.
-    pub fn stop_playback(mut self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
-        // Soft mute before transitioning out of Play (0x0B = MUTE:1, CTRL:11)
+    /// Executes the 3-step TI datasheet recovery sequence (PERIPH-603):
+    /// 1. Transition `DEVICE_CTRL_2 (0x03)` to `CTRL2_MODE_HIZ (0x02)`.
+    /// 2. Clear analog/digital fault latches (`FAULT_CLEAR (0x78) = 0x80`).
+    /// 3. Return `DEVICE_CTRL_2 (0x03)` to `CTRL2_MODE_PLAY (0x03)`.
+    pub fn recover_from_fault(&mut self) -> Result<(), DriverError<E>> {
         self.i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, 0x0B])
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
             .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
+            .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY])
+            .map_err(DriverError::I2cError)
+    }
 
-        // Transition to Standby (0x01 = CTRL:01)
-        self.i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, 0x01])
-            .map_err(DriverError::I2cError)?;
+    /// Transitions back to `Standby` mode, returning `Self` on I2C error (PERIPH-604).
+    pub fn try_stop_playback(mut self) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY_MUTE])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_STANDBY])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
 
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
             _state: PhantomData,
         })
+    }
+
+    /// Transitions back to `Standby` mode with soft-mute ramp down to prevent click/pop.
+    pub fn stop_playback(self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
+        self.try_stop_playback().map_err(|(_, e)| e)
     }
 }
 
@@ -472,6 +572,7 @@ mod tests {
         assert!(!clean.has_clock_fault());
         assert!(!clean.has_pvdd_uvlo());
         assert!(!clean.has_pvdd_ovlo());
+        assert!(!clean.has_bq_wr_error());
         assert!(!clean.has_ot_warning());
         assert!(!clean.has_overtemperature());
 
@@ -502,31 +603,66 @@ mod tests {
         assert!(dc2.has_dc_fault());
 
         let clk = FaultStatus {
-            global_fault1: 0x01,
+            global_fault1: FAULT1_CLOCK_FAULT,
             ..Default::default()
         };
         assert!(clk.has_clock_fault());
         assert!(!clk.has_pvdd_uvlo());
 
         let uvlo = FaultStatus {
-            global_fault1: 0x02,
+            global_fault1: FAULT1_PVDD_UV,
             ..Default::default()
         };
         assert!(!uvlo.has_clock_fault());
         assert!(uvlo.has_pvdd_uvlo());
 
         let ovlo = FaultStatus {
-            global_fault1: 0x04,
+            global_fault1: FAULT1_PVDD_OV,
             ..Default::default()
         };
         assert!(!ovlo.has_pvdd_uvlo());
         assert!(ovlo.has_pvdd_ovlo());
 
+        let bq = FaultStatus {
+            global_fault1: FAULT1_BQ_WR_ERROR,
+            ..Default::default()
+        };
+        assert!(bq.has_bq_wr_error());
+
         let otw = FaultStatus {
-            otw: 0x01,
+            otw: FAULT2_OTW,
             ..Default::default()
         };
         assert!(otw.has_ot_warning());
         assert!(otw.has_overtemperature());
+    }
+
+    #[test]
+    fn test_recover_from_fault_three_step_sequence() {
+        let expectations = [
+            I2cTrans::write(
+                DEFAULT_I2C_ADDR,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ],
+            ),
+            I2cTrans::write(
+                DEFAULT_I2C_ADDR,
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG],
+            ),
+            I2cTrans::write(
+                DEFAULT_I2C_ADDR,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY],
+            ),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut playing = Tas58xx {
+            i2c: &mut i2c,
+            addr: DEFAULT_I2C_ADDR,
+            _state: PhantomData::<Play>,
+        };
+
+        playing.recover_from_fault().unwrap();
+
+        i2c.done();
     }
 }

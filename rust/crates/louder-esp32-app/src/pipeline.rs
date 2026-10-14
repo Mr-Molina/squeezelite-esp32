@@ -9,7 +9,7 @@ use squeezelite_audio_core::{
 };
 use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 
-pub const PCM_SCRATCH_SAMPLES: usize = 2304;
+pub const PCM_SCRATCH_SAMPLES: usize = 8192;
 pub const READ_SCRATCH_BYTES: usize = 4096;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
@@ -98,6 +98,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     }
 
     /// Decodes a chunk from `stream_buffer`, processes volume and EQ, and stores in `output_buffer`.
+    ///
+    /// # Returns (`PIPE-504`)
+    /// - When draining buffered `pcm_pending_samples` from a prior decode step: returns
+    ///   `Ok(frames_to_write)` (the number of pending stereo frames written to `output_buffer`,
+    ///   or `Ok(0)` if `output_buffer` has fewer than 8 bytes of free space).
+    /// - When `output_buffer` is full (`available_write() < 8`): returns `Ok(0)` due to backpressure.
+    /// - When decoding new input from `stream_buffer`: returns `Ok(consumed)` (the number of
+    ///   encoded stream bytes consumed by the active decoder).
+    /// - On `DecoderError::CorruptedFrame` or `DecoderError::InvalidHeader`: consumes 1 byte from
+    ///   `stream_buffer` to advance past the corrupted byte and prevent an infinite decode loop (`PIPE-501`).
     pub fn process_decode_step(&mut self) -> Result<usize, DecoderError> {
         // Drain pending PCM frames from previous decode if output buffer was previously constrained (LOGIC-601/602)
         if self.pcm_pending_samples > 0 {
@@ -135,10 +145,19 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Err(DecoderError::NeedMoreData);
         }
 
-        let (consumed, frames_produced) = self.decoder.decode(
+        let (consumed, frames_produced) = match self.decoder.decode(
             &self.read_scratch[..peeked],
             &mut self.pcm_scratch,
-        )?;
+        ) {
+            Ok(res) => res,
+            Err(DecoderError::NeedMoreData) => return Err(DecoderError::NeedMoreData),
+            Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
+            Err(e) => {
+                // Consume at least 1 byte on corrupted frame / invalid header to prevent infinite busy loop
+                self.stream_buffer.consume(1);
+                return Err(e);
+            }
+        };
 
         // Only consume the exact bytes ingested by decoder (CONC-005)
         if consumed > 0 {
@@ -202,11 +221,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             *sample = i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
 
+        self.sink.set_mute(false);
         let written_frames = self.sink.write_frames(&self.output_i32_scratch[..frames_to_write * 2])?;
         // ONLY consume the exact number of frames successfully committed to the sink
         self.output_buffer.consume(written_frames * 8);
         if written_frames > 0 {
-            self.sink.set_mute(false);
             self.frames_played = self.frames_played.wrapping_add(written_frames as u64);
         }
 
@@ -238,6 +257,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Returns the number of bytes available in the output ringbuffer.
     pub fn output_buffer_available(&self) -> usize {
         self.output_buffer.available_read()
+    }
+
+    /// Returns `true` if decoded PCM samples are still waiting to be drained into `output_buffer` (`COORD-504`).
+    pub fn has_pending_pcm(&self) -> bool {
+        self.pcm_pending_samples > 0
     }
 
     /// Flushes both stream and output ringbuffers, clears pending PCM, and resets the decoder state.
@@ -514,14 +538,50 @@ mod tests {
 
         // Pending samples are set
         assert!(pipeline.pcm_pending_samples > 0);
+        assert!(pipeline.has_pending_pcm());
         assert!(pipeline.output_buffer_available() > 0);
 
         pipeline.flush();
 
         assert_eq!(pipeline.pcm_pending_offset, 0);
         assert_eq!(pipeline.pcm_pending_samples, 0);
+        assert!(!pipeline.has_pending_pcm());
         assert_eq!(pipeline.stream_buffer_available(), 0);
         assert_eq!(pipeline.output_buffer_available(), 0);
         assert!(pipeline.sink.muted);
     }
+
+    #[test]
+    fn test_pcm_scratch_samples_capacity_for_flac_4096_frames() {
+        // PIPE-502: 4096 stereo frames require 8192 i32 samples
+        assert_eq!(PCM_SCRATCH_SAMPLES, 8192);
+    }
+
+    #[test]
+    fn test_corrupted_frame_consumes_byte_and_prevents_infinite_loop() {
+        // PIPE-501: When decoder returns an error other than NeedMoreData / BufferOverflow,
+        // process_decode_step must consume at least 1 byte so the pipeline progresses.
+        let mut stream_storage = [0u8; 64];
+        let mut output_storage = [0u8; 128];
+        // Invalid bit depth (e.g. 7 bits) causes PcmDecoder::decode to return Err(DecoderError::InvalidHeader)
+        let bad_pcm_decoder = PcmDecoder::new(7, 2, true);
+        let sink = MockAudioSink::<64>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(bad_pcm_decoder),
+            sink,
+            44100,
+        );
+
+        pipeline.ingest_stream_data(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        assert_eq!(pipeline.stream_buffer_available(), 4);
+
+        let res = pipeline.process_decode_step();
+        assert!(res.is_err());
+        // Must have consumed 1 byte to prevent infinite busy loop!
+        assert_eq!(pipeline.stream_buffer_available(), 3);
+    }
 }
+

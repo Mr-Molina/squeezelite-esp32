@@ -41,7 +41,7 @@ impl Default for CydTelemetryState {
             ip: String::new(),
             elapsed_secs: 0,
             duration_secs: 0,
-            vol: 0,
+            vol: 50,
             wifi_connected: false,
             wifi_rssi: 0,
             link_active: false,
@@ -54,6 +54,7 @@ pub struct CydDisplayLink {
     pub state: CydTelemetryState,
     pub last_rx_time_us: i64,
     pub last_sync_time_us: i64,
+    pub parse_error_count: usize,
     rx_line: Vec<u8, 256>,
     discarding_overflow: bool,
     pub tx_queue: Deque<Vec<u8, 64>, 16>,
@@ -72,10 +73,26 @@ impl CydDisplayLink {
             state: CydTelemetryState::default(),
             last_rx_time_us: 0,
             last_sync_time_us: -1,
+            parse_error_count: 0,
             rx_line: Vec::new(),
             discarding_overflow: false,
             tx_queue: Deque::new(),
         }
+    }
+
+    /// Borrow the current telemetry state.
+    pub fn state(&self) -> &CydTelemetryState {
+        &self.state
+    }
+
+    /// Mutably borrow the current telemetry state.
+    pub fn state_mut(&mut self) -> &mut CydTelemetryState {
+        &mut self.state
+    }
+
+    /// Pop the next queued outbound UART frame from `tx_queue`.
+    pub fn pop_tx(&mut self) -> Option<Vec<u8, 64>> {
+        self.tx_queue.pop_front()
     }
 
     /// Reset internal state, buffer, and timers.
@@ -83,6 +100,7 @@ impl CydDisplayLink {
         self.state = CydTelemetryState::default();
         self.last_rx_time_us = 0;
         self.last_sync_time_us = -1;
+        self.parse_error_count = 0;
         self.rx_line.clear();
         self.discarding_overflow = false;
         self.tx_queue.clear();
@@ -99,12 +117,27 @@ impl CydDisplayLink {
         Ok(buf)
     }
 
+    /// Enqueue an interactive touch command in C-firmware NDJSON format for transmission to host.
+    pub fn send_json_command(&mut self, cmd: CydCommand) -> Result<Vec<u8, 64>, LinkError> {
+        let mut raw = [0u8; 64];
+        let len = CydLinkProtocol::encode_json_command(&cmd, &mut raw)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&raw[..len])
+            .map_err(|_| LinkError::BufferOverflow)?;
+        if self.tx_queue.is_full() {
+            let _ = self.tx_queue.pop_front();
+        }
+        let _ = self.tx_queue.push_back(buf.clone());
+        Ok(buf)
+    }
+
     /// Feed raw bytes received from UART into the line accumulator.
     ///
     /// Strips `\r`, accumulates up to 256 bytes, handles overflow discard recovery,
     /// and parses full frames terminated by `\n`.
     /// Returns the number of events parsed and applied.
     pub fn feed_rx_bytes(&mut self, bytes: &[u8], now_us: i64) -> usize {
+        let now_us = now_us.max(0);
         let mut events_parsed = 0;
 
         for &b in bytes {
@@ -140,8 +173,34 @@ impl CydDisplayLink {
                 CydMessage::PlaybackState(st) => self.state.state = st,
                 CydMessage::Volume(v) => self.state.vol = v,
                 CydMessage::TrackMetadata { artist, title } => {
-                    self.state.artist = artist;
-                    self.state.title = title;
+                    let trimmed = CydLinkProtocol::trim_crlf(&self.rx_line);
+                    if let Some(rest) = trimmed.strip_prefix(b"META=") {
+                        let mut parts = rest.splitn(3, |&b| b == b';');
+                        if let (Some(a_bytes), Some(alb_bytes), Some(t_bytes)) =
+                            (parts.next(), parts.next(), parts.next())
+                        {
+                            if let (Ok(a_str), Ok(alb_str), Ok(t_str)) = (
+                                core::str::from_utf8(a_bytes),
+                                core::str::from_utf8(alb_bytes),
+                                core::str::from_utf8(t_bytes),
+                            ) {
+                                self.state.artist.clear();
+                                let _ = self.state.artist.push_str(truncate_utf8(a_str, 64));
+                                self.state.album.clear();
+                                let _ = self.state.album.push_str(truncate_utf8(alb_str, 64));
+                                self.state.title.clear();
+                                let _ = self.state.title.push_str(truncate_utf8(t_str, 64));
+                            }
+                        } else {
+                            self.state.artist = artist;
+                            self.state.album.clear();
+                            self.state.title = title;
+                        }
+                    } else {
+                        self.state.artist = artist;
+                        self.state.album.clear();
+                        self.state.title = title;
+                    }
                 }
                 CydMessage::Progress {
                     elapsed_secs,
@@ -171,6 +230,7 @@ impl CydDisplayLink {
             }
         }
 
+        self.parse_error_count = self.parse_error_count.saturating_add(1);
         false
     }
 
@@ -180,6 +240,7 @@ impl CydDisplayLink {
     ///   marks link inactive and transmits `CMD=STATUS\n`.
     /// - If link is inactive: periodically transmits `CMD=STATUS\n` every 3s.
     pub fn poll_heartbeat(&mut self, now_us: i64) -> Option<Vec<u8, 64>> {
+        let now_us = now_us.max(0);
         if self.state.link_active {
             if (now_us - self.last_rx_time_us) > CYD_HEARTBEAT_TIMEOUT_US {
                 self.state.link_active = false;
@@ -208,23 +269,23 @@ pub fn parse_json_event(json_str: &str, state: &mut CydTelemetryState) -> Result
 
     let event = extract_json_str(trimmed, "event").ok_or(LinkError::InvalidFrame)?;
 
-    match event {
+    match event.as_str() {
         "meta" => {
             if let Some(t) = extract_json_str(trimmed, "title") {
                 state.title.clear();
-                let _ = state.title.push_str(truncate_utf8(t, 63));
+                let _ = state.title.push_str(truncate_utf8(t.as_str(), 63));
             } else {
                 state.title.clear();
             }
             if let Some(a) = extract_json_str(trimmed, "artist") {
                 state.artist.clear();
-                let _ = state.artist.push_str(truncate_utf8(a, 63));
+                let _ = state.artist.push_str(truncate_utf8(a.as_str(), 63));
             } else {
                 state.artist.clear();
             }
             if let Some(alb) = extract_json_str(trimmed, "album") {
                 state.album.clear();
-                let _ = state.album.push_str(truncate_utf8(alb, 63));
+                let _ = state.album.push_str(truncate_utf8(alb.as_str(), 63));
             } else {
                 state.album.clear();
             }
@@ -233,20 +294,25 @@ pub fn parse_json_event(json_str: &str, state: &mut CydTelemetryState) -> Result
         }
         "status" => {
             if let Some(st) = extract_json_str(trimmed, "state") {
-                state.state = match st {
+                state.state = match st.as_str() {
                     "play" => PlayState::Playing,
                     "pause" => PlayState::Paused,
                     _ => PlayState::Stopped,
                 };
             }
-            if let Some(el) = extract_json_i64(trimmed, "elapsed") {
+            if let Some(el) = extract_json_int(trimmed, "elapsed") {
                 state.elapsed_secs = el.max(0) as u32;
             }
-            if let Some(dur) = extract_json_i64(trimmed, "duration") {
+            if let Some(dur) = extract_json_int(trimmed, "duration") {
                 state.duration_secs = dur.max(0) as u32;
             }
-            if let Some(v) = extract_json_i64(trimmed, "vol") {
+            if let Some(v) = extract_json_int(trimmed, "vol") {
                 state.vol = v.clamp(0, 100) as u8;
+            }
+            if let Some(w) = extract_json_bool(trimmed, "wifi")
+                .or_else(|| extract_json_bool(trimmed, "connected"))
+            {
+                state.wifi_connected = w;
             }
             state.link_active = true;
             Ok(())
@@ -254,11 +320,16 @@ pub fn parse_json_event(json_str: &str, state: &mut CydTelemetryState) -> Result
         "sys" => {
             if let Some(m) = extract_json_str(trimmed, "mode") {
                 state.mode.clear();
-                let _ = state.mode.push_str(truncate_utf8(m, 15));
+                let _ = state.mode.push_str(truncate_utf8(m.as_str(), 15));
             }
             if let Some(ip) = extract_json_str(trimmed, "ip") {
                 state.ip.clear();
-                let _ = state.ip.push_str(truncate_utf8(ip, 31));
+                let _ = state.ip.push_str(truncate_utf8(ip.as_str(), 31));
+            }
+            if let Some(w) = extract_json_bool(trimmed, "wifi")
+                .or_else(|| extract_json_bool(trimmed, "connected"))
+            {
+                state.wifi_connected = w;
             }
             state.link_active = true;
             Ok(())
@@ -290,46 +361,96 @@ pub fn format_command(cmd: &str, val: i32) -> Option<Vec<u8, 64>> {
     }
 }
 
-fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+fn find_json_key_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let mut pattern = [0u8; 32];
     let k_bytes = key.as_bytes();
-    if k_bytes.len() + 3 > pattern.len() {
+    if k_bytes.len() + 2 > pattern.len() {
         return None;
     }
     pattern[0] = b'"';
     pattern[1..1 + k_bytes.len()].copy_from_slice(k_bytes);
     pattern[1 + k_bytes.len()] = b'"';
-    pattern[2 + k_bytes.len()] = b':';
-    let p_str = core::str::from_utf8(&pattern[..3 + k_bytes.len()]).ok()?;
+    let p_str = core::str::from_utf8(&pattern[..2 + k_bytes.len()]).ok()?;
 
-    let idx = json.find(p_str)?;
-    let rest = json[idx + p_str.len()..].trim_start();
-    if let Some(stripped) = rest.strip_prefix('"') {
-        let end = stripped.find('"')?;
-        Some(&stripped[..end])
-    } else {
-        None
+    let mut offset = 0;
+    while let Some(rel_idx) = json[offset..].find(p_str) {
+        let abs_idx = offset + rel_idx;
+        // Verify opening quote of key is not escaped
+        let mut backslashes = 0usize;
+        let bytes = json.as_bytes();
+        let mut i = abs_idx;
+        while i > 0 && bytes[i - 1] == b'\\' {
+            backslashes += 1;
+            i -= 1;
+        }
+        let after_key_idx = abs_idx + p_str.len();
+        if backslashes.is_multiple_of(2) {
+            let after_ws = json[after_key_idx..].trim_start();
+            if let Some(after_colon) = after_ws.strip_prefix(':') {
+                return Some(after_colon.trim_start());
+            }
+        }
+        offset = after_key_idx;
     }
+    None
 }
 
-fn extract_json_i64(json: &str, key: &str) -> Option<i64> {
-    let mut pattern = [0u8; 32];
-    let k_bytes = key.as_bytes();
-    if k_bytes.len() + 3 > pattern.len() {
-        return None;
-    }
-    pattern[0] = b'"';
-    pattern[1..1 + k_bytes.len()].copy_from_slice(k_bytes);
-    pattern[1 + k_bytes.len()] = b'"';
-    pattern[2 + k_bytes.len()] = b':';
-    let p_str = core::str::from_utf8(&pattern[..3 + k_bytes.len()]).ok()?;
+fn extract_json_str(json: &str, key: &str) -> Option<String<64>> {
+    let rest = find_json_key_value(json, key)?;
+    let stripped = rest.strip_prefix('"')?;
 
-    let idx = json.find(p_str)?;
-    let rest = json[idx + p_str.len()..].trim_start();
+    let mut out = String::<64>::new();
+    let mut escaped = false;
+    for ch in stripped.chars() {
+        if escaped {
+            let unescaped = match ch {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'n' | 't' | 'r' => ' ',
+                other => other,
+            };
+            let _ = out.push(unescaped);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            let _ = out.push(ch);
+        }
+    }
+    None
+}
+
+fn extract_json_int(json: &str, key: &str) -> Option<i64> {
+    let rest = find_json_key_value(json, key)?;
     let end = rest
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(rest.len());
     rest[..end].parse::<i64>().ok()
+}
+
+fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let rest = find_json_key_value(json, key)?;
+    if let Some(after) = rest.strip_prefix("true") {
+        if after.is_empty()
+            || after.starts_with(',')
+            || after.starts_with('}')
+            || after.starts_with(|c: char| c.is_ascii_whitespace())
+        {
+            return Some(true);
+        }
+    } else if let Some(after) = rest.strip_prefix("false") {
+        if after.is_empty()
+            || after.starts_with(',')
+            || after.starts_with('}')
+            || after.starts_with(|c: char| c.is_ascii_whitespace())
+        {
+            return Some(false);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -532,5 +653,89 @@ mod tests {
         // 8. Polling at t=11.7s (3.1s since sync): retransmits sync
         let cmd = link.poll_heartbeat(11_700_000);
         assert_eq!(cmd.as_deref(), Some(&b"CMD=STATUS\n"[..]));
+    }
+
+    #[test]
+    fn test_send_json_command_and_three_field_meta() {
+        let mut link = CydDisplayLink::new();
+
+        // send_json_command enqueues and returns C-compatible NDJSON
+        let toggle = link.send_json_command(CydCommand::Toggle).unwrap();
+        assert_eq!(&toggle[..], b"{\"cmd\":\"toggle\"}\n");
+        let vol = link.send_json_command(CydCommand::SetVolume(80)).unwrap();
+        assert_eq!(&vol[..], b"{\"cmd\":\"vol\",\"val\":80}\n");
+        let sync = link.send_json_command(CydCommand::QueryStatus).unwrap();
+        assert_eq!(&sync[..], b"{\"cmd\":\"sync\"}\n");
+        assert_eq!(link.tx_queue.len(), 3);
+        assert_eq!(
+            link.send_json_command(CydCommand::SetVolume(150)),
+            Err(LinkError::ValueOutOfRange)
+        );
+
+        // 3-field META=artist;album;title populates artist, album, and title
+        let parsed = link.feed_rx_bytes(b"META=Pink Floyd;The Wall;Comfortably Numb\n", 1000);
+        assert_eq!(parsed, 1);
+        assert_eq!(link.state.artist.as_str(), "Pink Floyd");
+        assert_eq!(link.state.album.as_str(), "The Wall");
+        assert_eq!(link.state.title.as_str(), "Comfortably Numb");
+
+        // 2-field META=artist;title populates artist and title, clearing album
+        let parsed2 = link.feed_rx_bytes(b"META=Daft Punk;Get Lucky\n", 2000);
+        assert_eq!(parsed2, 1);
+        assert_eq!(link.state.artist.as_str(), "Daft Punk");
+        assert_eq!(link.state.album.as_str(), "");
+        assert_eq!(link.state.title.as_str(), "Get Lucky");
+    }
+
+    #[test]
+    fn test_json_unescaping_and_exact_key_matching() {
+        // COMMS-308: unescape \", \\, \/, \n, \t and stop only at unescaped quote
+        let mut state = CydTelemetryState::default();
+        let line = "{\"event\":\"meta\",\"title\":\"Rock \\\"Live\\\" \\\\ \\/Pt 1\\n\\tEnd\",\"artist\":\"AC\\\\DC\",\"album\":\"Back \\\"In\\\" Black\"}\n";
+        assert!(parse_json_event(line, &mut state).is_ok());
+        assert_eq!(state.title.as_str(), "Rock \"Live\" \\ /Pt 1  End");
+        assert_eq!(state.artist.as_str(), "AC\\DC");
+        assert_eq!(state.album.as_str(), "Back \"In\" Black");
+
+        // COMMS-309: "vol" must NOT false-match "volume_max" or "voltage", and optional whitespace before ':' works
+        let mut st2 = CydTelemetryState::default();
+        let status_line = "{\"event\" : \"status\", \"state\" : \"play\", \"volume_max\": 100, \"voltage\": 5, \"vol\" : 42, \"wifi\" : true}\n";
+        assert!(parse_json_event(status_line, &mut st2).is_ok());
+        assert_eq!(st2.vol, 42);
+        assert!(st2.wifi_connected);
+
+        assert_eq!(extract_json_int("{\"volume_max\":99,\"voltage\":12}", "vol"), None);
+        assert_eq!(extract_json_bool("{\"wifi_enabled\":true,\"wifi\" : false}", "wifi"), Some(false));
+    }
+
+    #[test]
+    fn test_negative_timestamps_parse_error_count_and_reset() {
+        let mut link = CydDisplayLink::new();
+
+        // COMMS-311: negative timestamp clamped to 0 so last_sync_time_us is not left < 0
+        let sync = link.poll_heartbeat(-5000);
+        assert!(sync.is_some());
+        assert_eq!(link.last_sync_time_us, 0);
+        // Subsequent poll at t=1000 should NOT re-trigger sync spam
+        assert!(link.poll_heartbeat(1000).is_none());
+
+        // COMMS-312: parse_error_count increments on invalid non-empty lines
+        assert_eq!(link.parse_error_count, 0);
+        assert_eq!(link.feed_rx_bytes(b"INVALID_LINE\n{bad_json\n", -100), 0);
+        assert_eq!(link.parse_error_count, 2);
+
+        // Valid line with negative timestamp clamps last_rx_time_us to 0
+        assert_eq!(link.feed_rx_bytes(b"VOL=55\n", -250), 1);
+        assert_eq!(link.last_rx_time_us, 0);
+        assert_eq!(link.state.vol, 55);
+        assert_eq!(link.parse_error_count, 2);
+
+        // COMMS-313: reset_state clears everything
+        link.reset_state();
+        assert_eq!(link.parse_error_count, 0);
+        assert_eq!(link.last_rx_time_us, 0);
+        assert_eq!(link.last_sync_time_us, -1);
+        assert!(link.tx_queue.is_empty());
+        assert!(!link.state.link_active);
     }
 }

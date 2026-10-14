@@ -49,27 +49,73 @@ pub struct SlimprotoClient {
 
 impl SlimprotoClient {
     /// Connects to LMS server and completes the initial HELO handshake.
+    ///
+    /// Sends `HELO` while the socket is still in blocking mode (with write timeout)
+    /// and transitions to non-blocking mode only after `send_helo` succeeds (`HALNET-403`).
     pub fn connect(server_addr: SocketAddr, mac: [u8; 6], model: &'static str) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))?;
+        let stream = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_nonblocking(true)?;
 
-        // Build and send initial HELO packet
+        let mut client = Self {
+            stream,
+            mac,
+            model,
+            acc_buf: Vec::with_capacity(8192),
+        };
+
+        // HALNET-403: Send HELO while socket is still in blocking mode, then enable non-blocking mode
+        client.send_helo(mac)?;
+        client.stream.set_nonblocking(true)?;
+
+        Ok(client)
+    }
+
+    /// Builds and sends the initial `HELO` handshake packet (`HALNET-403`).
+    pub fn send_helo(&mut self, mac: [u8; 6]) -> std::io::Result<()> {
         let mut helo_buf = [0u8; 256];
         let caps = "Model=LouderESP32Plus,mp3,flac,aac,ogg,pcm,MaxSampleRate=192000";
         let helo_len = SlimprotoBuilder::build_helo(&mac, 12, caps, &mut helo_buf)
             .map_err(|_| std::io::Error::other("HELO build error"))?;
 
-        stream.write_all(&helo_buf[..helo_len])?;
+        Self::write_all_bounded(&mut self.stream, &helo_buf[..helo_len])
+    }
 
-        Ok(Self {
-            stream,
-            mac,
-            model,
-            acc_buf: Vec::with_capacity(8192),
-        })
+    /// Writes all bytes in `buf` to `stream`, retrying bounded times on `WouldBlock` (`HALNET-403`).
+    fn write_all_bounded(stream: &mut TcpStream, buf: &[u8]) -> std::io::Result<()> {
+        let mut offset = 0;
+        let mut retries = 0u8;
+        while offset < buf.len() {
+            match stream.write(&buf[offset..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ));
+                }
+                Ok(n) => {
+                    offset += n;
+                    retries = 0;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    retries += 1;
+                    if retries > 16 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "non-blocking write retry limit exceeded",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Returns the player MAC address.
@@ -87,7 +133,7 @@ impl SlimprotoClient {
         self.stream.peer_addr()
     }
 
-    /// Sends a STAT heartbeat or event update to LMS.
+    /// Sends a STAT heartbeat or event update to LMS (`HALNET-403`).
     pub fn send_stat(
         &mut self,
         event: StatEvent,
@@ -107,7 +153,7 @@ impl SlimprotoClient {
         )
         .map_err(|_| std::io::Error::other("STAT build error"))?;
 
-        self.stream.write_all(&buf[..len])
+        Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
     /// Inspects the frame header in the buffer to determine expected frame length without borrowing scratch.
@@ -221,12 +267,14 @@ impl HttpAudioStream {
     pub const MAX_HTTP_HEADER_LEN: usize = 4096;
 
     /// Connects to the HTTP streaming audio server and issues the initial GET request.
+    ///
+    /// Uses a 1500ms connect/write timeout (`HALNET-410`) and writes the full HTTP request
+    /// while the socket is still in blocking mode before enabling non-blocking mode (`HALNET-404`).
     pub fn connect(server_addr: SocketAddr, http_headers: &str) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))?;
+        let mut stream = TcpStream::connect_timeout(&server_addr, Duration::from_millis(1500))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_nonblocking(true)?;
+        stream.set_write_timeout(Some(Duration::from_millis(1500)))?;
 
         if !http_headers.is_empty() {
             stream.write_all(http_headers.as_bytes())?;
@@ -238,6 +286,9 @@ impl HttpAudioStream {
                 }
             }
         }
+
+        // HALNET-404: Transition to non-blocking mode only AFTER writing the HTTP request headers
+        stream.set_nonblocking(true)?;
 
         Ok(Self {
             stream,
@@ -261,8 +312,9 @@ impl HttpAudioStream {
     /// Polls audio stream bytes non-blockingly into `out`.
     ///
     /// During the initial header phase, incoming chunks are parsed to strip the HTTP response
-    /// header and verify HTTP/200 status. Once parsed, raw audio stream bytes are written directly
-    /// to `out`.
+    /// header and verify HTTP 200 / 206 status on the first status line (`HALNET-406`).
+    /// Once parsed, raw audio stream bytes are written directly to `out`, returning `Ok(0)`
+    /// with `is_eof() == true` when the HTTP stream finishes cleanly (`HALNET-405`).
     pub fn poll_audio_bytes(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -319,11 +371,15 @@ impl HttpAudioStream {
                 });
 
             if let Some((pos, delim_len)) = delim_match {
+                // HALNET-406: Validate HTTP status code on the FIRST status line only (200 or 206)
                 let header_slice = &self.header_buf[..pos];
+                let header_str = String::from_utf8_lossy(header_slice);
+                let status_line = header_str.lines().next().unwrap_or("");
                 let is_valid_proto =
-                    header_slice.starts_with(b"HTTP/1.") || header_slice.starts_with(b"ICY ");
-                let is_200 = header_slice.windows(4).any(|w| w == b" 200");
-                if !is_valid_proto || !is_200 {
+                    status_line.starts_with("HTTP/1.") || status_line.starts_with("ICY ");
+                let is_ok_status =
+                    status_line.contains(" 200") || status_line.contains(" 206");
+                if !is_valid_proto || !is_ok_status {
                     self.header_buf.clear();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -573,7 +629,8 @@ mod tests {
             let mut req_buf = [0u8; 512];
             let _ = server_stream.read(&mut req_buf).unwrap();
 
-            let resp = b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            // HALNET-406: Include " 200" in a header line on a 404 response to ensure only the status line is checked!
+            let resp = b"HTTP/1.0 404 Not Found\r\nX-RateLimit: 200\r\nContent-Length: 0\r\n\r\n";
             server_stream.write_all(resp).unwrap();
             server_stream.flush().unwrap();
         });
@@ -603,4 +660,47 @@ mod tests {
 
         handle.join().unwrap();
     }
+
+    #[test]
+    fn test_http_audio_stream_accepts_206_partial_content() {
+        // HALNET-406 & HALNET-405: 206 Partial Content must be accepted and clean EOF returns Ok(0)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut server_stream, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 512];
+            let _ = server_stream.read(&mut req_buf).unwrap();
+
+            let resp = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\n\r\n\x10\x20\x30\x40";
+            server_stream.write_all(resp).unwrap();
+            server_stream.flush().unwrap();
+            let _ = server_stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        let mut stream = HttpAudioStream::connect(
+            server_addr,
+            "GET /range.mp3 HTTP/1.1\r\nRange: bytes=0-3\r\n\r\n",
+        )
+        .unwrap();
+
+        let mut audio = Vec::new();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        while !stream.is_eof() && start.elapsed() < Duration::from_secs(3) {
+            match stream.poll_audio_bytes(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(n) => audio.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("Unexpected error on 206 Partial Content: {:?}", e),
+            }
+        }
+
+        assert!(stream.headers_parsed());
+        assert!(stream.is_eof());
+        assert_eq!(audio, vec![0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(stream.poll_audio_bytes(&mut buf).unwrap(), 0);
+
+        handle.join().unwrap();
+    }
 }
+

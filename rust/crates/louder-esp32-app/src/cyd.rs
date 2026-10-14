@@ -12,7 +12,7 @@ pub struct CydController {
     tx_buffer: Vec<u8, 256>,
     rx_scratch: Vec<u8, 128>,
     command_queue: Deque<CydCommand, 8>,
-    discarding_line: bool,
+    discarding_overflow: bool,
     invalid_frame_count: u32,
     last_state: Option<PlayState>,
     last_volume: Option<u8>,
@@ -30,11 +30,16 @@ impl CydController {
             tx_buffer: Vec::new(),
             rx_scratch: Vec::new(),
             command_queue: Deque::new(),
-            discarding_line: false,
+            discarding_overflow: false,
             invalid_frame_count: 0,
             last_state: None,
             last_volume: None,
         }
+    }
+
+    /// Returns whether the parser is currently discarding an overlong (>128 byte) UART line.
+    pub fn is_discarding_overflow(&self) -> bool {
+        self.discarding_overflow
     }
 
     /// Formats an outgoing message for transmission to the display.
@@ -51,9 +56,9 @@ impl CydController {
     /// Ingests incoming UART bytes and processes all complete commands via callback (CYD-003).
     pub fn feed_all<F: FnMut(CydCommand)>(&mut self, bytes: &[u8], mut on_cmd: F) -> Result<(), LinkError> {
         for &b in bytes {
-            if self.discarding_line {
+            if self.discarding_overflow {
                 if b == b'\n' {
-                    self.discarding_line = false;
+                    self.discarding_overflow = false;
                     self.rx_scratch.clear();
                 }
                 continue;
@@ -70,8 +75,8 @@ impl CydController {
                     }
                 }
             } else if self.rx_scratch.push(b).is_err() {
-                // Scratch overflow: mark line for discard until next \n (CYD-008)
-                self.discarding_line = true;
+                // Scratch overflow: mark line for discard until next \n (CYD-008 / PERIPH-606)
+                self.discarding_overflow = true;
                 self.rx_scratch.clear();
             }
         }
@@ -153,11 +158,17 @@ mod tests {
     fn test_cyd_controller_overflow_discard_recovery() {
         let mut controller = CydController::new();
 
-        // Feed >128 bytes of garbage followed by a valid command
+        // Feed >128 bytes with a valid command suffix ("CMD=PLAY\n") in the tail of the truncated line (PERIPH-606)
         let mut overlong = [b'X'; 150];
-        overlong[149] = b'\n';
+        overlong[141..150].copy_from_slice(b"CMD=PLAY\n");
 
-        controller.feed_bytes(&overlong).unwrap();
+        // Feed the first 135 bytes (triggers overflow, no newline yet)
+        assert_eq!(controller.feed_bytes(&overlong[..135]).unwrap(), None);
+        assert!(controller.is_discarding_overflow());
+
+        // Feed the remainder containing "CMD=PLAY\n" — must be discarded, NOT parsed as Play!
+        assert_eq!(controller.feed_bytes(&overlong[135..]).unwrap(), None);
+        assert!(!controller.is_discarding_overflow());
 
         // Next valid command must parse cleanly without corruption
         let cmd = controller.feed_bytes(b"CMD=PREV\n").unwrap();

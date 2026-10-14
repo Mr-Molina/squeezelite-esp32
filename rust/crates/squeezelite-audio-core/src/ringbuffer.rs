@@ -49,6 +49,7 @@ pub struct AudioRingBuffer<'a> {
     capacity: usize,
     read_pos: CachePaddedAtomic,
     write_pos: CachePaddedAtomic,
+    rewindable: AtomicUsize,
     _marker: PhantomData<&'a mut [u8]>,
 }
 
@@ -65,6 +66,7 @@ impl<'a> AudioRingBuffer<'a> {
             capacity,
             read_pos: CachePaddedAtomic::new(0),
             write_pos: CachePaddedAtomic::new(0),
+            rewindable: AtomicUsize::new(0),
             _marker: PhantomData,
         }
     }
@@ -149,18 +151,28 @@ impl<'a> AudioRingBuffer<'a> {
     /// Splits the ringbuffer into disjoint Producer and Consumer handles (CONC-001).
     pub fn split(&mut self) -> (Producer<'_, 'a>, Consumer<'_, 'a>) {
         (
-            Producer { ring: self },
-            Consumer { ring: self },
+            Producer {
+                ring: self,
+                _not_sync: PhantomData,
+            },
+            Consumer {
+                ring: self,
+                _not_sync: PhantomData,
+            },
         )
     }
 
     pub(crate) fn write_internal(&self, src: &[u8]) -> Result<usize, RingBufferError> {
-        let free = self.available_write();
+        let avail_read = self.available_read();
+        let free = self.capacity.saturating_sub(avail_read + 1);
         if free == 0 {
             return Err(RingBufferError::BufferFull);
         }
 
         let to_write = core::cmp::min(src.len(), free);
+        let max_rew = self.capacity.saturating_sub(avail_read + to_write);
+        self.rewindable.fetch_min(max_rew, Ordering::Release);
+
         let w = self.write_pos.load(Ordering::Relaxed);
 
         let space_to_end = self.capacity - w;
@@ -215,18 +227,32 @@ impl<'a> AudioRingBuffer<'a> {
         let new_r = (r + to_read) % self.capacity;
         self.read_pos.store(new_r, Ordering::Release);
 
+        let new_avail_read = avail - to_read;
+        let max_rew = self.capacity.saturating_sub(new_avail_read);
+        let prev_rew = self.rewindable.load(Ordering::Acquire);
+        self.rewindable
+            .store(prev_rew.saturating_add(to_read).min(max_rew), Ordering::Release);
+
         Ok(to_read)
     }
 
     pub(crate) fn consume_internal(&self, count: usize) {
-        let to_consume = core::cmp::min(count, self.available_read());
+        let avail = self.available_read();
+        let to_consume = core::cmp::min(count, avail);
         let r = self.read_pos.load(Ordering::Relaxed);
         let new_r = (r + to_consume) % self.capacity;
         self.read_pos.store(new_r, Ordering::Release);
+
+        let new_avail_read = avail - to_consume;
+        let max_rew = self.capacity.saturating_sub(new_avail_read);
+        let prev_rew = self.rewindable.load(Ordering::Acquire);
+        self.rewindable
+            .store(prev_rew.saturating_add(to_consume).min(max_rew), Ordering::Release);
     }
 
     pub(crate) fn rewind_read_internal(&self, count: usize) {
-        let to_rewind = core::cmp::min(count, self.available_write());
+        let rew = self.rewindable.load(Ordering::Acquire);
+        let to_rewind = count.min(rew).min(self.available_write());
         let r = self.read_pos.load(Ordering::Relaxed);
         let new_r = if r >= to_rewind {
             r - to_rewind
@@ -234,16 +260,21 @@ impl<'a> AudioRingBuffer<'a> {
             self.capacity - (to_rewind - r)
         };
         self.read_pos.store(new_r, Ordering::Release);
+        self.rewindable.fetch_sub(to_rewind, Ordering::Release);
     }
 
     pub(crate) fn flush_internal(&self) {
         let w = self.write_pos.load(Ordering::Acquire);
         self.read_pos.store(w, Ordering::Release);
+        self.rewindable.store(0, Ordering::Release);
     }
 }
 
+/// Exclusive SPSC producer handle. Explicitly `!Sync` and `!Clone` so only a single
+/// thread can ever invoke `write` (AUDIO-707).
 pub struct Producer<'ring, 'buf> {
     ring: &'ring AudioRingBuffer<'buf>,
+    _not_sync: PhantomData<core::cell::UnsafeCell<()>>,
 }
 
 unsafe impl<'ring, 'buf> Send for Producer<'ring, 'buf> {}
@@ -258,8 +289,11 @@ impl<'ring, 'buf> Producer<'ring, 'buf> {
     }
 }
 
+/// Exclusive SPSC consumer handle. Explicitly `!Sync` and `!Clone` so only a single
+/// thread can ever invoke `read`/`consume`/`rewind_read`/`flush` (AUDIO-707).
 pub struct Consumer<'ring, 'buf> {
     ring: &'ring AudioRingBuffer<'buf>,
+    _not_sync: PhantomData<core::cell::UnsafeCell<()>>,
 }
 
 unsafe impl<'ring, 'buf> Send for Consumer<'ring, 'buf> {}
@@ -391,32 +425,42 @@ mod tests {
 
     #[test]
     fn test_ringbuffer_rewind_read_underflow_protection() {
-        let mut storage = [0u8; 16];
+        let mut storage = [0xAAu8; 16];
         let mut rb = AudioRingBuffer::new(&mut storage);
+
+        // Rewinding before any read must be a no-op (never rewinds into uninitialized storage)
+        rb.rewind_read(10);
+        assert_eq!(rb.available_read(), 0);
 
         rb.write(b"0123456789").unwrap();
         assert_eq!(rb.available_read(), 10);
         assert_eq!(rb.available_write(), 5);
 
+        // Still 0 bytes read, so rewind must remain a no-op
+        rb.rewind_read(5);
+        assert_eq!(rb.available_read(), 10);
+
         let mut out = [0u8; 6];
         rb.read(&mut out).unwrap();
+        assert_eq!(&out, b"012345");
         assert_eq!(rb.available_read(), 4);
         assert_eq!(rb.available_write(), 11);
 
-        // Rewinding by 3 bytes should succeed normally
+        // Rewinding by 3 bytes should succeed normally (3 of 6 read bytes rewound)
         rb.rewind_read(3);
         assert_eq!(rb.available_read(), 7);
         assert_eq!(rb.available_write(), 8);
 
-        // Rewinding by an excessive number of bytes should clamp to available_write (8)
+        // Rewinding by an excessive number of bytes must clamp to the remaining 3 read bytes,
+        // NOT to available_write (8), preventing exposure of the 5 uninitialized bytes!
         rb.rewind_read(usize::MAX);
-        assert_eq!(rb.available_read(), 15);
-        assert_eq!(rb.available_write(), 0);
+        assert_eq!(rb.available_read(), 10);
+        assert_eq!(rb.available_write(), 5);
 
-        // Further rewind when buffer is at max capacity should not change anything
-        rb.rewind_read(10);
-        assert_eq!(rb.available_read(), 15);
-        assert_eq!(rb.available_write(), 0);
+        // Verify the rewound bytes match the exact original 10 written bytes
+        let mut verify = [0u8; 10];
+        rb.read(&mut verify).unwrap();
+        assert_eq!(&verify, b"0123456789");
     }
 
     #[test]

@@ -89,7 +89,7 @@ impl SimulatedSink {
 impl AudioOutputSink for SimulatedSink {
     type Error = OutputError;
 
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
         let mut stored_frames = 0;
         for pair in frames.chunks_exact(2) {

@@ -8,6 +8,7 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+#![allow(unknown_lints)]
 
 pub mod comms;
 pub mod drivers;
@@ -25,9 +26,12 @@ pub use drivers::{
     XPT2046_SAMPLE_COUNT,
 };
 pub use ui::{
-    rgb888_to_rgb565, NowPlayingUi, UiButtonId, UI_COLOR_HEX_ACCENT, UI_COLOR_HEX_BG,
-    UI_COLOR_HEX_OFFLINE, UI_COLOR_HEX_ONLINE, UI_COLOR_HEX_SURFACE, UI_COLOR_HEX_SURFACE_LIGHT,
-    UI_COLOR_HEX_TEXT_PRIMARY, UI_COLOR_HEX_TEXT_SECONDARY,
+    draw_text_box, glyph_pixel, rgb888_to_rgb565, NowPlayingUi, UiButtonId, DIRTY_ALL,
+    DIRTY_PROGRESS, DIRTY_STATUS, DIRTY_TRACK, DIRTY_TRANSPORT, DIRTY_VOLUME, FONT_8X8,
+    UI_COLOR_HEX_ACCENT, UI_COLOR_HEX_BG, UI_COLOR_HEX_OFFLINE, UI_COLOR_HEX_ONLINE,
+    UI_COLOR_HEX_SURFACE, UI_COLOR_HEX_SURFACE_LIGHT, UI_COLOR_HEX_TEXT_PRIMARY,
+    UI_COLOR_HEX_TEXT_SECONDARY,
 };
 
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, LinkError, PlayState};
+

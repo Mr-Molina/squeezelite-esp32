@@ -2,16 +2,43 @@
 //!
 //! Initializes board hardware profiles, starts audio streaming pipeline,
 //! and orchestrates SlimProto network connection with TAS5805M/TAS5825M digital amplifier.
+#![forbid(unsafe_code)]
+#![allow(unknown_lints)]
 
+use embedded_hal::i2c::I2c;
 use louder_esp32_app::board::{pins, BoardModel};
+use louder_esp32_app::hal::{BitDepth, EspI2sSink, LoopbackI2sDma, UartPort};
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
-use louder_esp32_app::sink::{BitDepth, EspI2sSink, LoopbackI2sDma};
 use louder_esp32_app::{
-    AmpManager, CydMessage, CydUartBridge, LoopbackUartPort, MemConfigStore,
+    AmpManager, AudioOutputSink, CydMessage, CydUartBridge, LoopbackUartPort, MemConfigStore,
     MemFlashPartition, NvsFlashBackend, PlayState, PlayerCoordinator, TargetI2cBus,
 };
 use squeezelite_config::AudioConfig;
 use squeezelite_decoders::PcmDecoder;
+
+/// Executes one integrated firmware tick across the CYD UART bridge, audio pipeline,
+/// and digital amplifier health monitor (`HALNET-409`).
+pub fn run_firmware_tick<S, U, I>(
+    coordinator: &mut PlayerCoordinator,
+    pipeline: &mut StreamPipeline<'_, S>,
+    cyd_bridge: &mut CydUartBridge<U>,
+    amp: &mut AmpManager<I>,
+) -> usize
+where
+    S: AudioOutputSink,
+    U: UartPort,
+    I: I2c,
+{
+    if let Ok(Some(cmd)) = cyd_bridge.poll_command() {
+        if let Some(reply) = coordinator.handle_cyd_command(cmd, pipeline) {
+            let _ = cyd_bridge.flush_outbound(&reply);
+        }
+    }
+
+    let frames = coordinator.process_audio_step(pipeline);
+    let _ = amp.check_faults();
+    frames
+}
 
 fn main() {
     let board = BoardModel::active();
@@ -68,7 +95,7 @@ fn main() {
     let sink = EspI2sSink::for_active_board(i2s_driver, 44100);
     let pcm_dec = PcmDecoder::new(16, 2, true);
 
-    let pipeline = StreamPipeline::new(
+    let mut pipeline = StreamPipeline::new(
         &mut stream_storage,
         &mut output_storage,
         ActiveDecoder::Pcm(pcm_dec),
@@ -82,7 +109,7 @@ fn main() {
         BoardModel::LouderEsp32PlusS3 => 0x02,
     };
     let mac = [0x24, 0x0A, 0xC4, 0x12, 0x34, suffix];
-    let coordinator = PlayerCoordinator::new(mac, board.name());
+    let mut coordinator = PlayerCoordinator::new(mac, board.name());
 
     println!("Player Coordinator initialized:");
     println!("  - State:       {:?}", coordinator.state);
@@ -107,10 +134,64 @@ fn main() {
     let uart_port = LoopbackUartPort::new();
     let mut cyd_bridge = CydUartBridge::new(uart_port);
     let tx_bytes = cyd_bridge
-        .send_message(&CydMessage::PlaybackState(PlayState::Stopped))
+        .flush_outbound(&CydMessage::PlaybackState(PlayState::Stopped))
         .expect("Failed to send initial playback state to CYD");
     println!("CYD Display UART Bridge:");
     println!("  - Sent Initial Frame: STATE=S ({} bytes)", tx_bytes);
     println!("--------------------------------------------------------");
     println!("Ready for LMS auto-discovery on UDP 3483...");
+
+    // 7. Firmware Tick Execution Loop (HALNET-409)
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        for _ in 0..16 {
+            let _ = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+        }
+    }
+
+    #[cfg(target_arch = "xtensa")]
+    {
+        loop {
+            let _ = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use louder_esp32_app::PlayerState;
+
+    #[test]
+    fn test_run_firmware_tick_processes_cyd_and_audio() {
+        let mut stream_storage = vec![0u8; 1024];
+        let mut output_storage = vec![0u8; 1024];
+        let i2s_driver = LoopbackI2sDma::new(44100);
+        let sink = EspI2sSink::for_active_board(i2s_driver, 44100);
+        let pcm_dec = PcmDecoder::new(16, 2, true);
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_dec),
+            sink,
+            44100,
+        );
+
+        let mut coordinator = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
+        let mut cyd_bridge = CydUartBridge::new(LoopbackUartPort::new());
+        let mut amp = AmpManager::for_active_board(TargetI2cBus::new());
+        amp.initialize(32).unwrap();
+        amp.start_playback().unwrap();
+
+        // Push PLAY command via UART RX and 1 stereo frame (4 bytes of 16-bit PCM) into stream buffer
+        cyd_bridge.port.push_rx(b"CMD=PLAY\n");
+        pipeline.ingest_stream_data(&[0x01, 0x00, 0xFF, 0x00]).unwrap();
+
+        let frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+        assert_eq!(coordinator.state, PlayerState::Playing);
+        assert_eq!(frames, 1);
+        assert_eq!(cyd_bridge.port.tx_bytes(), b"STATE=P\n");
+    }
+}
+

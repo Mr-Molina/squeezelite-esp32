@@ -316,6 +316,7 @@ impl AudioDecoder for PcmDecoder {
 pub struct Mp3Decoder {
     decoder: Box<nanomp3_core::Decoder>,
     sample_buf: Box<[i32]>,
+    id3_skip_remaining: usize,
 }
 
 impl Default for Mp3Decoder {
@@ -329,6 +330,7 @@ impl Mp3Decoder {
         Self {
             decoder: Box::new(nanomp3_core::Decoder::new()),
             sample_buf: vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME].into_boxed_slice(),
+            id3_skip_remaining: 0,
         }
     }
 }
@@ -339,6 +341,38 @@ impl AudioDecoder for Mp3Decoder {
         encoded_in: &[u8],
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
+        if pcm_out.len() < nanomp3_core::MAX_SAMPLES_PER_FRAME {
+            return Err(DecoderError::BufferOverflow);
+        }
+
+        if self.id3_skip_remaining > 0 {
+            if encoded_in.is_empty() {
+                return Err(DecoderError::NeedMoreData);
+            }
+            let to_skip = core::cmp::min(encoded_in.len(), self.id3_skip_remaining);
+            self.id3_skip_remaining -= to_skip;
+            return Ok((to_skip, 0));
+        }
+
+        if encoded_in.starts_with(b"ID3") {
+            if encoded_in.len() < 10 {
+                return Err(DecoderError::NeedMoreData);
+            }
+            let tag_size = ((encoded_in[6] as usize & 0x7F) << 21)
+                | ((encoded_in[7] as usize & 0x7F) << 14)
+                | ((encoded_in[8] as usize & 0x7F) << 7)
+                | (encoded_in[9] as usize & 0x7F);
+            let footer = if (encoded_in[5] & 0x10) != 0 { 10 } else { 0 };
+            let total_id3 = 10 + tag_size + footer;
+            let to_skip = core::cmp::min(encoded_in.len(), total_id3);
+            self.id3_skip_remaining = total_id3 - to_skip;
+            return Ok((to_skip, 0));
+        }
+
+        if encoded_in.len() < 4 {
+            return Err(DecoderError::NeedMoreData);
+        }
+
         let (consumed, result) = self.decoder.decode(encoded_in, &mut self.sample_buf);
 
         match result {
@@ -365,7 +399,13 @@ impl AudioDecoder for Mp3Decoder {
                 }
                 Ok((consumed, frames_produced))
             }
-            Err(nanomp3_core::DecodeError::NoFrame) => Err(DecoderError::NeedMoreData),
+            Err(nanomp3_core::DecodeError::NoFrame) => {
+                if consumed > 0 {
+                    Ok((consumed, 0))
+                } else {
+                    Err(DecoderError::NeedMoreData)
+                }
+            }
             Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => {
                 // DEC-005: Differentiate between 0 consumed (need more bytes) and >0 consumed (absorbed into reservoir)
                 if consumed == 0 {
@@ -387,6 +427,25 @@ impl AudioDecoder for Mp3Decoder {
     fn flush(&mut self) {
         *self.decoder = nanomp3_core::Decoder::new();
         self.sample_buf.fill(0);
+        self.id3_skip_remaining = 0;
+    }
+}
+
+#[cfg(feature = "std")]
+struct FlacByteReader<'a> {
+    data: &'a [u8],
+    pos: &'a std::cell::Cell<usize>,
+}
+
+#[cfg(feature = "std")]
+impl<'a> std::io::Read for FlacByteReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let cur = self.pos.get();
+        let avail = &self.data[cur..];
+        let n = avail.len().min(buf.len()).min(1);
+        buf[..n].copy_from_slice(&avail[..n]);
+        self.pos.set(cur + n);
+        Ok(n)
     }
 }
 
@@ -438,18 +497,24 @@ impl AudioDecoder for FlacDecoder {
             return Err(DecoderError::CorruptedFrame);
         }
 
-        self.stream_buf.extend_from_slice(encoded_in);
-        if self.stream_buf.len() < 4 {
+        if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
             return Err(DecoderError::NeedMoreData);
         }
 
-        let cursor = std::io::Cursor::new(&self.stream_buf[..]);
-        match claxon::FlacReader::new(cursor) {
-            Ok(reader) => {
+        let input_taken = encoded_in.len();
+        self.stream_buf.extend_from_slice(encoded_in);
+
+        let pos = std::cell::Cell::new(0usize);
+        let reader_input = FlacByteReader {
+            data: &self.stream_buf[..],
+            pos: &pos,
+        };
+
+        match claxon::FlacReader::new(reader_input) {
+            Ok(mut reader) => {
+                let header_end = pos.get();
                 if self.header_len == 0 {
-                    if let Ok(probe) = claxon::FlacReader::new(std::io::Cursor::new(&self.stream_buf[..])) {
-                        self.header_len = probe.into_inner().position() as usize;
-                    }
+                    self.header_len = header_end;
                 }
 
                 let info = reader.streaminfo();
@@ -470,83 +535,104 @@ impl AudioDecoder for FlacDecoder {
 
                 let mut frames_out = 0;
                 let mut block_buf = std::vec::Vec::new();
+                let mut last_good_pos = header_end;
+                let mut first_block_overflow = false;
+                let mut corrupted_block = false;
 
-                loop {
-                    if self.stream_buf.len() <= self.header_len {
-                        break;
-                    }
-                    let block_cursor = std::io::Cursor::new(&self.stream_buf[..]);
-                    let mut block_reader = match claxon::FlacReader::new(block_cursor) {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-                    let mut blocks = block_reader.blocks();
-                    let block = match blocks.read_next_or_eof(block_buf) {
-                        Ok(Some(b)) => b,
-                        _ => break,
-                    };
-
-                    let packet_frames = block.len() as usize;
-                    let available_space = max_frames.saturating_sub(frames_out);
-                    if packet_frames > available_space {
-                        if frames_out == 0 {
-                            return Err(DecoderError::BufferOverflow);
+                {
+                    let mut blocks = reader.blocks();
+                    loop {
+                        if pos.get() >= self.stream_buf.len() {
+                            break;
                         }
-                        break;
-                    }
+                        let pos_before_block = pos.get();
+                        match blocks.read_next_or_eof(block_buf) {
+                            Ok(Some(block)) => {
+                                let packet_frames = block.len() as usize;
+                                let available_space = max_frames.saturating_sub(frames_out);
+                                if packet_frames > available_space {
+                                    if frames_out == 0 {
+                                        first_block_overflow = true;
+                                    }
+                                    break;
+                                }
 
-                    if self.channels == 2 {
-                        for i in 0..packet_frames {
-                            let l = block.sample(0, i as u32) << shift;
-                            let r = block.sample(1, i as u32) << shift;
-                            pcm_out[(frames_out + i) * 2] = l;
-                            pcm_out[(frames_out + i) * 2 + 1] = r;
+                                if self.channels == 2 {
+                                    for i in 0..packet_frames {
+                                        let l = block.sample(0, i as u32) << shift;
+                                        let r = block.sample(1, i as u32) << shift;
+                                        pcm_out[(frames_out + i) * 2] = l;
+                                        pcm_out[(frames_out + i) * 2 + 1] = r;
+                                    }
+                                } else {
+                                    for i in 0..packet_frames {
+                                        let s = block.sample(0, i as u32) << shift;
+                                        pcm_out[(frames_out + i) * 2] = s;
+                                        pcm_out[(frames_out + i) * 2 + 1] = s;
+                                    }
+                                }
+
+                                frames_out += packet_frames;
+                                last_good_pos = pos.get();
+                                block_buf = block.into_buffer();
+
+                                if frames_out >= max_frames {
+                                    break;
+                                }
+                            }
+                            Ok(None) | Err(claxon::Error::IoError(_)) => {
+                                break;
+                            }
+                            Err(claxon::Error::FormatError(_))
+                            | Err(claxon::Error::Unsupported(_)) => {
+                                last_good_pos = pos
+                                    .get()
+                                    .max(pos_before_block + 1)
+                                    .min(self.stream_buf.len());
+                                corrupted_block = true;
+                                break;
+                            }
                         }
-                    } else {
-                        for i in 0..packet_frames {
-                            let s = block.sample(0, i as u32) << shift;
-                            pcm_out[(frames_out + i) * 2] = s;
-                            pcm_out[(frames_out + i) * 2 + 1] = s;
-                        }
-                    }
-
-                    frames_out += packet_frames;
-                    block_buf = block.into_buffer();
-                    let consumed = block_reader.into_inner().position() as usize;
-                    if consumed > self.header_len {
-                        self.stream_buf.drain(self.header_len..consumed);
-                    }
-
-                    if frames_out >= max_frames {
-                        break;
                     }
                 }
 
-                if frames_out == 0 && encoded_in.is_empty() {
+                if first_block_overflow {
+                    self.stream_buf
+                        .truncate(self.stream_buf.len().saturating_sub(input_taken));
+                    return Err(DecoderError::BufferOverflow);
+                }
+
+                if last_good_pos > self.header_len {
+                    self.stream_buf.drain(self.header_len..last_good_pos);
+                }
+
+                if corrupted_block && frames_out == 0 {
+                    return Err(DecoderError::CorruptedFrame);
+                }
+
+                if frames_out == 0 && input_taken == 0 {
                     Err(DecoderError::NeedMoreData)
                 } else {
-                    Ok((encoded_in.len(), frames_out))
+                    Ok((input_taken, frames_out))
                 }
             }
-            Err(claxon::Error::FormatError(_)) => {
-                if self.stream_buf.len() > MAX_STREAM_BUF {
-                    self.stream_buf.clear();
-                    self.header_len = 0;
-                    Err(DecoderError::CorruptedFrame)
+            Err(_) => {
+                if input_taken > 0 {
+                    Ok((input_taken, 0))
                 } else {
                     Err(DecoderError::NeedMoreData)
                 }
             }
-            Err(claxon::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Err(DecoderError::NeedMoreData)
-            }
-            Err(_) => Err(DecoderError::NeedMoreData),
         }
     }
 
     fn flush(&mut self) {
-        self.stream_buf.clear();
-        self.header_len = 0;
+        if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
+            self.stream_buf.truncate(self.header_len);
+        } else {
+            self.stream_buf.clear();
+            self.header_len = 0;
+        }
     }
 }
 
@@ -558,6 +644,7 @@ pub struct AacDecoder {
     decoder: syom::Decoder,
     pub sample_rate: u32,
     pub channels: u32,
+    pending_pcm: std::vec::Vec<i32>,
 }
 
 #[cfg(feature = "std")]
@@ -574,6 +661,7 @@ impl AacDecoder {
             decoder: syom::Decoder::new(syom::DecodeOptions::default()),
             sample_rate: 44100,
             channels: 2,
+            pending_pcm: std::vec::Vec::new(),
         }
     }
 }
@@ -590,16 +678,32 @@ impl AudioDecoder for AacDecoder {
             return Err(DecoderError::BufferOverflow);
         }
 
+        let mut frames_out = 0;
+        if !self.pending_pcm.is_empty() {
+            let pending_frames = self.pending_pcm.len() / 2;
+            let to_copy = core::cmp::min(pending_frames, max_frames);
+            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
+            self.pending_pcm.drain(..to_copy * 2);
+            frames_out += to_copy;
+            if frames_out >= max_frames {
+                return Ok((0, frames_out));
+            }
+        }
+
         if encoded_in.len() < 7 {
+            if frames_out > 0 {
+                return Ok((0, frames_out));
+            }
             return Err(DecoderError::NeedMoreData);
         }
 
-        let mut frames_out = 0;
-        let mut overflow_detected = false;
+        let pending_pcm = &mut self.pending_pcm;
+        let sample_rate = &mut self.sample_rate;
+        let channels = &mut self.channels;
 
         let feed_res = self.decoder.feed(encoded_in, |frame| {
-            self.sample_rate = frame.sample_rate;
-            self.channels = frame.planar.len() as u32;
+            *sample_rate = frame.sample_rate;
+            *channels = frame.planar.len() as u32;
 
             if frame.planar.is_empty() {
                 return Ok(());
@@ -613,28 +717,23 @@ impl AudioDecoder for AacDecoder {
             };
 
             let samples = core::cmp::min(left.len(), right.len());
-            let available_space = max_frames.saturating_sub(frames_out);
-            if samples > available_space {
-                overflow_detected = true;
-                return Ok(());
-            }
-
             for i in 0..samples {
                 let l_f = left[i].clamp(-1.0, 1.0);
                 let r_f = right[i].clamp(-1.0, 1.0);
                 let l = (l_f * 2147483520.0) as i32; // Clamping boundary to avoid overflow (DSP-003)
                 let r = (r_f * 2147483520.0) as i32;
-                pcm_out[(frames_out + i) * 2] = l;
-                pcm_out[(frames_out + i) * 2 + 1] = r;
+                if frames_out < max_frames {
+                    pcm_out[frames_out * 2] = l;
+                    pcm_out[frames_out * 2 + 1] = r;
+                    frames_out += 1;
+                } else {
+                    pending_pcm.push(l);
+                    pending_pcm.push(r);
+                }
             }
 
-            frames_out += samples;
             Ok(())
         });
-
-        if overflow_detected && frames_out == 0 {
-            return Err(DecoderError::BufferOverflow);
-        }
 
         match feed_res {
             Ok(consumed) => {
@@ -644,12 +743,19 @@ impl AudioDecoder for AacDecoder {
                     Ok((consumed, frames_out))
                 }
             }
-            Err(_) => Err(DecoderError::CorruptedFrame),
+            Err(_) => {
+                if frames_out > 0 {
+                    Ok((0, frames_out))
+                } else {
+                    Err(DecoderError::CorruptedFrame)
+                }
+            }
         }
     }
 
     fn flush(&mut self) {
         self.decoder = syom::Decoder::new(syom::DecodeOptions::default());
+        self.pending_pcm.clear();
     }
 }
 
@@ -660,6 +766,8 @@ pub struct VorbisDecoder {
     pub channels: u32,
     header_len: usize,
     stream_buf: std::vec::Vec<u8>,
+    pending_samples: std::vec::Vec<i16>,
+    pending_channels: usize,
 }
 
 #[cfg(feature = "std")]
@@ -677,6 +785,8 @@ impl VorbisDecoder {
             channels: 2,
             header_len: 0,
             stream_buf: std::vec::Vec::new(),
+            pending_samples: std::vec::Vec::new(),
+            pending_channels: 2,
         }
     }
 }
@@ -696,12 +806,43 @@ impl AudioDecoder for VorbisDecoder {
         if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
             self.stream_buf.clear();
             self.header_len = 0;
+            self.pending_samples.clear();
             return Err(DecoderError::CorruptedFrame);
         }
 
-        self.stream_buf.extend_from_slice(encoded_in);
-        if self.stream_buf.len() < 4 {
+        let mut frames_out = 0;
+        if !self.pending_samples.is_empty() {
+            let ch = if self.pending_channels == 2 { 2 } else { 1 };
+            let pending_frames = self.pending_samples.len() / ch;
+            let to_copy = core::cmp::min(pending_frames, max_frames);
+            if ch == 2 {
+                for i in 0..to_copy {
+                    pcm_out[i * 2] = (self.pending_samples[i * 2] as i32) << 16;
+                    pcm_out[i * 2 + 1] = (self.pending_samples[i * 2 + 1] as i32) << 16;
+                }
+            } else {
+                for i in 0..to_copy {
+                    let s = (self.pending_samples[i] as i32) << 16;
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
+            self.pending_samples.drain(..to_copy * ch);
+            frames_out += to_copy;
+        }
+
+        if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
+            if frames_out > 0 {
+                return Ok((0, frames_out));
+            }
             return Err(DecoderError::NeedMoreData);
+        }
+
+        let input_taken = encoded_in.len();
+        self.stream_buf.extend_from_slice(encoded_in);
+
+        if frames_out >= max_frames {
+            return Ok((input_taken, frames_out));
         }
 
         let cursor = std::io::Cursor::new(&self.stream_buf[..]);
@@ -720,38 +861,34 @@ impl AudioDecoder for VorbisDecoder {
                     return Err(DecoderError::UnsupportedSampleFormat);
                 }
 
-                let mut frames_out = 0;
+                let ch = self.channels as usize;
 
                 while let Ok(Some(samples_itl)) = reader.read_dec_packet_itl() {
-                    let packet_frames = if self.channels == 2 {
-                        samples_itl.len() / 2
-                    } else {
-                        samples_itl.len()
-                    };
-
+                    let packet_frames = samples_itl.len() / ch;
                     let available_space = max_frames.saturating_sub(frames_out);
-                    if packet_frames > available_space {
-                        if frames_out == 0 {
-                            return Err(DecoderError::BufferOverflow);
-                        }
-                        break;
-                    }
+                    let frames_to_write = core::cmp::min(packet_frames, available_space);
 
-                    if self.channels == 2 {
-                        for i in 0..packet_frames {
+                    if ch == 2 {
+                        for i in 0..frames_to_write {
                             pcm_out[(frames_out + i) * 2] = (samples_itl[i * 2] as i32) << 16;
                             pcm_out[(frames_out + i) * 2 + 1] =
                                 (samples_itl[i * 2 + 1] as i32) << 16;
                         }
                     } else {
-                        for i in 0..packet_frames {
+                        for i in 0..frames_to_write {
                             let s = (samples_itl[i] as i32) << 16;
                             pcm_out[(frames_out + i) * 2] = s;
                             pcm_out[(frames_out + i) * 2 + 1] = s;
                         }
                     }
 
-                    frames_out += packet_frames;
+                    frames_out += frames_to_write;
+                    if frames_to_write < packet_frames {
+                        self.pending_channels = ch;
+                        self.pending_samples
+                            .extend_from_slice(&samples_itl[frames_to_write * ch..]);
+                        break;
+                    }
                     if frames_out >= max_frames {
                         break;
                     }
@@ -764,32 +901,43 @@ impl AudioDecoder for VorbisDecoder {
                     self.stream_buf.drain(self.header_len..consumed);
                 }
 
-                if frames_out == 0 && encoded_in.is_empty() {
+                if frames_out == 0 && input_taken == 0 {
                     Err(DecoderError::NeedMoreData)
                 } else {
-                    Ok((encoded_in.len(), frames_out))
+                    Ok((input_taken, frames_out))
                 }
             }
             Err(lewton::VorbisError::BadHeader(lewton::header::HeaderReadError::EndOfPacket))
             | Err(lewton::VorbisError::OggError(_)) => {
                 // Header incomplete: absorbed data into stream buffer, waiting for more data (DEC-003)
-                Ok((encoded_in.len(), 0))
+                if frames_out == 0 && input_taken == 0 {
+                    Err(DecoderError::NeedMoreData)
+                } else {
+                    Ok((input_taken, frames_out))
+                }
             }
             Err(_) => {
                 if self.stream_buf.len() > MAX_STREAM_BUF {
                     self.stream_buf.clear();
                     self.header_len = 0;
                     Err(DecoderError::CorruptedFrame)
+                } else if frames_out == 0 && input_taken == 0 {
+                    Err(DecoderError::NeedMoreData)
                 } else {
-                    Ok((encoded_in.len(), 0))
+                    Ok((input_taken, frames_out))
                 }
             }
         }
     }
 
     fn flush(&mut self) {
-        self.stream_buf.clear();
-        self.header_len = 0;
+        self.pending_samples.clear();
+        if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
+            self.stream_buf.truncate(self.header_len);
+        } else {
+            self.stream_buf.clear();
+            self.header_len = 0;
+        }
     }
 }
 
@@ -862,9 +1010,39 @@ mod tests {
     #[test]
     fn test_mp3_heap_isolation_no_stack_overflow() {
         let mut decoder = Mp3Decoder::new();
-        let encoded = [0u8; 4];
-        let mut pcm_out = [0i32; 32];
+        let encoded = [0u8; 3];
+        let mut pcm_out = vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME];
         assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+
+        let mut small_pcm = [0i32; 32];
+        assert_eq!(decoder.decode(&encoded, &mut small_pcm), Err(DecoderError::BufferOverflow));
+    }
+
+    #[test]
+    fn test_mp3_id3v2_skip_and_no_frame_progress() {
+        let mut decoder = Mp3Decoder::new();
+        let mut pcm_out = vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME];
+
+        // Incomplete ID3v2 header (< 10 bytes) -> NeedMoreData
+        assert_eq!(
+            decoder.decode(b"ID3\x04\x00", &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
+
+        // Complete ID3v2 header with synchsafe size = 20 bytes (total = 10 + 20 = 30 bytes)
+        let mut id3_pkt = [0u8; 34];
+        id3_pkt[..3].copy_from_slice(b"ID3");
+        id3_pkt[3] = 4; // v2.4
+        id3_pkt[9] = 20; // size = 20
+        let (consumed, frames) = decoder.decode(&id3_pkt, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 30);
+        assert_eq!(frames, 0);
+
+        // Non-sync padding bytes are skipped with Ok((consumed, 0)) rather than stalling
+        let junk = [0u8; 8];
+        let (consumed_junk, frames_junk) = decoder.decode(&junk, &mut pcm_out).unwrap();
+        assert!(consumed_junk > 0);
+        assert_eq!(frames_junk, 0);
     }
 
     #[test]
@@ -939,13 +1117,30 @@ mod tests {
         #[cfg(feature = "std")]
         {
             let mut flac = FlacDecoder::new();
+            flac.stream_buf.extend_from_slice(b"fLaC00001111");
+            flac.header_len = 8;
             flac.flush();
+            assert_eq!(flac.stream_buf.len(), 8);
 
             let mut aac = AacDecoder::new();
+            aac.pending_pcm.extend_from_slice(&[100, -100, 200, -200]);
+            let mut out = [0i32; 2];
+            assert_eq!(aac.decode(&[], &mut out), Ok((0, 1)));
+            assert_eq!(out, [100, -100]);
             aac.flush();
+            assert!(aac.pending_pcm.is_empty());
 
             let mut vorbis = VorbisDecoder::new();
+            vorbis.pending_samples.extend_from_slice(&[10, -10, 20, -20]);
+            vorbis.pending_channels = 2;
+            vorbis.stream_buf.extend_from_slice(b"OggS00001111");
+            vorbis.header_len = 8;
+            let mut v_out = [0i32; 2];
+            assert_eq!(vorbis.decode(&[], &mut v_out), Ok((0, 1)));
+            assert_eq!(v_out, [10 << 16, (-10) << 16]);
             vorbis.flush();
+            assert!(vorbis.pending_samples.is_empty());
+            assert_eq!(vorbis.stream_buf.len(), 8);
         }
     }
 
@@ -1038,7 +1233,7 @@ mod tests {
         // Also test multi-step accumulation exceeding MAX_STREAM_BUF
         let mut dec2 = FlacDecoder::new();
         let chunk1 = std::vec![0u8; 32768];
-        let _ = dec2.decode(&chunk1, &mut pcm_out);
+        assert_eq!(dec2.decode(&chunk1, &mut pcm_out), Ok((32768, 0)));
         let chunk2 = std::vec![0u8; 32769];
         assert_eq!(
             dec2.decode(&chunk2, &mut pcm_out),

@@ -6,6 +6,7 @@
 //! - Horner's polynomial loudness curve compensation and digital volume scaler
 
 #![no_std]
+#![allow(unknown_lints)]
 
 pub mod equalizer;
 pub mod output;
