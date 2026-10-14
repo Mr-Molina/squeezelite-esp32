@@ -288,6 +288,62 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         }
     }
 
+    /// Fill a rectangular viewport region with a solid RGB565 color using a 512-byte chunk buffer.
+    pub fn fill_rect(&mut self, mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, color: u16) {
+        if x1 > x2 {
+            core::mem::swap(&mut x1, &mut x2);
+        }
+        if y1 > y2 {
+            core::mem::swap(&mut y1, &mut y2);
+        }
+        if x2 < 0 || y2 < 0 || x1 >= CYD_TFT_WIDTH || y1 >= CYD_TFT_HEIGHT {
+            return;
+        }
+        x1 = x1.max(0);
+        y1 = y1.max(0);
+        x2 = x2.min(CYD_TFT_WIDTH - 1);
+        y2 = y2.min(CYD_TFT_HEIGHT - 1);
+        if x1 > x2 || y1 > y2 {
+            return;
+        }
+
+        self.last_flush_window = (x1, y1, x2, y2);
+        self.flush_count += 1;
+
+        self.bus.send_cmd(0x2A);
+        self.bus.send_data(&[
+            ((x1 >> 8) & 0xFF) as u8,
+            (x1 & 0xFF) as u8,
+            ((x2 >> 8) & 0xFF) as u8,
+            (x2 & 0xFF) as u8,
+        ]);
+
+        self.bus.send_cmd(0x2B);
+        self.bus.send_data(&[
+            ((y1 >> 8) & 0xFF) as u8,
+            (y1 & 0xFF) as u8,
+            ((y2 >> 8) & 0xFF) as u8,
+            (y2 & 0xFF) as u8,
+        ]);
+
+        self.bus.send_cmd(0x2C);
+
+        let total_bytes = ((x2 - x1 + 1) as usize) * ((y2 - y1 + 1) as usize) * 2;
+        let [hi, lo] = color.to_be_bytes();
+        let mut chunk = [0u8; 512];
+        for pair in chunk.chunks_exact_mut(2) {
+            pair[0] = hi;
+            pair[1] = lo;
+        }
+
+        let mut remaining = total_bytes;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            self.bus.send_data(&chunk[..n]);
+            remaining -= n;
+        }
+    }
+
     /// Set backlight brightness percentage (0..=100%).
     pub fn set_backlight(&mut self, percent: u8) {
         let clamped = percent.min(100);

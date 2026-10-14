@@ -310,6 +310,74 @@ impl NowPlayingUi {
         buf.fill(bg_color);
         display.flush(0, 174, 319, 237, &buf);
     }
+
+    /// Render the complete 320x240 Now Playing interface onto physical ILI9341 GRAM.
+    pub fn render_hardware_canvas<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
+        let bg_color = rgb888_to_rgb565(UI_COLOR_HEX_BG);
+        let surface_color = rgb888_to_rgb565(UI_COLOR_HEX_SURFACE);
+        let surface_light = rgb888_to_rgb565(UI_COLOR_HEX_SURFACE_LIGHT);
+        let accent_color = rgb888_to_rgb565(UI_COLOR_HEX_ACCENT);
+        let text_primary = rgb888_to_rgb565(UI_COLOR_HEX_TEXT_PRIMARY);
+        let text_secondary = rgb888_to_rgb565(UI_COLOR_HEX_TEXT_SECONDARY);
+        let badge_color = if self.link_badge.as_str() == "ONLINE" {
+            rgb888_to_rgb565(UI_COLOR_HEX_ONLINE)
+        } else {
+            rgb888_to_rgb565(UI_COLOR_HEX_OFFLINE)
+        };
+
+        // 1. Full 320x240 Background (#121212)
+        display.fill_rect(0, 0, 319, 239, bg_color);
+
+        // 2. Top Status Bar (0..=319, 0..=27) + Mode pill & Link status badge
+        display.fill_rect(0, 0, 319, 27, surface_color);
+        display.fill_rect(10, 7, 68, 20, surface_light);
+        display.fill_rect(252, 6, 310, 21, badge_color);
+
+        // 3. Center Now Playing Card (8..=311, 34..=167)
+        display.fill_rect(8, 34, 311, 167, surface_color);
+        // Album Art Box (20..=88, 46..=114) with Spotify-green vinyl emblem
+        display.fill_rect(20, 46, 88, 114, surface_light);
+        display.fill_rect(36, 62, 72, 98, accent_color);
+        display.fill_rect(48, 74, 60, 86, surface_color);
+        // Track Title & Artist visual bars (102..=298)
+        display.fill_rect(102, 54, 286, 68, text_primary);
+        display.fill_rect(102, 78, 244, 88, text_secondary);
+        display.fill_rect(102, 96, 210, 104, surface_light);
+
+        // 4. Track Progress Bar (20..=299, 134..=145)
+        display.fill_rect(20, 134, 299, 145, surface_light);
+        let fill_w = ((self.progress_percent as i32 * 280) / 100).clamp(0, 280);
+        if fill_w > 0 {
+            display.fill_rect(20, 134, 20 + fill_w - 1, 145, accent_color);
+        }
+
+        // 5. Transport Buttons (Prev, Play/Pause, Next)
+        // Prev Button (12..=56, 184..=228)
+        display.fill_rect(12, 184, 56, 228, surface_light);
+        display.fill_rect(24, 198, 27, 214, text_primary);
+        display.fill_rect(30, 202, 42, 210, text_primary);
+
+        // Play/Pause Button (64..=112, 182..=230)
+        display.fill_rect(64, 182, 112, 230, accent_color);
+        if self.play_pause_icon.as_str() == "PAUSE" {
+            display.fill_rect(79, 196, 85, 216, text_primary);
+            display.fill_rect(91, 196, 97, 216, text_primary);
+        } else {
+            display.fill_rect(82, 196, 96, 216, text_primary);
+        }
+
+        // Next Button (120..=164, 184..=228)
+        display.fill_rect(120, 184, 164, 228, surface_light);
+        display.fill_rect(130, 202, 142, 210, text_primary);
+        display.fill_rect(145, 198, 148, 214, text_primary);
+
+        // 6. Volume Slider (195..=310, 198..=214)
+        display.fill_rect(195, 198, 310, 214, surface_light);
+        let vol_w = ((self.volume_slider as i32 * 116) / 100).clamp(0, 116);
+        if vol_w > 0 {
+            display.fill_rect(195, 198, 195 + vol_w - 1, 214, accent_color);
+        }
+    }
 }
 
 #[cfg(test)]
