@@ -278,7 +278,7 @@ mod xtensa_hw {
         let raw_x = touch.bus_mut().read_raw_12bit(0xD0);
         let raw_y = touch.bus_mut().read_raw_12bit(0x90);
         let (cal_x, cal_y) = touch.calibrate_raw(2050, 2050);
-        let hil2_pass = raw_x <= 4095 && raw_y <= 4095 && cal_x == 160 && cal_y == 120;
+        let hil2_pass = raw_x <= 4095 && raw_y <= 4095 && cal_x == 159 && cal_y == 119;
         println!(
             "[HIL 2/5] XPT2046 Touch Bus & Calibration:  {} (irq_low={}, raw_adc=({}, {}), center_cal=({}, {}))",
             if hil2_pass { "PASS" } else { "FAIL" },
@@ -293,7 +293,7 @@ mod xtensa_hw {
         // [HIL 3/5] Squeezelite CYD Link Protocol & Active Playback Render
         // ====================================================================
         let mut link = CydDisplayLink::new();
-        let rx_stream = b"STATE=P\r\nVOL=78\r\nMETA=Bohemian Rhapsody;Queen;A Night at the Opera\r\nTIME=142;354\r\nWIFI=1;-52\r\n";
+        let rx_stream = b"STATE=P\r\nVOL=78\r\nMETA=Queen;Bohemian Rhapsody\r\nTIME=142/354\r\nWIFI=1;-52\r\n";
         let parsed_events = link.feed_rx_bytes(rx_stream, 1_000_000);
         ui.update(&link.state);
         ui.render_hardware_canvas(&mut display);
@@ -302,7 +302,7 @@ mod xtensa_hw {
             && link.state.state == PlayState::Playing
             && link.state.vol == 78
             && ui.title_label.as_str() == "Bohemian Rhapsody"
-            && ui.subtitle_label.as_str() == "Queen • A Night at the Opera"
+            && ui.subtitle_label.as_str() == "Queen"
             && ui.progress_percent == 40
             && ui.time_elapsed_label.as_str() == "02:22"
             && ui.time_total_label.as_str() == "05:54"

@@ -331,7 +331,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         let total_bytes = ((x2 - x1 + 1) as usize) * ((y2 - y1 + 1) as usize) * 2;
         let [hi, lo] = color.to_be_bytes();
         let mut chunk = [0u8; 512];
-        for pair in chunk.chunks_exact_mut(2) {
+        for pair in chunk.as_chunks_mut::<2>().0 {
             pair[0] = hi;
             pair[1] = lo;
         }
