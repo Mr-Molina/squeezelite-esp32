@@ -8,7 +8,6 @@ description = "no_std lock-free audio ringbuffers, Horner loudness curve, and bi
 
 [dependencies]
 heapless = { workspace = true }
-thiserror = { workspace = true }
 log = { workspace = true, optional = true }
 
 [dev-dependencies]

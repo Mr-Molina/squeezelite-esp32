@@ -296,7 +296,6 @@ dependencies = [
  "squeezelite-decoders",
  "squeezelite-proto",
  "squeezelite-tas58xx",
- "thiserror",
 ]
 
 [[package]]
@@ -565,7 +564,6 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "log",
- "thiserror",
 ]
 
 [[package]]
