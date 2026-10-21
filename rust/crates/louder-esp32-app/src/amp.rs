@@ -276,6 +276,23 @@ where
             _ => Ok(None),
         }
     }
+
+    /// Stages the amplifier into Hi-Z mode and clears faults (`RUST-17`).
+    pub fn stage_hiz(&mut self) -> Result<(), DriverError<E>> {
+        match self.inner.as_mut() {
+            Some(AmpInner::Standby(driver)) => driver.stage_hiz_and_clear_faults(),
+            _ => Err(DriverError::InvalidParameter),
+        }
+    }
+
+    /// Selects book and page registers on the TAS58xx amplifier in Standby or Play mode (`RUST-18`).
+    pub fn select_book_page(&mut self, book: u8, page: u8) -> Result<(), DriverError<E>> {
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => driver.select_book_page(book, page),
+            Some(AmpInner::Standby(driver)) => driver.select_book_page(book, page),
+            _ => Err(DriverError::InvalidParameter),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +526,41 @@ mod tests {
         amp.initialize(32).unwrap();
         assert_eq!(amp.mode(), AmpMode::Standby);
         assert!(amp.into_inner().is_some());
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_amp_manager_select_book_page_and_stage_hiz() {
+        let addr = crate::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // init_into_standby
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            // reconfirm_book_page_and_clear_faults
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            // configure_audio_format(32)
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // stage_hiz
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            // select_book_page(0x01, 0x02)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x01]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x02]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut amp = AmpManager::new(&mut i2c);
+        amp.initialize(32).unwrap();
+        amp.stage_hiz().unwrap();
+        amp.select_book_page(0x01, 0x02).unwrap();
+
+        assert_eq!(crate::board::BoardModel::LouderEsp32Wrover.cyd_uart_pins(), (4, 36));
 
         i2c.done();
     }

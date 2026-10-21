@@ -15,8 +15,10 @@ use embedded_hal::i2c::I2c;
 
 /// Standard 7-bit I2C address for TAS5825M (Louder-ESP32-Plus).
 pub const DEFAULT_I2C_ADDR: u8 = 0x4C;
-/// Standard 7-bit I2C address for TAS5805M (Louder-ESP32).
+/// Standard 7-bit I2C address for TAS5805M (Louder-ESP32 alternate ADR pin high/float).
 pub const TAS5805M_I2C_ADDR: u8 = 0x2D;
+/// Standard 7-bit I2C address for TAS5805M (Sonocotta Louder-ESP32 default ADR pin low).
+pub const TAS5805M_I2C_ADDR_DEFAULT: u8 = 0x2C;
 
 /// Volume presets aligned with TI TAS5805M / TAS5825M register map (0x4C).
 /// - 0x00 is +24dB overdrive (dangerous).
@@ -293,6 +295,90 @@ where
             .map_err(DriverError::I2cError)
     }
 
+    /// Selects a register Book and Page, ensuring Page 0 is selected first (RUST-18).
+    ///
+    /// Texas Instruments TAS5805M/TAS5825M book selection (`BOOK_SELECT` register 0x7F)
+    /// is only accessible from Page 0. If the device was left on a non-zero page,
+    /// writing to 0x7F would modify that page's register instead of the book register.
+    /// Therefore, this method strictly performs:
+    /// 1. Write `PAGE_SELECT (0x00)` = `0x00`
+    /// 2. Write `BOOK_SELECT (0x7F)` = `book`
+    /// 3. Write `PAGE_SELECT (0x00)` = `page`
+    pub fn select_book_page(&mut self, book: u8, page: u8) -> Result<(), DriverError<E>> {
+        self.i2c
+            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
+            .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::BOOK_SELECT, book])
+            .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::PAGE_SELECT, page])
+            .map_err(DriverError::I2cError)
+    }
+
+    /// Stages the amplifier into Hi-Z mode and clears latched faults (RUST-17).
+    ///
+    /// Writes:
+    /// 1. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_HIZ (0x02)`
+    /// 2. `FAULT_CLEAR (0x78)` = `FAULT_CLEAR_ANALOG (0x80)`
+    pub fn stage_hiz_and_clear_faults(&mut self) -> Result<(), DriverError<E>> {
+        self.i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
+            .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
+            .map_err(DriverError::I2cError)
+    }
+
+    /// Transitions into `Play` mode, staging through Hi-Z and clearing faults first (RUST-17).
+    ///
+    /// Writes:
+    /// 1. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_HIZ (0x02)`
+    /// 2. `FAULT_CLEAR (0x78)` = `FAULT_CLEAR_ANALOG (0x80)`
+    /// 3. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_PLAY_MUTE (0x0B)`
+    /// 4. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_PLAY (0x03)`
+    ///
+    /// Returns `(Self, DriverError<E>)` on I2C error so peripheral ownership is retained (PERIPH-604).
+    pub fn try_start_playback_via_hiz(
+        mut self,
+    ) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY_MUTE])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+        if let Err(e) = self
+            .i2c
+            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY])
+        {
+            return Err((self, DriverError::I2cError(e)));
+        }
+
+        Ok(Tas58xx {
+            i2c: self.i2c,
+            addr: self.addr,
+            _state: PhantomData,
+        })
+    }
+
+    /// Transitions into `Play` mode staging through Hi-Z and clearing faults first (RUST-17).
+    pub fn start_playback_via_hiz(self) -> Result<Tas58xx<I2C, Play>, DriverError<E>> {
+        self.try_start_playback_via_hiz().map_err(|(_, e)| e)
+    }
+
     /// Transitions into `Play` mode, returning `Self` on I2C error (PERIPH-604).
     pub fn try_start_playback(mut self) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
         if let Err(e) = self
@@ -397,6 +483,27 @@ where
             .map_err(DriverError::I2cError)?;
         self.i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY])
+            .map_err(DriverError::I2cError)
+    }
+
+    /// Selects a register Book and Page during Play mode, ensuring Page 0 is selected first (RUST-18).
+    ///
+    /// Texas Instruments TAS5805M/TAS5825M book selection (`BOOK_SELECT` register 0x7F)
+    /// is only accessible from Page 0. If the device was left on a non-zero page,
+    /// writing to 0x7F would modify that page's register instead of the book register.
+    /// Therefore, this method strictly performs:
+    /// 1. Write `PAGE_SELECT (0x00)` = `0x00`
+    /// 2. Write `BOOK_SELECT (0x7F)` = `book`
+    /// 3. Write `PAGE_SELECT (0x00)` = `page`
+    pub fn select_book_page(&mut self, book: u8, page: u8) -> Result<(), DriverError<E>> {
+        self.i2c
+            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
+            .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::BOOK_SELECT, book])
+            .map_err(DriverError::I2cError)?;
+        self.i2c
+            .write(self.addr, &[registers::PAGE_SELECT, page])
             .map_err(DriverError::I2cError)
     }
 
@@ -662,6 +769,104 @@ mod tests {
         };
 
         playing.recover_from_fault().unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_select_book_page_writes_page_zero_before_book() {
+        let expectations = [
+            // Standby call: PAGE_SELECT 0x00 -> BOOK_SELECT 0x8C -> PAGE_SELECT 0x2A
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x00],
+            ),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::BOOK_SELECT, 0x8C]),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::PAGE_SELECT, 0x2A]),
+            // Play call: PAGE_SELECT 0x00 -> BOOK_SELECT 0x00 -> PAGE_SELECT 0x00
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x00],
+            ),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::PAGE_SELECT, 0x00]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            _state: PhantomData::<Standby>,
+        };
+        standby.select_book_page(0x8C, 0x2A).unwrap();
+
+        let mut playing = Tas58xx {
+            i2c: &mut i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            _state: PhantomData::<Play>,
+        };
+        playing.select_book_page(0x00, 0x00).unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_stage_hiz_and_clear_faults() {
+        let expectations = [
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG],
+            ),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            _state: PhantomData::<Standby>,
+        };
+
+        standby.stage_hiz_and_clear_faults().unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_try_start_playback_via_hiz_sequence() {
+        let expectations = [
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY_MUTE],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY],
+            ),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            _state: PhantomData::<Standby>,
+        };
+
+        let _playing = standby
+            .try_start_playback_via_hiz()
+            .map_err(|(_, e)| e)
+            .unwrap();
 
         i2c.done();
     }

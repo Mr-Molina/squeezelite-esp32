@@ -7,8 +7,8 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
 use squeezelite_proto::{
-    DiscoveredServer, DiscoveryBuilder, DiscoveryParser, ParseError, ServerCommand,
-    SlimprotoBuilder, SlimprotoParser, StatEvent,
+    DiscoveredServer, DiscoveryBuilder, DiscoveryParser, DisconnectReason, ParseError, ServerCommand,
+    SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
 };
 
 /// LMS Auto-Discovery Client over UDP broadcast (Port 3483).
@@ -43,7 +43,7 @@ impl LmsDiscovery {
 pub struct SlimprotoClient {
     stream: TcpStream,
     mac: [u8; 6],
-    model: &'static str,
+    model: String,
     acc_buf: Vec<u8>,
 }
 
@@ -52,7 +52,18 @@ impl SlimprotoClient {
     ///
     /// Sends `HELO` while the socket is still in blocking mode (with write timeout)
     /// and transitions to non-blocking mode only after `send_helo` succeeds (`HALNET-403`).
-    pub fn connect(server_addr: SocketAddr, mac: [u8; 6], model: &'static str) -> std::io::Result<Self> {
+    pub fn connect(server_addr: SocketAddr, mac: [u8; 6], model: &str) -> std::io::Result<Self> {
+        Self::connect_with_options(server_addr, mac, model, false, 0)
+    }
+
+    /// Connects to LMS server with extended reconnect and byte offset options (`HALNET-403`).
+    pub fn connect_with_options(
+        server_addr: SocketAddr,
+        mac: [u8; 6],
+        model_name: &str,
+        reconnect: bool,
+        bytes_received: u64,
+    ) -> std::io::Result<Self> {
         let stream = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -61,12 +72,12 @@ impl SlimprotoClient {
         let mut client = Self {
             stream,
             mac,
-            model,
+            model: model_name.to_string(),
             acc_buf: Vec::with_capacity(8192),
         };
 
         // HALNET-403: Send HELO while socket is still in blocking mode, then enable non-blocking mode
-        client.send_helo(mac)?;
+        client.send_helo_with_options(mac, model_name, reconnect, bytes_received)?;
         client.stream.set_nonblocking(true)?;
 
         Ok(client)
@@ -74,10 +85,36 @@ impl SlimprotoClient {
 
     /// Builds and sends the initial `HELO` handshake packet (`HALNET-403`).
     pub fn send_helo(&mut self, mac: [u8; 6]) -> std::io::Result<()> {
-        let mut helo_buf = [0u8; 256];
-        let caps = "Model=LouderESP32Plus,mp3,flac,aac,ogg,pcm,MaxSampleRate=192000";
-        let helo_len = SlimprotoBuilder::build_helo(&mac, 12, caps, &mut helo_buf)
-            .map_err(|_| std::io::Error::other("HELO build error"))?;
+        let model = self.model.clone();
+        self.send_helo_with_options(mac, &model, false, 0)
+    }
+
+    /// Builds and sends the `HELO` handshake packet with reconnect flag and received byte offset.
+    pub fn send_helo_with_options(
+        &mut self,
+        mac: [u8; 6],
+        model_name: &str,
+        reconnect: bool,
+        bytes_received: u64,
+    ) -> std::io::Result<()> {
+        let mut helo_buf = [0u8; 512];
+        let model_part = if model_name.is_empty() {
+            "Model=LouderESP32Plus".to_string()
+        } else if model_name.starts_with("Model=") {
+            model_name.to_string()
+        } else {
+            format!("Model={model_name}")
+        };
+        let caps = format!("{model_part},mp3,flac,aac,ogg,pcm,MaxSampleRate=192000");
+        let helo_len = SlimprotoBuilder::build_helo_with_options(
+            &mac,
+            12,
+            &caps,
+            reconnect,
+            bytes_received,
+            &mut helo_buf,
+        )
+        .map_err(|_| std::io::Error::other("HELO build error"))?;
 
         Self::write_all_bounded(&mut self.stream, &helo_buf[..helo_len])
     }
@@ -124,8 +161,8 @@ impl SlimprotoClient {
     }
 
     /// Returns the player model string.
-    pub fn model(&self) -> &'static str {
-        self.model
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Returns the remote peer address of the connected LMS server.
@@ -153,6 +190,69 @@ impl SlimprotoClient {
         )
         .map_err(|_| std::io::Error::other("STAT build error"))?;
 
+        Self::write_all_bounded(&mut self.stream, &buf[..len])
+    }
+
+    /// Sends a STAT telemetry packet with explicit metrics including custom sample rate,
+    /// 64-bit frames played, server timestamp, and 64-bit byte counter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_stat_with_metrics(
+        &mut self,
+        event: StatEvent,
+        stream_buf_fullness: u32,
+        output_buf_fullness: u32,
+        frames_played: u64,
+        sample_rate: u32,
+        bytes_received: u64,
+        jiffies_ms: u32,
+        server_timestamp: u32,
+    ) -> std::io::Result<()> {
+        let mut buf = [0u8; 128];
+        let len = StatBuilder::build_stat_with_metrics(
+            event,
+            stream_buf_fullness,
+            output_buf_fullness,
+            frames_played,
+            sample_rate,
+            bytes_received,
+            jiffies_ms,
+            server_timestamp,
+            &mut buf,
+        )
+        .map_err(|_| std::io::Error::other("STAT build error"))?;
+
+        Self::write_all_bounded(&mut self.stream, &buf[..len])
+    }
+
+    /// Sends an HTTP response packet (`RESP`) transmitting received HTTP headers to LMS.
+    pub fn send_resp(&mut self, headers: &[u8]) -> std::io::Result<()> {
+        let mut buf = vec![0u8; 8 + headers.len()];
+        let len = SlimprotoBuilder::build_resp(headers, &mut buf)
+            .map_err(|_| std::io::Error::other("RESP build error"))?;
+        Self::write_all_bounded(&mut self.stream, &buf[..len])
+    }
+
+    /// Sends a disconnect notification packet (`DSCO`) transmitting disconnect reason to LMS.
+    pub fn send_dsco(&mut self, reason: DisconnectReason) -> std::io::Result<()> {
+        let mut buf = [0u8; 16];
+        let len = SlimprotoBuilder::build_dsco(reason, &mut buf)
+            .map_err(|_| std::io::Error::other("DSCO build error"))?;
+        Self::write_all_bounded(&mut self.stream, &buf[..len])
+    }
+
+    /// Sends a stream metadata packet (`META`) forwarding stream metadata (e.g. ICY) to LMS.
+    pub fn send_meta(&mut self, metadata: &[u8]) -> std::io::Result<()> {
+        let mut buf = vec![0u8; 8 + metadata.len()];
+        let len = SlimprotoBuilder::build_meta(metadata, &mut buf)
+            .map_err(|_| std::io::Error::other("META build error"))?;
+        Self::write_all_bounded(&mut self.stream, &buf[..len])
+    }
+
+    /// Sends a player name device setting packet (`SETD` with id 0x00) to LMS.
+    pub fn send_setd_name(&mut self, name: &str) -> std::io::Result<()> {
+        let mut buf = vec![0u8; 9 + name.len()];
+        let len = SlimprotoBuilder::build_setd_name(name, &mut buf)
+            .map_err(|_| std::io::Error::other("SETD build error"))?;
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
@@ -254,16 +354,128 @@ impl SlimprotoClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkDecoderState {
+    ReadSize,
+    ReadData(usize),
+    ReadCrlf,
+    ReadTrailer,
+    Eof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IcyDecoderState {
+    Audio,
+    MetaLen,
+    MetaData { remaining: usize },
+}
+
+fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, String)> {
+    let s = location.trim().trim_matches('"').trim_matches('\'').trim();
+    let without_scheme = if let Some(stripped) = s.strip_prefix("http://") {
+        stripped
+    } else if let Some(stripped) = s.strip_prefix("HTTP://") {
+        stripped
+    } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case("http://") {
+        &s[7..]
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Unsupported URL scheme in Location: {s}"),
+        ));
+    };
+
+    let (host_port, path) = match without_scheme.find('/') {
+        Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
+        None => (without_scheme, "/"),
+    };
+
+    use std::net::ToSocketAddrs;
+    let host_port_with_default = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    let addrs: Vec<SocketAddr> = host_port_with_default.to_socket_addrs()?.collect();
+    let addr = addrs.into_iter().next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Could not resolve host: {host_port}"),
+        )
+    })?;
+
+    Ok((addr, host_port.to_string(), path.to_string()))
+}
+
+fn format_redirect_request(template: &str, host_port: &str, path: &str) -> String {
+    if template.is_empty() {
+        return format!("GET {path} HTTP/1.0\r\nHost: {host_port}\r\n\r\n");
+    }
+
+    let mut lines = Vec::new();
+    let mut first_line = true;
+    let mut host_found = false;
+
+    for line in template.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if first_line {
+            first_line = false;
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let proto = if parts.len() >= 3 { parts[2] } else { "HTTP/1.0" };
+            let method = if !parts.is_empty() { parts[0] } else { "GET" };
+            lines.push(format!("{method} {path} {proto}"));
+        } else if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("host:") {
+            lines.push(format!("Host: {host_port}"));
+            host_found = true;
+        } else {
+            lines.push(trimmed.to_string());
+        }
+    }
+
+    if !host_found {
+        lines.push(format!("Host: {host_port}"));
+    }
+
+    let mut req = lines.join("\r\n");
+    req.push_str("\r\n\r\n");
+    req
+}
+
 /// Pure-Rust HTTP Audio Stream Client for fetching streamed audio over TCP.
 pub struct HttpAudioStream {
     stream: TcpStream,
     header_buf: Vec<u8>,
-    pending_body: Vec<u8>,
     headers_parsed: bool,
     eof: bool,
+
+    // Redirect & request tracking
+    request_template: String,
+    redirect_count: usize,
+    response_headers: Option<Vec<u8>>,
+
+    // Chunked transfer decoding
+    is_chunked: bool,
+    chunk_state: ChunkDecoderState,
+    raw_body_buf: Vec<u8>,
+    unchunked_buf: Vec<u8>,
+
+    // ICY metadata handling
+    icy_metaint: usize,
+    icy_audio_remaining: usize,
+    icy_state: IcyDecoderState,
+    icy_meta_accum: Vec<u8>,
+    latest_icy_metadata: Option<Vec<u8>>,
+
+    // Final pure audio buffer
+    audio_buf: Vec<u8>,
+    total_audio_bytes: u64,
 }
 
 impl HttpAudioStream {
+    pub const MAX_REDIRECTS: usize = 3;
     pub const MAX_HTTP_HEADER_LEN: usize = 4096;
 
     /// Connects to the HTTP streaming audio server and issues the initial GET request.
@@ -293,15 +505,32 @@ impl HttpAudioStream {
         Ok(Self {
             stream,
             header_buf: Vec::with_capacity(512),
-            pending_body: Vec::with_capacity(2048),
             headers_parsed: false,
             eof: false,
+
+            request_template: http_headers.to_string(),
+            redirect_count: 0,
+            response_headers: None,
+
+            is_chunked: false,
+            chunk_state: ChunkDecoderState::ReadSize,
+            raw_body_buf: Vec::with_capacity(2048),
+            unchunked_buf: Vec::with_capacity(2048),
+
+            icy_metaint: 0,
+            icy_audio_remaining: 0,
+            icy_state: IcyDecoderState::Audio,
+            icy_meta_accum: Vec::new(),
+            latest_icy_metadata: None,
+
+            audio_buf: Vec::with_capacity(2048),
+            total_audio_bytes: 0,
         })
     }
 
     /// Returns `true` if the server disconnected (EOF) and all pending body bytes have been drained.
     pub fn is_eof(&self) -> bool {
-        self.eof && self.pending_body.is_empty()
+        self.eof && self.audio_buf.is_empty() && self.raw_body_buf.is_empty() && self.unchunked_buf.is_empty()
     }
 
     /// Returns `true` once the HTTP response headers have been successfully parsed and verified.
@@ -309,29 +538,227 @@ impl HttpAudioStream {
         self.headers_parsed
     }
 
+    /// Returns the captured raw HTTP response headers, if available.
+    pub fn take_response_headers(&mut self) -> Option<Vec<u8>> {
+        self.response_headers.take()
+    }
+
+    /// Returns the latest parsed ICY metadata block, if available.
+    pub fn take_icy_metadata(&mut self) -> Option<Vec<u8>> {
+        self.latest_icy_metadata.take()
+    }
+
+    /// Configures the ICY metadata interval in audio bytes.
+    pub fn set_icy_metaint(&mut self, interval: usize) {
+        self.icy_metaint = interval;
+        self.icy_audio_remaining = interval;
+        self.icy_state = IcyDecoderState::Audio;
+    }
+
+    /// Returns current ICY metadata interval.
+    pub fn icy_metaint(&self) -> usize {
+        self.icy_metaint
+    }
+
+    /// Returns total audio stream bytes polled by caller.
+    pub fn total_audio_bytes(&self) -> u64 {
+        self.total_audio_bytes
+    }
+
+    fn process_chunked_body(&mut self) -> std::io::Result<()> {
+        while !self.raw_body_buf.is_empty() {
+            match self.chunk_state {
+                ChunkDecoderState::ReadSize => {
+                    let delim_pos = self
+                        .raw_body_buf
+                        .windows(2)
+                        .position(|w| w == b"\r\n")
+                        .map(|p| (p, 2))
+                        .or_else(|| {
+                            self.raw_body_buf
+                                .iter()
+                                .position(|&b| b == b'\n')
+                                .map(|p| (p, 1))
+                        });
+
+                    if let Some((pos, delim_len)) = delim_pos {
+                        let line_slice = &self.raw_body_buf[..pos];
+                        let line_str = core::str::from_utf8(line_slice).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid UTF-8 in chunk size line",
+                            )
+                        })?;
+                        let hex_str = line_str.split(';').next().unwrap_or("").trim();
+                        let chunk_size = usize::from_str_radix(hex_str, 16).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Invalid chunk size hex: {hex_str}"),
+                            )
+                        })?;
+
+                        self.raw_body_buf.drain(..pos + delim_len);
+
+                        if chunk_size == 0 {
+                            self.chunk_state = ChunkDecoderState::ReadTrailer;
+                        } else {
+                            self.chunk_state = ChunkDecoderState::ReadData(chunk_size);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                ChunkDecoderState::ReadData(rem) => {
+                    let take = self.raw_body_buf.len().min(rem);
+                    if take > 0 {
+                        self.unchunked_buf.extend_from_slice(&self.raw_body_buf[..take]);
+                        self.raw_body_buf.drain(..take);
+                        let new_rem = rem - take;
+                        if new_rem == 0 {
+                            self.chunk_state = ChunkDecoderState::ReadCrlf;
+                        } else {
+                            self.chunk_state = ChunkDecoderState::ReadData(new_rem);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                ChunkDecoderState::ReadCrlf => {
+                    if self.raw_body_buf.starts_with(b"\r\n") {
+                        self.raw_body_buf.drain(..2);
+                        self.chunk_state = ChunkDecoderState::ReadSize;
+                    } else if self.raw_body_buf.starts_with(b"\n") {
+                        self.raw_body_buf.drain(..1);
+                        self.chunk_state = ChunkDecoderState::ReadSize;
+                    } else if self.raw_body_buf.is_empty() || self.raw_body_buf == b"\r" {
+                        break;
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Missing CRLF after chunk data",
+                        ));
+                    }
+                }
+                ChunkDecoderState::ReadTrailer => {
+                    if self.raw_body_buf.starts_with(b"\r\n") {
+                        self.raw_body_buf.drain(..2);
+                        self.chunk_state = ChunkDecoderState::Eof;
+                        self.eof = true;
+                        break;
+                    } else if self.raw_body_buf.starts_with(b"\n") {
+                        self.raw_body_buf.drain(..1);
+                        self.chunk_state = ChunkDecoderState::Eof;
+                        self.eof = true;
+                        break;
+                    } else if let Some(p) = self.raw_body_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        self.raw_body_buf.drain(..p + 4);
+                        self.chunk_state = ChunkDecoderState::Eof;
+                        self.eof = true;
+                        break;
+                    } else if let Some(p) = self.raw_body_buf.windows(2).position(|w| w == b"\n\n") {
+                        self.raw_body_buf.drain(..p + 2);
+                        self.chunk_state = ChunkDecoderState::Eof;
+                        self.eof = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                ChunkDecoderState::Eof => {
+                    self.raw_body_buf.clear();
+                    self.eof = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn process_icy_stripping(&mut self) {
+        if self.icy_metaint == 0 {
+            self.audio_buf.append(&mut self.unchunked_buf);
+            return;
+        }
+
+        while !self.unchunked_buf.is_empty() {
+            match self.icy_state {
+                IcyDecoderState::Audio => {
+                    if self.icy_audio_remaining > 0 {
+                        let take = self.unchunked_buf.len().min(self.icy_audio_remaining);
+                        self.audio_buf.extend_from_slice(&self.unchunked_buf[..take]);
+                        self.unchunked_buf.drain(..take);
+                        self.icy_audio_remaining -= take;
+                    }
+                    if self.icy_audio_remaining == 0 {
+                        self.icy_state = IcyDecoderState::MetaLen;
+                    }
+                }
+                IcyDecoderState::MetaLen => {
+                    let len_byte = self.unchunked_buf.remove(0);
+                    let meta_len = (len_byte as usize) * 16;
+                    if meta_len == 0 {
+                        self.icy_audio_remaining = self.icy_metaint;
+                        self.icy_state = IcyDecoderState::Audio;
+                    } else {
+                        self.icy_meta_accum.clear();
+                        self.icy_state = IcyDecoderState::MetaData { remaining: meta_len };
+                    }
+                }
+                IcyDecoderState::MetaData { remaining } => {
+                    let take = self.unchunked_buf.len().min(remaining);
+                    self.icy_meta_accum.extend_from_slice(&self.unchunked_buf[..take]);
+                    self.unchunked_buf.drain(..take);
+                    let new_rem = remaining - take;
+                    if new_rem == 0 {
+                        if !self.icy_meta_accum.is_empty() {
+                            self.latest_icy_metadata = Some(std::mem::take(&mut self.icy_meta_accum));
+                        }
+                        self.icy_audio_remaining = self.icy_metaint;
+                        self.icy_state = IcyDecoderState::Audio;
+                    } else {
+                        self.icy_state = IcyDecoderState::MetaData { remaining: new_rem };
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_raw_body(&mut self) -> std::io::Result<()> {
+        if self.is_chunked {
+            self.process_chunked_body()?;
+        } else {
+            self.unchunked_buf.append(&mut self.raw_body_buf);
+        }
+        self.process_icy_stripping();
+        Ok(())
+    }
+
     /// Polls audio stream bytes non-blockingly into `out`.
     ///
     /// During the initial header phase, incoming chunks are parsed to strip the HTTP response
-    /// header and verify HTTP 200 / 206 status on the first status line (`HALNET-406`).
-    /// Once parsed, raw audio stream bytes are written directly to `out`, returning `Ok(0)`
-    /// with `is_eof() == true` when the HTTP stream finishes cleanly (`HALNET-405`).
+    /// header, follow redirects (`301`, `302`, `307`, `308`), and verify HTTP 200 / 206 status (`HALNET-406`).
+    /// Once parsed, raw audio stream bytes are de-chunked and stripped of ICY metadata before
+    /// being written directly to `out`, returning `Ok(0)` with `is_eof() == true` when finished (`HALNET-405`).
     pub fn poll_audio_bytes(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
 
-        if !self.pending_body.is_empty() {
-            let n = out.len().min(self.pending_body.len());
-            out[..n].copy_from_slice(&self.pending_body[..n]);
-            self.pending_body.drain(..n);
+        // 1. Drain pending audio
+        if !self.audio_buf.is_empty() {
+            let n = out.len().min(self.audio_buf.len());
+            out[..n].copy_from_slice(&self.audio_buf[..n]);
+            self.audio_buf.drain(..n);
+            self.total_audio_bytes += n as u64;
             return Ok(n);
         }
 
-        if self.eof {
+        if self.is_eof() {
             return Ok(0);
         }
 
-        if !self.headers_parsed {
+        // 2. Initial header parsing and redirect following
+        while !self.headers_parsed {
             let mut temp = [0u8; 1024];
             let n = match self.stream.read(&mut temp) {
                 Ok(0) => {
@@ -371,15 +798,82 @@ impl HttpAudioStream {
                 });
 
             if let Some((pos, delim_len)) = delim_match {
-                // HALNET-406: Validate HTTP status code on the FIRST status line only (200 or 206)
                 let header_slice = &self.header_buf[..pos];
                 let header_str = String::from_utf8_lossy(header_slice);
                 let status_line = header_str.lines().next().unwrap_or("");
                 let is_valid_proto =
                     status_line.starts_with("HTTP/1.") || status_line.starts_with("ICY ");
-                let is_ok_status =
-                    status_line.contains(" 200") || status_line.contains(" 206");
-                if !is_valid_proto || !is_ok_status {
+
+                let status_code: Option<u16> = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok());
+
+                let code = match status_code {
+                    Some(c) if is_valid_proto => c,
+                    _ => {
+                        self.header_buf.clear();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Non-200 HTTP response",
+                        ));
+                    }
+                };
+
+                // Check for redirects: 301, 302, 307, 308
+                if matches!(code, 301 | 302 | 307 | 308) {
+                    if self.redirect_count >= Self::MAX_REDIRECTS {
+                        self.header_buf.clear();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Too many redirects",
+                        ));
+                    }
+
+                    let location = header_str
+                        .lines()
+                        .find_map(|line| {
+                            let trimmed = line.trim();
+                            if let Some(pos) = trimmed.find(':') {
+                                if trimmed[..pos].trim().eq_ignore_ascii_case("location") {
+                                    Some(trimmed[pos + 1..].trim())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Redirect response without Location header",
+                            )
+                        })?;
+
+                    let (new_addr, host_port, new_path) = parse_http_location(location)?;
+                    let new_request = format_redirect_request(
+                        &self.request_template,
+                        &host_port,
+                        &new_path,
+                    );
+
+                    let mut new_stream =
+                        TcpStream::connect_timeout(&new_addr, Duration::from_millis(1500))?;
+                    new_stream.set_nodelay(true)?;
+                    new_stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+                    new_stream.set_write_timeout(Some(Duration::from_millis(1500)))?;
+                    new_stream.write_all(new_request.as_bytes())?;
+                    new_stream.set_nonblocking(true)?;
+
+                    self.stream = new_stream;
+                    self.redirect_count += 1;
+                    self.header_buf.clear();
+                    continue;
+                }
+
+                // Verify 200 or 206 status (HALNET-406)
+                if code != 200 && code != 206 {
                     self.header_buf.clear();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -387,38 +881,88 @@ impl HttpAudioStream {
                     ));
                 }
 
+                // Check for Transfer-Encoding: chunked
+                self.is_chunked = header_str.lines().any(|l| {
+                    let trimmed = l.trim();
+                    if let Some(pos) = trimmed.find(':') {
+                        trimmed[..pos].trim().eq_ignore_ascii_case("transfer-encoding")
+                            && trimmed[pos + 1..].to_ascii_lowercase().contains("chunked")
+                    } else {
+                        false
+                    }
+                });
+
+                // Check for icy-metaint
+                if let Some(metaint) = header_str.lines().find_map(|l| {
+                    let trimmed = l.trim();
+                    if let Some(pos) = trimmed.find(':') {
+                        if trimmed[..pos].trim().eq_ignore_ascii_case("icy-metaint") {
+                            trimmed[pos + 1..].trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }) {
+                    self.icy_metaint = metaint;
+                    self.icy_audio_remaining = metaint;
+                    self.icy_state = IcyDecoderState::Audio;
+                }
+
+                // Capture raw response headers (including delimiter)
+                self.response_headers = Some(self.header_buf[..pos + delim_len].to_vec());
+
                 let body_start = pos + delim_len;
                 if body_start < self.header_buf.len() {
-                    self.pending_body.extend_from_slice(&self.header_buf[body_start..]);
+                    self.raw_body_buf.extend_from_slice(&self.header_buf[body_start..]);
                 }
                 self.header_buf.clear();
                 self.headers_parsed = true;
 
-                let copied = out.len().min(self.pending_body.len());
-                if copied > 0 {
-                    out[..copied].copy_from_slice(&self.pending_body[..copied]);
-                    self.pending_body.drain(..copied);
+                self.process_raw_body()?;
+
+                if !self.audio_buf.is_empty() {
+                    let copied = out.len().min(self.audio_buf.len());
+                    out[..copied].copy_from_slice(&self.audio_buf[..copied]);
+                    self.audio_buf.drain(..copied);
+                    self.total_audio_bytes += copied as u64;
+                    return Ok(copied);
                 }
-                return Ok(copied);
+                break;
             } else {
                 return Ok(0);
             }
         }
 
-        // Once self.headers_parsed is true and self.pending_body is empty:
-        match self.stream.read(out) {
+        // 3. Read body from TCP stream
+        let mut temp = [0u8; 2048];
+        match self.stream.read(&mut temp) {
             Ok(0) => {
                 self.eof = true;
-                Ok(0)
             }
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                self.raw_body_buf.extend_from_slice(&temp[..n]);
+            }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                Ok(0)
+                // No new bytes
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        }
+
+        self.process_raw_body()?;
+
+        if !self.audio_buf.is_empty() {
+            let n = out.len().min(self.audio_buf.len());
+            out[..n].copy_from_slice(&self.audio_buf[..n]);
+            self.audio_buf.drain(..n);
+            self.total_audio_bytes += n as u64;
+            Ok(n)
+        } else {
+            Ok(0)
         }
     }
 }
@@ -699,6 +1243,251 @@ mod tests {
         assert!(stream.is_eof());
         assert_eq!(audio, vec![0x10, 0x20, 0x30, 0x40]);
         assert_eq!(stream.poll_audio_bytes(&mut buf).unwrap(), 0);
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_audio_stream_icy_metaint_split_across_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut server_stream, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 512];
+            let _ = server_stream.read(&mut req_buf).unwrap();
+
+            // HTTP 200 with icy-metaint: 4
+            let resp_head = b"HTTP/1.0 200 OK\r\nicy-metaint: 4\r\n\r\n";
+            server_stream.write_all(resp_head).unwrap();
+            server_stream.flush().unwrap();
+
+            // Part 1: 4 audio bytes "ABCD" + 1 byte 0x01 (len=1 -> 16 bytes) + 8 bytes "StreamTi"
+            let mut part1 = Vec::new();
+            part1.extend_from_slice(b"ABCD");
+            part1.push(0x01); // 1 * 16 = 16 bytes metadata
+            part1.extend_from_slice(b"StreamTi");
+            server_stream.write_all(&part1).unwrap();
+            server_stream.flush().unwrap();
+
+            std::thread::sleep(Duration::from_millis(30));
+
+            // Part 2: remaining 8 metadata bytes "tle='X';" + 4 audio bytes "EFGH"
+            let mut part2 = Vec::new();
+            part2.extend_from_slice(b"tle='X';");
+            part2.extend_from_slice(b"EFGH");
+            server_stream.write_all(&part2).unwrap();
+            server_stream.flush().unwrap();
+
+            let _ = server_stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        let mut stream = HttpAudioStream::connect(server_addr, "GET /stream HTTP/1.0\r\n\r\n").unwrap();
+        let mut audio = Vec::new();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        while !stream.is_eof() && start.elapsed() < Duration::from_secs(3) {
+            match stream.poll_audio_bytes(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(n) => audio.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+
+        assert_eq!(audio, b"ABCDEFGH");
+        assert_eq!(stream.total_audio_bytes(), 8);
+        assert_eq!(stream.take_icy_metadata(), Some(b"StreamTitle='X';".to_vec()));
+        assert_eq!(
+            stream.take_response_headers(),
+            Some(b"HTTP/1.0 200 OK\r\nicy-metaint: 4\r\n\r\n".to_vec())
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_audio_stream_follows_302_redirect() {
+        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server1_addr = listener1.local_addr().unwrap();
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server2_addr = listener2.local_addr().unwrap();
+
+        // Redirect server (listener1)
+        let handle1 = std::thread::spawn(move || {
+            let (mut stream1, _) = listener1.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = stream1.read(&mut req).unwrap();
+
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/audio.pcm\r\n\r\n",
+                server2_addr.port()
+            );
+            stream1.write_all(resp.as_bytes()).unwrap();
+            stream1.flush().unwrap();
+        });
+
+        // Target server (listener2)
+        let handle2 = std::thread::spawn(move || {
+            let (mut stream2, _) = listener2.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = stream2.read(&mut req).unwrap();
+
+            let resp = b"HTTP/1.0 200 OK\r\n\r\n\x11\x22\x33\x44";
+            stream2.write_all(resp).unwrap();
+            stream2.flush().unwrap();
+            let _ = stream2.shutdown(std::net::Shutdown::Write);
+        });
+
+        let mut stream = HttpAudioStream::connect(
+            server1_addr,
+            "GET /old.pcm HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .unwrap();
+
+        let mut audio = Vec::new();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        while !stream.is_eof() && start.elapsed() < Duration::from_secs(3) {
+            match stream.poll_audio_bytes(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(n) => audio.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+
+        assert_eq!(audio, vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(stream.total_audio_bytes(), 4);
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_audio_stream_chunked_transfer_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = stream.read(&mut req).unwrap();
+
+            let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n2\r\nEF\r\n0\r\n\r\n";
+            stream.write_all(resp).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        let mut stream = HttpAudioStream::connect(
+            server_addr,
+            "GET /chunked.mp3 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .unwrap();
+
+        let mut audio = Vec::new();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        while !stream.is_eof() && start.elapsed() < Duration::from_secs(3) {
+            match stream.poll_audio_bytes(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(n) => audio.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+
+        assert_eq!(audio, b"ABCDEF");
+        assert_eq!(stream.total_audio_bytes(), 6);
+        assert!(stream.is_eof());
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_slimproto_client_outbound_methods() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+
+        let handle = std::thread::spawn(move || {
+            let mut client = SlimprotoClient::connect_with_options(
+                server_addr,
+                mac,
+                "CustomModel",
+                true,
+                12345,
+            )
+            .unwrap();
+
+            client
+                .send_stat_with_metrics(StatEvent::Connected, 100, 200, 44100, 44100, 12345, 500, 42)
+                .unwrap();
+            client.send_resp(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+            client.send_dsco(DisconnectReason::ResetByLocal).unwrap();
+            client.send_meta(b"StreamTitle='Song';").unwrap();
+            client.send_setd_name("Living Room").unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut acc = Vec::new();
+
+        let mut read_frame = |acc: &mut Vec<u8>| -> (Vec<u8>, Vec<u8>) {
+            loop {
+                if acc.len() >= 8 {
+                    let len = u32::from_be_bytes([acc[4], acc[5], acc[6], acc[7]]) as usize;
+                    if acc.len() >= 8 + len {
+                        let header = acc[0..8].to_vec();
+                        let payload = acc[8..8 + len].to_vec();
+                        acc.drain(..8 + len);
+                        return (header, payload);
+                    }
+                }
+                let mut chunk = [0u8; 512];
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    panic!("Unexpected EOF waiting for frame");
+                }
+                acc.extend_from_slice(&chunk[..n]);
+            }
+        };
+
+        // 1. HELO with options (reconnect=true, bytes=12345)
+        let (hdr1, payload1) = read_frame(&mut acc);
+        assert_eq!(&hdr1[0..4], b"HELO");
+        // wlan_flags at payload bytes 24..26 (offsets 32..34 from frame start)
+        let wlan_flags = u16::from_be_bytes([payload1[24], payload1[25]]);
+        assert_eq!(wlan_flags, 0x4000);
+        let bytes_rx = u64::from_be_bytes([
+            payload1[26], payload1[27], payload1[28], payload1[29],
+            payload1[30], payload1[31], payload1[32], payload1[33],
+        ]);
+        assert_eq!(bytes_rx, 12345);
+
+        // 2. STAT with metrics
+        let (hdr2, payload2) = read_frame(&mut acc);
+        assert_eq!(&hdr2[0..4], b"STAT");
+        assert_eq!(&payload2[0..4], b"STMc");
+
+        // 3. RESP
+        let (hdr3, payload3) = read_frame(&mut acc);
+        assert_eq!(&hdr3[0..4], b"RESP");
+        assert_eq!(&payload3, b"HTTP/1.0 200 OK\r\n\r\n");
+
+        // 4. DSCO
+        let (hdr4, payload4) = read_frame(&mut acc);
+        assert_eq!(&hdr4[0..4], b"DSCO");
+        assert_eq!(payload4[0], DisconnectReason::ResetByLocal.to_byte());
+
+        // 5. META
+        let (hdr5, payload5) = read_frame(&mut acc);
+        assert_eq!(&hdr5[0..4], b"META");
+        assert_eq!(&payload5, b"StreamTitle='Song';");
+
+        // 6. SETD name
+        let (hdr6, payload6) = read_frame(&mut acc);
+        assert_eq!(&hdr6[0..4], b"SETD");
+        assert_eq!(payload6[0], 0x00);
+        assert_eq!(&payload6[1..], b"Living Room");
 
         handle.join().unwrap();
     }

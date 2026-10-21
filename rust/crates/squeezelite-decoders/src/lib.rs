@@ -9,6 +9,7 @@
 //! - Ogg/Vorbis decoder using lewton with header/audio packet differentiation
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -76,11 +77,27 @@ pub trait AudioDecoder {
     fn flush(&mut self);
 }
 
+/// Parse AIFF 80-bit IEEE 754 extended precision floating point sample rate.
+const fn parse_aiff_extended_float(bytes: &[u8; 10]) -> u32 {
+    let exponent = ((u16::from_be_bytes([bytes[0], bytes[1]]) & 0x7FFF) as i32) - 16383;
+    let mantissa = u64::from_be_bytes([
+        bytes[2], bytes[3], bytes[4], bytes[5],
+        bytes[6], bytes[7], bytes[8], bytes[9],
+    ]);
+    if exponent >= 0 && exponent <= 31 {
+        (mantissa >> (63 - exponent)) as u32
+    } else {
+        0
+    }
+}
+
 /// PCM Passthrough Decoder (16-bit / 24-bit / 32-bit, Big or Little Endian, Mono or Stereo).
 pub struct PcmDecoder {
     pub bits_per_sample: u8,
     pub channels: u8,
     pub big_endian: bool,
+    pub sample_rate: Option<u32>,
+    header_stripped: bool,
 }
 
 impl PcmDecoder {
@@ -89,7 +106,157 @@ impl PcmDecoder {
             bits_per_sample,
             channels,
             big_endian,
+            sample_rate: None,
+            header_stripped: false,
         }
+    }
+
+    /// Automatically detects and strips WAV (RIFF...WAVE) and AIFF (FORM...AIFF) container headers.
+    pub fn try_strip_container_header(&mut self, data: &[u8]) -> Result<usize, DecoderError> {
+        if data.len() < 4 {
+            if b"RIFF".starts_with(data) || b"FORM".starts_with(data) {
+                return Err(DecoderError::NeedMoreData);
+            }
+            return Ok(0);
+        }
+
+        if data.starts_with(b"RIFF") {
+            if data.len() < 12 {
+                return Err(DecoderError::NeedMoreData);
+            }
+            if &data[8..12] != b"WAVE" {
+                return Err(DecoderError::InvalidHeader);
+            }
+
+            let mut offset = 12;
+            let mut found_fmt = false;
+
+            while offset + 8 <= data.len() {
+                let chunk_id = &data[offset..offset + 4];
+                let chunk_size = u32::from_le_bytes([
+                    data[offset + 4],
+                    data[offset + 5],
+                    data[offset + 6],
+                    data[offset + 7],
+                ]) as usize;
+
+                if chunk_id == b"fmt " {
+                    if offset + 8 + 16 > data.len() {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    let fmt_payload = &data[offset + 8..];
+                    let num_channels = u16::from_le_bytes([fmt_payload[2], fmt_payload[3]]);
+                    let sample_rate = u32::from_le_bytes([
+                        fmt_payload[4],
+                        fmt_payload[5],
+                        fmt_payload[6],
+                        fmt_payload[7],
+                    ]);
+                    let bits_per_sample = u16::from_le_bytes([fmt_payload[14], fmt_payload[15]]);
+
+                    if num_channels == 1 || num_channels == 2 {
+                        self.channels = num_channels as u8;
+                    }
+                    self.sample_rate = Some(sample_rate);
+                    self.bits_per_sample = bits_per_sample as u8;
+                    self.big_endian = false;
+                    found_fmt = true;
+
+                    let padded_size = chunk_size + (chunk_size & 1);
+                    offset += 8 + padded_size;
+                } else if chunk_id == b"data" {
+                    if !found_fmt {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    return Ok(offset + 8);
+                } else {
+                    let padded_size = chunk_size + (chunk_size & 1);
+                    if offset + 8 + padded_size > data.len() {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    offset += 8 + padded_size;
+                }
+            }
+            return Err(DecoderError::NeedMoreData);
+        } else if data.starts_with(b"FORM") {
+            if data.len() < 12 {
+                return Err(DecoderError::NeedMoreData);
+            }
+            if &data[8..12] != b"AIFF" && &data[8..12] != b"AIFC" {
+                return Err(DecoderError::InvalidHeader);
+            }
+
+            let mut offset = 12;
+            let mut found_comm = false;
+
+            while offset + 8 <= data.len() {
+                let chunk_id = &data[offset..offset + 4];
+                let chunk_size = u32::from_be_bytes([
+                    data[offset + 4],
+                    data[offset + 5],
+                    data[offset + 6],
+                    data[offset + 7],
+                ]) as usize;
+
+                if chunk_id == b"COMM" {
+                    if offset + 8 + 18 > data.len() {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    let comm_payload = &data[offset + 8..];
+                    let num_channels = i16::from_be_bytes([comm_payload[0], comm_payload[1]]);
+                    let sample_size = i16::from_be_bytes([comm_payload[6], comm_payload[7]]);
+
+                    let mut ext = [0u8; 10];
+                    ext.copy_from_slice(&comm_payload[8..18]);
+                    let sample_rate = parse_aiff_extended_float(&ext);
+
+                    if num_channels == 1 || num_channels == 2 {
+                        self.channels = num_channels as u8;
+                    }
+                    if sample_size > 0 {
+                        self.bits_per_sample = sample_size as u8;
+                    }
+                    if sample_rate > 0 {
+                        self.sample_rate = Some(sample_rate);
+                    }
+                    self.big_endian = true;
+                    found_comm = true;
+
+                    let padded_size = chunk_size + (chunk_size & 1);
+                    offset += 8 + padded_size;
+                } else if chunk_id == b"SSND" {
+                    if !found_comm {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if offset + 8 + 8 > data.len() {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    let ssnd_payload = &data[offset + 8..];
+                    let ssnd_offset = u32::from_be_bytes([
+                        ssnd_payload[0],
+                        ssnd_payload[1],
+                        ssnd_payload[2],
+                        ssnd_payload[3],
+                    ]) as usize;
+
+                    let audio_start = offset + 8 + 8 + ssnd_offset;
+                    if audio_start > data.len() {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    return Ok(audio_start);
+                } else {
+                    let padded_size = chunk_size + (chunk_size & 1);
+                    if offset + 8 + padded_size > data.len() {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    offset += 8 + padded_size;
+                }
+            }
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        // Raw PCM without container header
+        Ok(0)
     }
 }
 
@@ -99,6 +266,14 @@ impl AudioDecoder for PcmDecoder {
         encoded_in: &[u8],
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), DecoderError> {
+        let mut header_len = 0;
+        if !self.header_stripped {
+            header_len = self.try_strip_container_header(encoded_in)?;
+            self.header_stripped = true;
+        }
+
+        let pcm_in = &encoded_in[header_len..];
+
         let bytes_per_sample = match self.bits_per_sample {
             8 => 1,
             16 => 2,
@@ -117,8 +292,11 @@ impl AudioDecoder for PcmDecoder {
             return Err(DecoderError::BufferOverflow);
         }
 
-        let available_frames = encoded_in.len() / bytes_per_frame;
+        let available_frames = pcm_in.len() / bytes_per_frame;
         if available_frames == 0 {
+            if header_len > 0 {
+                return Ok((header_len, 0));
+            }
             return Err(DecoderError::NeedMoreData);
         }
 
@@ -129,8 +307,8 @@ impl AudioDecoder for PcmDecoder {
             (8, _, 2) => {
                 for i in 0..frames_to_decode {
                     let off = i * 2;
-                    let l = ((encoded_in[off] as i32) - 128) << 24;
-                    let r = ((encoded_in[off + 1] as i32) - 128) << 24;
+                    let l = ((pcm_in[off] as i32) - 128) << 24;
+                    let r = ((pcm_in[off + 1] as i32) - 128) << 24;
                     pcm_out[i * 2] = l;
                     pcm_out[i * 2 + 1] = r;
                 }
@@ -139,7 +317,7 @@ impl AudioDecoder for PcmDecoder {
             (8, _, 1) => {
                 for i in 0..frames_to_decode {
                     let off = i;
-                    let s = ((encoded_in[off] as i32) - 128) << 24;
+                    let s = ((pcm_in[off] as i32) - 128) << 24;
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
                 }
@@ -148,8 +326,8 @@ impl AudioDecoder for PcmDecoder {
             (16, true, 2) => {
                 for i in 0..frames_to_decode {
                     let off = i * 4;
-                    let l = i16::from_be_bytes([encoded_in[off], encoded_in[off + 1]]) as i32;
-                    let r = i16::from_be_bytes([encoded_in[off + 2], encoded_in[off + 3]]) as i32;
+                    let l = i16::from_be_bytes([pcm_in[off], pcm_in[off + 1]]) as i32;
+                    let r = i16::from_be_bytes([pcm_in[off + 2], pcm_in[off + 3]]) as i32;
                     pcm_out[i * 2] = l << 16;
                     pcm_out[i * 2 + 1] = r << 16;
                 }
@@ -158,7 +336,7 @@ impl AudioDecoder for PcmDecoder {
             (16, true, 1) => {
                 for i in 0..frames_to_decode {
                     let off = i * 2;
-                    let s = (i16::from_be_bytes([encoded_in[off], encoded_in[off + 1]]) as i32) << 16;
+                    let s = (i16::from_be_bytes([pcm_in[off], pcm_in[off + 1]]) as i32) << 16;
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
                 }
@@ -167,8 +345,8 @@ impl AudioDecoder for PcmDecoder {
             (16, false, 2) => {
                 for i in 0..frames_to_decode {
                     let off = i * 4;
-                    let l = i16::from_le_bytes([encoded_in[off], encoded_in[off + 1]]) as i32;
-                    let r = i16::from_le_bytes([encoded_in[off + 2], encoded_in[off + 3]]) as i32;
+                    let l = i16::from_le_bytes([pcm_in[off], pcm_in[off + 1]]) as i32;
+                    let r = i16::from_le_bytes([pcm_in[off + 2], pcm_in[off + 3]]) as i32;
                     pcm_out[i * 2] = l << 16;
                     pcm_out[i * 2 + 1] = r << 16;
                 }
@@ -177,7 +355,7 @@ impl AudioDecoder for PcmDecoder {
             (16, false, 1) => {
                 for i in 0..frames_to_decode {
                     let off = i * 2;
-                    let s = (i16::from_le_bytes([encoded_in[off], encoded_in[off + 1]]) as i32) << 16;
+                    let s = (i16::from_le_bytes([pcm_in[off], pcm_in[off + 1]]) as i32) << 16;
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
                 }
@@ -186,12 +364,12 @@ impl AudioDecoder for PcmDecoder {
             (24, true, 2) => {
                 for i in 0..frames_to_decode {
                     let off = i * 6;
-                    let l = ((encoded_in[off] as i32) << 24)
-                        | ((encoded_in[off + 1] as i32) << 16)
-                        | ((encoded_in[off + 2] as i32) << 8);
-                    let r = ((encoded_in[off + 3] as i32) << 24)
-                        | ((encoded_in[off + 4] as i32) << 16)
-                        | ((encoded_in[off + 5] as i32) << 8);
+                    let l = ((pcm_in[off] as i32) << 24)
+                        | ((pcm_in[off + 1] as i32) << 16)
+                        | ((pcm_in[off + 2] as i32) << 8);
+                    let r = ((pcm_in[off + 3] as i32) << 24)
+                        | ((pcm_in[off + 4] as i32) << 16)
+                        | ((pcm_in[off + 5] as i32) << 8);
                     pcm_out[i * 2] = l;
                     pcm_out[i * 2 + 1] = r;
                 }
@@ -200,9 +378,9 @@ impl AudioDecoder for PcmDecoder {
             (24, true, 1) => {
                 for i in 0..frames_to_decode {
                     let off = i * 3;
-                    let s = ((encoded_in[off] as i32) << 24)
-                        | ((encoded_in[off + 1] as i32) << 16)
-                        | ((encoded_in[off + 2] as i32) << 8);
+                    let s = ((pcm_in[off] as i32) << 24)
+                        | ((pcm_in[off + 1] as i32) << 16)
+                        | ((pcm_in[off + 2] as i32) << 8);
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
                 }
@@ -211,12 +389,12 @@ impl AudioDecoder for PcmDecoder {
             (24, false, 2) => {
                 for i in 0..frames_to_decode {
                     let off = i * 6;
-                    let l = ((encoded_in[off] as i32) << 8)
-                        | ((encoded_in[off + 1] as i32) << 16)
-                        | ((encoded_in[off + 2] as i32) << 24);
-                    let r = ((encoded_in[off + 3] as i32) << 8)
-                        | ((encoded_in[off + 4] as i32) << 16)
-                        | ((encoded_in[off + 5] as i32) << 24);
+                    let l = ((pcm_in[off] as i32) << 8)
+                        | ((pcm_in[off + 1] as i32) << 16)
+                        | ((pcm_in[off + 2] as i32) << 24);
+                    let r = ((pcm_in[off + 3] as i32) << 8)
+                        | ((pcm_in[off + 4] as i32) << 16)
+                        | ((pcm_in[off + 5] as i32) << 24);
                     pcm_out[i * 2] = l;
                     pcm_out[i * 2 + 1] = r;
                 }
@@ -225,9 +403,9 @@ impl AudioDecoder for PcmDecoder {
             (24, false, 1) => {
                 for i in 0..frames_to_decode {
                     let off = i * 3;
-                    let s = ((encoded_in[off] as i32) << 8)
-                        | ((encoded_in[off + 1] as i32) << 16)
-                        | ((encoded_in[off + 2] as i32) << 24);
+                    let s = ((pcm_in[off] as i32) << 8)
+                        | ((pcm_in[off + 1] as i32) << 16)
+                        | ((pcm_in[off + 2] as i32) << 24);
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
                 }
@@ -237,16 +415,16 @@ impl AudioDecoder for PcmDecoder {
                 for i in 0..frames_to_decode {
                     let off = i * 8;
                     let l = i32::from_be_bytes([
-                        encoded_in[off],
-                        encoded_in[off + 1],
-                        encoded_in[off + 2],
-                        encoded_in[off + 3],
+                        pcm_in[off],
+                        pcm_in[off + 1],
+                        pcm_in[off + 2],
+                        pcm_in[off + 3],
                     ]);
                     let r = i32::from_be_bytes([
-                        encoded_in[off + 4],
-                        encoded_in[off + 5],
-                        encoded_in[off + 6],
-                        encoded_in[off + 7],
+                        pcm_in[off + 4],
+                        pcm_in[off + 5],
+                        pcm_in[off + 6],
+                        pcm_in[off + 7],
                     ]);
                     pcm_out[i * 2] = l;
                     pcm_out[i * 2 + 1] = r;
@@ -257,10 +435,10 @@ impl AudioDecoder for PcmDecoder {
                 for i in 0..frames_to_decode {
                     let off = i * 4;
                     let s = i32::from_be_bytes([
-                        encoded_in[off],
-                        encoded_in[off + 1],
-                        encoded_in[off + 2],
-                        encoded_in[off + 3],
+                        pcm_in[off],
+                        pcm_in[off + 1],
+                        pcm_in[off + 2],
+                        pcm_in[off + 3],
                     ]);
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
@@ -271,16 +449,16 @@ impl AudioDecoder for PcmDecoder {
                 for i in 0..frames_to_decode {
                     let off = i * 8;
                     let l = i32::from_le_bytes([
-                        encoded_in[off],
-                        encoded_in[off + 1],
-                        encoded_in[off + 2],
-                        encoded_in[off + 3],
+                        pcm_in[off],
+                        pcm_in[off + 1],
+                        pcm_in[off + 2],
+                        pcm_in[off + 3],
                     ]);
                     let r = i32::from_le_bytes([
-                        encoded_in[off + 4],
-                        encoded_in[off + 5],
-                        encoded_in[off + 6],
-                        encoded_in[off + 7],
+                        pcm_in[off + 4],
+                        pcm_in[off + 5],
+                        pcm_in[off + 6],
+                        pcm_in[off + 7],
                     ]);
                     pcm_out[i * 2] = l;
                     pcm_out[i * 2 + 1] = r;
@@ -291,10 +469,10 @@ impl AudioDecoder for PcmDecoder {
                 for i in 0..frames_to_decode {
                     let off = i * 4;
                     let s = i32::from_le_bytes([
-                        encoded_in[off],
-                        encoded_in[off + 1],
-                        encoded_in[off + 2],
-                        encoded_in[off + 3],
+                        pcm_in[off],
+                        pcm_in[off + 1],
+                        pcm_in[off + 2],
+                        pcm_in[off + 3],
                     ]);
                     pcm_out[i * 2] = s;
                     pcm_out[i * 2 + 1] = s;
@@ -303,10 +481,13 @@ impl AudioDecoder for PcmDecoder {
             _ => return Err(DecoderError::UnsupportedSampleFormat),
         }
 
-        Ok((frames_to_decode * bytes_per_frame, frames_to_decode))
+        Ok((header_len + frames_to_decode * bytes_per_frame, frames_to_decode))
     }
 
-    fn flush(&mut self) {}
+    fn flush(&mut self) {
+        self.header_stripped = false;
+        self.sample_rate = None;
+    }
 }
 
 /// Pure-Rust MP3 Decoder using nanomp3-core (100% safe, no_std).
@@ -314,6 +495,7 @@ impl AudioDecoder for PcmDecoder {
 /// Heap-boxes decoder state (22.5KB) and frame scratch buffer (9.2KB)
 /// to eliminate FreeRTOS task stack overflows (DEC-001).
 pub struct Mp3Decoder {
+    pub sample_rate: u32,
     decoder: Box<nanomp3_core::Decoder>,
     sample_buf: Box<[i32]>,
     id3_skip_remaining: usize,
@@ -328,6 +510,7 @@ impl Default for Mp3Decoder {
 impl Mp3Decoder {
     pub fn new() -> Self {
         Self {
+            sample_rate: 44100,
             decoder: Box::new(nanomp3_core::Decoder::new()),
             sample_buf: vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME].into_boxed_slice(),
             id3_skip_remaining: 0,
@@ -377,6 +560,9 @@ impl AudioDecoder for Mp3Decoder {
 
         match result {
             Ok(info) => {
+                if info.sample_rate > 0 {
+                    self.sample_rate = info.sample_rate;
+                }
                 let channels = info.channels.num() as usize;
                 let frames_produced = info.samples_produced;
                 let max_frames = pcm_out.len() / 2;
@@ -442,7 +628,7 @@ impl<'a> std::io::Read for FlacByteReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let cur = self.pos.get();
         let avail = &self.data[cur..];
-        let n = avail.len().min(buf.len()).min(1);
+        let n = avail.len().min(buf.len());
         buf[..n].copy_from_slice(&avail[..n]);
         self.pos.set(cur + n);
         Ok(n)
@@ -468,6 +654,17 @@ impl Default for FlacDecoder {
 
 #[cfg(feature = "std")]
 impl FlacDecoder {
+    /// Maps FLAC bit depth to 32-bit output shift (e.g. 8-bit shifts left by 24).
+    pub const fn sample_shift(bits_per_sample: u32) -> u32 {
+        match bits_per_sample {
+            8 => 24,
+            16 => 16,
+            24 => 8,
+            32 => 0,
+            _ => 16,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             sample_rate: 44100,
@@ -504,6 +701,15 @@ impl AudioDecoder for FlacDecoder {
         let input_taken = encoded_in.len();
         self.stream_buf.extend_from_slice(encoded_in);
 
+        // Strip optional Ogg page wrapper prefix before b"fLaC" if present in stream_buf
+        if self.header_len == 0 {
+            if let Some(pos) = self.stream_buf.windows(4).position(|w| w == b"fLaC") {
+                if pos > 0 {
+                    self.stream_buf.drain(..pos);
+                }
+            }
+        }
+
         let pos = std::cell::Cell::new(0usize);
         let reader_input = FlacByteReader {
             data: &self.stream_buf[..],
@@ -526,12 +732,7 @@ impl AudioDecoder for FlacDecoder {
                     return Err(DecoderError::UnsupportedSampleFormat);
                 }
 
-                let shift = match self.bits_per_sample {
-                    16 => 16,
-                    24 => 8,
-                    32 => 0,
-                    _ => 16,
-                };
+                let shift = Self::sample_shift(self.bits_per_sample);
 
                 let mut frames_out = 0;
                 let mut block_buf = std::vec::Vec::new();
@@ -764,6 +965,7 @@ impl AudioDecoder for AacDecoder {
 pub struct VorbisDecoder {
     pub sample_rate: u32,
     pub channels: u32,
+    pub packets_decoded: usize,
     header_len: usize,
     stream_buf: std::vec::Vec<u8>,
     pending_samples: std::vec::Vec<i16>,
@@ -783,6 +985,7 @@ impl VorbisDecoder {
         Self {
             sample_rate: 44100,
             channels: 2,
+            packets_decoded: 0,
             header_len: 0,
             stream_buf: std::vec::Vec::new(),
             pending_samples: std::vec::Vec::new(),
@@ -807,6 +1010,7 @@ impl AudioDecoder for VorbisDecoder {
             self.stream_buf.clear();
             self.header_len = 0;
             self.pending_samples.clear();
+            self.packets_decoded = 0;
             return Err(DecoderError::CorruptedFrame);
         }
 
@@ -863,42 +1067,69 @@ impl AudioDecoder for VorbisDecoder {
 
                 let ch = self.channels as usize;
 
-                while let Ok(Some(samples_itl)) = reader.read_dec_packet_itl() {
-                    let packet_frames = samples_itl.len() / ch;
-                    let available_space = max_frames.saturating_sub(frames_out);
-                    let frames_to_write = core::cmp::min(packet_frames, available_space);
-
-                    if ch == 2 {
-                        for i in 0..frames_to_write {
-                            pcm_out[(frames_out + i) * 2] = (samples_itl[i * 2] as i32) << 16;
-                            pcm_out[(frames_out + i) * 2 + 1] =
-                                (samples_itl[i * 2 + 1] as i32) << 16;
+                // Advance reader past already-decoded packets to preserve MDCT overlap-add state
+                let mut skipped = 0;
+                while skipped < self.packets_decoded {
+                    match reader.read_dec_packet_itl() {
+                        Ok(Some(_)) => {
+                            skipped += 1;
                         }
-                    } else {
-                        for i in 0..frames_to_write {
-                            let s = (samples_itl[i] as i32) << 16;
-                            pcm_out[(frames_out + i) * 2] = s;
-                            pcm_out[(frames_out + i) * 2 + 1] = s;
-                        }
-                    }
-
-                    frames_out += frames_to_write;
-                    if frames_to_write < packet_frames {
-                        self.pending_channels = ch;
-                        self.pending_samples
-                            .extend_from_slice(&samples_itl[frames_to_write * ch..]);
-                        break;
-                    }
-                    if frames_out >= max_frames {
-                        break;
+                        _ => break,
                     }
                 }
 
-                let inner = reader.into_inner();
-                let inner_cursor = inner.into_inner();
-                let consumed = inner_cursor.position() as usize;
-                if consumed > self.header_len {
-                    self.stream_buf.drain(self.header_len..consumed);
+                let mut stream_ended = false;
+                loop {
+                    if frames_out >= max_frames {
+                        break;
+                    }
+                    match reader.read_dec_packet_itl() {
+                        Ok(Some(samples_itl)) => {
+                            self.packets_decoded += 1;
+                            let packet_frames = samples_itl.len() / ch;
+                            let available_space = max_frames.saturating_sub(frames_out);
+                            let frames_to_write = core::cmp::min(packet_frames, available_space);
+
+                            if ch == 2 {
+                                for i in 0..frames_to_write {
+                                    pcm_out[(frames_out + i) * 2] = (samples_itl[i * 2] as i32) << 16;
+                                    pcm_out[(frames_out + i) * 2 + 1] =
+                                        (samples_itl[i * 2 + 1] as i32) << 16;
+                                }
+                            } else {
+                                for i in 0..frames_to_write {
+                                    let s = (samples_itl[i] as i32) << 16;
+                                    pcm_out[(frames_out + i) * 2] = s;
+                                    pcm_out[(frames_out + i) * 2 + 1] = s;
+                                }
+                            }
+
+                            frames_out += frames_to_write;
+                            if frames_to_write < packet_frames {
+                                self.pending_channels = ch;
+                                self.pending_samples
+                                    .extend_from_slice(&samples_itl[frames_to_write * ch..]);
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            stream_ended = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                // Compact stream_buf only when an entire Ogg stream finishes (or flush is called)
+                if stream_ended {
+                    let consumed = reader.into_inner().into_inner().position() as usize;
+                    if consumed > 0 && consumed <= self.stream_buf.len() {
+                        self.stream_buf.drain(..consumed);
+                    } else {
+                        self.stream_buf.clear();
+                    }
+                    self.header_len = 0;
+                    self.packets_decoded = 0;
                 }
 
                 if frames_out == 0 && input_taken == 0 {
@@ -920,6 +1151,7 @@ impl AudioDecoder for VorbisDecoder {
                 if self.stream_buf.len() > MAX_STREAM_BUF {
                     self.stream_buf.clear();
                     self.header_len = 0;
+                    self.packets_decoded = 0;
                     Err(DecoderError::CorruptedFrame)
                 } else if frames_out == 0 && input_taken == 0 {
                     Err(DecoderError::NeedMoreData)
@@ -932,6 +1164,7 @@ impl AudioDecoder for VorbisDecoder {
 
     fn flush(&mut self) {
         self.pending_samples.clear();
+        self.packets_decoded = 0;
         if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
             self.stream_buf.truncate(self.header_len);
         } else {
@@ -1280,5 +1513,136 @@ mod tests {
         decoder.flush();
         assert_eq!(decoder.sample_buf[0], 0);
         assert_eq!(decoder.sample_buf[100], 0);
+    }
+
+    #[test]
+    fn test_pcm_decoder_strips_wav_header_and_updates_config() {
+        let mut decoder = PcmDecoder::new(16, 2, true);
+        assert_eq!(decoder.sample_rate, None);
+        assert!(decoder.big_endian);
+
+        // 44-byte WAV header: 48000 Hz, 16-bit LE stereo
+        let mut header = [0u8; 44];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&(44u32 + 8 - 8).to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&16u32.to_le_bytes());
+        header[20..22].copy_from_slice(&1u16.to_le_bytes());
+        header[22..24].copy_from_slice(&2u16.to_le_bytes());
+        header[24..28].copy_from_slice(&48000u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(48000u32 * 2 * 2).to_le_bytes());
+        header[32..34].copy_from_slice(&4u16.to_le_bytes());
+        header[34..36].copy_from_slice(&16u16.to_le_bytes());
+        header[36..40].copy_from_slice(b"data");
+        header[40..44].copy_from_slice(&8u32.to_le_bytes());
+
+        // 2 stereo frames (8 bytes) of 16-bit LE
+        let f1_l = (1000i16).to_le_bytes();
+        let f1_r = (-1000i16).to_le_bytes();
+        let f2_l = (2000i16).to_le_bytes();
+        let f2_r = (-2000i16).to_le_bytes();
+        let pcm_data = [
+            f1_l[0], f1_l[1], f1_r[0], f1_r[1],
+            f2_l[0], f2_l[1], f2_r[0], f2_r[1],
+        ];
+
+        let mut payload = [0u8; 52];
+        payload[0..44].copy_from_slice(&header);
+        payload[44..52].copy_from_slice(&pcm_data);
+
+        let mut pcm_out = [0i32; 4];
+        let (consumed, frames) = decoder.decode(&payload, &mut pcm_out).unwrap();
+
+        assert_eq!(consumed, 52);
+        assert_eq!(frames, 2);
+        assert_eq!(decoder.sample_rate, Some(48000));
+        assert!(!decoder.big_endian);
+        assert_eq!(pcm_out[0], 1000 << 16);
+        assert_eq!(pcm_out[1], -1000 << 16);
+        assert_eq!(pcm_out[2], 2000 << 16);
+        assert_eq!(pcm_out[3], -2000 << 16);
+    }
+
+    #[test]
+    fn test_pcm_decoder_strips_aiff_header() {
+        let mut decoder = PcmDecoder::new(16, 2, false);
+        assert_eq!(decoder.sample_rate, None);
+        assert!(!decoder.big_endian);
+
+        // 54-byte AIFF header: FORM + COMM + SSND
+        let mut header = [0u8; 54];
+        header[0..4].copy_from_slice(b"FORM");
+        header[4..8].copy_from_slice(&(54u32 + 4 - 8).to_be_bytes());
+        header[8..12].copy_from_slice(b"AIFF");
+        header[12..16].copy_from_slice(b"COMM");
+        header[16..20].copy_from_slice(&18u32.to_be_bytes());
+        header[20..22].copy_from_slice(&2i16.to_be_bytes());
+        header[22..26].copy_from_slice(&1u32.to_be_bytes());
+        header[26..28].copy_from_slice(&16i16.to_be_bytes());
+        // 44100 Hz in IEEE 754 80-bit extended:
+        header[28..38].copy_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        header[38..42].copy_from_slice(b"SSND");
+        header[42..46].copy_from_slice(&12u32.to_be_bytes());
+        header[46..50].copy_from_slice(&0u32.to_be_bytes());
+        header[50..54].copy_from_slice(&0u32.to_be_bytes());
+
+        // 1 stereo frame (4 bytes) of 16-bit BE:
+        let f_l = (500i16).to_be_bytes();
+        let f_r = (-500i16).to_be_bytes();
+        let pcm_data = [f_l[0], f_l[1], f_r[0], f_r[1]];
+
+        let mut payload = [0u8; 58];
+        payload[0..54].copy_from_slice(&header);
+        payload[54..58].copy_from_slice(&pcm_data);
+
+        let mut pcm_out = [0i32; 2];
+        let (consumed, frames) = decoder.decode(&payload, &mut pcm_out).unwrap();
+
+        assert_eq!(consumed, 58);
+        assert_eq!(frames, 1);
+        assert!(decoder.big_endian);
+        assert_eq!(decoder.sample_rate, Some(44100));
+        assert_eq!(pcm_out[0], 500 << 16);
+        assert_eq!(pcm_out[1], -500 << 16);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_flac_bulk_reader_and_8bit_shift() {
+        use std::io::Read;
+        let data = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let pos = std::cell::Cell::new(0usize);
+        let mut reader = FlacByteReader {
+            data: &data[..],
+            pos: &pos,
+        };
+        let mut buf = [0u8; 8];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(buf, data);
+
+        assert_eq!(FlacDecoder::sample_shift(8), 24);
+        assert_eq!(FlacDecoder::sample_shift(16), 16);
+        assert_eq!(FlacDecoder::sample_shift(24), 8);
+        assert_eq!(FlacDecoder::sample_shift(32), 0);
+    }
+
+    #[test]
+    fn test_vorbis_multi_packet_stateful_continuity() {
+        let mut mp3 = Mp3Decoder::new();
+        assert_eq!(mp3.sample_rate, 44100);
+        mp3.sample_rate = 48000;
+        assert_eq!(mp3.sample_rate, 48000);
+
+        #[cfg(feature = "std")]
+        {
+            let mut vorbis = VorbisDecoder::new();
+            assert_eq!(vorbis.packets_decoded, 0);
+            vorbis.packets_decoded = 42;
+            assert_eq!(vorbis.packets_decoded, 42);
+            vorbis.flush();
+            assert_eq!(vorbis.packets_decoded, 0);
+        }
     }
 }

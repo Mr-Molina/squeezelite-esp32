@@ -11,7 +11,7 @@ use louder_esp32_app::hal::{BitDepth, EspI2sSink, LoopbackI2sDma, UartPort};
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
 use louder_esp32_app::{
     AmpManager, AudioOutputSink, CydMessage, CydUartBridge, LoopbackUartPort, MemConfigStore,
-    MemFlashPartition, NvsFlashBackend, PlayState, PlayerCoordinator, TargetI2cBus,
+    MemFlashPartition, NvsFlashBackend, PlayState, PlayerCoordinator, SlimprotoClient, TargetI2cBus,
 };
 use squeezelite_config::AudioConfig;
 use squeezelite_decoders::PcmDecoder;
@@ -29,14 +29,48 @@ where
     U: UartPort,
     I: I2c,
 {
+    run_firmware_tick_with_network(coordinator, pipeline, cyd_bridge, amp, None, 0)
+}
+
+/// Executes one integrated firmware tick with SlimProto network integration,
+/// dynamic sample rate synchronization, DAC amplifier pause, and hardware fault recovery (`RUST-19`).
+pub fn run_firmware_tick_with_network<S, U, I>(
+    coordinator: &mut PlayerCoordinator,
+    pipeline: &mut StreamPipeline<'_, S>,
+    cyd_bridge: &mut CydUartBridge<U>,
+    amp: &mut AmpManager<I>,
+    client: Option<&mut SlimprotoClient>,
+    now_ms: u32,
+) -> usize
+where
+    S: AudioOutputSink,
+    U: UartPort,
+    I: I2c,
+{
     if let Ok(Some(cmd)) = cyd_bridge.poll_command() {
         if let Some(reply) = coordinator.handle_cyd_command(cmd, pipeline) {
             let _ = cyd_bridge.flush_outbound(&reply);
         }
     }
 
-    let frames = coordinator.process_audio_step(pipeline);
-    let _ = amp.check_faults();
+    let frames = if let Some(client_ref) = client {
+        coordinator.tick(client_ref, pipeline, now_ms)
+    } else {
+        coordinator.process_audio_step(pipeline)
+    };
+
+    coordinator.current_sample_rate = pipeline.sample_rate;
+
+    if !coordinator.dac_enabled {
+        let _ = amp.stop_playback();
+    }
+
+    if let Ok(Some(fault)) = amp.check_faults() {
+        if !fault.is_clean() {
+            let _ = amp.recover_from_fault();
+        }
+    }
+
     frames
 }
 
@@ -192,6 +226,85 @@ mod tests {
         assert_eq!(coordinator.state, PlayerState::Playing);
         assert_eq!(frames, 1);
         assert_eq!(cyd_bridge.port.tx_bytes(), b"STATE=P\n");
+    }
+
+    #[test]
+    fn test_run_firmware_tick_with_network_recovers_amp_fault_and_syncs_rate() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
+        use squeezelite_tas58xx::registers;
+
+        let addr = louder_esp32_app::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // initialize -> standby
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // start_playback
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x60]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
+            // check_faults returns a non-clean fault (overcurrent on channel)
+            I2cTrans::write_read(addr, vec![registers::CHAN_FAULT], vec![0x01, 0x00, 0x00, 0x00]),
+            // recover_from_fault: Hi-Z -> clear fault -> Play
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+        let mut amp = AmpManager::new(&mut i2c);
+        amp.initialize(32).unwrap();
+        amp.start_playback().unwrap();
+
+        let mut stream_storage = vec![0u8; 1024];
+        let mut output_storage = vec![0u8; 1024];
+        let i2s_driver = LoopbackI2sDma::new(48000);
+        let sink = EspI2sSink::for_active_board(i2s_driver, 48000);
+        let pcm_dec = PcmDecoder::new(16, 2, true);
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_dec),
+            sink,
+            48000,
+        );
+
+        let mac = [0x24, 0x0A, 0xC4, 0x00, 0x00, 0x02];
+        let mut coordinator = PlayerCoordinator::new(mac, "Test");
+        coordinator.current_sample_rate = 44100;
+        let mut cyd_bridge = CydUartBridge::new(LoopbackUartPort::new());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 128];
+            let _ = stream.read(&mut buf).unwrap(); // HELO
+        });
+
+        let mut client = SlimprotoClient::connect(server_addr, mac, "Test").unwrap();
+
+        let frames = run_firmware_tick_with_network(
+            &mut coordinator,
+            &mut pipeline,
+            &mut cyd_bridge,
+            &mut amp,
+            Some(&mut client),
+            100,
+        );
+
+        assert_eq!(frames, 0);
+        assert_eq!(coordinator.current_sample_rate, 48000);
+
+        server_handle.join().unwrap();
+        i2c.done();
     }
 }
 

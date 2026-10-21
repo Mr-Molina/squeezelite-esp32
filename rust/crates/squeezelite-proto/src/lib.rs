@@ -76,17 +76,91 @@ impl AudioFormat {
 /// Converts LMS SlimProto sample rate index into Hz.
 pub const fn sample_rate_from_index(index: u8) -> u32 {
     match index {
-        0 => 11025,
-        1 => 22050,
-        2 => 32000,
-        3 => 44100,
-        4 => 48000,
-        5 => 8000,
-        6 => 12000,
-        7 => 16000,
-        8 => 24000,
-        9 => 96000,
+        0 | b'0' => 11025,
+        1 | b'1' => 22050,
+        2 | b'2' => 32000,
+        3 | b'3' => 44100,
+        4 | b'4' => 48000,
+        5 | b'5' => 8000,
+        6 | b'6' => 12000,
+        7 | b'7' => 16000,
+        8 | b'8' => 24000,
+        9 | b'9' => 96000,
+        10 | b':' => 88200,
         _ => 44100,
+    }
+}
+
+/// Autostart mode for audio streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartMode {
+    Off,
+    Auto,
+    DirectOff,
+    DirectAuto,
+}
+
+pub const STRM_FLAG_CONT_WAIT: u8 = 0x20;
+pub const STRM_FLAG_SERVER_REBOOT: u8 = 0x40;
+
+impl AutostartMode {
+    pub const fn from_byte(b: u8) -> Self {
+        match b {
+            b'1' | 1 => Self::Auto,
+            b'2' | 2 => Self::DirectOff,
+            b'3' | 3 => Self::DirectAuto,
+            _ => Self::Off,
+        }
+    }
+
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto | Self::DirectAuto)
+    }
+
+    pub const fn requires_cont(self) -> bool {
+        matches!(self, Self::DirectOff | Self::DirectAuto)
+    }
+
+    pub const fn from_strm(autostart: bool, flags: u8) -> Self {
+        if flags & STRM_FLAG_CONT_WAIT != 0 {
+            if autostart {
+                Self::DirectAuto
+            } else {
+                Self::DirectOff
+            }
+        } else if autostart {
+            Self::Auto
+        } else {
+            Self::Off
+        }
+    }
+}
+
+/// Disconnect reason codes for client-initiated disconnection (`DSCO`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DisconnectReason {
+    ConnectionClosed = 0,
+    ResetByLocal = 1,
+    ResetByRemote = 2,
+    Unreachable = 3,
+    TimedOut = 4,
+}
+
+impl DisconnectReason {
+    pub const fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Self::ConnectionClosed,
+            1 => Self::ResetByLocal,
+            2 => Self::ResetByRemote,
+            3 => Self::Unreachable,
+            4 => Self::TimedOut,
+            _ => Self::ConnectionClosed,
+        }
     }
 }
 
@@ -329,6 +403,28 @@ impl<'a> ServerCommand<'a> {
             _ => None,
         }
     }
+
+    /// Extracts equalizer gains if this command is an `eqlz` frame.
+    pub fn equalizer_gains(&self) -> Option<&'a [u8]> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'e', b'q', b'l', b'z'],
+                payload,
+            } => Some(payload),
+            _ => None,
+        }
+    }
+
+    /// Extracts loudness gain if this command is a `loud` frame.
+    pub const fn loudness_gain(&self) -> Option<u8> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'l', b'o', b'u', b'd'],
+                payload,
+            } if !payload.is_empty() => Some(payload[0]),
+            _ => None,
+        }
+    }
 }
 
 /// Zero-allocation parser for SlimProto frame sequences.
@@ -424,7 +520,11 @@ impl SlimprotoParser {
         let spdif_enable = payload[8] != 0;
         let trans_duration = payload[9];
         let trans_type = TransitionType::from_byte(payload[10]);
-        let flags = payload[11];
+        let flags = if payload[1] == b'2' || payload[1] == b'3' {
+            payload[11] | STRM_FLAG_CONT_WAIT
+        } else {
+            payload[11]
+        };
         let output_threshold = payload[12];
         let _slaves = payload[13];
         let replay_gain = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
@@ -573,6 +673,8 @@ pub enum StatEvent {
     TrackStopped,
     /// Stream buffer underrun / threshold reached (`STMl`).
     StreamUnderrun,
+    /// Track underrun (`STMu`).
+    TrackUnderrun,
     /// Output buffer underrun (`STMo`).
     OutputUnderrun,
     /// Stream flushed (`STMf`).
@@ -588,6 +690,8 @@ pub enum StatEvent {
 }
 
 impl StatEvent {
+    pub const BUFFER_THRESHOLD: Self = Self::StreamUnderrun;
+
     pub const fn opcode_bytes(self) -> [u8; 4] {
         match self {
             Self::Heartbeat => *b"STMt",
@@ -596,6 +700,7 @@ impl StatEvent {
             Self::TrackResumed => *b"STMr",
             Self::TrackStopped => *b"STMq",
             Self::StreamUnderrun => *b"STMl",
+            Self::TrackUnderrun => *b"STMu",
             Self::OutputUnderrun => *b"STMo",
             Self::StreamFlushed => *b"STMf",
             Self::Connected | Self::ConnectEstablished => *b"STMc",
@@ -664,6 +769,44 @@ impl StatBuilder {
         };
         Self::build_stat_report(&report, out)
     }
+
+    /// Formats a `STAT` telemetry packet with explicit metrics including custom sample rate,
+    /// 64-bit frames played, server timestamp, and 64-bit byte counter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_stat_with_metrics(
+        event: StatEvent,
+        stream_buffer_fullness: u32,
+        output_buffer_fullness: u32,
+        frames_played: u64,
+        sample_rate: u32,
+        bytes_received: u64,
+        jiffies_ms: u32,
+        server_timestamp: u32,
+        out: &mut [u8],
+    ) -> Result<usize, ParseError> {
+        let rate = if sample_rate == 0 {
+            44_100
+        } else {
+            sample_rate as u64
+        };
+        let elapsed_ms = (frames_played.saturating_mul(1000) / rate) as u32;
+        let elapsed_seconds = (frames_played / rate) as u32;
+        let report = StatReport {
+            event,
+            stream_buffer_size: 65536,
+            stream_buffer_fullness,
+            bytes_received,
+            signal_strength: 0xFFFF,
+            jiffies: jiffies_ms,
+            output_buffer_size: 65536,
+            output_buffer_fullness,
+            elapsed_seconds,
+            voltage: 0,
+            elapsed_ms,
+            server_timestamp,
+        };
+        Self::build_stat_report(&report, out)
+    }
 }
 
 /// Packet serializer for outbound telemetry to LMS.
@@ -676,6 +819,18 @@ impl SlimprotoBuilder {
         mac: &[u8; 6],
         device_id: u8,
         capabilities: &str,
+        out: &mut [u8],
+    ) -> Result<usize, ParseError> {
+        Self::build_helo_with_options(mac, device_id, capabilities, false, 0, out)
+    }
+
+    /// Formats a client HELO packet with extended options (reconnect flag and bytes received).
+    pub fn build_helo_with_options(
+        mac: &[u8; 6],
+        device_id: u8,
+        capabilities: &str,
+        reconnect: bool,
+        bytes_received: u64,
         out: &mut [u8],
     ) -> Result<usize, ParseError> {
         let cap_bytes = capabilities.as_bytes();
@@ -694,8 +849,15 @@ impl SlimprotoBuilder {
         out[8] = device_id; // Device ID (e.g. 12 = Squeezelite)
         out[9] = 0;         // Firmware revision
         out[10..16].copy_from_slice(mac);
-        // Fill UUID (16), WLAN channels (2), bytes received (8), lang (2) with zero
-        out[16..44].fill(0);
+        // Fill UUID (16 bytes) with zero
+        out[16..32].fill(0);
+        // WLAN channels / reconnect flag (2 bytes at 32..34)
+        let wlan_flags: u16 = if reconnect { 0x4000 } else { 0 };
+        out[32..34].copy_from_slice(&wlan_flags.to_be_bytes());
+        // Bytes received (8 bytes at 34..42)
+        out[34..42].copy_from_slice(&bytes_received.to_be_bytes());
+        // Lang padding (2 bytes at 42..44)
+        out[42..44].fill(0);
 
         out[44..total_len].copy_from_slice(cap_bytes);
 
@@ -778,6 +940,65 @@ impl SlimprotoBuilder {
             server_timestamp: 0,
         };
         Self::build_stat_report(&report, out)
+    }
+
+    /// Formats an HTTP response packet (`RESP`) sending received HTTP headers to LMS.
+    pub fn build_resp(headers: &[u8], out: &mut [u8]) -> Result<usize, ParseError> {
+        let total_len = 8 + headers.len();
+        if out.len() < total_len {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        out[0..4].copy_from_slice(b"RESP");
+        out[4..8].copy_from_slice(&(headers.len() as u32).to_be_bytes());
+        out[8..total_len].copy_from_slice(headers);
+
+        Ok(total_len)
+    }
+
+    /// Formats a disconnect notification packet (`DSCO`) sending disconnect reason to LMS.
+    pub fn build_dsco(reason: DisconnectReason, out: &mut [u8]) -> Result<usize, ParseError> {
+        if out.len() < 9 {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        out[0..4].copy_from_slice(b"DSCO");
+        out[4..8].copy_from_slice(&1u32.to_be_bytes());
+        out[8] = reason.to_byte();
+
+        Ok(9)
+    }
+
+    /// Formats a stream metadata packet (`META`) forwarding stream metadata (e.g. ICY) to LMS.
+    pub fn build_meta(metadata: &[u8], out: &mut [u8]) -> Result<usize, ParseError> {
+        let total_len = 8 + metadata.len();
+        if out.len() < total_len {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        out[0..4].copy_from_slice(b"META");
+        out[4..8].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        out[8..total_len].copy_from_slice(metadata);
+
+        Ok(total_len)
+    }
+
+    /// Formats a player name device setting packet (`SETD` with id 0x00) for LMS.
+    pub fn build_setd_name(name: &str, out: &mut [u8]) -> Result<usize, ParseError> {
+        let name_bytes = name.as_bytes();
+        let payload_len = 1 + name_bytes.len();
+        let total_len = 8 + payload_len;
+
+        if out.len() < total_len {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        out[0..4].copy_from_slice(b"SETD");
+        out[4..8].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        out[8] = 0x00;
+        out[9..total_len].copy_from_slice(name_bytes);
+
+        Ok(total_len)
     }
 }
 
@@ -1333,5 +1554,222 @@ mod tests {
                 preamp: 255,
             }
         );
+    }
+
+    #[test]
+    fn test_build_resp_dsco_meta_and_setd_name() {
+        // RESP
+        let headers = b"HTTP/1.0 200 OK\r\nContent-Type: audio/flac\r\n\r\n";
+        let mut buf_resp = [0u8; 128];
+        let len_resp = SlimprotoBuilder::build_resp(headers, &mut buf_resp).unwrap();
+        assert_eq!(len_resp, 8 + headers.len());
+        assert_eq!(&buf_resp[0..4], b"RESP");
+        assert_eq!(
+            u32::from_be_bytes([buf_resp[4], buf_resp[5], buf_resp[6], buf_resp[7]]),
+            headers.len() as u32
+        );
+        assert_eq!(&buf_resp[8..len_resp], headers);
+
+        // DSCO
+        let mut buf_dsco = [0u8; 16];
+        let len_dsco =
+            SlimprotoBuilder::build_dsco(DisconnectReason::ResetByRemote, &mut buf_dsco).unwrap();
+        assert_eq!(len_dsco, 9);
+        assert_eq!(&buf_dsco[0..4], b"DSCO");
+        assert_eq!(
+            u32::from_be_bytes([buf_dsco[4], buf_dsco[5], buf_dsco[6], buf_dsco[7]]),
+            1
+        );
+        assert_eq!(buf_dsco[8], DisconnectReason::ResetByRemote as u8);
+
+        // META
+        let meta = b"TITLE=Song Name\0ARTIST=Artist Name\0";
+        let mut buf_meta = [0u8; 64];
+        let len_meta = SlimprotoBuilder::build_meta(meta, &mut buf_meta).unwrap();
+        assert_eq!(len_meta, 8 + meta.len());
+        assert_eq!(&buf_meta[0..4], b"META");
+        assert_eq!(
+            u32::from_be_bytes([buf_meta[4], buf_meta[5], buf_meta[6], buf_meta[7]]),
+            meta.len() as u32
+        );
+        assert_eq!(&buf_meta[8..len_meta], meta);
+
+        // SETD
+        let name = "Kitchen Speaker";
+        let mut buf_setd = [0u8; 32];
+        let len_setd = SlimprotoBuilder::build_setd_name(name, &mut buf_setd).unwrap();
+        assert_eq!(len_setd, 8 + 1 + name.len());
+        assert_eq!(&buf_setd[0..4], b"SETD");
+        assert_eq!(
+            u32::from_be_bytes([buf_setd[4], buf_setd[5], buf_setd[6], buf_setd[7]]),
+            (1 + name.len()) as u32
+        );
+        assert_eq!(buf_setd[8], 0x00);
+        assert_eq!(&buf_setd[9..len_setd], name.as_bytes());
+    }
+
+    #[test]
+    fn test_stat_event_stmu_stmc_stmf_and_build_stat_with_metrics() {
+        assert_eq!(&StatEvent::TrackUnderrun.opcode_bytes(), b"STMu");
+        assert_eq!(&StatEvent::Connected.opcode_bytes(), b"STMc");
+        assert_eq!(&StatEvent::StreamFlushed.opcode_bytes(), b"STMf");
+        assert_eq!(&StatEvent::StreamUnderrun.opcode_bytes(), b"STMl");
+        assert_eq!(StatEvent::BUFFER_THRESHOLD, StatEvent::StreamUnderrun);
+
+        let mut frame = [0u8; STAT_FRAME_SIZE];
+        let sample_rate = 96_000;
+        let frames_played = 192_000u64;
+        let bytes_received = 0x0000_0002_0000_1234u64;
+        let jiffies_ms = 45_000;
+        let server_timestamp = 0x1234_5678;
+
+        let len = StatBuilder::build_stat_with_metrics(
+            StatEvent::TrackUnderrun,
+            128_000,
+            64_000,
+            frames_played,
+            sample_rate,
+            bytes_received,
+            jiffies_ms,
+            server_timestamp,
+            &mut frame,
+        )
+        .unwrap();
+
+        assert_eq!(len, STAT_FRAME_SIZE);
+        assert_eq!(&frame[0..4], b"STAT");
+        assert_eq!(&frame[8..12], b"STMu");
+
+        // bytes_received at frame[23..31] (payload[15..23])
+        assert_eq!(
+            u64::from_be_bytes(frame[23..31].try_into().unwrap()),
+            bytes_received
+        );
+        // elapsed_seconds at frame[45..49] (payload[37..41]) = 192000 / 96000 = 2
+        assert_eq!(
+            u32::from_be_bytes(frame[45..49].try_into().unwrap()),
+            2
+        );
+        // elapsed_ms at frame[51..55] (payload[43..47]) = 192000 * 1000 / 96000 = 2000
+        assert_eq!(
+            u32::from_be_bytes(frame[51..55].try_into().unwrap()),
+            2000
+        );
+        // server_timestamp at payload offset 47..51 (frame offset 55..59)
+        assert_eq!(
+            u32::from_be_bytes(frame[55..59].try_into().unwrap()),
+            server_timestamp
+        );
+    }
+
+    #[test]
+    fn test_autostart_mode_and_88200_sample_rate() {
+        // AutostartMode methods
+        assert_eq!(AutostartMode::from_byte(b'0'), AutostartMode::Off);
+        assert_eq!(AutostartMode::from_byte(b'1'), AutostartMode::Auto);
+        assert_eq!(AutostartMode::from_byte(b'2'), AutostartMode::DirectOff);
+        assert_eq!(AutostartMode::from_byte(b'3'), AutostartMode::DirectAuto);
+
+        assert!(!AutostartMode::Off.is_auto());
+        assert!(AutostartMode::Auto.is_auto());
+        assert!(!AutostartMode::DirectOff.is_auto());
+        assert!(AutostartMode::DirectAuto.is_auto());
+
+        assert!(!AutostartMode::Off.requires_cont());
+        assert!(!AutostartMode::Auto.requires_cont());
+        assert!(AutostartMode::DirectOff.requires_cont());
+        assert!(AutostartMode::DirectAuto.requires_cont());
+
+        // Test roundtrip via parse_frame with '0'..'3'
+        for (byte, expected_mode, expected_cont_flag) in [
+            (b'0', AutostartMode::Off, 0),
+            (b'1', AutostartMode::Auto, 0),
+            (b'2', AutostartMode::DirectOff, STRM_FLAG_CONT_WAIT),
+            (b'3', AutostartMode::DirectAuto, STRM_FLAG_CONT_WAIT),
+        ] {
+            let mut strm_frame = [0u8; 32];
+            strm_frame[0..4].copy_from_slice(b"strm");
+            strm_frame[4..8].copy_from_slice(&24u32.to_be_bytes());
+            strm_frame[8] = b's';
+            strm_frame[9] = byte;
+            strm_frame[10] = b'f';
+            strm_frame[19] = 0; // flags
+
+            let (cmd, _) = SlimprotoParser::parse_frame(&strm_frame).unwrap();
+            match cmd {
+                ServerCommand::Stream { autostart, flags, .. } => {
+                    assert_eq!(flags & STRM_FLAG_CONT_WAIT, expected_cont_flag);
+                    let recovered = AutostartMode::from_strm(autostart, flags);
+                    assert_eq!(recovered, expected_mode);
+                }
+                _ => panic!("Expected Stream command"),
+            }
+        }
+
+        // sample_rate_from_index: 10 | b':' => 88200, and ASCII '0'..='9'
+        assert_eq!(sample_rate_from_index(10), 88200);
+        assert_eq!(sample_rate_from_index(b':'), 88200);
+        assert_eq!(sample_rate_from_index(b'0'), 11025);
+        assert_eq!(sample_rate_from_index(b'1'), 22050);
+        assert_eq!(sample_rate_from_index(b'2'), 32000);
+        assert_eq!(sample_rate_from_index(b'3'), 44100);
+        assert_eq!(sample_rate_from_index(b'4'), 48000);
+        assert_eq!(sample_rate_from_index(b'5'), 8000);
+        assert_eq!(sample_rate_from_index(b'6'), 12000);
+        assert_eq!(sample_rate_from_index(b'7'), 16000);
+        assert_eq!(sample_rate_from_index(b'8'), 24000);
+        assert_eq!(sample_rate_from_index(b'9'), 96000);
+
+        // eqlz / loud helper accessors
+        let mut eqlz_frame = [0u8; 14];
+        eqlz_frame[0..4].copy_from_slice(b"eqlz");
+        eqlz_frame[4..8].copy_from_slice(&6u32.to_be_bytes());
+        eqlz_frame[8..14].copy_from_slice(&[10, 20, 30, 40, 50, 60]);
+        let (cmd_eqlz, _) = SlimprotoParser::parse_frame(&eqlz_frame).unwrap();
+        assert_eq!(cmd_eqlz.equalizer_gains(), Some(&[10, 20, 30, 40, 50, 60][..]));
+
+        let mut loud_frame = [0u8; 9];
+        loud_frame[0..4].copy_from_slice(b"loud");
+        loud_frame[4..8].copy_from_slice(&1u32.to_be_bytes());
+        loud_frame[8] = 42;
+        let (cmd_loud, _) = SlimprotoParser::parse_frame(&loud_frame).unwrap();
+        assert_eq!(cmd_loud.loudness_gain(), Some(42));
+    }
+
+    #[test]
+    fn test_build_helo_with_options_sets_reconnect_bit_and_bytes() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let mut buf = [0u8; 128];
+        let bytes_received = 0x0102_0304_0506_0708u64;
+        let len = SlimprotoBuilder::build_helo_with_options(
+            &mac,
+            12,
+            "Model=Test",
+            true,
+            bytes_received,
+            &mut buf,
+        )
+        .unwrap();
+
+        assert_eq!(&buf[0..4], b"HELO");
+        assert_eq!(buf[8], 12);
+        assert_eq!(&buf[10..16], &mac);
+        assert_eq!(&buf[32..34], &0x4000u16.to_be_bytes());
+        assert_eq!(&buf[34..42], &bytes_received.to_be_bytes());
+        assert_eq!(len, 8 + 36 + "Model=Test".len());
+
+        // Without reconnect
+        let mut buf_noreconn = [0u8; 128];
+        SlimprotoBuilder::build_helo_with_options(
+            &mac,
+            12,
+            "Model=Test",
+            false,
+            0,
+            &mut buf_noreconn,
+        )
+        .unwrap();
+        assert_eq!(&buf_noreconn[32..34], &0u16.to_be_bytes());
+        assert_eq!(&buf_noreconn[34..42], &0u64.to_be_bytes());
     }
 }

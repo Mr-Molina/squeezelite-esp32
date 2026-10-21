@@ -20,6 +20,9 @@ pub mod pins {
     pub const TAS58XX_PWDN: i32 = 33;
     pub const TAS58XX_FAULT: i32 = 34; // Input only
     pub const TAS58XX_I2C_ADDR: u8 = 0x2D; // Louder-ESP32 TAS5825M ADR=GND/float
+    pub const TAS5805M_PRIMARY_I2C_ADDR: u8 = 0x2C;
+    pub const CYD_UART_TX: i32 = 4;
+    pub const CYD_UART_RX: i32 = 36;
 }
 
 #[cfg(feature = "board-louder-esp32-s3")]
@@ -33,6 +36,9 @@ pub mod pins {
     pub const TAS58XX_PWDN: i32 = 17;
     pub const TAS58XX_FAULT: i32 = 18;
     pub const TAS58XX_I2C_ADDR: u8 = 0x4C; // Louder-ESP32-Plus TAS5805M/TAS5825M ADR=DVDD
+    pub const TAS5805M_PRIMARY_I2C_ADDR: u8 = 0x2C;
+    pub const CYD_UART_TX: i32 = 43;
+    pub const CYD_UART_RX: i32 = 44;
 }
 
 /// Board identity descriptor
@@ -75,6 +81,13 @@ impl BoardModel {
         self.default_amp_address()
     }
 
+    pub const fn cyd_uart_pins(self) -> (u8, u8) {
+        match self {
+            Self::LouderEsp32Wrover => (4, 36),
+            Self::LouderEsp32PlusS3 => (43, 44),
+        }
+    }
+
     pub const fn i2s_pins(self) -> I2sPinConfig {
         match self {
             Self::LouderEsp32Wrover => I2sPinConfig {
@@ -112,6 +125,18 @@ impl I2sPinConfig {
             dout_pin: pins::I2S_DOUT as u8,
             mclk_pin: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_board_cyd_uart_pins_and_addresses() {
+        assert_eq!(BoardModel::LouderEsp32Wrover.cyd_uart_pins(), (4, 36));
+        assert_eq!(BoardModel::LouderEsp32PlusS3.cyd_uart_pins(), (43, 44));
+        assert_eq!(pins::TAS5805M_PRIMARY_I2C_ADDR, 0x2C);
     }
 }
 

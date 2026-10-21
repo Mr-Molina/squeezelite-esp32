@@ -48,6 +48,43 @@ impl AudioDecoder for ActiveDecoder {
     }
 }
 
+impl ActiveDecoder {
+    /// Returns the active stream sample rate in Hz reported by the decoder, if known.
+    pub fn sample_rate(&self) -> Option<u32> {
+        match self {
+            Self::Pcm(d) => d.sample_rate,
+            Self::Mp3(d) => {
+                if d.sample_rate > 0 {
+                    Some(d.sample_rate)
+                } else {
+                    None
+                }
+            }
+            Self::Flac(d) => {
+                if d.sample_rate > 0 {
+                    Some(d.sample_rate)
+                } else {
+                    None
+                }
+            }
+            Self::Aac(d) => {
+                if d.sample_rate > 0 {
+                    Some(d.sample_rate)
+                } else {
+                    None
+                }
+            }
+            Self::Vorbis(d) => {
+                if d.sample_rate > 0 {
+                    Some(d.sample_rate)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// The integrated audio pipeline engine.
 pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub stream_buffer: AudioRingBuffer<'a>,
@@ -158,6 +195,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 return Err(e);
             }
         };
+
+        if let Some(rate) = self.decoder.sample_rate() {
+            if rate > 0 && rate != self.sample_rate {
+                self.sample_rate = rate;
+                let _ = self.sink.set_sample_rate(rate);
+            }
+        }
 
         // Only consume the exact bytes ingested by decoder (CONC-005)
         if consumed > 0 {
@@ -582,6 +626,61 @@ mod tests {
         assert!(res.is_err());
         // Must have consumed 1 byte to prevent infinite busy loop!
         assert_eq!(pipeline.stream_buffer_available(), 3);
+    }
+
+    #[test]
+    fn test_pipeline_propagates_dynamic_decoder_sample_rate() {
+        let mut stream_storage = [0u8; 128];
+        let mut output_storage = [0u8; 128];
+        let pcm_decoder = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_decoder),
+            sink,
+            44100,
+        );
+        assert_eq!(pipeline.sample_rate, 44100);
+        assert_eq!(pipeline.sink.sample_rate, 44100);
+
+        // 44-byte WAV header: 48000 Hz, 16-bit LE stereo
+        let mut header = [0u8; 44];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&(44u32 + 8 - 8).to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&16u32.to_le_bytes());
+        header[20..22].copy_from_slice(&1u16.to_le_bytes());
+        header[22..24].copy_from_slice(&2u16.to_le_bytes());
+        header[24..28].copy_from_slice(&48000u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(48000u32 * 2 * 2).to_le_bytes());
+        header[32..34].copy_from_slice(&4u16.to_le_bytes());
+        header[34..36].copy_from_slice(&16u16.to_le_bytes());
+        header[36..40].copy_from_slice(b"data");
+        header[40..44].copy_from_slice(&8u32.to_le_bytes());
+
+        // 2 stereo frames (8 bytes) of 16-bit LE
+        let f1_l = (1000i16).to_le_bytes();
+        let f1_r = (-1000i16).to_le_bytes();
+        let f2_l = (2000i16).to_le_bytes();
+        let f2_r = (-2000i16).to_le_bytes();
+        let pcm_data = [
+            f1_l[0], f1_l[1], f1_r[0], f1_r[1],
+            f2_l[0], f2_l[1], f2_r[0], f2_r[1],
+        ];
+
+        let mut payload = [0u8; 52];
+        payload[0..44].copy_from_slice(&header);
+        payload[44..52].copy_from_slice(&pcm_data);
+
+        pipeline.ingest_stream_data(&payload).unwrap();
+        let consumed = pipeline.process_decode_step().unwrap();
+        assert_eq!(consumed, 52);
+
+        assert_eq!(pipeline.sample_rate, 48000);
+        assert_eq!(pipeline.sink.sample_rate, 48000);
     }
 }
 
