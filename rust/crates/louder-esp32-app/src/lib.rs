@@ -4,6 +4,7 @@
 #![cfg_attr(target_arch = "xtensa", no_std)]
 #![forbid(unsafe_code)]
 #![allow(unknown_lints)]
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::needless_lifetimes)]
 
 pub mod amp;
 pub mod board;

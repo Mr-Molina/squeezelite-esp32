@@ -2,17 +2,28 @@
 //!
 //! Initializes board hardware profiles, starts audio streaming pipeline,
 //! and orchestrates SlimProto network connection with TAS5805M/TAS5825M digital amplifier.
-#![forbid(unsafe_code)]
+#![cfg_attr(target_arch = "xtensa", no_std)]
+#![cfg_attr(target_arch = "xtensa", no_main)]
+#![cfg_attr(not(target_arch = "xtensa"), forbid(unsafe_code))]
+#![cfg_attr(target_arch = "xtensa", deny(unsafe_code))]
 #![allow(unknown_lints)]
 
 use embedded_hal::i2c::I2c;
+#[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::board::{pins, BoardModel};
-use louder_esp32_app::hal::{BitDepth, EspI2sSink, LoopbackI2sDma, UartPort};
+#[cfg(not(target_arch = "xtensa"))]
+use louder_esp32_app::hal::BitDepth;
+use louder_esp32_app::hal::{EspI2sSink, UartPort};
+#[cfg(not(target_arch = "xtensa"))]
+use louder_esp32_app::hal::LoopbackI2sDma;
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
+use louder_esp32_app::{AmpManager, AudioOutputSink, CydUartBridge, PlayerCoordinator};
+#[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::{
-    AmpManager, AudioOutputSink, CydMessage, CydUartBridge, LoopbackUartPort, MemConfigStore,
-    MemFlashPartition, NvsFlashBackend, PlayState, PlayerCoordinator, SlimprotoClient, TargetI2cBus,
+    CydMessage, LoopbackUartPort, MemConfigStore, MemFlashPartition, NvsFlashBackend, PlayState,
+    SlimprotoClient, TargetI2cBus,
 };
+#[cfg(not(target_arch = "xtensa"))]
 use squeezelite_config::AudioConfig;
 use squeezelite_decoders::PcmDecoder;
 
@@ -29,11 +40,38 @@ where
     U: UartPort,
     I: I2c,
 {
-    run_firmware_tick_with_network(coordinator, pipeline, cyd_bridge, amp, None, 0)
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        run_firmware_tick_with_network(coordinator, pipeline, cyd_bridge, amp, None, 0)
+    }
+    #[cfg(target_arch = "xtensa")]
+    {
+        if let Ok(Some(cmd)) = cyd_bridge.poll_command() {
+            if let Some(reply) = coordinator.handle_cyd_command(cmd, pipeline) {
+                let _ = cyd_bridge.flush_outbound(&reply);
+            }
+        }
+
+        let frames = coordinator.process_audio_step(pipeline);
+        coordinator.current_sample_rate = pipeline.sample_rate;
+
+        if !coordinator.dac_enabled {
+            let _ = amp.stop_playback();
+        }
+
+        if let Ok(Some(fault)) = amp.check_faults() {
+            if !fault.is_clean() {
+                let _ = amp.recover_from_fault();
+            }
+        }
+
+        frames
+    }
 }
 
 /// Executes one integrated firmware tick with SlimProto network integration,
 /// dynamic sample rate synchronization, DAC amplifier pause, and hardware fault recovery (`RUST-19`).
+#[cfg(not(target_arch = "xtensa"))]
 pub fn run_firmware_tick_with_network<S, U, I>(
     coordinator: &mut PlayerCoordinator,
     pipeline: &mut StreamPipeline<'_, S>,
@@ -74,6 +112,7 @@ where
     frames
 }
 
+#[cfg(not(target_arch = "xtensa"))]
 fn main() {
     let board = BoardModel::active();
     println!("========================================================");
@@ -92,9 +131,23 @@ fn main() {
 
     let mut audio_cfg = AudioConfig::default();
     audio_cfg.player_name.clear();
-    let raw_name = board.name();
+    let raw_name = std::env::var("SL_PLAYER_NAME")
+        .unwrap_or_else(|_| louder_esp32_app::board::DEFAULT_PLAYER_NAME.to_string());
     let safe_len = raw_name.floor_char_boundary(32.min(raw_name.len()));
     let _ = audio_cfg.player_name.push_str(&raw_name[..safe_len]);
+    audio_cfg.lms_server_ip = Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_IP);
+    audio_cfg.lms_server_port = Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_PORT);
+
+    if let Ok(server_override) = std::env::var("SL_LMS_SERVER") {
+        if let Ok(sock) = server_override.parse::<std::net::SocketAddr>() {
+            if let std::net::IpAddr::V4(v4) = sock.ip() {
+                audio_cfg.lms_server_ip = Some(v4.octets());
+                audio_cfg.lms_server_port = Some(sock.port());
+            }
+        } else if let Ok(ip) = server_override.parse::<std::net::Ipv4Addr>() {
+            audio_cfg.lms_server_ip = Some(ip.octets());
+        }
+    }
     audio_cfg.save_to(&mut config_store).expect("Failed to serialize AudioConfig");
 
     let initial_seq = nvs_backend.commit_store(&config_store).expect("Failed to commit dual-sector NVS");
@@ -113,7 +166,7 @@ fn main() {
     let i2c_bus = TargetI2cBus::new();
     let mut amp = AmpManager::for_active_board(i2c_bus);
     amp.initialize(BitDepth::Bits32.bits()).expect("Failed to initialize TAS5805M amplifier");
-    amp.start_playback().expect("Failed to start playback mode on TAS5805M");
+    amp.start_playback_via_hiz().expect("Failed to start playback mode via Hi-Z on TAS5805M");
     println!("TAS5805M Digital Amplifier Subsystem:");
     println!("  - Mode:         {:?}", amp.mode());
     println!("  - Volume:       -24 dB (0x{:02X})", amp.current_volume());
@@ -137,13 +190,20 @@ fn main() {
         44100,
     );
 
-    // 4. Derive deterministic MAC address from Sonocotta OUI prefix (24:0A:C4) and board hardware model (INFRA-801)
-    let suffix = match board {
-        BoardModel::LouderEsp32Wrover => 0x01,
-        BoardModel::LouderEsp32PlusS3 => 0x02,
+    // 4. Derive MAC address: use BASEMENT_PLAYER_MAC for "BASEMENT", or deterministic test MAC (INFRA-801, HW-PREP-05)
+    let mac = if audio_cfg.player_name.as_str() == louder_esp32_app::board::DEFAULT_PLAYER_NAME {
+        louder_esp32_app::board::BASEMENT_PLAYER_MAC
+    } else {
+        let suffix = match board {
+            BoardModel::LouderEsp32Wrover => 0x01,
+            BoardModel::LouderEsp32PlusS3 => 0x02,
+        };
+        [0x24, 0x0A, 0xC4, 0x12, 0x34, suffix]
     };
-    let mac = [0x24, 0x0A, 0xC4, 0x12, 0x34, suffix];
     let mut coordinator = PlayerCoordinator::new(mac, board.name());
+    coordinator.player_name.clear();
+    let safe_name_len = audio_cfg.player_name.floor_char_boundary(64.min(audio_cfg.player_name.len()));
+    let _ = coordinator.player_name.push_str(&audio_cfg.player_name[..safe_name_len]);
 
     println!("Player Coordinator initialized:");
     println!("  - State:       {:?}", coordinator.state);
@@ -175,21 +235,796 @@ fn main() {
     println!("--------------------------------------------------------");
     println!("Ready for LMS auto-discovery on UDP 3483...");
 
-    // 7. Firmware Tick Execution Loop (HALNET-409)
-    #[cfg(not(target_arch = "xtensa"))]
-    {
-        for _ in 0..16 {
-            let _ = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+    // 7. Optional Live LMS Network Connection & Firmware Tick Execution Loop (HALNET-409, HW-PREP-05)
+    let lms_ip = std::net::Ipv4Addr::from(audio_cfg.lms_server_ip.unwrap_or(louder_esp32_app::board::DEFAULT_LMS_SERVER_IP));
+    let lms_port = audio_cfg.lms_server_port.unwrap_or(louder_esp32_app::board::DEFAULT_LMS_SERVER_PORT);
+    let lms_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(lms_ip, lms_port));
+
+    let should_connect = std::env::var("SL_LMS_CONNECT").as_deref() == Ok("1") || cfg!(target_arch = "xtensa");
+    let mut client = if should_connect {
+        println!("Connecting SlimProto client to {}...", lms_addr);
+        match SlimprotoClient::connect_with_options(lms_addr, mac, audio_cfg.player_name.as_str(), false, 0) {
+            Ok(c) => {
+                println!("SlimProto client successfully connected to {} for player '{}'", lms_addr, audio_cfg.player_name);
+                Some(c)
+            }
+            Err(e) => {
+                if std::env::var("SL_LMS_CONNECT").as_deref() == Ok("1") {
+                    panic!("Failed to connect SlimProto client to {}: {:?}", lms_addr, e);
+                } else {
+                    eprintln!("Warning: Failed to connect SlimProto client to {}: {:?}", lms_addr, e);
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    let iterations = if client.is_some() { 5 } else { 16 };
+    for tick in 0..iterations {
+        let now_ms = (tick * 10) as u32;
+        let frames = run_firmware_tick_with_network(
+            &mut coordinator,
+            &mut pipeline,
+            &mut cyd_bridge,
+            &mut amp,
+            client.as_mut(),
+            now_ms,
+        );
+        if client.is_some() {
+            println!("  [Tick {:02}] frames={}, state={:?}", tick, frames, coordinator.state);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+mod xtensa_hw {
+    use super::*;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Waker};
+    use embedded_hal::i2c::{ErrorType, I2c, Operation};
+    use esp_backtrace as _;
+    use esp_hal::{
+        clock::CpuClock,
+        efuse::{interface_mac_address, InterfaceMacAddress},
+        gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+        i2c::master::{Config as I2cConfig, I2c as HalI2c},
+        i2s::master::{Channels, DataFormat, I2s, TdmConfig},
+        time::{Duration, Instant, Rate},
+        timer::timg::{MwdtStage, TimerGroup},
+        uart::{Config as UartConfig, Uart},
+    };
+    use esp_println::println;
+    use esp_radio::wifi::{
+        sta::StationConfig, AuthenticationMethodConfig, Config as WifiModeConfig, ControllerConfig,
+        Interface as WifiInterface, WifiController, WifiRxToken, WifiTxToken,
+    };
+    use esp_storage::FlashStorage;
+    use louder_esp32_app::board::{
+        BASEMENT_PLAYER_MAC, DEFAULT_LMS_SERVER_IP, DEFAULT_LMS_SERVER_PORT, DEFAULT_WIFI_SSID,
+    };
+    use louder_esp32_app::hal::I2sDmaDriver;
+    use louder_esp32_app::http_control::{
+        handle_http_control_request, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
+        LeaseHealth,
+    };
+    use louder_esp32_app::ota_safety::{
+        resolve_wifi_credentials, verify_otadata_erased, OtaSelectEntry, NVS_PARTITION_OFFSET,
+        OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET, OTADATA_SECTOR_1_OFFSET,
+    };
+    use smoltcp::iface::{Config as SmolIfaceConfig, Interface as SmolInterface, SocketSet, SocketStorage};
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::socket::{dhcpv4, tcp};
+    use smoltcp::time::Instant as SmolInstant;
+    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+    use squeezelite_audio_core::output::OutputError;
+    use squeezelite_proto::{
+        ServerCommand, SlimprotoBuilder, SlimprotoParser, StatEvent, StreamCommandType,
+    };
+    use squeezelite_tas58xx::registers;
+
+    // Mandatory Squeezelite-ESP32 OTA binary descriptor (`squeezelite-ota.c:663`).
+    // Sets `project_name = "Squeezelite-ESP32"` and `version = "I2S-4MFlash-Rust"` at offset 0x20.
+    esp_bootloader_esp_idf::esp_app_desc!(
+        "I2S-4MFlash-Rust",
+        "Squeezelite-ESP32",
+        "23:59:00",
+        "2026-10-21",
+        "4.3.0",
+        esp_bootloader_esp_idf::MMU_PAGE_SIZE,
+        0,
+        u16::MAX,
+        0
+    );
+
+    // Gate 2: Custom panic halt hook that resets immediately into factory recovery (`0x10000`)
+    // instead of spinning in `loop {}`.
+    #[allow(unsafe_code)]
+    #[unsafe(no_mangle)]
+    pub extern "Rust" fn custom_halt() -> ! {
+        println!("[ANTI-BRICK GATE 2] Panic halted -> executing software_reset() to boot recovery (0x10000)");
+        esp_hal::system::software_reset()
+    }
+
+    static HW_ACK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static HW_NACK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    pub struct SmolDevice<'a> {
+        pub driver: &'a mut WifiInterface,
+    }
+
+    pub struct SmolRxToken(pub WifiRxToken);
+    pub struct SmolTxToken(pub WifiTxToken);
+
+    impl RxToken for SmolRxToken {
+        fn consume<R, F>(self, f: F) -> R
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            self.0.consume_token(|buf| f(&*buf))
         }
     }
 
-    #[cfg(target_arch = "xtensa")]
-    {
-        loop {
-            let _ = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+    impl TxToken for SmolTxToken {
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            self.0.consume_token(len, f)
         }
     }
+
+    impl Device for SmolDevice<'_> {
+        type RxToken<'b> = SmolRxToken where Self: 'b;
+        type TxToken<'b> = SmolTxToken where Self: 'b;
+
+        fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let (rx, tx) = self.driver.receive()?;
+            Some((SmolRxToken(rx), SmolTxToken(tx)))
+        }
+
+        fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+            let tx = self.driver.transmit()?;
+            Some(SmolTxToken(tx))
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.max_transmission_unit = 1500;
+            caps.medium = Medium::Ethernet;
+            caps
+        }
+    }
+
+    pub struct Esp32I2cBus<'d> {
+        i2c: HalI2c<'d, esp_hal::Blocking>,
+        shadow_regs: [u8; 256],
+        current_reg: u8,
+    }
+
+    impl<'d> Esp32I2cBus<'d> {
+        pub fn new(i2c: HalI2c<'d, esp_hal::Blocking>) -> Self {
+            Self {
+                i2c,
+                shadow_regs: [0u8; 256],
+                current_reg: 0,
+            }
+        }
+
+        pub fn hw_ack_count() -> u32 {
+            HW_ACK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        pub fn hw_nack_count() -> u32 {
+            HW_NACK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl ErrorType for Esp32I2cBus<'_> {
+        type Error = core::convert::Infallible;
+    }
+
+    impl I2c for Esp32I2cBus<'_> {
+        fn read(&mut self, address: u8, read: &mut [u8]) -> Result<(), Self::Error> {
+            match self.i2c.read(address, read) {
+                Ok(()) => {
+                    HW_ACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    for &byte in read.iter() {
+                        self.shadow_regs[self.current_reg as usize] = byte;
+                        self.current_reg = self.current_reg.wrapping_add(1);
+                    }
+                }
+                Err(_) => {
+                    HW_NACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    for byte in read.iter_mut() {
+                        *byte = self.shadow_regs[self.current_reg as usize];
+                        self.current_reg = self.current_reg.wrapping_add(1);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, address: u8, write: &[u8]) -> Result<(), Self::Error> {
+            if write.is_empty() {
+                return Ok(());
+            }
+
+            self.current_reg = write[0];
+            let mut reg = write[0] as usize;
+            for &val in &write[1..] {
+                if reg < 256 {
+                    self.shadow_regs[reg] = val;
+                    reg += 1;
+                }
+            }
+
+            if write.len() > 1 && write[0] == registers::FAULT_CLEAR && (write[1] & 0x80) != 0 {
+                self.shadow_regs[registers::CHAN_FAULT as usize] = 0;
+                self.shadow_regs[registers::GLOBAL_FAULT1 as usize] = 0;
+                self.shadow_regs[registers::GLOBAL_FAULT2 as usize] = 0;
+                self.shadow_regs[registers::OTW as usize] = 0;
+            }
+
+            match self.i2c.write(address, write) {
+                Ok(()) => {
+                    HW_ACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => {
+                    HW_NACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        }
+
+        fn write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
+            if !write.is_empty() {
+                self.current_reg = write[0];
+            }
+            match self.i2c.write_read(address, write, read) {
+                Ok(()) => {
+                    HW_ACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    for &byte in read.iter() {
+                        self.shadow_regs[self.current_reg as usize] = byte;
+                        self.current_reg = self.current_reg.wrapping_add(1);
+                    }
+                }
+                Err(_) => {
+                    HW_NACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    self.write(address, write)?;
+                    self.read(address, read)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn transaction(&mut self, address: u8, operations: &mut [Operation<'_>]) -> Result<(), Self::Error> {
+            for op in operations {
+                match op {
+                    Operation::Read(buf) => self.read(address, buf)?,
+                    Operation::Write(buf) => self.write(address, buf)?,
+                }
+            }
+            Ok(())
+        }
+    }
+
+    pub struct Esp32Uart2Port<'d> {
+        uart: Uart<'d, esp_hal::Blocking>,
+    }
+
+    impl<'d> Esp32Uart2Port<'d> {
+        pub fn new(uart: Uart<'d, esp_hal::Blocking>) -> Self {
+            Self { uart }
+        }
+    }
+
+    impl UartPort for Esp32Uart2Port<'_> {
+        fn read_rx(&mut self, buf: &mut [u8]) -> usize {
+            let mut count = 0;
+            while count < buf.len() && self.uart.read_ready() {
+                let mut byte = [0u8; 1];
+                if let Ok(n) = self.uart.read(&mut byte) {
+                    if n > 0 {
+                        buf[count] = byte[0];
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            count
+        }
+
+        fn write_tx(&mut self, data: &[u8]) -> usize {
+            self.uart.write(data).unwrap_or(0)
+        }
+    }
+
+    /// Hardware I2S0 + DMA_I2S0 audio output driver (`BCK=GPIO26`, `WS=GPIO25`, `DOUT=GPIO22`).
+    pub struct Esp32HardwareI2sDma<'d> {
+        transfer: esp_hal::i2s::master::I2sTxDmaTransfer<
+            'd,
+            esp_hal::Blocking,
+            esp_hal::dma::DmaTxStreamBuf,
+        >,
+        sample_rate_hz: u32,
+        tx_enabled: bool,
+    }
+
+    impl<'d> Esp32HardwareI2sDma<'d> {
+        pub fn new(
+            transfer: esp_hal::i2s::master::I2sTxDmaTransfer<
+                'd,
+                esp_hal::Blocking,
+                esp_hal::dma::DmaTxStreamBuf,
+            >,
+            sample_rate_hz: u32,
+        ) -> Self {
+            Self {
+                transfer,
+                sample_rate_hz,
+                tx_enabled: true,
+            }
+        }
+    }
+
+    impl I2sDmaDriver for Esp32HardwareI2sDma<'_> {
+        fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
+            let valid_len = data.len() - (data.len() % 8);
+            if !self.tx_enabled || valid_len == 0 {
+                return Ok(valid_len);
+            }
+            // Push 32-bit stereo frames into the active hardware I2S0 TX streaming DMA circular buffer
+            let written = self.transfer.push(&data[..valid_len]);
+            Ok(written - (written % 8))
+        }
+
+        fn set_clock_rate(&mut self, sample_rate_hz: u32) -> Result<(), OutputError> {
+            if !(8_000..=192_000).contains(&sample_rate_hz) {
+                return Err(OutputError::UnsupportedSampleRate(sample_rate_hz));
+            }
+            self.sample_rate_hz = sample_rate_hz;
+            Ok(())
+        }
+
+        fn set_tx_enabled(&mut self, enabled: bool) {
+            self.tx_enabled = enabled;
+        }
+    }
+
+    fn now_millis() -> u64 {
+        Instant::now().duration_since_epoch().as_millis()
+    }
+
+    pub fn run_hardware_firmware() -> ! {
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let peripherals = esp_hal::init(config);
+
+        // ====================================================================
+        // GATE 2: Hardware Watchdog (TIMG0 WDT, 20s Stage0 -> ResetSystem)
+        // ====================================================================
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
+        let mut wdt = timg0.wdt;
+        wdt.set_timeout(MwdtStage::Stage0, Duration::from_millis(20_000));
+        wdt.enable();
+        wdt.feed();
+
+        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver
+        #[allow(unsafe_code)]
+        {
+            esp_alloc::heap_allocator!(size: 64 * 1024);
+        }
+
+        // ====================================================================
+        // GATE 1: First-Instruction `otadata` (0xD000..0xF000) Pre-Arming
+        // Erases `otadata` to 0xFF BEFORE Wi-Fi/interrupts so ANY subsequent
+        // reset (panic, WDT, network timeout, or power cycle) boots straight
+        // back into the untouched factory `recovery` partition (0x10000)!
+        // ====================================================================
+        let mut flash = FlashStorage::new(peripherals.FLASH);
+        if flash.erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END).is_err() {
+            println!("[ANTI-BRICK GATE 1] Failed to erase otadata -> resetting to recovery");
+            esp_hal::system::software_reset();
+        }
+        let mut verify_s0 = [0u8; 64];
+        let mut verify_s1 = [0u8; 64];
+        if flash.read(OTADATA_PARTITION_OFFSET, &mut verify_s0).is_err()
+            || flash.read(OTADATA_SECTOR_1_OFFSET, &mut verify_s1).is_err()
+            || verify_otadata_erased(&verify_s0).is_err()
+            || verify_otadata_erased(&verify_s1).is_err()
+        {
+            println!("[ANTI-BRICK GATE 1] otadata 0xFF read-back failed -> resetting to recovery");
+            esp_hal::system::software_reset();
+        }
+        wdt.feed();
+        println!("[ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)");
+
+        // Read 16 KB `nvs` partition (0x9000..0xD000) while single-core before starting Wi-Fi
+        let sta_mac_addr = interface_mac_address(InterfaceMacAddress::Station);
+        let mut sta_mac = [0u8; 6];
+        sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
+
+        let mut nvs_buf = [0xFFu8; 16_384];
+        let _ = flash.read(NVS_PARTITION_OFFSET, &mut nvs_buf);
+        wdt.feed();
+
+        let wifi_sta_creds = match resolve_wifi_credentials(
+            &nvs_buf,
+            &sta_mac,
+            option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
+            option_env!("SL_WIFI_PASS"),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                println!(
+                    "[ANTI-BRICK] Could not resolve Wi-Fi credentials from 0x9000 NVS ({:?}) -> resetting to recovery (0x10000)",
+                    e
+                );
+                esp_hal::system::software_reset();
+            }
+        };
+        println!(
+            "[NVS 0x9000] Loaded Wi-Fi STA SSID='{}' (pass_len={}) for MAC {:02x?}",
+            wifi_sta_creds.ssid.as_str(),
+            wifi_sta_creds.password.len(),
+            sta_mac
+        );
+
+        // Initialize GPIO33 PWDN, GPIO34 FAULT, I2C0 (SDA=21, SCL=27), I2S0 (BCK=26, WS=25, DOUT=22), UART2
+        let mut pwdn = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
+        let fault = Input::new(peripherals.GPIO34, InputConfig::default().with_pull(Pull::None));
+
+        let i2c_cfg = I2cConfig::default().with_frequency(Rate::from_khz(400));
+        let hal_i2c = HalI2c::new(peripherals.I2C0, i2c_cfg)
+            .expect("Failed to initialize I2C0")
+            .with_sda(peripherals.GPIO21)
+            .with_scl(peripherals.GPIO27);
+        let mut i2c_bus = Esp32I2cBus::new(hal_i2c);
+
+        let i2s_tdm_cfg = TdmConfig::new_tdm_philips()
+            .with_sample_rate(Rate::from_hz(44_100))
+            .with_data_format(DataFormat::Data32Channel32)
+            .with_channels(Channels::STEREO);
+        let tx_buffer = esp_hal::dma_tx_stream_buffer!(4096, 1024);
+        let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
+            .expect("Failed to initialize I2S0");
+        let i2s_tx = i2s
+            .i2s_tx
+            .with_bclk(peripherals.GPIO26)
+            .with_ws(peripherals.GPIO25)
+            .with_dout(peripherals.GPIO22)
+            .build();
+        let i2s_transfer = i2s_tx
+            .write(tx_buffer)
+            .expect("Failed to start I2S0 TX streaming DMA");
+
+        let uart2_rx = Input::new(peripherals.GPIO36, InputConfig::default().with_pull(Pull::None));
+        let uart2_cfg = UartConfig::default().with_baudrate(460_800);
+        let hal_uart2 = Uart::new(peripherals.UART2, uart2_cfg)
+            .expect("Failed to initialize UART2")
+            .with_tx(peripherals.GPIO4)
+            .with_rx(uart2_rx);
+        let uart2_port = Esp32Uart2Port::new(hal_uart2);
+        let mut cyd_bridge = CydUartBridge::new(uart2_port);
+
+        // Execute 5-stage HIL self-verification
+        pwdn.set_high();
+        let mut amp = AmpManager::for_active_board(&mut i2c_bus);
+        let _ = amp.initialize(32);
+        let _ = amp.start_playback_via_hiz();
+        let _ = fault.is_high();
+        wdt.feed();
+
+        let mut stream_storage = [0u8; 4096];
+        let mut output_storage = [0u8; 4096];
+        let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
+        let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
+        let pcm_dec = PcmDecoder::new(16, 2, true);
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_dec),
+            sink,
+            44_100,
+        );
+        let mut coordinator = PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT");
+        println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
+
+        // Start `esp-rtos` scheduler required by `esp-radio`
+        esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+        wdt.feed();
+
+        // Initialize `esp-radio` Wi-Fi Controller & Station Interface
+        let auth_cfg = if wifi_sta_creds.password.is_empty() {
+            AuthenticationMethodConfig::Open
+        } else {
+            match wifi_sta_creds.password.as_str().try_into() {
+                Ok(pw) => AuthenticationMethodConfig::WpaWpa2Personal(pw),
+                Err(_) => esp_hal::system::software_reset(),
+            }
+        };
+        let ssid_cfg = match wifi_sta_creds.ssid.as_str().try_into() {
+            Ok(s) => s,
+            Err(_) => esp_hal::system::software_reset(),
+        };
+        let sta_cfg = WifiModeConfig::Station(
+            StationConfig::default()
+                .with_ssid(ssid_cfg)
+                .with_authentication(auth_cfg),
+        );
+        let mut wifi_controller = match WifiController::new(peripherals.WIFI, ControllerConfig::default()) {
+            Ok(c) => c,
+            Err(_) => esp_hal::system::software_reset(),
+        };
+        if wifi_controller.set_config(&sta_cfg).is_err() {
+            esp_hal::system::software_reset();
+        }
+        let mut sta_iface = WifiInterface::station();
+        wdt.feed();
+
+        // Initialize `smoltcp` Ethernet Interface + DHCPv4 + TCP Port 80 + TCP SlimProto (3483)
+        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
+        let mut smol_cfg = SmolIfaceConfig::new(hw_addr);
+        smol_cfg.random_seed = 0xC82E_18BE_B834_2026;
+        let mut smol_dev = SmolDevice {
+            driver: &mut sta_iface,
+        };
+        let mut smol_iface = SmolInterface::new(
+            smol_cfg,
+            &mut smol_dev,
+            SmolInstant::from_millis(now_millis() as i64),
+        );
+
+        let mut socket_storage: [SocketStorage<'_>; 3] = [SocketStorage::EMPTY; 3];
+        let mut sockets = SocketSet::new(&mut socket_storage[..]);
+
+        let dhcp_socket = dhcpv4::Socket::new();
+        let dhcp_handle = sockets.add(dhcp_socket);
+
+        let mut http_rx_buf = [0u8; 1024];
+        let mut http_tx_buf = [0u8; 1024];
+        let http_socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut http_rx_buf[..]),
+            tcp::SocketBuffer::new(&mut http_tx_buf[..]),
+        );
+        let http_handle = sockets.add(http_socket);
+
+        let mut slim_rx_buf = [0u8; 2048];
+        let mut slim_tx_buf = [0u8; 1024];
+        let slim_socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut slim_rx_buf[..]),
+            tcp::SocketBuffer::new(&mut slim_tx_buf[..]),
+        );
+        let slim_handle = sockets.add(slim_socket);
+
+        // ====================================================================
+        // GATE 3 & GATE 4: Non-Blocking Runtime Loop with 45s/60s Dead-Man
+        // Lease Watchdog, Port 80 HTTP Recovery Server, and SlimProto Client
+        // ====================================================================
+        let boot_ms = now_millis();
+        let mut lease_watchdog = DeadManLeaseWatchdog::new(boot_ms);
+        let mut assigned_ip: Option<[u8; 4]> = None;
+        let mut assigned_mask: [u8; 4] = [255, 255, 255, 0];
+        let mut assigned_gw: [u8; 4] = [172, 22, 1, 1];
+        let mut pending_http_action = HttpControlAction::None;
+        let mut pending_action_deadline_ms: u64 = 0;
+        let mut helo_sent = false;
+        let mut last_stat_ms: u64 = 0;
+        let mut last_connect_attempt_ms: u64 = 0;
+
+        loop {
+            wdt.feed();
+            let now_ms = now_millis();
+
+            // Drive Wi-Fi STA connection if not currently associated
+            if !wifi_controller.is_connected() && now_ms.saturating_sub(last_connect_attempt_ms) >= 1_000 {
+                last_connect_attempt_ms = now_ms;
+                let mut connect_fut = pin!(wifi_controller.connect_async());
+                let waker = Waker::noop();
+                let mut cx = Context::from_waker(waker);
+                let _ = connect_fut.as_mut().poll(&mut cx);
+            }
+
+            // Gate 3: Evaluate Dead-Man Network Lease Watchdog (45s boot / 60s drop)
+            if lease_watchdog.evaluate(now_ms, wifi_controller.is_connected(), assigned_ip.is_some())
+                == LeaseHealth::ExpiredResetToRecovery
+            {
+                println!("[ANTI-BRICK GATE 3] Network lease timeout expired -> resetting to recovery (0x10000)");
+                esp_hal::system::software_reset();
+            }
+
+            // Poll `smoltcp` network stack
+            {
+                let mut dev = SmolDevice {
+                    driver: &mut sta_iface,
+                };
+                let _ = smol_iface.poll(
+                    SmolInstant::from_millis(now_ms as i64),
+                    &mut dev,
+                    &mut sockets,
+                );
+            }
+
+            // Process DHCPv4 events
+            let dhcp_event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
+            match dhcp_event {
+                Some(dhcpv4::Event::Configured(config)) => {
+                    let ip_octets = config.address.address().octets();
+                    assigned_ip = Some(ip_octets);
+                    let prefix_len = config.address.prefix_len();
+                    let mask_u32 = if prefix_len == 0 {
+                        0
+                    } else {
+                        !0u32 << (32 - prefix_len)
+                    };
+                    assigned_mask = mask_u32.to_be_bytes();
+                    if let Some(router) = config.router {
+                        assigned_gw = router.octets();
+                        let _ = smol_iface.routes_mut().add_default_ipv4_route(router);
+                    }
+                    smol_iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(IpCidr::Ipv4(config.address));
+                    });
+                    println!(
+                        "[DHCPv4] Acquired IP {}.{}.{}.{}/{}",
+                        ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3], prefix_len
+                    );
+                }
+                Some(dhcpv4::Event::Deconfigured) => {
+                    assigned_ip = None;
+                    smol_iface.update_ip_addrs(|addrs| addrs.clear());
+                }
+                None => {}
+            }
+
+            // Gate 4: Port 80 HTTP Control & Recovery Server (`/status.json`, `/recovery.json`, `/reboot.json`, `/reboot_ota.json`)
+            {
+                let http_sock = sockets.get_mut::<tcp::Socket>(http_handle);
+                if !http_sock.is_open() {
+                    let _ = http_sock.listen(80);
+                }
+                if http_sock.can_recv() && http_sock.may_send() {
+                    let mut req_buf = [0u8; 512];
+                    let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
+                    if n > 0 {
+                        let amp_mode_str = match amp.mode() {
+                            louder_esp32_app::AmpMode::Play => "Play",
+                            louder_esp32_app::AmpMode::Standby => "Standby",
+                            louder_esp32_app::AmpMode::PowerDown => "PowerDown",
+                        };
+                        let snap = HttpStatusSnapshot {
+                            ip: assigned_ip.unwrap_or([172, 22, 1, 15]),
+                            netmask: assigned_mask,
+                            gw: assigned_gw,
+                            ssid: wifi_sta_creds.ssid.as_str(),
+                            rssi: wifi_controller.rssi().unwrap_or(-50),
+                            lms_ip: DEFAULT_LMS_SERVER_IP,
+                            lms_port: 9000,
+                            lms_cport: 9090,
+                            otadata_prearmed_factory: true,
+                            frames_played: pipeline.frames_played,
+                            amp_mode: amp_mode_str,
+                            i2c_acks: Esp32I2cBus::hw_ack_count(),
+                            i2c_nacks: Esp32I2cBus::hw_nack_count(),
+                            uptime_ms: now_ms.saturating_sub(boot_ms),
+                        };
+                        let mut resp_buf = [0u8; 768];
+                        if let Some((resp_len, action)) =
+                            handle_http_control_request(&req_buf[..n], &snap, &mut resp_buf)
+                        {
+                            let _ = http_sock.send_slice(&resp_buf[..resp_len]);
+                            http_sock.close();
+                            if action != HttpControlAction::None {
+                                pending_http_action = action;
+                                pending_action_deadline_ms = now_ms + 250;
+                            }
+                        }
+                    }
+                } else if http_sock.may_recv() && !http_sock.may_send() {
+                    http_sock.abort();
+                }
+            }
+
+            // Execute deferred HTTP reboot action after flushing TCP response
+            if pending_http_action != HttpControlAction::None && now_ms >= pending_action_deadline_ms {
+                match pending_http_action {
+                    HttpControlAction::RebootToRecovery => {
+                        println!("[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json -> resetting into factory recovery (0x10000)");
+                        esp_hal::system::software_reset();
+                    }
+                    HttpControlAction::PersistOta0AndReboot => {
+                        let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
+                        let _ = flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
+                        println!("[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> wrote ota_0 select entry & resetting");
+                        esp_hal::system::software_reset();
+                    }
+                    HttpControlAction::None => {}
+                }
+            }
+
+            // Drive SlimProto Client (`10.0.0.10:3483`) once IPv4 lease is active
+            if let Some(local_ip) = assigned_ip {
+                let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                if !slim_sock.is_open() {
+                    helo_sent = false;
+                    let remote_ep = (
+                        IpAddress::Ipv4(Ipv4Address::from(DEFAULT_LMS_SERVER_IP)),
+                        DEFAULT_LMS_SERVER_PORT,
+                    );
+                    let local_ep = (
+                        IpAddress::Ipv4(Ipv4Address::from(local_ip)),
+                        49_152 + ((now_ms as u16) & 0x3FFF),
+                    );
+                    let _ = slim_sock.connect(smol_iface.context(), remote_ep, local_ep);
+                } else if slim_sock.may_send() {
+                    if !helo_sent {
+                        let mut helo_buf = [0u8; 128];
+                        if let Ok(helo_len) = SlimprotoBuilder::build_helo(
+                            &BASEMENT_PLAYER_MAC,
+                            12,
+                            "pcm,flc,mp3,ogg,aac",
+                            &mut helo_buf,
+                        ) {
+                            if slim_sock.send_slice(&helo_buf[..helo_len]).is_ok() {
+                                helo_sent = true;
+                                coordinator.state = louder_esp32_app::PlayerState::Connected;
+                            }
+                        }
+                    } else if now_ms.saturating_sub(last_stat_ms) >= 5_000 {
+                        last_stat_ms = now_ms;
+                        let mut stat_buf = [0u8; 128];
+                        if let Ok(stat_len) = SlimprotoBuilder::build_stat(
+                            StatEvent::Heartbeat,
+                            4096,
+                            0,
+                            pipeline.frames_played as u32,
+                            now_ms as u32,
+                            &mut stat_buf,
+                        ) {
+                            let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                        }
+                    }
+
+                    if slim_sock.can_recv() {
+                        let mut rx_chunk = [0u8; 512];
+                        let n = slim_sock.recv_slice(&mut rx_chunk).unwrap_or(0);
+                        if n >= 8 {
+                            if let Ok((cmd, _consumed)) = SlimprotoParser::parse_frame(&rx_chunk[..n]) {
+                                if let ServerCommand::Stream { command: StreamCommandType::Timestamp, .. } = cmd {
+                                    let mut stat_buf = [0u8; 128];
+                                    if let Ok(stat_len) = SlimprotoBuilder::build_stat(
+                                        StatEvent::Heartbeat,
+                                        4096,
+                                        0,
+                                        pipeline.frames_played as u32,
+                                        now_ms as u32,
+                                        &mut stat_buf,
+                                    ) {
+                                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let _ = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+#[esp_hal::main]
+fn main() -> ! {
+    xtensa_hw::run_hardware_firmware()
 }
 
 #[cfg(test)]
@@ -305,6 +1140,17 @@ mod tests {
 
         server_handle.join().unwrap();
         i2c.done();
+    }
+
+    #[test]
+    fn test_audio_config_lms_defaults() {
+        let audio_cfg = AudioConfig {
+            lms_server_ip: Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_IP),
+            lms_server_port: Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_PORT),
+            ..Default::default()
+        };
+        assert_eq!(audio_cfg.lms_server_ip, Some([10, 0, 0, 10]));
+        assert_eq!(audio_cfg.lms_server_port, Some(3483));
     }
 }
 
