@@ -1,6 +1,7 @@
 //! `louder-esp32-app`
 //!
 //! Main application engine for Louder-ESP32-Plus audio streamer.
+#![cfg_attr(target_arch = "xtensa", no_std)]
 #![forbid(unsafe_code)]
 #![allow(unknown_lints)]
 
@@ -9,7 +10,9 @@ pub mod board;
 pub mod coordinator;
 pub mod cyd;
 pub mod hal;
+#[cfg(not(target_arch = "xtensa"))]
 pub mod network;
+pub mod ota_safety;
 pub mod pipeline;
 pub mod sink;
 pub mod wifi;
@@ -29,6 +32,7 @@ pub use wifi::{WifiConfig, WifiManager, WifiState};
 
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
 pub use squeezelite_config::{AudioConfig, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials};
+#[cfg(not(target_arch = "xtensa"))]
 pub use network::{HttpAudioStream, LmsDiscovery, SlimprotoClient};
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};
