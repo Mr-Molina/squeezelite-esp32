@@ -106,7 +106,24 @@ pub fn handle_http_control_request(
 
     let mut body: String<512> = String::new();
     let (status_line, action) = match (method, path) {
-        ("GET", "/status.json") | ("GET", "/") => {
+        ("GET", "/") | ("GET", "/index.html") => {
+            let body_bytes = DASHBOARD_HTML.as_bytes();
+            let mut header: String<160> = String::new();
+            let _ = write!(
+                header,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+                body_bytes.len()
+            );
+            let header_bytes = header.as_bytes();
+            let total_len = header_bytes.len() + body_bytes.len();
+            if total_len > out_buf.len() {
+                return None;
+            }
+            out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
+            out_buf[header_bytes.len()..total_len].copy_from_slice(body_bytes);
+            return Some((total_len, HttpControlAction::None));
+        }
+        ("GET", "/status.json") => {
             let _ = write!(
                 body,
                 "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{}}}",
@@ -175,6 +192,9 @@ pub fn handle_http_control_request(
     out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
     Some((resp_bytes.len(), action))
 }
+
+/// Static HTML dashboard embedded for `GET /` and `GET /index.html` requests.
+pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:1em;background:#111;color:#eee}table{border-collapse:collapse}td{padding:4px 8px;border:1px solid #444}button{margin:8px 4px 0 0;padding:6px 12px;background:#c33;color:#fff;border:0;border-radius:3px;cursor:pointer}</style></head><body><h2>Louder-ESP32 Control</h2><table><tr><td>IP/SSID</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Frames</td><td id=\"f\">-</td></tr><tr><td>Status</td><td id=\"s\">-</td></tr></table><div style=\"margin-top:8px\"><button onclick=\"fetch('/recovery.json',{method:'POST'}).then(()=>alert('Recovery...'))\">Recovery</button><button style=\"background:#555\" onclick=\"fetch('/reboot_ota.json',{method:'POST'}).then(()=>alert('Reboot OTA...'))\">Reboot OTA</button></div><script>function u(){fetch('/status.json').then(r=>r.json()).then(d=>{document.getElementById('n').innerText=d.ip+' ('+d.ssid+' '+d.rssi+'dBm)';document.getElementById('l').innerText=d.lms_ip+':'+d.lms_port;document.getElementById('f').innerText=d.frames_played;document.getElementById('s').innerText=d.amp_mode+' / '+(d.uptime_ms/1000|0)+'s';}).catch(()=>{});}u();setInterval(u,2000);</script></body></html>";
 
 /// Health verdict emitted by [`DeadManLeaseWatchdog::evaluate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,5 +323,29 @@ mod tests {
             wd2.evaluate(65_000, false, false),
             LeaseHealth::ExpiredResetToRecovery
         );
+    }
+
+    #[test]
+    fn serves_html_dashboard_on_root_and_index_html() {
+        let snap = HttpStatusSnapshot::default();
+        let mut buf = [0u8; 1536];
+
+        let (len1, act1) =
+            handle_http_control_request(b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
+                .unwrap();
+        assert_eq!(act1, HttpControlAction::None);
+        let resp1 = core::str::from_utf8(&buf[..len1]).unwrap();
+        assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp1.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(resp1.contains("<title>Louder-ESP32 Control</title>"));
+        assert!(resp1.contains("/status.json"));
+
+        let (len2, act2) =
+            handle_http_control_request(b"GET /index.html HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
+                .unwrap();
+        assert_eq!(act2, HttpControlAction::None);
+        let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
+        assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp2.contains("Content-Type: text/html; charset=utf-8"));
     }
 }

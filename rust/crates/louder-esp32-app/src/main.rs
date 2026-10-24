@@ -53,15 +53,17 @@ where
             }
         }
 
-        if coordinator.state == louder_esp32_app::PlayerState::Playing
-            && pipeline.output_buffer.available_read() == 0
-            && !pipeline.has_pending_pcm()
-        {
+        if coordinator.state == louder_esp32_app::PlayerState::Playing {
             for _ in 0..4 {
-                if !matches!(pipeline.process_decode_step(), Ok(c) if c > 0)
-                    || pipeline.output_buffer.available_read() > 0
-                    || pipeline.has_pending_pcm()
+                if pipeline.output_buffer.available_write() >= 2304
+                    && (pipeline.stream_buffer.available_read() > 0 || pipeline.has_pending_pcm())
                 {
+                    if !matches!(pipeline.process_decode_step(), Ok(c) if c > 0)
+                        && !pipeline.has_pending_pcm()
+                    {
+                        break;
+                    }
+                } else {
                     break;
                 }
             }
@@ -126,6 +128,64 @@ where
     }
 
     frames
+}
+
+/// Maps LMS logarithmic mixer gain (`0..=65536`) to perceptual hardware volume percentage (`0..=100%`).
+///
+/// LMS sends gain on a 50 dB curve where 51% slider is `gain = 1842` (-31 dB) and 100% is `gain = 65536` (0 dB).
+/// This fixed-point Q8 integer log2 curve maps `gain = 0 -> 0%`, `gain = 1842 -> 55%` (-22.5 dB on TAS5805M `0x4C`),
+/// and `gain = 65536 -> 100%` (0 dB `0x30` on TAS5805M `0x4C`).
+pub fn lms_gain_to_hardware_volume_percent(gain: u32) -> u8 {
+    if gain == 0 {
+        return 0;
+    }
+    if gain >= 65536 {
+        return 100;
+    }
+    let shift = 31 - gain.leading_zeros();
+    let frac = ((gain - (1 << shift)) << 8) >> shift;
+    let log2_q8 = (shift << 8) | frac;
+    let diff = 4096_i32 - log2_q8 as i32;
+    let reduction = ((diff * 2202) + 32768) >> 16;
+    let p = 100_i32 - reduction;
+    p.clamp(1, 100) as u8
+}
+
+/// Case-insensitively searches for `icy-metaint:` header in raw HTTP response headers
+/// and parses the integer metadata interval if present.
+pub fn parse_icy_metaint_header(headers: &[u8]) -> Option<usize> {
+    const NEEDLE: &[u8] = b"icy-metaint:";
+    let nlen = NEEDLE.len();
+    if headers.len() < nlen {
+        return None;
+    }
+    let max_pos = headers.len() - nlen;
+    for i in 0..=max_pos {
+        let mut matches = true;
+        for j in 0..nlen {
+            if headers[i + j].to_ascii_lowercase() != NEEDLE[j] {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            let mut pos = i + nlen;
+            while pos < headers.len() && (headers[pos] == b' ' || headers[pos] == b'\t') {
+                pos += 1;
+            }
+            let mut val: usize = 0;
+            let mut found_digit = false;
+            while pos < headers.len() && headers[pos].is_ascii_digit() {
+                val = val.saturating_mul(10).saturating_add((headers[pos] - b'0') as usize);
+                found_digit = true;
+                pos += 1;
+            }
+            if found_digit && val > 0 {
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(target_arch = "xtensa"))]
@@ -611,8 +671,14 @@ mod xtensa_hw {
         pub fn pump_silence_if_needed(&mut self, is_playing: bool) {
             self.ensure_running();
             if let Some(ref mut transfer) = self.transfer {
-                let silence = [0u8; 512];
-                let threshold = if is_playing { 6144 } else { 2048 };
+                let avail = transfer.available_bytes();
+                let pad = avail % 1024;
+                if pad > 0 {
+                    let silence = [0u8; 1024];
+                    let _ = transfer.push(&silence[..pad]);
+                }
+                let silence = [0u8; 1024];
+                let threshold = if is_playing { 6144 } else { 4096 };
                 while transfer.available_bytes() >= threshold {
                     if transfer.push(&silence) == 0 {
                         break;
@@ -688,14 +754,49 @@ mod xtensa_hw {
                     break;
                 }
             }
+            let avail = transfer.available_bytes();
+            if avail >= 6144 {
+                let pad = avail % 1024;
+                if pad > 0 {
+                    let silence = [0u8; 1024];
+                    let _ = transfer.push(&silence[..pad]);
+                }
+                let silence = [0u8; 1024];
+                while transfer.available_bytes() >= 6144 {
+                    if transfer.push(&silence) == 0 {
+                        break;
+                    }
+                }
+            }
             Ok(total_written)
         }
 
+        #[allow(unsafe_code)]
         fn set_clock_rate(&mut self, sample_rate_hz: u32) -> Result<(), OutputError> {
             if !(8_000..=192_000).contains(&sample_rate_hz) {
                 return Err(OutputError::UnsupportedSampleRate(sample_rate_hz));
             }
-            self.sample_rate_hz = sample_rate_hz;
+            if self.sample_rate_hz != sample_rate_hz {
+                self.sample_rate_hz = sample_rate_hz;
+                #[cfg(target_arch = "xtensa")]
+                {
+                    const I2S0_CLKM_CONF_REG: *mut u32 = 0x3FF4_F0AC as *mut u32;
+                    let (div_num, div_b, div_a): (u32, u32, u32) = match sample_rate_hz {
+                        44_100 => (14, 11, 63),
+                        48_000 => (13, 1, 48),
+                        32_000 => (19, 17, 32),
+                        88_200 => (7, 11, 63),
+                        96_000 => (6, 25, 48),
+                        _ => (14, 11, 63),
+                    };
+                    unsafe {
+                        let cur = core::ptr::read_volatile(I2S0_CLKM_CONF_REG);
+                        let flags = cur & !0x000F_FFFF;
+                        let new_val = flags | (div_num & 0xFF) | ((div_b & 0x3F) << 8) | ((div_a & 0x3F) << 14);
+                        core::ptr::write_volatile(I2S0_CLKM_CONF_REG, new_val);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -740,12 +841,12 @@ mod xtensa_hw {
         http_rx_buf: [u8; 1024],
         http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
-        slim_tx_buf: [u8; 1024],
+        slim_tx_buf: [u8; 2048],
         audio_rx_buf: [u8; 4096],
         audio_tx_buf: [u8; 512],
         slim_acc_buf: [u8; 1536],
         audio_req_buf: [u8; 512],
-        audio_header_buf: [u8; 1024],
+        audio_header_buf: [u8; 2048],
     }
 
     impl FirmwareBssBuffers {
@@ -755,12 +856,12 @@ mod xtensa_hw {
                 http_rx_buf: [0u8; 1024],
                 http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
-                slim_tx_buf: [0u8; 1024],
+                slim_tx_buf: [0u8; 2048],
                 audio_rx_buf: [0u8; 4096],
                 audio_tx_buf: [0u8; 512],
                 slim_acc_buf: [0u8; 1536],
                 audio_req_buf: [0u8; 512],
-                audio_header_buf: [0u8; 1024],
+                audio_header_buf: [0u8; 2048],
             }
         }
     }
@@ -1000,6 +1101,10 @@ mod xtensa_hw {
         let mut audio_headers_stripped = false;
         let mut audio_req_len: usize = 0;
         let mut audio_header_len: usize = 0;
+        let mut audio_header_window: u32 = 0;
+        let mut pending_resp_buf = [0u8; 2064];
+        let mut pending_resp_len: usize = 0;
+        let mut pending_resp_sent: usize = 0;
         let mut last_fault_check_ms: u64 = 0;
         let mut audio_http_eof = false;
         let mut decode_ready_sent = false;
@@ -1110,7 +1215,7 @@ mod xtensa_hw {
                             i2c_nacks: Esp32I2cBus::hw_nack_count(),
                             uptime_ms: now_ms.saturating_sub(boot_ms),
                         };
-                        let mut resp_buf = [0u8; 768];
+                        let mut resp_buf = [0u8; 1536];
                         if let Some((resp_len, action)) =
                             handle_http_control_request(&req_buf[..n], &snap, &mut resp_buf)
                         {
@@ -1185,10 +1290,20 @@ mod xtensa_hw {
                     }
                 }
 
+                // Flush pending RESP bytes before any STAT/HELO frames
+                if pending_resp_sent < pending_resp_len {
+                    let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                    if slim_sock.may_send() {
+                        if let Ok(n) = slim_sock.send_slice(&pending_resp_buf[pending_resp_sent..pending_resp_len]) {
+                            pending_resp_sent += n;
+                        }
+                    }
+                }
+
                 // Initial HELO + SETD ("BASEMENT") + STAT Heartbeat, and periodic Heartbeats
                 {
                     let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
-                    if slim_sock.may_send() && !helo_sent {
+                    if slim_sock.may_send() && !helo_sent && pending_resp_sent == pending_resp_len {
                         let mut helo_buf = [0u8; 256];
                         if let Ok(helo_len) = SlimprotoBuilder::build_helo(
                             &BASEMENT_PLAYER_MAC,
@@ -1233,6 +1348,7 @@ mod xtensa_hw {
                         };
                         if slim_sock.may_send()
                             && helo_sent
+                            && pending_resp_sent == pending_resp_len
                             && now_ms.saturating_sub(last_stat_ms) >= stat_interval_ms
                         {
                             last_stat_ms = now_ms;
@@ -1300,17 +1416,13 @@ mod xtensa_hw {
                                     ServerCommand::AudioGain {
                                         gain_left,
                                         gain_right,
-                                        digital_atten,
                                         ..
                                     } => {
-                                        let (eff_gain_left, eff_gain_right) = if digital_atten == 0 {
-                                            let l = if gain_left > 0 { 65536 } else { 0 };
-                                            let r = if gain_right > 0 { 65536 } else { 0 };
-                                            (l, r)
-                                        } else {
-                                            (gain_left, gain_right)
-                                        };
-                                        pipeline.set_volume(eff_gain_left, eff_gain_right);
+                                        let max_gain = core::cmp::max(gain_left, gain_right);
+                                        let vol_pct = lms_gain_to_hardware_volume_percent(max_gain);
+                                        let _ = amp.set_volume_percent(vol_pct);
+                                        let eff_gain = if max_gain > 0 { 65536 } else { 0 };
+                                        pipeline.set_volume(eff_gain, eff_gain);
                                     }
                                     ServerCommand::Stream {
                                         command,
@@ -1355,6 +1467,9 @@ mod xtensa_hw {
                                                 icy_meta_interval = 0;
                                                 icy_meta_next = 0;
                                                 icy_meta_left = 0;
+                                                audio_header_window = 0;
+                                                pending_resp_len = 0;
+                                                pending_resp_sent = 0;
 
                                                 pipeline.flush();
                                                 pipeline.frames_played = 0;
@@ -1392,14 +1507,17 @@ mod xtensa_hw {
                                                     pcm_endianness,
                                                     Endianness::BigEndian
                                                 );
-                                                pipeline.decoder = ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be));
                                                 if format == squeezelite_proto::AudioFormat::Mp3 {
                                                     pipeline.set_decoder(ActiveDecoder::Mp3(take_static_mp3_decoder()));
+                                                    pipeline.sink.set_mute(false);
+                                                } else if format == squeezelite_proto::AudioFormat::Pcm {
+                                                    pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be)));
+                                                    pipeline.sink.set_mute(false);
                                                 } else {
                                                     pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be)));
+                                                    pipeline.sink.set_mute(true);
                                                 }
 
-                                                pipeline.sink.set_mute(false);
                                                 pipeline.sink.driver.pump_silence_if_needed(false);
                                                 let _ = amp.clear_faults();
                                                 if amp.mode() != louder_esp32_app::AmpMode::Play {
@@ -1450,27 +1568,29 @@ mod xtensa_hw {
                                                 audio_headers_stripped = false;
                                                 audio_header_len = 0;
 
-                                                let slim_sock =
-                                                    sockets.get_mut::<tcp::Socket>(slim_handle);
-                                                if slim_sock.may_send() {
-                                                    let mut stat_buf = [0u8; 128];
-                                                    if let Ok(stat_len) =
-                                                        StatBuilder::build_stat_with_metrics(
-                                                            StatEvent::Connected,
-                                                            pipeline.stream_buffer_available()
-                                                                as u32,
-                                                            pipeline.output_buffer_available()
-                                                                as u32,
-                                                            pipeline.frames_played,
-                                                            coordinator.current_sample_rate,
-                                                            coordinator.stream_bytes_received,
-                                                            now_ms as u32,
-                                                            0,
-                                                            &mut stat_buf,
-                                                        )
-                                                    {
-                                                        let _ = slim_sock
-                                                            .send_slice(&stat_buf[..stat_len]);
+                                                if pending_resp_sent == pending_resp_len {
+                                                    let slim_sock =
+                                                        sockets.get_mut::<tcp::Socket>(slim_handle);
+                                                    if slim_sock.may_send() {
+                                                        let mut stat_buf = [0u8; 128];
+                                                        if let Ok(stat_len) =
+                                                            StatBuilder::build_stat_with_metrics(
+                                                                StatEvent::Connected,
+                                                                pipeline.stream_buffer_available()
+                                                                    as u32,
+                                                                pipeline.output_buffer_available()
+                                                                    as u32,
+                                                                pipeline.frames_played,
+                                                                coordinator.current_sample_rate,
+                                                                coordinator.stream_bytes_received,
+                                                                now_ms as u32,
+                                                                0,
+                                                                &mut stat_buf,
+                                                            )
+                                                        {
+                                                            let _ = slim_sock
+                                                                .send_slice(&stat_buf[..stat_len]);
+                                                        }
                                                     }
                                                 }
 
@@ -1677,7 +1797,8 @@ mod xtensa_hw {
                                             pipeline.decoder = ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true));
                                             if codc_fmt == squeezelite_proto::AudioFormat::Mp3 {
                                                 pipeline.set_decoder(ActiveDecoder::Mp3(take_static_mp3_decoder()));
-                                            } else {
+                                                pipeline.sink.set_mute(false);
+                                            } else if codc_fmt == squeezelite_proto::AudioFormat::Pcm {
                                                 let bits = if payload.len() > 1 {
                                                     PlayerCoordinator::normalize_pcm_bits(payload[1])
                                                 } else {
@@ -1694,6 +1815,10 @@ mod xtensa_hw {
                                                     true
                                                 };
                                                 pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be)));
+                                                pipeline.sink.set_mute(false);
+                                            } else {
+                                                // Unsupported compressed codec: mute sink to avoid loud PCM static noise
+                                                pipeline.sink.set_mute(true);
                                             }
                                         }
                                     }
@@ -1740,19 +1865,23 @@ mod xtensa_hw {
 
                     // Process incoming HTTP stream bytes
                     if !audio_headers_stripped {
+                        let mut header_matched = false;
                         let audio_sock = sockets.get_mut::<tcp::Socket>(audio_handle);
-                        if audio_sock.can_recv() && audio_header_len < audio_header_buf.len() {
+                        if audio_sock.can_recv() {
                             let _ = audio_sock.recv(|rx_buf| {
                                 let mut consumed = 0;
-                                while consumed < rx_buf.len() && audio_header_len < audio_header_buf.len() {
+                                while consumed < rx_buf.len() {
                                     let b = rx_buf[consumed];
-                                    audio_header_buf[audio_header_len] = b;
-                                    audio_header_len += 1;
                                     consumed += 1;
-                                    if audio_header_len >= 4 && &audio_header_buf[audio_header_len - 4..audio_header_len] == b"\r\n\r\n" {
-                                        break;
+                                    audio_header_window = (audio_header_window << 8) | (b as u32);
+                                    if audio_header_len < audio_header_buf.len() {
+                                        audio_header_buf[audio_header_len] = b;
+                                        audio_header_len += 1;
                                     }
-                                    if audio_header_len >= 2 && &audio_header_buf[audio_header_len - 2..audio_header_len] == b"\n\n" {
+                                    if audio_header_window == 0x0D0A_0D0A
+                                        || (audio_header_window & 0xFFFF) == 0x0A0A
+                                    {
+                                        header_matched = true;
                                         break;
                                     }
                                 }
@@ -1760,43 +1889,50 @@ mod xtensa_hw {
                             });
                         }
 
-                        let is_header_complete = (audio_header_len >= 4
-                            && &audio_header_buf[audio_header_len - 4..audio_header_len] == b"\r\n\r\n")
-                            || (audio_header_len >= 2
-                                && &audio_header_buf[audio_header_len - 2..audio_header_len] == b"\n\n")
-                            || audio_header_len >= audio_header_buf.len();
-
-                        if is_header_complete && audio_header_len > 0 {
+                        if header_matched {
                             audio_headers_stripped = true;
 
-                            let mut resp_buf = [0u8; 2064];
+                            if icy_meta_interval == 0 {
+                                if let Some(interval) = parse_icy_metaint_header(&audio_header_buf[..audio_header_len]) {
+                                    icy_meta_interval = interval;
+                                    icy_meta_next = interval;
+                                    icy_meta_left = 0;
+                                }
+                            }
+
                             if let Ok(resp_len) = SlimprotoBuilder::build_resp(
                                 &audio_header_buf[..audio_header_len],
-                                &mut resp_buf,
+                                &mut pending_resp_buf,
                             ) {
+                                pending_resp_len = resp_len;
+                                pending_resp_sent = 0;
                                 let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
                                 if slim_sock.may_send() {
-                                    let _ = slim_sock.send_slice(&resp_buf[..resp_len]);
+                                    if let Ok(n) = slim_sock.send_slice(&pending_resp_buf[..resp_len]) {
+                                        pending_resp_sent = n;
+                                    }
                                 }
                             }
 
                             if !threshold_sent && !coordinator.autostart_mode.is_auto() && !coordinator.awaiting_cont {
                                 threshold_sent = true;
-                                let mut stat_buf = [0u8; 128];
-                                if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                                    StatEvent::BUFFER_THRESHOLD,
-                                    pipeline.stream_buffer_available() as u32,
-                                    pipeline.output_buffer_available() as u32,
-                                    pipeline.frames_played,
-                                    coordinator.current_sample_rate,
-                                    coordinator.stream_bytes_received,
-                                    now_ms as u32,
-                                    0,
-                                    &mut stat_buf,
-                                ) {
-                                    let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
-                                    if slim_sock.may_send() {
-                                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                                if pending_resp_sent == pending_resp_len {
+                                    let mut stat_buf = [0u8; 128];
+                                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                                        StatEvent::BUFFER_THRESHOLD,
+                                        pipeline.stream_buffer_available() as u32,
+                                        pipeline.output_buffer_available() as u32,
+                                        pipeline.frames_played,
+                                        coordinator.current_sample_rate,
+                                        coordinator.stream_bytes_received,
+                                        now_ms as u32,
+                                        0,
+                                        &mut stat_buf,
+                                    ) {
+                                        let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                                        if slim_sock.may_send() {
+                                            let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                                        }
                                     }
                                 }
                             }
@@ -1896,7 +2032,11 @@ mod xtensa_hw {
                 coordinator.state == louder_esp32_app::PlayerState::Playing,
             );
 
-            if audio_stream_active && !track_started_sent && pipeline.frames_played > 0 {
+            if audio_stream_active
+                && !track_started_sent
+                && pipeline.frames_played > 0
+                && pending_resp_sent == pending_resp_len
+            {
                 let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
                 if slim_sock.may_send() {
                     let mut stat_buf = [0u8; 128];
@@ -1930,6 +2070,7 @@ mod xtensa_hw {
                 && !decode_ready_sent
                 && !pipeline.has_pending_pcm()
                 && pipeline.stream_buffer.available_read() == 0
+                && pending_resp_sent == pending_resp_len
             {
                 let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
                 if slim_sock.may_send() {
@@ -1952,30 +2093,34 @@ mod xtensa_hw {
             }
 
             if audio_stream_active
+                && audio_http_eof
                 && decode_ready_sent
                 && !pipeline.has_pending_pcm()
+                && pipeline.stream_buffer.available_read() == 0
                 && pipeline.output_buffer.available_read() == 0
                 && step_frames == 0
             {
-                let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
-                if slim_sock.may_send() {
-                    let mut stat_buf = [0u8; 128];
-                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                        StatEvent::TrackUnderrun,
-                        pipeline.stream_buffer_available() as u32,
-                        pipeline.output_buffer_available() as u32,
-                        pipeline.frames_played,
-                        coordinator.current_sample_rate,
-                        coordinator.stream_bytes_received,
-                        now_ms as u32,
-                        0,
-                        &mut stat_buf,
-                    ) {
-                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                if pending_resp_sent == pending_resp_len {
+                    let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                    if slim_sock.may_send() {
+                        let mut stat_buf = [0u8; 128];
+                        if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                            StatEvent::TrackUnderrun,
+                            pipeline.stream_buffer_available() as u32,
+                            pipeline.output_buffer_available() as u32,
+                            pipeline.frames_played,
+                            coordinator.current_sample_rate,
+                            coordinator.stream_bytes_received,
+                            now_ms as u32,
+                            0,
+                            &mut stat_buf,
+                        ) {
+                            let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                        }
                     }
+                    audio_stream_active = false;
+                    coordinator.state = louder_esp32_app::PlayerState::Stopped;
                 }
-                audio_stream_active = false;
-                coordinator.state = louder_esp32_app::PlayerState::Stopped;
             }
 
             if coordinator.state == louder_esp32_app::PlayerState::Playing
@@ -2122,6 +2267,37 @@ mod tests {
         };
         assert_eq!(audio_cfg.lms_server_ip, Some([10, 0, 0, 10]));
         assert_eq!(audio_cfg.lms_server_port, Some(3483));
+    }
+
+    #[test]
+    fn test_lms_gain_to_hardware_volume_percent_curve() {
+        assert_eq!(lms_gain_to_hardware_volume_percent(0), 0);
+        assert_eq!(lms_gain_to_hardware_volume_percent(1842), 55);
+        assert_eq!(lms_gain_to_hardware_volume_percent(65536), 100);
+        assert_eq!(lms_gain_to_hardware_volume_percent(100_000), 100);
+
+        // Verify strictly monotonic non-decreasing behavior
+        let mut prev = 0;
+        for g in (100..=65536).step_by(500) {
+            let p = lms_gain_to_hardware_volume_percent(g);
+            assert!(p >= prev, "Non-monotonic at gain {}: {} < {}", g, p, prev);
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn test_parse_icy_metaint_header() {
+        let h1 = b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\nicy-metaint: 16000\r\n\r\n";
+        assert_eq!(parse_icy_metaint_header(h1), Some(16000));
+
+        let h2 = b"HTTP/1.1 200 OK\r\nICY-METAINT:\t32768\r\nServer: Icecast\r\n\r\n";
+        assert_eq!(parse_icy_metaint_header(h2), Some(32768));
+
+        let h3 = b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n\r\n";
+        assert_eq!(parse_icy_metaint_header(h3), None);
+
+        let h4 = b"icy-metaint: 0\r\n";
+        assert_eq!(parse_icy_metaint_header(h4), None);
     }
 }
 
