@@ -6,16 +6,24 @@
 use squeezelite_audio_core::output::AudioOutputSink;
 use squeezelite_audio_core::VolumeScale;
 use squeezelite_cyd_link::{CydCommand, CydMessage, PlayState};
-use squeezelite_decoders::{AacDecoder, FlacDecoder, Mp3Decoder, PcmDecoder, VorbisDecoder};
+use squeezelite_decoders::PcmDecoder;
+#[cfg(not(target_arch = "xtensa"))]
+use squeezelite_decoders::{AacDecoder, FlacDecoder, Mp3Decoder, VorbisDecoder};
+use squeezelite_proto::{AudioFormat, AutostartMode, DisconnectReason};
+#[cfg(not(target_arch = "xtensa"))]
 use squeezelite_proto::{
-    sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason, Endianness,
-    ServerCommand, StatEvent, StreamCommandType, STRM_FLAG_SERVER_REBOOT,
+    sample_rate_from_index, Endianness, ServerCommand, StatEvent, StreamCommandType,
+    STRM_FLAG_SERVER_REBOOT,
 };
 
+#[cfg(not(target_arch = "xtensa"))]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+#[cfg(not(target_arch = "xtensa"))]
 use crate::network::{HttpAudioStream, SlimprotoClient};
-use crate::pipeline::{ActiveDecoder, StreamPipeline};
+#[cfg(not(target_arch = "xtensa"))]
+use crate::pipeline::ActiveDecoder;
+use crate::pipeline::StreamPipeline;
 
 /// Helper trait to construct `PcmDecoder` with standard configuration.
 pub trait PcmDecoderExt {
@@ -65,11 +73,14 @@ pub struct PlayerCoordinator {
     pub pending_track_started: bool,
     pub pending_underrun: bool,
     pub pending_dsco: Option<DisconnectReason>,
-    pub pending_resp: Option<Vec<u8>>,
-    pub pending_meta: Option<Vec<u8>>,
+    #[cfg(not(target_arch = "xtensa"))]
+    pub pending_resp: Option<std::vec::Vec<u8>>,
+    #[cfg(not(target_arch = "xtensa"))]
+    pub pending_meta: Option<std::vec::Vec<u8>>,
     pub dac_enabled: bool,
     pub server_rebooting: bool,
     pub player_name: heapless::String<64>,
+    #[cfg(not(target_arch = "xtensa"))]
     pub audio_stream: Option<HttpAudioStream>,
 }
 
@@ -99,11 +110,14 @@ impl PlayerCoordinator {
             pending_track_started: false,
             pending_underrun: false,
             pending_dsco: None,
+            #[cfg(not(target_arch = "xtensa"))]
             pending_resp: None,
+            #[cfg(not(target_arch = "xtensa"))]
             pending_meta: None,
             dac_enabled: true,
             server_rebooting: false,
             player_name,
+            #[cfg(not(target_arch = "xtensa"))]
             audio_stream: None,
         }
     }
@@ -153,6 +167,7 @@ impl PlayerCoordinator {
     }
 
     /// Handles an incoming command from LMS, mutating the pipeline and sending telemetry.
+    #[cfg(not(target_arch = "xtensa"))]
     pub fn handle_command<S: AudioOutputSink>(
         &mut self,
         cmd: ServerCommand<'_>,
@@ -435,6 +450,14 @@ impl PlayerCoordinator {
                 Ok(Some(CydMessage::Volume(pct)))
             }
             ServerCommand::SetDevice { sample_rate } => {
+                if sample_rate <= u8::MAX as u32 {
+                    if let Some(setting) = cmd.device_setting() {
+                        if setting.id == 0 {
+                            client.send_setd_name(&self.player_name)?;
+                            return Ok(None);
+                        }
+                    }
+                }
                 self.current_sample_rate = sample_rate;
                 let _ = pipeline.set_sample_rate(sample_rate);
                 Ok(None)
@@ -498,6 +521,7 @@ impl PlayerCoordinator {
     ///
     /// Breaks out of the loop when `n == 0` (`HALNET-405`), and drops `self.audio_stream = None`
     /// if `poll_audio_bytes` returns an error (`COORD-508`).
+    #[cfg(not(target_arch = "xtensa"))]
     pub fn poll_http_stream<S: AudioOutputSink>(
         &mut self,
         pipeline: &mut StreamPipeline<S>,
@@ -548,11 +572,14 @@ impl PlayerCoordinator {
     /// decoder completion (`STMd` + `DSCO(0)`), and end-of-track underrun (`STMu` + Stopped).
     pub fn evaluate_state<S: AudioOutputSink>(&mut self, pipeline: &mut StreamPipeline<S>) {
         self.frames_played = pipeline.frames_played;
+        #[cfg(not(target_arch = "xtensa"))]
         let is_eof = self
             .audio_stream
             .as_ref()
             .map(|s| s.is_eof())
             .unwrap_or(false);
+        #[cfg(target_arch = "xtensa")]
+        let is_eof = false;
 
         if self.state == PlayerState::Buffering
             && !self.awaiting_cont
@@ -594,6 +621,7 @@ impl PlayerCoordinator {
         &mut self,
         pipeline: &mut StreamPipeline<S>,
     ) -> usize {
+        #[cfg(not(target_arch = "xtensa"))]
         let _ = self.poll_http_stream(pipeline);
         self.evaluate_state(pipeline);
 
@@ -620,6 +648,7 @@ impl PlayerCoordinator {
 
     /// Evaluates one integrated coordinator tick with Slimproto client telemetry,
     /// audio decoding, frame output, and deferred STAT updates (`RUST-01..RUST-10`).
+    #[cfg(not(target_arch = "xtensa"))]
     pub fn tick<S: AudioOutputSink>(
         &mut self,
         client: &mut SlimprotoClient,
@@ -705,6 +734,7 @@ impl PlayerCoordinator {
 
     /// Emits pending deferred `STAT` transition events (`STMs` / `STMd` / `STMu`),
     /// `RESP`, `META`, `DSCO`, and periodic `STAT` heartbeats.
+    #[cfg(not(target_arch = "xtensa"))]
     pub fn check_heartbeat<S: AudioOutputSink>(
         &mut self,
         pipeline: &StreamPipeline<S>,
@@ -2044,6 +2074,52 @@ mod tests {
         assert_eq!(&opcode, b"SETD");
         assert_eq!(payload[0], 0x00);
         assert_eq!(&payload[1..], b"Kitchen");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_setd_one_byte_query_preserves_sample_rate_and_replies_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0xDD];
+
+        let handle = std::thread::spawn(move || {
+            let mut client = SlimprotoClient::connect(server_addr, mac, "Basement").unwrap();
+            let mut coordinator = PlayerCoordinator::new(mac, "Basement");
+            assert_eq!(coordinator.current_sample_rate, 44100);
+
+            let mut stream_storage = [0u8; 1024];
+            let mut output_storage = [0u8; 1024];
+            let pcm_dec = PcmDecoder::new(16, 2, true);
+            let sink = MockAudioSink::<64>::new();
+            let mut pipeline = StreamPipeline::new(
+                &mut stream_storage,
+                &mut output_storage,
+                ActiveDecoder::Pcm(pcm_dec),
+                sink,
+                44100,
+            );
+
+            // 1-byte setd [0x00] query from LMS
+            let setd_query = ServerCommand::SetDevice { sample_rate: 0 };
+            coordinator
+                .handle_command(setd_query, &mut pipeline, &mut client, 100)
+                .unwrap();
+
+            assert_eq!(coordinator.current_sample_rate, 44100);
+            assert_eq!(coordinator.player_name.as_str(), "Basement");
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let (opcode, _) = read_slimproto_frame(&mut server_stream).unwrap();
+        assert_eq!(&opcode, b"HELO");
+
+        // SETD name reply with "Basement"
+        let (opcode, payload) = read_slimproto_frame(&mut server_stream).unwrap();
+        assert_eq!(&opcode, b"SETD");
+        assert_eq!(payload[0], 0x00);
+        assert_eq!(&payload[1..], b"Basement");
 
         handle.join().unwrap();
     }

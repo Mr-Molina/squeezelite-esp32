@@ -8,7 +8,8 @@ description = "Pure-Rust audio decoders (PCM, MP3, FLAC, AAC, Vorbis) for squeez
 
 [features]
 default = ["std"]
-std = ["dep:claxon", "dep:lewton", "dep:syom", "dep:thiserror"]
+alloc = []
+std = ["alloc", "dep:claxon", "dep:lewton", "dep:syom", "dep:thiserror"]
 
 [dependencies]
 squeezelite-audio-core = { path = "../squeezelite-audio-core" }

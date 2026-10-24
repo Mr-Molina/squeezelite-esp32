@@ -41,6 +41,17 @@ pub mod pins {
     pub const CYD_UART_RX: i32 = 44;
 }
 
+/// Default Lyrion Music Server (LMS) IPv4 address from target build context (`10.0.0.10`).
+pub const DEFAULT_LMS_SERVER_IP: [u8; 4] = [10, 0, 0, 10];
+/// Default Lyrion Music Server (LMS) SlimProto TCP/UDP port (`3483`).
+pub const DEFAULT_LMS_SERVER_PORT: u16 = 3483;
+/// Default deployed player node name (`"BASEMENT"` on `172.22.1.15`).
+pub const DEFAULT_PLAYER_NAME: &str = "BASEMENT";
+/// Default deployed Wi-Fi SSID (`"iot"` on `172.22.1.15`).
+pub const DEFAULT_WIFI_SSID: &str = "iot";
+/// Hardware MAC address of the `172.22.1.15` `"BASEMENT"` ESP32 unit (`c8:2e:18:be:b8:34`).
+pub const BASEMENT_PLAYER_MAC: [u8; 6] = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
+
 /// Board identity descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoardModel {
@@ -137,6 +148,15 @@ mod tests {
         assert_eq!(BoardModel::LouderEsp32Wrover.cyd_uart_pins(), (4, 36));
         assert_eq!(BoardModel::LouderEsp32PlusS3.cyd_uart_pins(), (43, 44));
         assert_eq!(pins::TAS5805M_PRIMARY_I2C_ADDR, 0x2C);
+    }
+
+    #[test]
+    fn test_basement_deployment_constants() {
+        assert_eq!(DEFAULT_LMS_SERVER_IP, [10, 0, 0, 10]);
+        assert_eq!(DEFAULT_LMS_SERVER_PORT, 3483);
+        assert_eq!(DEFAULT_PLAYER_NAME, "BASEMENT");
+        assert_eq!(DEFAULT_WIFI_SSID, "iot");
+        assert_eq!(BASEMENT_PLAYER_MAC, [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34]);
     }
 }
 

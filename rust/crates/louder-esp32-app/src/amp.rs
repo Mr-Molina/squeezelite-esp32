@@ -199,6 +199,38 @@ where
         }
     }
 
+    /// Transitions the amplifier from Standby into active Play mode via Hi-Z staging (`HW-PREP-05`).
+    ///
+    /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
+    pub fn start_playback_via_hiz(&mut self) -> Result<(), DriverError<E>> {
+        match self.inner.take() {
+            Some(AmpInner::Standby(mut driver)) => {
+                if let Err(e) = driver.set_digital_volume(self.current_volume) {
+                    self.inner = Some(AmpInner::Standby(driver));
+                    return Err(e);
+                }
+                match driver.try_start_playback_via_hiz() {
+                    Ok(play) => {
+                        self.inner = Some(AmpInner::Play(play));
+                        Ok(())
+                    }
+                    Err((standby, e)) => {
+                        self.inner = Some(AmpInner::Standby(standby));
+                        Err(e)
+                    }
+                }
+            }
+            Some(AmpInner::Play(play)) => {
+                self.inner = Some(AmpInner::Play(play));
+                Ok(())
+            }
+            other => {
+                self.inner = other;
+                Ok(())
+            }
+        }
+    }
+
     /// Transitions the amplifier from Play back to Standby mode (muting power stage).
     /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
     pub fn stop_playback(&mut self) -> Result<(), DriverError<E>> {
@@ -561,6 +593,42 @@ mod tests {
         amp.select_book_page(0x01, 0x02).unwrap();
 
         assert_eq!(crate::board::BoardModel::LouderEsp32Wrover.cyd_uart_pins(), (4, 36));
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_amp_manager_start_playback_via_hiz() {
+        let addr = crate::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // init_into_standby
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            // reconfirm_book_page_and_clear_faults
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            // configure_audio_format(32)
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // start_playback_via_hiz:
+            // 1) set_digital_volume(0x60)
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x60]),
+            // 2) try_start_playback_via_hiz sequence:
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut amp = AmpManager::new(&mut i2c);
+        amp.initialize(32).unwrap();
+        assert_eq!(amp.mode(), AmpMode::Standby);
+
+        amp.start_playback_via_hiz().unwrap();
+        assert_eq!(amp.mode(), AmpMode::Play);
 
         i2c.done();
     }

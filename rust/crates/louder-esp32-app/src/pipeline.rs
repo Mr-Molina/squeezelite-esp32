@@ -9,16 +9,27 @@ use squeezelite_audio_core::{
 };
 use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 
+#[cfg(not(target_arch = "xtensa"))]
 pub const PCM_SCRATCH_SAMPLES: usize = 8192;
+#[cfg(target_arch = "xtensa")]
+pub const PCM_SCRATCH_SAMPLES: usize = 512;
+
+#[cfg(not(target_arch = "xtensa"))]
 pub const READ_SCRATCH_BYTES: usize = 4096;
+#[cfg(target_arch = "xtensa")]
+pub const READ_SCRATCH_BYTES: usize = 1024;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
 pub enum ActiveDecoder {
     Pcm(PcmDecoder),
+    #[cfg(not(target_arch = "xtensa"))]
     Mp3(Box<squeezelite_decoders::Mp3Decoder>),
+    #[cfg(not(target_arch = "xtensa"))]
     Flac(Box<squeezelite_decoders::FlacDecoder>),
+    #[cfg(not(target_arch = "xtensa"))]
     Aac(Box<squeezelite_decoders::AacDecoder>),
+    #[cfg(not(target_arch = "xtensa"))]
     Vorbis(Box<squeezelite_decoders::VorbisDecoder>),
 }
 
@@ -30,9 +41,13 @@ impl AudioDecoder for ActiveDecoder {
     ) -> Result<(usize, usize), DecoderError> {
         match self {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Aac(d) => d.decode(encoded_in, pcm_out),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Vorbis(d) => d.decode(encoded_in, pcm_out),
         }
     }
@@ -40,9 +55,13 @@ impl AudioDecoder for ActiveDecoder {
     fn flush(&mut self) {
         match self {
             Self::Pcm(d) => d.flush(),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => d.flush(),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.flush(),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Aac(d) => d.flush(),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Vorbis(d) => d.flush(),
         }
     }
@@ -53,6 +72,7 @@ impl ActiveDecoder {
     pub fn sample_rate(&self) -> Option<u32> {
         match self {
             Self::Pcm(d) => d.sample_rate,
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)
@@ -60,6 +80,7 @@ impl ActiveDecoder {
                     None
                 }
             }
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)
@@ -67,6 +88,7 @@ impl ActiveDecoder {
                     None
                 }
             }
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Aac(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)
@@ -74,6 +96,7 @@ impl ActiveDecoder {
                     None
                 }
             }
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Vorbis(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)

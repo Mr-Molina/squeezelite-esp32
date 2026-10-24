@@ -14,7 +14,7 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(feature = "alloc", not(feature = "std")))]
 extern crate alloc;
 
 #[cfg(feature = "std")]
@@ -22,9 +22,9 @@ use std::boxed::Box;
 #[cfg(feature = "std")]
 use std::vec;
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
+#[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::vec;
 
 #[cfg(not(feature = "std"))]
@@ -494,6 +494,7 @@ impl AudioDecoder for PcmDecoder {
 ///
 /// Heap-boxes decoder state (22.5KB) and frame scratch buffer (9.2KB)
 /// to eliminate FreeRTOS task stack overflows (DEC-001).
+#[cfg(feature = "alloc")]
 pub struct Mp3Decoder {
     pub sample_rate: u32,
     decoder: Box<nanomp3_core::Decoder>,
@@ -501,12 +502,14 @@ pub struct Mp3Decoder {
     id3_skip_remaining: usize,
 }
 
+#[cfg(feature = "alloc")]
 impl Default for Mp3Decoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Mp3Decoder {
     pub fn new() -> Self {
         Self {
@@ -518,6 +521,7 @@ impl Mp3Decoder {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl AudioDecoder for Mp3Decoder {
     fn decode(
         &mut self,
