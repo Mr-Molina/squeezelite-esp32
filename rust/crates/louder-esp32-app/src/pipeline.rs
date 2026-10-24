@@ -17,7 +17,7 @@ pub const PCM_SCRATCH_SAMPLES: usize = 2304;
 #[cfg(not(target_arch = "xtensa"))]
 pub const READ_SCRATCH_BYTES: usize = 4096;
 #[cfg(target_arch = "xtensa")]
-pub const READ_SCRATCH_BYTES: usize = 2048;
+pub const READ_SCRATCH_BYTES: usize = 1536;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
@@ -141,6 +141,7 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
+    #[inline(always)]
     pub fn new(
         stream_storage: &'a mut [u8],
         output_storage: &'a mut [u8],

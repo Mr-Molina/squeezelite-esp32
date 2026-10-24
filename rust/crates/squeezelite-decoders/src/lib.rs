@@ -640,7 +640,7 @@ impl Default for StaticMp3Decoder {
 impl StaticMp3Decoder {
     pub const fn new() -> Self {
         Self {
-            sample_rate: 44100,
+            sample_rate: 0,
             decoder: nanomp3_core::Decoder::new(),
             id3_skip_remaining: 0,
         }
@@ -1817,6 +1817,8 @@ mod tests {
     #[test]
     fn test_static_mp3_decoder_partial_frame_and_id3() {
         let mut dec = StaticMp3Decoder::new();
+        assert_eq!(dec.sample_rate, 0);
+        dec.reset_in_place();
         assert_eq!(dec.sample_rate, 44100);
         dec.sample_rate = 48000;
         dec.flush();

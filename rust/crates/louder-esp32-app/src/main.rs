@@ -712,11 +712,12 @@ mod xtensa_hw {
     fn load_nvs_wifi_credentials(
         flash: &mut FlashStorage<'_>,
         sta_mac: &[u8; 6],
+        nvs_buf: &mut [u8; 16_384],
     ) -> Result<WifiStaCredentials, OtaSafetyError> {
-        let mut nvs_buf = [0xFFu8; 16_384];
-        let _ = flash.read(NVS_PARTITION_OFFSET, &mut nvs_buf);
+        nvs_buf.fill(0xFF);
+        let _ = flash.read(NVS_PARTITION_OFFSET, nvs_buf);
         resolve_wifi_credentials(
-            &nvs_buf,
+            nvs_buf,
             sta_mac,
             option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
             option_env!("SL_WIFI_PASS"),
@@ -735,33 +736,31 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        stream_storage: [u8; 8192],
-        output_storage: [u8; 8192],
+        ring_storage: [u8; 16384],
         http_rx_buf: [u8; 1024],
         http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
-        slim_tx_buf: [u8; 4096],
-        audio_rx_buf: [u8; 8192],
-        audio_tx_buf: [u8; 1024],
-        slim_acc_buf: [u8; 2048],
-        audio_req_buf: [u8; 2048],
-        audio_header_buf: [u8; 2048],
+        slim_tx_buf: [u8; 1024],
+        audio_rx_buf: [u8; 4096],
+        audio_tx_buf: [u8; 512],
+        slim_acc_buf: [u8; 1536],
+        audio_req_buf: [u8; 512],
+        audio_header_buf: [u8; 1024],
     }
 
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                stream_storage: [0u8; 8192],
-                output_storage: [0u8; 8192],
+                ring_storage: [0u8; 16384],
                 http_rx_buf: [0u8; 1024],
                 http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
-                slim_tx_buf: [0u8; 4096],
-                audio_rx_buf: [0u8; 8192],
-                audio_tx_buf: [0u8; 1024],
-                slim_acc_buf: [0u8; 2048],
-                audio_req_buf: [0u8; 2048],
-                audio_header_buf: [0u8; 2048],
+                slim_tx_buf: [0u8; 1024],
+                audio_rx_buf: [0u8; 4096],
+                audio_tx_buf: [0u8; 512],
+                slim_acc_buf: [0u8; 1536],
+                audio_req_buf: [0u8; 512],
+                audio_header_buf: [0u8; 1024],
             }
         }
     }
@@ -820,7 +819,8 @@ mod xtensa_hw {
         let mut sta_mac = [0u8; 6];
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
 
-        let wifi_sta_creds = match load_nvs_wifi_credentials(&mut flash, &sta_mac) {
+        let fw_bufs = take_firmware_bss_buffers();
+        let wifi_sta_creds = match load_nvs_wifi_credentials(&mut flash, &sta_mac, &mut fw_bufs.ring_storage) {
             Ok(c) => c,
             Err(e) => {
                 println!(
@@ -830,6 +830,7 @@ mod xtensa_hw {
                 esp_hal::system::software_reset();
             }
         };
+        fw_bufs.ring_storage.fill(0);
         wdt.feed();
         println!(
             "[NVS 0x9000] Loaded Wi-Fi STA SSID='{}' (pass_len={}) for MAC {:02x?}",
@@ -884,8 +885,7 @@ mod xtensa_hw {
         wdt.feed();
 
         let FirmwareBssBuffers {
-            ref mut stream_storage,
-            ref mut output_storage,
+            ref mut ring_storage,
             ref mut http_rx_buf,
             ref mut http_tx_buf,
             ref mut slim_rx_buf,
@@ -895,7 +895,8 @@ mod xtensa_hw {
             ref mut slim_acc_buf,
             ref mut audio_req_buf,
             ref mut audio_header_buf,
-        } = *take_firmware_bss_buffers();
+        } = fw_bufs;
+        let (stream_storage, output_storage) = ring_storage.split_at_mut(8192);
 
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
