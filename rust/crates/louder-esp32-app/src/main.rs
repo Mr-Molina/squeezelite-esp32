@@ -53,17 +53,18 @@ where
             }
         }
 
-        let frames = coordinator.process_audio_step(pipeline);
+        let mut frames = 0;
+        for _ in 0..8 {
+            let step_frames = coordinator.process_audio_step(pipeline);
+            frames += step_frames;
+            if step_frames == 0 {
+                break;
+            }
+        }
         coordinator.current_sample_rate = pipeline.sample_rate;
 
         if !coordinator.dac_enabled {
             let _ = amp.stop_playback();
-        }
-
-        if let Ok(Some(fault)) = amp.check_faults() {
-            if !fault.is_clean() {
-                let _ = amp.recover_from_fault();
-            }
         }
 
         frames
@@ -321,15 +322,17 @@ mod xtensa_hw {
     use smoltcp::socket::{dhcpv4, tcp};
     use smoltcp::time::Instant as SmolInstant;
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+    extern crate alloc;
+    use alloc::boxed::Box;
     use squeezelite_audio_core::output::OutputError;
-    use squeezelite_decoders::PcmDecoder;
+    use squeezelite_decoders::{Mp3Decoder, PcmDecoder};
     #[allow(unused_imports)]
     use squeezelite_proto::{
         sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason, Endianness,
         ParseError, ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
         StreamCommandType,
     };
-    use squeezelite_tas58xx::registers;
+    use squeezelite_tas58xx::{registers, VOL_UNITY_0DB};
 
     // Mandatory Squeezelite-ESP32 OTA binary descriptor (`squeezelite-ota.c:663`).
     // Sets `project_name = "Squeezelite-ESP32"` and `version = "I2S-4MFlash-Rust"` at offset 0x20.
@@ -553,10 +556,12 @@ mod xtensa_hw {
 
     /// Hardware I2S0 + DMA_I2S0 audio output driver (`BCK=GPIO26`, `WS=GPIO25`, `DOUT=GPIO22`).
     pub struct Esp32HardwareI2sDma<'d> {
-        transfer: esp_hal::i2s::master::I2sTxDmaTransfer<
-            'd,
-            esp_hal::Blocking,
-            esp_hal::dma::DmaTxStreamBuf,
+        transfer: Option<
+            esp_hal::i2s::master::I2sTxDmaTransfer<
+                'd,
+                esp_hal::Blocking,
+                esp_hal::dma::DmaTxStreamBuf,
+            >,
         >,
         sample_rate_hz: u32,
         tx_enabled: bool,
@@ -572,9 +577,33 @@ mod xtensa_hw {
             sample_rate_hz: u32,
         ) -> Self {
             Self {
-                transfer,
+                transfer: Some(transfer),
                 sample_rate_hz,
                 tx_enabled: true,
+            }
+        }
+
+        pub fn ensure_running(&mut self) {
+            let needs_restart = self.transfer.as_ref().map(|t| t.is_done()).unwrap_or(false);
+            if needs_restart {
+                if let Some(transfer) = self.transfer.take() {
+                    let (i2s_tx, buf) = transfer.stop();
+                    if let Ok(new_transfer) = i2s_tx.write(buf) {
+                        self.transfer = Some(new_transfer);
+                    }
+                }
+            }
+        }
+
+        pub fn pump_silence_if_needed(&mut self) {
+            self.ensure_running();
+            if let Some(ref mut transfer) = self.transfer {
+                let silence = [0u8; 512];
+                while transfer.available_bytes() >= 2048 {
+                    if transfer.push(&silence) == 0 {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -582,12 +611,70 @@ mod xtensa_hw {
     impl I2sDmaDriver for Esp32HardwareI2sDma<'_> {
         fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
             let valid_len = data.len() - (data.len() % 8);
-            if !self.tx_enabled || valid_len == 0 {
-                return Ok(valid_len);
+            if valid_len == 0 {
+                return Ok(0);
             }
-            // Push 32-bit stereo frames into the active hardware I2S0 TX streaming DMA circular buffer
-            let written = self.transfer.push(&data[..valid_len]);
-            Ok(written - (written % 8))
+            self.ensure_running();
+
+            let transfer = match self.transfer.as_mut() {
+                Some(t) => t,
+                None => return Ok(0),
+            };
+
+            if !self.tx_enabled {
+                let silence = [0u8; 512];
+                let mut written = 0;
+                while written < valid_len {
+                    let avail = transfer.available_bytes();
+                    let avail_aligned = avail - (avail % 8);
+                    if avail_aligned == 0 {
+                        break;
+                    }
+                    let chunk_len = core::cmp::min(silence.len(), valid_len - written).min(avail_aligned);
+                    if chunk_len == 0 {
+                        break;
+                    }
+                    let n = transfer.push(&silence[..chunk_len]);
+                    let aligned_n = n - (n % 8);
+                    written += aligned_n;
+                    if n < chunk_len {
+                        break;
+                    }
+                }
+                return Ok(written);
+            }
+
+            let mut total_written = 0;
+            let mut offset = 0;
+            let mut scratch = [0u8; 512];
+
+            while offset < valid_len {
+                let avail = transfer.available_bytes();
+                let avail_aligned = avail - (avail % 8);
+                if avail_aligned == 0 {
+                    break;
+                }
+                let chunk_in_len = core::cmp::min(scratch.len(), valid_len - offset).min(avail_aligned);
+                let frames_in_chunk = chunk_in_len / 8;
+                if frames_in_chunk == 0 {
+                    break;
+                }
+                for f in 0..frames_in_chunk {
+                    let src_idx = offset + f * 8;
+                    let dst_idx = f * 8;
+                    scratch[dst_idx..dst_idx + 4].copy_from_slice(&data[src_idx + 4..src_idx + 8]);
+                    scratch[dst_idx + 4..dst_idx + 8].copy_from_slice(&data[src_idx..src_idx + 4]);
+                }
+                let chunk_bytes = frames_in_chunk * 8;
+                let n = transfer.push(&scratch[..chunk_bytes]);
+                let aligned_n = n - (n % 8);
+                total_written += aligned_n;
+                offset += aligned_n;
+                if n < chunk_bytes {
+                    break;
+                }
+            }
+            Ok(total_written)
         }
 
         fn set_clock_rate(&mut self, sample_rate_hz: u32) -> Result<(), OutputError> {
@@ -696,7 +783,7 @@ mod xtensa_hw {
             .with_sample_rate(Rate::from_hz(44_100))
             .with_data_format(DataFormat::Data32Channel32)
             .with_channels(Channels::STEREO);
-        let tx_buffer = esp_hal::dma_tx_stream_buffer!(4096, 1024);
+        let tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
         let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
             .expect("Failed to initialize I2S0");
         let i2s_tx = i2s
@@ -722,12 +809,13 @@ mod xtensa_hw {
         pwdn.set_high();
         let mut amp = AmpManager::for_active_board(&mut i2c_bus);
         let _ = amp.initialize(32);
+        let _ = amp.set_volume(VOL_UNITY_0DB);
         let _ = amp.start_playback_via_hiz();
         let _ = fault.is_high();
         wdt.feed();
 
-        let mut stream_storage = [0u8; 4096];
-        let mut output_storage = [0u8; 4096];
+        let mut stream_storage = [0u8; 8192];
+        let mut output_storage = [0u8; 8192];
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
         let pcm_dec = PcmDecoder::new(16, 2, true);
@@ -808,7 +896,7 @@ mod xtensa_hw {
         );
         let slim_handle = sockets.add(slim_socket);
 
-        let mut audio_rx_buf = [0u8; 4096];
+        let mut audio_rx_buf = [0u8; 8192];
         let mut audio_tx_buf = [0u8; 1024];
         let audio_socket = tcp::Socket::new(
             tcp::SocketBuffer::new(&mut audio_rx_buf[..]),
@@ -830,7 +918,7 @@ mod xtensa_hw {
         let mut helo_sent = false;
         let mut last_stat_ms: u64 = 0;
         let mut last_connect_attempt_ms: u64 = 0;
-        let mut slim_acc_buf = [0u8; 1536];
+        let mut slim_acc_buf = [0u8; 2048];
         let mut slim_acc_len: usize = 0;
         let mut audio_stream_active = false;
         let mut audio_req_sent = false;
@@ -839,6 +927,15 @@ mod xtensa_hw {
         let mut audio_req_len: usize = 0;
         let mut audio_header_buf = [0u8; 1024];
         let mut audio_header_len: usize = 0;
+        let mut last_fault_check_ms: u64 = 0;
+        let mut audio_http_eof = false;
+        let mut decode_ready_sent = false;
+        let mut track_started_sent = false;
+        let mut threshold_sent = false;
+
+        pipeline.sink.driver.pump_silence_if_needed();
+        let _ = amp.clear_faults();
+        let _ = amp.start_playback_via_hiz();
 
         loop {
             wdt.feed();
@@ -1020,7 +1117,7 @@ mod xtensa_hw {
                         if let Ok(helo_len) = SlimprotoBuilder::build_helo(
                             &BASEMENT_PLAYER_MAC,
                             12,
-                            "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,HasDigitalOut=1,MaxSampleRate=48000,pcm",
+                            "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,HasDigitalOut=1,MaxSampleRate=48000,pcm,mp3",
                             &mut helo_buf,
                         ) {
                             if slim_sock.send_slice(&helo_buf[..helo_len]).is_ok() {
@@ -1052,24 +1149,31 @@ mod xtensa_hw {
                                 coordinator.state = louder_esp32_app::PlayerState::Connected;
                             }
                         }
-                    } else if slim_sock.may_send()
-                        && helo_sent
-                        && now_ms.saturating_sub(last_stat_ms) >= 5_000
-                    {
-                        last_stat_ms = now_ms;
-                        let mut stat_buf = [0u8; 128];
-                        if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                            StatEvent::Heartbeat,
-                            pipeline.stream_buffer_available() as u32,
-                            pipeline.output_buffer_available() as u32,
-                            pipeline.frames_played,
-                            coordinator.current_sample_rate,
-                            coordinator.stream_bytes_received,
-                            now_ms as u32,
-                            0,
-                            &mut stat_buf,
-                        ) {
-                            let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                    } else {
+                        let stat_interval_ms: u64 = if coordinator.state == louder_esp32_app::PlayerState::Playing {
+                            1_000
+                        } else {
+                            5_000
+                        };
+                        if slim_sock.may_send()
+                            && helo_sent
+                            && now_ms.saturating_sub(last_stat_ms) >= stat_interval_ms
+                        {
+                            last_stat_ms = now_ms;
+                            let mut stat_buf = [0u8; 128];
+                            if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                                StatEvent::Heartbeat,
+                                pipeline.stream_buffer_available() as u32,
+                                pipeline.output_buffer_available() as u32,
+                                pipeline.frames_played,
+                                coordinator.current_sample_rate,
+                                coordinator.stream_bytes_received,
+                                now_ms as u32,
+                                0,
+                                &mut stat_buf,
+                            ) {
+                                let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                            }
                         }
                     }
                 }
@@ -1173,12 +1277,19 @@ mod xtensa_hw {
                                             }
                                             StreamCommandType::Start => {
                                                 pipeline.flush();
+                                                pipeline.frames_played = 0;
+                                                coordinator.frames_played = 0;
+                                                coordinator.stream_bytes_received = 0;
+                                                audio_http_eof = false;
+                                                decode_ready_sent = false;
+                                                track_started_sent = false;
+                                                threshold_sent = false;
+
                                                 coordinator.autostart_mode =
                                                     AutostartMode::from_strm(autostart, flags);
                                                 coordinator.awaiting_cont =
                                                     coordinator.autostart_mode.requires_cont();
                                                 coordinator.current_format = Some(format);
-                                                coordinator.stream_bytes_received = 0;
 
                                                 let sample_rate =
                                                     PlayerCoordinator::decode_pcm_sample_rate_hz(
@@ -1190,19 +1301,31 @@ mod xtensa_hw {
                                                 coordinator.current_sample_rate = sample_rate;
                                                 let _ = pipeline.set_sample_rate(sample_rate);
 
-                                                let bits = PlayerCoordinator::normalize_pcm_bits(
-                                                    pcm_sample_size,
-                                                );
-                                                let channels =
-                                                    PlayerCoordinator::normalize_pcm_channels(
-                                                        pcm_channels,
-                                                    );
-                                                let is_be = matches!(
-                                                    pcm_endianness,
-                                                    Endianness::BigEndian
-                                                );
-                                                let pcm_dec = PcmDecoder::new(bits, channels, is_be);
-                                                pipeline.set_decoder(ActiveDecoder::Pcm(pcm_dec));
+                                                match format {
+                                                    AudioFormat::Mp3 => {
+                                                        pipeline.set_decoder(ActiveDecoder::Mp3(Box::new(Mp3Decoder::new())));
+                                                    }
+                                                    _ => {
+                                                        let bits = PlayerCoordinator::normalize_pcm_bits(
+                                                            pcm_sample_size,
+                                                        );
+                                                        let channels =
+                                                            PlayerCoordinator::normalize_pcm_channels(
+                                                                pcm_channels,
+                                                            );
+                                                        let is_be = matches!(
+                                                            pcm_endianness,
+                                                            Endianness::BigEndian
+                                                        );
+                                                        let pcm_dec = PcmDecoder::new(bits, channels, is_be);
+                                                        pipeline.set_decoder(ActiveDecoder::Pcm(pcm_dec));
+                                                    }
+                                                }
+
+                                                pipeline.sink.set_mute(false);
+                                                pipeline.sink.driver.pump_silence_if_needed();
+                                                let _ = amp.clear_faults();
+                                                let _ = amp.start_playback_via_hiz();
 
                                                 if http_headers.is_empty() {
                                                     let req = b"GET /stream.mp3 HTTP/1.0\r\n\r\n";
@@ -1336,6 +1459,10 @@ mod xtensa_hw {
                                                 coordinator.state =
                                                     louder_esp32_app::PlayerState::Stopped;
                                                 audio_stream_active = false;
+                                                audio_http_eof = false;
+                                                decode_ready_sent = false;
+                                                track_started_sent = false;
+                                                threshold_sent = false;
                                                 sockets
                                                     .get_mut::<tcp::Socket>(audio_handle)
                                                     .abort();
@@ -1366,6 +1493,10 @@ mod xtensa_hw {
                                             }
                                             StreamCommandType::Flush => {
                                                 audio_stream_active = false;
+                                                audio_http_eof = false;
+                                                decode_ready_sent = false;
+                                                track_started_sent = false;
+                                                threshold_sent = false;
                                                 sockets
                                                     .get_mut::<tcp::Socket>(audio_handle)
                                                     .abort();
@@ -1405,6 +1536,10 @@ mod xtensa_hw {
                                     }
                                     ServerCommand::Flush => {
                                         audio_stream_active = false;
+                                        audio_http_eof = false;
+                                        decode_ready_sent = false;
+                                        track_started_sent = false;
+                                        threshold_sent = false;
                                         sockets.get_mut::<tcp::Socket>(audio_handle).abort();
                                         pipeline.flush();
                                         let slim_sock =
@@ -1526,21 +1661,24 @@ mod xtensa_hw {
                                     }
                                 }
 
-                                let mut stat_buf = [0u8; 128];
-                                if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                                    StatEvent::TrackStarted,
-                                    pipeline.stream_buffer_available() as u32,
-                                    pipeline.output_buffer_available() as u32,
-                                    pipeline.frames_played,
-                                    coordinator.current_sample_rate,
-                                    coordinator.stream_bytes_received,
-                                    now_ms as u32,
-                                    0,
-                                    &mut stat_buf,
-                                ) {
-                                    let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
-                                    if slim_sock.may_send() {
-                                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                                if !threshold_sent && !coordinator.autostart_mode.is_auto() {
+                                    threshold_sent = true;
+                                    let mut stat_buf = [0u8; 128];
+                                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                                        StatEvent::BUFFER_THRESHOLD,
+                                        pipeline.stream_buffer_available() as u32,
+                                        pipeline.output_buffer_available() as u32,
+                                        pipeline.frames_played,
+                                        coordinator.current_sample_rate,
+                                        coordinator.stream_bytes_received,
+                                        now_ms as u32,
+                                        0,
+                                        &mut stat_buf,
+                                    ) {
+                                        let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                                        if slim_sock.may_send() {
+                                            let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                                        }
                                     }
                                 }
 
@@ -1552,7 +1690,7 @@ mod xtensa_hw {
                                 }
                             }
                         }
-                    } else {
+                    } else if !audio_http_eof {
                         let mut audio_rx_chunk = [0u8; 512];
                         while sockets.get_mut::<tcp::Socket>(audio_handle).can_recv()
                             && pipeline.stream_buffer.available_write() >= 512
@@ -1572,33 +1710,19 @@ mod xtensa_hw {
                         }
                     }
 
-                    // EOF detection on audio_sock
-                    let is_eof = {
+                    // Check HTTP socket EOF:
+                    let sock_eof = {
                         let audio_sock = sockets.get_mut::<tcp::Socket>(audio_handle);
-                        audio_req_sent && !audio_sock.can_recv() && !audio_sock.may_recv()
+                        audio_req_sent
+                            && audio_headers_stripped
+                            && !audio_sock.can_recv()
+                            && !audio_sock.may_recv()
                     };
-
-                    if is_eof {
+                    if sock_eof && !audio_http_eof {
                         sockets.get_mut::<tcp::Socket>(audio_handle).abort();
-                        audio_stream_active = false;
-
+                        audio_http_eof = true;
                         let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
                         if slim_sock.may_send() {
-                            let mut stat_buf = [0u8; 128];
-                            if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                                StatEvent::DecodeReady,
-                                pipeline.stream_buffer_available() as u32,
-                                pipeline.output_buffer_available() as u32,
-                                pipeline.frames_played,
-                                coordinator.current_sample_rate,
-                                coordinator.stream_bytes_received,
-                                now_ms as u32,
-                                0,
-                                &mut stat_buf,
-                            ) {
-                                let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
-                            }
-
                             let mut dsco_buf = [0u8; 32];
                             if let Ok(dsco_len) = SlimprotoBuilder::build_dsco(
                                 DisconnectReason::ConnectionClosed,
@@ -1611,7 +1735,92 @@ mod xtensa_hw {
                 }
             }
 
-            let _ = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+            let step_frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+
+            pipeline.sink.driver.pump_silence_if_needed();
+
+            if audio_stream_active && !track_started_sent && pipeline.frames_played > 0 {
+                let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                if slim_sock.may_send() {
+                    let mut stat_buf = [0u8; 128];
+                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                        StatEvent::TrackStarted,
+                        pipeline.stream_buffer_available() as u32,
+                        pipeline.output_buffer_available() as u32,
+                        pipeline.frames_played,
+                        coordinator.current_sample_rate,
+                        coordinator.stream_bytes_received,
+                        now_ms as u32,
+                        0,
+                        &mut stat_buf,
+                    ) {
+                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                    }
+                }
+                track_started_sent = true;
+            }
+
+            if audio_stream_active
+                && audio_http_eof
+                && !decode_ready_sent
+                && pipeline.stream_buffer.available_read() == 0
+            {
+                let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                if slim_sock.may_send() {
+                    let mut stat_buf = [0u8; 128];
+                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                        StatEvent::DecodeReady,
+                        pipeline.stream_buffer_available() as u32,
+                        pipeline.output_buffer_available() as u32,
+                        pipeline.frames_played,
+                        coordinator.current_sample_rate,
+                        coordinator.stream_bytes_received,
+                        now_ms as u32,
+                        0,
+                        &mut stat_buf,
+                    ) {
+                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                    }
+                }
+                decode_ready_sent = true;
+            }
+
+            if audio_stream_active
+                && decode_ready_sent
+                && pipeline.output_buffer.available_read() == 0
+                && step_frames == 0
+            {
+                let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                if slim_sock.may_send() {
+                    let mut stat_buf = [0u8; 128];
+                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
+                        StatEvent::TrackUnderrun,
+                        pipeline.stream_buffer_available() as u32,
+                        pipeline.output_buffer_available() as u32,
+                        pipeline.frames_played,
+                        coordinator.current_sample_rate,
+                        coordinator.stream_bytes_received,
+                        now_ms as u32,
+                        0,
+                        &mut stat_buf,
+                    ) {
+                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
+                    }
+                }
+                audio_stream_active = false;
+                coordinator.state = louder_esp32_app::PlayerState::Stopped;
+            }
+
+            if coordinator.state == louder_esp32_app::PlayerState::Playing
+                && now_ms.saturating_sub(last_fault_check_ms) >= 2_000
+            {
+                last_fault_check_ms = now_ms;
+                if let Ok(Some(fault)) = amp.check_faults() {
+                    if !fault.is_clean() {
+                        let _ = amp.recover_from_fault();
+                    }
+                }
+            }
         }
     }
 }
