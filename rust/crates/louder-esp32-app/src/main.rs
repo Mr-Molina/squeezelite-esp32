@@ -595,11 +595,12 @@ mod xtensa_hw {
             }
         }
 
-        pub fn pump_silence_if_needed(&mut self) {
+        pub fn pump_silence_if_needed(&mut self, is_playing: bool) {
             self.ensure_running();
             if let Some(ref mut transfer) = self.transfer {
                 let silence = [0u8; 512];
-                while transfer.available_bytes() >= 2048 {
+                let threshold = if is_playing { 6144 } else { 2048 };
+                while transfer.available_bytes() >= threshold {
                     if transfer.push(&silence) == 0 {
                         break;
                     }
@@ -810,7 +811,6 @@ mod xtensa_hw {
         let mut amp = AmpManager::for_active_board(&mut i2c_bus);
         let _ = amp.initialize(32);
         let _ = amp.set_volume(VOL_UNITY_0DB);
-        let _ = amp.start_playback_via_hiz();
         let _ = fault.is_high();
         wdt.feed();
 
@@ -933,7 +933,7 @@ mod xtensa_hw {
         let mut track_started_sent = false;
         let mut threshold_sent = false;
 
-        pipeline.sink.driver.pump_silence_if_needed();
+        pipeline.sink.driver.pump_silence_if_needed(false);
         let _ = amp.clear_faults();
         let _ = amp.start_playback_via_hiz();
 
@@ -1323,7 +1323,8 @@ mod xtensa_hw {
                                                 }
 
                                                 pipeline.sink.set_mute(false);
-                                                pipeline.sink.driver.pump_silence_if_needed();
+                                                pipeline.sink.driver.pump_silence_if_needed(false);
+                                                let _ = amp.stop_playback();
                                                 let _ = amp.clear_faults();
                                                 let _ = amp.start_playback_via_hiz();
 
@@ -1737,7 +1738,9 @@ mod xtensa_hw {
 
             let step_frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
 
-            pipeline.sink.driver.pump_silence_if_needed();
+            pipeline.sink.driver.pump_silence_if_needed(
+                coordinator.state == louder_esp32_app::PlayerState::Playing,
+            );
 
             if audio_stream_active && !track_started_sent && pipeline.frames_played > 0 {
                 let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
