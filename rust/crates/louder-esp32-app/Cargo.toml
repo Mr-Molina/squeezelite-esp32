@@ -15,7 +15,7 @@ board-louder-esp32-s3 = []
 squeezelite-proto = { path = "../squeezelite-proto" }
 squeezelite-audio-core = { path = "../squeezelite-audio-core" }
 squeezelite-tas58xx = { path = "../squeezelite-tas58xx" }
-squeezelite-decoders = { path = "../squeezelite-decoders", default-features = false, features = ["alloc"] }
+squeezelite-decoders = { path = "../squeezelite-decoders", default-features = false }
 squeezelite-cyd-link = { path = "../squeezelite-cyd-link" }
 squeezelite-config = { path = "../squeezelite-config" }
 embedded-hal = { workspace = true }

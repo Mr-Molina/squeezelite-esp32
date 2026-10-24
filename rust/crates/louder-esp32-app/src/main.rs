@@ -314,18 +314,17 @@ mod xtensa_hw {
         LeaseHealth,
     };
     use louder_esp32_app::ota_safety::{
-        resolve_wifi_credentials, verify_otadata_erased, OtaSelectEntry, NVS_PARTITION_OFFSET,
-        OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET, OTADATA_SECTOR_1_OFFSET,
+        resolve_wifi_credentials, verify_otadata_erased, OtaSafetyError, OtaSelectEntry,
+        WifiStaCredentials, NVS_PARTITION_OFFSET, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
+        OTADATA_SECTOR_1_OFFSET,
     };
     use smoltcp::iface::{Config as SmolIfaceConfig, Interface as SmolInterface, SocketSet, SocketStorage};
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
     use smoltcp::socket::{dhcpv4, tcp};
     use smoltcp::time::Instant as SmolInstant;
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-    extern crate alloc;
-    use alloc::boxed::Box;
     use squeezelite_audio_core::output::OutputError;
-    use squeezelite_decoders::{Mp3Decoder, PcmDecoder};
+    use squeezelite_decoders::PcmDecoder;
     #[allow(unused_imports)]
     use squeezelite_proto::{
         sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason, Endianness,
@@ -695,6 +694,21 @@ mod xtensa_hw {
         Instant::now().duration_since_epoch().as_millis()
     }
 
+    #[inline(never)]
+    fn load_nvs_wifi_credentials(
+        flash: &mut FlashStorage<'_>,
+        sta_mac: &[u8; 6],
+    ) -> Result<WifiStaCredentials, OtaSafetyError> {
+        let mut nvs_buf = [0xFFu8; 16_384];
+        let _ = flash.read(NVS_PARTITION_OFFSET, &mut nvs_buf);
+        resolve_wifi_credentials(
+            &nvs_buf,
+            sta_mac,
+            option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
+            option_env!("SL_WIFI_PASS"),
+        )
+    }
+
     pub fn run_hardware_firmware() -> ! {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let peripherals = esp_hal::init(config);
@@ -743,16 +757,7 @@ mod xtensa_hw {
         let mut sta_mac = [0u8; 6];
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
 
-        let mut nvs_buf = [0xFFu8; 16_384];
-        let _ = flash.read(NVS_PARTITION_OFFSET, &mut nvs_buf);
-        wdt.feed();
-
-        let wifi_sta_creds = match resolve_wifi_credentials(
-            &nvs_buf,
-            &sta_mac,
-            option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
-            option_env!("SL_WIFI_PASS"),
-        ) {
+        let wifi_sta_creds = match load_nvs_wifi_credentials(&mut flash, &sta_mac) {
             Ok(c) => c,
             Err(e) => {
                 println!(
@@ -762,6 +767,7 @@ mod xtensa_hw {
                 esp_hal::system::software_reset();
             }
         };
+        wdt.feed();
         println!(
             "[NVS 0x9000] Loaded Wi-Fi STA SSID='{}' (pass_len={}) for MAC {:02x?}",
             wifi_sta_creds.ssid.as_str(),
@@ -814,8 +820,8 @@ mod xtensa_hw {
         let _ = fault.is_high();
         wdt.feed();
 
-        let mut stream_storage = [0u8; 8192];
-        let mut output_storage = [0u8; 8192];
+        let mut stream_storage = [0u8; 4096];
+        let mut output_storage = [0u8; 4096];
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
         let pcm_dec = PcmDecoder::new(16, 2, true);
@@ -896,7 +902,7 @@ mod xtensa_hw {
         );
         let slim_handle = sockets.add(slim_socket);
 
-        let mut audio_rx_buf = [0u8; 8192];
+        let mut audio_rx_buf = [0u8; 4096];
         let mut audio_tx_buf = [0u8; 1024];
         let audio_socket = tcp::Socket::new(
             tcp::SocketBuffer::new(&mut audio_rx_buf[..]),
@@ -918,7 +924,7 @@ mod xtensa_hw {
         let mut helo_sent = false;
         let mut last_stat_ms: u64 = 0;
         let mut last_connect_attempt_ms: u64 = 0;
-        let mut slim_acc_buf = [0u8; 2048];
+        let mut slim_acc_buf = [0u8; 1536];
         let mut slim_acc_len: usize = 0;
         let mut audio_stream_active = false;
         let mut audio_req_sent = false;
@@ -1117,7 +1123,7 @@ mod xtensa_hw {
                         if let Ok(helo_len) = SlimprotoBuilder::build_helo(
                             &BASEMENT_PLAYER_MAC,
                             12,
-                            "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,HasDigitalOut=1,MaxSampleRate=48000,pcm,mp3",
+                            "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,HasDigitalOut=1,MaxSampleRate=48000,pcm",
                             &mut helo_buf,
                         ) {
                             if slim_sock.send_slice(&helo_buf[..helo_len]).is_ok() {
@@ -1301,32 +1307,26 @@ mod xtensa_hw {
                                                 coordinator.current_sample_rate = sample_rate;
                                                 let _ = pipeline.set_sample_rate(sample_rate);
 
-                                                match format {
-                                                    AudioFormat::Mp3 => {
-                                                        pipeline.set_decoder(ActiveDecoder::Mp3(Box::new(Mp3Decoder::new())));
-                                                    }
-                                                    _ => {
-                                                        let bits = PlayerCoordinator::normalize_pcm_bits(
-                                                            pcm_sample_size,
-                                                        );
-                                                        let channels =
-                                                            PlayerCoordinator::normalize_pcm_channels(
-                                                                pcm_channels,
-                                                            );
-                                                        let is_be = matches!(
-                                                            pcm_endianness,
-                                                            Endianness::BigEndian
-                                                        );
-                                                        let pcm_dec = PcmDecoder::new(bits, channels, is_be);
-                                                        pipeline.set_decoder(ActiveDecoder::Pcm(pcm_dec));
-                                                    }
-                                                }
+                                                let bits = PlayerCoordinator::normalize_pcm_bits(
+                                                    pcm_sample_size,
+                                                );
+                                                let channels =
+                                                    PlayerCoordinator::normalize_pcm_channels(
+                                                        pcm_channels,
+                                                    );
+                                                let is_be = matches!(
+                                                    pcm_endianness,
+                                                    Endianness::BigEndian
+                                                );
+                                                let pcm_dec = PcmDecoder::new(bits, channels, is_be);
+                                                pipeline.set_decoder(ActiveDecoder::Pcm(pcm_dec));
 
                                                 pipeline.sink.set_mute(false);
                                                 pipeline.sink.driver.pump_silence_if_needed(false);
-                                                let _ = amp.stop_playback();
                                                 let _ = amp.clear_faults();
-                                                let _ = amp.start_playback_via_hiz();
+                                                if amp.mode() != louder_esp32_app::AmpMode::Play {
+                                                    let _ = amp.start_playback_via_hiz();
+                                                }
 
                                                 if http_headers.is_empty() {
                                                     let req = b"GET /stream.mp3 HTTP/1.0\r\n\r\n";
@@ -1398,7 +1398,6 @@ mod xtensa_hw {
 
                                                 coordinator.state =
                                                     louder_esp32_app::PlayerState::Playing;
-                                                let _ = amp.start_playback_via_hiz();
                                             }
                                             StreamCommandType::Pause => {
                                                 coordinator.state =

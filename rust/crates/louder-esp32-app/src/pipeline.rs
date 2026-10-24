@@ -3,11 +3,6 @@
 //! Connects LMS stream buffers, pure-Rust decoders, DSP equalizer,
 //! volume scaling, and the I2S audio output sink into an integrated processing loop.
 
-#[cfg(target_arch = "xtensa")]
-extern crate alloc;
-#[cfg(target_arch = "xtensa")]
-use alloc::boxed::Box;
-
 use squeezelite_audio_core::{
     scale_samples_inplace, AudioOutputSink, AudioRingBuffer, Equalizer, RingBufferError,
     VolumeScale,
@@ -28,6 +23,7 @@ pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
 pub enum ActiveDecoder {
     Pcm(PcmDecoder),
+    #[cfg(not(target_arch = "xtensa"))]
     Mp3(Box<squeezelite_decoders::Mp3Decoder>),
     #[cfg(not(target_arch = "xtensa"))]
     Flac(Box<squeezelite_decoders::FlacDecoder>),
@@ -45,6 +41,7 @@ impl AudioDecoder for ActiveDecoder {
     ) -> Result<(usize, usize), DecoderError> {
         match self {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
@@ -58,6 +55,7 @@ impl AudioDecoder for ActiveDecoder {
     fn flush(&mut self) {
         match self {
             Self::Pcm(d) => d.flush(),
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => d.flush(),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.flush(),
@@ -74,6 +72,7 @@ impl ActiveDecoder {
     pub fn sample_rate(&self) -> Option<u32> {
         match self {
             Self::Pcm(d) => d.sample_rate,
+            #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)
