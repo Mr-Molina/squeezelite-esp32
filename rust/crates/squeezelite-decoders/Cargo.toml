@@ -16,7 +16,7 @@ squeezelite-audio-core = { path = "../squeezelite-audio-core" }
 claxon = { version = "0.4", default-features = false, optional = true }
 lewton = { version = "0.10", default-features = false, features = ["ogg"], optional = true }
 syom = { version = "0.7", optional = true }
-nanomp3-core = "0.2"
+nanomp3-core = { version = "0.2", default-features = false, features = ["layer12"] }
 thiserror = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 

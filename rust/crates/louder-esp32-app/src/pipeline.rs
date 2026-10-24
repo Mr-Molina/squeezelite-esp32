@@ -12,12 +12,12 @@ use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 #[cfg(not(target_arch = "xtensa"))]
 pub const PCM_SCRATCH_SAMPLES: usize = 8192;
 #[cfg(target_arch = "xtensa")]
-pub const PCM_SCRATCH_SAMPLES: usize = 512;
+pub const PCM_SCRATCH_SAMPLES: usize = 2304;
 
 #[cfg(not(target_arch = "xtensa"))]
 pub const READ_SCRATCH_BYTES: usize = 4096;
 #[cfg(target_arch = "xtensa")]
-pub const READ_SCRATCH_BYTES: usize = 1024;
+pub const READ_SCRATCH_BYTES: usize = 2048;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
@@ -25,6 +25,8 @@ pub enum ActiveDecoder {
     Pcm(PcmDecoder),
     #[cfg(not(target_arch = "xtensa"))]
     Mp3(Box<squeezelite_decoders::Mp3Decoder>),
+    #[cfg(target_arch = "xtensa")]
+    Mp3(&'static mut squeezelite_decoders::StaticMp3Decoder),
     #[cfg(not(target_arch = "xtensa"))]
     Flac(Box<squeezelite_decoders::FlacDecoder>),
     #[cfg(not(target_arch = "xtensa"))]
@@ -43,6 +45,8 @@ impl AudioDecoder for ActiveDecoder {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
+            #[cfg(target_arch = "xtensa")]
+            Self::Mp3(d) => d.decode(encoded_in, pcm_out),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
             #[cfg(not(target_arch = "xtensa"))]
@@ -56,6 +60,8 @@ impl AudioDecoder for ActiveDecoder {
         match self {
             Self::Pcm(d) => d.flush(),
             #[cfg(not(target_arch = "xtensa"))]
+            Self::Mp3(d) => d.flush(),
+            #[cfg(target_arch = "xtensa")]
             Self::Mp3(d) => d.flush(),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.flush(),
@@ -73,6 +79,14 @@ impl ActiveDecoder {
         match self {
             Self::Pcm(d) => d.sample_rate,
             #[cfg(not(target_arch = "xtensa"))]
+            Self::Mp3(d) => {
+                if d.sample_rate > 0 {
+                    Some(d.sample_rate)
+                } else {
+                    None
+                }
+            }
+            #[cfg(target_arch = "xtensa")]
             Self::Mp3(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)

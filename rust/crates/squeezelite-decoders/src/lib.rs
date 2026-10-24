@@ -621,6 +621,170 @@ impl AudioDecoder for Mp3Decoder {
     }
 }
 
+/// Zero-heap, `no_std`, `const fn`-initializable MP3 decoder for embedded targets (`xtensa`).
+///
+/// Decodes directly into `pcm_out` (`>= 2304` `i32` samples) with zero heap allocations
+/// and resets in O(1) via `nanomp3_core::__private::init` without constructing a 23 KB temporary.
+pub struct StaticMp3Decoder {
+    pub sample_rate: u32,
+    decoder: nanomp3_core::Decoder,
+    id3_skip_remaining: usize,
+}
+
+impl Default for StaticMp3Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StaticMp3Decoder {
+    pub const fn new() -> Self {
+        Self {
+            sample_rate: 44100,
+            decoder: nanomp3_core::Decoder::new(),
+            id3_skip_remaining: 0,
+        }
+    }
+
+    /// Resets the decoder state in-place without constructing a 23 KB temporary on the stack.
+    pub fn reset_in_place(&mut self) {
+        self.sample_rate = 44100;
+        nanomp3_core::__private::init(&mut self.decoder);
+        self.id3_skip_remaining = 0;
+    }
+}
+
+impl AudioDecoder for StaticMp3Decoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        if pcm_out.len() < nanomp3_core::MAX_SAMPLES_PER_FRAME {
+            return Err(DecoderError::BufferOverflow);
+        }
+
+        if self.id3_skip_remaining > 0 {
+            if encoded_in.is_empty() {
+                return Err(DecoderError::NeedMoreData);
+            }
+            let to_skip = core::cmp::min(encoded_in.len(), self.id3_skip_remaining);
+            self.id3_skip_remaining -= to_skip;
+            return Ok((to_skip, 0));
+        }
+
+        if encoded_in.starts_with(b"ID3") {
+            if encoded_in.len() < 10 {
+                return Err(DecoderError::NeedMoreData);
+            }
+            let tag_size = ((encoded_in[6] as usize & 0x7F) << 21)
+                | ((encoded_in[7] as usize & 0x7F) << 14)
+                | ((encoded_in[8] as usize & 0x7F) << 7)
+                | (encoded_in[9] as usize & 0x7F);
+            let footer = if (encoded_in[5] & 0x10) != 0 { 10 } else { 0 };
+            let total_id3 = 10 + tag_size + footer;
+            let to_skip = core::cmp::min(encoded_in.len(), total_id3);
+            self.id3_skip_remaining = total_id3 - to_skip;
+            return Ok((to_skip, 0));
+        }
+
+        if encoded_in.len() < 4 {
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let mut sync_offset = None;
+        let mut idx = 0;
+        while idx + 4 <= encoded_in.len() {
+            let h = nanomp3_core::__private::Header::read(&encoded_in[idx..]);
+            if h.valid() {
+                sync_offset = Some((idx, h));
+                break;
+            }
+            idx += 1;
+        }
+
+        let slice_to_decode = match sync_offset {
+            None => {
+                let skip = encoded_in.len().saturating_sub(3);
+                if skip > 0 {
+                    return Ok((skip, 0));
+                }
+                return Err(DecoderError::NeedMoreData);
+            }
+            Some((offset, _)) if offset > 0 => {
+                return Ok((offset, 0));
+            }
+            Some((0, h)) => {
+                let frame_bytes = h.frame_bytes(0) + h.padding();
+                if frame_bytes > 0 {
+                    if encoded_in.len() < frame_bytes + 4 {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    let next_h = nanomp3_core::__private::Header::read(&encoded_in[frame_bytes..]);
+                    if !h.compare(next_h) {
+                        return Ok((1, 0));
+                    }
+                    &encoded_in[..frame_bytes + 4]
+                } else {
+                    encoded_in
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        let (consumed, result) = self.decoder.decode(slice_to_decode, pcm_out);
+
+        match result {
+            Ok(info) => {
+                if info.sample_rate > 0 {
+                    self.sample_rate = info.sample_rate;
+                }
+                let channels = info.channels.num() as usize;
+                let frames_produced = info.samples_produced;
+                let max_frames = pcm_out.len() / 2;
+
+                if max_frames < frames_produced {
+                    return Err(DecoderError::BufferOverflow);
+                }
+
+                if channels == 1 {
+                    for i in (0..frames_produced).rev() {
+                        let s = pcm_out[i];
+                        pcm_out[i * 2] = s;
+                        pcm_out[i * 2 + 1] = s;
+                    }
+                }
+                Ok((consumed, frames_produced))
+            }
+            Err(nanomp3_core::DecodeError::NoFrame) => {
+                if consumed > 0 {
+                    Ok((consumed, 0))
+                } else {
+                    Err(DecoderError::NeedMoreData)
+                }
+            }
+            Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => {
+                if consumed == 0 {
+                    Err(DecoderError::NeedMoreData)
+                } else {
+                    Ok((consumed, 0))
+                }
+            }
+            Err(_) => {
+                if consumed > 0 {
+                    Ok((consumed, 0))
+                } else {
+                    Err(DecoderError::CorruptedFrame)
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        self.reset_in_place();
+    }
+}
+
 #[cfg(feature = "std")]
 struct FlacByteReader<'a> {
     data: &'a [u8],
@@ -1648,5 +1812,43 @@ mod tests {
             vorbis.flush();
             assert_eq!(vorbis.packets_decoded, 0);
         }
+    }
+
+    #[test]
+    fn test_static_mp3_decoder_partial_frame_and_id3() {
+        let mut dec = StaticMp3Decoder::new();
+        assert_eq!(dec.sample_rate, 44100);
+        dec.sample_rate = 48000;
+        dec.flush();
+        assert_eq!(dec.sample_rate, 44100);
+
+        // 2) Partial frame: Valid MPEG-1 Layer III 128 kbps 44.1 kHz header
+        // Frame size is 144 * 128_000 / 44_100 + 0 = 417 bytes.
+        let mut partial = [0u8; 250];
+        partial[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let mut pcm_out = [0i32; 2304];
+        let err = dec.decode(&partial, &mut pcm_out);
+        assert_eq!(err, Err(DecoderError::NeedMoreData));
+
+        // 3) Leading non-sync bytes before [0xFF, 0xFB, 0x90, 0x00]
+        let mut leading = [0u8; 300];
+        leading[0] = 0x12;
+        leading[1] = 0x34;
+        leading[2] = 0x56;
+        leading[3..7].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let (consumed, frames) = dec.decode(&leading, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(frames, 0);
+
+        // ID3 tag skip test:
+        let id3_header = [b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 20]; // 10 header + 20 payload = 30 total
+        let (consumed_id3, frames_id3) = dec.decode(&id3_header, &mut pcm_out).unwrap();
+        assert_eq!(consumed_id3, 10);
+        assert_eq!(frames_id3, 0);
+        assert_eq!(dec.id3_skip_remaining, 20);
+        let id3_tail = [0u8; 20];
+        let (consumed_tail, _) = dec.decode(&id3_tail, &mut pcm_out).unwrap();
+        assert_eq!(consumed_tail, 20);
+        assert_eq!(dec.id3_skip_remaining, 0);
     }
 }
