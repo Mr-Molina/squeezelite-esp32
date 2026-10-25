@@ -9,6 +9,9 @@ use squeezelite_audio_core::{
 };
 use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 
+pub use squeezelite_audio_core::EqPreset;
+pub type ActiveCodec = ActiveDecoder;
+
 #[cfg(not(target_arch = "xtensa"))]
 pub const PCM_SCRATCH_SAMPLES: usize = 8192;
 #[cfg(target_arch = "xtensa")]
@@ -138,6 +141,7 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub pcm_scratch: [i32; PCM_SCRATCH_SAMPLES],
     pub write_scratch: [u8; WRITE_SCRATCH_BYTES],
     pub output_i32_scratch: [i32; OUTPUT_I32_SCRATCH_SAMPLES],
+    pub current_eq_preset: EqPreset,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -164,6 +168,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             pcm_scratch: [0i32; PCM_SCRATCH_SAMPLES],
             write_scratch: [0u8; WRITE_SCRATCH_BYTES],
             output_i32_scratch: [0i32; OUTPUT_I32_SCRATCH_SAMPLES],
+            current_eq_preset: EqPreset::Flat,
         }
     }
 
@@ -247,10 +252,12 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
 
         if frames_produced > 0 {
-            // Apply DSP across ALL produced samples exactly once before buffering
+            // Apply DSP across ALL produced samples exactly once before buffering:
+            // 1. Equalizer preset and loudness contour in-place
+            // 2. Volume scaling and attenuation in-place
             let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
-            scale_samples_inplace(active_pcm, self.volume);
             self.equalizer.process_interleaved(active_pcm);
+            scale_samples_inplace(active_pcm, self.volume);
 
             let avail_frames = self.output_buffer.available_write() / 8;
             let frames_to_write = frames_produced.min(avail_frames);
@@ -323,6 +330,74 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Sets the active audio decoder.
     pub fn set_decoder(&mut self, decoder: ActiveDecoder) {
         self.decoder = decoder;
+    }
+
+    /// Applies a 10-band biquad graphic equalizer preset to the audio pipeline.
+    pub fn apply_eq_preset(&mut self, preset: EqPreset) {
+        self.current_eq_preset = preset;
+        self.equalizer.apply_preset(preset);
+    }
+
+    /// Sets the 10-band equalizer preset (alias for `apply_eq_preset`).
+    pub fn set_eq_preset(&mut self, preset: EqPreset) {
+        self.apply_eq_preset(preset);
+    }
+
+    /// Returns the currently active 10-band equalizer preset.
+    #[must_use]
+    pub const fn eq_preset(&self) -> EqPreset {
+        self.current_eq_preset
+    }
+
+    /// Enables or disables Horner's polynomial loudness contour compensation.
+    pub fn set_loudness(&mut self, enabled: bool) {
+        self.equalizer.set_loudness_contour(enabled);
+    }
+
+    /// Returns whether the loudness contour is currently enabled.
+    #[must_use]
+    pub const fn loudness_enabled(&self) -> bool {
+        self.equalizer.loudness_enabled()
+    }
+
+    /// Dynamically selects and instantiates the audio decoder based on the LMS format character or byte.
+    ///
+    /// - `'m'` / `'M'`: MP3 (nanomp3-core)
+    /// - `'f'` / `'F'`: FLAC (claxon)
+    /// - `'a'` / `'A'`: AAC (syom)
+    /// - `'o'` / `'O'`: Ogg Vorbis (lewton)
+    /// - `'p'` / `'P'`: PCM passthrough
+    pub fn select_format(&mut self, format_byte: u8) {
+        match format_byte {
+            b'm' | b'M' => {
+                #[cfg(not(target_arch = "xtensa"))]
+                self.set_decoder(ActiveDecoder::Mp3(Box::new(squeezelite_decoders::Mp3Decoder::new())));
+            }
+            b'f' | b'F' => {
+                #[cfg(not(target_arch = "xtensa"))]
+                self.set_decoder(ActiveDecoder::Flac(Box::new(squeezelite_decoders::FlacDecoder::new())));
+            }
+            b'a' | b'A' => {
+                #[cfg(not(target_arch = "xtensa"))]
+                self.set_decoder(ActiveDecoder::Aac(Box::new(squeezelite_decoders::AacDecoder::new())));
+            }
+            b'o' | b'O' => {
+                #[cfg(not(target_arch = "xtensa"))]
+                self.set_decoder(ActiveDecoder::Vorbis(Box::new(squeezelite_decoders::VorbisDecoder::new())));
+            }
+            b'p' | b'P' => {
+                self.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
+            }
+            _ => {
+                self.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
+            }
+        }
+    }
+
+    /// Executes one step of the audio pipeline (alias for `process_decode_step`).
+    #[inline]
+    pub fn step_audio_pipeline(&mut self) -> Result<usize, DecoderError> {
+        self.process_decode_step()
     }
 
     /// Sets sample rate on pipeline and output sink.
@@ -750,6 +825,146 @@ mod tests {
         }
 
         assert_eq!(pipeline.stream_buffer_available(), 0);
+    }
+
+    #[test]
+    fn test_pipeline_apply_eq_preset() {
+        let mut stream_mem = [0u8; 4096];
+        let mut out_mem = [0u8; 4096];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            MockAudioSink::<64>::new(),
+            44_100,
+        );
+        assert_eq!(pipeline.eq_preset(), squeezelite_audio_core::EqPreset::Flat);
+
+        pipeline.apply_eq_preset(squeezelite_audio_core::EqPreset::BassBoost);
+        assert_eq!(pipeline.eq_preset(), squeezelite_audio_core::EqPreset::BassBoost);
+        assert!(pipeline.equalizer.is_enabled());
+
+        pipeline.apply_eq_preset(squeezelite_audio_core::EqPreset::Flat);
+        assert_eq!(pipeline.eq_preset(), squeezelite_audio_core::EqPreset::Flat);
+        assert!(!pipeline.equalizer.is_enabled());
+    }
+
+    #[test]
+    fn test_pipeline_loudness_contour() {
+        let mut stream_mem = [0u8; 4096];
+        let mut out_mem = [0u8; 4096];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            MockAudioSink::<64>::new(),
+            44_100,
+        );
+        assert!(!pipeline.loudness_enabled());
+
+        pipeline.set_loudness(true);
+        assert!(pipeline.loudness_enabled());
+
+        pipeline.set_loudness(false);
+        assert!(!pipeline.loudness_enabled());
+    }
+
+    #[test]
+    fn test_pipeline_select_format_codecs() {
+        let mut stream_mem = [0u8; 4096];
+        let mut out_mem = [0u8; 4096];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            MockAudioSink::<64>::new(),
+            44_100,
+        );
+
+        pipeline.select_format(b'm');
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Mp3(_)));
+
+        pipeline.select_format(b'f');
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+
+        pipeline.select_format(b'a');
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Aac(_)));
+
+        pipeline.select_format(b'o');
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Vorbis(_)));
+
+        pipeline.select_format(b'p');
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
+
+        // Unknown format defaults to PCM
+        pipeline.select_format(b'?');
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
+    }
+
+    #[test]
+    fn test_pipeline_eq_processed_before_volume_scaling() {
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let pcm_decoder = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_decoder),
+            sink,
+            44100,
+        );
+
+        pipeline.set_eq_preset(EqPreset::BassBoost);
+        assert_eq!(pipeline.eq_preset(), EqPreset::BassBoost);
+
+        // 50% digital volume attenuation
+        pipeline.set_volume(0x00008000, 0x00008000);
+
+        // Feed 1 stereo frame (4 bytes) of 16-bit PCM: (4000, -4000)
+        let f1_l = (4000i16).to_be_bytes();
+        let f1_r = (-4000i16).to_be_bytes();
+        let raw = [f1_l[0], f1_l[1], f1_r[0], f1_r[1]];
+
+        pipeline.ingest_stream_data(&raw).unwrap();
+        let consumed = pipeline.step_audio_pipeline().unwrap();
+        assert_eq!(consumed, 4);
+
+        let out = pipeline.process_output_step().unwrap();
+        assert_eq!(out, 1);
+        assert_eq!(pipeline.sink.recorded_samples().len(), 2);
+    }
+
+    #[test]
+    fn test_pipeline_all_eq_presets_roundtrip() {
+        let mut stream_mem = [0u8; 1024];
+        let mut out_mem = [0u8; 1024];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveCodec::Pcm(PcmDecoder::new(16, 2, true)),
+            MockAudioSink::<64>::new(),
+            44_100,
+        );
+
+        let presets = [
+            EqPreset::Flat,
+            EqPreset::BassBoost,
+            EqPreset::Loudness,
+            EqPreset::Vocal,
+            EqPreset::Rock,
+        ];
+
+        for &p in &presets {
+            pipeline.set_eq_preset(p);
+            assert_eq!(pipeline.eq_preset(), p);
+            if p == EqPreset::Flat {
+                assert!(!pipeline.equalizer.is_enabled());
+            } else {
+                assert!(pipeline.equalizer.is_enabled());
+            }
+        }
     }
 }
 
