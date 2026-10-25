@@ -58,3 +58,7 @@ The following mechanical invariants are binding safety rules enforced across ses
 
 ## Invariant 43: Ground Truth Entity & Acronym Verification
 - **Rule**: Agents MUST verify institutional names, client identities, organization titles, and domain acronym expansions against authoritative repository documentation or device backups before scaffolding UI templates or configuration copy.
+
+## Invariant 44: End-to-End Control, Stream Resync & Sibling-Daemon Regression Verification Gate
+- **Rule**: (1) Interactive UI controls MUST NOT be certified via static HTML byte-count checks (`curl GET /`); verification MUST execute at least one state-changing control request against the live endpoint and confirm backend state mutation. (2) Streaming audio decoders MUST advance/consume bytes on all error paths (`CorruptedFrame`, `NoFrame`, `ReservoirUnavailable`, oversized false-sync `frame_bytes`) so a single corrupt byte never deadlocks the ringbuffer. (3) Before and after restarting a parent service daemon (e.g., `logitechmediaserver`), agents MUST verify all previously active child bridge processes (`shairport_helper`, UPnP) remain running.
+

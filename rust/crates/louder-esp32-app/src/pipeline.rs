@@ -720,5 +720,36 @@ mod tests {
         assert_eq!(pipeline.sample_rate, 48000);
         assert_eq!(pipeline.sink.sample_rate, 48000);
     }
+
+    #[test]
+    fn test_mp3_corrupt_frame_skips_and_recovers() {
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mp3_decoder = squeezelite_decoders::Mp3Decoder::new();
+        let sink = MockAudioSink::<64>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Mp3(Box::new(mp3_decoder)),
+            sink,
+            44100,
+        );
+
+        // Ingest corrupted / garbage bytes
+        let garbage = [0x55, 0xAA, 0x12, 0x34, 0xFE, 0xDC, 0xBA, 0x98];
+        pipeline.ingest_stream_data(&garbage).unwrap();
+        assert_eq!(pipeline.stream_buffer_available(), 8);
+
+        // Process decode steps: must consume bytes and progress without deadlock
+        for _ in 0..8 {
+            if pipeline.stream_buffer_available() == 0 {
+                break;
+            }
+            let _ = pipeline.process_decode_step();
+        }
+
+        assert_eq!(pipeline.stream_buffer_available(), 0);
+    }
 }
 

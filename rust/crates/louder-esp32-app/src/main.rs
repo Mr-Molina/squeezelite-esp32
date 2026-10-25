@@ -72,10 +72,10 @@ where
                 }
             }
 
-            // 2. Now that hardware I2S0 DMA is topped up, decode at most 1 MP3 frame (or up to 4 fast PCM chunks)
+            // 2. Now that hardware I2S0 DMA is topped up, decode at most 1 audio frame (or fast resync/skip up to 16 chunks)
             // if no pending PCM remains and output_buffer has space.
             let max_decode_steps = match pipeline.decoder {
-                ActiveDecoder::Mp3(_) => 1,
+                ActiveDecoder::Mp3(_) => 16,
                 _ => 4,
             };
             for _ in 0..max_decode_steps {
@@ -83,7 +83,12 @@ where
                     && pipeline.output_buffer.available_write() >= 1024
                     && pipeline.stream_buffer.available_read() > 0
                 {
-                    if !matches!(pipeline.process_decode_step(), Ok(c) if c > 0) {
+                    let prev_out = pipeline.output_buffer.available_read();
+                    let res = pipeline.process_decode_step();
+                    if pipeline.has_pending_pcm() || pipeline.output_buffer.available_read() > prev_out {
+                        break;
+                    }
+                    if !matches!(res, Ok(c) if c > 0) {
                         break;
                     }
                 } else {
@@ -897,7 +902,7 @@ mod xtensa_hw {
         audio_tx_buf: [u8; 512],
         slim_acc_buf: [u8; 1536],
         audio_req_buf: [u8; 512],
-        audio_header_buf: [u8; 2048],
+        audio_header_buf: [u8; 2000],
     }
 
     impl FirmwareBssBuffers {
@@ -912,7 +917,7 @@ mod xtensa_hw {
                 audio_tx_buf: [0u8; 512],
                 slim_acc_buf: [0u8; 1536],
                 audio_req_buf: [0u8; 512],
-                audio_header_buf: [0u8; 2048],
+                audio_header_buf: [0u8; 2000],
             }
         }
     }
@@ -1292,6 +1297,12 @@ mod xtensa_hw {
                             louder_esp32_app::AmpMode::Standby => "Standby",
                             louder_esp32_app::AmpMode::PowerDown => "PowerDown",
                         };
+                        let vol_reg = amp.current_volume();
+                        let vol_pct = if vol_reg == 0xFF {
+                            0
+                        } else {
+                            100u8.saturating_sub(vol_reg.saturating_sub(0x30))
+                        };
                         let snap = HttpStatusSnapshot {
                             ip: assigned_ip.unwrap_or([172, 22, 1, 15]),
                             netmask: assigned_mask,
@@ -1304,11 +1315,12 @@ mod xtensa_hw {
                             otadata_prearmed_factory: true,
                             frames_played: pipeline.frames_played,
                             amp_mode: amp_mode_str,
+                            vol_pct,
                             i2c_acks: Esp32I2cBus::hw_ack_count(),
                             i2c_nacks: Esp32I2cBus::hw_nack_count(),
                             uptime_ms: now_ms.saturating_sub(boot_ms),
                         };
-                        let mut resp_buf = [0u8; 640];
+                        let mut resp_buf = [0u8; 768];
                         if let Some((hdr_or_resp_len, static_body, action)) =
                             handle_http_request_streaming(&req_buf[..n], &snap, &mut resp_buf)
                         {
@@ -1328,9 +1340,40 @@ mod xtensa_hw {
                                 pending_http_closing = true;
                                 pending_close_deadline_ms = now_ms + 500;
                             }
-                            if action != HttpControlAction::None {
-                                pending_http_action = action;
-                                pending_action_deadline_ms = now_ms + 250;
+                            match action {
+                                HttpControlAction::PlayerIrCommand { ir_code, vol_pct, mute } => {
+                                    if let Some(pct) = vol_pct {
+                                        let vol_reg = if pct == 0 {
+                                            0xFF
+                                        } else {
+                                            0x30 + (100 - pct.min(100))
+                                        };
+                                        let _ = amp.set_volume(vol_reg);
+                                        let eff_gain = if pct > 0 { 65536 } else { 0 };
+                                        pipeline.set_volume(eff_gain, eff_gain);
+                                    }
+                                    if let Some(m) = mute {
+                                        pipeline.sink.set_mute(m);
+                                    }
+                                    if ir_code != 0 {
+                                        let slim_sock = sockets.get_mut::<tcp::Socket>(slim_handle);
+                                        if slim_sock.may_send() {
+                                            let mut ir_buf = [0u8; 32];
+                                            if let Ok(ir_len) = SlimprotoBuilder::build_ir(
+                                                now_ms as u32,
+                                                ir_code,
+                                                &mut ir_buf,
+                                            ) {
+                                                let _ = slim_sock.send_slice(&ir_buf[..ir_len]);
+                                            }
+                                        }
+                                    }
+                                }
+                                HttpControlAction::RebootToRecovery | HttpControlAction::PersistOta0AndReboot => {
+                                    pending_http_action = action;
+                                    pending_action_deadline_ms = now_ms + 250;
+                                }
+                                HttpControlAction::None => {}
                             }
                         }
                     }
@@ -1350,7 +1393,7 @@ mod xtensa_hw {
                         println!("[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> wrote ota_0 select entry & resetting");
                         esp_hal::system::software_reset();
                     }
-                    HttpControlAction::None => {}
+                    _ => {}
                 }
             }
 

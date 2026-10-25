@@ -32,6 +32,9 @@ impl fmt::Display for ParseError {
     }
 }
 
+/// Type alias for packet serialization errors.
+pub type BuildError = ParseError;
+
 /// Supported audio streaming formats transmitted by LMS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
@@ -1000,6 +1003,23 @@ impl SlimprotoBuilder {
 
         Ok(total_len)
     }
+
+    /// Formats an infrared remote control packet (`IR  `) forwarding NEC IR button presses to LMS.
+    /// Wire format: 4-byte opcode (`b"IR  "`), 4-byte length (10), 4-byte timestamp, 1-byte code type (0xFF), 1-byte bits (16), 4-byte IR code.
+    pub fn build_ir(time_ms: u32, ir_code: u32, out: &mut [u8]) -> Result<usize, BuildError> {
+        if out.len() < 18 {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        out[0..4].copy_from_slice(b"IR  ");
+        out[4..8].copy_from_slice(&10u32.to_be_bytes());
+        out[8..12].copy_from_slice(&time_ms.to_be_bytes());
+        out[12] = 0xFF;
+        out[13] = 16;
+        out[14..18].copy_from_slice(&ir_code.to_be_bytes());
+
+        Ok(18)
+    }
 }
 
 /// Discovered Logitech Media Server details from UDP broadcast query.
@@ -1771,5 +1791,24 @@ mod tests {
         .unwrap();
         assert_eq!(&buf_noreconn[32..34], &0u16.to_be_bytes());
         assert_eq!(&buf_noreconn[34..42], &0u64.to_be_bytes());
+    }
+
+    #[test]
+    fn test_build_ir_encodes_nec_slimproto_frame() {
+        let mut buf = [0u8; 32];
+        let len = SlimprotoBuilder::build_ir(123456, 0x7689_10EF, &mut buf).unwrap();
+        assert_eq!(len, 18);
+        assert_eq!(&buf[0..4], b"IR  ");
+        assert_eq!(&buf[4..8], &10u32.to_be_bytes());
+        assert_eq!(&buf[8..12], &123456u32.to_be_bytes());
+        assert_eq!(buf[12], 0xFF);
+        assert_eq!(buf[13], 16);
+        assert_eq!(&buf[14..18], &0x7689_10EFu32.to_be_bytes());
+
+        let mut short_buf = [0u8; 17];
+        assert_eq!(
+            SlimprotoBuilder::build_ir(100, 0x1234, &mut short_buf),
+            Err(ParseError::PayloadTooLarge)
+        );
     }
 }

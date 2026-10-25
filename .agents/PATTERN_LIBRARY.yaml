@@ -215,3 +215,46 @@ patterns:
   - session: conversation://8a779460-b3e0-4c18-972f-af0baecb5405
     date: '2026-09-10'
     postmortem_ref: PM-2026-0910-001
+- id: PAT-2026-1025-001
+  name: Audio Decoder Resynchronization & Corrupted Frame Byte Advancement Gate
+  failure_type: logic
+  scope: project
+  root_cause_category: decoder_resync_ringbuffer_wedging
+  description: Streaming audio decoders failed to advance or consume stream buffer bytes
+    on decode errors (CorruptedFrame, NoFrame, ReservoirUnavailable, oversized false-sync
+    frame_bytes), permanently wedging the decode ringbuffer and halting playback. Decoders
+    and audio pipelines MUST advance at least 1 byte past invalid frames on all error
+    paths to resynchronize to subsequent valid frames.
+  escalation_level: 3
+  mitigation_level: 3
+  current_mitigation: automation — automated unit tests in louder-esp32-app and squeezelite-decoders
+  mitigation_target: rust/crates/louder-esp32-app/src/pipeline.rs
+  postmortem_ids:
+  - PM-2026-1025-001
+  occurrences:
+  - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
+    date: '2026-10-25'
+    postmortem_ref: PM-2026-1025-001
+- id: PAT-2026-1025-002
+  name: Proxy-Verification Fallacy, Sibling Service Regression & Audit Mislabeling Gate
+  failure_type: behavioral
+  scope: global
+  root_cause_category: proxy_verification_sibling_regression_audit_conflation
+  description: Certifying interactive Web UI controls via static HTML curl byte counts,
+    restarting multi-plugin parent daemons without verifying sibling helper bridge processes,
+    and labeling read-only feasibility audits as [EXECUTED & VERIFIED] when features remain
+    unimplemented. Interactive controls MUST execute live state-changing mutations, parent
+    daemon restarts MUST verify all sibling helper processes (pgrep/ss), and read-only audits
+    MUST NOT be reported as feature completion.
+  escalation_level: 2
+  mitigation_level: 2
+  current_mitigation: mechanical_invariant — Invariant 44 in .agents/INFRASTRUCTURE_INVARIANTS.md
+    and ~/.gemini/config/rules/verify-autonomous-work.md
+  mitigation_target: .agents/INFRASTRUCTURE_INVARIANTS.md
+  postmortem_ids:
+  - PM-2026-1025-002
+  occurrences:
+  - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
+    date: '2026-10-25'
+    postmortem_ref: PM-2026-1025-002
+

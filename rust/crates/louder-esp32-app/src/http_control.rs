@@ -30,6 +30,12 @@ pub enum HttpControlAction {
     /// Write `OtaSelectEntry::new_ota_0()` to `0xD000` and trigger `software_reset()`
     /// so the next boot stays in `ota_0` (`0x160000`).
     PersistOta0AndReboot,
+    /// Transmit SlimProto IR packet to LMS and/or adjust amplifier volume/mute.
+    PlayerIrCommand {
+        ir_code: u32,
+        vol_pct: Option<u8>,
+        mute: Option<bool>,
+    },
 }
 
 /// Live telemetry snapshot serialized into `GET /status.json`.
@@ -57,6 +63,8 @@ pub struct HttpStatusSnapshot<'a> {
     pub frames_played: u64,
     /// Current TAS5805M amplifier mode label (`"Play"`, `"HiZ"`, `"DeepSleep"`, `"Fault"`).
     pub amp_mode: &'a str,
+    /// Current TAS5805M amplifier volume percentage (`0..=100%`).
+    pub vol_pct: u8,
     /// Total hardware `I2C0` ACK transactions to `0x2D`.
     pub i2c_acks: u32,
     /// Total hardware `I2C0` NACK errors.
@@ -79,6 +87,7 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             otadata_prearmed_factory: true,
             frames_played: 0,
             amp_mode: "HiZ",
+            vol_pct: 55,
             i2c_acks: 0,
             i2c_nacks: 0,
             uptime_ms: 0,
@@ -133,10 +142,10 @@ pub fn handle_http_request_streaming(
             Some((resp.len(), &[], HttpControlAction::None))
         }
         ("GET", "/status.json") => {
-            let mut body: String<512> = String::new();
+            let mut body: String<576> = String::new();
             let _ = write!(
                 body,
-                "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{}}}",
+                "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{}}}",
                 REQUIRED_OTA_PROJECT_NAME,
                 RUST_OTA_FIRMWARE_VERSION,
                 snapshot.otadata_prearmed_factory,
@@ -162,11 +171,12 @@ pub fn handle_http_request_streaming(
                 snapshot.lms_ip[3],
                 snapshot.frames_played,
                 snapshot.amp_mode,
+                snapshot.vol_pct,
                 snapshot.i2c_acks,
                 snapshot.i2c_nacks,
                 snapshot.uptime_ms,
             );
-            let mut response: String<640> = String::new();
+            let mut response: String<704> = String::new();
             let _ = write!(
                 response,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
@@ -179,6 +189,133 @@ pub fn handle_http_request_streaming(
             }
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
             Some((resp_bytes.len(), &[], HttpControlAction::None))
+        }
+        ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
+            let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let act = query.split('&').find_map(|p| p.strip_prefix("act=")).unwrap_or("");
+            let (action, ok) = match act {
+                "play" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_10EF,
+                        vol_pct: None,
+                        mute: Some(false),
+                    },
+                    true,
+                ),
+                "pause" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_20DF,
+                        vol_pct: None,
+                        mute: None,
+                    },
+                    true,
+                ),
+                "stop" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_20DF,
+                        vol_pct: None,
+                        mute: Some(true),
+                    },
+                    true,
+                ),
+                "prev" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_C03F,
+                        vol_pct: None,
+                        mute: None,
+                    },
+                    true,
+                ),
+                "next" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_A05F,
+                        vol_pct: None,
+                        mute: None,
+                    },
+                    true,
+                ),
+                "volup" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_807F,
+                        vol_pct: Some((snapshot.vol_pct + 5).min(100)),
+                        mute: Some(false),
+                    },
+                    true,
+                ),
+                "voldown" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_00FF,
+                        vol_pct: Some(snapshot.vol_pct.saturating_sub(5)),
+                        mute: None,
+                    },
+                    true,
+                ),
+                "preset1" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_F00F,
+                        vol_pct: None,
+                        mute: Some(false),
+                    },
+                    true,
+                ),
+                "preset2" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_08F7,
+                        vol_pct: None,
+                        mute: Some(false),
+                    },
+                    true,
+                ),
+                "preset3" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_8877,
+                        vol_pct: None,
+                        mute: Some(false),
+                    },
+                    true,
+                ),
+                "preset4" => (
+                    HttpControlAction::PlayerIrCommand {
+                        ir_code: 0x7689_48B7,
+                        vol_pct: None,
+                        mute: Some(false),
+                    },
+                    true,
+                ),
+                other if other.starts_with("vol") && !other[3..].is_empty() && other[3..].chars().all(|c| c.is_ascii_digit()) => {
+                    let pct: u8 = other[3..].parse().unwrap_or(snapshot.vol_pct).min(100);
+                    (
+                        HttpControlAction::PlayerIrCommand {
+                            ir_code: 0,
+                            vol_pct: Some(pct),
+                            mute: Some(false),
+                        },
+                        true,
+                    )
+                }
+                _ => (HttpControlAction::None, false),
+            };
+
+            let mut body: String<128> = String::new();
+            if ok {
+                let _ = write!(body, "{{\"ok\":true,\"act\":\"{}\"}}", act);
+            } else {
+                let _ = write!(body, "{{\"ok\":false,\"error\":\"unknown_action\"}}");
+            }
+
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body.as_str()
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], action))
         }
         ("POST", "/recovery.json") | ("GET", "/recovery.json") => {
             let body = "{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}";
@@ -270,7 +407,7 @@ pub fn handle_http_control_request(
 }
 
 /// Static HTML dashboard embedded for `GET /` and `GET /index.html` requests.
-pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:8px;background:#111;color:#eee}h3{margin:6px 0 2px;color:#0ef}table{width:100%;border-collapse:collapse}td{padding:2px 6px;border:1px solid #333;font-size:12px}button{margin:2px;padding:4px 8px;background:#222;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer}a{color:#0ef;text-decoration:none;font-size:12px}</style></head><body><h3>Louder-ESP32 Control</h3><table><tr><td>Net/RSSI</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Amp/Up</td><td id=\"s\">-</td></tr><tr><td>Audio</td><td id=\"f\">-</td></tr><tr><td>I2C</td><td id=\"i\">-</td></tr><tr><td>Firmware</td><td id=\"w\">-</td></tr></table><h3>Transport &amp; Volume</h3><button style=\"background:#085\" onclick=\"lms(['play'])\">&#9654;Play</button><button onclick=\"lms(['pause','1'])\">&#10074;&#10074;Pause</button><button onclick=\"lms(['stop'])\">&#9632;Stop</button><button onclick=\"lms(['playlist','index','-1'])\">&#9198;Prev</button><button onclick=\"lms(['playlist','index','+1'])\">Next&#9197;</button><br><button onclick=\"lms(['mixer','volume','-5'])\">-5%</button><button onclick=\"lms(['mixer','volume','25'])\">25%</button><button onclick=\"lms(['mixer','volume','40'])\">40%</button><button onclick=\"lms(['mixer','volume','55'])\">55%</button><button onclick=\"lms(['mixer','volume','70'])\">70%</button><button onclick=\"lms(['mixer','volume','85'])\">85%</button><button onclick=\"lms(['mixer','volume','+5'])\">+5%</button><h3>Presets</h3><button style=\"background:#158\" onclick=\"ply(0)\">Ibiza</button><button style=\"background:#158\" onclick=\"ply(1)\">WHYY</button><button style=\"background:#158\" onclick=\"ply(2)\">WDIY</button><button style=\"background:#158\" onclick=\"ply(3)\">Groove</button><br><a id=\"ll\" href=\"http://10.0.0.10:9000/\" target=\"_blank\">&rarr; Open Full Lyrion UI (10.0.0.10:9000)</a><h3>System</h3><button style=\"background:#922\" onclick=\"if(confirm('Recovery?'))fetch('/recovery.json',{method:'POST'}).then(()=>alert('Recovery...'))\">Reboot to Recovery (0x10000)</button><button style=\"background:#444\" onclick=\"if(confirm('Reboot OTA?'))fetch('/reboot_ota.json',{method:'POST'}).then(()=>alert('Reboot OTA...'))\">Commit OTA &amp; Reboot</button><script>var h='10.0.0.10:9000',pF=0,pT=0,P=['https://cdn-peer032.streaming-pro.com:8025/ibizaglobalradio.mp3','https://whyy.streamguys1.com/whyy_tunein','https://war.streamguys1.com:7883/wdiy_7880','file:///var/lib/squeezeboxserver/cache/djmix_demo_tracks/01_Basement_Deep_Groove_122bpm_8A.wav'];function lms(c){fetch('http://'+h+'/jsonrpc.js',{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify({id:1,method:'slim.request',params:['c8:2e:18:be:b8:34',c]})});}function ply(i){lms(['playlist','play',P[i]]);}function g(k,v){document.getElementById(k).innerText=v;}function u(){var n=Date.now();fetch('/status.json').then(r=>r.json()).then(d=>{h=d.lms_ip+':'+d.lms_port;document.getElementById('ll').href='http://'+h+'/';g('n',d.ip+' ('+d.ssid+' '+d.rssi+'dBm)');g('l',h+' (CLI '+d.lms_cport+')');var up=d.uptime_ms/1000|0;g('s',d.amp_mode+' | Up '+(up/60|0)+':'+((up%60<10)?'0':'')+(up%60));var fps=(pT>0&&n>pT)?((d.frames_played-pF)*1000/(n-pT)|0):0;pF=d.frames_played;pT=n;g('f',fps+' fps ('+d.frames_played+')');g('i','ACK: '+d.i2c_acks+' / NACK: '+d.i2c_nacks);g('w',d.version+' ('+(d.otadata_prearmed_factory?'Pre-Armed':'Normal')+')');}).catch(()=>{});}u();setInterval(u,1500);</script></body></html>";
+pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:8px;background:#111;color:#eee}h3{margin:6px 0 2px;color:#0ef}table{width:100%;border-collapse:collapse}td{padding:2px 6px;border:1px solid #333;font-size:12px}button{margin:2px;padding:4px 8px;background:#222;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer}a{color:#0ef;text-decoration:none;font-size:12px}</style></head><body><h3>Louder-ESP32 Control</h3><table><tr><td>Net/RSSI</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Amp/Up</td><td id=\"s\">-</td></tr><tr><td>Audio</td><td id=\"f\">-</td></tr><tr><td>I2C</td><td id=\"i\">-</td></tr><tr><td>Firmware</td><td id=\"w\">-</td></tr></table><h3>Transport &amp; Volume</h3><button style=\"background:#085\" onclick=\"cmd('play')\">&#9654;Play</button><button onclick=\"cmd('pause')\">&#10074;&#10074;Pause</button><button onclick=\"cmd('stop')\">&#9632;Stop</button><button onclick=\"cmd('prev')\">&#9198;Prev</button><button onclick=\"cmd('next')\">Next&#9197;</button><br><button onclick=\"cmd('voldown')\">-5%</button><button onclick=\"cmd('vol25')\">25%</button><button onclick=\"cmd('vol40')\">40%</button><button onclick=\"cmd('vol55')\">55%</button><button onclick=\"cmd('vol70')\">70%</button><button onclick=\"cmd('vol85')\">85%</button><button onclick=\"cmd('volup')\">+5%</button><h3>Presets</h3><button style=\"background:#158\" onclick=\"cmd('preset1')\">Ibiza</button><button style=\"background:#158\" onclick=\"cmd('preset2')\">WHYY</button><button style=\"background:#158\" onclick=\"cmd('preset3')\">WDIY</button><button style=\"background:#158\" onclick=\"cmd('preset4')\">Groove</button><br><a id=\"ll\" href=\"http://10.0.0.10:9000/\" target=\"_blank\">&rarr; Open Full Lyrion UI (10.0.0.10:9000)</a><h3>System</h3><button style=\"background:#922\" onclick=\"if(confirm('Recovery?'))fetch('/recovery.json',{method:'POST'}).then(()=>alert('Recovery...'))\">Reboot to Recovery (0x10000)</button><button style=\"background:#444\" onclick=\"if(confirm('Reboot OTA?'))fetch('/reboot_ota.json',{method:'POST'}).then(()=>alert('Reboot OTA...'))\">Commit OTA &amp; Reboot</button><script>var pF=0,pT=0;function cmd(a){fetch('/cmd.json?act='+a).then(u).catch(()=>{});}function g(k,v){document.getElementById(k).innerText=v;}function u(){var n=Date.now();fetch('/status.json').then(r=>r.json()).then(d=>{var h=d.lms_ip+':'+d.lms_port;document.getElementById('ll').href='http://'+h+'/';g('n',d.ip+' ('+d.ssid+' '+d.rssi+'dBm)');g('l',h+' (CLI '+d.lms_cport+')');var up=d.uptime_ms/1000|0;g('s',d.amp_mode+' ('+d.vol_pct+'%) | Up '+(up/60|0)+':'+((up%60<10)?'0':'')+(up%60));var fps=(pT>0&&n>pT)?((d.frames_played-pF)*1000/(n-pT)|0):0;pF=d.frames_played;pT=n;g('f',fps+' fps ('+d.frames_played+')');g('i','ACK: '+d.i2c_acks+' / NACK: '+d.i2c_nacks);g('w',d.version+' ('+(d.otadata_prearmed_factory?'Pre-Armed':'Normal')+')');}).catch(()=>{});}u();setInterval(u,1500);</script></body></html>";
 
 /// Health verdict emitted by [`DeadManLeaseWatchdog::evaluate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +493,111 @@ mod tests {
         assert!(resp.contains("\"ip\":\"172.22.1.15\""));
         assert!(resp.contains("\"frames_played\":1024"));
         assert!(resp.contains("\"amp_mode\":\"Play\""));
+        assert!(resp.contains("\"vol_pct\":55"));
+    }
+
+    #[test]
+    fn handles_cmd_json_player_ir_and_volume_commands() {
+        let snap = HttpStatusSnapshot {
+            vol_pct: 60,
+            ..HttpStatusSnapshot::default()
+        };
+        let mut buf = [0u8; 512];
+
+        // 1. Play
+        let (len1, act1) =
+            handle_http_control_request(b"GET /cmd.json?act=play HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act1,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_10EF,
+                vol_pct: None,
+                mute: Some(false)
+            }
+        );
+        let resp1 = core::str::from_utf8(&buf[..len1]).unwrap();
+        assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp1.contains("Access-Control-Allow-Origin: *"));
+        assert!(resp1.contains("{\"ok\":true,\"act\":\"play\"}"));
+
+        // 2. Pause
+        let (_len2, act2) =
+            handle_http_control_request(b"GET /cmd.json?act=pause HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act2,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_20DF,
+                vol_pct: None,
+                mute: None
+            }
+        );
+
+        // 3. Stop
+        let (_len3, act3) =
+            handle_http_control_request(b"GET /cmd.json?act=stop HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act3,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_20DF,
+                vol_pct: None,
+                mute: Some(true)
+            }
+        );
+
+        // 4. VolUp (+5% from snapshot.vol_pct=60 -> 65)
+        let (_len4, act4) =
+            handle_http_control_request(b"GET /cmd.json?act=volup HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act4,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_807F,
+                vol_pct: Some(65),
+                mute: Some(false)
+            }
+        );
+
+        // 5. VolDown (-5% from snapshot.vol_pct=60 -> 55)
+        let (_len5, act5) =
+            handle_http_control_request(b"GET /cmd.json?act=voldown HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act5,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_00FF,
+                vol_pct: Some(55),
+                mute: None
+            }
+        );
+
+        // 6. Direct volume setting: vol70
+        let (_len6, act6) =
+            handle_http_control_request(b"GET /cmd.json?act=vol70 HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act6,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0,
+                vol_pct: Some(70),
+                mute: Some(false)
+            }
+        );
+
+        // 7. Preset1
+        let (_len7, act7) =
+            handle_http_control_request(b"GET /cmd.json?act=preset1 HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(
+            act7,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_F00F,
+                vol_pct: None,
+                mute: Some(false)
+            }
+        );
+
+        // 8. Unknown action -> ok: false
+        let (len8, act8) =
+            handle_http_control_request(b"GET /cmd.json?act=unknown HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+        assert_eq!(act8, HttpControlAction::None);
+        let resp8 = core::str::from_utf8(&buf[..len8]).unwrap();
+        assert!(resp8.contains("{\"ok\":false,\"error\":\"unknown_action\"}"));
     }
 
     #[test]

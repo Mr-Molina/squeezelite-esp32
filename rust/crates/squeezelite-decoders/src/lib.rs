@@ -703,7 +703,7 @@ impl AudioDecoder for StaticMp3Decoder {
             idx += 1;
         }
 
-        let slice_to_decode = match sync_offset {
+        let (frame_bytes, slice_to_decode) = match sync_offset {
             None => {
                 let skip = encoded_in.len().saturating_sub(3);
                 if skip > 0 {
@@ -716,18 +716,17 @@ impl AudioDecoder for StaticMp3Decoder {
             }
             Some((0, h)) => {
                 let frame_bytes = h.frame_bytes(0) + h.padding();
-                if frame_bytes > 0 {
-                    if encoded_in.len() < frame_bytes + 4 {
-                        return Err(DecoderError::NeedMoreData);
-                    }
-                    let next_h = nanomp3_core::__private::Header::read(&encoded_in[frame_bytes..]);
-                    if !h.compare(next_h) {
-                        return Ok((1, 0));
-                    }
-                    &encoded_in[..frame_bytes + 4]
-                } else {
-                    encoded_in
+                if frame_bytes == 0 || frame_bytes + 4 > 1536 {
+                    return Ok((1, 0));
                 }
+                if encoded_in.len() < frame_bytes + 4 {
+                    return Err(DecoderError::NeedMoreData);
+                }
+                let next_h = nanomp3_core::__private::Header::read(&encoded_in[frame_bytes..]);
+                if !h.compare(next_h) {
+                    return Ok((1, 0));
+                }
+                (frame_bytes, &encoded_in[..frame_bytes + 4])
             }
             _ => unreachable!(),
         };
@@ -756,25 +755,11 @@ impl AudioDecoder for StaticMp3Decoder {
                 }
                 Ok((consumed, frames_produced))
             }
-            Err(nanomp3_core::DecodeError::NoFrame) => {
-                if consumed > 0 {
-                    Ok((consumed, 0))
-                } else {
-                    Err(DecoderError::NeedMoreData)
-                }
-            }
-            Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => {
-                if consumed == 0 {
-                    Err(DecoderError::NeedMoreData)
-                } else {
-                    Ok((consumed, 0))
-                }
-            }
             Err(_) => {
                 if consumed > 0 {
                     Ok((consumed, 0))
                 } else {
-                    Err(DecoderError::CorruptedFrame)
+                    Ok((frame_bytes.max(1), 0))
                 }
             }
         }
@@ -1852,5 +1837,40 @@ mod tests {
         let (consumed_tail, _) = dec.decode(&id3_tail, &mut pcm_out).unwrap();
         assert_eq!(consumed_tail, 20);
         assert_eq!(dec.id3_skip_remaining, 0);
+    }
+
+    #[test]
+    fn test_static_mp3_decoder_never_deadlocks_on_false_sync_or_reservoir() {
+        let mut dec = StaticMp3Decoder::new();
+        let mut pcm_out = [0i32; 2304];
+
+        // 1. Two matching valid MP3 headers (MPEG-1 Layer III 128 kbps 44.1 kHz = 417 bytes)
+        // but with all-zero/garbage payload that cannot be decoded as valid audio or has no reservoir.
+        let mut corrupted_frame = [0u8; 417 + 4];
+        corrupted_frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        corrupted_frame[4..417].fill(0xFF);
+        corrupted_frame[417..417 + 4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+
+        // Decoder must NOT return NeedMoreData; it must return Ok((consumed, 0)) to advance past bad frame!
+        let res = dec.decode(&corrupted_frame, &mut pcm_out);
+        assert!(res.is_ok(), "Expected Ok but got {:?}", res);
+        let (consumed, frames) = res.unwrap();
+        assert!(consumed >= 417, "Expected at least 417 bytes consumed, got {}", consumed);
+        assert_eq!(frames, 0);
+
+        // 2. Unmatched second header: first header matches sync, but byte at 417 does not match
+        let mut unmatched = [0u8; 417 + 4];
+        unmatched[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        unmatched[417] = 0x00; // Not a matching header
+        let (consumed_unmatched, frames_unmatched) = dec.decode(&unmatched, &mut pcm_out).unwrap();
+        assert_eq!(consumed_unmatched, 1);
+        assert_eq!(frames_unmatched, 0);
+
+        // 3. Invalid bitrate nibble (0xF) is rejected by Header::read, skipping non-sync bytes
+        let mut invalid_bitrate = [0u8; 16];
+        invalid_bitrate[0..4].copy_from_slice(&[0xFF, 0xFB, 0xF0, 0x00]);
+        let (consumed_inv, frames_inv) = dec.decode(&invalid_bitrate, &mut pcm_out).unwrap();
+        assert_eq!(consumed_inv, 13);
+        assert_eq!(frames_inv, 0);
     }
 }
