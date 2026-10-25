@@ -221,10 +221,15 @@ impl Tas5805mTelemetry {
         self.bck_mon as u16
     }
 
-    /// Returns `true` if `CLKDET_STATUS` (`0x39`) bit 3 indicates internal PLL lock (`1`) and no clock error.
+    /// Returns `true` if `CLKDET_STATUS` (`0x39`) bit 3 indicates internal PLL lock (`1`) or
+    /// when `CLKDET_STATUS` bits `2:0` (`0x07`) report zero clock faults while `FS_MON` (`0x37`)
+    /// reports a valid sample rate (`> 0`) and `BCK_MON` (`0x38`) reports a valid BCK ratio (`>= 32`).
     #[must_use]
     pub const fn is_pll_locked(&self) -> bool {
         (self.clkdet_status & 0x08) != 0
+            || ((self.clkdet_status & 0x07) == 0
+                && self.detected_sample_rate_hz() > 0
+                && self.bck_mon >= 32)
     }
 
     /// Returns `true` if both Left and Right channels are currently hardware-automuted (`0x69` bits `1:0` == `0b11`).
@@ -1227,5 +1232,26 @@ mod tests {
         assert_eq!(telem.bck_ratio(), 64);
         assert!(telem.is_pll_locked());
         assert!(!telem.is_automuted());
+    }
+
+    #[test]
+    fn test_telemetry_pll_locked_zero_fault_and_error_bits() {
+        assert!(!Tas5805mTelemetry::default().is_pll_locked());
+        let valid_44k1 = Tas5805mTelemetry {
+            fs_mon: 0x08,
+            bck_mon: 64,
+            clkdet_status: 0x00,
+            automute_state: 0x00,
+        };
+        assert_eq!(valid_44k1.detected_sample_rate_hz(), 44_100);
+        assert!(valid_44k1.is_pll_locked());
+
+        let faulted_44k1 = Tas5805mTelemetry {
+            fs_mon: 0x08,
+            bck_mon: 64,
+            clkdet_status: 0x01,
+            automute_state: 0x00,
+        };
+        assert!(!faulted_44k1.is_pll_locked());
     }
 }

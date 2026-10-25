@@ -502,6 +502,9 @@ mod xtensa_hw {
     pub struct SmolRxToken(pub WifiRxToken);
     pub struct SmolTxToken(pub WifiTxToken);
 
+    /// Matches `esp-radio`'s `ESP_RADIO_CONFIG_WIFI_MTU = 1492` (`src/wifi/mod.rs:117`).
+    const WIFI_MAX_FRAME_LEN: usize = 1492;
+
     impl RxToken for SmolRxToken {
         fn consume<R, F>(self, f: F) -> R
         where
@@ -516,7 +519,7 @@ mod xtensa_hw {
         where
             F: FnOnce(&mut [u8]) -> R,
         {
-            self.0.consume_token(len, f)
+            self.0.consume_token(len.min(WIFI_MAX_FRAME_LEN), f)
         }
     }
 
@@ -536,7 +539,7 @@ mod xtensa_hw {
 
         fn capabilities(&self) -> DeviceCapabilities {
             let mut caps = DeviceCapabilities::default();
-            caps.max_transmission_unit = 1500;
+            caps.max_transmission_unit = WIFI_MAX_FRAME_LEN;
             caps.medium = Medium::Ethernet;
             caps
         }
@@ -711,11 +714,13 @@ mod xtensa_hw {
             >,
             sample_rate_hz: u32,
         ) -> Self {
-            Self {
+            let mut driver = Self {
                 transfer: Some(transfer),
-                sample_rate_hz,
+                sample_rate_hz: 0,
                 tx_enabled: true,
-            }
+            };
+            let _ = driver.set_clock_rate(sample_rate_hz);
+            driver
         }
 
         pub fn ensure_running(&mut self) {
@@ -730,6 +735,9 @@ mod xtensa_hw {
                         let _ = new_buf.push(&silence);
                         if let Ok(new_transfer) = i2s_tx.write(new_buf) {
                             self.transfer = Some(new_transfer);
+                            let rate = self.sample_rate_hz;
+                            self.sample_rate_hz = 0;
+                            let _ = self.set_clock_rate(rate);
                         }
                     }
                 }
@@ -1298,7 +1306,8 @@ mod xtensa_hw {
             .with_sample_rate(Rate::from_hz(44_100))
             .with_data_format(DataFormat::Data32Channel32)
             .with_channels(Channels::STEREO);
-        let tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
+        let mut tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
+        let _ = tx_buffer.push(&[0u8; 2048]);
         let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
             .expect("Failed to initialize I2S0");
         let i2s_tx = i2s
@@ -1310,6 +1319,7 @@ mod xtensa_hw {
         let i2s_transfer = i2s_tx
             .write(tx_buffer)
             .expect("Failed to start I2S0 TX streaming DMA");
+        let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
 
         let uart2_rx = Input::new(peripherals.GPIO36, InputConfig::default().with_pull(Pull::None));
         let uart2_cfg = UartConfig::default().with_baudrate(460_800);
@@ -1328,7 +1338,6 @@ mod xtensa_hw {
         let _ = fault.is_high();
         wdt.feed();
 
-        let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
         let (pipeline, pending_resp_buf, http_resp_buf, http_tx_buf) =
             init_static_pipeline(stream_storage, output_storage, sink);
@@ -1454,9 +1463,6 @@ mod xtensa_hw {
         let mut pending_resp_sent: usize = 0;
         let mut last_fault_check_ms: u64 = 0;
         let mut latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry> = None;
-        if let Ok(telem) = amp.read_telemetry() {
-            latest_telemetry = telem;
-        }
         let mut last_cyd_progress_ms: u64 = 0;
         let mut audio_http_eof = false;
         let mut decode_ready_sent = false;
@@ -1469,6 +1475,9 @@ mod xtensa_hw {
         pipeline.sink.driver.pump_silence_if_needed(false, false);
         let _ = amp.clear_faults();
         let _ = amp.start_playback_via_hiz();
+        if let Ok(telem) = amp.read_telemetry() {
+            latest_telemetry = telem;
+        }
 
         loop {
             wdt.feed();
