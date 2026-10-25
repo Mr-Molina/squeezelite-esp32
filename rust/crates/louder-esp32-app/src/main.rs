@@ -53,28 +53,61 @@ where
             }
         }
 
+        let mut frames = 0;
         if coordinator.state == louder_esp32_app::PlayerState::Playing {
-            for _ in 0..4 {
-                if pipeline.output_buffer.available_write() >= 2304
-                    && (pipeline.stream_buffer.available_read() > 0 || pipeline.has_pending_pcm())
+            // 1. Fast O(1) drain of any pending decoded PCM into output_buffer and immediately top up I2S0 DMA
+            // BEFORE spending ~4.5 ms decoding a new MP3 frame!
+            for _ in 0..12 {
+                if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
+                    let _ = pipeline.process_decode_step();
+                }
+                if !coordinator.dac_enabled || pipeline.output_buffer.available_read() < 8 {
+                    break;
+                }
+                let written = pipeline.process_output_step().unwrap_or(0);
+                frames += written;
+                coordinator.frames_played = pipeline.frames_played;
+                if written == 0 {
+                    break;
+                }
+            }
+
+            // 2. Now that hardware I2S0 DMA is topped up, decode at most 1 MP3 frame (or up to 4 fast PCM chunks)
+            // if no pending PCM remains and output_buffer has space.
+            let max_decode_steps = match pipeline.decoder {
+                ActiveDecoder::Mp3(_) => 1,
+                _ => 4,
+            };
+            for _ in 0..max_decode_steps {
+                if !pipeline.has_pending_pcm()
+                    && pipeline.output_buffer.available_write() >= 1024
+                    && pipeline.stream_buffer.available_read() > 0
                 {
-                    if !matches!(pipeline.process_decode_step(), Ok(c) if c > 0)
-                        && !pipeline.has_pending_pcm()
-                    {
+                    if !matches!(pipeline.process_decode_step(), Ok(c) if c > 0) {
                         break;
                     }
                 } else {
                     break;
                 }
             }
-        }
 
-        let mut frames = 0;
-        for _ in 0..8 {
-            let step_frames = coordinator.process_audio_step(pipeline);
-            frames += step_frames;
-            if step_frames == 0 && !pipeline.has_pending_pcm() {
-                break;
+            // 3. Top up I2S0 DMA again with the newly decoded frames and drain pending PCM into output_buffer.
+            for _ in 0..12 {
+                if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
+                    let _ = pipeline.process_decode_step();
+                }
+                if !coordinator.dac_enabled || pipeline.output_buffer.available_read() < 8 {
+                    break;
+                }
+                let written = pipeline.process_output_step().unwrap_or(0);
+                frames += written;
+                coordinator.frames_played = pipeline.frames_played;
+                if written == 0 {
+                    break;
+                }
+            }
+            if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
+                let _ = pipeline.process_decode_step();
             }
         }
         coordinator.current_sample_rate = pipeline.sample_rate;
@@ -149,6 +182,21 @@ pub fn lms_gain_to_hardware_volume_percent(gain: u32) -> u8 {
     let reduction = ((diff * 2202) + 32768) >> 16;
     let p = 100_i32 - reduction;
     p.clamp(1, 100) as u8
+}
+
+/// Maps LMS logarithmic mixer gain (`0..=65536`) to exact TAS5805M `0x4C` hardware volume register code.
+///
+/// TAS5805M `DIG_VOL_CTRL` (register `0x4C`) is calibrated at 0.5 dB per step:
+/// - `0x30` = 0.0 dB (100% volume)
+/// - `0x5D` = -22.5 dB (55% perceptual volume)
+/// - `0xFF` = Mute (0% volume)
+pub fn lms_gain_to_tas5805m_vol_reg(gain: u32) -> u8 {
+    let pct = lms_gain_to_hardware_volume_percent(gain);
+    if pct == 0 {
+        0xFF // VOL_MUTE
+    } else {
+        0x30 + (100 - pct.min(100)) // 0x30 (0.0 dB) at 100%, +1 (+0.5 dB attenuation) per 1% below 100%
+    }
 }
 
 /// Case-insensitively searches for `icy-metaint:` header in raw HTTP response headers
@@ -668,20 +716,24 @@ mod xtensa_hw {
             }
         }
 
-        pub fn pump_silence_if_needed(&mut self, is_playing: bool) {
+        pub fn pump_silence_if_needed(&mut self, is_playing: bool, has_buffered_audio: bool) {
             self.ensure_running();
+            if is_playing && has_buffered_audio {
+                return;
+            }
             if let Some(ref mut transfer) = self.transfer {
+                let threshold = if is_playing { 10240 } else { 6144 };
                 let avail = transfer.available_bytes();
-                let pad = avail % 1024;
-                if pad > 0 {
+                if avail >= threshold {
                     let silence = [0u8; 1024];
-                    let _ = transfer.push(&silence[..pad]);
-                }
-                let silence = [0u8; 1024];
-                let threshold = if is_playing { 6144 } else { 4096 };
-                while transfer.available_bytes() >= threshold {
-                    if transfer.push(&silence) == 0 {
-                        break;
+                    let pad = avail % 1024;
+                    if pad > 0 {
+                        let _ = transfer.push(&silence[..pad]);
+                    }
+                    while transfer.available_bytes() >= threshold {
+                        if transfer.push(&silence) == 0 {
+                            break;
+                        }
                     }
                 }
             }
@@ -702,7 +754,7 @@ mod xtensa_hw {
             };
 
             if !self.tx_enabled {
-                let silence = [0u8; 512];
+                let silence = [0u8; 1024];
                 let mut written = 0;
                 while written < valid_len {
                     let avail = transfer.available_bytes();
@@ -726,7 +778,7 @@ mod xtensa_hw {
 
             let mut total_written = 0;
             let mut offset = 0;
-            let mut scratch = [0u8; 512];
+            let mut scratch = [0u8; 1024];
 
             while offset < valid_len {
                 let avail = transfer.available_bytes();
@@ -754,20 +806,6 @@ mod xtensa_hw {
                     break;
                 }
             }
-            let avail = transfer.available_bytes();
-            if avail >= 6144 {
-                let pad = avail % 1024;
-                if pad > 0 {
-                    let silence = [0u8; 1024];
-                    let _ = transfer.push(&silence[..pad]);
-                }
-                let silence = [0u8; 1024];
-                while transfer.available_bytes() >= 6144 {
-                    if transfer.push(&silence) == 0 {
-                        break;
-                    }
-                }
-            }
             Ok(total_written)
         }
 
@@ -785,6 +823,11 @@ mod xtensa_hw {
                         44_100 => (14, 11, 63),
                         48_000 => (13, 1, 48),
                         32_000 => (19, 17, 32),
+                        24_000 => (26, 1, 24),
+                        22_050 => (28, 22, 63),
+                        16_000 => (39, 1, 16),
+                        12_000 => (52, 1, 12),
+                        11_025 => (56, 44, 63),
                         88_200 => (7, 11, 63),
                         96_000 => (6, 25, 48),
                         _ => (14, 11, 63),
@@ -813,12 +856,17 @@ mod xtensa_hw {
     fn load_nvs_wifi_credentials(
         flash: &mut FlashStorage<'_>,
         sta_mac: &[u8; 6],
-        nvs_buf: &mut [u8; 16_384],
+        nvs_buf: &mut [u8],
     ) -> Result<WifiStaCredentials, OtaSafetyError> {
-        nvs_buf.fill(0xFF);
-        let _ = flash.read(NVS_PARTITION_OFFSET, nvs_buf);
+        let nvs_slice = if nvs_buf.len() >= 16_384 {
+            &mut nvs_buf[..16_384]
+        } else {
+            return Err(OtaSafetyError::CredentialsNotFound);
+        };
+        nvs_slice.fill(0xFF);
+        let _ = flash.read(NVS_PARTITION_OFFSET, nvs_slice);
         resolve_wifi_credentials(
-            nvs_buf,
+            nvs_slice,
             sta_mac,
             option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
             option_env!("SL_WIFI_PASS"),
@@ -837,7 +885,7 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        ring_storage: [u8; 16384],
+        ring_storage: [u8; 20480],
         http_rx_buf: [u8; 1024],
         http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
@@ -852,7 +900,7 @@ mod xtensa_hw {
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                ring_storage: [0u8; 16384],
+                ring_storage: [0u8; 20480],
                 http_rx_buf: [0u8; 1024],
                 http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
@@ -955,7 +1003,7 @@ mod xtensa_hw {
             .with_sample_rate(Rate::from_hz(44_100))
             .with_data_format(DataFormat::Data32Channel32)
             .with_channels(Channels::STEREO);
-        let tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
+        let tx_buffer = esp_hal::dma_tx_stream_buffer!(12288, 1024);
         let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
             .expect("Failed to initialize I2S0");
         let i2s_tx = i2s
@@ -1114,7 +1162,7 @@ mod xtensa_hw {
         let mut icy_meta_next: usize = 0;
         let mut icy_meta_left: usize = 0;
 
-        pipeline.sink.driver.pump_silence_if_needed(false);
+        pipeline.sink.driver.pump_silence_if_needed(false, false);
         let _ = amp.clear_faults();
         let _ = amp.start_playback_via_hiz();
 
@@ -1419,8 +1467,10 @@ mod xtensa_hw {
                                         ..
                                     } => {
                                         let max_gain = core::cmp::max(gain_left, gain_right);
-                                        let vol_pct = lms_gain_to_hardware_volume_percent(max_gain);
-                                        let _ = amp.set_volume_percent(vol_pct);
+                                        let vol_reg = lms_gain_to_tas5805m_vol_reg(max_gain);
+                                        if amp.current_volume() != vol_reg {
+                                            let _ = amp.set_volume(vol_reg);
+                                        }
                                         let eff_gain = if max_gain > 0 { 65536 } else { 0 };
                                         pipeline.set_volume(eff_gain, eff_gain);
                                     }
@@ -1518,9 +1568,9 @@ mod xtensa_hw {
                                                     pipeline.sink.set_mute(true);
                                                 }
 
-                                                pipeline.sink.driver.pump_silence_if_needed(false);
-                                                let _ = amp.clear_faults();
+                                                pipeline.sink.driver.pump_silence_if_needed(false, false);
                                                 if amp.mode() != louder_esp32_app::AmpMode::Play {
+                                                    let _ = amp.clear_faults();
                                                     let _ = amp.start_playback_via_hiz();
                                                 }
 
@@ -1768,9 +1818,13 @@ mod xtensa_hw {
                                             pipeline.sink.set_mute(!dac_enable);
                                         } else if let Some(metaint) = cmd.stream_continue() {
                                             coordinator.awaiting_cont = false;
-                                            icy_meta_interval = metaint as usize;
-                                            icy_meta_next = metaint as usize;
-                                            icy_meta_left = 0;
+                                            if metaint > 0 && icy_meta_interval == 0 {
+                                                let interval = metaint as usize;
+                                                let already = (coordinator.stream_bytes_received as usize) % interval;
+                                                icy_meta_interval = interval;
+                                                icy_meta_next = interval - already;
+                                                icy_meta_left = 0;
+                                            }
                                             if !threshold_sent && !coordinator.autostart_mode.is_auto() {
                                                 threshold_sent = true;
                                                 let mut stat_buf = [0u8; 128];
@@ -1973,7 +2027,7 @@ mod xtensa_hw {
                                 }
                             } else {
                                 let avail_write = pipeline.stream_buffer.available_write();
-                                if avail_write < 512 {
+                                if avail_write == 0 {
                                     break;
                                 }
                                 let max_chunk = if icy_meta_interval > 0 {
@@ -2028,8 +2082,11 @@ mod xtensa_hw {
 
             let step_frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
 
+            let has_buffered_audio =
+                pipeline.output_buffer.available_read() >= 8 || pipeline.has_pending_pcm();
             pipeline.sink.driver.pump_silence_if_needed(
                 coordinator.state == louder_esp32_app::PlayerState::Playing,
+                has_buffered_audio,
             );
 
             if audio_stream_active
@@ -2298,6 +2355,13 @@ mod tests {
 
         let h4 = b"icy-metaint: 0\r\n";
         assert_eq!(parse_icy_metaint_header(h4), None);
+    }
+
+    #[test]
+    fn test_lms_gain_to_tas5805m_vol_reg() {
+        assert_eq!(lms_gain_to_tas5805m_vol_reg(0), 0xFF); // Mute
+        assert_eq!(lms_gain_to_tas5805m_vol_reg(65536), 0x30); // 0.0 dB (100%)
+        assert_eq!(lms_gain_to_tas5805m_vol_reg(1842), 0x5D); // -22.5 dB (55%)
     }
 }
 
