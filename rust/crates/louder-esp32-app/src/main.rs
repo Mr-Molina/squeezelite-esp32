@@ -1145,6 +1145,7 @@ mod xtensa_hw {
         let mut pending_action_deadline_ms: u64 = 0;
         let mut pending_http_body: &'static [u8] = &[];
         let mut pending_http_closing = false;
+        let mut pending_close_deadline_ms: u64 = 0;
         let mut helo_sent = false;
         let mut last_stat_ms: u64 = 0;
         let mut last_connect_attempt_ms: u64 = 0;
@@ -1250,6 +1251,7 @@ mod xtensa_hw {
                         if pending_http_body.is_empty() {
                             http_sock.close();
                             pending_http_closing = true;
+                            pending_close_deadline_ms = now_ms + 500;
                         }
                     } else {
                         pending_http_body = &[];
@@ -1258,19 +1260,10 @@ mod xtensa_hw {
                     }
                 }
 
-                // Immediate recycling of closing sockets (TimeWait / CloseWait / LastAck / FinWait2 / Closed)
+                // Immediate recycling of closing sockets once FIN/ACK handshake completes (TimeWait) or on timeout
                 if pending_http_closing {
-                    if http_sock.send_queue() == 0
-                        && (!http_sock.may_send()
-                            || matches!(
-                                http_sock.state(),
-                                tcp::State::TimeWait
-                                    | tcp::State::CloseWait
-                                    | tcp::State::Closing
-                                    | tcp::State::LastAck
-                                    | tcp::State::FinWait2
-                                    | tcp::State::Closed
-                            ))
+                    if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                        || now_ms >= pending_close_deadline_ms
                     {
                         http_sock.abort();
                         pending_http_closing = false;
@@ -1328,10 +1321,12 @@ mod xtensa_hw {
                                 if pending_http_body.is_empty() {
                                     http_sock.close();
                                     pending_http_closing = true;
+                                    pending_close_deadline_ms = now_ms + 500;
                                 }
                             } else {
                                 http_sock.close();
                                 pending_http_closing = true;
+                                pending_close_deadline_ms = now_ms + 500;
                             }
                             if action != HttpControlAction::None {
                                 pending_http_action = action;
@@ -1339,9 +1334,6 @@ mod xtensa_hw {
                             }
                         }
                     }
-                } else if pending_http_body.is_empty() && http_sock.may_recv() && !http_sock.may_send() {
-                    http_sock.abort();
-                    pending_http_closing = false;
                 }
             }
 
