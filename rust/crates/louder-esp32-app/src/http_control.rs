@@ -923,4 +923,55 @@ mod tests {
         assert!(INDEX_HTML.contains("eq_flat"));
         assert!(INDEX_HTML.contains("again0"));
     }
+
+    #[test]
+    fn test_status_json_fits_in_1024_byte_buffer() {
+        let snap = HttpStatusSnapshot {
+            ip: [172, 22, 1, 15],
+            netmask: [255, 255, 255, 0],
+            gw: [172, 22, 1, 1],
+            ssid: "IoT-LAN",
+            rssi: -48,
+            lms_ip: [10, 0, 0, 10],
+            lms_port: 9000,
+            lms_cport: 9090,
+            otadata_prearmed_factory: true,
+            frames_played: 123_456,
+            amp_mode: "Play",
+            vol_pct: 55,
+            i2c_acks: 42,
+            i2c_nacks: 0,
+            uptime_ms: 98_765,
+            psram_free_bytes: 3_538_944,
+            psram_used_bytes: 655_360,
+            core1_active: true,
+            core1_loops: 54_321,
+            codec: "MP3",
+            codec_sample_rate: 44_100,
+            codec_channels: 2,
+            codec_bit_depth: 16,
+            eq_preset: "Loudness",
+            eq_enabled: true,
+            tas_fs_hz: 44_100,
+            tas_bck_ratio: 64,
+            tas_pll_locked: true,
+            tas_automuted: false,
+            again_code: 0x08,
+            settings_seq: 7,
+        };
+        let mut out_buf = [0u8; 1024];
+        let (len, static_body, action) = handle_http_request_streaming(
+            b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n",
+            &snap,
+            &mut out_buf,
+        )
+        .expect("status.json should fit in 1024-byte buffer");
+        assert_eq!(action, HttpControlAction::None);
+        assert!(static_body.is_empty());
+        assert!(len > 600 && len <= 1024, "expected 600 < len <= 1024, got {len}");
+        let resp = core::str::from_utf8(&out_buf[..len]).expect("valid utf8");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("\"eq_preset\":\"Loudness\""));
+        assert!(resp.contains("\"settings_seq\":7"));
+    }
 }

@@ -921,7 +921,6 @@ mod xtensa_hw {
         ring_storage: [u8; 16384],
         settings_scratch: [u8; 512],
         http_rx_buf: [u8; 1024],
-        http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
         slim_tx_buf: [u8; 2048],
         audio_rx_buf: [u8; 4096],
@@ -935,9 +934,8 @@ mod xtensa_hw {
         const fn new() -> Self {
             Self {
                 ring_storage: [0u8; 16384],
-                settings_scratch: [0xFFu8; 512],
+                settings_scratch: [0u8; 512],
                 http_rx_buf: [0u8; 1024],
-                http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
                 slim_tx_buf: [0u8; 2048],
                 audio_rx_buf: [0u8; 4096],
@@ -1063,12 +1061,23 @@ mod xtensa_hw {
         stream_storage: &'static mut [u8],
         output_storage: &'static mut [u8],
         sink: EspI2sSink<Esp32HardwareI2sDma<'static>>,
-    ) -> (&'static mut HwStreamPipeline, &'static mut [u8; 2064]) {
+    ) -> (
+        &'static mut HwStreamPipeline,
+        &'static mut [u8; 2064],
+        &'static mut [u8; 1536],
+        &'static mut [u8; 1536],
+    ) {
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_PIPELINE: core::mem::MaybeUninit<HwStreamPipeline> =
             core::mem::MaybeUninit::uninit();
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_RESP_BUF: core::mem::MaybeUninit<[u8; 2064]> =
+            core::mem::MaybeUninit::uninit();
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut STATIC_HTTP_RESP_BUF: core::mem::MaybeUninit<[u8; 1536]> =
+            core::mem::MaybeUninit::uninit();
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut STATIC_HTTP_TX_BUF: core::mem::MaybeUninit<[u8; 1536]> =
             core::mem::MaybeUninit::uninit();
         unsafe {
             let ptr = (*core::ptr::addr_of_mut!(STATIC_PIPELINE)).as_mut_ptr();
@@ -1096,7 +1105,13 @@ mod xtensa_hw {
             let resp_ptr = (*core::ptr::addr_of_mut!(STATIC_RESP_BUF)).as_mut_ptr();
             resp_ptr.write_bytes(0, 1);
 
-            (&mut *ptr, &mut *resp_ptr)
+            let http_resp_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_RESP_BUF)).as_mut_ptr();
+            http_resp_ptr.write_bytes(0, 1);
+
+            let http_tx_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_TX_BUF)).as_mut_ptr();
+            http_tx_ptr.write_bytes(0, 1);
+
+            (&mut *ptr, &mut *resp_ptr, &mut *http_resp_ptr, &mut *http_tx_ptr)
         }
     }
 
@@ -1147,7 +1162,6 @@ mod xtensa_hw {
             ref mut ring_storage,
             ref mut settings_scratch,
             ref mut http_rx_buf,
-            ref mut http_tx_buf,
             ref mut slim_rx_buf,
             ref mut slim_tx_buf,
             ref mut audio_rx_buf,
@@ -1281,7 +1295,8 @@ mod xtensa_hw {
 
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
-        let (pipeline, pending_resp_buf) = init_static_pipeline(stream_storage, output_storage, sink);
+        let (pipeline, pending_resp_buf, http_resp_buf, http_tx_buf) =
+            init_static_pipeline(stream_storage, output_storage, sink);
         let mut coordinator = PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT");
         println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
 
@@ -1512,6 +1527,22 @@ mod xtensa_hw {
                     }
                 }
 
+                if pending_http_body.is_empty()
+                    && !pending_http_closing
+                    && http_sock.is_open()
+                    && matches!(
+                        http_sock.state(),
+                        tcp::State::CloseWait
+                            | tcp::State::TimeWait
+                            | tcp::State::Closing
+                            | tcp::State::LastAck
+                            | tcp::State::FinWait1
+                            | tcp::State::FinWait2
+                    )
+                {
+                    http_sock.abort();
+                }
+
                 if !http_sock.is_open() {
                     pending_http_body = &[];
                     pending_http_closing = false;
@@ -1593,11 +1624,10 @@ mod xtensa_hw {
                             again_code: amp.analog_gain_code(),
                             settings_seq,
                         };
-                        let mut resp_buf = [0u8; 768];
                         if let Some((hdr_or_resp_len, static_body, action)) =
-                            handle_http_request_streaming(&req_buf[..n], &snap, &mut resp_buf)
+                            handle_http_request_streaming(&req_buf[..n], &snap, &mut http_resp_buf[..])
                         {
-                            let _ = http_sock.send_slice(&resp_buf[..hdr_or_resp_len]);
+                            let _ = http_sock.send_slice(&http_resp_buf[..hdr_or_resp_len]);
                             if !static_body.is_empty() {
                                 pending_http_body = static_body;
                                 if let Ok(s) = http_sock.send_slice(pending_http_body) {
@@ -1671,6 +1701,10 @@ mod xtensa_hw {
                                 }
                                 HttpControlAction::None => {}
                             }
+                        } else {
+                            http_sock.close();
+                            pending_http_closing = true;
+                            pending_close_deadline_ms = now_ms + 250;
                         }
                     }
                 }
