@@ -673,6 +673,8 @@ pub struct AudioConfig {
     pub lms_server_port: Option<u16>,
     pub volume: u8,
     pub equalizer_preset: u8,
+    pub analog_gain_code: u8,
+    pub loudness_enabled: bool,
 }
 
 impl Default for AudioConfig {
@@ -685,6 +687,8 @@ impl Default for AudioConfig {
             lms_server_port: None,
             volume: 80,
             equalizer_preset: 0,
+            analog_gain_code: Self::DEFAULT_ANALOG_GAIN_CODE,
+            loudness_enabled: false,
         }
     }
 }
@@ -695,6 +699,11 @@ impl AudioConfig {
     pub const KEY_LMS_PORT: &'static str = "audio.lms_port";
     pub const KEY_VOL: &'static str = "audio.vol";
     pub const KEY_EQ: &'static str = "audio.eq";
+    pub const KEY_AGAIN: &'static str = "audio.again";
+    pub const KEY_LOUD: &'static str = "audio.loud";
+
+    pub const DEFAULT_ANALOG_GAIN_CODE: u8 = 0x08;
+    pub const MAX_ANALOG_GAIN_CODE: u8 = 0x1F;
 
     /// Validates player audio configuration invariants.
     pub fn validate(&self) -> Result<(), StorageError> {
@@ -712,6 +721,9 @@ impl AudioConfig {
                 return Err(StorageError::InvalidFormat);
             }
         }
+        if self.analog_gain_code > Self::MAX_ANALOG_GAIN_CODE {
+            return Err(StorageError::InvalidFormat);
+        }
         Ok(())
     }
 
@@ -720,6 +732,8 @@ impl AudioConfig {
         store.set_str(Self::KEY_NAME, self.player_name.as_str())?;
         store.set_u8(Self::KEY_VOL, self.volume)?;
         store.set_u8(Self::KEY_EQ, self.equalizer_preset)?;
+        store.set_u32(Self::KEY_AGAIN, u32::from(self.analog_gain_code))?;
+        store.set_bool(Self::KEY_LOUD, self.loudness_enabled)?;
 
         if let Some(ip) = self.lms_server_ip {
             store.set(Self::KEY_LMS_IP, &ip)?;
@@ -749,6 +763,24 @@ impl AudioConfig {
 
         if let Some(eq) = store.get_u8(Self::KEY_EQ)? {
             config.equalizer_preset = eq;
+        }
+
+        match store.get_u32(Self::KEY_AGAIN) {
+            Ok(Some(again)) => {
+                let again_u8 = u8::try_from(again).map_err(|_| StorageError::InvalidFormat)?;
+                config.analog_gain_code = again_u8;
+            }
+            Ok(None) => {}
+            Err(StorageError::InvalidFormat) => {
+                if let Some(again_u8) = store.get_u8(Self::KEY_AGAIN)? {
+                    config.analog_gain_code = again_u8;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+
+        if let Some(loud) = store.get_bool(Self::KEY_LOUD)? {
+            config.loudness_enabled = loud;
         }
 
         config.lms_server_ip = read_ip_opt(store, Self::KEY_LMS_IP)?;
@@ -1042,5 +1074,64 @@ mod tests {
         FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 0).unwrap();
         assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_b), Ok(1));
         assert_eq!(DualSectorFlashStore::active_sector(&sector_b, &sector_a), Ok(0));
+    }
+
+    #[test]
+    fn test_audio_config_analog_gain_and_loudness_roundtrip() {
+        const SECTOR_SIZE: usize = 512;
+        let mut store = MemConfigStore::<16>::new();
+        let mut sector_a = [0xFFu8; SECTOR_SIZE];
+        let mut sector_b = [0xFFu8; SECTOR_SIZE];
+
+        let mut cfg = AudioConfig::default();
+        assert_eq!(cfg.analog_gain_code, AudioConfig::DEFAULT_ANALOG_GAIN_CODE); // Default -4.0 dB (0x08)
+        assert!(!cfg.loudness_enabled);
+
+        cfg.volume = 55;
+        cfg.equalizer_preset = 2;
+        cfg.analog_gain_code = 12; // -6.0 dB (0x0C)
+        cfg.loudness_enabled = true;
+
+        cfg.save_to(&mut store).expect("save_to ok");
+        let (wrote_b, bytes) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b)
+            .expect("journal save ok");
+        assert!(!wrote_b);
+        assert!(bytes > FlashJournal::HEADER_SIZE);
+
+        let mut loaded_store = MemConfigStore::<16>::new();
+        FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut loaded_store)
+            .expect("journal load ok");
+        let loaded = AudioConfig::load_from(&loaded_store).expect("load_from ok");
+        assert_eq!(loaded.volume, 55);
+        assert_eq!(loaded.equalizer_preset, 2);
+        assert_eq!(loaded.analog_gain_code, 12);
+        assert!(loaded.loudness_enabled);
+    }
+
+    #[test]
+    fn test_audio_config_backwards_compatibility_missing_again_loud() {
+        let mut store = MemConfigStore::<16>::new();
+        store.set_str(AudioConfig::KEY_NAME, "LegacyPlayer").unwrap();
+        store.set_u8(AudioConfig::KEY_VOL, 75).unwrap();
+        store.set_u8(AudioConfig::KEY_EQ, 1).unwrap();
+
+        let loaded = AudioConfig::load_from(&store).expect("load_from ok");
+        assert_eq!(loaded.player_name.as_str(), "LegacyPlayer");
+        assert_eq!(loaded.volume, 75);
+        assert_eq!(loaded.equalizer_preset, 1);
+        assert_eq!(loaded.analog_gain_code, AudioConfig::DEFAULT_ANALOG_GAIN_CODE);
+        assert!(!loaded.loudness_enabled);
+    }
+
+    #[test]
+    fn test_audio_config_analog_gain_validation() {
+        let mut cfg = AudioConfig {
+            analog_gain_code: AudioConfig::MAX_ANALOG_GAIN_CODE, // 0x1F (31)
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        cfg.analog_gain_code = AudioConfig::MAX_ANALOG_GAIN_CODE + 1; // 0x20 (32)
+        assert_eq!(cfg.validate(), Err(StorageError::InvalidFormat));
     }
 }
