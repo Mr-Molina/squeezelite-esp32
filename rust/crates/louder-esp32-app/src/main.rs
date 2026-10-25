@@ -57,7 +57,7 @@ where
         if coordinator.state == louder_esp32_app::PlayerState::Playing {
             // 1. Fast O(1) drain of any pending decoded PCM into output_buffer and immediately top up I2S0 DMA
             // BEFORE spending ~4.5 ms decoding a new MP3 frame!
-            for _ in 0..12 {
+            for _ in 0..16 {
                 if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
                     let _ = pipeline.process_decode_step();
                 }
@@ -92,7 +92,7 @@ where
             }
 
             // 3. Top up I2S0 DMA again with the newly decoded frames and drain pending PCM into output_buffer.
-            for _ in 0..12 {
+            for _ in 0..16 {
                 if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
                     let _ = pipeline.process_decode_step();
                 }
@@ -722,13 +722,21 @@ mod xtensa_hw {
                 return;
             }
             if let Some(ref mut transfer) = self.transfer {
-                let threshold = if is_playing { 10240 } else { 6144 };
+                let threshold = if is_playing { 6144 } else { 4096 };
                 let avail = transfer.available_bytes();
                 if avail >= threshold {
-                    let silence = [0u8; 1024];
+                    let silence = [0u8; 512];
                     let pad = avail % 1024;
                     if pad > 0 {
-                        let _ = transfer.push(&silence[..pad]);
+                        let mut rem = pad;
+                        while rem > 0 {
+                            let c = rem.min(silence.len());
+                            let n = transfer.push(&silence[..c]);
+                            if n == 0 {
+                                break;
+                            }
+                            rem -= n;
+                        }
                     }
                     while transfer.available_bytes() >= threshold {
                         if transfer.push(&silence) == 0 {
@@ -754,7 +762,7 @@ mod xtensa_hw {
             };
 
             if !self.tx_enabled {
-                let silence = [0u8; 1024];
+                let silence = [0u8; 512];
                 let mut written = 0;
                 while written < valid_len {
                     let avail = transfer.available_bytes();
@@ -778,7 +786,7 @@ mod xtensa_hw {
 
             let mut total_written = 0;
             let mut offset = 0;
-            let mut scratch = [0u8; 1024];
+            let mut scratch = [0u8; 512];
 
             while offset < valid_len {
                 let avail = transfer.available_bytes();
@@ -856,17 +864,12 @@ mod xtensa_hw {
     fn load_nvs_wifi_credentials(
         flash: &mut FlashStorage<'_>,
         sta_mac: &[u8; 6],
-        nvs_buf: &mut [u8],
+        nvs_buf: &mut [u8; 16_384],
     ) -> Result<WifiStaCredentials, OtaSafetyError> {
-        let nvs_slice = if nvs_buf.len() >= 16_384 {
-            &mut nvs_buf[..16_384]
-        } else {
-            return Err(OtaSafetyError::CredentialsNotFound);
-        };
-        nvs_slice.fill(0xFF);
-        let _ = flash.read(NVS_PARTITION_OFFSET, nvs_slice);
+        nvs_buf.fill(0xFF);
+        let _ = flash.read(NVS_PARTITION_OFFSET, nvs_buf);
         resolve_wifi_credentials(
-            nvs_slice,
+            nvs_buf,
             sta_mac,
             option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
             option_env!("SL_WIFI_PASS"),
@@ -885,7 +888,7 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        ring_storage: [u8; 20480],
+        ring_storage: [u8; 16384],
         http_rx_buf: [u8; 1024],
         http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
@@ -900,7 +903,7 @@ mod xtensa_hw {
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                ring_storage: [0u8; 20480],
+                ring_storage: [0u8; 16384],
                 http_rx_buf: [0u8; 1024],
                 http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
@@ -1003,7 +1006,7 @@ mod xtensa_hw {
             .with_sample_rate(Rate::from_hz(44_100))
             .with_data_format(DataFormat::Data32Channel32)
             .with_channels(Channels::STEREO);
-        let tx_buffer = esp_hal::dma_tx_stream_buffer!(12288, 1024);
+        let tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
         let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
             .expect("Failed to initialize I2S0");
         let i2s_tx = i2s

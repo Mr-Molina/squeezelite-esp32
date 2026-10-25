@@ -18,8 +18,8 @@ pub const PCM_SCRATCH_SAMPLES: usize = 2304;
 pub const READ_SCRATCH_BYTES: usize = 4096;
 #[cfg(target_arch = "xtensa")]
 pub const READ_SCRATCH_BYTES: usize = 1536;
-pub const WRITE_SCRATCH_BYTES: usize = 1024;
-pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 256;
+pub const WRITE_SCRATCH_BYTES: usize = 512;
+pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
 pub enum ActiveDecoder {
     Pcm(PcmDecoder),
