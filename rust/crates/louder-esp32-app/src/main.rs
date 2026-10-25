@@ -948,7 +948,7 @@ mod xtensa_hw {
     }
 
     #[allow(unsafe_code)]
-    static mut APP_CORE_STACK: Stack<512> = Stack::new();
+    static mut APP_CORE_STACK: Stack<2048> = Stack::new();
     static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
     #[esp_hal::ram]
@@ -1119,6 +1119,16 @@ mod xtensa_hw {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let peripherals = esp_hal::init(config);
 
+        // Park Core 1 (APP_CPU) immediately on entry in case a warm reboot from
+        // dual-core ESP-IDF (`I2S-4MFlash-1681`) left `APP_CPU` unparked (`appcpu_clkgate_en=1`),
+        // preventing `FlashStorage::multicore_auto_park()` from unparking a rogue `APP_CPU`
+        // and ensuring `cpu_ctrl.start_app_core(...)` sees `is_running(Cpu::AppCpu) == false`.
+        let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
+        #[allow(unsafe_code)]
+        unsafe {
+            cpu_ctrl.park_core(esp_hal::system::Cpu::AppCpu);
+        }
+
         // ====================================================================
         // GATE 2: Hardware Watchdog (TIMG0 WDT, 20s Stage0 -> ResetSystem)
         // ====================================================================
@@ -1240,8 +1250,33 @@ mod xtensa_hw {
             };
         wdt.feed();
 
-        // Start Core 1 (APP_CPU @ 240 MHz) executing `app_core_loop` in IRAM (`#[esp_hal::ram]`)
-        let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
+        // Start Core 1 (APP_CPU @ 240 MHz) executing `app_core_loop` in IRAM (`#[esp_hal::ram]`).
+        // Sync `DPORT_APP_FLASH_MMU_TABLE` (0x3FF1_2000..0x3FF1_2400) and `DPORT_APP_CACHE_CTRL1_REG`
+        // (0x3FF0_005C) from `PRO_CPU` (0x3FF1_0000 and 0x3FF0_0044) while `APP_CPU` cache is disabled
+        // so `APP_CPU` can fetch `start_core1_init` / `start_core1_run` from XIP Flash `.text`.
+        #[allow(unsafe_code)]
+        unsafe {
+            const DPORT_PRO_CACHE_CTRL1_REG: *const u32 = 0x3FF0_0044 as *const u32;
+            const DPORT_APP_CACHE_CTRL_REG: *mut u32 = 0x3FF0_0058 as *mut u32;
+            const DPORT_APP_CACHE_CTRL1_REG: *mut u32 = 0x3FF0_005C as *mut u32;
+            const DPORT_PRO_FLASH_MMU_TABLE: *const u32 = 0x3FF1_0000 as *const u32;
+            const DPORT_APP_FLASH_MMU_TABLE: *mut u32 = 0x3FF1_2000 as *mut u32;
+
+            let app_ctrl = core::ptr::read_volatile(DPORT_APP_CACHE_CTRL_REG);
+            core::ptr::write_volatile(DPORT_APP_CACHE_CTRL_REG, app_ctrl & !(1 << 3));
+
+            let pro_ctrl1 = core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL1_REG);
+            let app_ctrl1 = core::ptr::read_volatile(DPORT_APP_CACHE_CTRL1_REG);
+            core::ptr::write_volatile(
+                DPORT_APP_CACHE_CTRL1_REG,
+                (app_ctrl1 & !0x3F) | (pro_ctrl1 & 0x3F),
+            );
+
+            for i in 0..256 {
+                let entry = core::ptr::read_volatile(DPORT_PRO_FLASH_MMU_TABLE.add(i));
+                core::ptr::write_volatile(DPORT_APP_FLASH_MMU_TABLE.add(i), entry);
+            }
+        }
         #[allow(unsafe_code)]
         let _app_core_guard = cpu_ctrl.start_app_core(
             unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
@@ -1331,17 +1366,22 @@ mod xtensa_hw {
         let sta_cfg = WifiModeConfig::Station(
             StationConfig::default()
                 .with_ssid(ssid_cfg)
-                .with_authentication(auth_cfg),
+                .with_authentication(auth_cfg)
+                .with_scan_method(esp_radio::wifi::sta::ScanMethod::AllChannels)
+                .with_beacon_timeout(30)
+                .with_failure_retry_cnt(3),
         );
         let mut wifi_controller = match WifiController::new(peripherals.WIFI, ControllerConfig::default()) {
             Ok(c) => c,
             Err(_) => esp_hal::system::software_reset(),
         };
         let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
-        let _ = wifi_controller.set_max_tx_power(60);
+        let _ = wifi_controller.set_max_tx_power(52);
         if wifi_controller.set_config(&sta_cfg).is_err() {
             esp_hal::system::software_reset();
         }
+        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+        let _ = wifi_controller.set_max_tx_power(52);
         let mut sta_iface = WifiInterface::station();
         wdt.feed();
 
@@ -1397,6 +1437,7 @@ mod xtensa_hw {
         let mut pending_http_action = HttpControlAction::None;
         let mut pending_action_deadline_ms: u64 = 0;
         let mut pending_http_body: &'static [u8] = &[];
+        let mut pending_http_started_ms: u64 = 0;
         let mut pending_http_closing = false;
         let mut pending_close_deadline_ms: u64 = 0;
         let mut helo_sent = false;
@@ -1434,8 +1475,11 @@ mod xtensa_hw {
             let now_ms = now_millis();
 
             // Drive Wi-Fi STA connection if not currently associated
-            if !wifi_controller.is_connected() && now_ms.saturating_sub(last_connect_attempt_ms) >= 1_000 {
-                last_connect_attempt_ms = now_ms;
+            if !wifi_controller.is_connected()
+                && (last_connect_attempt_ms == 0
+                    || now_ms.saturating_sub(last_connect_attempt_ms) >= 5_000)
+            {
+                last_connect_attempt_ms = now_ms.max(1);
                 let mut connect_fut = pin!(wifi_controller.connect_async());
                 let waker = Waker::noop();
                 let mut cx = Context::from_waker(waker);
@@ -1501,7 +1545,22 @@ mod xtensa_hw {
 
                 // Multi-chunk streaming of static body (.rodata)
                 if !pending_http_body.is_empty() {
-                    if http_sock.may_send() {
+                    if now_ms.saturating_sub(pending_http_started_ms) >= 2_500
+                        || matches!(
+                            http_sock.state(),
+                            tcp::State::CloseWait
+                                | tcp::State::TimeWait
+                                | tcp::State::Closing
+                                | tcp::State::LastAck
+                                | tcp::State::FinWait1
+                                | tcp::State::FinWait2
+                                | tcp::State::Closed
+                        )
+                    {
+                        pending_http_body = &[];
+                        http_sock.abort();
+                        pending_http_closing = false;
+                    } else if http_sock.may_send() {
                         if let Ok(sent) = http_sock.send_slice(pending_http_body) {
                             pending_http_body = &pending_http_body[sent..];
                         }
@@ -1630,6 +1689,7 @@ mod xtensa_hw {
                             let _ = http_sock.send_slice(&http_resp_buf[..hdr_or_resp_len]);
                             if !static_body.is_empty() {
                                 pending_http_body = static_body;
+                                pending_http_started_ms = now_ms;
                                 if let Ok(s) = http_sock.send_slice(pending_http_body) {
                                     pending_http_body = &pending_http_body[s..];
                                 }
