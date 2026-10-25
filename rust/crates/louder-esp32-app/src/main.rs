@@ -440,7 +440,7 @@ mod xtensa_hw {
     use louder_esp32_app::board::{
         BASEMENT_PLAYER_MAC, DEFAULT_LMS_SERVER_IP, DEFAULT_LMS_SERVER_PORT, DEFAULT_WIFI_SSID,
     };
-    use louder_esp32_app::hal::{I2sDmaDriver, NvsFlashBackend};
+    use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{
         handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
         LeaseHealth,
@@ -918,7 +918,8 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        nvs_scratch: [u8; 12288],
+        ring_storage: [u8; 16384],
+        settings_scratch: [u8; 512],
         http_rx_buf: [u8; 1024],
         http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
@@ -927,13 +928,14 @@ mod xtensa_hw {
         audio_tx_buf: [u8; 512],
         slim_acc_buf: [u8; 1536],
         audio_req_buf: [u8; 512],
-        audio_header_buf: [u8; 2000],
+        audio_header_buf: [u8; 1024],
     }
 
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                nvs_scratch: [0u8; 12288],
+                ring_storage: [0u8; 16384],
+                settings_scratch: [0xFFu8; 512],
                 http_rx_buf: [0u8; 1024],
                 http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
@@ -942,13 +944,13 @@ mod xtensa_hw {
                 audio_tx_buf: [0u8; 512],
                 slim_acc_buf: [0u8; 1536],
                 audio_req_buf: [0u8; 512],
-                audio_header_buf: [0u8; 2000],
+                audio_header_buf: [0u8; 1024],
             }
         }
     }
 
     #[allow(unsafe_code)]
-    static mut APP_CORE_STACK: Stack<4096> = Stack::new();
+    static mut APP_CORE_STACK: Stack<512> = Stack::new();
     static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
     #[esp_hal::ram]
@@ -963,94 +965,139 @@ mod xtensa_hw {
 
     const SETTINGS_PARTITION_OFFSET: u32 = 0x3FE000;
 
-    pub struct Esp32SettingsFlashPartition<'a, 'd> {
-        pub flash: &'a mut FlashStorage<'d>,
-        sector_a: &'a mut [u8; 4096],
-        sector_b: &'a mut [u8; 4096],
+    #[inline(never)]
+    fn load_boot_audio_config(
+        flash: &mut FlashStorage<'_>,
+        scratch: &mut [u8; 12_288],
+    ) -> (AudioConfig, u32) {
+        let (sector_a, rest) = scratch.split_at_mut(4096);
+        let (sector_b, _) = rest.split_at_mut(4096);
+        let _ = flash.read_nor(SETTINGS_PARTITION_OFFSET, sector_a);
+        let _ = flash.read_nor(SETTINGS_PARTITION_OFFSET + 4096, sector_b);
+
+        let meta_a = squeezelite_config::FlashJournal::read_sector_meta(sector_a);
+        let meta_b = squeezelite_config::FlashJournal::read_sector_meta(sector_b);
+        let active_seq = match (meta_a, meta_b) {
+            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
+                if squeezelite_config::FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
+                    seq_a
+                } else {
+                    seq_b
+                }
+            }
+            (Ok((seq_a, _, _)), Err(_)) => seq_a,
+            (Err(_), Ok((seq_b, _, _))) => seq_b,
+            (Err(_), Err(_)) => 0,
+        };
+
+        let mut store = MemConfigStore::<8>::new();
+        if squeezelite_config::FlashJournal::load_from_dual_sectors(sector_a, sector_b, &mut store)
+            .is_ok()
+        {
+            (AudioConfig::load_from(&store).unwrap_or_default(), active_seq)
+        } else {
+            (AudioConfig::default(), 0)
+        }
     }
 
-    impl<'a, 'd> Esp32SettingsFlashPartition<'a, 'd> {
-        pub fn new(flash: &'a mut FlashStorage<'d>, scratch: &'a mut [u8; 12288]) -> Self {
-            let (a_slice, rest) = scratch.split_at_mut(4096);
-            let (b_slice, _) = rest.split_at_mut(4096);
-            let sector_a: &mut [u8; 4096] = a_slice.try_into().unwrap();
-            let sector_b: &mut [u8; 4096] = b_slice.try_into().unwrap();
+    #[inline(never)]
+    fn persist_audio_config(
+        flash: &mut FlashStorage<'_>,
+        scratch: &mut [u8; 512],
+        cfg: &AudioConfig,
+    ) -> Option<u32> {
+        scratch.fill(0xFF);
+        let meta_a = if flash.read_nor(SETTINGS_PARTITION_OFFSET, scratch).is_ok() {
+            squeezelite_config::FlashJournal::read_sector_meta(scratch)
+        } else {
+            Err(squeezelite_config::StorageError::CorruptedData)
+        };
 
-            let _ = flash.read_nor(SETTINGS_PARTITION_OFFSET, sector_a);
-            let _ = flash.read_nor(SETTINGS_PARTITION_OFFSET + 4096, sector_b);
+        scratch.fill(0xFF);
+        let meta_b = if flash.read_nor(SETTINGS_PARTITION_OFFSET + 4096, scratch).is_ok() {
+            squeezelite_config::FlashJournal::read_sector_meta(scratch)
+        } else {
+            Err(squeezelite_config::StorageError::CorruptedData)
+        };
 
-            Self {
-                flash,
-                sector_a,
-                sector_b,
+        let (write_to_b, next_seq) = match (meta_a, meta_b) {
+            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
+                if squeezelite_config::FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
+                    (true, seq_a.wrapping_add(1))
+                } else {
+                    (false, seq_b.wrapping_add(1))
+                }
             }
-        }
-    }
+            (Ok((seq_a, _, _)), Err(_)) => (true, seq_a.wrapping_add(1)),
+            (Err(_), Ok((seq_b, _, _))) => (false, seq_b.wrapping_add(1)),
+            (Err(_), Err(_)) => (false, 1),
+        };
 
-    impl louder_esp32_app::hal::FlashPartition for Esp32SettingsFlashPartition<'_, '_> {
-        fn read_sector(
-            &self,
-            sector_idx: u8,
-        ) -> Result<&[u8; louder_esp32_app::hal::FLASH_SECTOR_SIZE], squeezelite_config::StorageError> {
-            match sector_idx {
-                0 => Ok(self.sector_a),
-                1 => Ok(self.sector_b),
-                _ => Err(squeezelite_config::StorageError::CapacityExceeded),
-            }
-        }
+        let mut store = MemConfigStore::<8>::new();
+        cfg.save_to(&mut store).ok()?;
 
-        fn write_sector(
-            &mut self,
-            sector_idx: u8,
-            data: &[u8; louder_esp32_app::hal::FLASH_SECTOR_SIZE],
-        ) -> Result<(), squeezelite_config::StorageError> {
-            let offset = match sector_idx {
-                0 => {
-                    self.sector_a.copy_from_slice(data);
-                    SETTINGS_PARTITION_OFFSET
-                }
-                1 => {
-                    self.sector_b.copy_from_slice(data);
-                    SETTINGS_PARTITION_OFFSET + 4096
-                }
-                _ => return Err(squeezelite_config::StorageError::CapacityExceeded),
-            };
+        scratch.fill(0xFF);
+        squeezelite_config::FlashJournal::save_to_sector_with_seq(&store, scratch, next_seq).ok()?;
 
-            self.flash
-                .erase(offset, offset + 4096)
-                .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
-            self.flash
-                .write_nor(offset, data)
-                .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
-
-            Ok(())
-        }
-
-        fn erase_sector(&mut self, sector_idx: u8) -> Result<(), squeezelite_config::StorageError> {
-            let offset = match sector_idx {
-                0 => {
-                    self.sector_a.fill(0xFF);
-                    SETTINGS_PARTITION_OFFSET
-                }
-                1 => {
-                    self.sector_b.fill(0xFF);
-                    SETTINGS_PARTITION_OFFSET + 4096
-                }
-                _ => return Err(squeezelite_config::StorageError::CapacityExceeded),
-            };
-
-            self.flash
-                .erase(offset, offset + 4096)
-                .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
-
-            Ok(())
-        }
+        let target_offset = if write_to_b {
+            SETTINGS_PARTITION_OFFSET + 4096
+        } else {
+            SETTINGS_PARTITION_OFFSET
+        };
+        flash.erase(target_offset, target_offset + 4096).ok()?;
+        flash.write_nor(target_offset, scratch).ok()?;
+        Some(next_seq)
     }
 
     #[allow(unsafe_code)]
     fn take_firmware_bss_buffers() -> &'static mut FirmwareBssBuffers {
         static mut BSS_BUFFERS: FirmwareBssBuffers = FirmwareBssBuffers::new();
         unsafe { &mut *core::ptr::addr_of_mut!(BSS_BUFFERS) }
+    }
+
+    type HwStreamPipeline = StreamPipeline<'static, EspI2sSink<Esp32HardwareI2sDma<'static>>>;
+
+    #[allow(unsafe_code)]
+    #[inline(never)]
+    fn init_static_pipeline(
+        stream_storage: &'static mut [u8],
+        output_storage: &'static mut [u8],
+        sink: EspI2sSink<Esp32HardwareI2sDma<'static>>,
+    ) -> (&'static mut HwStreamPipeline, &'static mut [u8; 2064]) {
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut STATIC_PIPELINE: core::mem::MaybeUninit<HwStreamPipeline> =
+            core::mem::MaybeUninit::uninit();
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut STATIC_RESP_BUF: core::mem::MaybeUninit<[u8; 2064]> =
+            core::mem::MaybeUninit::uninit();
+        unsafe {
+            let ptr = (*core::ptr::addr_of_mut!(STATIC_PIPELINE)).as_mut_ptr();
+            core::ptr::addr_of_mut!((*ptr).stream_buffer)
+                .write(squeezelite_audio_core::AudioRingBuffer::new(stream_storage));
+            core::ptr::addr_of_mut!((*ptr).output_buffer)
+                .write(squeezelite_audio_core::AudioRingBuffer::new(output_storage));
+            core::ptr::addr_of_mut!((*ptr).decoder)
+                .write(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
+            core::ptr::addr_of_mut!((*ptr).equalizer)
+                .write(squeezelite_audio_core::Equalizer::new());
+            core::ptr::addr_of_mut!((*ptr).volume)
+                .write(squeezelite_audio_core::VolumeScale::unity());
+            core::ptr::addr_of_mut!((*ptr).sink).write(sink);
+            core::ptr::addr_of_mut!((*ptr).sample_rate).write(44_100);
+            core::ptr::addr_of_mut!((*ptr).frames_played).write(0);
+            core::ptr::addr_of_mut!((*ptr).pcm_pending_offset).write(0);
+            core::ptr::addr_of_mut!((*ptr).pcm_pending_samples).write(0);
+            core::ptr::addr_of_mut!((*ptr).read_scratch).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*ptr).pcm_scratch).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*ptr).write_scratch).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*ptr).output_i32_scratch).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*ptr).current_eq_preset).write(EqPreset::Flat);
+
+            let resp_ptr = (*core::ptr::addr_of_mut!(STATIC_RESP_BUF)).as_mut_ptr();
+            resp_ptr.write_bytes(0, 1);
+
+            (&mut *ptr, &mut *resp_ptr)
+        }
     }
 
     pub fn run_hardware_firmware() -> ! {
@@ -1097,7 +1144,8 @@ mod xtensa_hw {
 
         let fw_bufs = take_firmware_bss_buffers();
         let FirmwareBssBuffers {
-            ref mut nvs_scratch,
+            ref mut ring_storage,
+            ref mut settings_scratch,
             ref mut http_rx_buf,
             ref mut http_tx_buf,
             ref mut slim_rx_buf,
@@ -1109,17 +1157,19 @@ mod xtensa_hw {
             ref mut audio_header_buf,
         } = fw_bufs;
 
-        let wifi_sta_creds = match load_nvs_wifi_credentials(&mut flash, &sta_mac, nvs_scratch) {
-            Ok(c) => c,
-            Err(e) => {
-                println!(
-                    "[ANTI-BRICK] Could not resolve Wi-Fi credentials from 0x9000 NVS ({:?}) -> resetting to recovery (0x10000)",
-                    e
-                );
-                esp_hal::system::software_reset();
+        let wifi_sta_creds = {
+            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
+            match load_nvs_wifi_credentials(&mut flash, &sta_mac, boot_scratch) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!(
+                        "[ANTI-BRICK] Could not resolve Wi-Fi credentials from 0x9000 NVS ({:?}) -> resetting to recovery (0x10000)",
+                        e
+                    );
+                    esp_hal::system::software_reset();
+                }
             }
         };
-        nvs_scratch.fill(0);
         wdt.feed();
         println!(
             "[NVS 0x9000] Loaded Wi-Fi STA SSID='{}' (pass_len={}) for MAC {:02x?}",
@@ -1128,44 +1178,52 @@ mod xtensa_hw {
             sta_mac
         );
 
-        let settings_partition = Esp32SettingsFlashPartition::new(&mut flash, nvs_scratch);
-        let mut nvs_backend = NvsFlashBackend::new(settings_partition);
-        let mut config_store = MemConfigStore::<32>::new();
-        if nvs_backend.load_store(&mut config_store).is_err() {
-            let default_cfg = AudioConfig::default();
-            let _ = default_cfg.save_to(&mut config_store);
-        }
-        let mut audio_cfg = AudioConfig::load_from(&config_store).unwrap_or_default();
+        let (mut audio_cfg, mut settings_seq) = {
+            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
+            load_boot_audio_config(&mut flash, boot_scratch)
+        };
+        ring_storage.fill(0);
         wdt.feed();
 
-        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver,
-        // and initialize 4 MB External Quad-SPI PSRAM allocator
+        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver.
+        // External PSRAM (`0x3F80_0000`) is registered only if the hardware MMU
+        // (`DPORT_PRO_CACHE_CTRL1_REG` and `SPI0_CACHE_SCTRL_REG`) has already mapped
+        // external SRAM (`>= 1_048_576` B), avoiding `esp-hal 1.2.2` `psram_gpio_config`
+        // `.text` (`0x4013c190`) XIP instruction fetch corruption on 40 MHz DIO flash
+        // and avoiding `esp-alloc` TLSF panic when `psram_size < 1_048_576`.
         #[allow(unsafe_code)]
         let psram_avail_bytes = {
             esp_alloc::heap_allocator!(size: 64 * 1024);
-            let psram = esp_hal::psram::Psram::new(
-                peripherals.PSRAM,
-                esp_hal::psram::PsramConfig::default(),
-            );
-            let (psram_start, psram_size) = psram.raw_parts();
-            if psram_size > 0 && !psram_start.is_null() {
+            const DPORT_PRO_CACHE_CTRL1_REG: *const u32 = 0x3FF0_0044 as *const u32;
+            const SPI0_CACHE_SCTRL_REG: *const u32 = 0x3FF4_303C as *const u32;
+            const EXTMEM_ORIGIN: usize = 0x3F80_0000;
+            const EXTMEM_SIZE: usize = 4 * 1024 * 1024;
+            let cache_ctrl1 = unsafe { core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL1_REG) };
+            let spi0_sctrl = unsafe { core::ptr::read_volatile(SPI0_CACHE_SCTRL_REG) };
+            let ext_sram_mapped = (cache_ctrl1 & (1 << 1)) == 0 && (spi0_sctrl & (1 << 2)) != 0;
+            if ext_sram_mapped {
                 unsafe {
                     esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-                        psram_start,
-                        psram_size,
+                        EXTMEM_ORIGIN as *mut u8,
+                        EXTMEM_SIZE,
                         esp_alloc::MemoryCapability::External.into(),
                     ));
                 }
+                EXTMEM_SIZE
+            } else {
+                0
             }
-            psram_size
         };
-        let (stream_cap, output_cap) = if psram_avail_bytes >= 524_288 + 131_072 {
-            (524_288, 131_072)
-        } else {
-            (8_192, 8_192)
-        };
-        let mut psram_stream_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; stream_cap];
-        let mut psram_output_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; output_cap];
+        let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(8192);
+        let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) =
+            if psram_avail_bytes >= 1_048_576 {
+                (
+                    alloc::boxed::Box::leak(alloc::vec![0u8; 524_288].into_boxed_slice()),
+                    alloc::boxed::Box::leak(alloc::vec![0u8; 131_072].into_boxed_slice()),
+                )
+            } else {
+                (bss_stream_storage, bss_output_storage)
+            };
         wdt.feed();
 
         // Start Core 1 (APP_CPU @ 240 MHz) executing `app_core_loop` in IRAM (`#[esp_hal::ram]`)
@@ -1223,14 +1281,7 @@ mod xtensa_hw {
 
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
-        let pcm_dec = PcmDecoder::new(16, 2, true);
-        let mut pipeline = StreamPipeline::new(
-            &mut psram_stream_storage[..],
-            &mut psram_output_storage[..],
-            ActiveDecoder::Pcm(pcm_dec),
-            sink,
-            44_100,
-        );
+        let (pipeline, pending_resp_buf) = init_static_pipeline(stream_storage, output_storage, sink);
         let mut coordinator = PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT");
         println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
 
@@ -1343,7 +1394,6 @@ mod xtensa_hw {
         let mut audio_req_len: usize = 0;
         let mut audio_header_len: usize = 0;
         let mut audio_header_window: u32 = 0;
-        let mut pending_resp_buf = [0u8; 2064];
         let mut pending_resp_len: usize = 0;
         let mut pending_resp_sent: usize = 0;
         let mut last_fault_check_ms: u64 = 0;
@@ -1541,7 +1591,7 @@ mod xtensa_hw {
                             tas_pll_locked,
                             tas_automuted,
                             again_code: amp.analog_gain_code(),
-                            settings_seq: nvs_backend.last_seq(),
+                            settings_seq,
                         };
                         let mut resp_buf = [0u8; 768];
                         if let Some((hdr_or_resp_len, static_body, action)) =
@@ -1568,14 +1618,20 @@ mod xtensa_hw {
                                     let preset = EqPreset::from_u8(preset_id);
                                     pipeline.apply_eq_preset(preset);
                                     audio_cfg.equalizer_preset = preset_id;
-                                    let _ = audio_cfg.save_to(&mut config_store);
-                                    let _ = nvs_backend.commit_store(&config_store);
+                                    if let Some(seq) =
+                                        persist_audio_config(&mut flash, settings_scratch, &audio_cfg)
+                                    {
+                                        settings_seq = seq;
+                                    }
                                 }
                                 HttpControlAction::SetAnalogGain(again_code) => {
                                     let _ = amp.set_analog_gain(again_code);
                                     audio_cfg.analog_gain_code = again_code;
-                                    let _ = audio_cfg.save_to(&mut config_store);
-                                    let _ = nvs_backend.commit_store(&config_store);
+                                    if let Some(seq) =
+                                        persist_audio_config(&mut flash, settings_scratch, &audio_cfg)
+                                    {
+                                        settings_seq = seq;
+                                    }
                                 }
                                 HttpControlAction::PlayerIrCommand { ir_code, vol_pct, mute } => {
                                     if let Some(pct) = vol_pct {
@@ -1586,8 +1642,11 @@ mod xtensa_hw {
                                         pipeline.set_volume(eff_gain, eff_gain);
                                         let _ = cyd_bridge.send_message(&CydMessage::Volume(pct));
                                         audio_cfg.volume = pct;
-                                        let _ = audio_cfg.save_to(&mut config_store);
-                                        let _ = nvs_backend.commit_store(&config_store);
+                                        if let Some(seq) =
+                                            persist_audio_config(&mut flash, settings_scratch, &audio_cfg)
+                                        {
+                                            settings_seq = seq;
+                                        }
                                     }
                                     if let Some(m) = mute {
                                         pipeline.sink.set_mute(m);
@@ -1626,7 +1685,7 @@ mod xtensa_hw {
                     }
                     HttpControlAction::PersistOta0AndReboot => {
                         let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                        let _ = nvs_backend.flash_mut().flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
+                        let _ = flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
                         println!("[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> wrote ota_0 select entry & resetting");
                         esp_hal::system::software_reset();
                     }
@@ -2295,7 +2354,7 @@ mod xtensa_hw {
 
                             if let Ok(resp_len) = SlimprotoBuilder::build_resp(
                                 &audio_header_buf[..audio_header_len],
-                                &mut pending_resp_buf,
+                                pending_resp_buf,
                             ) {
                                 pending_resp_len = resp_len;
                                 pending_resp_sent = 0;
@@ -2419,7 +2478,7 @@ mod xtensa_hw {
                 }
             }
 
-            let step_frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+            let step_frames = run_firmware_tick(&mut coordinator, pipeline, &mut cyd_bridge, &mut amp);
 
             let has_buffered_audio =
                 pipeline.output_buffer.available_read() >= 8 || pipeline.has_pending_pcm();
