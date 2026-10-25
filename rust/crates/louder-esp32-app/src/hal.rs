@@ -395,6 +395,11 @@ pub trait FlashPartition {
 
     /// Writes a 4096-byte sector (0 for Sector A, 1 for Sector B).
     fn write_sector(&mut self, sector_idx: u8, data: &[u8; FLASH_SECTOR_SIZE]) -> Result<(), StorageError>;
+
+    /// Erases a 4096-byte sector (0 for Sector A, 1 for Sector B), setting all bytes to 0xFF.
+    fn erase_sector(&mut self, sector_idx: u8) -> Result<(), StorageError> {
+        self.write_sector(sector_idx, &[0xFF; FLASH_SECTOR_SIZE])
+    }
 }
 
 /// In-memory dual-sector flash partition for simulation and verification.
@@ -436,6 +441,20 @@ impl FlashPartition for MemFlashPartition {
             }
             1 => {
                 self.sector_b.copy_from_slice(data);
+                Ok(())
+            }
+            _ => Err(StorageError::CapacityExceeded),
+        }
+    }
+
+    fn erase_sector(&mut self, sector_idx: u8) -> Result<(), StorageError> {
+        match sector_idx {
+            0 => {
+                self.sector_a.fill(0xFF);
+                Ok(())
+            }
+            1 => {
+                self.sector_b.fill(0xFF);
                 Ok(())
             }
             _ => Err(StorageError::CapacityExceeded),
@@ -523,6 +542,35 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
         self.last_seq = new_seq;
         Ok(new_seq)
     }
+
+    /// Erases all sectors (0 and 1) in the flash partition and resets journal state (`HALNET-408`).
+    pub fn erase_all(&mut self) -> Result<(), StorageError> {
+        self.flash.erase_sector(0)?;
+        self.flash.erase_sector(1)?;
+        self.last_seq = 0;
+        self.scratch.fill(0xFF);
+        Ok(())
+    }
+
+    /// Erases a specific sector (0 or 1) in the flash partition.
+    pub fn erase_sector(&mut self, sector_idx: u8) -> Result<(), StorageError> {
+        self.flash.erase_sector(sector_idx)
+    }
+
+    /// Erases flash partition sectors spanning byte range `start..end`.
+    pub fn erase_range(&mut self, range: core::ops::Range<usize>) -> Result<(), StorageError> {
+        if range.start < FLASH_SECTOR_SIZE {
+            self.flash.erase_sector(0)?;
+        }
+        if range.end > FLASH_SECTOR_SIZE {
+            self.flash.erase_sector(1)?;
+        }
+        if range.start == 0 && range.end >= FLASH_SECTOR_SIZE * 2 {
+            self.last_seq = 0;
+            self.scratch.fill(0xFF);
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -586,12 +634,17 @@ impl TargetI2cBus {
         )
     }
 
-    /// Creates a target I2C bus with explicit pin assignments.
+    /// Creates a target I2C bus with explicit pin assignments and default TAS5805M telemetry.
     pub fn with_pins(sda_pin: u8, scl_pin: u8) -> Self {
+        let mut registers = [0u8; 256];
+        registers[0x37] = 0x08; // 44.1 kHz detected FS_MON
+        registers[0x38] = 64;   // 64 FS BCK_MON
+        registers[0x39] = 0x08; // PLL locked CLKDET_STATUS
+        registers[0x54] = 0x08; // -4.0 dB AGAIN
         Self {
             sda_pin,
             scl_pin,
-            registers: [0u8; 256],
+            registers,
             current_reg: 0,
         }
     }
@@ -1025,6 +1078,29 @@ mod tests {
         assert_eq!(cfg.bclk_pin, crate::board::pins::I2S_BCLK as u8);
         assert_eq!(cfg.lrclk_pin, crate::board::pins::I2S_LRCLK as u8);
         assert_eq!(cfg.dout_pin, crate::board::pins::I2S_DOUT as u8);
+    }
+
+    #[test]
+    fn test_nvs_flash_backend_erase_all() {
+        let partition = MemFlashPartition::new();
+        let mut backend = NvsFlashBackend::new(partition);
+        let mut store = MemConfigStore::<16>::new();
+        let mut audio = AudioConfig::default();
+        audio.player_name.clear();
+        audio.player_name.push_str("LouderStudio").unwrap();
+        audio.save_to(&mut store).unwrap();
+
+        let seq1 = backend.commit_store(&store).unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(backend.last_seq(), 1);
+
+        backend.erase_all().unwrap();
+        assert_eq!(backend.last_seq(), 0);
+        assert_eq!(backend.flash().read_sector(0).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
+        assert_eq!(backend.flash().read_sector(1).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
+
+        backend.erase_range(0..4096).unwrap();
+        assert_eq!(backend.flash().read_sector(0).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
     }
 }
 
