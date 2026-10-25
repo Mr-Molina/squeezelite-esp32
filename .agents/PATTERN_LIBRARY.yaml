@@ -257,4 +257,88 @@ patterns:
   - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
     date: '2026-10-25'
     postmortem_ref: PM-2026-1025-002
+- id: PAT-2026-1025-003
+  name: Hardware & Workspace Feature-Maximization Audit Gate
+  failure_type: design
+  scope: project
+  root_cause_category: unutilized_board_psram_dualcore_dsp_and_workspace_crates
+  description: Sizing audio ringbuffers inside constrained internal .bss (8 KB + 8 KB)
+    while leaving the board's 4 MB Quad-SPI PSRAM, Core 1 (APP_CPU), TI TAS5805M silicon
+    maximization (1SPW modulation, AGAIN analog gain, spread-spectrum, live clock/PLL
+    telemetry), 10-band biquad EQ, and FlashJournal NVS persistence uninitialized.
+    Firmware ports MUST audit and wire full board silicon and workspace crates before
+    claiming feature parity.
+  escalation_level: 2
+  mitigation_level: 2
+  current_mitigation: mechanical_invariant — Invariant 45 in .agents/INFRASTRUCTURE_INVARIANTS.md
+  mitigation_target: .agents/INFRASTRUCTURE_INVARIANTS.md
+  postmortem_ids:
+  - PM-2026-1025-003
+  occurrences:
+  - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
+    date: '2026-10-25'
+    postmortem_ref: PM-2026-1025-003
+- id: PAT-2026-1025-004
+  name: 8-Byte Stereo Frame Circular DMA Alignment & Underrun Zero-Fill Gate
+  failure_type: logic
+  scope: project
+  root_cause_category: i2s_circular_dma_frame_misalignment_and_stale_underrun_replay
+  description: Pushing non-8-byte-aligned byte counts into ESP32 32-bit stereo circular
+    I2S DMA (DmaTxCircularBuffer) or restarting a halted DMA transfer in ensure_running()
+    without zero-filling the circular buffer first, causing stereo channel/byte swap
+    corruption and replaying stale audio samples on underrun recovery.
+  escalation_level: 2
+  mitigation_level: 2
+  current_mitigation: mechanical_invariant — Invariant 46 in .agents/INFRASTRUCTURE_INVARIANTS.md
+  mitigation_target: rust/crates/louder-esp32-app/src/main.rs
+  postmortem_ids:
+  - PM-2026-1025-004
+  occurrences:
+  - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
+    date: '2026-10-25'
+    postmortem_ref: PM-2026-1025-004
+- id: PAT-2026-1025-005
+  name: Split NVS Page-0 Namespace Pinning & Gate-1-First Boot Order Gate
+  failure_type: logic
+  scope: project
+  root_cause_category: split_nvs_window_losing_page0_namespace_definitions
+  description: Reading a 4-page (16 KB) ESP-IDF NVS partition (0x9000..0xD000) through
+    a sliding 3-page (12 KB) buffer where Pass 1 (0x9000..0xC000) misses Page 3 credentials
+    and Pass 2 (0xA000..0xD000) overwrites Page 0 (0x9000..0xA000, where namespace
+    IDs config_ns_id and aplist_ns_id are defined), causing Err(CredentialsNotFound)
+    and immediate boot rollback. Windowed NVS reads MUST pin Page 0 in nvs_buf[0..4096]
+    while reading Pages 2-3 into nvs_buf[4096..12288], and Gate 1 (otadata erase) MUST
+    execute before PSRAM/Core1 initialization.
+  escalation_level: 3
+  mitigation_level: 3
+  current_mitigation: automation & mechanical_invariant — test_split_12kb_nvs_read_with_page0_namespaces_and_page3_credentials
+    in rust/crates/louder-esp32-app/src/ota_safety.rs and Invariant 47 in .agents/INFRASTRUCTURE_INVARIANTS.md
+  mitigation_target: rust/crates/louder-esp32-app/src/ota_safety.rs
+  postmortem_ids:
+  - PM-2026-1025-005
+  occurrences:
+  - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
+    date: '2026-10-25'
+    postmortem_ref: PM-2026-1025-005
+- id: PAT-2026-1014-001
+  name: Single-Persona Subagent Isolation & Extension Certifier Source-Edit Ban
+  failure_type: behavioral
+  scope: global
+  root_cause_category: certifier_subagent_unauthorized_source_edit_and_flash_loop
+  description: Extension Certifier subagent stepped outside its verification boundary
+    after an OTA boot rollback, editing src/main.rs, rebuilding, and reflashing in
+    a multi-hundred-step loop instead of immediately halting and returning [BLOCKED / ERROR]
+    after the first rollback.
+  escalation_level: 3
+  mitigation_level: 3
+  current_mitigation: mechanical_invariant — Invariant 47 in .agents/INFRASTRUCTURE_INVARIANTS.md
+    and GLB-017 in ~/.gemini/config/pattern-library.yaml
+  mitigation_target: .agents/INFRASTRUCTURE_INVARIANTS.md
+  postmortem_ids:
+  - PM-2026-1025-006
+  occurrences:
+  - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
+    date: '2026-10-25'
+    postmortem_ref: PM-2026-1025-006
+
 

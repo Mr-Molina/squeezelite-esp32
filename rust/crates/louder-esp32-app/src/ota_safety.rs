@@ -490,6 +490,157 @@ pub fn resolve_wifi_credentials(
     Err(OtaSafetyError::CredentialsNotFound)
 }
 
+fn scan_nvs_namespaces(
+    nvs_bytes: &[u8],
+    config_ns_id: &mut Option<u8>,
+    aplist_ns_id: &mut Option<u8>,
+) {
+    for page in nvs_bytes.chunks_exact(NVS_PAGE_SIZE) {
+        let state = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
+        if state != NVS_PAGE_STATE_ACTIVE && state != NVS_PAGE_STATE_FULL {
+            continue;
+        }
+        let bitmap = &page[32..64];
+        let mut idx = 0usize;
+        while idx < NVS_ENTRIES_PER_PAGE {
+            let entry_off = NVS_ENTRY_OFFSET + idx * NVS_ENTRY_SIZE;
+            let entry = &page[entry_off..entry_off + NVS_ENTRY_SIZE];
+            let span = usize::from(entry[2]).max(1);
+            if is_nvs_entry_written(bitmap, idx) && entry[0] == 0 && entry[1] == NVS_TYPE_U8 {
+                let key = parse_nvs_entry_key(entry);
+                let ns_id = entry[24];
+                if key == "config" {
+                    *config_ns_id = Some(ns_id);
+                } else if key == "aplist" {
+                    *aplist_ns_id = Some(ns_id);
+                }
+            }
+            idx += span;
+        }
+    }
+}
+
+fn scan_nvs_credentials(
+    nvs_bytes: &[u8],
+    sta_mac: &[u8; 6],
+    config_ns_id: Option<u8>,
+    aplist_ns_id: Option<u8>,
+    latest_ssid: &mut Option<String<32>>,
+    latest_password: &mut Option<String<64>>,
+    latest_aplist_creds: &mut Option<WifiStaCredentials>,
+) -> Result<(), OtaSafetyError> {
+    for page in nvs_bytes.chunks_exact(NVS_PAGE_SIZE) {
+        let state = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
+        if state != NVS_PAGE_STATE_ACTIVE && state != NVS_PAGE_STATE_FULL {
+            continue;
+        }
+        let bitmap = &page[32..64];
+        let mut idx = 0usize;
+        while idx < NVS_ENTRIES_PER_PAGE {
+            let entry_off = NVS_ENTRY_OFFSET + idx * NVS_ENTRY_SIZE;
+            let entry = &page[entry_off..entry_off + NVS_ENTRY_SIZE];
+            let span = usize::from(entry[2]).max(1);
+            if is_nvs_entry_written(bitmap, idx) {
+                let ns = entry[0];
+                let dtype = entry[1];
+                let key = parse_nvs_entry_key(entry);
+                if Some(ns) == config_ns_id {
+                    if key == "ssid" {
+                        if let Some(val) = extract_nvs_entry_value(page, idx, span, dtype) {
+                            let trimmed = val.trim_end_matches('\0');
+                            if !trimmed.is_empty() {
+                                *latest_ssid = Some(heapless_string_from_str(trimmed)?);
+                            }
+                        }
+                    } else if key == "password" {
+                        if let Some(val) = extract_nvs_entry_value(page, idx, span, dtype) {
+                            *latest_password = Some(decrypt_nvs_wifi_password(val, sta_mac)?);
+                        }
+                    }
+                } else if Some(ns) == aplist_ns_id {
+                    if let Some(val) = extract_nvs_entry_value(page, idx, span, dtype) {
+                        if val.contains("\"ssid\"") && val.contains("\"pass\"") {
+                            if let (Some(raw_ssid), Some(raw_pass)) = (
+                                extract_json_string_field(val, "\"ssid\":\""),
+                                extract_json_string_field(val, "\"pass\":\""),
+                            ) {
+                                let ssid = heapless_string_from_str(raw_ssid)?;
+                                let password = decrypt_nvs_wifi_password(raw_pass, sta_mac)?;
+                                *latest_aplist_creds = Some(WifiStaCredentials { ssid, password });
+                            }
+                        }
+                    }
+                }
+            }
+            idx += span;
+        }
+    }
+    Ok(())
+}
+
+/// Resolves Wi-Fi STA credentials across the full 4-page (`16,384`-byte) NVS partition
+/// (`0x9000..0xD000`) using a 3-page (`12,288`-byte) scratch buffer by keeping Page 0
+/// (`0x9000..0xA000`, containing namespace ID definitions `config_ns_id`/`aplist_ns_id`)
+/// pinned in `nvs_buf[0..4096]` while reading Pages 2–3 (`0xB000..0xD000`) into
+/// `nvs_buf[4096..12288]`.
+pub fn load_nvs_wifi_credentials_split_12kb<F>(
+    mut read_flash: F,
+    sta_mac: &[u8; 6],
+    nvs_buf: &mut [u8; 12_288],
+    compile_time_ssid: Option<&str>,
+    compile_time_pass: Option<&str>,
+) -> Result<WifiStaCredentials, OtaSafetyError>
+where
+    F: FnMut(u32, &mut [u8]),
+{
+    let mut config_ns_id: Option<u8> = None;
+    let mut aplist_ns_id: Option<u8> = None;
+    let mut latest_ssid: Option<String<32>> = None;
+    let mut latest_password: Option<String<64>> = None;
+    let mut latest_aplist_creds: Option<WifiStaCredentials> = None;
+
+    // Pass 1: Read Pages 0, 1, 2 (0x9000..0xC000, 12,288 bytes) into nvs_buf[0..12_288].
+    nvs_buf.fill(0xFF);
+    read_flash(NVS_PARTITION_OFFSET, nvs_buf);
+    scan_nvs_namespaces(nvs_buf, &mut config_ns_id, &mut aplist_ns_id);
+    scan_nvs_credentials(
+        nvs_buf,
+        sta_mac,
+        config_ns_id,
+        aplist_ns_id,
+        &mut latest_ssid,
+        &mut latest_password,
+        &mut latest_aplist_creds,
+    )?;
+
+    // Pass 2: Keep Page 0 (0x9000..0xA000) pinned in nvs_buf[0..4096] and read Pages 2 & 3
+    // (0xB000..0xD000, 8,192 bytes) into nvs_buf[4096..12_288].
+    nvs_buf[NVS_PAGE_SIZE..].fill(0xFF);
+    read_flash(
+        NVS_PARTITION_OFFSET + (2 * NVS_PAGE_SIZE as u32),
+        &mut nvs_buf[NVS_PAGE_SIZE..],
+    );
+    scan_nvs_namespaces(&nvs_buf[NVS_PAGE_SIZE..], &mut config_ns_id, &mut aplist_ns_id);
+    scan_nvs_credentials(
+        nvs_buf,
+        sta_mac,
+        config_ns_id,
+        aplist_ns_id,
+        &mut latest_ssid,
+        &mut latest_password,
+        &mut latest_aplist_creds,
+    )?;
+
+    if let (Some(ssid), Some(password)) = (latest_ssid, latest_password) {
+        return Ok(WifiStaCredentials { ssid, password });
+    }
+    if let Some(creds) = latest_aplist_creds {
+        return Ok(creds);
+    }
+
+    resolve_wifi_credentials(nvs_buf, sta_mac, compile_time_ssid, compile_time_pass)
+}
+
 /// Validates an ESP32 firmware `.bin` image against the exact checks performed by
 /// `ota_header_check()` in `components/squeezelite-ota/squeezelite-ota.c:633-669`.
 pub fn verify_ota_binary_header(image: &[u8]) -> Result<OtaBinarySummary, OtaSafetyError> {
@@ -743,5 +894,58 @@ mod tests {
             verify_ota_binary_header(&bin),
             Err(OtaSafetyError::InvalidBinaryHeader(_))
         ));
+    }
+
+    #[test]
+    fn test_split_12kb_nvs_read_with_page0_namespaces_and_page3_credentials() {
+        let mut full_nvs = [0xFFu8; NVS_PAGE_SIZE * 4];
+        // Page 0 (0x9000..0xA000): FULL state, holds namespace definitions for "config" (ns_id=1) and "aplist" (ns_id=2)
+        full_nvs[0..4].copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
+        write_nvs_namespace_entry(&mut full_nvs[0..NVS_PAGE_SIZE], 0, "config", 1);
+        write_nvs_namespace_entry(&mut full_nvs[0..NVS_PAGE_SIZE], 1, "aplist", 2);
+
+        // Page 1 (0xA000..0xB000) and Page 2 (0xB000..0xC000): FULL state, no active Wi-Fi credentials
+        full_nvs[NVS_PAGE_SIZE..NVS_PAGE_SIZE + 4]
+            .copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
+        full_nvs[2 * NVS_PAGE_SIZE..2 * NVS_PAGE_SIZE + 4]
+            .copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
+
+        // Page 3 (0xC000..0xD000): ACTIVE state, holds active Wi-Fi credentials under ns_id=1 ("config")
+        let page3_start = 3 * NVS_PAGE_SIZE;
+        full_nvs[page3_start..page3_start + 4]
+            .copy_from_slice(&NVS_PAGE_STATE_ACTIVE.to_le_bytes());
+        let span1 = write_nvs_blob_entry(
+            &mut full_nvs[page3_start..page3_start + NVS_PAGE_SIZE],
+            0,
+            1,
+            NVS_TYPE_BLOB,
+            "ssid",
+            b"iot\0",
+        );
+        let enc_pass = encrypt_for_test("Page3SecretPass2026!", &BASEMENT_MAC);
+        let _span2 = write_nvs_blob_entry(
+            &mut full_nvs[page3_start..page3_start + NVS_PAGE_SIZE],
+            span1,
+            1,
+            NVS_TYPE_BLOB,
+            "password",
+            enc_pass.as_bytes(),
+        );
+
+        let mut nvs_buf = [0xFFu8; 12_288];
+        let creds = load_nvs_wifi_credentials_split_12kb(
+            |offset, buf| {
+                let rel = (offset - NVS_PARTITION_OFFSET) as usize;
+                buf.copy_from_slice(&full_nvs[rel..rel + buf.len()]);
+            },
+            &BASEMENT_MAC,
+            &mut nvs_buf,
+            None,
+            None,
+        )
+        .expect("Split 12 KB NVS reader should resolve Page 0 namespace + Page 3 credentials");
+
+        assert_eq!(creds.ssid.as_str(), "iot");
+        assert_eq!(creds.password.as_str(), "Page3SecretPass2026!");
     }
 }

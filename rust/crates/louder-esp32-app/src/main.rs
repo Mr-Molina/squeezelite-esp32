@@ -450,8 +450,8 @@ mod xtensa_hw {
     use squeezelite_config::AudioConfig;
     use squeezelite_cyd_link::CydMessage;
     use louder_esp32_app::ota_safety::{
-        resolve_wifi_credentials, verify_otadata_erased, OtaSafetyError, OtaSelectEntry,
-        WifiStaCredentials, NVS_PARTITION_OFFSET, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
+        load_nvs_wifi_credentials_split_12kb, verify_otadata_erased, OtaSafetyError,
+        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
         OTADATA_SECTOR_1_OFFSET,
     };
     use smoltcp::iface::{Config as SmolIfaceConfig, Interface as SmolInterface, SocketSet, SocketStorage};
@@ -895,19 +895,12 @@ mod xtensa_hw {
         sta_mac: &[u8; 6],
         nvs_buf: &mut [u8; 12_288],
     ) -> Result<WifiStaCredentials, OtaSafetyError> {
-        nvs_buf.fill(0xFF);
-        let _ = flash.read(NVS_PARTITION_OFFSET, nvs_buf);
-        if let Ok(creds) = louder_esp32_app::ota_safety::parse_nvs_wifi_credentials(nvs_buf, sta_mac) {
-            return Ok(creds);
-        }
-        nvs_buf.fill(0xFF);
-        let _ = flash.read(NVS_PARTITION_OFFSET + 4096, nvs_buf);
-        if let Ok(creds) = louder_esp32_app::ota_safety::parse_nvs_wifi_credentials(nvs_buf, sta_mac) {
-            return Ok(creds);
-        }
-        resolve_wifi_credentials(
-            nvs_buf,
+        load_nvs_wifi_credentials_split_12kb(
+            |offset, buf| {
+                let _ = flash.read_nor(offset, buf);
+            },
             sta_mac,
+            nvs_buf,
             option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
             option_env!("SL_WIFI_PASS"),
         )
@@ -958,7 +951,17 @@ mod xtensa_hw {
     static mut APP_CORE_STACK: Stack<4096> = Stack::new();
     static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-    const SETTINGS_PARTITION_OFFSET: u32 = 0x3F0000;
+    #[esp_hal::ram]
+    fn app_core_loop() {
+        loop {
+            CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            for _ in 0..10_000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    const SETTINGS_PARTITION_OFFSET: u32 = 0x3FE000;
 
     pub struct Esp32SettingsFlashPartition<'a, 'd> {
         pub flash: &'a mut FlashStorage<'d>,
@@ -973,8 +976,8 @@ mod xtensa_hw {
             let sector_a: &mut [u8; 4096] = a_slice.try_into().unwrap();
             let sector_b: &mut [u8; 4096] = b_slice.try_into().unwrap();
 
-            let _ = flash.read(SETTINGS_PARTITION_OFFSET, sector_a);
-            let _ = flash.read(SETTINGS_PARTITION_OFFSET + 4096, sector_b);
+            let _ = flash.read_nor(SETTINGS_PARTITION_OFFSET, sector_a);
+            let _ = flash.read_nor(SETTINGS_PARTITION_OFFSET + 4096, sector_b);
 
             Self {
                 flash,
@@ -1017,7 +1020,7 @@ mod xtensa_hw {
                 .erase(offset, offset + 4096)
                 .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
             self.flash
-                .write(offset, data)
+                .write_nor(offset, data)
                 .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
 
             Ok(())
@@ -1063,36 +1066,11 @@ mod xtensa_hw {
         wdt.enable();
         wdt.feed();
 
-        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver,
-        // and initialize 4 MB External Quad-SPI PSRAM allocator
-        #[allow(unsafe_code)]
-        {
-            esp_alloc::heap_allocator!(size: 64 * 1024);
-            esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
-        }
-        let mut psram_stream_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 524_288];
-        let mut psram_output_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 131_072];
-
-        // Start Core 1 (APP_CPU @ 240 MHz)
-        let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
-        #[allow(unsafe_code)]
-        let _app_core_guard = cpu_ctrl.start_app_core(
-            unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
-            || {
-                loop {
-                    CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    for _ in 0..10_000 {
-                        core::hint::spin_loop();
-                    }
-                }
-            },
-        );
-
         // ====================================================================
         // GATE 1: First-Instruction `otadata` (0xD000..0xF000) Pre-Arming
-        // Erases `otadata` to 0xFF BEFORE Wi-Fi/interrupts so ANY subsequent
-        // reset (panic, WDT, network timeout, or power cycle) boots straight
-        // back into the untouched factory `recovery` partition (0x10000)!
+        // Erases `otadata` to 0xFF BEFORE PSRAM, Core 1, or Wi-Fi so ANY
+        // subsequent reset (panic, WDT, network timeout, or power cycle) boots
+        // straight back into the untouched factory `recovery` partition (0x10000)!
         // ====================================================================
         let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
         if flash.erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END).is_err() {
@@ -1112,7 +1090,7 @@ mod xtensa_hw {
         wdt.feed();
         println!("[ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)");
 
-        // Read 16 KB `nvs` partition (0x9000..0xD000) while single-core before starting Wi-Fi
+        // Read 16 KB `nvs` partition (0x9000..0xD000) and `settings` (0x3FE000) while single-core
         let sta_mac_addr = interface_mac_address(InterfaceMacAddress::Station);
         let mut sta_mac = [0u8; 6];
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
@@ -1156,9 +1134,47 @@ mod xtensa_hw {
         if nvs_backend.load_store(&mut config_store).is_err() {
             let default_cfg = AudioConfig::default();
             let _ = default_cfg.save_to(&mut config_store);
-            let _ = nvs_backend.commit_store(&config_store);
         }
         let mut audio_cfg = AudioConfig::load_from(&config_store).unwrap_or_default();
+        wdt.feed();
+
+        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver,
+        // and initialize 4 MB External Quad-SPI PSRAM allocator
+        #[allow(unsafe_code)]
+        let psram_avail_bytes = {
+            esp_alloc::heap_allocator!(size: 64 * 1024);
+            let psram = esp_hal::psram::Psram::new(
+                peripherals.PSRAM,
+                esp_hal::psram::PsramConfig::default(),
+            );
+            let (psram_start, psram_size) = psram.raw_parts();
+            if psram_size > 0 && !psram_start.is_null() {
+                unsafe {
+                    esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                        psram_start,
+                        psram_size,
+                        esp_alloc::MemoryCapability::External.into(),
+                    ));
+                }
+            }
+            psram_size
+        };
+        let (stream_cap, output_cap) = if psram_avail_bytes >= 524_288 + 131_072 {
+            (524_288, 131_072)
+        } else {
+            (8_192, 8_192)
+        };
+        let mut psram_stream_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; stream_cap];
+        let mut psram_output_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; output_cap];
+        wdt.feed();
+
+        // Start Core 1 (APP_CPU @ 240 MHz) executing `app_core_loop` in IRAM (`#[esp_hal::ram]`)
+        let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
+        #[allow(unsafe_code)]
+        let _app_core_guard = cpu_ctrl.start_app_core(
+            unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
+            app_core_loop,
+        );
 
         // Initialize GPIO33 PWDN, GPIO34 FAULT, I2C0 (SDA=21, SCL=27), I2S0 (BCK=26, WS=25, DOUT=22), UART2
         let mut pwdn = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
