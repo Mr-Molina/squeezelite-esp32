@@ -723,6 +723,15 @@ mod xtensa_hw {
             driver
         }
 
+        #[inline(never)]
+        pub fn prefill_silence(buf: &mut esp_hal::dma::DmaTxStreamBuf) {
+            let silence = [0u8; 2048];
+            for _ in 0..4 {
+                let _ = buf.push(&silence);
+            }
+        }
+
+        #[inline(never)]
         pub fn ensure_running(&mut self) {
             let needs_restart = self.transfer.as_ref().map(|t| t.is_done()).unwrap_or(false);
             if needs_restart {
@@ -731,8 +740,7 @@ mod xtensa_hw {
                     let (descriptors, mut buffer) = buf.split();
                     buffer.fill(0);
                     if let Ok(mut new_buf) = esp_hal::dma::DmaTxStreamBuf::new(descriptors, buffer) {
-                        let silence = [0u8; 2048];
-                        let _ = new_buf.push(&silence);
+                        Self::prefill_silence(&mut new_buf);
                         if let Ok(new_transfer) = i2s_tx.write(new_buf) {
                             self.transfer = Some(new_transfer);
                             let rate = self.sample_rate_hz;
@@ -880,7 +888,7 @@ mod xtensa_hw {
                     unsafe {
                         let cur = core::ptr::read_volatile(I2S0_CLKM_CONF_REG);
                         let flags = cur & !0x000F_FFFF;
-                        let new_val = flags | (div_num & 0xFF) | ((div_b & 0x3F) << 8) | ((div_a & 0x3F) << 14);
+                        let new_val = flags | (div_num & 0xFF) | ((div_a & 0x3F) << 8) | ((div_b & 0x3F) << 14);
                         core::ptr::write_volatile(I2S0_CLKM_CONF_REG, new_val);
                     }
                 }
@@ -1008,50 +1016,15 @@ mod xtensa_hw {
 
     #[inline(never)]
     fn persist_audio_config(
-        flash: &mut FlashStorage<'_>,
         scratch: &mut [u8; 512],
         cfg: &AudioConfig,
+        current_seq: u32,
     ) -> Option<u32> {
-        scratch.fill(0xFF);
-        let meta_a = if flash.read_nor(SETTINGS_PARTITION_OFFSET, scratch).is_ok() {
-            squeezelite_config::FlashJournal::read_sector_meta(scratch)
-        } else {
-            Err(squeezelite_config::StorageError::CorruptedData)
-        };
-
-        scratch.fill(0xFF);
-        let meta_b = if flash.read_nor(SETTINGS_PARTITION_OFFSET + 4096, scratch).is_ok() {
-            squeezelite_config::FlashJournal::read_sector_meta(scratch)
-        } else {
-            Err(squeezelite_config::StorageError::CorruptedData)
-        };
-
-        let (write_to_b, next_seq) = match (meta_a, meta_b) {
-            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
-                if squeezelite_config::FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
-                    (true, seq_a.wrapping_add(1))
-                } else {
-                    (false, seq_b.wrapping_add(1))
-                }
-            }
-            (Ok((seq_a, _, _)), Err(_)) => (true, seq_a.wrapping_add(1)),
-            (Err(_), Ok((seq_b, _, _))) => (false, seq_b.wrapping_add(1)),
-            (Err(_), Err(_)) => (false, 1),
-        };
-
+        let next_seq = current_seq.wrapping_add(1);
         let mut store = MemConfigStore::<8>::new();
         cfg.save_to(&mut store).ok()?;
-
         scratch.fill(0xFF);
         squeezelite_config::FlashJournal::save_to_sector_with_seq(&store, scratch, next_seq).ok()?;
-
-        let target_offset = if write_to_b {
-            SETTINGS_PARTITION_OFFSET + 4096
-        } else {
-            SETTINGS_PARTITION_OFFSET
-        };
-        flash.erase(target_offset, target_offset + 4096).ok()?;
-        flash.write_nor(target_offset, scratch).ok()?;
         Some(next_seq)
     }
 
@@ -1307,7 +1280,7 @@ mod xtensa_hw {
             .with_data_format(DataFormat::Data32Channel32)
             .with_channels(Channels::STEREO);
         let mut tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
-        let _ = tx_buffer.push(&[0u8; 2048]);
+        Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
         let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
             .expect("Failed to initialize I2S0");
         let i2s_tx = i2s
@@ -1718,7 +1691,7 @@ mod xtensa_hw {
                                     pipeline.apply_eq_preset(preset);
                                     audio_cfg.equalizer_preset = preset_id;
                                     if let Some(seq) =
-                                        persist_audio_config(&mut flash, settings_scratch, &audio_cfg)
+                                        persist_audio_config(settings_scratch, &audio_cfg, settings_seq)
                                     {
                                         settings_seq = seq;
                                     }
@@ -1727,7 +1700,7 @@ mod xtensa_hw {
                                     let _ = amp.set_analog_gain(again_code);
                                     audio_cfg.analog_gain_code = again_code;
                                     if let Some(seq) =
-                                        persist_audio_config(&mut flash, settings_scratch, &audio_cfg)
+                                        persist_audio_config(settings_scratch, &audio_cfg, settings_seq)
                                     {
                                         settings_seq = seq;
                                     }
@@ -1742,7 +1715,7 @@ mod xtensa_hw {
                                         let _ = cyd_bridge.send_message(&CydMessage::Volume(pct));
                                         audio_cfg.volume = pct;
                                         if let Some(seq) =
-                                            persist_audio_config(&mut flash, settings_scratch, &audio_cfg)
+                                            persist_audio_config(settings_scratch, &audio_cfg, settings_seq)
                                         {
                                             settings_seq = seq;
                                         }
