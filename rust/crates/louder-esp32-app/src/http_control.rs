@@ -86,14 +86,18 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
     }
 }
 
-/// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1 response into `out_buf`.
+/// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full response for JSON) into `out_buf`.
+///
+/// For static HTML responses (`GET /`, `GET /index.html`), writes ONLY the HTTP headers into `out_buf` and
+/// returns `Some((header_len, DASHBOARD_HTML.as_bytes(), action))`, enabling multi-chunk streaming
+/// directly from `.rodata` without buffer overflow or truncation.
 ///
 /// Returns `None` if `req_bytes` does not yet contain a complete request line (`\r\n` or `\n`).
-pub fn handle_http_control_request(
+pub fn handle_http_request_streaming(
     req_bytes: &[u8],
     snapshot: &HttpStatusSnapshot<'_>,
     out_buf: &mut [u8],
-) -> Option<(usize, HttpControlAction)> {
+) -> Option<(usize, &'static [u8], HttpControlAction)> {
     let line_end = req_bytes.iter().position(|&b| b == b'\n')?;
     let first_line = core::str::from_utf8(&req_bytes[..line_end])
         .unwrap_or("")
@@ -104,8 +108,7 @@ pub fn handle_http_control_request(
     let raw_path = parts.next().unwrap_or("");
     let path = raw_path.split('?').next().unwrap_or(raw_path);
 
-    let mut body: String<512> = String::new();
-    let (status_line, action) = match (method, path) {
+    match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
             let body_bytes = DASHBOARD_HTML.as_bytes();
             let mut header: String<160> = String::new();
@@ -115,15 +118,22 @@ pub fn handle_http_control_request(
                 body_bytes.len()
             );
             let header_bytes = header.as_bytes();
-            let total_len = header_bytes.len() + body_bytes.len();
-            if total_len > out_buf.len() {
+            if header_bytes.len() > out_buf.len() {
                 return None;
             }
             out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
-            out_buf[header_bytes.len()..total_len].copy_from_slice(body_bytes);
-            return Some((total_len, HttpControlAction::None));
+            Some((header_bytes.len(), body_bytes, HttpControlAction::None))
+        }
+        ("GET", "/favicon.ico") => {
+            let resp = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if resp.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp.len()].copy_from_slice(resp);
+            Some((resp.len(), &[], HttpControlAction::None))
         }
         ("GET", "/status.json") => {
+            let mut body: String<512> = String::new();
             let _ = write!(
                 body,
                 "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{}}}",
@@ -156,45 +166,111 @@ pub fn handle_http_control_request(
                 snapshot.i2c_nacks,
                 snapshot.uptime_ms,
             );
-            ("HTTP/1.1 200 OK", HttpControlAction::None)
+            let mut response: String<640> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body.as_str()
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::None))
         }
         ("POST", "/recovery.json") | ("GET", "/recovery.json") => {
-            let _ = body.push_str("{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}");
-            ("HTTP/1.1 200 OK", HttpControlAction::RebootToRecovery)
+            let body = "{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}";
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::RebootToRecovery))
         }
         ("POST", "/reboot.json") | ("GET", "/reboot.json") => {
-            let _ = body.push_str("{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}");
-            ("HTTP/1.1 200 OK", HttpControlAction::RebootToRecovery)
+            let body = "{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}";
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::RebootToRecovery))
         }
         ("POST", "/reboot_ota.json") => {
-            let _ = body.push_str("{\"status\":\"rebooting_to_ota_0\",\"target_partition\":\"ota_0_0x160000\"}");
-            ("HTTP/1.1 200 OK", HttpControlAction::PersistOta0AndReboot)
+            let body = "{\"status\":\"rebooting_to_ota_0\",\"target_partition\":\"ota_0_0x160000\"}";
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
         }
         _ => {
-            let _ = body.push_str("{\"error\":\"not_found\"}");
-            ("HTTP/1.1 404 Not Found", HttpControlAction::None)
+            let body = "{\"error\":\"not_found\"}";
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::None))
         }
-    };
-
-    let mut response: String<768> = String::new();
-    let _ = write!(
-        response,
-        "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
-        status_line,
-        body.len(),
-        body.as_str()
-    );
-
-    let resp_bytes = response.as_bytes();
-    if resp_bytes.len() > out_buf.len() {
-        return None;
     }
-    out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
-    Some((resp_bytes.len(), action))
+}
+
+/// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1 response into `out_buf`.
+///
+/// Returns `None` if `req_bytes` does not yet contain a complete request line (`\r\n` or `\n`),
+/// or if `out_buf` is too small to contain the full response.
+pub fn handle_http_control_request(
+    req_bytes: &[u8],
+    snapshot: &HttpStatusSnapshot<'_>,
+    out_buf: &mut [u8],
+) -> Option<(usize, HttpControlAction)> {
+    let (hdr_len, static_body, action) = handle_http_request_streaming(req_bytes, snapshot, out_buf)?;
+    if !static_body.is_empty() {
+        let total_len = hdr_len + static_body.len();
+        if total_len > out_buf.len() {
+            return None;
+        }
+        out_buf[hdr_len..total_len].copy_from_slice(static_body);
+        Some((total_len, action))
+    } else {
+        Some((hdr_len, action))
+    }
 }
 
 /// Static HTML dashboard embedded for `GET /` and `GET /index.html` requests.
-pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:1em;background:#111;color:#eee}table{border-collapse:collapse}td{padding:4px 8px;border:1px solid #444}button{margin:8px 4px 0 0;padding:6px 12px;background:#c33;color:#fff;border:0;border-radius:3px;cursor:pointer}</style></head><body><h2>Louder-ESP32 Control</h2><table><tr><td>IP/SSID</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Frames</td><td id=\"f\">-</td></tr><tr><td>Status</td><td id=\"s\">-</td></tr></table><div style=\"margin-top:8px\"><button onclick=\"fetch('/recovery.json',{method:'POST'}).then(()=>alert('Recovery...'))\">Recovery</button><button style=\"background:#555\" onclick=\"fetch('/reboot_ota.json',{method:'POST'}).then(()=>alert('Reboot OTA...'))\">Reboot OTA</button></div><script>function u(){fetch('/status.json').then(r=>r.json()).then(d=>{document.getElementById('n').innerText=d.ip+' ('+d.ssid+' '+d.rssi+'dBm)';document.getElementById('l').innerText=d.lms_ip+':'+d.lms_port;document.getElementById('f').innerText=d.frames_played;document.getElementById('s').innerText=d.amp_mode+' / '+(d.uptime_ms/1000|0)+'s';}).catch(()=>{});}u();setInterval(u,2000);</script></body></html>";
+pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:8px;background:#111;color:#eee}h3{margin:6px 0 2px;color:#0ef}table{width:100%;border-collapse:collapse}td{padding:2px 6px;border:1px solid #333;font-size:12px}button{margin:2px;padding:4px 8px;background:#222;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer}a{color:#0ef;text-decoration:none;font-size:12px}</style></head><body><h3>Louder-ESP32 Control</h3><table><tr><td>Net/RSSI</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Amp/Up</td><td id=\"s\">-</td></tr><tr><td>Audio</td><td id=\"f\">-</td></tr><tr><td>I2C</td><td id=\"i\">-</td></tr><tr><td>Firmware</td><td id=\"w\">-</td></tr></table><h3>Transport &amp; Volume</h3><button style=\"background:#085\" onclick=\"lms(['play'])\">&#9654;Play</button><button onclick=\"lms(['pause','1'])\">&#10074;&#10074;Pause</button><button onclick=\"lms(['stop'])\">&#9632;Stop</button><button onclick=\"lms(['playlist','index','-1'])\">&#9198;Prev</button><button onclick=\"lms(['playlist','index','+1'])\">Next&#9197;</button><br><button onclick=\"lms(['mixer','volume','-5'])\">-5%</button><button onclick=\"lms(['mixer','volume','25'])\">25%</button><button onclick=\"lms(['mixer','volume','40'])\">40%</button><button onclick=\"lms(['mixer','volume','55'])\">55%</button><button onclick=\"lms(['mixer','volume','70'])\">70%</button><button onclick=\"lms(['mixer','volume','85'])\">85%</button><button onclick=\"lms(['mixer','volume','+5'])\">+5%</button><h3>Presets</h3><button style=\"background:#158\" onclick=\"ply(0)\">Ibiza</button><button style=\"background:#158\" onclick=\"ply(1)\">WHYY</button><button style=\"background:#158\" onclick=\"ply(2)\">WDIY</button><button style=\"background:#158\" onclick=\"ply(3)\">Groove</button><br><a id=\"ll\" href=\"http://10.0.0.10:9000/\" target=\"_blank\">&rarr; Open Full Lyrion UI (10.0.0.10:9000)</a><h3>System</h3><button style=\"background:#922\" onclick=\"if(confirm('Recovery?'))fetch('/recovery.json',{method:'POST'}).then(()=>alert('Recovery...'))\">Reboot to Recovery (0x10000)</button><button style=\"background:#444\" onclick=\"if(confirm('Reboot OTA?'))fetch('/reboot_ota.json',{method:'POST'}).then(()=>alert('Reboot OTA...'))\">Commit OTA &amp; Reboot</button><script>var h='10.0.0.10:9000',pF=0,pT=0,P=['https://cdn-peer032.streaming-pro.com:8025/ibizaglobalradio.mp3','https://whyy.streamguys1.com/whyy_tunein','https://war.streamguys1.com:7883/wdiy_7880','file:///var/lib/squeezeboxserver/cache/djmix_demo_tracks/01_Basement_Deep_Groove_122bpm_8A.wav'];function lms(c){fetch('http://'+h+'/jsonrpc.js',{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify({id:1,method:'slim.request',params:['c8:2e:18:be:b8:34',c]})});}function ply(i){lms(['playlist','play',P[i]]);}function g(k,v){document.getElementById(k).innerText=v;}function u(){var n=Date.now();fetch('/status.json').then(r=>r.json()).then(d=>{h=d.lms_ip+':'+d.lms_port;document.getElementById('ll').href='http://'+h+'/';g('n',d.ip+' ('+d.ssid+' '+d.rssi+'dBm)');g('l',h+' (CLI '+d.lms_cport+')');var up=d.uptime_ms/1000|0;g('s',d.amp_mode+' | Up '+(up/60|0)+':'+((up%60<10)?'0':'')+(up%60));var fps=(pT>0&&n>pT)?((d.frames_played-pF)*1000/(n-pT)|0):0;pF=d.frames_played;pT=n;g('f',fps+' fps ('+d.frames_played+')');g('i','ACK: '+d.i2c_acks+' / NACK: '+d.i2c_nacks);g('w',d.version+' ('+(d.otadata_prearmed_factory?'Pre-Armed':'Normal')+')');}).catch(()=>{});}u();setInterval(u,1500);</script></body></html>";
 
 /// Health verdict emitted by [`DeadManLeaseWatchdog::evaluate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,7 +404,7 @@ mod tests {
     #[test]
     fn serves_html_dashboard_on_root_and_index_html() {
         let snap = HttpStatusSnapshot::default();
-        let mut buf = [0u8; 1536];
+        let mut buf = [0u8; 4096];
 
         let (len1, act1) =
             handle_http_control_request(b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
@@ -347,5 +423,28 @@ mod tests {
         let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
         assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp2.contains("Content-Type: text/html; charset=utf-8"));
+    }
+
+    #[test]
+    fn serves_favicon_204_and_handles_streaming() {
+        let snap = HttpStatusSnapshot::default();
+        let mut buf = [0u8; 512];
+
+        let (len, body, act) =
+            handle_http_request_streaming(b"GET /favicon.ico HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .unwrap();
+        assert_eq!(act, HttpControlAction::None);
+        assert!(body.is_empty());
+        let resp = core::str::from_utf8(&buf[..len]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let (hdr_len, body_bytes, act2) =
+            handle_http_request_streaming(b"GET / HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .unwrap();
+        assert_eq!(act2, HttpControlAction::None);
+        assert!(!body_bytes.is_empty());
+        let hdr_resp = core::str::from_utf8(&buf[..hdr_len]).unwrap();
+        assert!(hdr_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(hdr_resp.contains("Content-Type: text/html; charset=utf-8"));
     }
 }

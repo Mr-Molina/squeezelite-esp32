@@ -432,7 +432,7 @@ mod xtensa_hw {
     };
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{
-        handle_http_control_request, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
+        handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
         LeaseHealth,
     };
     use louder_esp32_app::ota_safety::{
@@ -1143,6 +1143,8 @@ mod xtensa_hw {
         let mut assigned_gw: [u8; 4] = [172, 22, 1, 1];
         let mut pending_http_action = HttpControlAction::None;
         let mut pending_action_deadline_ms: u64 = 0;
+        let mut pending_http_body: &'static [u8] = &[];
+        let mut pending_http_closing = false;
         let mut helo_sent = false;
         let mut last_stat_ms: u64 = 0;
         let mut last_connect_attempt_ms: u64 = 0;
@@ -1238,12 +1240,59 @@ mod xtensa_hw {
             // Gate 4: Port 80 HTTP Control & Recovery Server (`/status.json`, `/recovery.json`, `/reboot.json`, `/reboot_ota.json`)
             {
                 let http_sock = sockets.get_mut::<tcp::Socket>(http_handle);
+
+                // Multi-chunk streaming of static body (.rodata)
+                if !pending_http_body.is_empty() {
+                    if http_sock.may_send() {
+                        if let Ok(sent) = http_sock.send_slice(pending_http_body) {
+                            pending_http_body = &pending_http_body[sent..];
+                        }
+                        if pending_http_body.is_empty() {
+                            http_sock.close();
+                            pending_http_closing = true;
+                        }
+                    } else {
+                        pending_http_body = &[];
+                        http_sock.abort();
+                        pending_http_closing = false;
+                    }
+                }
+
+                // Immediate recycling of closing sockets (TimeWait / CloseWait / LastAck / FinWait2 / Closed)
+                if pending_http_closing {
+                    if http_sock.send_queue() == 0
+                        && (!http_sock.may_send()
+                            || matches!(
+                                http_sock.state(),
+                                tcp::State::TimeWait
+                                    | tcp::State::CloseWait
+                                    | tcp::State::Closing
+                                    | tcp::State::LastAck
+                                    | tcp::State::FinWait2
+                                    | tcp::State::Closed
+                            ))
+                    {
+                        http_sock.abort();
+                        pending_http_closing = false;
+                    }
+                }
+
                 if !http_sock.is_open() {
+                    pending_http_body = &[];
+                    pending_http_closing = false;
                     let _ = http_sock.listen(80);
                 }
-                if http_sock.can_recv() && http_sock.may_send() {
-                    let mut req_buf = [0u8; 512];
+
+                if pending_http_body.is_empty()
+                    && !pending_http_closing
+                    && http_sock.can_recv()
+                    && http_sock.may_send()
+                {
+                    let mut req_buf = [0u8; 256];
                     let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
+                    while http_sock.can_recv() {
+                        let _ = http_sock.recv(|buf| (buf.len(), ()));
+                    }
                     if n > 0 {
                         let amp_mode_str = match amp.mode() {
                             louder_esp32_app::AmpMode::Play => "Play",
@@ -1266,20 +1315,33 @@ mod xtensa_hw {
                             i2c_nacks: Esp32I2cBus::hw_nack_count(),
                             uptime_ms: now_ms.saturating_sub(boot_ms),
                         };
-                        let mut resp_buf = [0u8; 1536];
-                        if let Some((resp_len, action)) =
-                            handle_http_control_request(&req_buf[..n], &snap, &mut resp_buf)
+                        let mut resp_buf = [0u8; 640];
+                        if let Some((hdr_or_resp_len, static_body, action)) =
+                            handle_http_request_streaming(&req_buf[..n], &snap, &mut resp_buf)
                         {
-                            let _ = http_sock.send_slice(&resp_buf[..resp_len]);
-                            http_sock.close();
+                            let _ = http_sock.send_slice(&resp_buf[..hdr_or_resp_len]);
+                            if !static_body.is_empty() {
+                                pending_http_body = static_body;
+                                if let Ok(s) = http_sock.send_slice(pending_http_body) {
+                                    pending_http_body = &pending_http_body[s..];
+                                }
+                                if pending_http_body.is_empty() {
+                                    http_sock.close();
+                                    pending_http_closing = true;
+                                }
+                            } else {
+                                http_sock.close();
+                                pending_http_closing = true;
+                            }
                             if action != HttpControlAction::None {
                                 pending_http_action = action;
                                 pending_action_deadline_ms = now_ms + 250;
                             }
                         }
                     }
-                } else if http_sock.may_recv() && !http_sock.may_send() {
+                } else if pending_http_body.is_empty() && http_sock.may_recv() && !http_sock.may_send() {
                     http_sock.abort();
+                    pending_http_closing = false;
                 }
             }
 
