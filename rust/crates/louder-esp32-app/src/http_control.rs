@@ -36,6 +36,10 @@ pub enum HttpControlAction {
         vol_pct: Option<u8>,
         mute: Option<bool>,
     },
+    /// Sets the active 10-band equalizer preset (`0 = Flat`, `1 = Bass`, `2 = Loudness`, `3 = Vocal`, `4 = Rock`).
+    SetEqPreset(u8),
+    /// Sets TAS5805M analog gain attenuation (`0x00 = 0 dB`, `0x08 = -4 dB`, `0x0C = -6 dB`, `0x10 = -8 dB`).
+    SetAnalogGain(u8),
 }
 
 /// Live telemetry snapshot serialized into `GET /status.json`.
@@ -71,7 +75,42 @@ pub struct HttpStatusSnapshot<'a> {
     pub i2c_nacks: u32,
     /// Monotonic uptime in milliseconds since boot.
     pub uptime_ms: u64,
+    /// Free PSRAM in external Quad-SPI RAM in bytes.
+    pub psram_free_bytes: u32,
+    /// Used PSRAM in external Quad-SPI RAM in bytes.
+    pub psram_used_bytes: u32,
+    /// Whether Core 1 (`APP_CPU`) audio/watchdog task is active.
+    pub core1_active: bool,
+    /// Core 1 monotonic loop execution counter.
+    pub core1_loops: u32,
+    /// Active decoder codec name (`"PCM"`, `"FLAC"`, `"MP3"`, etc.).
+    pub codec: &'a str,
+    /// Active decoder audio sample rate in Hz.
+    pub codec_sample_rate: u32,
+    /// Active decoder channel count (1 = mono, 2 = stereo).
+    pub codec_channels: u8,
+    /// Active decoder sample bit depth (16, 24, 32).
+    pub codec_bit_depth: u8,
+    /// Active 10-band equalizer preset name (`"Flat"`, `"Bass"`, `"Loudness"`, `"Vocal"`, `"Rock"`).
+    pub eq_preset: &'a str,
+    /// Whether 10-band graphic equalizer is actively filtering samples.
+    pub eq_enabled: bool,
+    /// Detected hardware I2S sampling frequency in Hz from TAS5805M register 0x37.
+    pub tas_fs_hz: u32,
+    /// Detected hardware BCK-to-FS ratio from TAS5805M register 0x38.
+    pub tas_bck_ratio: u16,
+    /// Whether TAS5805M internal PLL clock synthesizer is locked (register 0x39 bit 3).
+    pub tas_pll_locked: bool,
+    /// Whether TAS5805M clock fault auto-mute is active (register 0x39 bit 0).
+    pub tas_automuted: bool,
+    /// Hardware analog gain code (`0x54`, bits 4:0; `0x00` = 0 dB, `0x08` = -4 dB, `0x0C` = -6 dB, `0x10` = -8 dB).
+    pub again_code: u8,
+    /// NVS FlashJournal monotonic sequence number.
+    pub settings_seq: u32,
 }
+
+/// Type alias for runtime status snapshot.
+pub type RuntimeStatusSnapshot<'a> = HttpStatusSnapshot<'a>;
 
 impl<'a> Default for HttpStatusSnapshot<'a> {
     fn default() -> Self {
@@ -91,8 +130,114 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             i2c_acks: 0,
             i2c_nacks: 0,
             uptime_ms: 0,
+            psram_free_bytes: 3_538_944,
+            psram_used_bytes: 655_360,
+            core1_active: true,
+            core1_loops: 0,
+            codec: "PCM",
+            codec_sample_rate: 44_100,
+            codec_channels: 2,
+            codec_bit_depth: 16,
+            eq_preset: "Flat",
+            eq_enabled: false,
+            tas_fs_hz: 44_100,
+            tas_bck_ratio: 64,
+            tas_pll_locked: true,
+            tas_automuted: false,
+            again_code: 0x08,
+            settings_seq: 1,
         }
     }
+}
+
+struct BufferWriter<'a> {
+    buf: &'a mut [u8],
+    offset: usize,
+}
+
+impl<'a> BufferWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    fn written_len(&self) -> usize {
+        self.offset
+    }
+}
+
+impl<'a> core::fmt::Write for BufferWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len().saturating_sub(self.offset);
+        if bytes.len() > remaining {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.offset..self.offset + bytes.len()].copy_from_slice(bytes);
+        self.offset += bytes.len();
+        Ok(())
+    }
+}
+
+/// Formats the `/status.json` payload into `out_buf` (up to 2048 bytes).
+/// Returns the number of bytes written, or `None` if `out_buf` is too small.
+pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    write!(
+        writer,
+        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\"again_code\":{},\"settings_seq\":{}}}",
+        REQUIRED_OTA_PROJECT_NAME,
+        RUST_OTA_FIRMWARE_VERSION,
+        snapshot.otadata_prearmed_factory,
+        snapshot.ip[0],
+        snapshot.ip[1],
+        snapshot.ip[2],
+        snapshot.ip[3],
+        snapshot.netmask[0],
+        snapshot.netmask[1],
+        snapshot.netmask[2],
+        snapshot.netmask[3],
+        snapshot.gw[0],
+        snapshot.gw[1],
+        snapshot.gw[2],
+        snapshot.gw[3],
+        snapshot.ssid,
+        snapshot.rssi,
+        snapshot.lms_cport,
+        snapshot.lms_port,
+        snapshot.lms_ip[0],
+        snapshot.lms_ip[1],
+        snapshot.lms_ip[2],
+        snapshot.lms_ip[3],
+        snapshot.frames_played,
+        snapshot.amp_mode,
+        snapshot.vol_pct,
+        snapshot.i2c_acks,
+        snapshot.i2c_nacks,
+        snapshot.uptime_ms,
+        snapshot.psram_free_bytes,
+        snapshot.psram_used_bytes,
+        snapshot.core1_active,
+        snapshot.core1_loops,
+        snapshot.codec,
+        snapshot.codec_sample_rate,
+        snapshot.codec_channels,
+        snapshot.codec_bit_depth,
+        snapshot.eq_preset,
+        snapshot.eq_enabled,
+        snapshot.tas_fs_hz,
+        snapshot.tas_bck_ratio,
+        snapshot.tas_pll_locked,
+        snapshot.tas_automuted,
+        snapshot.again_code,
+        snapshot.settings_seq,
+    ).ok()?;
+    Some(writer.written_len())
+}
+
+/// Formats the `/status.json` payload into `out_buf` (up to 2048 bytes).
+#[inline]
+pub fn format_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
+    write_status_json(snapshot, out_buf)
 }
 
 /// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full response for JSON) into `out_buf`.
@@ -142,53 +287,23 @@ pub fn handle_http_request_streaming(
             Some((resp.len(), &[], HttpControlAction::None))
         }
         ("GET", "/status.json") => {
-            let mut body: String<576> = String::new();
+            let mut body_buf = [0u8; 1024];
+            let body_len = write_status_json(snapshot, &mut body_buf)?;
+
+            let mut header: String<160> = String::new();
             let _ = write!(
-                body,
-                "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{}}}",
-                REQUIRED_OTA_PROJECT_NAME,
-                RUST_OTA_FIRMWARE_VERSION,
-                snapshot.otadata_prearmed_factory,
-                snapshot.ip[0],
-                snapshot.ip[1],
-                snapshot.ip[2],
-                snapshot.ip[3],
-                snapshot.netmask[0],
-                snapshot.netmask[1],
-                snapshot.netmask[2],
-                snapshot.netmask[3],
-                snapshot.gw[0],
-                snapshot.gw[1],
-                snapshot.gw[2],
-                snapshot.gw[3],
-                snapshot.ssid,
-                snapshot.rssi,
-                snapshot.lms_cport,
-                snapshot.lms_port,
-                snapshot.lms_ip[0],
-                snapshot.lms_ip[1],
-                snapshot.lms_ip[2],
-                snapshot.lms_ip[3],
-                snapshot.frames_played,
-                snapshot.amp_mode,
-                snapshot.vol_pct,
-                snapshot.i2c_acks,
-                snapshot.i2c_nacks,
-                snapshot.uptime_ms,
+                header,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+                body_len
             );
-            let mut response: String<704> = String::new();
-            let _ = write!(
-                response,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
-                body.len(),
-                body.as_str()
-            );
-            let resp_bytes = response.as_bytes();
-            if resp_bytes.len() > out_buf.len() {
+            let header_bytes = header.as_bytes();
+            let total_len = header_bytes.len() + body_len;
+            if total_len > out_buf.len() {
                 return None;
             }
-            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
-            Some((resp_bytes.len(), &[], HttpControlAction::None))
+            out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
+            out_buf[header_bytes.len()..total_len].copy_from_slice(&body_buf[..body_len]);
+            Some((total_len, &[], HttpControlAction::None))
         }
         ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
             let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -282,6 +397,16 @@ pub fn handle_http_request_streaming(
                     },
                     true,
                 ),
+                "eq_flat" => (HttpControlAction::SetEqPreset(0), true),
+                "eq_bass" => (HttpControlAction::SetEqPreset(1), true),
+                "eq_loudness" => (HttpControlAction::SetEqPreset(2), true),
+                "eq_vocal" | "eq_voice" => (HttpControlAction::SetEqPreset(3), true),
+                "eq_rock" | "eq_treble" => (HttpControlAction::SetEqPreset(4), true),
+                "again0" => (HttpControlAction::SetAnalogGain(0x00), true),
+                "again4" => (HttpControlAction::SetAnalogGain(0x08), true),
+                "again6" => (HttpControlAction::SetAnalogGain(0x0C), true),
+                "again8" => (HttpControlAction::SetAnalogGain(0x10), true),
+                "again10" => (HttpControlAction::SetAnalogGain(0x14), true),
                 other if other.starts_with("vol") && !other[3..].is_empty() && other[3..].chars().all(|c| c.is_ascii_digit()) => {
                     let pct: u8 = other[3..].parse().unwrap_or(snapshot.vol_pct).min(100);
                     (
@@ -407,7 +532,10 @@ pub fn handle_http_control_request(
 }
 
 /// Static HTML dashboard embedded for `GET /` and `GET /index.html` requests.
-pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:8px;background:#111;color:#eee}h3{margin:6px 0 2px;color:#0ef}table{width:100%;border-collapse:collapse}td{padding:2px 6px;border:1px solid #333;font-size:12px}button{margin:2px;padding:4px 8px;background:#222;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer}a{color:#0ef;text-decoration:none;font-size:12px}</style></head><body><h3>Louder-ESP32 Control</h3><table><tr><td>Net/RSSI</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Amp/Up</td><td id=\"s\">-</td></tr><tr><td>Audio</td><td id=\"f\">-</td></tr><tr><td>I2C</td><td id=\"i\">-</td></tr><tr><td>Firmware</td><td id=\"w\">-</td></tr></table><h3>Transport &amp; Volume</h3><button style=\"background:#085\" onclick=\"cmd('play')\">&#9654;Play</button><button onclick=\"cmd('pause')\">&#10074;&#10074;Pause</button><button onclick=\"cmd('stop')\">&#9632;Stop</button><button onclick=\"cmd('prev')\">&#9198;Prev</button><button onclick=\"cmd('next')\">Next&#9197;</button><br><button onclick=\"cmd('voldown')\">-5%</button><button onclick=\"cmd('vol25')\">25%</button><button onclick=\"cmd('vol40')\">40%</button><button onclick=\"cmd('vol55')\">55%</button><button onclick=\"cmd('vol70')\">70%</button><button onclick=\"cmd('vol85')\">85%</button><button onclick=\"cmd('volup')\">+5%</button><h3>Presets</h3><button style=\"background:#158\" onclick=\"cmd('preset1')\">Ibiza</button><button style=\"background:#158\" onclick=\"cmd('preset2')\">WHYY</button><button style=\"background:#158\" onclick=\"cmd('preset3')\">WDIY</button><button style=\"background:#158\" onclick=\"cmd('preset4')\">Groove</button><br><a id=\"ll\" href=\"http://10.0.0.10:9000/\" target=\"_blank\">&rarr; Open Full Lyrion UI (10.0.0.10:9000)</a><h3>System</h3><button style=\"background:#922\" onclick=\"if(confirm('Recovery?'))fetch('/recovery.json',{method:'POST'}).then(()=>alert('Recovery...'))\">Reboot to Recovery (0x10000)</button><button style=\"background:#444\" onclick=\"if(confirm('Reboot OTA?'))fetch('/reboot_ota.json',{method:'POST'}).then(()=>alert('Reboot OTA...'))\">Commit OTA &amp; Reboot</button><script>var pF=0,pT=0;function cmd(a){fetch('/cmd.json?act='+a).then(u).catch(()=>{});}function g(k,v){document.getElementById(k).innerText=v;}function u(){var n=Date.now();fetch('/status.json').then(r=>r.json()).then(d=>{var h=d.lms_ip+':'+d.lms_port;document.getElementById('ll').href='http://'+h+'/';g('n',d.ip+' ('+d.ssid+' '+d.rssi+'dBm)');g('l',h+' (CLI '+d.lms_cport+')');var up=d.uptime_ms/1000|0;g('s',d.amp_mode+' ('+d.vol_pct+'%) | Up '+(up/60|0)+':'+((up%60<10)?'0':'')+(up%60));var fps=(pT>0&&n>pT)?((d.frames_played-pF)*1000/(n-pT)|0):0;pF=d.frames_played;pT=n;g('f',fps+' fps ('+d.frames_played+')');g('i','ACK: '+d.i2c_acks+' / NACK: '+d.i2c_nacks);g('w',d.version+' ('+(d.otadata_prearmed_factory?'Pre-Armed':'Normal')+')');}).catch(()=>{});}u();setInterval(u,1500);</script></body></html>";
+pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:6px;background:#111;color:#eee}h3{margin:4px 0 2px;color:#0ef}table{width:100%;border-collapse:collapse}td{padding:2px 4px;border:1px solid #333;font-size:11px}button{margin:1px;padding:3px 6px;background:#222;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer}a{color:#0ef;text-decoration:none;font-size:11px}</style></head><body><h3>Louder-ESP32 Control</h3><table><tr><td>Net/RSSI</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Amp/Up</td><td id=\"s\">-</td></tr><tr><td>Audio</td><td id=\"f\">-</td></tr><tr><td>PSRAM</td><td id=\"p\">-</td></tr><tr><td>Core 1</td><td id=\"c\">-</td></tr><tr><td>TAS5805M</td><td id=\"t\">-</td></tr><tr><td>EQ / NVS</td><td id=\"e\">-</td></tr><tr><td>I2C</td><td id=\"i\">-</td></tr><tr><td>Firmware</td><td id=\"w\">-</td></tr></table><h3>Transport &amp; Volume</h3><button style=\"background:#085\" onclick=\"cmd('play')\">&#9654;Play</button><button onclick=\"cmd('pause')\">&#10074;&#10074;Pause</button><button onclick=\"cmd('stop')\">&#9632;Stop</button><button onclick=\"cmd('prev')\">&#9198;Prev</button><button onclick=\"cmd('next')\">Next&#9197;</button><br><button onclick=\"cmd('voldown')\">-5%</button><button onclick=\"cmd('vol25')\">25%</button><button onclick=\"cmd('vol40')\">40%</button><button onclick=\"cmd('vol55')\">55%</button><button onclick=\"cmd('vol70')\">70%</button><button onclick=\"cmd('vol85')\">85%</button><button onclick=\"cmd('volup')\">+5%</button><h3>Presets</h3><button style=\"background:#158\" onclick=\"cmd('preset1')\">Ibiza</button><button style=\"background:#158\" onclick=\"cmd('preset2')\">WHYY</button><button style=\"background:#158\" onclick=\"cmd('preset3')\">WDIY</button><button style=\"background:#158\" onclick=\"cmd('preset4')\">Groove</button><h3>Equalizer (10-Band)</h3><button onclick=\"cmd('eq_flat')\">Flat</button><button onclick=\"cmd('eq_bass')\">Bass Boost</button><button onclick=\"cmd('eq_loudness')\">Loudness</button><button onclick=\"cmd('eq_vocal')\">Vocal</button><button onclick=\"cmd('eq_rock')\">Rock</button><h3>Analog Gain (AGAIN)</h3><button onclick=\"cmd('again0')\">0 dB (29.5V)</button><button onclick=\"cmd('again4')\">-4 dB (20V PD)</button><button onclick=\"cmd('again6')\">-6 dB (15V)</button><button onclick=\"cmd('again8')\">-8 dB (12V)</button><br><a id=\"ll\" href=\"http://10.0.0.10:9000/\" target=\"_blank\">&rarr; Open Full Lyrion UI (10.0.0.10:9000)</a><h3>System</h3><button style=\"background:#922\" onclick=\"if(confirm('Recovery?'))fetch('/recovery.json',{method:'POST'})\">Reboot to Recovery (0x10000)</button><button style=\"background:#444\" onclick=\"if(confirm('Reboot OTA?'))fetch('/reboot_ota.json',{method:'POST'})\">Commit OTA &amp; Reboot</button><script>var pF=0,pT=0,D=document;function cmd(a){fetch('/cmd.json?act='+a).then(u).catch(()=>{});}function g(k,v){D.getElementById(k).innerText=v;}function u(){var n=Date.now();fetch('/status.json').then(r=>r.json()).then(d=>{var h=d.lms_ip+':'+d.lms_port;D.getElementById('ll').href='http://'+h+'/';g('n',d.ip+' ('+d.ssid+' '+d.rssi+'dBm)');g('l',h+' (CLI '+d.lms_cport+')');var up=d.uptime_ms/1000|0;g('s',d.amp_mode+' ('+d.vol_pct+'%) | Up '+(up/60|0)+':'+((up%60<10)?'0':'')+(up%60));var fps=(pT>0&&n>pT)?((d.frames_played-pF)*1000/(n-pT)|0):0;pF=d.frames_played;pT=n;g('f',fps+' fps ('+d.frames_played+') | '+d.codec);g('p',(d.psram_used_bytes/1024|0)+' / '+(d.psram_free_bytes/1024|0)+' KB');g('c',(d.core1_active?'Active':'Halted')+' ('+d.core1_loops+' loops)');g('t',d.tas_fs_hz+'Hz|'+d.tas_bck_ratio+'x|'+(d.tas_pll_locked?'PLL-Lock':'Unlocked')+'|-'+(d.again_code*0.5).toFixed(1)+'dB'+(d.tas_automuted?'(Muted)':''));g('e',d.eq_preset+' | Seq '+d.settings_seq);g('i','ACK:'+d.i2c_acks+'/NACK:'+d.i2c_nacks);g('w',d.version+' ('+(d.otadata_prearmed_factory?'Pre-Armed':'Normal')+')');}).catch(()=>{});}u();setInterval(u,1500);</script></body></html>";
+
+/// Alias for static HTML dashboard.
+pub const INDEX_HTML: &str = DASHBOARD_HTML;
 
 /// Health verdict emitted by [`DeadManLeaseWatchdog::evaluate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,7 +607,7 @@ mod tests {
             uptime_ms: 12_345,
             ..HttpStatusSnapshot::default()
         };
-        let mut buf = [0u8; 768];
+        let mut buf = [0u8; 2048];
         let (len, action) =
             handle_http_control_request(b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
                 .unwrap();
@@ -494,6 +622,22 @@ mod tests {
         assert!(resp.contains("\"frames_played\":1024"));
         assert!(resp.contains("\"amp_mode\":\"Play\""));
         assert!(resp.contains("\"vol_pct\":55"));
+        assert!(resp.contains("\"psram_free_bytes\":3538944"));
+        assert!(resp.contains("\"psram_used_bytes\":655360"));
+        assert!(resp.contains("\"core1_active\":true"));
+        assert!(resp.contains("\"core1_loops\":0"));
+        assert!(resp.contains("\"codec\":\"PCM\""));
+        assert!(resp.contains("\"codec_sample_rate\":44100"));
+        assert!(resp.contains("\"codec_channels\":2"));
+        assert!(resp.contains("\"codec_bit_depth\":16"));
+        assert!(resp.contains("\"eq_preset\":\"Flat\""));
+        assert!(resp.contains("\"eq_enabled\":false"));
+        assert!(resp.contains("\"tas_fs_hz\":44100"));
+        assert!(resp.contains("\"tas_bck_ratio\":64"));
+        assert!(resp.contains("\"tas_pll_locked\":true"));
+        assert!(resp.contains("\"tas_automuted\":false"));
+        assert!(resp.contains("\"again_code\":8"));
+        assert!(resp.contains("\"settings_seq\":1"));
     }
 
     #[test]
@@ -688,5 +832,95 @@ mod tests {
         let hdr_resp = core::str::from_utf8(&buf[..hdr_len]).unwrap();
         assert!(hdr_resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(hdr_resp.contains("Content-Type: text/html; charset=utf-8"));
+    }
+
+    fn sample_status() -> HttpStatusSnapshot<'static> {
+        HttpStatusSnapshot::default()
+    }
+
+    #[test]
+    fn test_cmd_json_eq_and_again_actions() {
+        extern crate alloc;
+        use alloc::format;
+
+        let mut scratch = [0u8; 1024];
+        for (act, expected_action) in [
+            ("eq_flat", HttpControlAction::SetEqPreset(0)),
+            ("eq_bass", HttpControlAction::SetEqPreset(1)),
+            ("eq_loudness", HttpControlAction::SetEqPreset(2)),
+            ("eq_vocal", HttpControlAction::SetEqPreset(3)),
+            ("eq_rock", HttpControlAction::SetEqPreset(4)),
+            ("again0", HttpControlAction::SetAnalogGain(0x00)),
+            ("again4", HttpControlAction::SetAnalogGain(0x08)),
+            ("again6", HttpControlAction::SetAnalogGain(0x0C)),
+            ("again8", HttpControlAction::SetAnalogGain(0x10)),
+        ] {
+            let req = format!("GET /cmd.json?act={act} HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n");
+            let (len, action) =
+                handle_http_control_request(req.as_bytes(), &sample_status(), &mut scratch)
+                    .expect("valid response");
+            assert_eq!(action, expected_action);
+            let text = core::str::from_utf8(&scratch[..len]).expect("utf8");
+            assert!(text.contains("HTTP/1.1 200 OK"));
+        }
+    }
+
+    #[test]
+    fn test_cmd_json_eq_and_again_aliases() {
+        let mut scratch = [0u8; 1024];
+
+        // eq_voice alias
+        let (len1, act1) = handle_http_control_request(
+            b"GET /cmd.json?act=eq_voice HTTP/1.1\r\n\r\n",
+            &sample_status(),
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(act1, HttpControlAction::SetEqPreset(3));
+        assert!(core::str::from_utf8(&scratch[..len1]).unwrap().contains("{\"ok\":true,\"act\":\"eq_voice\"}"));
+
+        // eq_treble alias
+        let (len2, act2) = handle_http_control_request(
+            b"GET /cmd.json?act=eq_treble HTTP/1.1\r\n\r\n",
+            &sample_status(),
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(act2, HttpControlAction::SetEqPreset(4));
+        assert!(core::str::from_utf8(&scratch[..len2]).unwrap().contains("{\"ok\":true,\"act\":\"eq_treble\"}"));
+
+        // again10 alias
+        let (len3, act3) = handle_http_control_request(
+            b"GET /cmd.json?act=again10 HTTP/1.1\r\n\r\n",
+            &sample_status(),
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(act3, HttpControlAction::SetAnalogGain(0x14));
+        assert!(core::str::from_utf8(&scratch[..len3]).unwrap().contains("{\"ok\":true,\"act\":\"again10\"}"));
+    }
+
+    #[test]
+    fn test_format_status_json_buffer() {
+        let snap = RuntimeStatusSnapshot::default();
+        let mut buf = [0u8; 2048];
+        let written = format_status_json(&snap, &mut buf).expect("format ok");
+        assert!(written > 0);
+        let s = core::str::from_utf8(&buf[..written]).expect("valid utf8");
+        assert!(s.starts_with('{'));
+        assert!(s.ends_with('}'));
+        assert!(s.contains("\"psram_free_bytes\":3538944"));
+        assert!(s.contains("\"core1_active\":true"));
+        assert!(s.contains("\"tas_fs_hz\":44100"));
+        assert!(s.contains("\"eq_preset\":\"Flat\""));
+    }
+
+    #[test]
+    fn test_index_html_alias() {
+        assert_eq!(INDEX_HTML, DASHBOARD_HTML);
+        assert!(INDEX_HTML.contains("Equalizer (10-Band)"));
+        assert!(INDEX_HTML.contains("Analog Gain (AGAIN)"));
+        assert!(INDEX_HTML.contains("eq_flat"));
+        assert!(INDEX_HTML.contains("again0"));
     }
 }
