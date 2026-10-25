@@ -410,6 +410,8 @@ fn main() {
 
 #[cfg(target_arch = "xtensa")]
 mod xtensa_hw {
+    extern crate alloc;
+
     use super::*;
     use core::future::Future;
     use core::pin::pin;
@@ -422,6 +424,8 @@ mod xtensa_hw {
         gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
         i2c::master::{Config as I2cConfig, I2c as HalI2c},
         i2s::master::{Channels, DataFormat, I2s, TdmConfig},
+        rng::Rng,
+        system::{CpuControl, Stack},
         time::{Duration, Instant, Rate},
         timer::timg::{MwdtStage, TimerGroup},
         uart::{Config as UartConfig, Uart},
@@ -429,17 +433,22 @@ mod xtensa_hw {
     use esp_println::println;
     use esp_radio::wifi::{
         sta::StationConfig, AuthenticationMethodConfig, Config as WifiModeConfig, ControllerConfig,
-        Interface as WifiInterface, WifiController, WifiRxToken, WifiTxToken,
+        Interface as WifiInterface, PowerSaveMode, WifiController, WifiRxToken, WifiTxToken,
     };
     use esp_storage::FlashStorage;
+    use louder_esp32_app::amp::percent_to_attenuation;
     use louder_esp32_app::board::{
         BASEMENT_PLAYER_MAC, DEFAULT_LMS_SERVER_IP, DEFAULT_LMS_SERVER_PORT, DEFAULT_WIFI_SSID,
     };
-    use louder_esp32_app::hal::I2sDmaDriver;
+    use louder_esp32_app::hal::{I2sDmaDriver, NvsFlashBackend};
     use louder_esp32_app::http_control::{
         handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
         LeaseHealth,
     };
+    use louder_esp32_app::MemConfigStore;
+    use squeezelite_audio_core::EqPreset;
+    use squeezelite_config::AudioConfig;
+    use squeezelite_cyd_link::CydMessage;
     use louder_esp32_app::ota_safety::{
         resolve_wifi_credentials, verify_otadata_erased, OtaSafetyError, OtaSelectEntry,
         WifiStaCredentials, NVS_PARTITION_OFFSET, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
@@ -714,8 +723,14 @@ mod xtensa_hw {
             if needs_restart {
                 if let Some(transfer) = self.transfer.take() {
                     let (i2s_tx, buf) = transfer.stop();
-                    if let Ok(new_transfer) = i2s_tx.write(buf) {
-                        self.transfer = Some(new_transfer);
+                    let (descriptors, mut buffer) = buf.split();
+                    buffer.fill(0);
+                    if let Ok(mut new_buf) = esp_hal::dma::DmaTxStreamBuf::new(descriptors, buffer) {
+                        let silence = [0u8; 2048];
+                        let _ = new_buf.push(&silence);
+                        if let Ok(new_transfer) = i2s_tx.write(new_buf) {
+                            self.transfer = Some(new_transfer);
+                        }
                     }
                 }
             }
@@ -727,24 +742,34 @@ mod xtensa_hw {
                 return;
             }
             if let Some(ref mut transfer) = self.transfer {
-                let threshold = if is_playing { 6144 } else { 4096 };
+                let threshold = 4096;
                 let avail = transfer.available_bytes();
-                if avail >= threshold {
+                let avail_aligned = avail & !7;
+                if avail_aligned >= threshold {
                     let silence = [0u8; 512];
-                    let pad = avail % 1024;
-                    if pad > 0 {
-                        let mut rem = pad;
+                    let pad = avail_aligned % 1024;
+                    let pad_aligned = pad & !7;
+                    if pad_aligned > 0 {
+                        let mut rem = pad_aligned;
                         while rem > 0 {
-                            let c = rem.min(silence.len());
+                            let c = (rem.min(silence.len())) & !7;
+                            if c == 0 {
+                                break;
+                            }
                             let n = transfer.push(&silence[..c]);
                             if n == 0 {
                                 break;
                             }
-                            rem -= n;
+                            rem = rem.saturating_sub(n & !7);
+                            if n < c {
+                                break;
+                            }
                         }
                     }
-                    while transfer.available_bytes() >= threshold {
-                        if transfer.push(&silence) == 0 {
+                    while (transfer.available_bytes() & !7) >= threshold {
+                        let avail_now = transfer.available_bytes() & !7;
+                        let to_push = avail_now.min(silence.len()) & !7;
+                        if to_push == 0 || transfer.push(&silence[..to_push]) == 0 {
                             break;
                         }
                     }
@@ -755,7 +780,7 @@ mod xtensa_hw {
 
     impl I2sDmaDriver for Esp32HardwareI2sDma<'_> {
         fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
-            let valid_len = data.len() - (data.len() % 8);
+            let valid_len = data.len() & !7;
             if valid_len == 0 {
                 return Ok(0);
             }
@@ -770,17 +795,17 @@ mod xtensa_hw {
                 let silence = [0u8; 512];
                 let mut written = 0;
                 while written < valid_len {
-                    let avail = transfer.available_bytes();
-                    let avail_aligned = avail - (avail % 8);
+                    let avail_aligned = transfer.available_bytes() & !7;
                     if avail_aligned == 0 {
                         break;
                     }
-                    let chunk_len = core::cmp::min(silence.len(), valid_len - written).min(avail_aligned);
+                    let rem_bytes = (valid_len - written) & !7;
+                    let chunk_len = silence.len().min(rem_bytes).min(avail_aligned) & !7;
                     if chunk_len == 0 {
                         break;
                     }
                     let n = transfer.push(&silence[..chunk_len]);
-                    let aligned_n = n - (n % 8);
+                    let aligned_n = n & !7;
                     written += aligned_n;
                     if n < chunk_len {
                         break;
@@ -794,13 +819,12 @@ mod xtensa_hw {
             let mut scratch = [0u8; 512];
 
             while offset < valid_len {
-                let avail = transfer.available_bytes();
-                let avail_aligned = avail - (avail % 8);
+                let avail_aligned = transfer.available_bytes() & !7;
                 if avail_aligned == 0 {
                     break;
                 }
-                let chunk_in_len = core::cmp::min(scratch.len(), valid_len - offset).min(avail_aligned);
-                let frames_in_chunk = chunk_in_len / 8;
+                let rem_frames = (valid_len - offset) / 8;
+                let frames_in_chunk = rem_frames.min(64).min(avail_aligned / 8);
                 if frames_in_chunk == 0 {
                     break;
                 }
@@ -812,7 +836,7 @@ mod xtensa_hw {
                 }
                 let chunk_bytes = frames_in_chunk * 8;
                 let n = transfer.push(&scratch[..chunk_bytes]);
-                let aligned_n = n - (n % 8);
+                let aligned_n = n & !7;
                 total_written += aligned_n;
                 offset += aligned_n;
                 if n < chunk_bytes {
@@ -869,10 +893,18 @@ mod xtensa_hw {
     fn load_nvs_wifi_credentials(
         flash: &mut FlashStorage<'_>,
         sta_mac: &[u8; 6],
-        nvs_buf: &mut [u8; 16_384],
+        nvs_buf: &mut [u8; 12_288],
     ) -> Result<WifiStaCredentials, OtaSafetyError> {
         nvs_buf.fill(0xFF);
         let _ = flash.read(NVS_PARTITION_OFFSET, nvs_buf);
+        if let Ok(creds) = louder_esp32_app::ota_safety::parse_nvs_wifi_credentials(nvs_buf, sta_mac) {
+            return Ok(creds);
+        }
+        nvs_buf.fill(0xFF);
+        let _ = flash.read(NVS_PARTITION_OFFSET + 4096, nvs_buf);
+        if let Ok(creds) = louder_esp32_app::ota_safety::parse_nvs_wifi_credentials(nvs_buf, sta_mac) {
+            return Ok(creds);
+        }
         resolve_wifi_credentials(
             nvs_buf,
             sta_mac,
@@ -893,7 +925,7 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        ring_storage: [u8; 16384],
+        nvs_scratch: [u8; 12288],
         http_rx_buf: [u8; 1024],
         http_tx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
@@ -908,7 +940,7 @@ mod xtensa_hw {
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                ring_storage: [0u8; 16384],
+                nvs_scratch: [0u8; 12288],
                 http_rx_buf: [0u8; 1024],
                 http_tx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
@@ -919,6 +951,96 @@ mod xtensa_hw {
                 audio_req_buf: [0u8; 512],
                 audio_header_buf: [0u8; 2000],
             }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    static mut APP_CORE_STACK: Stack<4096> = Stack::new();
+    static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    const SETTINGS_PARTITION_OFFSET: u32 = 0x3F0000;
+
+    pub struct Esp32SettingsFlashPartition<'a, 'd> {
+        pub flash: &'a mut FlashStorage<'d>,
+        sector_a: &'a mut [u8; 4096],
+        sector_b: &'a mut [u8; 4096],
+    }
+
+    impl<'a, 'd> Esp32SettingsFlashPartition<'a, 'd> {
+        pub fn new(flash: &'a mut FlashStorage<'d>, scratch: &'a mut [u8; 12288]) -> Self {
+            let (a_slice, rest) = scratch.split_at_mut(4096);
+            let (b_slice, _) = rest.split_at_mut(4096);
+            let sector_a: &mut [u8; 4096] = a_slice.try_into().unwrap();
+            let sector_b: &mut [u8; 4096] = b_slice.try_into().unwrap();
+
+            let _ = flash.read(SETTINGS_PARTITION_OFFSET, sector_a);
+            let _ = flash.read(SETTINGS_PARTITION_OFFSET + 4096, sector_b);
+
+            Self {
+                flash,
+                sector_a,
+                sector_b,
+            }
+        }
+    }
+
+    impl louder_esp32_app::hal::FlashPartition for Esp32SettingsFlashPartition<'_, '_> {
+        fn read_sector(
+            &self,
+            sector_idx: u8,
+        ) -> Result<&[u8; louder_esp32_app::hal::FLASH_SECTOR_SIZE], squeezelite_config::StorageError> {
+            match sector_idx {
+                0 => Ok(self.sector_a),
+                1 => Ok(self.sector_b),
+                _ => Err(squeezelite_config::StorageError::CapacityExceeded),
+            }
+        }
+
+        fn write_sector(
+            &mut self,
+            sector_idx: u8,
+            data: &[u8; louder_esp32_app::hal::FLASH_SECTOR_SIZE],
+        ) -> Result<(), squeezelite_config::StorageError> {
+            let offset = match sector_idx {
+                0 => {
+                    self.sector_a.copy_from_slice(data);
+                    SETTINGS_PARTITION_OFFSET
+                }
+                1 => {
+                    self.sector_b.copy_from_slice(data);
+                    SETTINGS_PARTITION_OFFSET + 4096
+                }
+                _ => return Err(squeezelite_config::StorageError::CapacityExceeded),
+            };
+
+            self.flash
+                .erase(offset, offset + 4096)
+                .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
+            self.flash
+                .write(offset, data)
+                .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
+
+            Ok(())
+        }
+
+        fn erase_sector(&mut self, sector_idx: u8) -> Result<(), squeezelite_config::StorageError> {
+            let offset = match sector_idx {
+                0 => {
+                    self.sector_a.fill(0xFF);
+                    SETTINGS_PARTITION_OFFSET
+                }
+                1 => {
+                    self.sector_b.fill(0xFF);
+                    SETTINGS_PARTITION_OFFSET + 4096
+                }
+                _ => return Err(squeezelite_config::StorageError::CapacityExceeded),
+            };
+
+            self.flash
+                .erase(offset, offset + 4096)
+                .map_err(|_| squeezelite_config::StorageError::CorruptedData)?;
+
+            Ok(())
         }
     }
 
@@ -941,11 +1063,30 @@ mod xtensa_hw {
         wdt.enable();
         wdt.feed();
 
-        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver
+        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver,
+        // and initialize 4 MB External Quad-SPI PSRAM allocator
         #[allow(unsafe_code)]
         {
             esp_alloc::heap_allocator!(size: 64 * 1024);
+            esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
         }
+        let mut psram_stream_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 524_288];
+        let mut psram_output_storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 131_072];
+
+        // Start Core 1 (APP_CPU @ 240 MHz)
+        let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
+        #[allow(unsafe_code)]
+        let _app_core_guard = cpu_ctrl.start_app_core(
+            unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
+            || {
+                loop {
+                    CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    for _ in 0..10_000 {
+                        core::hint::spin_loop();
+                    }
+                }
+            },
+        );
 
         // ====================================================================
         // GATE 1: First-Instruction `otadata` (0xD000..0xF000) Pre-Arming
@@ -953,7 +1094,7 @@ mod xtensa_hw {
         // reset (panic, WDT, network timeout, or power cycle) boots straight
         // back into the untouched factory `recovery` partition (0x10000)!
         // ====================================================================
-        let mut flash = FlashStorage::new(peripherals.FLASH);
+        let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
         if flash.erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END).is_err() {
             println!("[ANTI-BRICK GATE 1] Failed to erase otadata -> resetting to recovery");
             esp_hal::system::software_reset();
@@ -977,7 +1118,20 @@ mod xtensa_hw {
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
 
         let fw_bufs = take_firmware_bss_buffers();
-        let wifi_sta_creds = match load_nvs_wifi_credentials(&mut flash, &sta_mac, &mut fw_bufs.ring_storage) {
+        let FirmwareBssBuffers {
+            ref mut nvs_scratch,
+            ref mut http_rx_buf,
+            ref mut http_tx_buf,
+            ref mut slim_rx_buf,
+            ref mut slim_tx_buf,
+            ref mut audio_rx_buf,
+            ref mut audio_tx_buf,
+            ref mut slim_acc_buf,
+            ref mut audio_req_buf,
+            ref mut audio_header_buf,
+        } = fw_bufs;
+
+        let wifi_sta_creds = match load_nvs_wifi_credentials(&mut flash, &sta_mac, nvs_scratch) {
             Ok(c) => c,
             Err(e) => {
                 println!(
@@ -987,7 +1141,7 @@ mod xtensa_hw {
                 esp_hal::system::software_reset();
             }
         };
-        fw_bufs.ring_storage.fill(0);
+        nvs_scratch.fill(0);
         wdt.feed();
         println!(
             "[NVS 0x9000] Loaded Wi-Fi STA SSID='{}' (pass_len={}) for MAC {:02x?}",
@@ -995,6 +1149,16 @@ mod xtensa_hw {
             wifi_sta_creds.password.len(),
             sta_mac
         );
+
+        let settings_partition = Esp32SettingsFlashPartition::new(&mut flash, nvs_scratch);
+        let mut nvs_backend = NvsFlashBackend::new(settings_partition);
+        let mut config_store = MemConfigStore::<32>::new();
+        if nvs_backend.load_store(&mut config_store).is_err() {
+            let default_cfg = AudioConfig::default();
+            let _ = default_cfg.save_to(&mut config_store);
+            let _ = nvs_backend.commit_store(&config_store);
+        }
+        let mut audio_cfg = AudioConfig::load_from(&config_store).unwrap_or_default();
 
         // Initialize GPIO33 PWDN, GPIO34 FAULT, I2C0 (SDA=21, SCL=27), I2S0 (BCK=26, WS=25, DOUT=22), UART2
         let mut pwdn = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
@@ -1041,32 +1205,29 @@ mod xtensa_hw {
         let _ = fault.is_high();
         wdt.feed();
 
-        let FirmwareBssBuffers {
-            ref mut ring_storage,
-            ref mut http_rx_buf,
-            ref mut http_tx_buf,
-            ref mut slim_rx_buf,
-            ref mut slim_tx_buf,
-            ref mut audio_rx_buf,
-            ref mut audio_tx_buf,
-            ref mut slim_acc_buf,
-            ref mut audio_req_buf,
-            ref mut audio_header_buf,
-        } = fw_bufs;
-        let (stream_storage, output_storage) = ring_storage.split_at_mut(8192);
-
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
         let pcm_dec = PcmDecoder::new(16, 2, true);
         let mut pipeline = StreamPipeline::new(
-            stream_storage,
-            output_storage,
+            &mut psram_stream_storage[..],
+            &mut psram_output_storage[..],
             ActiveDecoder::Pcm(pcm_dec),
             sink,
             44_100,
         );
         let mut coordinator = PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT");
         println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
+
+        // Apply saved audio configuration from 0x3F0000 settings partition
+        let mut current_vol_pct = audio_cfg.volume;
+        let init_vol_reg = percent_to_attenuation(current_vol_pct);
+        let _ = amp.set_volume(init_vol_reg);
+        let _ = amp.set_analog_gain(audio_cfg.analog_gain_code);
+        pipeline.apply_eq_preset(EqPreset::from_u8(audio_cfg.equalizer_preset));
+        pipeline.set_loudness(audio_cfg.loudness_enabled);
+        let eff_gain = if current_vol_pct > 0 { 65536 } else { 0 };
+        pipeline.set_volume(eff_gain, eff_gain);
+        let _ = cyd_bridge.send_message(&CydMessage::Volume(current_vol_pct));
 
         // Start `esp-rtos` scheduler required by `esp-radio`
         esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
@@ -1094,6 +1255,8 @@ mod xtensa_hw {
             Ok(c) => c,
             Err(_) => esp_hal::system::software_reset(),
         };
+        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+        let _ = wifi_controller.set_max_tx_power(60);
         if wifi_controller.set_config(&sta_cfg).is_err() {
             esp_hal::system::software_reset();
         }
@@ -1101,9 +1264,12 @@ mod xtensa_hw {
         wdt.feed();
 
         // Initialize `smoltcp` Ethernet Interface + DHCPv4 + TCP Port 80 + TCP SlimProto (3483)
+        let hw_rng = Rng::new();
+        let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
         let mut smol_cfg = SmolIfaceConfig::new(hw_addr);
-        smol_cfg.random_seed = 0xC82E_18BE_B834_2026;
+        smol_cfg.random_seed = rng_seed;
+        let mut local_port_counter: u16 = 49152 + ((hw_rng.random() as u16) & 0x3FFF);
         let mut smol_dev = SmolDevice {
             driver: &mut sta_iface,
         };
@@ -1165,6 +1331,11 @@ mod xtensa_hw {
         let mut pending_resp_len: usize = 0;
         let mut pending_resp_sent: usize = 0;
         let mut last_fault_check_ms: u64 = 0;
+        let mut latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry> = None;
+        if let Ok(telem) = amp.read_telemetry() {
+            latest_telemetry = telem;
+        }
+        let mut last_cyd_progress_ms: u64 = 0;
         let mut audio_http_eof = false;
         let mut decode_ready_sent = false;
         let mut track_started_sent = false;
@@ -1297,11 +1468,31 @@ mod xtensa_hw {
                             louder_esp32_app::AmpMode::Standby => "Standby",
                             louder_esp32_app::AmpMode::PowerDown => "PowerDown",
                         };
-                        let vol_reg = amp.current_volume();
-                        let vol_pct = if vol_reg == 0xFF {
-                            0
-                        } else {
-                            100u8.saturating_sub(vol_reg.saturating_sub(0x30))
+                        let codec_name = match pipeline.decoder {
+                            ActiveDecoder::Mp3(_) => "MP3",
+                            ActiveDecoder::Pcm(_) => "PCM",
+                        };
+                        let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) = match latest_telemetry {
+                            Some(t) => (
+                                t.detected_sample_rate_hz(),
+                                t.bck_ratio(),
+                                t.is_pll_locked(),
+                                t.is_automuted(),
+                            ),
+                            None => (coordinator.current_sample_rate, 64, true, false),
+                        };
+                        let (psram_free_bytes, psram_used_bytes) = {
+                            let stats = esp_alloc::HEAP.stats();
+                            let mut free = 3_538_944u32;
+                            let mut used = 655_360u32;
+                            for r in stats.region_stats.iter().flatten() {
+                                if r.size > 1024 * 1024 {
+                                    free = r.free as u32;
+                                    used = r.used as u32;
+                                    break;
+                                }
+                            }
+                            (free, used)
                         };
                         let snap = HttpStatusSnapshot {
                             ip: assigned_ip.unwrap_or([172, 22, 1, 15]),
@@ -1315,10 +1506,26 @@ mod xtensa_hw {
                             otadata_prearmed_factory: true,
                             frames_played: pipeline.frames_played,
                             amp_mode: amp_mode_str,
-                            vol_pct,
+                            vol_pct: current_vol_pct,
                             i2c_acks: Esp32I2cBus::hw_ack_count(),
                             i2c_nacks: Esp32I2cBus::hw_nack_count(),
                             uptime_ms: now_ms.saturating_sub(boot_ms),
+                            psram_free_bytes,
+                            psram_used_bytes,
+                            core1_active: _app_core_guard.is_ok(),
+                            core1_loops: CORE1_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed),
+                            codec: codec_name,
+                            codec_sample_rate: coordinator.current_sample_rate,
+                            codec_channels: 2,
+                            codec_bit_depth: 16,
+                            eq_preset: pipeline.current_eq_preset.as_str(),
+                            eq_enabled: pipeline.equalizer.enabled,
+                            tas_fs_hz,
+                            tas_bck_ratio,
+                            tas_pll_locked,
+                            tas_automuted,
+                            again_code: amp.analog_gain_code(),
+                            settings_seq: nvs_backend.last_seq(),
                         };
                         let mut resp_buf = [0u8; 768];
                         if let Some((hdr_or_resp_len, static_body, action)) =
@@ -1341,16 +1548,30 @@ mod xtensa_hw {
                                 pending_close_deadline_ms = now_ms + 500;
                             }
                             match action {
+                                HttpControlAction::SetEqPreset(preset_id) => {
+                                    let preset = EqPreset::from_u8(preset_id);
+                                    pipeline.apply_eq_preset(preset);
+                                    audio_cfg.equalizer_preset = preset_id;
+                                    let _ = audio_cfg.save_to(&mut config_store);
+                                    let _ = nvs_backend.commit_store(&config_store);
+                                }
+                                HttpControlAction::SetAnalogGain(again_code) => {
+                                    let _ = amp.set_analog_gain(again_code);
+                                    audio_cfg.analog_gain_code = again_code;
+                                    let _ = audio_cfg.save_to(&mut config_store);
+                                    let _ = nvs_backend.commit_store(&config_store);
+                                }
                                 HttpControlAction::PlayerIrCommand { ir_code, vol_pct, mute } => {
                                     if let Some(pct) = vol_pct {
-                                        let vol_reg = if pct == 0 {
-                                            0xFF
-                                        } else {
-                                            0x30 + (100 - pct.min(100))
-                                        };
+                                        current_vol_pct = pct;
+                                        let vol_reg = percent_to_attenuation(pct);
                                         let _ = amp.set_volume(vol_reg);
                                         let eff_gain = if pct > 0 { 65536 } else { 0 };
                                         pipeline.set_volume(eff_gain, eff_gain);
+                                        let _ = cyd_bridge.send_message(&CydMessage::Volume(pct));
+                                        audio_cfg.volume = pct;
+                                        let _ = audio_cfg.save_to(&mut config_store);
+                                        let _ = nvs_backend.commit_store(&config_store);
                                     }
                                     if let Some(m) = mute {
                                         pipeline.sink.set_mute(m);
@@ -1389,7 +1610,7 @@ mod xtensa_hw {
                     }
                     HttpControlAction::PersistOta0AndReboot => {
                         let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                        let _ = flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
+                        let _ = nvs_backend.flash_mut().flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
                         println!("[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> wrote ota_0 select entry & resetting");
                         esp_hal::system::software_reset();
                     }
@@ -1430,9 +1651,10 @@ mod xtensa_hw {
                             IpAddress::Ipv4(Ipv4Address::from(DEFAULT_LMS_SERVER_IP)),
                             DEFAULT_LMS_SERVER_PORT,
                         );
+                        local_port_counter = 49152 + ((local_port_counter.wrapping_add(1) - 49152) & 0x3FFF);
                         let local_ep = (
                             IpAddress::Ipv4(Ipv4Address::from(local_ip)),
-                            49_152 + ((now_ms as u16) & 0x3FFF),
+                            local_port_counter,
                         );
                         let _ = slim_sock.connect(smol_iface.context(), remote_ep, local_ep);
                     }
@@ -1704,9 +1926,10 @@ mod xtensa_hw {
                                                     )),
                                                     audio_remote_port,
                                                 );
+                                                local_port_counter = 49152 + ((local_port_counter.wrapping_add(1) - 49152) & 0x3FFF);
                                                 let local_ep = (
                                                     IpAddress::Ipv4(Ipv4Address::from(local_ip)),
-                                                    49_152 + (((now_ms as u16) + 1) & 0x3FFF),
+                                                    local_port_counter,
                                                 );
                                                 let _ = audio_sock.connect(
                                                     smol_iface.context(),
@@ -2280,14 +2503,28 @@ mod xtensa_hw {
                 }
             }
 
-            if coordinator.state == louder_esp32_app::PlayerState::Playing
-                && now_ms.saturating_sub(last_fault_check_ms) >= 2_000
-            {
+            if now_ms.saturating_sub(last_fault_check_ms) >= 2_000 {
                 last_fault_check_ms = now_ms;
-                if let Ok(Some(fault)) = amp.check_faults() {
-                    if !fault.is_clean() {
-                        let _ = amp.recover_from_fault();
+                if coordinator.state == louder_esp32_app::PlayerState::Playing {
+                    if let Ok(Some(fault)) = amp.check_faults() {
+                        if !fault.is_clean() {
+                            let _ = amp.recover_from_fault();
+                        }
                     }
+                }
+                if let Ok(telem) = amp.read_telemetry() {
+                    latest_telemetry = telem;
+                }
+            }
+
+            if now_ms.saturating_sub(last_cyd_progress_ms) >= 1_000 {
+                last_cyd_progress_ms = now_ms;
+                if coordinator.state == louder_esp32_app::PlayerState::Playing && coordinator.current_sample_rate > 0 {
+                    let elapsed_secs = (pipeline.frames_played / coordinator.current_sample_rate as u64) as u32;
+                    let _ = cyd_bridge.send_message(&CydMessage::Progress {
+                        elapsed_secs,
+                        duration_secs: 0,
+                    });
                 }
             }
         }
@@ -2354,6 +2591,16 @@ mod tests {
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // configure_silicon_maximization(0x08)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
+            I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
+            I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL2, 0x00]),
+            I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
+            I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x60]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
