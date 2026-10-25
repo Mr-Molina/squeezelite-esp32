@@ -94,8 +94,10 @@ where
 
     /// Creates a new amplifier manager with a custom I2C address.
     pub fn with_address(i2c: I2C, addr: u8) -> Self {
-        let mut cfg = AmpConfig::default();
-        cfg.i2c_addr = addr;
+        let cfg = AmpConfig {
+            i2c_addr: addr,
+            ..AmpConfig::default()
+        };
         Self {
             inner: Some(AmpInner::PowerDown(Tas58xx::new(i2c, addr))),
             current_volume: VOL_DEFAULT_MINUS_24DB, // Default -24dB volume (0x60)
