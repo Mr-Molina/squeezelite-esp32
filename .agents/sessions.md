@@ -2,6 +2,36 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-25 20:17 | Antigravity Orchestrator | `[squeezelite-esp32]` Sonocotta Louder-ESP32 Full Silicon/PSRAM/Dual-Core Maximization Plan (`WO-028`..`WO-110`), `/improvement`, & Live `"BASEMENT"` (`172.22.1.15`) Certification (MK5-Rust)
+**Agent**: Antigravity Orchestrator (`31deac42-e161-443d-9205-80c67d7541ab`)
+**Host OS**: Linux (`x86_64`)
+**Branch**: `MK5-Rust` (synced with `origin/MK5-Rust`)
+**Hardware Targets**: `"BASEMENT"` (`172.22.1.15`, Wi-Fi MAC `c8:2e:18:be:b8:34`, BT MAC `c8:2e:18:be:b8:36`, **Sonocotta Louder-ESP32** with TI `TAS5805M` at `I2C0 0x2D`) & Lyrion Music Server (`10.0.0.10:9000` / `3483`)
+**Verification Suite**: `259/259` Workspace Unit/Integration Tests Passing + `0` Clippy Warnings + Bare-Metal `xtensa-esp32-none-elf` Build (`.stack = 35,792` B, `run_hardware_firmware` frame = `8,480` B, `756,240` B OTA binary) + Live 5-Gate Hardware Certification on `172.22.1.15` (`WO-110`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (`goodbye_preflight.py`: `0` secrets, `0` scratch artifacts; Invariants 1–47 Certified)
+
+### Completed This Session
+- **4-Gate Anti-Brick Architecture & Live Pure-Rust Firmware Deployment on `"BASEMENT"` (`172.22.1.15`, `WO-028`..`WO-080`)**:
+  - Designed and verified the 4-Gate Anti-Brick Architecture (`Gate 1`: `otadata` `0xD000..0xF000` pre-erased to `0xFF` so any panic/reset boots Factory `recovery` `0x10000` `"I2S-4MFlash-1681"`; `Gate 2`: `TIMG0` 20s Hardware Watchdog; `Gate 3`: `DeadManLeaseWatchdog` 45s boot / 60s link-drop timeout; `Gate 4`: Port 80 `/recovery.json`, `/reboot.json`, `/status.json`, `/cmd.json`, and Web UI dashboard).
+  - Resolved `StaticMp3Decoder` false-sync/reservoir stalls (`PM-2026-1025-001`), implemented same-origin `/cmd.json?act=...` + `SlimprotoBuilder::build_ir` (`PM-2026-1025-002`), installed `avahi-utils` on `10.0.0.10` for persistent `ShairTunes2W` AirPlay (`_raop._tcp`) + UPnP/DLNA `MediaRenderer.xml`, and verified host Wi-Fi (`wlx98482766488b`) and Bluetooth (`hci0`) connectivity (`WO-080`).
+- **4-Wave, 10-Task Sonocotta Louder-ESP32 Full Maximization Plan (`WO-081`..`WO-110`)**:
+  - **Wave 1 (`WO-085`..`WO-088`)**: Maximized TI `TAS5805M` silicon in `squeezelite-tas58xx` (`1SPW` Hybrid-Pro modulation, out-of-phase PWM `0x53`, analog gain `AGAIN` `0x54`, spread-spectrum `0x6B`, live `FS_MON`/`BCK_MON`/`CLKDET_STATUS`/`AUTOMUTE_STATE` telemetry), implemented 10-band RBJ biquad `EqPreset` (`Flat`, `Bass`, `Loudness`, `Vocal`, `Rock`) in `squeezelite-audio-core`, and added persistent `analog_gain_code` & `loudness_enabled` to `squeezelite-config` `FlashJournal`.
+  - **Wave 2 (`WO-089`..`WO-092`)**: Wired `configure_silicon_maximization`, `set_analog_gain`, and `read_telemetry` into `AmpManager` (`src/amp.rs`), multi-codec dispatcher + 10-band EQ into `StreamPipeline` (`src/pipeline.rs`), and extended `/status.json`, `/cmd.json`, and Web UI (`src/http_control.rs`).
+  - **Wave 3 & Wave 4 (`WO-093`..`WO-110`)**:
+    - Enabled `4 MB` external Quad-SPI PSRAM (`512 KB` stream buffer + `128 KB` output buffer; `655,360` B used / `3,538,944` B free) with non-destructive MMU check and `.bss` fallback (`WO-101`).
+    - Enabled dual-core `APP_CPU` execution (`"core1_active": true`, `> 1.23B` loops) by parking `Cpu::AppCpu` immediately after `esp_hal::init` on warm reboot and synchronizing `DPORT_APP_FLASH_MMU_TABLE` + `DPORT_APP_CACHE_CTRL1_REG` before `start_app_core` (`WO-105`).
+    - Pinned NVS Page 0 (`0x9000..0xA000` namespace table) during split `12 KB` NVS reads in `load_nvs_wifi_credentials_split_12kb` (`src/ota_safety.rs`, `WO-099`).
+    - Shrank `run_hardware_firmware` stack frame from `33,568` B (`0x8320`) to `8,480` B (`0x2120`) inside `35,792` B `.stack` (`WO-101`, Invariant 46).
+    - Configured `ScanMethod::AllChannels` + `beacon_timeout(30)` + `5,000 ms` reconnect cadence (`RSSI` improved from `-82 dBm` to `-48 dBm`, `WO-105`).
+    - Aligned `SmolDevice::capabilities()` `max_transmission_unit = 1492` (`esp-radio` `WIFI_MTU = 1492`), eliminating the `slice_index_fail` panic on `GET /` (`WO-107`).
+    - Eliminated synchronous runtime `SPI1` NOR Flash erase/write deadlocks in `persist_audio_config` while `APP_CPU`, `4 MB` PSRAM `SPI0` cache, and `esp-radio` Wi-Fi are active, and fixed `I2S0_CLKM_CONF_REG` `div_a`/`div_b` bitfield order + `8,192` B DMA silence pre-fill (`WO-109`).
+- **Live Hardware Certification (`WO-110`) & `/improvement` Protocol (`WO-098`..`WO-099`)**:
+  - Certified all 5 Wave 4 Task 10 gates on `172.22.1.15`: `GET /status.json` (`733` B), `GET /` (`3,928` B HTML), all 6 `/cmd.json` interactive EQ/AGAIN mutations (`settings_seq: 1 -> 7`), continuous `44.1 kHz` stereo MP3 playback of *Ibiza Global Radio* past `363.7s` (`16,037,440` frames, `0` I2C NACKs), and simultaneous UPnP/DLNA, AirPlay (`ShairTunes2W`), CastBridge, and SqueezeDSP bridges on `10.0.0.10`.
+  - Recorded postmortems `PM-2026-1025-003`..`006` (project) and `PM-2026-1025-025`..`026` (global) and codified Invariants 45–47.
+
+### Next-Session Handoff Notes
+- `"BASEMENT"` (`172.22.1.15`) is running `I2S-4MFlash-Rust` (`ota_0`) with `otadata` pre-armed to Factory `recovery` (`0x10000`, `"otadata_prearmed_factory": true`). Never call `POST /reboot_ota.json`, and never touch `/dev/ttyUSB0`.
+
 ## 2026-10-20 20:14 | Antigravity Orchestrator | `/wakeup` Repository Status Audit, `cargo check` Verification & Clean RustSec CVE Scan (MK5-Rust)
 **Agent**: Antigravity Orchestrator
 **Host OS**: Windows 11
