@@ -2,6 +2,30 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-10-27 16:42 | Antigravity Orchestrator | `[squeezelite-esp32]` `/deep-code-audit`, `/deep-hardware-audit`, Pure-Rust Dual-Mode Bluetooth (`BTDM` A2DP Sink + BLE), 10-Phase Parity Menu, & Phase 1 Native Lossless FLAC in `4 MB` PSRAM (`WO-111`..`WO-156`, MK5-Rust)
+**Agent**: Antigravity Orchestrator (`55587c74-4c6d-4688-90db-d3185fdddae1`)
+**Host OS**: Linux (`x86_64`)
+**Branch**: `MK5-Rust` (`/home/console-admin/Github/squeezelite-esp32`)
+**Hardware Targets**: `"BASEMENT"` (`172.22.1.15`, Wi-Fi MAC `c8:2e:18:be:b8:34`, BT MAC `CA:2E:18:BE:B8:35`, **Sonocotta Louder-ESP32** with TI `TAS5805M` at `I2C0 0x2D`) & Lyrion Music Server (`10.0.0.10:9000` / `3483`) + Local Workstation Bluetooth (`hci0` `04:7F:0E:01:21:B3`)
+**Verification Suite**: `300+/300+` Workspace Unit/Integration Tests Passing (`27/27` `squeezelite-decoders` including `claxon` cross-validation, `113/113` `louder-esp32-app` lib + `8/8` main) + `0` Clippy Warnings + Bare-Metal `xtensa-esp32-none-elf` Build (`.stack = 36,920` B, `.dram2_uninit = 98,264` B, `955,072` B OTA binary) + Live Hardware Certification (`WO-147`, `WO-153`, `WO-156`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (`goodbye_preflight.py`: `"status": "clean"`, `0` secrets, `0` scratch artifacts)
+
+### Completed This Session
+- **Full `/deep-code-audit` & `/deep-hardware-audit` Remediation + Live OTA Certification (`WO-111`..`WO-147`)**:
+  - Remediated all 32 code findings (`CODE-MAIN-001..011`, `CODE-HAL-001..003`, `CODE-TAS-001..004`, `CODE-PIPE-001..002`, `CODE-EQ-001..002`, `CODE-DEC-001..002`, `CODE-CFG-001`, `CODE-PROTO-001..003`, `CODE-NET-001`, `CODE-OTA-001`, `CODE-HTTP-001`, `CODE-CYD-001..002`) and all 14 hardware/bridge findings (`HW-EMB-001..002`, `HW-DRV-002`, `HW-PWR-001`, `HW-CFG-002`, `HW-STORAGE-001`, `HW-NET-001`, `HW-LMS-001`).
+  - Bypassed `SqueezeDSP` (`bypass: 1`) on LMS `10.0.0.10` (`WO-145`), flashed `172.22.1.15` (`WO-147`), and certified `44,080.9` fps audio clock accuracy, `"tas_fs_hz": 44100`, throttled `core1_loops` (`3,561.3` loops/sec), LMS volume sync, and NOR flash settings persistence across `POST /reboot.json`.
+- **Pure-Rust ESP32 Dual-Mode Bluetooth (`BTDM` Classic A2DP Audio Sink + BLE) Implementation & Live Certification (`WO-148`..`WO-154`)**:
+  - Vendored and patched `esp-radio-1.0.0-beta.1` (`rust/vendor/esp-radio`) for `ESP_BT_MODE_BTDM` (`3`), `config_bt_funcs_reset()` in `patch_apply()`, and Bluetooth Link Controller ROM symbols in `esp32_provides.x`.
+  - Implemented `rust/crates/louder-esp32-app/src/bt_a2dp.rs` (`#![forbid(unsafe_code)]`) for 17-step Dual-Mode HCI initialization, SSP "Just Works" auto-pairing, L2CAP (`l2ping` Echo + SDP `0x0001` + AVDTP `0x0019` + AVRCP `0x0017` with `ch.remote_cid` routing), SDP `AudioSink` (`0x110B`), AVDTP 1.3 Signaling & Media, and a pure-Rust 4/8-subband Bitpool-53 SBC audio decoder.
+  - Certified live over-the-air discovery from `hci0` (`btmgmt find` on `BR/EDR` `rssi -63` + `LE` `rssi -67`), `l2ping CA:2E:18:BE:B8:35` (`0% loss`), `sdptool browse` (`Audio Sink 0x110b`), and live A2DP SBC streaming (`bt_frames = 153,600`, `frames_played = 95,582`) coexisting with Wi-Fi SlimProto, AirPlay (`ShairTunes2W`), and UPnP/DLNA (`WO-153`).
+- **10-Phase Legacy Parity Menu & Menu Phase 1: Native On-Chip Lossless FLAC Decoding in `4 MB` PSRAM (`WO-155`..`WO-156`)**:
+  - Implemented pure-Rust `#![no_std]` + `alloc` (`#![forbid(unsafe_code)]`) RFC 9639 lossless `FlacDecoder` in `squeezelite-decoders/src/lib.rs` with three `64 KB` pre-allocated buffers (`stream_buf`, `pending_pcm`, `subframe_scratch`) deterministically placed in External `4 MB` PSRAM (`0x3F80_0000`) and verified 100% bit-exact parity against `claxon` across 5 `.flac` fixtures (`WO-155`).
+  - Wired `ActiveDecoder::Flac` and `BASEMENT_HELO_CAPABILITIES` (`"...MaxSampleRate=96000,flc,pcm,wav,aif,mp3"`) in `louder-esp32-app/src/{pipeline,main}.rs` (`WO-155` Rev 3, staged OTA image `955,072` B, SHA-256 `aa55b7cc9af807799ae8f747830d7d2d5a02ae92fdb531a6c2b4ef5f742763d9`).
+
+### Next-Session Handoff Notes
+- **Live `"BASEMENT"` (`172.22.1.15`) State**: Online in `ota_0` (`"recovery": 0`, `"rust_engine": true`, `"bt_enabled": true`, `"bt_rx_pkts": 17`, `"vol_pct": 55`, `"tas_pll_locked": true`, `"i2c_nacks": 0`, `uptime_ms > 24.7M` ms). Never call `POST /reboot_ota.json` and **never touch `/dev/ttyUSB0`** (separate CYD board).
+- **Immediate Next Step on Resume**: Complete `WO-156` Rev 2 by flashing the already-staged `WO-155` Rev 3 binary (`/home/console-admin/.gemini/antigravity/brain/55587c74-4c6d-4688-90db-d3185fdddae1/scratch/louder-esp32-app-basement-ota.bin`, SHA-256 `aa55b7cc9af807799ae8f747830d7d2d5a02ae92fdb531a6c2b4ef5f742763d9` with `flc` in `BASEMENT_HELO_CAPABILITIES`) to `172.22.1.15` and running the 10-second live `.flac` stream verification check (`"codec": "FLAC"`, `psram_used_bytes == 851968`), then present the Phase 2–10 menu.
+
 ## 2026-10-25 20:17 | Antigravity Orchestrator | `[squeezelite-esp32]` Sonocotta Louder-ESP32 Full Silicon/PSRAM/Dual-Core Maximization Plan (`WO-028`..`WO-110`), `/improvement`, & Live `"BASEMENT"` (`172.22.1.15`) Certification (MK5-Rust)
 **Agent**: Antigravity Orchestrator (`31deac42-e161-443d-9205-80c67d7541ab`)
 **Host OS**: Linux (`x86_64`)

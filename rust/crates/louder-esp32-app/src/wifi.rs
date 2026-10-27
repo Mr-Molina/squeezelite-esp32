@@ -136,13 +136,23 @@ impl<S: KeyValueStorage> WifiManager<S> {
             return Err(StorageError::InvalidFormat);
         }
 
+        self.retry_count = 0;
+
         self.config.ssid.clear();
         self.config.ssid.push_str(ssid).map_err(|_| StorageError::CapacityExceeded)?;
         self.config.password.clear();
         self.config.password.push_str(password).map_err(|_| StorageError::CapacityExceeded)?;
 
-        // Persist to key-value storage
-        let creds = WifiCredentials::new(ssid, password)?;
+        // Persist to key-value storage, preserving existing static IP / network configuration if present (CODE-CFG-001)
+        let existing = WifiCredentials::load_from(&self.store).ok().flatten();
+        let mut creds = WifiCredentials::new(ssid, password)?;
+        if let Some(prev) = existing {
+            creds.static_ip = prev.static_ip;
+            creds.gateway = prev.gateway;
+            creds.subnet = prev.subnet;
+            creds.dns = prev.dns;
+            creds.autoconnect = prev.autoconnect;
+        }
         creds.save_to(&mut self.store)?;
 
         self.state = WifiState::Connecting;
@@ -345,5 +355,40 @@ mod tests {
         // Success resets backoff
         wifi.record_success();
         assert_eq!(wifi.current_backoff_ms(), 0);
+    }
+
+    #[test]
+    fn test_begin_connect_resets_retry_count_and_preserves_network_config() {
+        let store = MemConfigStore::<32>::new();
+        let mut wifi = WifiManager::with_store(store);
+
+        // Preconfigure existing credentials with static IP and gateway
+        let mut creds = WifiCredentials::new("InitialSSID", "InitialPassword123").unwrap();
+        creds.static_ip = Some([192, 168, 1, 150]);
+        creds.gateway = Some([192, 168, 1, 1]);
+        creds.subnet = Some([255, 255, 255, 0]);
+        creds.dns = Some([1, 1, 1, 1]);
+        creds.save_to(wifi.store_mut()).unwrap();
+
+        // Simulate failed connections to accumulate retry_count
+        wifi.record_failure();
+        wifi.record_failure();
+        assert_eq!(wifi.retry_count(), 2);
+        assert!(wifi.current_backoff_ms() > 0);
+
+        // begin_connect with new credentials
+        let state = wifi.begin_connect("NewSSID", "NewPassword456").unwrap();
+        assert_eq!(state, WifiState::Connecting);
+        assert_eq!(wifi.retry_count(), 0);
+        assert_eq!(wifi.current_backoff_ms(), 0);
+
+        // Verify that the stored credentials contain the new SSID/password but preserved static IP settings
+        let stored = WifiCredentials::load_from(wifi.store()).unwrap().expect("creds present");
+        assert_eq!(stored.ssid.as_str(), "NewSSID");
+        assert_eq!(stored.passphrase.as_str(), "NewPassword456");
+        assert_eq!(stored.static_ip, Some([192, 168, 1, 150]));
+        assert_eq!(stored.gateway, Some([192, 168, 1, 1]));
+        assert_eq!(stored.subnet, Some([255, 255, 255, 0]));
+        assert_eq!(stored.dns, Some([1, 1, 1, 1]));
     }
 }

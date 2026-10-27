@@ -175,21 +175,32 @@ impl CydDisplayLink {
                 CydMessage::TrackMetadata { artist, title } => {
                     let trimmed = CydLinkProtocol::trim_crlf(&self.rx_line);
                     if let Some(rest) = trimmed.strip_prefix(b"META=") {
-                        let mut parts = rest.splitn(3, |&b| b == b';');
-                        if let (Some(a_bytes), Some(alb_bytes), Some(t_bytes)) =
-                            (parts.next(), parts.next(), parts.next())
-                        {
-                            if let (Ok(a_str), Ok(alb_str), Ok(t_str)) = (
-                                core::str::from_utf8(a_bytes),
-                                core::str::from_utf8(alb_bytes),
-                                core::str::from_utf8(t_bytes),
-                            ) {
-                                self.state.artist.clear();
-                                let _ = self.state.artist.push_str(truncate_utf8(a_str, 64));
+                        let semi_count = rest.iter().filter(|&&b| b == b';').count();
+                        if semi_count == 1 {
+                            self.state.artist = artist;
+                            self.state.album.clear();
+                            self.state.title = title;
+                        } else if semi_count >= 2 {
+                            let mut parts = rest.splitn(3, |&b| b == b';');
+                            if let (Some(a_bytes), Some(alb_bytes), Some(t_bytes)) =
+                                (parts.next(), parts.next(), parts.next())
+                            {
+                                if let (Ok(a_str), Ok(alb_str), Ok(t_str)) = (
+                                    core::str::from_utf8(a_bytes),
+                                    core::str::from_utf8(alb_bytes),
+                                    core::str::from_utf8(t_bytes),
+                                ) {
+                                    self.state.artist.clear();
+                                    let _ = self.state.artist.push_str(truncate_utf8(a_str, 64));
+                                    self.state.album.clear();
+                                    let _ = self.state.album.push_str(truncate_utf8(alb_str, 64));
+                                    self.state.title.clear();
+                                    let _ = self.state.title.push_str(truncate_utf8(t_str, 64));
+                                }
+                            } else {
+                                self.state.artist = artist;
                                 self.state.album.clear();
-                                let _ = self.state.album.push_str(truncate_utf8(alb_str, 64));
-                                self.state.title.clear();
-                                let _ = self.state.title.push_str(truncate_utf8(t_str, 64));
+                                self.state.title = title;
                             }
                         } else {
                             self.state.artist = artist;

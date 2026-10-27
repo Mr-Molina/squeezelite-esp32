@@ -212,7 +212,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
     /// NaN state isolation, and accurate 32-bit boundary saturation.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_interleaved(&mut self, samples: &mut [i32]) {
-        if !self.enabled {
+        if !self.enabled && !self.loudness_enabled {
             return;
         }
 
@@ -226,51 +226,52 @@ impl<const BANDS: usize> Equalizer<BANDS> {
             let mut l = chunk[0] as f32 * NORM;
             let mut r = chunk[1] as f32 * NORM;
 
-            for i in 0..BANDS {
-                let f = &self.filters[i];
+            if self.enabled {
+                for i in 0..BANDS {
+                    let f = &self.filters[i];
 
-                // Left channel biquad (Direct Form II Transposed)
-                let (z1_l, z2_l) = &mut self.hist_left[i];
-                let mut out_l = f.b0 * l + *z1_l;
-                if !out_l.is_finite() {
-                    *z1_l = 0.0;
-                    *z2_l = 0.0;
-                    out_l = 0.0;
-                } else {
-                    *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
-                    *z2_l = f.b2 * l - f.a2 * out_l;
-                    // Flush subnormal floats to prevent CPU traps (DSP-006)
-                    if z1_l.abs() < 1e-15 { *z1_l = 0.0; }
-                    if z2_l.abs() < 1e-15 { *z2_l = 0.0; }
-                }
-                l = out_l;
+                    // Left channel biquad (Direct Form II Transposed)
+                    let (z1_l, z2_l) = &mut self.hist_left[i];
+                    let mut out_l = f.b0 * l + *z1_l;
+                    if !out_l.is_finite() {
+                        *z1_l = 0.0;
+                        *z2_l = 0.0;
+                        out_l = 0.0;
+                    } else {
+                        *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
+                        *z2_l = f.b2 * l - f.a2 * out_l;
+                        // Flush subnormal floats to prevent CPU traps (DSP-006)
+                        if z1_l.abs() < 1e-15 { *z1_l = 0.0; }
+                        if z2_l.abs() < 1e-15 { *z2_l = 0.0; }
+                    }
+                    l = out_l;
 
-                // Right channel biquad (Direct Form II Transposed)
-                let (z1_r, z2_r) = &mut self.hist_right[i];
-                let mut out_r = f.b0 * r + *z1_r;
-                if !out_r.is_finite() {
-                    *z1_r = 0.0;
-                    *z2_r = 0.0;
-                    out_r = 0.0;
-                } else {
-                    *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
-                    *z2_r = f.b2 * r - f.a2 * out_r;
-                    if z1_r.abs() < 1e-15 { *z1_r = 0.0; }
-                    if z2_r.abs() < 1e-15 { *z2_r = 0.0; }
+                    // Right channel biquad (Direct Form II Transposed)
+                    let (z1_r, z2_r) = &mut self.hist_right[i];
+                    let mut out_r = f.b0 * r + *z1_r;
+                    if !out_r.is_finite() {
+                        *z1_r = 0.0;
+                        *z2_r = 0.0;
+                        out_r = 0.0;
+                    } else {
+                        *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
+                        *z2_r = f.b2 * r - f.a2 * out_r;
+                        if z1_r.abs() < 1e-15 { *z1_r = 0.0; }
+                        if z2_r.abs() < 1e-15 { *z2_r = 0.0; }
+                    }
+                    r = out_r;
                 }
-                r = out_r;
+            }
+
+            if self.loudness_enabled {
+                l *= horner_loudness(l.abs());
+                r *= horner_loudness(r.abs());
             }
 
             let scaled_l = l * DENORM;
             let scaled_r = r * DENORM;
             chunk[0] = if scaled_l.is_nan() { 0 } else { scaled_l.clamp(MIN_F32_I32, MAX_F32_I32) as i32 };
             chunk[1] = if scaled_r.is_nan() { 0 } else { scaled_r.clamp(MIN_F32_I32, MAX_F32_I32) as i32 };
-        }
-
-        // Remainder guard: zero out trailing odd sample to prevent channel phase swap (DSP-007)
-        let rem = chunks.into_remainder();
-        if let Some(last) = rem.first_mut() {
-            *last = 0;
         }
     }
 }
@@ -546,10 +547,10 @@ pub const ROCK_COEFFS: [BiquadCoeffs; 10] = [
 impl Equalizer<10> {
     /// Applies a pre-tuned 10-band graphic equalizer preset (`Flat`, `BassBoost`, `Loudness`, `Vocal`, `Rock`).
     ///
-    /// When `EqPreset::Flat`, resets all 10 bands to `BiquadCoeffs::BYPASS`, resets delay history,
+    /// When `EqPreset::Flat`, resets all 10 bands to `BiquadCoeffs::BYPASS`
     /// and sets `enabled = false` for 0-cycle passthrough.
-    /// For all other presets, loads the Schur-Cohn verified coefficient tables, resets delay history,
-    /// and sets `enabled = true`.
+    /// For all other presets, loads the Schur-Cohn verified coefficient tables
+    /// and sets `enabled = true` without clearing biquad history to ensure smooth, click-free transitions.
     pub fn apply_preset(&mut self, preset: EqPreset) {
         self.current_preset = preset;
         match preset {
@@ -557,7 +558,6 @@ impl Equalizer<10> {
                 for i in 0..10 {
                     let _ = self.set_band(i, BiquadCoeffs::BYPASS);
                 }
-                self.reset();
                 self.set_enabled(false);
             }
             EqPreset::BassBoost => {
@@ -565,7 +565,6 @@ impl Equalizer<10> {
                     let ok = self.set_band(i, coeffs);
                     debug_assert!(ok, "BassBoost band {} must be stable", i);
                 }
-                self.reset();
                 self.set_enabled(true);
             }
             EqPreset::Loudness => {
@@ -573,7 +572,6 @@ impl Equalizer<10> {
                     let ok = self.set_band(i, coeffs);
                     debug_assert!(ok, "Loudness band {} must be stable", i);
                 }
-                self.reset();
                 self.set_enabled(true);
             }
             EqPreset::Vocal => {
@@ -581,7 +579,6 @@ impl Equalizer<10> {
                     let ok = self.set_band(i, coeffs);
                     debug_assert!(ok, "Vocal band {} must be stable", i);
                 }
-                self.reset();
                 self.set_enabled(true);
             }
             EqPreset::Rock => {
@@ -589,7 +586,6 @@ impl Equalizer<10> {
                     let ok = self.set_band(i, coeffs);
                     debug_assert!(ok, "Rock band {} must be stable", i);
                 }
-                self.reset();
                 self.set_enabled(true);
             }
         }
@@ -756,6 +752,26 @@ mod tests {
         let max_vol = horner_loudness(1.0);
         assert!(max_vol > 0.6 && max_vol < 0.7);
         assert_eq!(horner_loudness(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn test_loudness_contour_processing_and_odd_remainder() {
+        let mut eq: Equalizer<10> = Equalizer::new();
+        eq.set_loudness_contour(true);
+        // EQ disabled but loudness enabled -> processes loudness
+        let mut samples = [100_000, -100_000, 999_999];
+        eq.process_interleaved(&mut samples);
+        // Odd remainder trailing sample (999_999) must remain unmodified
+        assert_eq!(samples[2], 999_999);
+        // First stereo pair should be processed by horner loudness
+        assert_ne!(samples[0], 0);
+
+        // When Flat preset is applied and loudness is enabled, loop should not be bypassed
+        eq.apply_preset(EqPreset::Flat);
+        assert!(!eq.is_enabled());
+        let mut samples_flat = [500_000, -500_000];
+        eq.process_interleaved(&mut samples_flat);
+        assert_ne!(samples_flat[0], 500_000);
     }
 
     #[test]

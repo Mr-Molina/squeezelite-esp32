@@ -56,6 +56,9 @@ impl CydController {
     /// Ingests incoming UART bytes and processes all complete commands via callback (CYD-003).
     pub fn feed_all<F: FnMut(CydCommand)>(&mut self, bytes: &[u8], mut on_cmd: F) -> Result<(), LinkError> {
         for &b in bytes {
+            if b == b'\r' {
+                continue;
+            }
             if self.discarding_overflow {
                 if b == b'\n' {
                     self.discarding_overflow = false;
@@ -65,6 +68,9 @@ impl CydController {
             }
 
             if b == b'\n' {
+                if self.rx_scratch.is_empty() {
+                    continue;
+                }
                 let res = CydLinkProtocol::parse_command(&self.rx_scratch);
                 // Unconditional scratch clear on delimiter (CYD-002)
                 self.rx_scratch.clear();
@@ -236,5 +242,16 @@ mod tests {
 
         let cmd2 = controller.feed_bytes(b"CMD=VOL=84\n").unwrap();
         assert_eq!(cmd2, Some(CydCommand::SetVolume(84)));
+    }
+
+    #[test]
+    fn test_cyd_controller_crlf_and_empty_lines() {
+        let mut controller = CydController::new();
+        assert_eq!(controller.invalid_frame_count(), 0);
+
+        // Feed CRLF and multiple empty lines - invalid_frame_count must not increment
+        let cmd = controller.feed_bytes(b"\r\n\n\r\nCMD=PLAY\r\n\r\n").unwrap();
+        assert_eq!(cmd, Some(CydCommand::Play));
+        assert_eq!(controller.invalid_frame_count(), 0);
     }
 }

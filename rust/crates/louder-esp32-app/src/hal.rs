@@ -8,9 +8,41 @@
 
 use embedded_hal::i2c::{Error as I2cError, ErrorKind, ErrorType, I2c, NoAcknowledgeSource, Operation};
 use squeezelite_audio_core::output::{AudioOutputSink, OutputError};
-use squeezelite_config::{FlashJournal, MemConfigStore, StorageError};
+use squeezelite_config::{DualSectorFlashStore, FlashJournal, MemConfigStore, StorageError};
 use squeezelite_cyd_link::{CydCommand, CydMessage, LinkError};
 use squeezelite_tas58xx::registers;
+
+/// HAL-level error type covering bus writes, storage bounds, link and storage failures (`CODE-HAL-003`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalError {
+    BusWriteFailed,
+    StorageBoundsError,
+    Link(LinkError),
+    Storage(StorageError),
+}
+
+impl core::fmt::Display for HalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BusWriteFailed => write!(f, "HAL bus write failed or timed out"),
+            Self::StorageBoundsError => write!(f, "Flash storage byte range out of bounds"),
+            Self::Link(e) => write!(f, "CYD link error: {:?}", e),
+            Self::Storage(e) => write!(f, "Storage error: {:?}", e),
+        }
+    }
+}
+
+impl From<LinkError> for HalError {
+    fn from(e: LinkError) -> Self {
+        Self::Link(e)
+    }
+}
+
+impl From<StorageError> for HalError {
+    fn from(e: StorageError) -> Self {
+        Self::Storage(e)
+    }
+}
 
 // ============================================================================
 // A. I2S DMA Audio Output Driver & Sink
@@ -210,7 +242,10 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
                     if w == 0 {
                         retries += 1;
                         if retries >= 64 {
-                            return Err(OutputError::HardwareFault);
+                            // CODE-HAL-002: round down to 8-byte frame boundary and break out cleanly
+                            // instead of looping indefinitely into false HardwareFault.
+                            written_bytes &= !7;
+                            break;
                         }
                         continue;
                     }
@@ -360,8 +395,8 @@ impl<U: UartPort> CydUartBridge<U> {
     }
 
     /// Encodes and transmits a telemetry message to the display over UART,
-    /// looping over partial TX writes (`HALNET-407`).
-    pub fn send_message(&mut self, msg: &CydMessage) -> Result<usize, LinkError> {
+    /// looping over partial TX writes (`HALNET-407`, `CODE-HAL-003`).
+    pub fn send_message(&mut self, msg: &CydMessage) -> Result<usize, HalError> {
         let buf = self.controller.format_message(msg)?;
         let len = buf.len();
         let mut offset = 0;
@@ -372,11 +407,14 @@ impl<U: UartPort> CydUartBridge<U> {
             }
             offset += w;
         }
+        if offset < len {
+            return Err(HalError::BusWriteFailed);
+        }
         Ok(offset)
     }
 
-    /// Flushes an outbound telemetry message to the UART TX port across partial writes (`HALNET-407`).
-    pub fn flush_outbound(&mut self, msg: &CydMessage) -> Result<usize, LinkError> {
+    /// Flushes an outbound telemetry message to the UART TX port across partial writes (`HALNET-407`, `CODE-HAL-003`).
+    pub fn flush_outbound(&mut self, msg: &CydMessage) -> Result<usize, HalError> {
         self.send_message(msg)
     }
 }
@@ -521,26 +559,27 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
 
     /// Commits the in-memory store atomically to the alternate flash sector with incremented sequence.
     ///
-    /// Uses `self.scratch` to avoid allocating two 4KB sector buffers (8KB) on the call stack (`HALNET-408`).
+    /// Uses `self.scratch` to avoid allocating 4KB sector buffers on the call stack (`HALNET-408`, `CODE-HAL-001`).
     pub fn commit_store<const N: usize>(&mut self, store: &MemConfigStore<N>) -> Result<u32, StorageError> {
-        self.scratch.copy_from_slice(self.flash.read_sector(0)?);
-        let mut b = *self.flash.read_sector(1)?;
+        let s0 = self.flash.read_sector(0)?;
+        let s1 = self.flash.read_sector(1)?;
 
-        let (wrote_to_b, _bytes_written) =
-            FlashJournal::save_to_dual_sectors(store, &mut self.scratch, &mut b)?;
-
-        let new_seq = if wrote_to_b {
-            self.flash.write_sector(1, &b)?;
-            let (seq, _, _) = FlashJournal::read_sector_meta(&b)?;
-            seq
-        } else {
-            self.flash.write_sector(0, &self.scratch)?;
-            let (seq, _, _) = FlashJournal::read_sector_meta(&self.scratch)?;
-            seq
+        let (target_sector, next_seq) = match DualSectorFlashStore::active_sector(s0, s1) {
+            Ok(0) => {
+                let seq = FlashJournal::read_sector_meta(s0).map(|(s, _, _)| s).unwrap_or(0);
+                (1u8, seq.wrapping_add(1))
+            }
+            Ok(1) => {
+                let seq = FlashJournal::read_sector_meta(s1).map(|(s, _, _)| s).unwrap_or(0);
+                (0u8, seq.wrapping_add(1))
+            }
+            _ => (0u8, 1u32),
         };
 
-        self.last_seq = new_seq;
-        Ok(new_seq)
+        FlashJournal::save_to_sector_with_seq(store, &mut self.scratch, next_seq)?;
+        self.flash.write_sector(target_sector, &self.scratch)?;
+        self.last_seq = next_seq;
+        Ok(next_seq)
     }
 
     /// Erases all sectors (0 and 1) in the flash partition and resets journal state (`HALNET-408`).
@@ -557,8 +596,11 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
         self.flash.erase_sector(sector_idx)
     }
 
-    /// Erases flash partition sectors spanning byte range `start..end`.
-    pub fn erase_range(&mut self, range: core::ops::Range<usize>) -> Result<(), StorageError> {
+    /// Erases flash partition sectors spanning byte range `start..end` (`CODE-HAL-003`).
+    pub fn erase_range(&mut self, range: core::ops::Range<usize>) -> Result<(), HalError> {
+        if range.is_empty() || range.start >= range.end || range.end > FLASH_SECTOR_SIZE * 2 {
+            return Err(HalError::StorageBoundsError);
+        }
         if range.start < FLASH_SECTOR_SIZE {
             self.flash.erase_sector(0)?;
         }
@@ -1081,6 +1123,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
     fn test_nvs_flash_backend_erase_all() {
         let partition = MemFlashPartition::new();
         let mut backend = NvsFlashBackend::new(partition);
@@ -1101,6 +1144,11 @@ mod tests {
 
         backend.erase_range(0..4096).unwrap();
         assert_eq!(backend.flash().read_sector(0).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
+
+        // CODE-HAL-003: verify bounds checking on erase_range
+        assert_eq!(backend.erase_range(0..0), Err(HalError::StorageBoundsError));
+        assert_eq!(backend.erase_range(100..50), Err(HalError::StorageBoundsError));
+        assert_eq!(backend.erase_range(0..FLASH_SECTOR_SIZE * 3), Err(HalError::StorageBoundsError));
     }
 }
 

@@ -3,6 +3,11 @@
 //! Connects LMS stream buffers, pure-Rust decoders, DSP equalizer,
 //! volume scaling, and the I2S audio output sink into an integrated processing loop.
 
+#[cfg(target_arch = "xtensa")]
+extern crate alloc;
+#[cfg(target_arch = "xtensa")]
+use alloc::boxed::Box;
+
 use squeezelite_audio_core::{
     scale_samples_inplace, AudioOutputSink, AudioRingBuffer, Equalizer, RingBufferError,
     VolumeScale,
@@ -30,7 +35,6 @@ pub enum ActiveDecoder {
     Mp3(Box<squeezelite_decoders::Mp3Decoder>),
     #[cfg(target_arch = "xtensa")]
     Mp3(&'static mut squeezelite_decoders::StaticMp3Decoder),
-    #[cfg(not(target_arch = "xtensa"))]
     Flac(Box<squeezelite_decoders::FlacDecoder>),
     #[cfg(not(target_arch = "xtensa"))]
     Aac(Box<squeezelite_decoders::AacDecoder>),
@@ -50,7 +54,6 @@ impl AudioDecoder for ActiveDecoder {
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
             #[cfg(target_arch = "xtensa")]
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Aac(d) => d.decode(encoded_in, pcm_out),
@@ -66,7 +69,6 @@ impl AudioDecoder for ActiveDecoder {
             Self::Mp3(d) => d.flush(),
             #[cfg(target_arch = "xtensa")]
             Self::Mp3(d) => d.flush(),
-            #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => d.flush(),
             #[cfg(not(target_arch = "xtensa"))]
             Self::Aac(d) => d.flush(),
@@ -97,7 +99,6 @@ impl ActiveDecoder {
                     None
                 }
             }
-            #[cfg(not(target_arch = "xtensa"))]
             Self::Flac(d) => {
                 if d.sample_rate > 0 {
                     Some(d.sample_rate)
@@ -123,6 +124,14 @@ impl ActiveDecoder {
             }
         }
     }
+
+    /// Returns whether the active decoder has unconsumed decoded PCM frames waiting in its internal buffer.
+    pub fn has_pending_pcm(&self) -> bool {
+        match self {
+            Self::Flac(d) => d.has_pending_pcm(),
+            _ => false,
+        }
+    }
 }
 
 /// The integrated audio pipeline engine.
@@ -142,6 +151,7 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub write_scratch: [u8; WRITE_SCRATCH_BYTES],
     pub output_i32_scratch: [i32; OUTPUT_I32_SCRATCH_SAMPLES],
     pub current_eq_preset: EqPreset,
+    pub user_muted: bool,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -169,7 +179,14 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             write_scratch: [0u8; WRITE_SCRATCH_BYTES],
             output_i32_scratch: [0i32; OUTPUT_I32_SCRATCH_SAMPLES],
             current_eq_preset: EqPreset::Flat,
+            user_muted: false,
         }
+    }
+
+    /// Sets user mute state on pipeline and output sink.
+    pub fn set_mute(&mut self, mute: bool) {
+        self.user_muted = mute;
+        self.sink.set_mute(mute);
     }
 
     /// Pushes incoming encoded stream bytes from LMS into the stream ringbuffer.
@@ -200,13 +217,56 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             let samples_to_write = frames_to_write * 2;
             let slice = &self.pcm_scratch[self.pcm_pending_offset..self.pcm_pending_offset + samples_to_write];
             let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
-            let _ = self.output_buffer.write(pcm_bytes);
-            self.pcm_pending_offset += samples_to_write;
-            self.pcm_pending_samples -= samples_to_write;
+            let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+            let frames_written = written / 8;
+            let samples_written = frames_written * 2;
+            self.pcm_pending_offset += samples_written;
+            self.pcm_pending_samples -= samples_written;
             if self.pcm_pending_samples == 0 {
                 self.pcm_pending_offset = 0;
             }
-            return Ok(frames_to_write);
+            return Ok(frames_written);
+        }
+
+        // Drain pending PCM frames from decoder if available (e.g. FlacDecoder pending frames)
+        if self.decoder.has_pending_pcm() {
+            let avail_frames = self.output_buffer.available_write() / 8;
+            if avail_frames == 0 {
+                return Ok(0);
+            }
+            let (consumed, frames_produced) = match self.decoder.decode(&[], &mut self.pcm_scratch) {
+                Ok(res) => res,
+                Err(DecoderError::NeedMoreData) => (0, 0),
+                Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
+                Err(e) => return Err(e),
+            };
+
+            if frames_produced > 0 {
+                let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
+                self.equalizer.process_interleaved(active_pcm);
+                scale_samples_inplace(active_pcm, self.volume);
+
+                let frames_to_write = frames_produced.min(avail_frames);
+                let frames_written = if frames_to_write > 0 {
+                    let pcm_bytes: &[u8] = bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
+                    let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                    written / 8
+                } else {
+                    0
+                };
+
+                let samples_written = frames_written * 2;
+                if samples_written < frames_produced * 2 {
+                    self.pcm_pending_offset = samples_written;
+                    self.pcm_pending_samples = frames_produced * 2 - samples_written;
+                } else {
+                    self.pcm_pending_offset = 0;
+                    self.pcm_pending_samples = 0;
+                }
+                return Ok(frames_written);
+            }
+
+            return Ok(consumed);
         }
 
         let bytes_available = self.stream_buffer.available_read();
@@ -241,8 +301,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
         if let Some(rate) = self.decoder.sample_rate() {
             if rate > 0 && rate != self.sample_rate {
-                self.sample_rate = rate;
                 let _ = self.sink.set_sample_rate(rate);
+                self.sample_rate = rate;
             }
         }
 
@@ -262,15 +322,19 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             let avail_frames = self.output_buffer.available_write() / 8;
             let frames_to_write = frames_produced.min(avail_frames);
 
-            if frames_to_write > 0 {
+            let frames_written = if frames_to_write > 0 {
                 let pcm_bytes: &[u8] = bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
                 debug_assert_eq!(pcm_bytes.len() % 8, 0);
-                let _ = self.output_buffer.write(pcm_bytes);
-            }
+                let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                written / 8
+            } else {
+                0
+            };
 
-            if frames_to_write < frames_produced {
-                self.pcm_pending_offset = frames_to_write * 2;
-                self.pcm_pending_samples = (frames_produced - frames_to_write) * 2;
+            let samples_written = frames_written * 2;
+            if samples_written < frames_produced * 2 {
+                self.pcm_pending_offset = samples_written;
+                self.pcm_pending_samples = frames_produced * 2 - samples_written;
             } else {
                 self.pcm_pending_offset = 0;
                 self.pcm_pending_samples = 0;
@@ -310,7 +374,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             *sample = i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
 
-        self.sink.set_mute(false);
+        if !self.user_muted {
+            self.sink.set_mute(false);
+        }
         let written_frames = self.sink.write_frames(&self.output_i32_scratch[..frames_to_write * 2])?;
         // ONLY consume the exact number of frames successfully committed to the sink
         self.output_buffer.consume(written_frames * 8);
@@ -374,7 +440,6 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 self.set_decoder(ActiveDecoder::Mp3(Box::new(squeezelite_decoders::Mp3Decoder::new())));
             }
             b'f' | b'F' => {
-                #[cfg(not(target_arch = "xtensa"))]
                 self.set_decoder(ActiveDecoder::Flac(Box::new(squeezelite_decoders::FlacDecoder::new())));
             }
             b'a' | b'A' => {
@@ -402,8 +467,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
     /// Sets sample rate on pipeline and output sink.
     pub fn set_sample_rate(&mut self, rate: u32) -> Result<(), S::Error> {
+        self.sink.set_sample_rate(rate)?;
         self.sample_rate = rate;
-        self.sink.set_sample_rate(rate)
+        Ok(())
     }
 
     /// Returns the number of bytes available in the stream ringbuffer.
@@ -418,7 +484,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
     /// Returns `true` if decoded PCM samples are still waiting to be drained into `output_buffer` (`COORD-504`).
     pub fn has_pending_pcm(&self) -> bool {
-        self.pcm_pending_samples > 0
+        self.pcm_pending_samples > 0 || self.decoder.has_pending_pcm()
     }
 
     /// Flushes both stream and output ringbuffers, clears pending PCM, and resets the decoder state.
@@ -965,6 +1031,110 @@ mod tests {
                 assert!(pipeline.equalizer.is_enabled());
             }
         }
+    }
+
+    #[test]
+    fn test_user_muted_preserves_mute_state_in_process_output_step() {
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let pcm_decoder = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_decoder),
+            sink,
+            44100,
+        );
+
+        let f1_l = (1000i16).to_be_bytes();
+        let f1_r = (-1000i16).to_be_bytes();
+        let raw_stream = [f1_l[0], f1_l[1], f1_r[0], f1_r[1]];
+
+        pipeline.ingest_stream_data(&raw_stream).unwrap();
+        pipeline.process_decode_step().unwrap();
+
+        // Mute via user command
+        pipeline.set_mute(true);
+        assert!(pipeline.user_muted);
+        assert!(pipeline.sink.muted);
+
+        // process_output_step must NOT unmute when user_muted is true
+        let written = pipeline.process_output_step().unwrap();
+        assert_eq!(written, 1);
+        assert!(pipeline.sink.muted);
+
+        // Unmute via user command
+        pipeline.set_mute(false);
+        assert!(!pipeline.user_muted);
+        assert!(!pipeline.sink.muted);
+    }
+
+    #[test]
+    fn test_set_sample_rate_failure_preserves_previous_rate() {
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let pcm_decoder = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_decoder),
+            sink,
+            44100,
+        );
+
+        assert_eq!(pipeline.sample_rate, 44100);
+
+        // Attempt invalid sample rate on sink (e.g. 999_999)
+        let res = pipeline.set_sample_rate(999_999);
+        assert!(res.is_err());
+        assert_eq!(pipeline.sample_rate, 44100);
+
+        // Valid sample rate updates both sink and pipeline
+        let res = pipeline.set_sample_rate(96000);
+        assert!(res.is_ok());
+        assert_eq!(pipeline.sample_rate, 96000);
+        assert_eq!(pipeline.sink.sample_rate, 96000);
+    }
+
+    #[test]
+    fn test_pipeline_flac_playback_flow() {
+        let flac_bytes = include_bytes!("../../squeezelite-decoders/tests/fixtures/stereo_16bit.flac");
+        let mut stream_storage = [0u8; 16384];
+        let mut output_storage = [0u8; 16384];
+        let flac_decoder = squeezelite_decoders::FlacDecoder::new();
+        let sink = MockAudioSink::<32768>::new();
+
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Flac(Box::new(flac_decoder)),
+            sink,
+            44100,
+        );
+
+        let mut offset = 0;
+        let mut safety_counter = 0;
+        while (offset < flac_bytes.len() || pipeline.stream_buffer_available() > 0 || pipeline.has_pending_pcm()) && safety_counter < 100_000 {
+            safety_counter += 1;
+            if offset < flac_bytes.len() {
+                if let Ok(ingested) = pipeline.ingest_stream_data(&flac_bytes[offset..]) {
+                    offset += ingested;
+                }
+            }
+            let _ = pipeline.process_decode_step();
+            let _ = pipeline.process_output_step();
+        }
+        while pipeline.output_buffer_available() >= 4 && safety_counter < 100_000 {
+            safety_counter += 1;
+            let _ = pipeline.process_output_step();
+        }
+
+        assert!(pipeline.frames_played > 0, "Frames played should be > 0, got {}", pipeline.frames_played);
+        assert_eq!(pipeline.frames_played, 8820);
     }
 }
 

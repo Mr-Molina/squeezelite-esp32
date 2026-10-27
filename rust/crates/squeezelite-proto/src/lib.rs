@@ -90,6 +90,8 @@ pub const fn sample_rate_from_index(index: u8) -> u32 {
         8 | b'8' => 24000,
         9 | b'9' => 96000,
         10 | b':' => 88200,
+        11 | b';' => 176400,
+        12 | b'<' => 192000,
         _ => 44100,
     }
 }
@@ -523,7 +525,7 @@ impl SlimprotoParser {
         let spdif_enable = payload[8] != 0;
         let trans_duration = payload[9];
         let trans_type = TransitionType::from_byte(payload[10]);
-        let flags = if payload[1] == b'2' || payload[1] == b'3' {
+        let flags = if payload[1] == b'2' || payload[1] == b'3' || payload[1] == 2 || payload[1] == 3 {
             payload[11] | STRM_FLAG_CONT_WAIT
         } else {
             payload[11]
@@ -567,9 +569,10 @@ impl SlimprotoParser {
         let raw_left = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
         let raw_right = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
 
-        // Legacy negative dB value in old_gain_left/right indicates mute when 16.16 fixed-point gain is zero
-        let gain_left = if old_left < 0 { 0 } else { raw_left };
-        let gain_right = if old_right < 0 { 0 } else { raw_right };
+        // Legacy negative dB value in old_gain_left/right indicates mute when 16.16 fixed-point gain is zero (CODE-PROTO-001)
+        let _ = (old_left, old_right);
+        let gain_left = raw_left;
+        let gain_right = raw_right;
 
         Ok(ServerCommand::AudioGain {
             gain_left,
@@ -1553,12 +1556,37 @@ mod tests {
 
     #[test]
     fn test_audg_negative_db_mute_indicator() {
-        // PROTOCFG-805: negative old_gain_left/right mutes channel
+        // PROTOCFG-805: negative old_gain_left/right mutes channel when raw_gain is zero
         let mut frame = [0u8; 26];
         frame[0..4].copy_from_slice(b"audg");
         frame[4..8].copy_from_slice(&18u32.to_be_bytes());
         frame[8..12].copy_from_slice(&(-30i32).to_be_bytes()); // old_left < 0
         frame[12..16].copy_from_slice(&(-30i32).to_be_bytes()); // old_right < 0
+        frame[16] = 1;
+        frame[17] = 255;
+        frame[18..22].copy_from_slice(&0u32.to_be_bytes());
+        frame[22..26].copy_from_slice(&0u32.to_be_bytes());
+
+        let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
+        assert_eq!(
+            cmd,
+            ServerCommand::AudioGain {
+                gain_left: 0,
+                gain_right: 0,
+                digital_atten: 1,
+                preamp: 255,
+            }
+        );
+    }
+
+    #[test]
+    fn test_audg_negative_db_preserves_nonzero_raw() {
+        // CODE-PROTO-001: non-zero raw_gain is preserved even if old_left/right < 0
+        let mut frame = [0u8; 26];
+        frame[0..4].copy_from_slice(b"audg");
+        frame[4..8].copy_from_slice(&18u32.to_be_bytes());
+        frame[8..12].copy_from_slice(&(-30i32).to_be_bytes());
+        frame[12..16].copy_from_slice(&(-30i32).to_be_bytes());
         frame[16] = 1;
         frame[17] = 255;
         frame[18..22].copy_from_slice(&0x00010000u32.to_be_bytes());
@@ -1568,8 +1596,8 @@ mod tests {
         assert_eq!(
             cmd,
             ServerCommand::AudioGain {
-                gain_left: 0,
-                gain_right: 0,
+                gain_left: 0x00010000,
+                gain_right: 0x00010000,
                 digital_atten: 1,
                 preamp: 255,
             }
@@ -1729,6 +1757,10 @@ mod tests {
         // sample_rate_from_index: 10 | b':' => 88200, and ASCII '0'..='9'
         assert_eq!(sample_rate_from_index(10), 88200);
         assert_eq!(sample_rate_from_index(b':'), 88200);
+        assert_eq!(sample_rate_from_index(11), 176400);
+        assert_eq!(sample_rate_from_index(b';'), 176400);
+        assert_eq!(sample_rate_from_index(12), 192000);
+        assert_eq!(sample_rate_from_index(b'<'), 192000);
         assert_eq!(sample_rate_from_index(b'0'), 11025);
         assert_eq!(sample_rate_from_index(b'1'), 22050);
         assert_eq!(sample_rate_from_index(b'2'), 32000);

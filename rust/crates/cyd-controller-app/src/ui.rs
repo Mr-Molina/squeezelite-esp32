@@ -37,6 +37,7 @@ pub const UI_COLOR_OFFLINE_565: u16 = rgb888_to_rgb565(UI_COLOR_HEX_OFFLINE);
 pub const UI_COLOR_ONLINE_565: u16 = rgb888_to_rgb565(UI_COLOR_HEX_ONLINE);
 
 pub const DIRTY_STATUS: u8 = 1 << 0;
+pub const DIRTY_HEADER: u8 = DIRTY_STATUS;
 pub const DIRTY_TRACK: u8 = 1 << 1;
 pub const DIRTY_PROGRESS: u8 = 1 << 2;
 pub const DIRTY_TRANSPORT: u8 = 1 << 3;
@@ -365,6 +366,16 @@ impl NowPlayingUi {
         !self.cached_state.link_active
     }
 
+    /// Update link active state directly and mark header, track, and progress regions dirty if changed.
+    pub fn set_link_active(&mut self, active: bool) {
+        if self.cached_state.link_active != active {
+            self.cached_state.link_active = active;
+            self.link_badge.clear();
+            let _ = self.link_badge.push_str(if active { "ONLINE" } else { "OFFLINE" });
+            self.dirty_flags |= DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS;
+        }
+    }
+
     /// Format duration in seconds into `MM:SS` or `HH:MM:SS` (if >= 3600 seconds).
     pub fn format_time(seconds: u32) -> String<16> {
         let mut s = String::new();
@@ -389,6 +400,7 @@ impl NowPlayingUi {
     /// Update UI widget labels, progress, and controls from received telemetry state,
     /// setting dirty region flags only for sections whose displayed values changed.
     pub fn update(&mut self, state: &CydTelemetryState) {
+        let link_changed = self.cached_state.link_active != state.link_active;
         self.cached_state = state.clone();
 
         // 1. Mode and IP
@@ -421,6 +433,10 @@ impl NowPlayingUi {
             self.ip_label = new_ip;
             self.link_badge = new_badge;
             self.dirty_flags |= DIRTY_STATUS;
+        }
+
+        if link_changed {
+            self.dirty_flags |= DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS;
         }
 
         // 3. Track Title
@@ -582,7 +598,7 @@ impl NowPlayingUi {
 
     /// Route a touch screen coordinate against UI hit-boxes.
     ///
-    /// Supports both standard-Y (`182..=230`) and mirrored-Y (`12..=58`, mapped to `239 - y`)
+    /// Supports both standard-Y (`182..=230`) and mirrored-Y (`9..=58`, mapped to `239 - y`)
     /// CYD touch glass panel revisions:
     /// - Prev Button: `x: 12..=56, y: 184..=228`
     /// - Play/Pause Button: `x: 64..=112, y: 182..=230`
@@ -596,7 +612,7 @@ impl NowPlayingUi {
         now_ms: u32,
         link: &mut CydDisplayLink,
     ) -> Option<Vec<u8, 64>> {
-        let effective_y = if (12..=58).contains(&y) { 239 - y } else { y };
+        let effective_y = if (9..=58).contains(&y) { 239 - y } else { y };
         if (12..=56).contains(&x) && (184..=228).contains(&effective_y) {
             if released {
                 self.click_button(UiButtonId::Prev, link).ok()
@@ -616,7 +632,8 @@ impl NowPlayingUi {
                 None
             }
         } else if (195..=310).contains(&x) && (190..=222).contains(&effective_y) {
-            let vol = (((x - 195) as i32 * 100) / 115).clamp(0, 100) as u8;
+            let rel_x = (x - 195).max(0) as u32;
+            let vol = ((rel_x * 100 + 57) / 115).min(100) as u8;
             self.change_volume_slider(vol, released, now_ms, link)
         } else {
             None
@@ -691,15 +708,20 @@ impl NowPlayingUi {
         );
 
         // Track Title (x: 98..312, y: 44..64): 2x if len <= 13, else 1x
-        let title_scale = if self.title_label.len() <= 13 { 2 } else { 1 };
+        let (title_text, title_color) = if !self.cached_state.link_active {
+            ("UART LINK LOST", UI_COLOR_OFFLINE_565)
+        } else {
+            (self.title_label(), UI_COLOR_TEXT_PRIMARY_565)
+        };
+        let title_scale = if title_text.len() <= 13 { 2 } else { 1 };
         draw_text_box(
             display,
             98,
             44,
             312,
             64,
-            self.title_label(),
-            UI_COLOR_TEXT_PRIMARY_565,
+            title_text,
+            title_color,
             UI_COLOR_SURFACE_565,
             title_scale,
             false,
@@ -1193,6 +1215,27 @@ mod tests {
         // Bypass 3: Mirrored-Y touch coordinate (y = 39 -> effective_y = 200) routes to transport buttons & volume
         let res = ui.handle_touch_point(80, 39, true, 600, &mut link);
         assert_eq!(res.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
+
+        // Mirrored-Y tolerance includes rows 9..=11 (y = 9 -> effective_y = 230, y = 11 -> effective_y = 228)
+        let res9 = ui.handle_touch_point(80, 9, true, 650, &mut link);
+        assert_eq!(res9.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
+        let res11 = ui.handle_touch_point(80, 11, true, 700, &mut link);
+        assert_eq!(res11.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
+
+        // Volume slider division rounding: midpoint x = 252 (rel_x = 57) yields 50%
+        let vol_res = ui.handle_touch_point(252, 200, true, 750, &mut link);
+        assert_eq!(vol_res.as_deref(), Some(&b"CMD=VOL:50\n"[..]));
+        assert_eq!(ui.volume_slider, 50);
+
+        // set_link_active sets DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS when changed
+        ui.clear_dirty();
+        ui.set_link_active(true);
+        assert_eq!(ui.dirty_flags() & (DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS), DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS);
+        assert_eq!(ui.link_badge(), "ONLINE");
+        ui.clear_dirty();
+        ui.set_link_active(false);
+        assert_eq!(ui.dirty_flags() & (DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS), DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS);
+        assert_eq!(ui.link_badge(), "OFFLINE");
     }
 }
 

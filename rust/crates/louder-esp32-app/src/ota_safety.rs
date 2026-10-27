@@ -35,6 +35,8 @@ pub const OTA_0_PARTITION_SIZE: u32 = 0x0029_0000;
 
 /// Offset of the `settings` partition (`partitions.csv`, strictly read-only).
 pub const SETTINGS_PARTITION_OFFSET: u32 = 0x003F_0000;
+/// Offset of the `settings` journal sector (last 4KB sector of settings partition at 0x003F_E000).
+pub const SETTINGS_JOURNAL_OFFSET: u32 = 0x003F_E000;
 /// Size of the `settings` partition in bytes (64 KB).
 pub const SETTINGS_PARTITION_SIZE: u32 = 0x0001_0000;
 
@@ -61,8 +63,14 @@ const NVS_ENTRY_OFFSET: usize = 64;
 const NVS_ENTRY_SIZE: usize = 32;
 const NVS_ENTRIES_PER_PAGE: usize = 126;
 
-const NVS_PAGE_STATE_ACTIVE: u32 = 0xFFFF_FFFE;
-const NVS_PAGE_STATE_FULL: u32 = 0xFFFF_FFFC;
+pub const NVS_PAGE_STATE_ACTIVE: u32 = 0xFFFF_FFFE;
+pub const NVS_PAGE_STATE_FULL: u32 = 0xFFFF_FFFC;
+pub const NVS_PAGE_STATE_FREEING: u32 = 0xFFFF_FFF8;
+
+#[inline]
+const fn is_nvs_page_valid_state(state: u32) -> bool {
+    state == NVS_PAGE_STATE_ACTIVE || state == NVS_PAGE_STATE_FULL || state == NVS_PAGE_STATE_FREEING
+}
 
 const NVS_TYPE_U8: u8 = 0x01;
 const NVS_TYPE_STR: u8 = 0x21;
@@ -377,7 +385,7 @@ pub fn parse_nvs_wifi_credentials(
 
     for page in nvs_bytes.chunks_exact(NVS_PAGE_SIZE) {
         let state = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
-        if state != NVS_PAGE_STATE_ACTIVE && state != NVS_PAGE_STATE_FULL {
+        if !is_nvs_page_valid_state(state) {
             continue;
         }
         let bitmap = &page[32..64];
@@ -405,7 +413,7 @@ pub fn parse_nvs_wifi_credentials(
 
     for page in nvs_bytes.chunks_exact(NVS_PAGE_SIZE) {
         let state = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
-        if state != NVS_PAGE_STATE_ACTIVE && state != NVS_PAGE_STATE_FULL {
+        if !is_nvs_page_valid_state(state) {
             continue;
         }
         let bitmap = &page[32..64];
@@ -497,7 +505,7 @@ fn scan_nvs_namespaces(
 ) {
     for page in nvs_bytes.chunks_exact(NVS_PAGE_SIZE) {
         let state = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
-        if state != NVS_PAGE_STATE_ACTIVE && state != NVS_PAGE_STATE_FULL {
+        if !is_nvs_page_valid_state(state) {
             continue;
         }
         let bitmap = &page[32..64];
@@ -531,7 +539,7 @@ fn scan_nvs_credentials(
 ) -> Result<(), OtaSafetyError> {
     for page in nvs_bytes.chunks_exact(NVS_PAGE_SIZE) {
         let state = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
-        if state != NVS_PAGE_STATE_ACTIVE && state != NVS_PAGE_STATE_FULL {
+        if !is_nvs_page_valid_state(state) {
             continue;
         }
         let bitmap = &page[32..64];
@@ -621,8 +629,10 @@ where
         &mut nvs_buf[NVS_PAGE_SIZE..],
     );
     scan_nvs_namespaces(&nvs_buf[NVS_PAGE_SIZE..], &mut config_ns_id, &mut aplist_ns_id);
+    // Scan only Page 3 (nvs_buf[2 * NVS_PAGE_SIZE..]) since Pages 0, 1, 2 were already scanned in Pass 1!
+    // Never re-scan Page 0 (at nvs_buf[0..4096]) after Page 1 to prevent newer credentials from being overwritten.
     scan_nvs_credentials(
-        nvs_buf,
+        &nvs_buf[2 * NVS_PAGE_SIZE..],
         sta_mac,
         config_ns_id,
         aplist_ns_id,
@@ -947,5 +957,76 @@ mod tests {
 
         assert_eq!(creds.ssid.as_str(), "iot");
         assert_eq!(creds.password.as_str(), "Page3SecretPass2026!");
+    }
+
+    #[test]
+    fn test_split_12kb_nvs_read_preserves_page1_newer_credentials_over_page0() {
+        let mut full_nvs = [0xFFu8; NVS_PAGE_SIZE * 4];
+        // Page 0 (0x9000..0xA000): FULL state, holds namespace definitions and OLD credentials
+        full_nvs[0..4].copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
+        write_nvs_namespace_entry(&mut full_nvs[0..NVS_PAGE_SIZE], 0, "config", 1);
+        let span1 = write_nvs_blob_entry(
+            &mut full_nvs[0..NVS_PAGE_SIZE],
+            1,
+            1,
+            NVS_TYPE_BLOB,
+            "ssid",
+            b"old_ssid_page0\0",
+        );
+        let _span2 = write_nvs_blob_entry(
+            &mut full_nvs[0..NVS_PAGE_SIZE],
+            1 + span1,
+            1,
+            NVS_TYPE_BLOB,
+            "password",
+            b"old_pass_page0\0",
+        );
+
+        // Page 1 (0xA000..0xB000): ACTIVE state, holds NEWER credentials
+        let page1_start = NVS_PAGE_SIZE;
+        full_nvs[page1_start..page1_start + 4].copy_from_slice(&NVS_PAGE_STATE_ACTIVE.to_le_bytes());
+        let span3 = write_nvs_blob_entry(
+            &mut full_nvs[page1_start..page1_start + NVS_PAGE_SIZE],
+            0,
+            1,
+            NVS_TYPE_BLOB,
+            "ssid",
+            b"new_ssid_page1\0",
+        );
+        let _span4 = write_nvs_blob_entry(
+            &mut full_nvs[page1_start..page1_start + NVS_PAGE_SIZE],
+            span3,
+            1,
+            NVS_TYPE_BLOB,
+            "password",
+            b"new_pass_page1\0",
+        );
+
+        let mut nvs_buf = [0xFFu8; 12_288];
+        let creds = load_nvs_wifi_credentials_split_12kb(
+            |offset, buf| {
+                let rel = (offset - NVS_PARTITION_OFFSET) as usize;
+                buf.copy_from_slice(&full_nvs[rel..rel + buf.len()]);
+            },
+            &BASEMENT_MAC,
+            &mut nvs_buf,
+            None,
+            None,
+        )
+        .expect("Should resolve Page 1 credentials");
+
+        // Verify newer credentials on Page 1 were NOT overwritten by older credentials on Page 0!
+        assert_eq!(creds.ssid.as_str(), "new_ssid_page1");
+        assert_eq!(creds.password.as_str(), "new_pass_page1");
+    }
+
+    #[test]
+    fn test_nvs_page_state_freeing_recognized_and_journal_offset() {
+        assert_eq!(SETTINGS_JOURNAL_OFFSET, 0x003F_E000);
+        assert_eq!(NVS_PAGE_STATE_FREEING, 0xFFFF_FFF8);
+        assert!(is_nvs_page_valid_state(NVS_PAGE_STATE_FREEING));
+        assert!(is_nvs_page_valid_state(NVS_PAGE_STATE_ACTIVE));
+        assert!(is_nvs_page_valid_state(NVS_PAGE_STATE_FULL));
+        assert!(!is_nvs_page_valid_state(0xFFFF_FFFF));
     }
 }

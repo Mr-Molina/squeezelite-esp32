@@ -15,7 +15,7 @@ board-louder-esp32-s3 = []
 squeezelite-proto = { path = "../squeezelite-proto" }
 squeezelite-audio-core = { path = "../squeezelite-audio-core" }
 squeezelite-tas58xx = { path = "../squeezelite-tas58xx" }
-squeezelite-decoders = { path = "../squeezelite-decoders", default-features = false }
+squeezelite-decoders = { path = "../squeezelite-decoders", default-features = false, features = ["alloc"] }
 squeezelite-cyd-link = { path = "../squeezelite-cyd-link" }
 squeezelite-config = { path = "../squeezelite-config" }
 embedded-hal = { workspace = true }
@@ -32,7 +32,7 @@ esp-backtrace = { version = "0.20.0", features = ["esp32", "panic-handler", "pri
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"] }
 esp-hal = { version = "1.2.2", features = ["esp32", "unstable"] }
 esp-println = { version = "0.18.0", features = ["esp32"] }
-esp-radio = { version = "1.0.0-beta.1", features = ["esp32", "wifi", "unstable"] }
+esp-radio = { version = "1.0.0-beta.1", features = ["esp32", "wifi", "ble", "coex", "unstable"] }
 esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc"] }
 esp-storage = { version = "0.10.0", features = ["esp32", "critical-section", "bytewise-read"] }
 smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4"] }

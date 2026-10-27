@@ -53,6 +53,9 @@ pub struct AudioRingBuffer<'a> {
     _marker: PhantomData<&'a mut [u8]>,
 }
 
+// SAFETY: `AudioRingBuffer` owns raw pointer access to `storage` during its lifetime `'a`.
+// Access to storage is synchronized via atomic load/store with acquire/release semantics
+// across single-producer single-consumer threads, making it safe to send across threads.
 unsafe impl<'a> Send for AudioRingBuffer<'a> {}
 
 impl<'a> AudioRingBuffer<'a> {
@@ -115,10 +118,16 @@ impl<'a> AudioRingBuffer<'a> {
 
         let data_to_end = self.capacity - r;
         if to_peek <= data_to_end {
+            // SAFETY: `r + to_peek <= self.capacity` because `to_peek <= data_to_end` and `data_to_end = self.capacity - r`.
+            // Destination pointer is valid for `to_peek` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), to_peek);
             }
         } else {
+            // SAFETY: The peek range wraps around buffer boundary. It is split into two disjoint contiguous slices:
+            // 1. `self.storage.add(r)` of size `data_to_end` into `dst[..data_to_end]`.
+            // 2. `self.storage` of size `remainder` into `dst[data_to_end..to_peek]`.
+            // Both source and destination pointers are valid and non-overlapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), data_to_end);
                 let remainder = to_peek - data_to_end;
@@ -177,10 +186,16 @@ impl<'a> AudioRingBuffer<'a> {
 
         let space_to_end = self.capacity - w;
         if to_write <= space_to_end {
+            // SAFETY: `w + to_write <= self.capacity` because `to_write <= space_to_end` and `space_to_end = self.capacity - w`.
+            // `src` is valid for `to_write` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), self.storage.add(w), to_write);
             }
         } else {
+            // SAFETY: The write range wraps around buffer boundary. It is split into two disjoint contiguous slices:
+            // 1. `src[..space_to_end]` into `self.storage.add(w)`.
+            // 2. `src[space_to_end..to_write]` into `self.storage`.
+            // Both source and destination pointers are valid and non-overlapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), self.storage.add(w), space_to_end);
                 let remainder = to_write - space_to_end;
@@ -198,6 +213,7 @@ impl<'a> AudioRingBuffer<'a> {
         Ok(to_write)
     }
 
+    #[allow(deprecated)]
     pub(crate) fn read_internal(&self, dst: &mut [u8]) -> Result<usize, RingBufferError> {
         let avail = self.available_read();
         if avail == 0 {
@@ -209,10 +225,16 @@ impl<'a> AudioRingBuffer<'a> {
 
         let data_to_end = self.capacity - r;
         if to_read <= data_to_end {
+            // SAFETY: `r + to_read <= self.capacity` because `to_read <= data_to_end` and `data_to_end = self.capacity - r`.
+            // `dst` is valid for `to_read` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), to_read);
             }
         } else {
+            // SAFETY: The read range wraps around buffer boundary. It is split into two disjoint contiguous slices:
+            // 1. `self.storage.add(r)` of size `data_to_end` into `dst[..data_to_end]`.
+            // 2. `self.storage` of size `remainder` into `dst[data_to_end..to_read]`.
+            // Both source and destination pointers are valid and non-overlapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), data_to_end);
                 let remainder = to_read - data_to_end;
@@ -227,15 +249,14 @@ impl<'a> AudioRingBuffer<'a> {
         let new_r = (r + to_read) % self.capacity;
         self.read_pos.store(new_r, Ordering::Release);
 
-        let new_avail_read = avail - to_read;
-        let max_rew = self.capacity.saturating_sub(new_avail_read);
-        let prev_rew = self.rewindable.load(Ordering::Acquire);
-        self.rewindable
-            .store(prev_rew.saturating_add(to_read).min(max_rew), Ordering::Release);
+        let _ = self.rewindable.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_add(to_read).min(self.capacity()))
+        });
 
         Ok(to_read)
     }
 
+    #[allow(deprecated)]
     pub(crate) fn consume_internal(&self, count: usize) {
         let avail = self.available_read();
         let to_consume = core::cmp::min(count, avail);
@@ -243,13 +264,12 @@ impl<'a> AudioRingBuffer<'a> {
         let new_r = (r + to_consume) % self.capacity;
         self.read_pos.store(new_r, Ordering::Release);
 
-        let new_avail_read = avail - to_consume;
-        let max_rew = self.capacity.saturating_sub(new_avail_read);
-        let prev_rew = self.rewindable.load(Ordering::Acquire);
-        self.rewindable
-            .store(prev_rew.saturating_add(to_consume).min(max_rew), Ordering::Release);
+        let _ = self.rewindable.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_add(to_consume).min(self.capacity()))
+        });
     }
 
+    #[allow(deprecated)]
     pub(crate) fn rewind_read_internal(&self, count: usize) {
         let rew = self.rewindable.load(Ordering::Acquire);
         let to_rewind = count.min(rew).min(self.available_write());
@@ -260,7 +280,9 @@ impl<'a> AudioRingBuffer<'a> {
             self.capacity - (to_rewind - r)
         };
         self.read_pos.store(new_r, Ordering::Release);
-        self.rewindable.fetch_sub(to_rewind, Ordering::Release);
+        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(to_rewind))
+        });
     }
 
     pub(crate) fn flush_internal(&self) {
@@ -277,6 +299,8 @@ pub struct Producer<'ring, 'buf> {
     _not_sync: PhantomData<core::cell::UnsafeCell<()>>,
 }
 
+// SAFETY: `Producer` holds an immutable reference to the ringbuffer and has exclusive write
+// access via SPSC protocol. It contains `!Sync` PhantomData so it cannot be shared across threads simultaneously.
 unsafe impl<'ring, 'buf> Send for Producer<'ring, 'buf> {}
 
 impl<'ring, 'buf> Producer<'ring, 'buf> {
@@ -296,6 +320,8 @@ pub struct Consumer<'ring, 'buf> {
     _not_sync: PhantomData<core::cell::UnsafeCell<()>>,
 }
 
+// SAFETY: `Consumer` holds an immutable reference to the ringbuffer and has exclusive read/rewind
+// access via SPSC protocol. It contains `!Sync` PhantomData so it cannot be shared across threads simultaneously.
 unsafe impl<'ring, 'buf> Send for Consumer<'ring, 'buf> {}
 
 impl<'ring, 'buf> Consumer<'ring, 'buf> {

@@ -139,9 +139,12 @@ impl PcmDecoder {
                     data[offset + 6],
                     data[offset + 7],
                 ]) as usize;
+                let padded_size = chunk_size
+                    .checked_add(chunk_size & 1)
+                    .ok_or(DecoderError::InvalidHeader)?;
 
                 if chunk_id == b"fmt " {
-                    if offset + 8 + 16 > data.len() {
+                    if offset.checked_add(24).is_none_or(|end| end > data.len()) {
                         return Err(DecoderError::NeedMoreData);
                     }
                     let fmt_payload = &data[offset + 8..];
@@ -162,19 +165,25 @@ impl PcmDecoder {
                     self.big_endian = false;
                     found_fmt = true;
 
-                    let padded_size = chunk_size + (chunk_size & 1);
-                    offset += 8 + padded_size;
+                    offset = offset
+                        .checked_add(8)
+                        .and_then(|o| o.checked_add(padded_size))
+                        .ok_or(DecoderError::InvalidHeader)?;
                 } else if chunk_id == b"data" {
                     if !found_fmt {
                         return Err(DecoderError::InvalidHeader);
                     }
-                    return Ok(offset + 8);
+                    let data_start = offset.checked_add(8).ok_or(DecoderError::InvalidHeader)?;
+                    return Ok(data_start);
                 } else {
-                    let padded_size = chunk_size + (chunk_size & 1);
-                    if offset + 8 + padded_size > data.len() {
+                    let next_offset = offset
+                        .checked_add(8)
+                        .and_then(|o| o.checked_add(padded_size))
+                        .ok_or(DecoderError::InvalidHeader)?;
+                    if next_offset > data.len() {
                         return Err(DecoderError::NeedMoreData);
                     }
-                    offset += 8 + padded_size;
+                    offset = next_offset;
                 }
             }
             return Err(DecoderError::NeedMoreData);
@@ -197,9 +206,12 @@ impl PcmDecoder {
                     data[offset + 6],
                     data[offset + 7],
                 ]) as usize;
+                let padded_size = chunk_size
+                    .checked_add(chunk_size & 1)
+                    .ok_or(DecoderError::InvalidHeader)?;
 
                 if chunk_id == b"COMM" {
-                    if offset + 8 + 18 > data.len() {
+                    if offset.checked_add(26).is_none_or(|end| end > data.len()) {
                         return Err(DecoderError::NeedMoreData);
                     }
                     let comm_payload = &data[offset + 8..];
@@ -222,13 +234,15 @@ impl PcmDecoder {
                     self.big_endian = true;
                     found_comm = true;
 
-                    let padded_size = chunk_size + (chunk_size & 1);
-                    offset += 8 + padded_size;
+                    offset = offset
+                        .checked_add(8)
+                        .and_then(|o| o.checked_add(padded_size))
+                        .ok_or(DecoderError::InvalidHeader)?;
                 } else if chunk_id == b"SSND" {
                     if !found_comm {
                         return Err(DecoderError::InvalidHeader);
                     }
-                    if offset + 8 + 8 > data.len() {
+                    if offset.checked_add(16).is_none_or(|end| end > data.len()) {
                         return Err(DecoderError::NeedMoreData);
                     }
                     let ssnd_payload = &data[offset + 8..];
@@ -239,17 +253,23 @@ impl PcmDecoder {
                         ssnd_payload[3],
                     ]) as usize;
 
-                    let audio_start = offset + 8 + 8 + ssnd_offset;
+                    let audio_start = offset
+                        .checked_add(16)
+                        .and_then(|o| o.checked_add(ssnd_offset))
+                        .ok_or(DecoderError::InvalidHeader)?;
                     if audio_start > data.len() {
                         return Err(DecoderError::NeedMoreData);
                     }
                     return Ok(audio_start);
                 } else {
-                    let padded_size = chunk_size + (chunk_size & 1);
-                    if offset + 8 + padded_size > data.len() {
+                    let next_offset = offset
+                        .checked_add(8)
+                        .and_then(|o| o.checked_add(padded_size))
+                        .ok_or(DecoderError::InvalidHeader)?;
+                    if next_offset > data.len() {
                         return Err(DecoderError::NeedMoreData);
                     }
-                    offset += 8 + padded_size;
+                    offset = next_offset;
                 }
             }
             return Err(DecoderError::NeedMoreData);
@@ -716,10 +736,16 @@ impl AudioDecoder for StaticMp3Decoder {
             }
             Some((0, h)) => {
                 let frame_bytes = h.frame_bytes(0) + h.padding();
-                if frame_bytes == 0 || frame_bytes + 4 > 1536 {
+                if frame_bytes == 0 || frame_bytes + 4 > 1728 {
                     return Ok((1, 0));
                 }
                 if encoded_in.len() < frame_bytes + 4 {
+                    if encoded_in.len() >= frame_bytes + 2
+                        && (encoded_in[frame_bytes] != 0xFF
+                            || (encoded_in[frame_bytes + 1] & 0xE0) != 0xE0)
+                    {
+                        return Ok((1, 0));
+                    }
                     return Err(DecoderError::NeedMoreData);
                 }
                 let next_h = nanomp3_core::__private::Header::read(&encoded_in[frame_bytes..]);
@@ -770,13 +796,13 @@ impl AudioDecoder for StaticMp3Decoder {
     }
 }
 
-#[cfg(feature = "std")]
-struct FlacByteReader<'a> {
-    data: &'a [u8],
-    pos: &'a std::cell::Cell<usize>,
+#[cfg(any(feature = "std", test))]
+pub struct FlacByteReader<'a> {
+    pub data: &'a [u8],
+    pub pos: &'a std::cell::Cell<usize>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 impl<'a> std::io::Read for FlacByteReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let cur = self.pos.get();
@@ -788,30 +814,629 @@ impl<'a> std::io::Read for FlacByteReader<'a> {
     }
 }
 
-#[cfg(feature = "std")]
-/// Pure-Rust FLAC Decoder using claxon with stateful streaming bitstream accumulation (DEC-002).
+const CRC8_TABLE: [u8; 256] = [
+    0x00, 0x07, 0x0e, 0x09, 0x1c, 0x1b, 0x12, 0x15, 0x38, 0x3f, 0x36, 0x31, 0x24, 0x23, 0x2a,
+    0x2d, 0x70, 0x77, 0x7e, 0x79, 0x6c, 0x6b, 0x62, 0x65, 0x48, 0x4f, 0x46, 0x41, 0x54, 0x53,
+    0x5a, 0x5d, 0xe0, 0xe7, 0xee, 0xe9, 0xfc, 0xfb, 0xf2, 0xf5, 0xd8, 0xdf, 0xd6, 0xd1, 0xc4,
+    0xc3, 0xca, 0xcd, 0x90, 0x97, 0x9e, 0x99, 0x8c, 0x8b, 0x82, 0x85, 0xa8, 0xaf, 0xa6, 0xa1,
+    0xb4, 0xb3, 0xba, 0xbd, 0xc7, 0xc0, 0xc9, 0xce, 0xdb, 0xdc, 0xd5, 0xd2, 0xff, 0xf8, 0xf1,
+    0xf6, 0xe3, 0xe4, 0xed, 0xea, 0xb7, 0xb0, 0xb9, 0xbe, 0xab, 0xac, 0xa5, 0xa2, 0x8f, 0x88,
+    0x81, 0x86, 0x93, 0x94, 0x9d, 0x9a, 0x27, 0x20, 0x29, 0x2e, 0x3b, 0x3c, 0x35, 0x32, 0x1f,
+    0x18, 0x11, 0x16, 0x03, 0x04, 0x0d, 0x0a, 0x57, 0x50, 0x59, 0x5e, 0x4b, 0x4c, 0x45, 0x42,
+    0x6f, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7d, 0x7a, 0x89, 0x8e, 0x87, 0x80, 0x95, 0x92, 0x9b,
+    0x9c, 0xb1, 0xb6, 0xbf, 0xb8, 0xad, 0xaa, 0xa3, 0xa4, 0xf9, 0xfe, 0xf7, 0xf0, 0xe5, 0xe2,
+    0xeb, 0xec, 0xc1, 0xc6, 0xcf, 0xc8, 0xdd, 0xda, 0xd3, 0xd4, 0x69, 0x6e, 0x67, 0x60, 0x75,
+    0x72, 0x7b, 0x7c, 0x51, 0x56, 0x5f, 0x58, 0x4d, 0x4a, 0x43, 0x44, 0x19, 0x1e, 0x17, 0x10,
+    0x05, 0x02, 0x0b, 0x0c, 0x21, 0x26, 0x2f, 0x28, 0x3d, 0x3a, 0x33, 0x34, 0x4e, 0x49, 0x40,
+    0x47, 0x52, 0x55, 0x5c, 0x5b, 0x76, 0x71, 0x78, 0x7f, 0x6a, 0x6d, 0x64, 0x63, 0x3e, 0x39,
+    0x30, 0x37, 0x22, 0x25, 0x2c, 0x2b, 0x06, 0x01, 0x08, 0x0f, 0x1a, 0x1d, 0x14, 0x13, 0xae,
+    0xa9, 0xa0, 0xa7, 0xb2, 0xb5, 0xbc, 0xbb, 0x96, 0x91, 0x98, 0x9f, 0x8a, 0x8d, 0x84, 0x83,
+    0xde, 0xd9, 0xd0, 0xd7, 0xc2, 0xc5, 0xcc, 0xcb, 0xe6, 0xe1, 0xe8, 0xef, 0xfa, 0xfd, 0xf4,
+    0xf3,
+];
+
+const CRC16_TABLE: [u16; 256] = [
+    0x0000, 0x8005, 0x800f, 0x000a, 0x801b, 0x001e, 0x0014, 0x8011, 0x8033, 0x0036, 0x003c,
+    0x8039, 0x0028, 0x802d, 0x8027, 0x0022, 0x8063, 0x0066, 0x006c, 0x8069, 0x0078, 0x807d,
+    0x8077, 0x0072, 0x0050, 0x8055, 0x805f, 0x005a, 0x804b, 0x004e, 0x0044, 0x8041, 0x80c3,
+    0x00c6, 0x00cc, 0x80c9, 0x00d8, 0x80dd, 0x80d7, 0x00d2, 0x00f0, 0x80f5, 0x80ff, 0x00fa,
+    0x80eb, 0x00ee, 0x00e4, 0x80e1, 0x00a0, 0x80a5, 0x80af, 0x00aa, 0x80bb, 0x00be, 0x00b4,
+    0x80b1, 0x8093, 0x0096, 0x009c, 0x8099, 0x0088, 0x808d, 0x8087, 0x0082, 0x8183, 0x0186,
+    0x018c, 0x8189, 0x0198, 0x819d, 0x8197, 0x0192, 0x01b0, 0x81b5, 0x81bf, 0x01ba, 0x81ab,
+    0x01ae, 0x01a4, 0x81a1, 0x01e0, 0x81e5, 0x81ef, 0x01ea, 0x81fb, 0x01fe, 0x01f4, 0x81f1,
+    0x81d3, 0x01d6, 0x01dc, 0x81d9, 0x01c8, 0x81cd, 0x81c7, 0x01c2, 0x0140, 0x8145, 0x814f,
+    0x014a, 0x815b, 0x015e, 0x0154, 0x8151, 0x8173, 0x0176, 0x017c, 0x8179, 0x0168, 0x816d,
+    0x8167, 0x0162, 0x8123, 0x0126, 0x012c, 0x8129, 0x0138, 0x813d, 0x8137, 0x0132, 0x0110,
+    0x8115, 0x811f, 0x011a, 0x810b, 0x010e, 0x0104, 0x8101, 0x8303, 0x0306, 0x030c, 0x8309,
+    0x0318, 0x831d, 0x8317, 0x0312, 0x0330, 0x8335, 0x833f, 0x033a, 0x832b, 0x032e, 0x0324,
+    0x8321, 0x0360, 0x8365, 0x836f, 0x036a, 0x837b, 0x037e, 0x0374, 0x8371, 0x8353, 0x0356,
+    0x035c, 0x8359, 0x0348, 0x834d, 0x8347, 0x0342, 0x03c0, 0x83c5, 0x83cf, 0x03ca, 0x83db,
+    0x03de, 0x03d4, 0x83d1, 0x83f3, 0x03f6, 0x03fc, 0x83f9, 0x03e8, 0x83ed, 0x83e7, 0x03e2,
+    0x83a3, 0x03a6, 0x03ac, 0x83a9, 0x03b8, 0x83bd, 0x83b7, 0x03b2, 0x0390, 0x8395, 0x839f,
+    0x039a, 0x838b, 0x038e, 0x0384, 0x8381, 0x0280, 0x8285, 0x828f, 0x028a, 0x829b, 0x029e,
+    0x0294, 0x8291, 0x82b3, 0x02b6, 0x02bc, 0x82b9, 0x02a8, 0x82ad, 0x82a7, 0x02a2, 0x82e3,
+    0x02e6, 0x02ec, 0x82e9, 0x02f8, 0x82fd, 0x82f7, 0x02f2, 0x02d0, 0x82d5, 0x82df, 0x02da,
+    0x82cb, 0x02ce, 0x02c4, 0x82c1, 0x8243, 0x0246, 0x024c, 0x8249, 0x0258, 0x825d, 0x8257,
+    0x0252, 0x0270, 0x8275, 0x827f, 0x027a, 0x826b, 0x026e, 0x0264, 0x8261, 0x0220, 0x8225,
+    0x822f, 0x022a, 0x823b, 0x023e, 0x0234, 0x8231, 0x8213, 0x0216, 0x021c, 0x8219, 0x0208,
+    0x820d, 0x8207, 0x0202,
+];
+
+#[inline(always)]
+fn flac_crc8(data: &[u8]) -> u8 {
+    let mut state = 0u8;
+    for &byte in data {
+        state = CRC8_TABLE[(state ^ byte) as usize];
+    }
+    state
+}
+
+#[inline(always)]
+fn flac_crc16(data: &[u8]) -> u16 {
+    let mut state = 0u16;
+    for &byte in data {
+        state = (state << 8) ^ CRC16_TABLE[((state >> 8) as u8 ^ byte) as usize];
+    }
+    state
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+}
+
+impl<'a> BitReader<'a> {
+    #[inline(always)]
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn read_bit(&mut self) -> Result<u32, ()> {
+        if self.byte_pos >= self.bytes.len() {
+            return Err(());
+        }
+        let bit = ((self.bytes[self.byte_pos] >> (7 - self.bit_pos)) & 1) as u32;
+        self.bit_pos += 1;
+        if self.bit_pos == 8 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+        Ok(bit)
+    }
+
+    #[inline(always)]
+    fn read_bits(&mut self, mut n: usize) -> Result<u32, ()> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut val = 0u32;
+        while n > 0 {
+            if self.byte_pos >= self.bytes.len() {
+                return Err(());
+            }
+            let avail = 8 - self.bit_pos as usize;
+            let take = n.min(avail);
+            let shift = avail - take;
+            let mask = ((1u32 << take) - 1) as u8;
+            let bits = (self.bytes[self.byte_pos] >> shift) & mask;
+            val = (val << take) | (bits as u32);
+            self.bit_pos += take as u8;
+            if self.bit_pos == 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+            n -= take;
+        }
+        Ok(val)
+    }
+
+    #[inline(always)]
+    fn read_signed(&mut self, n: usize) -> Result<i64, ()> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let u = self.read_bits(n)? as u64;
+        let sign_bit = 1u64 << (n - 1);
+        if (u & sign_bit) != 0 {
+            let mask = !((1u64 << n) - 1);
+            Ok((u | mask) as i64)
+        } else {
+            Ok(u as i64)
+        }
+    }
+
+    #[inline(always)]
+    fn read_unary_zeros(&mut self) -> Result<u32, ()> {
+        let mut count = 0u32;
+        while self.bit_pos > 0 {
+            let b = self.read_bit()?;
+            if b == 1 {
+                return Ok(count);
+            }
+            count += 1;
+        }
+        while self.byte_pos < self.bytes.len() && self.bytes[self.byte_pos] == 0 {
+            count += 8;
+            self.byte_pos += 1;
+        }
+        if self.byte_pos >= self.bytes.len() {
+            return Err(());
+        }
+        let byte = self.bytes[self.byte_pos];
+        let leading_zeros = byte.leading_zeros();
+        count += leading_zeros;
+        self.bit_pos = (leading_zeros as u8) + 1;
+        if self.bit_pos == 8 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+        Ok(count)
+    }
+
+    #[inline(always)]
+    fn align_to_byte(&mut self) {
+        if self.bit_pos > 0 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+    }
+}
+
+fn read_utf8_number(buf: &[u8], idx: usize) -> Result<(u64, usize), ()> {
+    if idx >= buf.len() {
+        return Err(());
+    }
+    let u0 = buf[idx];
+    if (u0 & 0x80) == 0 {
+        return Ok((u0 as u64, idx + 1));
+    }
+    if (u0 & 0xE0) == 0xC0 {
+        if idx + 2 > buf.len() { return Err(()); }
+        let u1 = buf[idx + 1];
+        if (u1 & 0xC0) != 0x80 { return Err(()); }
+        let val = ((u0 as u64 & 0x1F) << 6) | (u1 as u64 & 0x3F);
+        return Ok((val, idx + 2));
+    }
+    if (u0 & 0xF0) == 0xE0 {
+        if idx + 3 > buf.len() { return Err(()); }
+        let (u1, u2) = (buf[idx + 1], buf[idx + 2]);
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 { return Err(()); }
+        let val = ((u0 as u64 & 0x0F) << 12) | ((u1 as u64 & 0x3F) << 6) | (u2 as u64 & 0x3F);
+        return Ok((val, idx + 3));
+    }
+    if (u0 & 0xF8) == 0xF0 {
+        if idx + 4 > buf.len() { return Err(()); }
+        let (u1, u2, u3) = (buf[idx + 1], buf[idx + 2], buf[idx + 3]);
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 { return Err(()); }
+        let val = ((u0 as u64 & 0x07) << 18) | ((u1 as u64 & 0x3F) << 12) | ((u2 as u64 & 0x3F) << 6) | (u3 as u64 & 0x3F);
+        return Ok((val, idx + 4));
+    }
+    if (u0 & 0xFC) == 0xF8 {
+        if idx + 5 > buf.len() { return Err(()); }
+        let (u1, u2, u3, u4) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4]);
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 || (u4 & 0xC0) != 0x80 { return Err(()); }
+        let val = ((u0 as u64 & 0x03) << 24) | ((u1 as u64 & 0x3F) << 18) | ((u2 as u64 & 0x3F) << 12) | ((u3 as u64 & 0x3F) << 6) | (u4 as u64 & 0x3F);
+        return Ok((val, idx + 5));
+    }
+    if (u0 & 0xFE) == 0xFC {
+        if idx + 6 > buf.len() { return Err(()); }
+        let (u1, u2, u3, u4, u5) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4], buf[idx + 5]);
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 || (u4 & 0xC0) != 0x80 || (u5 & 0xC0) != 0x80 { return Err(()); }
+        let val = ((u0 as u64 & 0x01) << 30) | ((u1 as u64 & 0x3F) << 24) | ((u2 as u64 & 0x3F) << 18) | ((u3 as u64 & 0x3F) << 12) | ((u4 as u64 & 0x3F) << 6) | (u5 as u64 & 0x3F);
+        return Ok((val, idx + 6));
+    }
+    if u0 == 0xFE {
+        if idx + 7 > buf.len() { return Err(()); }
+        let (u1, u2, u3, u4, u5, u6) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4], buf[idx + 5], buf[idx + 6]);
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 || (u4 & 0xC0) != 0x80 || (u5 & 0xC0) != 0x80 || (u6 & 0xC0) != 0x80 { return Err(()); }
+        let val = ((u1 as u64 & 0x3F) << 30) | ((u2 as u64 & 0x3F) << 24) | ((u3 as u64 & 0x3F) << 18) | ((u4 as u64 & 0x3F) << 12) | ((u5 as u64 & 0x3F) << 6) | (u6 as u64 & 0x3F);
+        return Ok((val, idx + 7));
+    }
+    Err(())
+}
+
+struct FrameHeader {
+    block_size: usize,
+    sample_rate: u32,
+    channels: u32,
+    channel_assignment: u8,
+    bits_per_sample: u32,
+    header_bytes: usize,
+}
+
+fn parse_frame_header(
+    buf: &[u8],
+    stream_sr: u32,
+    stream_bps: u32,
+    min_bs: u16,
+) -> Result<Option<FrameHeader>, ()> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    if buf[0] != 0xFF || (buf[1] & 0xFE) != 0xF8 {
+        return Err(());
+    }
+    let block_size_code = (buf[2] >> 4) & 0x0F;
+    let sample_rate_code = buf[2] & 0x0F;
+    let channel_assignment = (buf[3] >> 4) & 0x0F;
+    let sample_size_code = (buf[3] >> 1) & 0x07;
+    let reserved = buf[3] & 1;
+    if reserved != 0 || sample_rate_code == 15 || sample_size_code == 3 {
+        return Err(());
+    }
+    let num_channels = match channel_assignment {
+        0 => 1,
+        1 | 8 | 9 | 10 => 2,
+        _ => return Err(()),
+    };
+
+    let (_, mut idx) = match read_utf8_number(buf, 4) {
+        Ok(res) => res,
+        Err(_) => {
+            if buf.len() < 12 { return Ok(None); }
+            return Err(());
+        }
+    };
+
+    let block_size = match block_size_code {
+        0 => {
+            if min_bs > 0 { min_bs as usize } else { return Err(()); }
+        }
+        1 => 192,
+        2..=5 => 576 * (1usize << (block_size_code - 2)),
+        6 => {
+            if idx >= buf.len() { return Ok(None); }
+            let bs = (buf[idx] as usize) + 1;
+            idx += 1;
+            bs
+        }
+        7 => {
+            if idx + 2 > buf.len() { return Ok(None); }
+            let bs = (u16::from_be_bytes([buf[idx], buf[idx + 1]]) as usize) + 1;
+            idx += 2;
+            bs
+        }
+        8..=15 => 256 * (1usize << (block_size_code - 8)),
+        _ => return Err(()),
+    };
+    if block_size == 0 || block_size > 4096 {
+        return Err(());
+    }
+
+    let sample_rate = match sample_rate_code {
+        0 => stream_sr,
+        1 => 88200,
+        2 => 176400,
+        3 => 192000,
+        4 => 8000,
+        5 => 16000,
+        6 => 22050,
+        7 => 24000,
+        8 => 32000,
+        9 => 44100,
+        10 => 48000,
+        11 => 96000,
+        12 => {
+            if idx >= buf.len() { return Ok(None); }
+            let sr = (buf[idx] as u32) * 1000;
+            idx += 1;
+            sr
+        }
+        13 => {
+            if idx + 2 > buf.len() { return Ok(None); }
+            let sr = u16::from_be_bytes([buf[idx], buf[idx + 1]]) as u32;
+            idx += 2;
+            sr
+        }
+        14 => {
+            if idx + 2 > buf.len() { return Ok(None); }
+            let sr = (u16::from_be_bytes([buf[idx], buf[idx + 1]]) as u32) * 10;
+            idx += 2;
+            sr
+        }
+        _ => return Err(()),
+    };
+
+    let bits_per_sample = match sample_size_code {
+        0 => stream_bps,
+        1 => 8,
+        2 => 12,
+        4 => 16,
+        5 => 20,
+        6 => 24,
+        7 => 32,
+        _ => return Err(()),
+    };
+
+    if idx >= buf.len() {
+        return Ok(None);
+    }
+    let expected_crc = buf[idx];
+    let actual_crc = flac_crc8(&buf[0..idx]);
+    if expected_crc != actual_crc {
+        return Err(());
+    }
+    idx += 1;
+
+    Ok(Some(FrameHeader {
+        block_size,
+        sample_rate,
+        channels: num_channels,
+        channel_assignment,
+        bits_per_sample,
+        header_bytes: idx,
+    }))
+}
+
+fn decode_subframe(
+    reader: &mut BitReader<'_>,
+    subframe_bps: u32,
+    block_size: usize,
+    out: &mut [i64],
+) -> Result<(), ()> {
+    let pad = reader.read_bit()?;
+    if pad != 0 {
+        return Err(());
+    }
+    let sf_type = reader.read_bits(6)?;
+    let wasted_flag = reader.read_bit()?;
+    let wasted_bits = if wasted_flag == 1 {
+        (reader.read_unary_zeros()? + 1) as usize
+    } else {
+        0
+    };
+    if wasted_bits >= subframe_bps as usize {
+        return Err(());
+    }
+    let eff_bps = (subframe_bps as usize) - wasted_bits;
+
+    match sf_type {
+        0 => {
+            let val = reader.read_signed(eff_bps)?;
+            out[..block_size].fill(val);
+        }
+        1 => {
+            for sample in out[..block_size].iter_mut() {
+                *sample = reader.read_signed(eff_bps)?;
+            }
+        }
+        8..=12 => {
+            let order = (sf_type - 8) as usize;
+            if block_size < order {
+                return Err(());
+            }
+            for sample in out[..order].iter_mut() {
+                *sample = reader.read_signed(eff_bps)?;
+            }
+            decode_residual(reader, block_size, order, &mut out[order..block_size])?;
+            match order {
+                0 => {}
+                1 => {
+                    for i in 1..block_size {
+                        out[i] += out[i - 1];
+                    }
+                }
+                2 => {
+                    for i in 2..block_size {
+                        out[i] += 2 * out[i - 1] - out[i - 2];
+                    }
+                }
+                3 => {
+                    for i in 3..block_size {
+                        out[i] += 3 * out[i - 1] - 3 * out[i - 2] + out[i - 3];
+                    }
+                }
+                4 => {
+                    for i in 4..block_size {
+                        out[i] += 4 * out[i - 1] - 6 * out[i - 2] + 4 * out[i - 3] - out[i - 4];
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+        32..=63 => {
+            let order = ((sf_type & 0x1F) + 1) as usize;
+            if block_size < order {
+                return Err(());
+            }
+            for sample in out[..order].iter_mut() {
+                *sample = reader.read_signed(eff_bps)?;
+            }
+            let qlp_prec = (reader.read_bits(4)? + 1) as usize;
+            if qlp_prec > 15 {
+                return Err(());
+            }
+            let qlp_shift = reader.read_signed(5)? as i32;
+            let mut coeffs = [0i64; 32];
+            for coeff in coeffs[..order].iter_mut() {
+                *coeff = reader.read_signed(qlp_prec)?;
+            }
+            decode_residual(reader, block_size, order, &mut out[order..block_size])?;
+
+            for i in order..block_size {
+                let mut sum: i64 = 0;
+                for j in 0..order {
+                    sum += coeffs[j] * out[i - 1 - j];
+                }
+                let predicted = if qlp_shift >= 0 {
+                    sum >> qlp_shift
+                } else {
+                    sum << (-qlp_shift)
+                };
+                out[i] += predicted;
+            }
+        }
+        _ => return Err(()),
+    }
+
+    if wasted_bits > 0 {
+        for s in out[..block_size].iter_mut() {
+            *s <<= wasted_bits;
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_residual(
+    reader: &mut BitReader<'_>,
+    block_size: usize,
+    order: usize,
+    out: &mut [i64],
+) -> Result<(), ()> {
+    let method = reader.read_bits(2)?;
+    if method != 0 && method != 1 {
+        return Err(());
+    }
+    let p_order = reader.read_bits(4)? as usize;
+    let num_partitions = 1usize << p_order;
+    let partition_samples = block_size >> p_order;
+
+    if block_size & (num_partitions - 1) != 0 {
+        return Err(());
+    }
+    if partition_samples < order {
+        return Err(());
+    }
+
+    let param_bits = if method == 0 { 4 } else { 5 };
+    let escape_param = if method == 0 { 0b1111 } else { 0b11111 };
+
+    let mut sample_idx = 0;
+    for p in 0..num_partitions {
+        let n_samples = if p == 0 {
+            partition_samples - order
+        } else {
+            partition_samples
+        };
+
+        let k = reader.read_bits(param_bits)?;
+        if k == escape_param {
+            let b = reader.read_bits(5)? as usize;
+            for _ in 0..n_samples {
+                if sample_idx >= out.len() {
+                    return Err(());
+                }
+                out[sample_idx] = reader.read_signed(b)?;
+                sample_idx += 1;
+            }
+        } else {
+            for _ in 0..n_samples {
+                if sample_idx >= out.len() {
+                    return Err(());
+                }
+                let q = reader.read_unary_zeros()? as u64;
+                let rem = if k > 0 {
+                    reader.read_bits(k as usize)? as u64
+                } else {
+                    0
+                };
+                let u = (q << k) | rem;
+                let val = if (u & 1) != 0 {
+                    -1 - (u >> 1) as i64
+                } else {
+                    (u >> 1) as i64
+                };
+                out[sample_idx] = val;
+                sample_idx += 1;
+            }
+        }
+    }
+
+    if sample_idx == out.len() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+#[inline(always)]
+fn decorrelate_samples(
+    scratch: &[i64],
+    i: usize,
+    channel_assignment: u8,
+    shift: u32,
+) -> (i32, i32) {
+    match channel_assignment {
+        0 => {
+            let s = (scratch[i] as i32) << shift;
+            (s, s)
+        }
+        1 => {
+            let l = (scratch[i] as i32) << shift;
+            let r = (scratch[4096 + i] as i32) << shift;
+            (l, r)
+        }
+        8 => {
+            let ch0 = scratch[i];
+            let ch1 = scratch[4096 + i];
+            let l = (ch0 as i32) << shift;
+            let r = ((ch0 - ch1) as i32) << shift;
+            (l, r)
+        }
+        9 => {
+            let ch0 = scratch[i];
+            let ch1 = scratch[4096 + i];
+            let l = ((ch1 + ch0) as i32) << shift;
+            let r = (ch1 as i32) << shift;
+            (l, r)
+        }
+        10 => {
+            let ch0 = scratch[i];
+            let ch1 = scratch[4096 + i];
+            let mid = (ch0 << 1) | (ch1 & 1);
+            let l = (((mid + ch1) >> 1) as i32) << shift;
+            let r = (((mid - ch1) >> 1) as i32) << shift;
+            (l, r)
+        }
+        _ => {
+            let l = (scratch[i] as i32) << shift;
+            let r = (scratch[4096 + i] as i32) << shift;
+            (l, r)
+        }
+    }
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+/// Pure-Rust RFC 9639 Lossless FLAC Decoder with 64KB External PSRAM buffer placement.
 pub struct FlacDecoder {
     pub sample_rate: u32,
     pub bits_per_sample: u32,
     pub channels: u32,
-    header_len: usize,
-    stream_buf: std::vec::Vec<u8>,
+    pub header_len: usize,
+    pub stream_buf: vec::Vec<u8>,
+    pub pending_pcm: vec::Vec<i32>,
+    pub pending_offset: usize,
+    subframe_scratch: Box<[i64]>,
+    meta_skip_remaining: usize,
+    in_metadata: bool,
+    min_block_size: u16,
+    max_block_size: u16,
+    need_more_input: bool,
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "alloc", feature = "std"))]
 impl Default for FlacDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "alloc", feature = "std"))]
 impl FlacDecoder {
     /// Maps FLAC bit depth to 32-bit output shift (e.g. 8-bit shifts left by 24).
     pub const fn sample_shift(bits_per_sample: u32) -> u32 {
         match bits_per_sample {
             8 => 24,
+            12 => 20,
             16 => 16,
+            20 => 12,
             24 => 8,
             32 => 0,
             _ => 16,
@@ -824,12 +1449,53 @@ impl FlacDecoder {
             bits_per_sample: 16,
             channels: 2,
             header_len: 0,
-            stream_buf: std::vec::Vec::new(),
+            stream_buf: vec::Vec::with_capacity(MAX_STREAM_BUF),
+            pending_pcm: vec::Vec::with_capacity(16384),
+            pending_offset: 0,
+            subframe_scratch: vec![0i64; 8192].into_boxed_slice(),
+            meta_skip_remaining: 0,
+            in_metadata: false,
+            min_block_size: 0,
+            max_block_size: 0,
+            need_more_input: true,
+        }
+    }
+
+    pub fn has_pending_pcm(&self) -> bool {
+        if self.pending_offset < self.pending_pcm.len() {
+            return true;
+        }
+        if !self.need_more_input
+            && self.header_len > 0
+            && self.meta_skip_remaining == 0
+            && self.stream_buf.len() > self.header_len + 4
+        {
+            let buf = &self.stream_buf[self.header_len..];
+            for i in 0..buf.len() - 1 {
+                if buf[i] == 0xFF && (buf[i + 1] & 0xFE) == 0xF8 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn flush(&mut self) {
+        self.pending_pcm.clear();
+        self.pending_offset = 0;
+        self.meta_skip_remaining = 0;
+        self.in_metadata = false;
+        self.need_more_input = true;
+        if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
+            self.stream_buf.truncate(self.header_len);
+        } else {
+            self.stream_buf.clear();
+            self.header_len = 0;
         }
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "alloc", feature = "std"))]
 impl AudioDecoder for FlacDecoder {
     fn decode(
         &mut self,
@@ -841,9 +1507,29 @@ impl AudioDecoder for FlacDecoder {
             return Err(DecoderError::BufferOverflow);
         }
 
+        if self.pending_offset < self.pending_pcm.len() {
+            let pending_samples = self.pending_pcm.len() - self.pending_offset;
+            let pending_frames = pending_samples / 2;
+            let to_copy = core::cmp::min(pending_frames, max_frames);
+            let sample_count = to_copy * 2;
+            pcm_out[..sample_count].copy_from_slice(
+                &self.pending_pcm[self.pending_offset..self.pending_offset + sample_count],
+            );
+            self.pending_offset += sample_count;
+            if self.pending_offset >= self.pending_pcm.len() {
+                self.pending_pcm.clear();
+                self.pending_offset = 0;
+            }
+            return Ok((0, to_copy));
+        }
+
         if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
             self.stream_buf.clear();
             self.header_len = 0;
+            self.pending_pcm.clear();
+            self.pending_offset = 0;
+            self.meta_skip_remaining = 0;
+            self.in_metadata = false;
             return Err(DecoderError::CorruptedFrame);
         }
 
@@ -854,139 +1540,260 @@ impl AudioDecoder for FlacDecoder {
         let input_taken = encoded_in.len();
         self.stream_buf.extend_from_slice(encoded_in);
 
-        // Strip optional Ogg page wrapper prefix before b"fLaC" if present in stream_buf
+        if self.meta_skip_remaining > 0 {
+            let start = self.header_len;
+            let avail = self.stream_buf.len().saturating_sub(start);
+            let to_skip = avail.min(self.meta_skip_remaining);
+            self.stream_buf.drain(start..start + to_skip);
+            self.meta_skip_remaining -= to_skip;
+            if self.meta_skip_remaining > 0 {
+                self.need_more_input = true;
+                return Ok((input_taken, 0));
+            }
+        }
+
+        if self.header_len > 0 && self.stream_buf.len() > self.header_len {
+            if let Some(pos) = self.stream_buf[self.header_len..].windows(4).position(|w| w == b"fLaC") {
+                let abs_pos = self.header_len + pos;
+                self.stream_buf.drain(..abs_pos);
+                self.header_len = 0;
+                self.in_metadata = false;
+            }
+        }
+
         if self.header_len == 0 {
             if let Some(pos) = self.stream_buf.windows(4).position(|w| w == b"fLaC") {
                 if pos > 0 {
                     self.stream_buf.drain(..pos);
                 }
-            }
-        }
-
-        let pos = std::cell::Cell::new(0usize);
-        let reader_input = FlacByteReader {
-            data: &self.stream_buf[..],
-            pos: &pos,
-        };
-
-        match claxon::FlacReader::new(reader_input) {
-            Ok(mut reader) => {
-                let header_end = pos.get();
-                if self.header_len == 0 {
-                    self.header_len = header_end;
+                if self.stream_buf.len() < 42 {
+                    self.need_more_input = true;
+                    if input_taken > 0 {
+                        return Ok((input_taken, 0));
+                    } else {
+                        return Err(DecoderError::NeedMoreData);
+                    }
                 }
-
-                let info = reader.streaminfo();
-                self.sample_rate = info.sample_rate;
-                self.bits_per_sample = info.bits_per_sample;
-                self.channels = info.channels;
+                let b0 = self.stream_buf[4];
+                let is_last = (b0 & 0x80) != 0;
+                let block_type = b0 & 0x7F;
+                let block_len = ((self.stream_buf[5] as usize) << 16)
+                    | ((self.stream_buf[6] as usize) << 8)
+                    | (self.stream_buf[7] as usize);
+                if block_type != 0 || block_len != 34 {
+                    return Err(DecoderError::InvalidHeader);
+                }
+                let si = &self.stream_buf[8..42];
+                self.min_block_size = u16::from_be_bytes([si[0], si[1]]);
+                self.max_block_size = u16::from_be_bytes([si[2], si[3]]);
+                let b10 = si[10] as u32;
+                let b11 = si[11] as u32;
+                let b12 = si[12] as u32;
+                let b13 = si[13] as u32;
+                self.sample_rate = (b10 << 12) | (b11 << 4) | (b12 >> 4);
+                self.channels = ((b12 >> 1) & 0x07) + 1;
+                self.bits_per_sample = (((b12 & 1) << 4) | (b13 >> 4)) + 1;
 
                 if self.channels != 1 && self.channels != 2 {
                     return Err(DecoderError::UnsupportedSampleFormat);
                 }
 
-                let shift = Self::sample_shift(self.bits_per_sample);
-
-                let mut frames_out = 0;
-                let mut block_buf = std::vec::Vec::new();
-                let mut last_good_pos = header_end;
-                let mut first_block_overflow = false;
-                let mut corrupted_block = false;
-
-                {
-                    let mut blocks = reader.blocks();
-                    loop {
-                        if pos.get() >= self.stream_buf.len() {
-                            break;
-                        }
-                        let pos_before_block = pos.get();
-                        match blocks.read_next_or_eof(block_buf) {
-                            Ok(Some(block)) => {
-                                let packet_frames = block.len() as usize;
-                                let available_space = max_frames.saturating_sub(frames_out);
-                                if packet_frames > available_space {
-                                    if frames_out == 0 {
-                                        first_block_overflow = true;
-                                    }
-                                    break;
-                                }
-
-                                if self.channels == 2 {
-                                    for i in 0..packet_frames {
-                                        let l = block.sample(0, i as u32) << shift;
-                                        let r = block.sample(1, i as u32) << shift;
-                                        pcm_out[(frames_out + i) * 2] = l;
-                                        pcm_out[(frames_out + i) * 2 + 1] = r;
-                                    }
-                                } else {
-                                    for i in 0..packet_frames {
-                                        let s = block.sample(0, i as u32) << shift;
-                                        pcm_out[(frames_out + i) * 2] = s;
-                                        pcm_out[(frames_out + i) * 2 + 1] = s;
-                                    }
-                                }
-
-                                frames_out += packet_frames;
-                                last_good_pos = pos.get();
-                                block_buf = block.into_buffer();
-
-                                if frames_out >= max_frames {
-                                    break;
-                                }
-                            }
-                            Ok(None) | Err(claxon::Error::IoError(_)) => {
-                                break;
-                            }
-                            Err(claxon::Error::FormatError(_))
-                            | Err(claxon::Error::Unsupported(_)) => {
-                                last_good_pos = pos
-                                    .get()
-                                    .max(pos_before_block + 1)
-                                    .min(self.stream_buf.len());
-                                corrupted_block = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if first_block_overflow {
-                    self.stream_buf
-                        .truncate(self.stream_buf.len().saturating_sub(input_taken));
-                    return Err(DecoderError::BufferOverflow);
-                }
-
-                if last_good_pos > self.header_len {
-                    self.stream_buf.drain(self.header_len..last_good_pos);
-                }
-
-                if corrupted_block && frames_out == 0 {
-                    return Err(DecoderError::CorruptedFrame);
-                }
-
-                if frames_out == 0 && input_taken == 0 {
-                    Err(DecoderError::NeedMoreData)
-                } else {
-                    Ok((input_taken, frames_out))
-                }
+                self.header_len = 42;
+                self.in_metadata = !is_last;
             }
-            Err(_) => {
+        }
+
+        while self.in_metadata {
+            if self.stream_buf.len() < self.header_len + 4 {
+                self.need_more_input = true;
                 if input_taken > 0 {
-                    Ok((input_taken, 0))
+                    return Ok((input_taken, 0));
                 } else {
-                    Err(DecoderError::NeedMoreData)
+                    return Err(DecoderError::NeedMoreData);
                 }
             }
+            let b0 = self.stream_buf[self.header_len];
+            let is_last = (b0 & 0x80) != 0;
+            let block_len = ((self.stream_buf[self.header_len + 1] as usize) << 16)
+                | ((self.stream_buf[self.header_len + 2] as usize) << 8)
+                | (self.stream_buf[self.header_len + 3] as usize);
+            let total_block_bytes = 4 + block_len;
+            let avail = self.stream_buf.len() - self.header_len;
+            if avail >= total_block_bytes {
+                self.stream_buf.drain(self.header_len..self.header_len + total_block_bytes);
+                if is_last {
+                    self.in_metadata = false;
+                }
+            } else {
+                self.stream_buf.drain(self.header_len..);
+                self.meta_skip_remaining = total_block_bytes - avail;
+                self.in_metadata = !is_last;
+                self.need_more_input = true;
+                return Ok((input_taken, 0));
+            }
+        }
+
+        let mut frames_out = 0;
+        let mut corrupted_block = false;
+
+        loop {
+            if frames_out >= max_frames {
+                break;
+            }
+            let avail_bytes = self.stream_buf.len().saturating_sub(self.header_len);
+            if avail_bytes < 4 {
+                self.need_more_input = true;
+                break;
+            }
+            let buf = &self.stream_buf[self.header_len..];
+
+            let mut sync_pos = None;
+            for i in 0..buf.len() - 1 {
+                if buf[i] == 0xFF && (buf[i + 1] & 0xFE) == 0xF8 {
+                    sync_pos = Some(i);
+                    break;
+                }
+            }
+
+            let sync_idx = match sync_pos {
+                Some(idx) => idx,
+                None => {
+                    self.need_more_input = true;
+                    break;
+                }
+            };
+
+            if sync_idx > 0 {
+                self.stream_buf.drain(self.header_len..self.header_len + sync_idx);
+            }
+
+            let frame_buf = &self.stream_buf[self.header_len..];
+            if frame_buf.len() < 4 {
+                self.need_more_input = true;
+                break;
+            }
+
+            let hdr = match parse_frame_header(
+                frame_buf,
+                self.sample_rate,
+                self.bits_per_sample,
+                self.min_block_size,
+            ) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    self.need_more_input = true;
+                    break;
+                }
+                Err(()) => {
+                    self.stream_buf.drain(self.header_len..self.header_len + 1);
+                    corrupted_block = true;
+                    continue;
+                }
+            };
+
+            self.sample_rate = hdr.sample_rate;
+            self.bits_per_sample = hdr.bits_per_sample;
+            self.channels = hdr.channels;
+
+            let mut reader = BitReader::new(&frame_buf[hdr.header_bytes..]);
+            let mut subframe_err = false;
+            let mut subframe_incomplete = false;
+
+            for ch in 0..hdr.channels as usize {
+                let subframe_bps = match hdr.channel_assignment {
+                    8 if ch == 1 => hdr.bits_per_sample + 1,
+                    9 if ch == 0 => hdr.bits_per_sample + 1,
+                    10 if ch == 1 => hdr.bits_per_sample + 1,
+                    _ => hdr.bits_per_sample,
+                };
+                let ch_start = ch * 4096;
+                let ch_slice = &mut self.subframe_scratch[ch_start..ch_start + hdr.block_size];
+                if let Err(()) = decode_subframe(&mut reader, subframe_bps, hdr.block_size, ch_slice) {
+                    if reader.byte_pos >= reader.bytes.len() {
+                        subframe_incomplete = true;
+                    } else {
+                        subframe_err = true;
+                    }
+                    break;
+                }
+            }
+
+            if subframe_incomplete {
+                self.need_more_input = true;
+                break;
+            }
+            if subframe_err {
+                self.stream_buf.drain(self.header_len..self.header_len + 1);
+                corrupted_block = true;
+                continue;
+            }
+
+            reader.align_to_byte();
+            let frame_body_len = hdr.header_bytes + reader.byte_pos;
+            if frame_buf.len() < frame_body_len + 2 {
+                self.need_more_input = true;
+                break;
+            }
+
+            let expected_crc = u16::from_be_bytes([frame_buf[frame_body_len], frame_buf[frame_body_len + 1]]);
+            let actual_crc = flac_crc16(&frame_buf[0..frame_body_len]);
+            if expected_crc != actual_crc {
+                self.stream_buf.drain(self.header_len..self.header_len + 1);
+                corrupted_block = true;
+                continue;
+            }
+
+            let total_frame_bytes = frame_body_len + 2;
+            let shift = Self::sample_shift(self.bits_per_sample);
+            let block_size = hdr.block_size;
+            let available_space = max_frames.saturating_sub(frames_out);
+            let to_write = core::cmp::min(block_size, available_space);
+
+            for i in 0..to_write {
+                let (l, r) = decorrelate_samples(
+                    &self.subframe_scratch,
+                    i,
+                    hdr.channel_assignment,
+                    shift,
+                );
+                pcm_out[(frames_out + i) * 2] = l;
+                pcm_out[(frames_out + i) * 2 + 1] = r;
+            }
+            frames_out += to_write;
+
+            for i in to_write..block_size {
+                let (l, r) = decorrelate_samples(
+                    &self.subframe_scratch,
+                    i,
+                    hdr.channel_assignment,
+                    shift,
+                );
+                self.pending_pcm.push(l);
+                self.pending_pcm.push(r);
+            }
+
+            self.stream_buf.drain(self.header_len..self.header_len + total_frame_bytes);
+            self.need_more_input = false;
+
+            if !self.pending_pcm.is_empty() {
+                break;
+            }
+        }
+
+        if corrupted_block && frames_out == 0 {
+            return Err(DecoderError::CorruptedFrame);
+        }
+
+        if frames_out == 0 && input_taken == 0 {
+            self.need_more_input = true;
+            Err(DecoderError::NeedMoreData)
+        } else {
+            Ok((input_taken, frames_out))
         }
     }
 
     fn flush(&mut self) {
-        if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
-            self.stream_buf.truncate(self.header_len);
-        } else {
-            self.stream_buf.clear();
-            self.header_len = 0;
-        }
+        self.flush();
     }
 }
 
@@ -1505,7 +2312,12 @@ mod tests {
             let mut flac = FlacDecoder::new();
             flac.stream_buf.extend_from_slice(b"fLaC00001111");
             flac.header_len = 8;
+            flac.pending_pcm.extend_from_slice(&[50, -50, 60, -60]);
+            let mut flac_out = [0i32; 2];
+            assert_eq!(flac.decode(&[], &mut flac_out), Ok((0, 1)));
+            assert_eq!(flac_out, [50, -50]);
             flac.flush();
+            assert!(flac.pending_pcm.is_empty());
             assert_eq!(flac.stream_buf.len(), 8);
 
             let mut aac = AacDecoder::new();
@@ -1872,5 +2684,135 @@ mod tests {
         let (consumed_inv, frames_inv) = dec.decode(&invalid_bitrate, &mut pcm_out).unwrap();
         assert_eq!(consumed_inv, 13);
         assert_eq!(frames_inv, 0);
+    }
+
+    #[test]
+    fn test_flac_cross_validation_all_fixtures() {
+        let fixtures: &[(&str, &[u8])] = &[
+            ("mono_16bit.flac", include_bytes!("../tests/fixtures/mono_16bit.flac")),
+            ("stereo_16bit.flac", include_bytes!("../tests/fixtures/stereo_16bit.flac")),
+            ("stereo_24bit.flac", include_bytes!("../tests/fixtures/stereo_24bit.flac")),
+            ("fixed.flac", include_bytes!("../tests/fixtures/fixed.flac")),
+            ("lpc.flac", include_bytes!("../tests/fixtures/lpc.flac")),
+        ];
+
+        for &(name, data) in fixtures {
+            // 1. Decode with claxon
+            let mut claxon_reader = claxon::FlacReader::new(std::io::Cursor::new(data)).unwrap();
+            let claxon_info = claxon_reader.streaminfo();
+            let shift = FlacDecoder::sample_shift(claxon_info.bits_per_sample);
+            let mut claxon_samples = std::vec::Vec::new();
+            for sample in claxon_reader.samples() {
+                let s = sample.unwrap();
+                claxon_samples.push(s << shift);
+            }
+
+            // 2. Decode with native FlacDecoder in chunks of 512 bytes with 1024-sample pcm_out
+            let mut decoder = FlacDecoder::new();
+            let mut native_samples = std::vec::Vec::new();
+            let mut pcm_buf = [0i32; 1024];
+            let mut offset = 0;
+
+            while offset < data.len() || decoder.has_pending_pcm() || decoder.stream_buf.len() > decoder.header_len {
+                let end = (offset + 512).min(data.len());
+                let chunk = &data[offset..end];
+                match decoder.decode(chunk, &mut pcm_buf) {
+                    Ok((consumed, frames)) => {
+                        offset += consumed;
+                        if claxon_info.channels == 1 {
+                            for i in 0..frames {
+                                native_samples.push(pcm_buf[i * 2]);
+                            }
+                        } else {
+                            native_samples.extend_from_slice(&pcm_buf[..frames * 2]);
+                        }
+                        if consumed == 0 && frames == 0 && offset >= data.len() {
+                            break;
+                        }
+                    }
+                    Err(DecoderError::NeedMoreData) => {
+                        if offset >= data.len() && !decoder.has_pending_pcm() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        panic!("Decoder error on {}: {:?}", name, e);
+                    }
+                }
+            }
+
+            assert_eq!(
+                claxon_samples.len(),
+                native_samples.len(),
+                "Sample count mismatch on fixture {}",
+                name
+            );
+            for i in 0..claxon_samples.len() {
+                if claxon_samples[i] != native_samples[i] {
+                    panic!(
+                        "Mismatch on {} at sample {}: claxon={}, native={}",
+                        name, i, claxon_samples[i], native_samples[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_flac_block_draining_across_constrained_pcm_buffer() {
+        let data = include_bytes!("../tests/fixtures/stereo_16bit.flac");
+        let mut claxon_reader = claxon::FlacReader::new(std::io::Cursor::new(data)).unwrap();
+        let claxon_info = claxon_reader.streaminfo();
+        let shift = FlacDecoder::sample_shift(claxon_info.bits_per_sample);
+        let mut expected = std::vec::Vec::new();
+        for sample in claxon_reader.samples() {
+            expected.push(sample.unwrap() << shift);
+        }
+
+        // Test with 2304-sample buffer (matching Xtensa PCM_SCRATCH_SAMPLES = 2304)
+        let mut decoder = FlacDecoder::new();
+        let mut output = std::vec::Vec::new();
+        let mut pcm_buf = [0i32; 2304];
+        let mut offset = 0;
+
+        while offset < data.len() || decoder.has_pending_pcm() || decoder.stream_buf.len() > decoder.header_len {
+            let end = (offset + 1024).min(data.len());
+            let chunk = &data[offset..end];
+            match decoder.decode(chunk, &mut pcm_buf) {
+                Ok((consumed, frames)) => {
+                    offset += consumed;
+                    output.extend_from_slice(&pcm_buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && offset >= data.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if offset >= data.len() && !decoder.has_pending_pcm() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("Decode error in constrained buffer test: {:?}", e),
+            }
+        }
+
+        assert_eq!(expected.len(), output.len());
+        assert_eq!(expected, output);
+    }
+
+    #[test]
+    fn test_flac_partial_chunk_ingestion_need_more_input() {
+        let data = include_bytes!("../tests/fixtures/stereo_16bit.flac");
+        let mut decoder = FlacDecoder::new();
+        let mut pcm_buf = [0i32; 1024];
+
+        // Feed first 500 bytes (header + partial Frame 1)
+        let res = decoder.decode(&data[..500], &mut pcm_buf);
+        assert_eq!(res, Ok((500, 0)));
+        assert!(!decoder.has_pending_pcm(), "Decoder must NOT report pending PCM on partial chunk");
+
+        // Feed next 1036 bytes (total 1536 bytes, matching Xtensa READ_SCRATCH_BYTES chunk)
+        let res2 = decoder.decode(&data[500..1536], &mut pcm_buf);
+        assert_eq!(res2, Ok((1036, 0)));
+        assert!(!decoder.has_pending_pcm(), "Decoder must NOT report pending PCM on partial chunk");
     }
 }

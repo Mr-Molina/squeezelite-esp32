@@ -1094,8 +1094,10 @@ fn l3_decode(
         l3_huffman(&mut grbuf[ch], bs, &gr_info[ch], scf, layer3gr_limit);
     }
 
-    #[allow(unsafe_code)]
-    let stereo: &mut [f32; 1152] = unsafe { &mut *(grbuf.as_mut_ptr() as *mut [f32; 1152]) };
+    let stereo: &mut [f32; 1152] = match grbuf.as_flattened_mut().try_into() {
+        Ok(s) => s,
+        Err(_) => unreachable!(),
+    };
     if hdr.test_i_stereo() {
         l3_intensity_stereo(stereo, &mut ist_pos[1], gr_info, hdr);
     } else if hdr.is_ms_stereo() {

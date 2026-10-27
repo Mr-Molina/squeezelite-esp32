@@ -154,8 +154,12 @@ impl FaultStatus {
         self.chan_fault == 0 && self.global_fault1 == 0 && self.global_fault2 == 0
     }
 
+    pub fn has_overtemp_shutdown(&self) -> bool {
+        (self.global_fault2 & (FAULT2_OTSD | 0x01)) != 0
+    }
+
     pub fn has_overtemperature(&self) -> bool {
-        (self.global_fault2 & (FAULT2_OTSD | 0x01)) != 0 || self.has_ot_warning()
+        self.has_overtemp_shutdown() || self.has_ot_warning()
     }
 
     pub fn has_overcurrent(&self) -> bool {
@@ -183,7 +187,7 @@ impl FaultStatus {
     }
 
     pub fn has_ot_warning(&self) -> bool {
-        (self.otw & (FAULT2_OTW | 0x02)) != 0 || (self.global_fault2 & FAULT2_OTW) != 0
+        (self.global_fault2 & FAULT2_OTW) != 0 || (self.otw & (FAULT2_OTW | 0x0F)) != 0
     }
 }
 
@@ -204,21 +208,45 @@ impl Tas5805mTelemetry {
     /// Decodes `FS_MON` (`0x37` bits `3:0`) into the detected sample rate in Hz.
     #[must_use]
     pub const fn detected_sample_rate_hz(&self) -> u32 {
+        self.detected_sample_rate_hz_with_hint(0)
+    }
+
+    /// Decodes `FS_MON` (`0x37` bits `3:0`) into the detected sample rate in Hz with an optional hint.
+    ///
+    /// Per TI SLASEH5B Table 7-19, `0x09` indicates 44.1 kHz or 48 kHz. If `hint_hz == 44_100`,
+    /// 44_100 is returned; otherwise 48_000 is returned by default. `0x08` is preserved for
+    /// backwards compatibility.
+    #[must_use]
+    pub const fn detected_sample_rate_hz_with_hint(&self, hint_hz: u32) -> u32 {
         match self.fs_mon & 0x0F {
             0x02 => 8_000,
             0x04 => 16_000,
             0x06 => 32_000,
             0x08 => 44_100,
-            0x09 => 48_000,
+            0x09 => {
+                if hint_hz == 44_100 {
+                    44_100
+                } else {
+                    48_000
+                }
+            }
+            0x0A => 88_200,
             0x0B => 96_000,
+            0x0C => 176_400,
+            0x0D => 192_000,
             _ => 0,
         }
     }
 
-    /// Returns the detected BCK-to-FS ratio (`BCK_MON` `0x38`).
+    /// Returns the detected BCK-to-FS ratio (`BCK_MON` `0x38` and `FS_MON` `0x37` bits `5:4`).
     #[must_use]
     pub const fn bck_ratio(&self) -> u16 {
-        self.bck_mon as u16
+        let high = ((self.fs_mon >> 4) & 0x03) as u16;
+        if high != 0 {
+            (high << 6) | (self.bck_mon as u16 & 0x3F)
+        } else {
+            self.bck_mon as u16
+        }
     }
 
     /// Returns `true` if `CLKDET_STATUS` (`0x39`) bit 3 indicates internal PLL lock (`1`) or
@@ -296,10 +324,10 @@ where
     /// Resets the TAS58xx and transitions it into `Standby` mode, returning `Self` on I2C error
     /// so the caller never loses ownership of the I2C peripheral (PERIPH-604).
     pub fn try_init_into_standby(mut self) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
-        if let Err(e) = self.i2c.write(self.addr, &[registers::BOOK_SELECT, 0x00]) {
+        if let Err(e) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
             return Err((self, DriverError::I2cError(e)));
         }
-        if let Err(e) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
+        if let Err(e) = self.i2c.write(self.addr, &[registers::BOOK_SELECT, 0x00]) {
             return Err((self, DriverError::I2cError(e)));
         }
         if let Err(e) = self.i2c.write(self.addr, &[registers::RESET_CTRL, 0x11]) {
@@ -457,10 +485,10 @@ where
     /// Re-confirms Book 0 and Page 0 selection and clears hardware faults after reset.
     pub fn reconfirm_book_page_and_clear_faults(&mut self) -> Result<(), DriverError<E>> {
         self.i2c
-            .write(self.addr, &[registers::BOOK_SELECT, 0x00])
+            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
             .map_err(DriverError::I2cError)?;
         self.i2c
-            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
+            .write(self.addr, &[registers::BOOK_SELECT, 0x00])
             .map_err(DriverError::I2cError)?;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
@@ -782,8 +810,8 @@ mod tests {
     #[test]
     fn test_power_up_to_standby_transition() {
         let expectations = [
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
         ];
@@ -798,8 +826,8 @@ mod tests {
     #[test]
     fn test_standby_to_play_and_volume_change() {
         let expectations = [
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1, 0x03]), // 32-bit I2S (bits [1:0] = 11)
@@ -890,8 +918,8 @@ mod tests {
     #[test]
     fn test_standby_reconfirm_book_page_and_clear_faults() {
         let expectations = [
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::FAULT_CLEAR, 0x80]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -1253,5 +1281,64 @@ mod tests {
             automute_state: 0x00,
         };
         assert!(!faulted_44k1.is_pll_locked());
+    }
+
+    #[test]
+    fn test_telemetry_extended_rates_hints_and_bck_ratio() {
+        let t_48k = Tas5805mTelemetry {
+            fs_mon: 0x09,
+            bck_mon: 64,
+            clkdet_status: 0x08,
+            automute_state: 0x00,
+        };
+        assert_eq!(t_48k.detected_sample_rate_hz(), 48_000);
+        assert_eq!(t_48k.detected_sample_rate_hz_with_hint(44_100), 44_100);
+        assert_eq!(t_48k.detected_sample_rate_hz_with_hint(48_000), 48_000);
+        assert_eq!(t_48k.bck_ratio(), 64);
+
+        let t_88k = Tas5805mTelemetry { fs_mon: 0x0A, ..Default::default() };
+        assert_eq!(t_88k.detected_sample_rate_hz(), 88_200);
+
+        let t_176k = Tas5805mTelemetry { fs_mon: 0x0C, ..Default::default() };
+        assert_eq!(t_176k.detected_sample_rate_hz(), 176_400);
+
+        let t_192k = Tas5805mTelemetry { fs_mon: 0x0D, ..Default::default() };
+        assert_eq!(t_192k.detected_sample_rate_hz(), 192_000);
+
+        // Test high BCK bits in FS_MON [5:4]
+        let t_bck_high = Tas5805mTelemetry {
+            fs_mon: 0x19, // high = 1
+            bck_mon: 0x00,
+            ..Default::default()
+        };
+        assert_eq!(t_bck_high.bck_ratio(), 64);
+
+        let t_bck_high2 = Tas5805mTelemetry {
+            fs_mon: 0x29, // high = 2
+            bck_mon: 0x00,
+            ..Default::default()
+        };
+        assert_eq!(t_bck_high2.bck_ratio(), 128);
+    }
+
+    #[test]
+    fn test_fault_status_ot_warning_and_shutdown() {
+        let mut f = FaultStatus::default();
+        assert!(!f.has_ot_warning());
+        assert!(!f.has_overtemp_shutdown());
+
+        f.otw = 0x04; // 135 C warning
+        assert!(f.has_ot_warning());
+        assert!(f.has_overtemperature());
+        assert!(!f.has_overtemp_shutdown());
+
+        f.otw = 0x00;
+        f.global_fault2 = 0x01; // hardware OTSD
+        assert!(f.has_overtemp_shutdown());
+        assert!(f.has_overtemperature());
+
+        f.global_fault2 = 0x02; // legacy OTSD test bit
+        assert!(f.has_overtemp_shutdown());
+        assert!(f.has_overtemperature());
     }
 }

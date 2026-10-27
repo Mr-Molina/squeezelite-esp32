@@ -391,7 +391,21 @@ fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, S
     };
 
     use std::net::ToSocketAddrs;
-    let host_port_with_default = if host_port.contains(':') {
+    let host_port_with_default = if host_port.starts_with('[') {
+        if let Some(bracket_end) = host_port.find(']') {
+            let after_bracket = &host_port[bracket_end + 1..];
+            if after_bracket.starts_with(':') {
+                host_port.to_string()
+            } else {
+                format!("{host_port}:80")
+            }
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unclosed bracket in IPv6 host: {host_port}"),
+            ));
+        }
+    } else if host_port.contains(':') {
         host_port.to_string()
     } else {
         format!("{host_port}:80")
@@ -477,6 +491,8 @@ pub struct HttpAudioStream {
 impl HttpAudioStream {
     pub const MAX_REDIRECTS: usize = 3;
     pub const MAX_HTTP_HEADER_LEN: usize = 4096;
+    pub const MAX_BODY_BUF_LEN: usize = 65_536;
+    pub const MAX_CHUNK_SIZE: usize = 1_048_576;
 
     /// Connects to the HTTP streaming audio server and issues the initial GET request.
     ///
@@ -528,9 +544,9 @@ impl HttpAudioStream {
         })
     }
 
-    /// Returns `true` if the server disconnected (EOF) and all pending body bytes have been drained.
+    /// Returns `true` if the server disconnected (EOF) and all pending audio bytes have been drained.
     pub fn is_eof(&self) -> bool {
-        self.eof && self.audio_buf.is_empty() && self.raw_body_buf.is_empty() && self.unchunked_buf.is_empty()
+        self.eof && self.audio_buf.is_empty() && self.unchunked_buf.is_empty()
     }
 
     /// Returns `true` once the HTTP response headers have been successfully parsed and verified.
@@ -596,6 +612,13 @@ impl HttpAudioStream {
                                 format!("Invalid chunk size hex: {hex_str}"),
                             )
                         })?;
+
+                        if chunk_size > Self::MAX_CHUNK_SIZE {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Chunk size {chunk_size} exceeds maximum allowed {}", Self::MAX_CHUNK_SIZE),
+                            ));
+                        }
 
                         self.raw_body_buf.drain(..pos + delim_len);
 
@@ -711,7 +734,15 @@ impl HttpAudioStream {
                     let new_rem = remaining - take;
                     if new_rem == 0 {
                         if !self.icy_meta_accum.is_empty() {
-                            self.latest_icy_metadata = Some(std::mem::take(&mut self.icy_meta_accum));
+                            let trimmed = self
+                                .icy_meta_accum
+                                .iter()
+                                .rposition(|&b| b != 0)
+                                .map_or(&[][..], |i| &self.icy_meta_accum[..=i]);
+                            if !trimmed.is_empty() {
+                                self.latest_icy_metadata = Some(trimmed.to_vec());
+                            }
+                            self.icy_meta_accum.clear();
                         }
                         self.icy_audio_remaining = self.icy_metaint;
                         self.icy_state = IcyDecoderState::Audio;
@@ -942,6 +973,12 @@ impl HttpAudioStream {
                 self.eof = true;
             }
             Ok(n) => {
+                if self.raw_body_buf.len() + n > Self::MAX_BODY_BUF_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::OutOfMemory,
+                        "raw_body_buf exceeded MAX_BODY_BUF_LEN",
+                    ));
+                }
                 self.raw_body_buf.extend_from_slice(&temp[..n]);
             }
             Err(ref e)
@@ -1489,6 +1526,47 @@ mod tests {
         assert_eq!(payload6[0], 0x00);
         assert_eq!(&payload6[1..], b"Living Room");
 
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_parse_http_location_bracketed_ipv6() {
+        let (addr1, host1, path1) = parse_http_location("http://[::1]/stream.mp3").unwrap();
+        assert_eq!(addr1.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(addr1.port(), 80);
+        assert_eq!(host1, "[::1]");
+        assert_eq!(path1, "/stream.mp3");
+
+        let (addr2, host2, path2) = parse_http_location("http://[::1]:8000/stream.mp3").unwrap();
+        assert_eq!(addr2.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(addr2.port(), 8000);
+        assert_eq!(host2, "[::1]:8000");
+        assert_eq!(path2, "/stream.mp3");
+    }
+
+    #[test]
+    fn test_is_eof_returns_true_when_socket_eof_and_unchunked_empty() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 128];
+            let _ = stream.read(&mut buf);
+            // Incomplete/malformed chunk header then disconnect
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\npartial_chunk_with_no_crlf").unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+
+        let mut http = HttpAudioStream::connect(server_addr, "GET /stream HTTP/1.0").unwrap();
+        let mut out = [0u8; 64];
+        let start = std::time::Instant::now();
+        while !http.is_eof() && start.elapsed() < Duration::from_secs(2) {
+            let _ = http.poll_audio_bytes(&mut out);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(http.is_eof());
+        assert!(!http.raw_body_buf.is_empty());
         handle.join().unwrap();
     }
 }

@@ -107,6 +107,16 @@ pub struct HttpStatusSnapshot<'a> {
     pub again_code: u8,
     /// NVS FlashJournal monotonic sequence number.
     pub settings_seq: u32,
+    /// Whether Bluetooth Classic A2DP sink subsystem is enabled and initialized.
+    pub bt_enabled: bool,
+    /// Whether Bluetooth Classic connection is active with peer device.
+    pub bt_connected: bool,
+    /// Whether Bluetooth A2DP audio stream is currently streaming SBC frames.
+    pub bt_streaming: bool,
+    /// Total received HCI packets from Bluetooth controller.
+    pub bt_rx_pkts: u32,
+    /// Total decoded audio frames from Bluetooth A2DP stream.
+    pub bt_frames: u64,
 }
 
 /// Type alias for runtime status snapshot.
@@ -146,6 +156,11 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             tas_automuted: false,
             again_code: 0x08,
             settings_seq: 1,
+            bt_enabled: false,
+            bt_connected: false,
+            bt_streaming: false,
+            bt_rx_pkts: 0,
+            bt_frames: 0,
         }
     }
 }
@@ -178,15 +193,47 @@ impl<'a> core::fmt::Write for BufferWriter<'a> {
     }
 }
 
+/// Writes a string slice escaped for JSON output (escaping `"`, `\`, and ASCII control chars < 0x20).
+pub fn write_json_escaped_str<W: core::fmt::Write>(mut writer: W, s: &str) -> core::fmt::Result {
+    for b in s.bytes() {
+        match b {
+            b'"' => writer.write_str("\\\"")?,
+            b'\\' => writer.write_str("\\\\")?,
+            b'\n' => writer.write_str("\\n")?,
+            b'\r' => writer.write_str("\\r")?,
+            b'\t' => writer.write_str("\\t")?,
+            0x00..=0x1F => {
+                let hex_digits = b"0123456789abcdef";
+                let hi = hex_digits[(b >> 4) as usize] as char;
+                let lo = hex_digits[(b & 0x0F) as usize] as char;
+                writer.write_str("\\u00")?;
+                writer.write_char(hi)?;
+                writer.write_char(lo)?;
+            }
+            _ => writer.write_char(b as char)?,
+        }
+    }
+    Ok(())
+}
+
+/// Helper wrapper struct implementing Display to format JSON-escaped strings inline.
+pub struct JsonEscaped<'a>(pub &'a str);
+
+impl<'a> core::fmt::Display for JsonEscaped<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_json_escaped_str(f, self.0)
+    }
+}
+
 /// Formats the `/status.json` payload into `out_buf` (up to 2048 bytes).
 /// Returns the number of bytes written, or `None` if `out_buf` is too small.
 pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
     write!(
         writer,
-        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\"again_code\":{},\"settings_seq\":{}}}",
-        REQUIRED_OTA_PROJECT_NAME,
-        RUST_OTA_FIRMWARE_VERSION,
+        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\"again_code\":{},\"settings_seq\":{},\"bt_enabled\":{},\"bt_connected\":{},\"bt_streaming\":{},\"bt_rx_pkts\":{},\"bt_frames\":{}}}",
+        JsonEscaped(REQUIRED_OTA_PROJECT_NAME),
+        JsonEscaped(RUST_OTA_FIRMWARE_VERSION),
         snapshot.otadata_prearmed_factory,
         snapshot.ip[0],
         snapshot.ip[1],
@@ -200,7 +247,7 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.gw[1],
         snapshot.gw[2],
         snapshot.gw[3],
-        snapshot.ssid,
+        JsonEscaped(snapshot.ssid),
         snapshot.rssi,
         snapshot.lms_cport,
         snapshot.lms_port,
@@ -209,7 +256,7 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.lms_ip[2],
         snapshot.lms_ip[3],
         snapshot.frames_played,
-        snapshot.amp_mode,
+        JsonEscaped(snapshot.amp_mode),
         snapshot.vol_pct,
         snapshot.i2c_acks,
         snapshot.i2c_nacks,
@@ -218,11 +265,11 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.psram_used_bytes,
         snapshot.core1_active,
         snapshot.core1_loops,
-        snapshot.codec,
+        JsonEscaped(snapshot.codec),
         snapshot.codec_sample_rate,
         snapshot.codec_channels,
         snapshot.codec_bit_depth,
-        snapshot.eq_preset,
+        JsonEscaped(snapshot.eq_preset),
         snapshot.eq_enabled,
         snapshot.tas_fs_hz,
         snapshot.tas_bck_ratio,
@@ -230,6 +277,11 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.tas_automuted,
         snapshot.again_code,
         snapshot.settings_seq,
+        snapshot.bt_enabled,
+        snapshot.bt_connected,
+        snapshot.bt_streaming,
+        snapshot.bt_rx_pkts,
+        snapshot.bt_frames,
     ).ok()?;
     Some(writer.written_len())
 }
@@ -307,7 +359,29 @@ pub fn handle_http_request_streaming(
         }
         ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
             let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let act = query.split('&').find_map(|p| p.strip_prefix("act=")).unwrap_or("");
+            let mut act = query.split('&').find_map(|p| p.strip_prefix("act=")).unwrap_or("");
+            if act.is_empty() {
+                let body_slice = req_bytes
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| &req_bytes[p + 4..])
+                    .or_else(|| {
+                        req_bytes
+                            .windows(2)
+                            .position(|w| w == b"\n\n")
+                            .map(|p| &req_bytes[p + 2..])
+                    })
+                    .unwrap_or(&[]);
+                if let Ok(body_str) = core::str::from_utf8(body_slice) {
+                    act = body_str.split('&').find_map(|p| p.strip_prefix("act=")).unwrap_or("");
+                    if act.is_empty() {
+                        let trimmed = body_str.trim();
+                        if let Some(rest) = trimmed.strip_prefix("act=") {
+                            act = rest.split('&').next().unwrap_or(rest);
+                        }
+                    }
+                }
+            }
             let (action, ok) = match act {
                 "play" => (
                     HttpControlAction::PlayerIrCommand {
@@ -459,7 +533,7 @@ pub fn handle_http_request_streaming(
             Some((resp_bytes.len(), &[], HttpControlAction::RebootToRecovery))
         }
         ("POST", "/reboot.json") | ("GET", "/reboot.json") => {
-            let body = "{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}";
+            let body = "{\"status\":\"rebooting_to_ota_0\",\"target_partition\":\"ota_0_0x160000\"}";
             let mut response: String<256> = String::new();
             let _ = write!(
                 response,
@@ -472,7 +546,7 @@ pub fn handle_http_request_streaming(
                 return None;
             }
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
-            Some((resp_bytes.len(), &[], HttpControlAction::RebootToRecovery))
+            Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
         }
         ("POST", "/reboot_ota.json") => {
             let body = "{\"status\":\"rebooting_to_ota_0\",\"target_partition\":\"ota_0_0x160000\"}";
@@ -760,12 +834,38 @@ mod tests {
         let (_len2, act2) =
             handle_http_control_request(b"POST /reboot.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
                 .unwrap();
-        assert_eq!(act2, HttpControlAction::RebootToRecovery);
+        assert_eq!(act2, HttpControlAction::PersistOta0AndReboot);
 
         let (_len3, act3) =
             handle_http_control_request(b"POST /reboot_ota.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
                 .unwrap();
         assert_eq!(act3, HttpControlAction::PersistOta0AndReboot);
+    }
+
+    #[test]
+    fn test_cmd_json_post_body_and_json_string_escaping() {
+        let snap = HttpStatusSnapshot {
+            ssid: "My\"Wi-Fi\\Net\tName\x01",
+            amp_mode: "Stereo\"BTL\"",
+            ..Default::default()
+        };
+        let mut buf = [0u8; 1024];
+
+        // JSON escaping in write_status_json
+        let len = write_status_json(&snap, &mut buf).unwrap();
+        let json_str = core::str::from_utf8(&buf[..len]).unwrap();
+        assert!(json_str.contains("\"ssid\":\"My\\\"Wi-Fi\\\\Net\\tName\\u0001\""));
+        assert!(json_str.contains("\"amp_mode\":\"Stereo\\\"BTL\\\"\""));
+
+        // POST /cmd.json with act= in body
+        let req = b"POST /cmd.json HTTP/1.1\r\nHost: 192.168.1.50\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nact=pause";
+        let (resp_len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
+        assert_eq!(act, HttpControlAction::PlayerIrCommand {
+            ir_code: 0x7689_20DF,
+            vol_pct: None,
+            mute: None,
+        });
+        assert!(core::str::from_utf8(&buf[..resp_len]).unwrap().contains("\"ok\":true"));
     }
 
     #[test]
@@ -958,6 +1058,11 @@ mod tests {
             tas_automuted: false,
             again_code: 0x08,
             settings_seq: 7,
+            bt_enabled: false,
+            bt_connected: false,
+            bt_streaming: false,
+            bt_rx_pkts: 0,
+            bt_frames: 0,
         };
         let mut out_buf = [0u8; 1024];
         let (len, static_body, action) = handle_http_request_streaming(
@@ -973,5 +1078,10 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.contains("\"eq_preset\":\"Loudness\""));
         assert!(resp.contains("\"settings_seq\":7"));
+        assert!(resp.contains("\"bt_enabled\":false"));
+        assert!(resp.contains("\"bt_connected\":false"));
+        assert!(resp.contains("\"bt_streaming\":false"));
+        assert!(resp.contains("\"bt_rx_pkts\":0"));
+        assert!(resp.contains("\"bt_frames\":0"));
     }
 }

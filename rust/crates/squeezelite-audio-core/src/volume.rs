@@ -46,13 +46,6 @@ pub fn scale_samples_inplace(samples: &mut [i32], volume: VolumeScale) {
         return;
     }
 
-    // Remainder guard: zero out trailing odd sample to prevent channel phase swap (DSP-007)
-    if !samples.len().is_multiple_of(2) {
-        if let Some(last) = samples.last_mut() {
-            *last = 0;
-        }
-    }
-
     if volume.gain_left == 0x00010000 && volume.gain_right == 0x00010000 {
         return; // Unity gain fast path
     }
@@ -63,6 +56,12 @@ pub fn scale_samples_inplace(samples: &mut [i32], volume: VolumeScale) {
         let r = ((chunk[1] as i64 * volume.gain_right as i64) + 0x8000) >> 16;
         chunk[0] = l.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         chunk[1] = r.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+
+    let rem = chunks.into_remainder();
+    if let Some(last) = rem.first_mut() {
+        let l = ((*last as i64 * volume.gain_left as i64) + 0x8000) >> 16;
+        *last = l.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
 }
 
@@ -82,7 +81,19 @@ mod tests {
     fn test_volume_unity_gain_odd_remainder() {
         let mut samples = [1000, -1000, 2000, -2000, 9999];
         scale_samples_inplace(&mut samples, VolumeScale::unity());
-        assert_eq!(samples, [1000, -1000, 2000, -2000, 0]);
+        assert_eq!(samples, [1000, -1000, 2000, -2000, 9999]);
+    }
+
+    #[test]
+    fn test_volume_attenuation_odd_remainder() {
+        let mut samples = [10000, -10000, 20000, -20000, 8000];
+        let half = VolumeScale {
+            gain_left: 0x00008000, // 0.5x
+            gain_right: 0x00008000,
+            muted: false,
+        };
+        scale_samples_inplace(&mut samples, half);
+        assert_eq!(samples, [5000, -5000, 10000, -10000, 4000]);
     }
 
     #[test]

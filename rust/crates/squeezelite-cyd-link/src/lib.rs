@@ -60,6 +60,9 @@ pub enum LinkError {
     ValueOutOfRange,
 }
 
+/// Convenience alias matching work order and protocol specifications.
+pub type CydLinkError = LinkError;
+
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -219,6 +222,9 @@ impl CydLinkProtocol {
             CydCommand::Previous => out.extend_from_slice(b"CMD=PREV\n").map_err(|_| LinkError::BufferOverflow)?,
             CydCommand::QueryStatus => out.extend_from_slice(b"CMD=STATUS\n").map_err(|_| LinkError::BufferOverflow)?,
             CydCommand::SetVolume(vol) => {
+                if *vol > 100 {
+                    return Err(LinkError::ValueOutOfRange);
+                }
                 out.extend_from_slice(b"CMD=VOL:").map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 3];
                 let s = format_u8(*vol, &mut num_buf);
@@ -276,8 +282,14 @@ impl CydLinkProtocol {
                 b"STATUS" => Ok(CydCommand::QueryStatus),
                 other if other.starts_with(b"VOL:") || other.starts_with(b"VOL=") => {
                     let s = core::str::from_utf8(&other[4..]).map_err(|_| LinkError::InvalidFrame)?;
-                    let vol: u8 = parse_u8(s).ok_or(LinkError::InvalidFrame)?;
-                    Ok(CydCommand::SetVolume(vol))
+                    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(LinkError::InvalidFrame);
+                    }
+                    let vol: u32 = parse_u32(s).ok_or(LinkError::ValueOutOfRange)?;
+                    if vol > 100 {
+                        return Err(LinkError::ValueOutOfRange);
+                    }
+                    Ok(CydCommand::SetVolume(vol as u8))
                 }
                 _ => Err(LinkError::InvalidFrame),
             }
@@ -303,24 +315,50 @@ fn copy_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, LinkError> {
 }
 
 fn find_json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let mut pattern = [0u8; 32];
+    let bytes = json.as_bytes();
     let k_bytes = key.as_bytes();
-    if k_bytes.len() + 2 > pattern.len() {
-        return None;
-    }
-    pattern[0] = b'"';
-    pattern[1..1 + k_bytes.len()].copy_from_slice(k_bytes);
-    pattern[1 + k_bytes.len()] = b'"';
-    let pat = core::str::from_utf8(&pattern[..2 + k_bytes.len()]).ok()?;
+    let pat_len = k_bytes.len() + 2;
 
-    let mut search = json;
-    while let Some(idx) = search.find(pat) {
-        let after_key = &search[idx + pat.len()..];
-        let after_ws = after_key.trim_start();
-        if let Some(after_colon) = after_ws.strip_prefix(':') {
-            return Some(after_colon.trim_start());
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+            i += 1;
+        } else {
+            if b == b'"' {
+                // Outside string quotes: check if this quote starts `"key":`
+                if i + pat_len <= bytes.len()
+                    && &bytes[i + 1..i + 1 + k_bytes.len()] == k_bytes
+                    && bytes[i + 1 + k_bytes.len()] == b'"'
+                {
+                    // Check if followed by optional whitespace and ':'
+                    let mut colon_idx = i + pat_len;
+                    while colon_idx < bytes.len() && bytes[colon_idx].is_ascii_whitespace() {
+                        colon_idx += 1;
+                    }
+                    if colon_idx < bytes.len() && bytes[colon_idx] == b':' {
+                        let after_colon = &json[colon_idx + 1..];
+                        return Some(after_colon.trim_start());
+                    }
+                }
+                // Entered a string property or string value
+                in_quotes = true;
+                escaped = false;
+                i += 1;
+            } else {
+                i += 1;
+            }
         }
-        search = after_key;
     }
     None
 }
@@ -540,6 +578,24 @@ mod tests {
         assert_eq!(&buf[..], b"CMD=VOL:75\n");
         assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::SetVolume(75));
 
+        // Volume out of range (>100) validations
+        assert_eq!(
+            CydLinkProtocol::encode_command(&CydCommand::SetVolume(101), &mut buf),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=VOL:101\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=VOL=255\r\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=VOL:999\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+
         CydLinkProtocol::encode_command(&CydCommand::QueryStatus, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=STATUS\n");
         assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::QueryStatus);
@@ -633,6 +689,12 @@ mod tests {
         assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\"}"), Err(LinkError::InvalidFrame));
         assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"unknown\"}"), Err(LinkError::InvalidFrame));
         assert_eq!(CydLinkProtocol::parse_command("{\"val\":50}"), Err(LinkError::InvalidFrame));
+
+        // JSON commands with key pattern inside string values must not falsely match
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"title\":\"Song with \\\"cmd\\\": \\\"pause\\\" in title\",\"cmd\":\"play\"}\n"),
+            Ok(CydCommand::Play)
+        );
 
         // Encode NDJSON commands and roundtrip
         let mut raw = [0u8; 64];

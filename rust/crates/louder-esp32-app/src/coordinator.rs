@@ -80,6 +80,7 @@ pub struct PlayerCoordinator {
     pub dac_enabled: bool,
     pub server_rebooting: bool,
     pub player_name: heapless::String<64>,
+    pub stream_eof: bool,
     #[cfg(not(target_arch = "xtensa"))]
     pub audio_stream: Option<HttpAudioStream>,
 }
@@ -117,9 +118,30 @@ impl PlayerCoordinator {
             dac_enabled: true,
             server_rebooting: false,
             player_name,
+            stream_eof: false,
             #[cfg(not(target_arch = "xtensa"))]
             audio_stream: None,
         }
+    }
+
+    /// Sets the stream EOF indicator.
+    pub fn set_stream_eof(&mut self, eof: bool) {
+        self.stream_eof = eof;
+    }
+
+    /// Returns `true` if the audio stream reached EOF.
+    pub fn is_stream_eof(&self) -> bool {
+        self.stream_eof
+    }
+
+    /// Resets transient stream coordinator state.
+    pub fn reset(&mut self) {
+        self.stream_eof = false;
+        self.decode_complete_sent = false;
+        self.pending_decode_ready = false;
+        self.pending_track_started = false;
+        self.pending_underrun = false;
+        self.pending_dsco = None;
     }
 
     /// Decodes SlimProto sample rate code into Hz.
@@ -137,6 +159,8 @@ impl PlayerCoordinator {
             b'8' | 8 => Some(24000),
             b'9' | 9 => Some(96000),
             b':' | 10 => Some(88200),
+            b';' | 11 => Some(176400),
+            b'<' | 12 => Some(192000),
             _ => None,
         }
     }
@@ -210,6 +234,7 @@ impl PlayerCoordinator {
                         self.pending_meta = None;
                         self.stream_bytes_received = 0;
                         self.audio_stream = None;
+                        self.stream_eof = false;
 
                         self.autostart_mode = AutostartMode::from_strm(autostart, flags);
                         self.autostart = self.autostart_mode.is_auto();
@@ -418,8 +443,10 @@ impl PlayerCoordinator {
                         Ok(None)
                     }
                     StreamCommandType::Unknown(b'a') => {
-                        // RUST-08: strm 'a' skip-ahead consumes output buffer frames
-                        let bytes = (replay_gain as usize * (self.current_sample_rate as usize / 1000)) * 8;
+                        // CODE-PROTO-003: strm 'a' skip-ahead consumes output buffer frames using u64 math
+                        let skip_ms = replay_gain;
+                        let frames = (u64::from(skip_ms) * u64::from(self.current_sample_rate)) / 1000;
+                        let bytes = usize::try_from(frames.saturating_mul(4)).unwrap_or(usize::MAX);
                         pipeline.output_buffer.consume(bytes);
                         Ok(None)
                     }
@@ -433,9 +460,17 @@ impl PlayerCoordinator {
                 ..
             } => {
                 let (eff_gain_left, eff_gain_right) = if digital_atten == 0 {
-                    let l = if gain_left > 0 { 65536 } else { 0 };
-                    let r = if gain_right > 0 { 65536 } else { 0 };
-                    (l, r)
+                    if gain_left == 0
+                        && gain_right == 0
+                        && self.volume.gain_left > 0
+                        && self.volume.gain_right > 0
+                    {
+                        (65536, 65536)
+                    } else {
+                        let l = if gain_left > 0 { 65536 } else { 0 };
+                        let r = if gain_right > 0 { 65536 } else { 0 };
+                        (l, r)
+                    }
                 } else {
                     (gain_left, gain_right)
                 };
@@ -451,12 +486,20 @@ impl PlayerCoordinator {
             }
             ServerCommand::SetDevice { sample_rate } => {
                 if sample_rate <= u8::MAX as u32 {
-                    if let Some(setting) = cmd.device_setting() {
-                        if setting.id == 0 {
-                            client.send_setd_name(&self.player_name)?;
-                            return Ok(None);
-                        }
+                    if sample_rate == 0 {
+                        client.send_setd_name(&self.player_name)?;
                     }
+                    // 1-byte id != 0 query is NOT a sample rate; do not update current_sample_rate
+                    return Ok(None);
+                }
+                let bytes = sample_rate.to_be_bytes();
+                if bytes[0] == 0 && bytes[1..].iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+                    if let Ok(name) = core::str::from_utf8(&bytes[1..]) {
+                        self.player_name.clear();
+                        let _ = self.player_name.push_str(name);
+                    }
+                    client.send_setd_name(&self.player_name)?;
+                    return Ok(None);
                 }
                 self.current_sample_rate = sample_rate;
                 let _ = pipeline.set_sample_rate(sample_rate);
@@ -541,7 +584,12 @@ impl PlayerCoordinator {
             }
             let max_read = avail_write.min(chunk.len());
             match http.poll_audio_bytes(&mut chunk[..max_read]) {
-                Ok(0) => break,
+                Ok(0) => {
+                    if http.is_eof() {
+                        self.stream_eof = true;
+                    }
+                    break;
+                }
                 Ok(n) => {
                     self.stream_bytes_received = http.total_audio_bytes();
                     let written = pipeline.ingest_stream_data(&chunk[..n]).unwrap_or(0);
@@ -551,6 +599,7 @@ impl PlayerCoordinator {
                     }
                 }
                 Err(e) => {
+                    self.stream_eof = true;
                     self.audio_stream = None;
                     return Err(e);
                 }
@@ -573,13 +622,14 @@ impl PlayerCoordinator {
     pub fn evaluate_state<S: AudioOutputSink>(&mut self, pipeline: &mut StreamPipeline<S>) {
         self.frames_played = pipeline.frames_played;
         #[cfg(not(target_arch = "xtensa"))]
-        let is_eof = self
-            .audio_stream
-            .as_ref()
-            .map(|s| s.is_eof())
-            .unwrap_or(false);
+        let is_eof = self.stream_eof
+            || self
+                .audio_stream
+                .as_ref()
+                .map(|s| s.is_eof())
+                .unwrap_or(false);
         #[cfg(target_arch = "xtensa")]
-        let is_eof = false;
+        let is_eof = self.stream_eof;
 
         if self.state == PlayerState::Buffering
             && !self.awaiting_cont
@@ -750,7 +800,6 @@ impl PlayerCoordinator {
         }
 
         if self.pending_track_started {
-            self.pending_track_started = false;
             client.send_stat_with_metrics(
                 StatEvent::TrackStarted,
                 pipeline.stream_buffer.available_read() as u32,
@@ -761,10 +810,10 @@ impl PlayerCoordinator {
                 now_ms,
                 0,
             )?;
+            self.pending_track_started = false;
         }
 
         if self.pending_decode_ready {
-            self.pending_decode_ready = false;
             client.send_stat_with_metrics(
                 StatEvent::DecodeReady,
                 pipeline.stream_buffer.available_read() as u32,
@@ -775,14 +824,15 @@ impl PlayerCoordinator {
                 now_ms,
                 0,
             )?;
+            self.pending_decode_ready = false;
         }
 
-        if let Some(reason) = self.pending_dsco.take() {
+        if let Some(reason) = self.pending_dsco {
             client.send_dsco(reason)?;
+            self.pending_dsco = None;
         }
 
         if self.pending_underrun {
-            self.pending_underrun = false;
             client.send_stat_with_metrics(
                 StatEvent::TrackUnderrun,
                 pipeline.stream_buffer.available_read() as u32,
@@ -793,6 +843,7 @@ impl PlayerCoordinator {
                 now_ms,
                 0,
             )?;
+            self.pending_underrun = false;
         }
 
         if now_ms.wrapping_sub(self.last_heartbeat_ms) >= self.heartbeat_interval_ms {
@@ -2121,6 +2172,76 @@ mod tests {
         assert_eq!(payload[0], 0x00);
         assert_eq!(&payload[1..], b"Basement");
 
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_coordinator_audg_digital_atten_zero_unity_gain_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0xEE];
+
+        let handle = std::thread::spawn(move || {
+            let (mut server_stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 128];
+            let _ = server_stream.read(&mut buf); // HELO
+            let _ = server_stream.read(&mut buf); // SETD reply
+        });
+
+        let mut client = SlimprotoClient::connect(server_addr, mac, "Test").unwrap();
+        let mut coordinator = PlayerCoordinator::new(mac, "Test");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let pcm_dec = PcmDecoder::new(16, 2, true);
+        let sink = MockAudioSink::<64>::new();
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(pcm_dec),
+            sink,
+            44100,
+        );
+
+        // Initially unity gain (65536, 65536)
+        assert_eq!(coordinator.volume.gain_left, 65536);
+        assert_eq!(coordinator.volume.gain_right, 65536);
+
+        // When digital_atten == 0 and incoming gain is 0,0 while old gain was > 0, set unity gain (65536)
+        let audg_unity = ServerCommand::AudioGain {
+            gain_left: 0,
+            gain_right: 0,
+            digital_atten: 0,
+            preamp: 0,
+        };
+        coordinator.handle_command(audg_unity, &mut pipeline, &mut client, 100).unwrap();
+        assert_eq!(coordinator.volume.gain_left, 65536);
+        assert_eq!(coordinator.volume.gain_right, 65536);
+
+        // 4-byte player name [0, 'B', 'o', 'b'] updates player_name and replies with SETD without altering current_sample_rate
+        let bob_rate = u32::from_be_bytes([0x00, b'B', b'o', b'b']);
+        let setd_bob = ServerCommand::SetDevice { sample_rate: bob_rate };
+        coordinator.handle_command(setd_bob, &mut pipeline, &mut client, 200).unwrap();
+        assert_eq!(coordinator.player_name.as_str(), "Bob");
+        assert_eq!(coordinator.current_sample_rate, 44100);
+
+        // 1-byte id=4 DAC query does not alter current_sample_rate
+        let setd_dac_query = ServerCommand::SetDevice { sample_rate: 4 };
+        coordinator.handle_command(setd_dac_query, &mut pipeline, &mut client, 300).unwrap();
+        assert_eq!(coordinator.current_sample_rate, 44100);
+
+        // Sample rate decoding for 176.4k and 192k
+        assert_eq!(PlayerCoordinator::decode_pcm_sample_rate_hz(b';'), Some(176400));
+        assert_eq!(PlayerCoordinator::decode_pcm_sample_rate_hz(11), Some(176400));
+        assert_eq!(PlayerCoordinator::decode_pcm_sample_rate_hz(b'<'), Some(192000));
+        assert_eq!(PlayerCoordinator::decode_pcm_sample_rate_hz(12), Some(192000));
+
+        // Stream EOF tracking and reset
+        coordinator.set_stream_eof(true);
+        assert!(coordinator.is_stream_eof());
+        coordinator.reset();
+        assert!(!coordinator.is_stream_eof());
+
+        drop(client);
         handle.join().unwrap();
     }
 }

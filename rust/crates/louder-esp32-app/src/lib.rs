@@ -8,6 +8,7 @@
 
 pub mod amp;
 pub mod board;
+pub mod bt_a2dp;
 pub mod coordinator;
 pub mod cyd;
 pub mod hal;
@@ -21,6 +22,7 @@ pub mod wifi;
 
 pub use amp::{AmpManager, AmpMode};
 pub use board::{BoardModel, I2sPinConfig, ACTIVE_BOARD};
+pub use bt_a2dp::{AvdtpStreamState, BtA2dpSink, HciTransport, InitStep, SbcDecoder};
 pub use coordinator::{PlayerCoordinator, PlayerState};
 pub use cyd::CydController;
 pub use hal::{

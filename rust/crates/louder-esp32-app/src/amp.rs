@@ -8,7 +8,7 @@ use embedded_hal::i2c::I2c;
 pub use squeezelite_tas58xx::Tas5805mTelemetry;
 use squeezelite_tas58xx::{
     DriverError, FaultStatus, Play, PowerDown, Standby, Tas58xx,
-    VOL_DEFAULT_M20DB, VOL_DEFAULT_MINUS_24DB, VOL_MUTE, VOL_UNITY_0DB,
+    VOL_DEFAULT_M20DB, VOL_MUTE, VOL_UNITY_0DB,
 };
 
 /// Current operational state of the amplifier.
@@ -52,15 +52,16 @@ impl Default for AmpConfig {
 }
 
 /// Maps a logical `0..=100%` volume percentage to a TAS58xx hardware digital volume
-/// attenuation register value (`0x30..=0xFF`) (PERIPH-601):
+/// attenuation register value (`0x30..=0xFF`) (PERIPH-601, CODE-TAS-001):
 /// - `0%` returns [`VOL_MUTE`] (`0xFF`, hardware mute).
-/// - `1..=100%` (clamped at `100%`) maps linearly from `0xCF` (`-79.5 dB`) to [`VOL_UNITY_0DB`] (`0x30`, `0.0 dB` unity gain).
+/// - `1..=100%` (clamped at `100%`) maps linearly with 0.5 dB/step matching `lms_gain_to_tas5805m_vol_reg`:
+///   `100% => 0x30` (0.0 dB), `50% => 0x62` (-25.0 dB), `1% => 0x93` (-49.5 dB).
 pub const fn percent_to_attenuation(percent: u8) -> u8 {
     if percent == 0 {
         VOL_MUTE
     } else {
         let clamped = if percent > 100 { 100 } else { percent };
-        0xCF - (((clamped as u16 - 1) * (0xCF - VOL_UNITY_0DB) as u16) / 99) as u8
+        0x30 + (100 - clamped)
     }
 }
 
@@ -100,7 +101,7 @@ where
         };
         Self {
             inner: Some(AmpInner::PowerDown(Tas58xx::new(i2c, addr))),
-            current_volume: VOL_DEFAULT_MINUS_24DB, // Default -24dB volume (0x60)
+            current_volume: cfg.initial_volume,
             current_again_code: cfg.initial_again_code,
             config: cfg,
         }
@@ -410,13 +411,13 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -431,7 +432,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
-            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x60]),
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
@@ -445,7 +446,7 @@ mod tests {
 
         let mut amp = AmpManager::new(&mut i2c);
         assert_eq!(amp.mode(), AmpMode::PowerDown);
-        assert_eq!(amp.current_volume(), VOL_DEFAULT_MINUS_24DB);
+        assert_eq!(amp.current_volume(), VOL_DEFAULT_M20DB);
 
         amp.initialize(32).unwrap();
         assert_eq!(amp.mode(), AmpMode::Standby);
@@ -467,13 +468,13 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -515,13 +516,13 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -554,13 +555,13 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -577,7 +578,7 @@ mod tests {
             // clear_faults in Standby
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
-            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x60]),
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
@@ -605,20 +606,21 @@ mod tests {
     #[test]
     fn test_percent_to_attenuation_and_set_volume_percent() {
         assert_eq!(percent_to_attenuation(0), VOL_MUTE);
-        assert_eq!(percent_to_attenuation(1), 0xCF);
+        assert_eq!(percent_to_attenuation(1), 0x93);
+        assert_eq!(percent_to_attenuation(50), 0x62);
         assert_eq!(percent_to_attenuation(100), VOL_UNITY_0DB);
         assert_eq!(percent_to_attenuation(150), VOL_UNITY_0DB);
 
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -657,15 +659,15 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // First initialize attempt fails on first I2C write
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00])
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00])
                 .with_error(ErrorKind::Bus),
             // Second initialize attempt succeeds because inner was preserved
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
@@ -698,13 +700,13 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -743,13 +745,13 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // init_into_standby
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
             // reconfirm_book_page_and_clear_faults
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
@@ -764,8 +766,8 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback_via_hiz:
-            // 1) set_digital_volume(0x60)
-            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x60]),
+            // 1) set_digital_volume(0x58)
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             // 2) try_start_playback_via_hiz sequence:
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),

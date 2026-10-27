@@ -40,9 +40,9 @@ proptest! {
         prop_assert_eq!(dec_res.unwrap(), CydMessage::Volume(vol));
     }
 
-    /// Invariant: Roundtrip encoding & decoding of CydCommand::SetVolume (0..=255).
+    /// Invariant: Roundtrip encoding & decoding of CydCommand::SetVolume (0..=100).
     #[test]
-    fn fuzz_command_set_volume_roundtrip(vol in any::<u8>()) {
+    fn fuzz_command_set_volume_roundtrip(vol in 0..=100u8) {
         let mut buf = Vec::new();
         let enc_res = CydLinkProtocol::encode_command(&CydCommand::SetVolume(vol), &mut buf);
         prop_assert!(enc_res.is_ok());
@@ -50,6 +50,36 @@ proptest! {
         let dec_res = CydLinkProtocol::parse_command(&buf);
         prop_assert!(dec_res.is_ok());
         prop_assert_eq!(dec_res.unwrap(), CydCommand::SetVolume(vol));
+    }
+
+    /// Invariant: Out-of-range volume levels (>100) are rejected with ValueOutOfRange.
+    #[test]
+    fn fuzz_command_set_volume_out_of_range(vol in 101..=255u8) {
+        let mut buf = Vec::new();
+        let enc_res = CydLinkProtocol::encode_command(&CydCommand::SetVolume(vol), &mut buf);
+        prop_assert_eq!(enc_res, Err(LinkError::ValueOutOfRange));
+
+        // Format as ASCII CMD=VOL:<vol> and assert parse_command rejects
+        let mut ascii_cmd = [0u8; 16];
+        ascii_cmd[..8].copy_from_slice(b"CMD=VOL:");
+        let mut n = 8;
+        let mut temp = [0u8; 3];
+        let mut v = vol;
+        let mut digits = 0;
+        while v > 0 {
+            temp[digits] = b'0' + (v % 10);
+            v /= 10;
+            digits += 1;
+        }
+        for d in 0..digits {
+            ascii_cmd[n] = temp[digits - 1 - d];
+            n += 1;
+        }
+        ascii_cmd[n] = b'\n';
+        n += 1;
+
+        let dec_res = CydLinkProtocol::parse_command(&ascii_cmd[..n]);
+        prop_assert_eq!(dec_res, Err(LinkError::ValueOutOfRange));
     }
 
     /// Invariant: Roundtrip encoding & decoding of playback states.

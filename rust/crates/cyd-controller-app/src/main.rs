@@ -190,6 +190,14 @@ mod xtensa_hw {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let peripherals = esp_hal::init(config);
 
+        // Disable hardware watchdogs (TIMG0, TIMG1, RTC RWDT)
+        let mut timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
+        let mut timg1 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG1);
+        let mut rtc = esp_hal::rtc_cntl::Rtc::new(peripherals.RTC_TIMER);
+        timg0.wdt.disable();
+        timg1.wdt.disable();
+        rtc.rwdt.disable();
+
         // Configure physical SPI2 (HSPI) @ 40 MHz for ILI9341 Display
         let spi2 = Spi::new(
             peripherals.SPI2,
@@ -409,7 +417,15 @@ mod xtensa_hw {
         // 3. Queue initial status sync request via poll_heartbeat(0) and flush over UART2 TX
         let _ = link.poll_heartbeat(0);
         while let Some(pkt) = link.pop_tx() {
-            let _ = uart2.write(&pkt);
+            let mut written = 0;
+            let mut iters = 0;
+            while written < pkt.len() && iters < 64 {
+                match uart2.write(&pkt[written..]) {
+                    Ok(n) => written += n,
+                    Err(_) => break,
+                }
+                iters += 1;
+            }
         }
         delay_ms(20);
 
@@ -418,13 +434,14 @@ mod xtensa_hw {
 
         let delay = esp_hal::delay::Delay::new();
         let mut last_touch: Option<(i16, i16)> = None;
+        let mut tick: u32 = 0;
 
         loop {
             let elapsed = Instant::now().duration_since_epoch();
             let now_us = elapsed.as_micros() as i64;
             let now_ms = elapsed.as_millis() as u32;
 
-            // 1. Non-blocking UART2 RX Drain
+            // 1. Non-blocking UART2 RX Drain (runs on EVERY 1 ms tick so 128-byte FIFO never overflows at 460,800 baud)
             let mut rx_buf = [0u8; 64];
             let mut rx_any = false;
             while uart2.read_ready() {
@@ -439,48 +456,55 @@ mod xtensa_hw {
                     break;
                 }
             }
-            if rx_any {
-                ui.update(link.state());
-                ui.render_dirty_regions(&mut display);
-            }
 
-            // 2. Heartbeat & Resync Monitor
-            let was_active = link.state().link_active;
-            let _ = link.poll_heartbeat(now_us);
-            if link.state().link_active != was_active {
-                ui.update(link.state());
-                ui.render_dirty_regions(&mut display);
-            }
-
-            // 3. Touch Press & Release Router with Dirty-Region Redraw
-            if let Some((tx, ty)) = touch.read() {
-                if let Some(cmd_bytes) = ui.handle_touch_point(tx, ty, false, now_ms, &mut link) {
-                    if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
-                        println!("[TOUCH DRAG] ({}, {}) -> {}", tx, ty, s.trim());
-                    }
-                } else if last_touch.is_none() {
-                    println!("[TOUCH PRESS] ({}, {})", tx, ty);
+            // 2. Display rendering, touch polling, and heartbeat every 16 ticks (~60 Hz cadence)
+            if tick % 16 == 0 {
+                // Heartbeat & Resync Monitor
+                let was_active = link.state().link_active;
+                let _ = link.poll_heartbeat(now_us);
+                if rx_any || link.state().link_active != was_active {
+                    ui.update(link.state());
                 }
-                ui.render_dirty_regions(&mut display);
-                last_touch = Some((tx, ty));
-            } else if let Some((rx, ry)) = last_touch.take() {
-                if let Some(cmd_bytes) = ui.handle_touch_point(rx, ry, true, now_ms, &mut link) {
-                    if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
-                        println!("[TOUCH RELEASE] ({}, {}) -> {}", rx, ry, s.trim());
+
+                // Touch Press & Release Router with Dirty-Region Redraw
+                if let Some((tx, ty)) = touch.read() {
+                    if let Some(cmd_bytes) = ui.handle_touch_point(tx, ty, false, now_ms, &mut link) {
+                        if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
+                            println!("[TOUCH DRAG] ({}, {}) -> {}", tx, ty, s.trim());
+                        }
+                    } else if last_touch.is_none() {
+                        println!("[TOUCH PRESS] ({}, {})", tx, ty);
                     }
-                } else {
-                    println!("[TOUCH TAP] ({}, {})", rx, ry);
+                    last_touch = Some((tx, ty));
+                } else if let Some((rx, ry)) = last_touch.take() {
+                    if let Some(cmd_bytes) = ui.handle_touch_point(rx, ry, true, now_ms, &mut link) {
+                        if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
+                            println!("[TOUCH RELEASE] ({}, {}) -> {}", rx, ry, s.trim());
+                        }
+                    } else {
+                        println!("[TOUCH TAP] ({}, {})", rx, ry);
+                    }
                 }
+
                 ui.render_dirty_regions(&mut display);
             }
 
-            // 4. Flush tx_queue over Physical UART2 TX (GPIO27)
+            // 3. Flush tx_queue over Physical UART2 TX (GPIO27) using bounded write loop (up to 64 iterations)
             while let Some(pkt) = link.pop_tx() {
-                let _ = uart2.write(&pkt);
+                let mut written = 0;
+                let mut iters = 0;
+                while written < pkt.len() && iters < 64 {
+                    match uart2.write(&pkt[written..]) {
+                        Ok(n) => written += n,
+                        Err(_) => break,
+                    }
+                    iters += 1;
+                }
             }
 
-            // 5. ~60 Hz loop cadence
-            delay.delay_millis(16);
+            // 4. 1 ms loop tick cadence
+            tick = tick.wrapping_add(1);
+            delay.delay_millis(1);
         }
     }
 }

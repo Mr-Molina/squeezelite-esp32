@@ -258,10 +258,10 @@ impl DualSectorFlashStore {
 
         match (meta_a, meta_b) {
             (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
-                if (seq_b.wrapping_sub(seq_a) as i32) >= 0 {
-                    Ok(1)
-                } else {
+                if FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
                     Ok(0)
+                } else {
+                    Ok(1)
                 }
             }
             (Ok(_), Err(_)) => Ok(0),
@@ -293,7 +293,16 @@ impl FlashJournal {
         sector: &mut [u8],
         sequence: u32,
     ) -> Result<usize, StorageError> {
-        if sector.len() < Self::HEADER_SIZE {
+        let mut total_entry_len = 0usize;
+        for (k, v) in store.iter() {
+            let key_bytes = k.as_bytes();
+            let val_bytes = v.as_slice();
+            let entry_len = 1 + 2 + 4 + key_bytes.len() + val_bytes.len();
+            total_entry_len = total_entry_len.saturating_add(entry_len);
+        }
+
+        let total_required = Self::HEADER_SIZE.saturating_add(total_entry_len);
+        if sector.len() < total_required {
             return Err(StorageError::BufferTooSmall);
         }
 
@@ -1074,6 +1083,17 @@ mod tests {
         FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 0).unwrap();
         assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_b), Ok(1));
         assert_eq!(DualSectorFlashStore::active_sector(&sector_b, &sector_a), Ok(0));
+
+        // Equal sequence numbers must consistently select Sector A (Ok(0))
+        let mut sector_equal_b = [0u8; 256];
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_equal_b, u32::MAX).unwrap();
+        assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_equal_b), Ok(0));
+
+        // Validation before writing header: buffer too small for entries does not mutate header
+        let mut small_buf = [0xFFu8; 20]; // fits 16-byte header, but not entry
+        let err = FlashJournal::save_to_sector_with_seq(&store, &mut small_buf, 42);
+        assert_eq!(err, Err(StorageError::BufferTooSmall));
+        assert_eq!(small_buf, [0xFFu8; 20]); // unmodified!
     }
 
     #[test]
