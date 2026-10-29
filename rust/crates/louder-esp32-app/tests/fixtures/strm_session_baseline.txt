@@ -1,0 +1,11 @@
+# Baseline frozen at Task 4 — update only with a comment naming the task that changed behavior.
+HELO
+STAT:STMt
+STAT:STMc
+RESP
+STAT:STMs
+STAT:STMd
+DSCO:0
+STAT:STMu
+STAT:STMt
+STAT:STMq
