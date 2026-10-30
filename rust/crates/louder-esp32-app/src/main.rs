@@ -21,9 +21,11 @@ use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
 use louder_esp32_app::{AmpManager, AudioOutputSink, CydUartBridge, PlayerCoordinator};
 #[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::{
-    CydMessage, LoopbackUartPort, MemConfigStore, MemFlashPartition, NvsFlashBackend, PlayState,
-    SlimprotoClient, TargetI2cBus,
+    CydMessage, HttpAudioStream, LoopbackUartPort, MemConfigStore, MemFlashPartition,
+    NvsFlashBackend, PlayState, SlimprotoClient, TargetI2cBus,
 };
+#[cfg(not(target_arch = "xtensa"))]
+use louder_esp32_app::io_traits::MockBackend;
 #[cfg(not(target_arch = "xtensa"))]
 use squeezelite_config::AudioConfig;
 #[cfg(not(target_arch = "xtensa"))]
@@ -130,6 +132,15 @@ where
     }
 }
 
+/// Host network I/O driven by [`run_firmware_tick_with_network`]: the SlimProto control
+/// connection, the HTTP audio stream and the (simulated) audio backend.
+#[cfg(not(target_arch = "xtensa"))]
+pub struct HostNet<'a> {
+    pub client: &'a mut SlimprotoClient,
+    pub stream: &'a mut HttpAudioStream,
+    pub backend: &'a mut MockBackend,
+}
+
 /// Executes one integrated firmware tick with SlimProto network integration,
 /// dynamic sample rate synchronization, DAC amplifier pause, and hardware fault recovery (`RUST-19`).
 #[cfg(not(target_arch = "xtensa"))]
@@ -138,7 +149,7 @@ pub fn run_firmware_tick_with_network<S, U, I>(
     pipeline: &mut StreamPipeline<'_, S>,
     cyd_bridge: &mut CydUartBridge<U>,
     amp: &mut AmpManager<I>,
-    client: Option<&mut SlimprotoClient>,
+    net: Option<HostNet<'_>>,
     now_ms: u32,
 ) -> usize
 where
@@ -152,8 +163,12 @@ where
         }
     }
 
-    let frames = if let Some(client_ref) = client {
-        coordinator.tick(client_ref, pipeline, now_ms)
+    let frames = if let Some(net) = net {
+        let _ = coordinator.tick(net.client, net.stream, net.backend, pipeline, now_ms);
+        if let Some(update) = coordinator.take_cyd_message() {
+            let _ = cyd_bridge.flush_outbound(&update);
+        }
+        coordinator.last_tick_frames()
     } else {
         coordinator.process_audio_step(pipeline)
     };
@@ -173,41 +188,9 @@ where
     frames
 }
 
-/// Maps LMS logarithmic mixer gain (`0..=65536`) to perceptual hardware volume percentage (`0..=100%`).
-///
-/// LMS sends gain on a 50 dB curve where 51% slider is `gain = 1842` (-31 dB) and 100% is `gain = 65536` (0 dB).
-/// This fixed-point Q8 integer log2 curve maps `gain = 0 -> 0%`, `gain = 1842 -> 55%` (-22.5 dB on TAS5805M `0x4C`),
-/// and `gain = 65536 -> 100%` (0 dB `0x30` on TAS5805M `0x4C`).
-pub fn lms_gain_to_hardware_volume_percent(gain: u32) -> u8 {
-    if gain == 0 {
-        return 0;
-    }
-    if gain >= 65536 {
-        return 100;
-    }
-    let shift = 31 - gain.leading_zeros();
-    let frac = ((gain - (1 << shift)) << 8) >> shift;
-    let log2_q8 = (shift << 8) | frac;
-    let diff = 4096_i32 - log2_q8 as i32;
-    let reduction = ((diff * 2202) + 32768) >> 16;
-    let p = 100_i32 - reduction;
-    p.clamp(1, 100) as u8
-}
-
-/// Maps LMS logarithmic mixer gain (`0..=65536`) to exact TAS5805M `0x4C` hardware volume register code.
-///
-/// TAS5805M `DIG_VOL_CTRL` (register `0x4C`) is calibrated at 0.5 dB per step:
-/// - `0x30` = 0.0 dB (100% volume)
-/// - `0x5D` = -22.5 dB (55% perceptual volume)
-/// - `0xFF` = Mute (0% volume)
-pub fn lms_gain_to_tas5805m_vol_reg(gain: u32) -> u8 {
-    let pct = lms_gain_to_hardware_volume_percent(gain);
-    if pct == 0 {
-        0xFF // VOL_MUTE
-    } else {
-        0x30 + (100 - pct.min(100)) // 0x30 (0.0 dB) at 100%, +1 (+0.5 dB attenuation) per 1% below 100%
-    }
-}
+// Moved to the library (`amp`) so the shared coordinator can map `audg` onto the TAS volume
+// registers through `AudioBackend::set_hw_volume` (Task 7); re-exported for existing callers.
+pub use louder_esp32_app::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
 
 /// Case-insensitively searches for `icy-metaint:` header in raw HTTP response headers
 /// and parses the integer metadata interval if present.
@@ -395,15 +378,23 @@ fn main() {
         None
     };
 
+    coordinator.lms_ip = lms_ip.octets();
+    let mut http_stream = HttpAudioStream::new();
+    let mut backend = MockBackend::new();
     let iterations = if client.is_some() { 5 } else { 16 };
     for tick in 0..iterations {
         let now_ms = (tick * 10) as u32;
+        let net = client.as_mut().map(|client| HostNet {
+            client,
+            stream: &mut http_stream,
+            backend: &mut backend,
+        });
         let frames = run_firmware_tick_with_network(
             &mut coordinator,
             &mut pipeline,
             &mut cyd_bridge,
             &mut amp,
-            client.as_mut(),
+            net,
             now_ms,
         );
         if client.is_some() {
@@ -3038,7 +3029,11 @@ mod tests {
             &mut pipeline,
             &mut cyd_bridge,
             &mut amp,
-            Some(&mut client),
+            Some(HostNet {
+                client: &mut client,
+                stream: &mut HttpAudioStream::new(),
+                backend: &mut MockBackend::new(),
+            }),
             100,
         );
 

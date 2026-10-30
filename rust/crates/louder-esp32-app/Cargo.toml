@@ -10,6 +10,12 @@ description = "Clean-slate Rust firmware application for Louder-ESP32-Plus audio
 default = ["board-louder-esp32"]
 board-louder-esp32 = []
 board-louder-esp32-s3 = []
+# Host-class codec set: heap-boxed MP3 decoder, AAC + Ogg Vorbis (std-only decoders) and the
+# larger decode scratch buffers they need. Off for the xtensa firmware (static MP3 decoder from
+# bring-up, FLAC, PCM). Host test builds turn it on through the self dev-dependency below, so
+# `cargo test` exercises the full codec set while `cargo +esp build --target xtensa-...` (default
+# features) keeps it off.
+std-codecs = ["squeezelite-decoders/std"]
 
 [dependencies]
 squeezelite-proto = { path = "../squeezelite-proto" }
@@ -38,4 +44,7 @@ esp-storage = { version = "0.10.0", features = ["esp32", "critical-section", "by
 smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "socket-dns", "multicast"] }
 
 [dev-dependencies]
+# Self dev-dependency: enables `std-codecs` for every test/bench build of this package (host only;
+# tests never build for xtensa).
+louder-esp32-app = { path = ".", default-features = false, features = ["std-codecs"] }
 embedded-hal-mock = { version = "0.11", default-features = false, features = ["eh1"] }

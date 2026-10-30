@@ -3,9 +3,7 @@
 //! Connects LMS stream buffers, pure-Rust decoders, DSP equalizer,
 //! volume scaling, and the I2S audio output sink into an integrated processing loop.
 
-#[cfg(target_arch = "xtensa")]
 extern crate alloc;
-#[cfg(target_arch = "xtensa")]
 use alloc::boxed::Box;
 
 use squeezelite_audio_core::{
@@ -17,28 +15,40 @@ use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 pub use squeezelite_audio_core::EqPreset;
 pub type ActiveCodec = ActiveDecoder;
 
-#[cfg(not(target_arch = "xtensa"))]
+// Scratch sizing follows the codec set: the `std-codecs` decoders (FLAC 4096-frame blocks, AAC,
+// Vorbis) need the large buffers; the firmware codec set fits the smaller ones.
+#[cfg(feature = "std-codecs")]
 pub const PCM_SCRATCH_SAMPLES: usize = 8192;
-#[cfg(target_arch = "xtensa")]
+#[cfg(not(feature = "std-codecs"))]
 pub const PCM_SCRATCH_SAMPLES: usize = 2304;
 
-#[cfg(not(target_arch = "xtensa"))]
+#[cfg(feature = "std-codecs")]
 pub const READ_SCRATCH_BYTES: usize = 4096;
-#[cfg(target_arch = "xtensa")]
+#[cfg(not(feature = "std-codecs"))]
 pub const READ_SCRATCH_BYTES: usize = 1536;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
+/// Storage of the MP3 decoder carried by [`ActiveDecoder::Mp3`].
+///
+/// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it (firmware) the
+/// decoder is a static singleton handed out by bring-up, so no MP3 state lives on the heap.
+#[cfg(feature = "std-codecs")]
+pub type Mp3Handle = Box<squeezelite_decoders::Mp3Decoder>;
+/// Storage of the MP3 decoder carried by [`ActiveDecoder::Mp3`].
+///
+/// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it (firmware) the
+/// decoder is a static singleton handed out by bring-up, so no MP3 state lives on the heap.
+#[cfg(not(feature = "std-codecs"))]
+pub type Mp3Handle = &'static mut squeezelite_decoders::StaticMp3Decoder;
+
 pub enum ActiveDecoder {
     Pcm(PcmDecoder),
-    #[cfg(not(target_arch = "xtensa"))]
-    Mp3(Box<squeezelite_decoders::Mp3Decoder>),
-    #[cfg(target_arch = "xtensa")]
-    Mp3(&'static mut squeezelite_decoders::StaticMp3Decoder),
+    Mp3(Mp3Handle),
     Flac(Box<squeezelite_decoders::FlacDecoder>),
-    #[cfg(not(target_arch = "xtensa"))]
+    #[cfg(feature = "std-codecs")]
     Aac(Box<squeezelite_decoders::AacDecoder>),
-    #[cfg(not(target_arch = "xtensa"))]
+    #[cfg(feature = "std-codecs")]
     Vorbis(Box<squeezelite_decoders::VorbisDecoder>),
 }
 
@@ -50,14 +60,11 @@ impl AudioDecoder for ActiveDecoder {
     ) -> Result<(usize, usize), DecoderError> {
         match self {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(not(target_arch = "xtensa"))]
-            Self::Mp3(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(target_arch = "xtensa")]
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(not(target_arch = "xtensa"))]
+            #[cfg(feature = "std-codecs")]
             Self::Aac(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(not(target_arch = "xtensa"))]
+            #[cfg(feature = "std-codecs")]
             Self::Vorbis(d) => d.decode(encoded_in, pcm_out),
         }
     }
@@ -65,14 +72,11 @@ impl AudioDecoder for ActiveDecoder {
     fn flush(&mut self) {
         match self {
             Self::Pcm(d) => d.flush(),
-            #[cfg(not(target_arch = "xtensa"))]
-            Self::Mp3(d) => d.flush(),
-            #[cfg(target_arch = "xtensa")]
             Self::Mp3(d) => d.flush(),
             Self::Flac(d) => d.flush(),
-            #[cfg(not(target_arch = "xtensa"))]
+            #[cfg(feature = "std-codecs")]
             Self::Aac(d) => d.flush(),
-            #[cfg(not(target_arch = "xtensa"))]
+            #[cfg(feature = "std-codecs")]
             Self::Vorbis(d) => d.flush(),
         }
     }
@@ -81,48 +85,63 @@ impl AudioDecoder for ActiveDecoder {
 impl ActiveDecoder {
     /// Returns the active stream sample rate in Hz reported by the decoder, if known.
     pub fn sample_rate(&self) -> Option<u32> {
-        match self {
-            Self::Pcm(d) => d.sample_rate,
-            #[cfg(not(target_arch = "xtensa"))]
-            Self::Mp3(d) => {
-                if d.sample_rate > 0 {
-                    Some(d.sample_rate)
-                } else {
-                    None
-                }
-            }
-            #[cfg(target_arch = "xtensa")]
-            Self::Mp3(d) => {
-                if d.sample_rate > 0 {
-                    Some(d.sample_rate)
-                } else {
-                    None
-                }
-            }
-            Self::Flac(d) => {
-                if d.sample_rate > 0 {
-                    Some(d.sample_rate)
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(target_arch = "xtensa"))]
-            Self::Aac(d) => {
-                if d.sample_rate > 0 {
-                    Some(d.sample_rate)
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(target_arch = "xtensa"))]
-            Self::Vorbis(d) => {
-                if d.sample_rate > 0 {
-                    Some(d.sample_rate)
-                } else {
-                    None
-                }
-            }
+        let rate = match self {
+            Self::Pcm(d) => return d.sample_rate,
+            Self::Mp3(d) => d.sample_rate,
+            Self::Flac(d) => d.sample_rate,
+            #[cfg(feature = "std-codecs")]
+            Self::Aac(d) => d.sample_rate,
+            #[cfg(feature = "std-codecs")]
+            Self::Vorbis(d) => d.sample_rate,
+        };
+        if rate > 0 {
+            Some(rate)
+        } else {
+            None
         }
+    }
+
+    /// A fresh MP3 decoder, or `None` when this build cannot create one (without `std-codecs`
+    /// the static MP3 decoder is owned by bring-up).
+    #[cfg(feature = "std-codecs")]
+    pub fn new_mp3() -> Option<Self> {
+        Some(Self::Mp3(Box::new(squeezelite_decoders::Mp3Decoder::new())))
+    }
+
+    /// A fresh MP3 decoder, or `None` when this build cannot create one (without `std-codecs`
+    /// the static MP3 decoder is owned by bring-up).
+    #[cfg(not(feature = "std-codecs"))]
+    pub fn new_mp3() -> Option<Self> {
+        None
+    }
+
+    /// A fresh AAC decoder, or `None` when the build lacks `std-codecs`.
+    #[cfg(feature = "std-codecs")]
+    pub fn new_aac() -> Option<Self> {
+        Some(Self::Aac(Box::new(squeezelite_decoders::AacDecoder::new())))
+    }
+
+    /// A fresh AAC decoder, or `None` when the build lacks `std-codecs`.
+    #[cfg(not(feature = "std-codecs"))]
+    pub fn new_aac() -> Option<Self> {
+        None
+    }
+
+    /// A fresh Ogg Vorbis decoder, or `None` when the build lacks `std-codecs`.
+    #[cfg(feature = "std-codecs")]
+    pub fn new_vorbis() -> Option<Self> {
+        Some(Self::Vorbis(Box::new(squeezelite_decoders::VorbisDecoder::new())))
+    }
+
+    /// A fresh Ogg Vorbis decoder, or `None` when the build lacks `std-codecs`.
+    #[cfg(not(feature = "std-codecs"))]
+    pub fn new_vorbis() -> Option<Self> {
+        None
+    }
+
+    /// A fresh FLAC decoder (available in every build).
+    pub fn new_flac() -> Self {
+        Self::Flac(Box::new(squeezelite_decoders::FlacDecoder::new()))
     }
 
     /// Returns whether the active decoder has unconsumed decoded PCM frames waiting in its internal buffer.
@@ -433,29 +452,19 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// - `'a'` / `'A'`: AAC (syom)
     /// - `'o'` / `'O'`: Ogg Vorbis (lewton)
     /// - `'p'` / `'P'`: PCM passthrough
+    ///
+    /// A codec missing from this build (MP3/AAC/Vorbis without `std-codecs`) leaves the current
+    /// decoder unchanged.
     pub fn select_format(&mut self, format_byte: u8) {
-        match format_byte {
-            b'm' | b'M' => {
-                #[cfg(not(target_arch = "xtensa"))]
-                self.set_decoder(ActiveDecoder::Mp3(Box::new(squeezelite_decoders::Mp3Decoder::new())));
-            }
-            b'f' | b'F' => {
-                self.set_decoder(ActiveDecoder::Flac(Box::new(squeezelite_decoders::FlacDecoder::new())));
-            }
-            b'a' | b'A' => {
-                #[cfg(not(target_arch = "xtensa"))]
-                self.set_decoder(ActiveDecoder::Aac(Box::new(squeezelite_decoders::AacDecoder::new())));
-            }
-            b'o' | b'O' => {
-                #[cfg(not(target_arch = "xtensa"))]
-                self.set_decoder(ActiveDecoder::Vorbis(Box::new(squeezelite_decoders::VorbisDecoder::new())));
-            }
-            b'p' | b'P' => {
-                self.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
-            }
-            _ => {
-                self.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
-            }
+        let decoder = match format_byte {
+            b'm' | b'M' => ActiveDecoder::new_mp3(),
+            b'f' | b'F' => Some(ActiveDecoder::new_flac()),
+            b'a' | b'A' => ActiveDecoder::new_aac(),
+            b'o' | b'O' => ActiveDecoder::new_vorbis(),
+            _ => Some(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true))),
+        };
+        if let Some(decoder) = decoder {
+            self.set_decoder(decoder);
         }
     }
 

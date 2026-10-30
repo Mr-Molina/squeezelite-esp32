@@ -5,6 +5,10 @@
 //! [`ClientMessage`], and compares the ordered opcode sequence with
 //! `fixtures/strm_session_baseline.txt`.
 //!
+//! Since Task 7 the session is driven only through `PlayerCoordinator::tick` over the real
+//! host adapters (`SlimprotoClient` as `SlimTransport`, `HttpAudioStream` as `StreamSource`);
+//! the fixture itself is unchanged.
+//!
 //! The fixture is the regression net for the coordinator refactor: it must keep passing.
 //! A legitimate behavior change updates the fixture with a comment line naming the task.
 #![cfg(not(target_arch = "xtensa"))]
@@ -14,7 +18,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use louder_esp32_app::coordinator::PlayerCoordinator;
-use louder_esp32_app::network::SlimprotoClient;
+use louder_esp32_app::io_traits::{MockBackend, SlimTransport, TransportError};
+use louder_esp32_app::network::{HttpAudioStream, SlimprotoClient};
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
 use louder_esp32_app::NullAudioSink;
 use squeezelite_decoders::PcmDecoder;
@@ -153,33 +158,64 @@ fn accept_http_stream(listener: &TcpListener) -> TcpStream {
 
 type Pipeline<'a> = StreamPipeline<'a, NullAudioSink>;
 
+/// The player's control connection, counting the server frames handed to the coordinator so the
+/// script knows when a command has been consumed.
+struct Lms {
+    client: SlimprotoClient,
+    frames_delivered: usize,
+}
+
+impl SlimTransport for Lms {
+    fn poll_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        let frame = self.client.poll_frame(buf)?;
+        if frame.is_some() {
+            self.frames_delivered += 1;
+        }
+        Ok(frame)
+    }
+
+    fn send(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+        self.client.send(frame)
+    }
+
+    fn connected(&self) -> bool {
+        self.client.connected()
+    }
+}
+
+/// Everything one coordinator tick drives.
+struct Player<'a> {
+    coordinator: PlayerCoordinator,
+    pipeline: Pipeline<'a>,
+    lms: Lms,
+    stream: HttpAudioStream,
+    backend: MockBackend,
+}
+
+impl Player<'_> {
+    fn tick(&mut self, now_ms: u32) {
+        self.coordinator
+            .tick(&mut self.lms, &mut self.stream, &mut self.backend, &mut self.pipeline, now_ms)
+            .expect("coordinator tick");
+    }
+}
+
 /// Ticks the coordinator until `done` holds.
-fn tick_until(
-    coordinator: &mut PlayerCoordinator,
-    pipeline: &mut Pipeline<'_>,
-    client: &mut SlimprotoClient,
-    now_ms: u32,
-    what: &str,
-    done: impl Fn(&PlayerCoordinator) -> bool,
-) {
+fn tick_until(player: &mut Player<'_>, now_ms: u32, what: &str, done: impl Fn(&Player<'_>) -> bool) {
     let start = Instant::now();
-    while !done(coordinator) {
-        coordinator.tick(client, pipeline, now_ms);
+    while !done(player) {
+        player.tick(now_ms);
         assert!(start.elapsed() < DEADLINE, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
 
 /// Ticks until four consecutive ticks produce no output frames, so deferred STAT events flush.
-fn quiesce(
-    coordinator: &mut PlayerCoordinator,
-    pipeline: &mut Pipeline<'_>,
-    client: &mut SlimprotoClient,
-    now_ms: u32,
-) {
+fn quiesce(player: &mut Player<'_>, now_ms: u32) {
     let mut idle = 0;
     for _ in 0..10_000 {
-        if coordinator.tick(client, pipeline, now_ms) == 0 {
+        player.tick(now_ms);
+        if player.coordinator.last_tick_frames() == 0 {
             idle += 1;
             if idle == 4 {
                 return;
@@ -199,24 +235,28 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
     let http_port = http_listener.local_addr().unwrap().port();
 
     // The connect completes against the listen backlog; HELO is sent during connect.
-    let mut client = SlimprotoClient::connect(lms_addr, MAC, "TestPlayer").unwrap();
+    let client = SlimprotoClient::connect(lms_addr, MAC, "TestPlayer").unwrap();
     let mut lms_conn = accept_with_deadline(&lms_listener);
 
-    let mut coordinator = PlayerCoordinator::new(MAC, "TestPlayer");
     let mut stream_storage = [0u8; 8192];
     let mut output_storage = [0u8; 8192];
-    let mut pipeline = StreamPipeline::new(
-        &mut stream_storage,
-        &mut output_storage,
-        ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)),
-        NullAudioSink::new(44100),
-        44100,
-    );
+    let mut player = Player {
+        coordinator: PlayerCoordinator::new(MAC, "TestPlayer"),
+        pipeline: StreamPipeline::new(
+            &mut stream_storage,
+            &mut output_storage,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)),
+            NullAudioSink::new(44100),
+            44100,
+        ),
+        lms: Lms { client, frames_delivered: 0 },
+        stream: HttpAudioStream::new(),
+        backend: MockBackend::new(),
+    };
 
     let mut http_conn: Option<TcpStream> = None;
     let mut now_ms: u32 = 0;
     let mut stream_bytes_sent: u64 = 0;
-    let mut scratch = [0u8; 2048];
 
     for step in script {
         match step {
@@ -227,19 +267,12 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
                 }
                 lms_conn.write_all(&frame).unwrap();
 
-                let start = Instant::now();
-                let command = loop {
-                    if let Some(cmd) = client.poll_command(&mut scratch).unwrap() {
-                        break cmd;
-                    }
-                    assert!(start.elapsed() < DEADLINE, "timed out waiting for server command");
-                    std::thread::sleep(Duration::from_millis(1));
-                };
-                coordinator
-                    .handle_command(command, &mut pipeline, &mut client, now_ms)
-                    .unwrap();
+                let delivered = player.lms.frames_delivered + 1;
+                tick_until(&mut player, now_ms, "server command", |p| {
+                    p.lms.frames_delivered >= delivered
+                });
 
-                if coordinator.audio_stream.is_some() && http_conn.is_none() {
+                if player.coordinator.stream_active() && http_conn.is_none() {
                     http_conn = Some(accept_http_stream(&http_listener));
                 }
             }
@@ -250,29 +283,25 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
                     .write_all(bytes)
                     .unwrap();
                 stream_bytes_sent += bytes.len() as u64;
-                tick_until(&mut coordinator, &mut pipeline, &mut client, now_ms, "stream bytes", |c| {
-                    c.stream_bytes_received >= stream_bytes_sent
+                tick_until(&mut player, now_ms, "stream bytes", |p| {
+                    p.coordinator.stream_bytes_received >= stream_bytes_sent
                 });
-                quiesce(&mut coordinator, &mut pipeline, &mut client, now_ms);
+                quiesce(&mut player, now_ms);
             }
             ScriptStep::StreamEof => {
                 drop(http_conn.take().expect("StreamEof before a stream was started"));
-                tick_until(&mut coordinator, &mut pipeline, &mut client, now_ms, "stream EOF", |c| {
-                    c.is_stream_eof()
-                });
-                quiesce(&mut coordinator, &mut pipeline, &mut client, now_ms);
+                tick_until(&mut player, now_ms, "stream EOF", |p| p.coordinator.is_stream_eof());
+                quiesce(&mut player, now_ms);
             }
             ScriptStep::AdvanceMs(ms) => {
                 now_ms = now_ms.wrapping_add(*ms);
-                coordinator.tick(&mut client, &mut pipeline, now_ms);
+                player.tick(now_ms);
             }
         }
     }
 
     // Closing the client lets the mock server read everything the player sent up to EOF.
-    drop(pipeline);
-    drop(coordinator);
-    drop(client);
+    drop(player);
     let mut outbound = Vec::new();
     lms_conn.read_to_end(&mut outbound).unwrap();
     parse_client_frames(&outbound)
