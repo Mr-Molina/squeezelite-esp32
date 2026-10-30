@@ -14,6 +14,7 @@ pub mod coordinator;
 pub mod cyd;
 pub mod hal;
 pub mod http_control;
+pub mod io_traits;
 #[cfg(not(target_arch = "xtensa"))]
 pub mod network;
 pub mod ota_safety;
