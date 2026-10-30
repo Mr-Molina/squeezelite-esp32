@@ -5,7 +5,11 @@
 //! - `0xD000` (`0x2000`): `otadata` partition (`0xFF` = boot `recovery` factory partition at `0x10000`)
 //! - `0x10000` (`0x150000`): `recovery` (`factory` partition — NEVER modified by OTA)
 //! - `0x160000` (`0x290000`): `ota_0` partition (target slot for `louder-esp32-app`)
-//! - `0x3F0000` (`0x10000`): `settings` partition (strictly read-only from Rust)
+//! - `0x3F0000` (`0x10000`): `settings` partition (the C firmware's NVS). Rust reads its last two
+//!   sectors (`0x3FE000`, `0x3FF000`) as the settings FlashJournal at boot and writes ONLY the
+//!   journal: the default build erases + writes sector `0x3FE000` alone, on the reboot paths
+//!   with APP_CPU parked; the `runtime-flash-persist` build may also write `0x3FF000`
+//!   (ping-pong) at runtime. Nothing else in the partition is written from Rust.
 
 use heapless::String;
 
@@ -33,9 +37,11 @@ pub const OTA_0_PARTITION_OFFSET: u32 = 0x0016_0000;
 /// Maximum size of the `ota_0` app partition in bytes (2,624 KB = 2,686,976 bytes).
 pub const OTA_0_PARTITION_SIZE: u32 = 0x0029_0000;
 
-/// Offset of the `settings` partition (`partitions.csv`, strictly read-only).
+/// Offset of the `settings` partition (`partitions.csv`). Rust writes only the journal sectors
+/// at [`SETTINGS_JOURNAL_OFFSET`] (`0x3FE000`; `0x3FF000` too with `runtime-flash-persist`).
 pub const SETTINGS_PARTITION_OFFSET: u32 = 0x003F_0000;
-/// Offset of the `settings` journal sector (last 4KB sector of settings partition at 0x003F_E000).
+/// Offset of the `settings` journal: sector A at 0x003F_E000 (the only sector the default build
+/// writes); sector B, 0x003F_F000, is the last 4 KB sector of the partition.
 pub const SETTINGS_JOURNAL_OFFSET: u32 = 0x003F_E000;
 /// Size of the `settings` partition in bytes (64 KB).
 pub const SETTINGS_PARTITION_SIZE: u32 = 0x0001_0000;

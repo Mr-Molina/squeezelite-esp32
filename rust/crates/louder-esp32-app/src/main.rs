@@ -324,13 +324,13 @@ mod xtensa_hw {
     use louder_esp32_app::board::first_boot_defaults;
     use louder_esp32_app::config_handle::{
         resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigSource, JournalSector,
-        JournalSlot, RamJournal,
+        FlashTargetPolicy, JournalSlot, RamJournal,
     };
     use louder_esp32_app::net_device::{HttpStreamState, SlimLinkState};
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{DeadManLeaseWatchdog, HttpControlAction};
     use squeezelite_audio_core::EqPreset;
-    use squeezelite_config::{FlashJournal, JournalView, WifiCredentials};
+    use squeezelite_config::{FlashJournal, JournalView};
     use squeezelite_cyd_link::CydMessage;
     use louder_esp32_app::ota_safety::{
         load_nvs_wifi_credentials_split_12kb, resolve_wifi_credentials, verify_otadata_erased,
@@ -835,9 +835,10 @@ mod xtensa_hw {
         )
     }
 
-    /// Boot resolution of the Wi-Fi STA credentials (spec §3.4): the settings journal's
-    /// (`journal_wifi`), else the C firmware's NVS (read only when the journal has none), else
-    /// the compile-time first-boot credentials; none at all resets into recovery, as before.
+    /// Boot resolution of the Wi-Fi STA credentials, Phase 0/1: the C firmware's NVS, else the
+    /// compile-time first-boot credentials; none at all resets into recovery, as before. Journal
+    /// `wifi.*` keys are ignored (Wi-Fi provisioning belongs to the C recovery firmware until
+    /// Phase 3, and no Rust path can write or clear them).
     /// The result lives in `.dram2_uninit` for the life of the image (`/status.json` shows the
     /// SSID), keeping it off the boot frame and out of `.bss` (which would shrink `.stack`).
     #[allow(unsafe_code)]
@@ -846,13 +847,12 @@ mod xtensa_hw {
         flash: &mut FlashStorage<'_>,
         nvs_scratch: &mut [u8; 12_288],
         sta_mac: &[u8; 6],
-        journal_wifi: Option<&WifiCredentials>,
     ) -> &'static WifiStaCredentials {
         #[unsafe(link_section = ".dram2_uninit")]
         static mut WIFI_STA_CREDS: core::mem::MaybeUninit<WifiStaCredentials> =
             core::mem::MaybeUninit::uninit();
+        // Journal precedence for Wi-Fi returns in Phase 3 with Rust provisioning.
         let resolved = resolve_boot_wifi(
-            journal_wifi,
             || load_nvs_wifi_credentials(flash, sta_mac, nvs_scratch).ok(),
             || default_wifi_credentials(sta_mac),
         );
@@ -975,6 +975,18 @@ mod xtensa_hw {
 
     use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
 
+    /// Settings flash write target. Default build: sector A (0x3FE000) only, byte-identical to
+    /// the certified pre-reboot write. 0x3FF000 is page 15 of the C firmware's live `settings`
+    /// NVS partition, which the certified build never touched, and a failed C NVS init erases the
+    /// whole partition (`components/platform_config/nvs_utilities.c:97-100`). Boot still reads
+    /// and validates both sectors.
+    #[cfg(not(feature = "runtime-flash-persist"))]
+    const SETTINGS_FLASH_TARGET: FlashTargetPolicy = FlashTargetPolicy::FixedA;
+    /// Settings flash write target, `runtime-flash-persist`: dual-sector ping-pong at
+    /// 0x3FE000 / 0x3FF000 (power loss mid-write keeps the previous journal).
+    #[cfg(feature = "runtime-flash-persist")]
+    const SETTINGS_FLASH_TARGET: FlashTargetPolicy = FlashTargetPolicy::PingPong;
+
     /// Boot resolution step 1 + runtime configuration statics (spec §3.4–3.5, Task 10).
     ///
     /// Reads both settings sectors (0x3FE000 / 0x3FF000) into `scratch` -- the only flash read
@@ -983,7 +995,8 @@ mod xtensa_hw {
     /// `.dram2_uninit` (so neither `.stack` nor this frame carries them):
     /// - the [`ConfigHandle`] holding the resolved [`AudioConfig`](squeezelite_config::AudioConfig);
     /// - the [`RamJournal`]: DRAM sector image + which sector holds the newest journal and its
-    ///   sequence, so no later flash write ever needs to read flash.
+    ///   sequence, so no later flash write ever needs to read flash. Its flash target policy is
+    ///   [`SETTINGS_FLASH_TARGET`].
     #[allow(unsafe_code)]
     #[inline(never)]
     fn init_config(
@@ -1012,7 +1025,6 @@ mod xtensa_hw {
             JournalView::new(if index == 0 { &sector_a[..] } else { &sector_b[..] }).ok()
         });
         let audio = resolve_boot_audio(view.as_ref(), &first_boot_defaults::audio_config());
-        let journal_wifi = view.and_then(|v| WifiCredentials::load_from(&v).ok().flatten());
         let boot_slot = selected.map(|(index, seq)| (JournalSlot::from_index(index), seq));
 
         // SAFETY: called once (TAKEN); each static is fully written before the only reference
@@ -1021,7 +1033,7 @@ mod xtensa_hw {
             let image = (*core::ptr::addr_of_mut!(JOURNAL_IMAGE)).as_mut_ptr();
             image.write_bytes(0xFF, 1);
             let journal = (*core::ptr::addr_of_mut!(RAM_JOURNAL))
-                .write(RamJournal::new(&mut *image, boot_slot, journal_wifi));
+                .write(RamJournal::new(&mut *image, boot_slot, SETTINGS_FLASH_TARGET));
             let config = (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
             (&*config, journal)
         }
@@ -1561,7 +1573,7 @@ mod xtensa_hw {
         wdt.feed();
         let wifi_sta_creds = {
             let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
-            init_wifi_credentials(&mut flash, boot_scratch, &sta_mac, journal.wifi())
+            init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
         };
         let (lms_ip, lms_port) = config.read(|c| {
             (

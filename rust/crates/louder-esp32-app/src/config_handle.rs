@@ -11,11 +11,12 @@
 //!   change it through [`ConfigHandle::update`].
 //! - [`ConfigWriter`]: the debounce state machine of the `config_writer` task: a change is
 //!   journaled once no further change has arrived for [`DEBOUNCE_MS`].
-//! - [`RamJournal`]: the serialized journal image (a DRAM sector buffer) plus the ping-pong flash
-//!   bookkeeping (target sector, sequence) carried in RAM from the boot-time load, so a later
-//!   flash write never has to read flash to find where to go.
+//! - [`RamJournal`]: the serialized journal image (a DRAM sector buffer) plus the flash
+//!   bookkeeping (target sector per [`FlashTargetPolicy`], sequence) carried in RAM from the
+//!   boot-time load, so a later flash write never has to read flash to find where to go.
 //! - [`resolve_boot_audio`] / [`resolve_boot_wifi`]: the per-field boot resolution order
-//!   (FlashJournal, then the C firmware's NVS for Wi-Fi, then the first-boot defaults).
+//!   (audio/identity: FlashJournal, then first-boot defaults; Wi-Fi in Phase 0/1: the C
+//!   firmware's NVS, then the first-boot default).
 //!
 //! # Why a snapshot can never be torn
 //!
@@ -30,7 +31,7 @@ use core::cell::RefCell;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use squeezelite_config::{AudioConfig, KeyValueStorage, SectorWriter, WifiCredentials};
+use squeezelite_config::{AudioConfig, KeyValueStorage, SectorWriter};
 
 use crate::ota_safety::WifiStaCredentials;
 
@@ -244,48 +245,59 @@ pub struct PendingImage<'a> {
     pub sequence: u32,
 }
 
-/// The serialized settings journal kept in RAM, plus the ping-pong flash bookkeeping.
+/// Which journal sector a flash write targets. Chosen by the firmware build (the cfg lives in
+/// `main.rs`) and passed in at runtime, so this module stays platform-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashTargetPolicy {
+    /// Always sector A (0x3FE000): byte-identical to the certified pre-reboot write. The default
+    /// build: 0x3FF000 is page 15 of the C firmware's live `settings` NVS partition, which the
+    /// certified build never touched (a failed C NVS init erases the whole partition,
+    /// `components/platform_config/nvs_utilities.c:97-100`).
+    FixedA,
+    /// Dual-sector ping-pong (`runtime-flash-persist` builds only): the target is never the
+    /// sector holding the newest valid journal, so power loss mid-write keeps the previous one.
+    PingPong,
+}
+
+/// The serialized settings journal kept in RAM, plus the flash bookkeeping.
 ///
 /// Built from the boot-time flash load ([`Self::new`]): the sector holding the newest valid
-/// journal and its sequence. Every commit serializes the configuration (and the Wi-Fi
-/// credentials the boot journal held, so a commit never drops them) into the RAM image with the
-/// next sequence number and targets the OTHER sector, so a write interrupted by power loss
-/// always leaves the previous journal intact. Flash is never read after boot.
+/// journal (boot reads and validates BOTH sectors) and its sequence. Every commit serializes the
+/// audio/identity configuration into the RAM image with the next sequence number; the flash
+/// target follows the [`FlashTargetPolicy`]. Journal `wifi.*` keys are never written (Phase 0/1:
+/// Wi-Fi provisioning belongs to the C recovery firmware), so a commit drops any the boot
+/// journal held. Flash is never read after boot.
 pub struct RamJournal<'a> {
     image: &'a mut JournalSector,
     image_len: usize,
     sequence: u32,
     target: JournalSlot,
+    policy: FlashTargetPolicy,
     flash_pending: bool,
-    wifi: Option<WifiCredentials>,
 }
 
 impl<'a> RamJournal<'a> {
     /// `boot`: the sector holding the newest valid journal and its sequence (`None` when flash
-    /// held none). `wifi`: Wi-Fi credentials read from that journal, carried into every commit.
-    pub fn new(image: &'a mut JournalSector, boot: Option<(JournalSlot, u32)>, wifi: Option<WifiCredentials>) -> Self {
-        let (target, sequence) = match boot {
-            Some((active, sequence)) => (active.other(), sequence),
-            None => (JournalSlot::A, 0),
+    /// held none). `policy`: where flash writes go.
+    pub fn new(image: &'a mut JournalSector, boot: Option<(JournalSlot, u32)>, policy: FlashTargetPolicy) -> Self {
+        let sequence = boot.map_or(0, |(_, sequence)| sequence);
+        let target = match (policy, boot) {
+            (FlashTargetPolicy::FixedA, _) | (FlashTargetPolicy::PingPong, None) => JournalSlot::A,
+            (FlashTargetPolicy::PingPong, Some((active, _))) => active.other(),
         };
         Self {
             image,
             image_len: 0,
             sequence,
             target,
+            policy,
             flash_pending: false,
-            wifi,
         }
     }
 
     /// Sequence of the newest journal (RAM image, or the boot journal before any commit).
     pub fn sequence(&self) -> u32 {
         self.sequence
-    }
-
-    /// Wi-Fi credentials the boot journal held (carried into every commit).
-    pub fn wifi(&self) -> Option<&WifiCredentials> {
-        self.wifi.as_ref()
     }
 
     /// Sector the next flash write goes to.
@@ -304,11 +316,13 @@ impl<'a> RamJournal<'a> {
     }
 
     /// Records that [`Self::pending_image`] reached flash: that sector now holds the newest
-    /// journal and the next write targets the other one.
+    /// journal. With [`FlashTargetPolicy::PingPong`] the next write targets the other one.
     pub fn mark_flash_written(&mut self) {
         if self.flash_pending {
             self.flash_pending = false;
-            self.target = self.target.other();
+            if self.policy == FlashTargetPolicy::PingPong {
+                self.target = self.target.other();
+            }
         }
     }
 }
@@ -316,7 +330,7 @@ impl<'a> RamJournal<'a> {
 impl ConfigJournal for RamJournal<'_> {
     fn commit(&mut self, cfg: &AudioConfig) -> bool {
         let next = self.sequence.wrapping_add(1);
-        match serialize_image(&mut self.image.0, cfg, self.wifi.as_ref(), next) {
+        match serialize_image(&mut self.image.0, cfg, next) {
             Ok(len) => {
                 self.image_len = len;
                 self.sequence = next;
@@ -386,48 +400,33 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(journal: Option<&S>, defaults: &Au
     cfg
 }
 
-/// Boot resolution of the Wi-Fi station credentials: the journal's, else the NVS ones (`nvs`
-/// is only called when the journal has none), else the default (`default` likewise).
+/// Boot resolution of the Wi-Fi station credentials: the C firmware's NVS ones, else the
+/// first-boot default (`default` is only called when NVS has none). Journal `wifi.*` keys are
+/// deliberately not an input: no Rust path can write or clear them in Phase 0/1, so a stale
+/// journal would shadow freshly re-provisioned NVS credentials forever.
 pub fn resolve_boot_wifi(
-    journal: Option<&WifiCredentials>,
     nvs: impl FnOnce() -> Option<WifiStaCredentials>,
     default: impl FnOnce() -> Option<WifiStaCredentials>,
 ) -> Option<(WifiStaCredentials, ConfigSource)> {
-    if let Some(creds) = journal {
-        // Same capacities (32-byte SSID, 64-byte passphrase), so the copy can not truncate.
-        return Some((
-            WifiStaCredentials {
-                ssid: creds.ssid.clone(),
-                password: creds.passphrase.clone(),
-            },
-            ConfigSource::Journal,
-        ));
-    }
+    // Journal precedence for Wi-Fi returns in Phase 3 with Rust provisioning.
     if let Some(creds) = nvs() {
         return Some((creds, ConfigSource::Nvs));
     }
     default().map(|creds| (creds, ConfigSource::Default))
 }
 
-/// Serializes `cfg` (+ `wifi`) as a complete journal image into `sector` with `sequence`;
-/// returns the image length. Both configs are validated first, so on `Err` `sector` is
-/// untouched.
+/// Serializes `cfg` (audio/identity keys only, never `wifi.*`) as a complete journal image into
+/// `sector` with `sequence`; returns the image length. `cfg` is validated first, so on `Err`
+/// `sector` is untouched.
 fn serialize_image(
     sector: &mut [u8; JOURNAL_SECTOR_SIZE],
     cfg: &AudioConfig,
-    wifi: Option<&WifiCredentials>,
     sequence: u32,
 ) -> Result<usize, squeezelite_config::StorageError> {
     cfg.validate()?;
-    if let Some(wifi) = wifi {
-        wifi.validate()?;
-    }
     sector.fill(0xFF);
     let mut writer = SectorWriter::new(&mut sector[..])?;
     cfg.save_to(&mut writer)?;
-    if let Some(wifi) = wifi {
-        wifi.save_to(&mut writer)?;
-    }
     writer.finish(sequence)
 }
 
@@ -498,7 +497,7 @@ mod tests {
     #[test]
     fn test_ram_journal_refused_commit_keeps_pending_image() {
         let mut image = JournalSector::erased();
-        let mut ram = RamJournal::new(&mut image, Some((JournalSlot::B, 9)), None);
+        let mut ram = RamJournal::new(&mut image, Some((JournalSlot::B, 9)), FlashTargetPolicy::PingPong);
         assert_eq!(ram.target(), JournalSlot::A);
         assert!(ram.commit(&AudioConfig::default()));
         let mut bad = AudioConfig::default();
@@ -510,5 +509,16 @@ mod tests {
         ram.mark_flash_written();
         ram.mark_flash_written(); // idempotent without a pending image
         assert_eq!(ram.target(), JournalSlot::B);
+
+        // FixedA never leaves sector A, whatever the boot journal and however many writes.
+        let mut image = JournalSector::erased();
+        let mut ram = RamJournal::new(&mut image, Some((JournalSlot::B, 9)), FlashTargetPolicy::FixedA);
+        for seq in 10..13 {
+            assert!(ram.commit(&AudioConfig::default()));
+            let p = ram.pending_image().unwrap();
+            assert_eq!((p.slot, p.sequence), (JournalSlot::A, seq));
+            ram.mark_flash_written();
+            assert_eq!(ram.target(), JournalSlot::A);
+        }
     }
 }

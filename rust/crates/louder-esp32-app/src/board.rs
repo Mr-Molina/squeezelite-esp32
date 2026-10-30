@@ -52,6 +52,10 @@ pub mod first_boot_defaults {
     use squeezelite_config::AudioConfig;
 
     /// Player name announced to LMS (`SETD`) until LMS or a user renames the player.
+    ///
+    /// Must be exactly 8 bytes: it is also the Bluetooth local name, and the fixed SDP service
+    /// record in `bt_a2dp.rs` holds an 8-byte Text element (compile-time assert where the record
+    /// is built from `BT_LOCAL_NAME`).
     pub const PLAYER_NAME: &str = "BASEMENT";
     /// Lyrion Music Server (LMS) IPv4 address.
     pub const LMS_SERVER_IP: [u8; 4] = [10, 0, 0, 10];

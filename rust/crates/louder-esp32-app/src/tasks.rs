@@ -55,13 +55,15 @@
 //! Every runtime change (`setd` name in the coordinator, `/cmd.json` EQ/AGAIN/volume, LMS
 //! `audg` volume, CYD volume) goes through the [`ConfigHandle`]. `config_writer` polls it every
 //! `CONFIG_WRITER_POLL_MS` (100 ms) and, once a change has been quiet for `DEBOUNCE_MS` (2 s),
-//! serializes the snapshot into the RAM journal (DRAM sector image + next sequence, ping-pong
-//! target sector tracked in RAM since the boot load). Flash is written:
+//! serializes the snapshot into the RAM journal (DRAM sector image + next sequence; target
+//! sector and sequence tracked in RAM since the boot load). Flash is written:
 //! - default build: ONLY on the reboot paths (`/recovery.json`, `/reboot.json`,
 //!   `/reboot_ota.json`), by `flush_settings_before_reboot` -- `flush_now`, then the certified
-//!   pre-reboot write with APP_CPU parked. No flash I/O at runtime (WO-108/WO-109 deadlock);
+//!   pre-reboot write of sector A (0x3FE000) with APP_CPU parked, byte-identical to the
+//!   certified build (`main.rs` `SETTINGS_FLASH_TARGET`). No flash I/O at runtime (WO-108/WO-109
+//!   deadlock);
 //! - feature `runtime-flash-persist` (default OFF): additionally at runtime, hazard-gated, in
-//!   `runtime_flash_commit` (rules documented there).
+//!   `runtime_flash_commit` (rules documented there), with dual-sector ping-pong.
 //!
 //! [`ConfigHandle`]: louder_esp32_app::config_handle::ConfigHandle
 //!
@@ -313,7 +315,7 @@ mod device {
         // --- configuration (Task 10) ---
         /// Runtime configuration every settings change goes through.
         pub(crate) config: &'static ConfigHandle,
-        /// RAM settings journal (DRAM image + ping-pong target/sequence from the boot load).
+        /// RAM settings journal (DRAM image + target/sequence from the boot load).
         pub(crate) journal: &'static mut RamJournal<'static>,
         /// Boot-resolved Wi-Fi credentials (journal, else NVS, else first-boot default).
         pub(crate) wifi_sta_creds: &'static WifiStaCredentials,
@@ -492,7 +494,8 @@ mod device {
     ///    carries them from the boot-time load;
     /// 4. DRAM-only buffers: `write_nor` writes straight from the word-aligned RAM journal image
     ///    in `.dram2_uninit` (no bounce buffer, nothing in PSRAM);
-    /// 5. dual-sector ping-pong at 0x3FE000 / 0x3FF000 with the FlashJournal sequence logic: the
+    /// 5. dual-sector ping-pong at 0x3FE000 / 0x3FF000 with the FlashJournal sequence logic
+    ///    (`FlashTargetPolicy::PingPong`, selected in `main.rs` for this feature only): the
     ///    target is never the sector holding the newest valid journal, so power loss mid-write
     ///    leaves the previous journal intact;
     /// 6. a failed erase/write is retried after 60 s, never in a loop.
@@ -533,13 +536,20 @@ mod device {
     }
 
     /// Before every reboot action: journal any pending change into RAM now (`flush_now`, no
-    /// debounce), then write the RAM journal to its ping-pong sector with the certified
+    /// debounce), then write the RAM journal to its target sector with the certified
     /// pre-reboot sequence: APP_CPU parked first, DRAM buffer, sector erase + write. In the
-    /// default build this is the ONLY settings flash write (WO-109).
+    /// default build this is the ONLY settings flash write (WO-109) and the target is always
+    /// sector A (0x3FE000), byte-identical to the certified build.
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut FirmwareState) {
         s.config.flush_now(&mut *s.journal);
         if let Some(image) = s.journal.pending_image() {
+            // Default build: sector A (0x3FE000) as a constant, exactly the certified write
+            // (`FlashTargetPolicy::FixedA` keeps `image.slot` at A too). Any image is valid in
+            // either sector (the newest sequence wins at boot), so the constant is always safe.
+            #[cfg(not(feature = "runtime-flash-persist"))]
+            let offset = SETTINGS_JOURNAL_OFFSET;
+            #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
             s.core1.park_for_flash_write();
             let _ = s.flash.erase(offset, offset + 4096);
