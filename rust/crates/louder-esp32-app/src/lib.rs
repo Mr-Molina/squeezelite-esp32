@@ -20,6 +20,7 @@ pub mod network;
 pub mod ota_safety;
 pub mod pipeline;
 pub mod sink;
+pub mod stream_codec;
 pub mod wifi;
 
 pub use amp::{AmpManager, AmpMode};

@@ -9,6 +9,10 @@ use std::time::Duration;
 use crate::io_traits::{
     HeaderBuf, MetaBuf, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
+use crate::stream_codec::{
+    find_head_end, request_host, ChunkedDecoder, IcyStripper, RedirectPolicy, RedirectTarget,
+    ResponseHead,
+};
 use squeezelite_proto::{
     DiscoveredServer, DiscoveryBuilder, DiscoveryParser, DisconnectReason, ParseError, ServerCommand,
     SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
@@ -441,22 +445,6 @@ impl SlimTransport for SlimprotoClient {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkDecoderState {
-    ReadSize,
-    ReadData(usize),
-    ReadCrlf,
-    ReadTrailer,
-    Eof,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IcyDecoderState {
-    Audio,
-    MetaLen,
-    MetaData { remaining: usize },
-}
-
 fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, String)> {
     let s = location.trim().trim_matches('"').trim_matches('\'').trim();
     let without_scheme = if let Some(stripped) = s.strip_prefix("http://") {
@@ -508,43 +496,6 @@ fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, S
     Ok((addr, host_port.to_string(), path.to_string()))
 }
 
-fn format_redirect_request(template: &str, host_port: &str, path: &str) -> String {
-    if template.is_empty() {
-        return format!("GET {path} HTTP/1.0\r\nHost: {host_port}\r\n\r\n");
-    }
-
-    let mut lines = Vec::new();
-    let mut first_line = true;
-    let mut host_found = false;
-
-    for line in template.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if first_line {
-            first_line = false;
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            let proto = if parts.len() >= 3 { parts[2] } else { "HTTP/1.0" };
-            let method = if !parts.is_empty() { parts[0] } else { "GET" };
-            lines.push(format!("{method} {path} {proto}"));
-        } else if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("host:") {
-            lines.push(format!("Host: {host_port}"));
-            host_found = true;
-        } else {
-            lines.push(trimmed.to_string());
-        }
-    }
-
-    if !host_found {
-        lines.push(format!("Host: {host_port}"));
-    }
-
-    let mut req = lines.join("\r\n");
-    req.push_str("\r\n\r\n");
-    req
-}
-
 /// Opens a TCP connection to `addr` and writes `request` while the socket is still blocking
 /// (1500ms connect/write timeout, `HALNET-410`); only then switches it to non-blocking mode
 /// (`HALNET-404`).
@@ -560,13 +511,8 @@ fn open_stream(addr: SocketAddr, request: &[u8]) -> std::io::Result<TcpStream> {
 
 /// Value of the `Host:` header in `request`, falling back to the socket address.
 fn host_of_request(request: &str, addr: SocketAddr) -> String {
-    request
-        .lines()
-        .find_map(|l| {
-            let t = l.trim();
-            (t.len() >= 5 && t[..5].eq_ignore_ascii_case("host:")).then(|| t[5..].trim().to_string())
-        })
-        .filter(|h| !h.is_empty())
+    request_host(request.as_bytes())
+        .map(|h| String::from_utf8_lossy(h).into_owned())
         .unwrap_or_else(|| addr.to_string())
 }
 
@@ -590,7 +536,7 @@ pub struct HttpAudioStream {
 
     // Redirect & request tracking
     request_template: String,
-    redirect_count: usize,
+    redirects: RedirectPolicy,
     response_headers: Option<Vec<u8>>,
     /// Address and `Host` value of the server currently being read; same-origin (relative)
     /// `Location` values resolve against these.
@@ -599,18 +545,14 @@ pub struct HttpAudioStream {
 
     // Chunked transfer decoding
     is_chunked: bool,
-    chunk_state: ChunkDecoderState,
+    chunk: ChunkedDecoder,
     raw_body_buf: Vec<u8>,
     unchunked_buf: Vec<u8>,
     /// Body bytes still owed according to `Content-Length` (not chunked).
     content_remaining: Option<u64>,
 
     // ICY metadata handling
-    icy_metaint: usize,
-    icy_audio_remaining: usize,
-    icy_state: IcyDecoderState,
-    icy_meta_accum: Vec<u8>,
-    latest_icy_metadata: Option<Vec<u8>>,
+    icy: IcyStripper,
 
     // Final pure audio buffer
     audio_buf: Vec<u8>,
@@ -647,22 +589,18 @@ impl HttpAudioStream {
             eof: false,
 
             request_template: String::new(),
-            redirect_count: 0,
+            redirects: RedirectPolicy::new(),
             response_headers: None,
             cur_addr: None,
             cur_host: String::new(),
 
             is_chunked: false,
-            chunk_state: ChunkDecoderState::ReadSize,
+            chunk: ChunkedDecoder::new(),
             raw_body_buf: Vec::with_capacity(2048),
             unchunked_buf: Vec::with_capacity(2048),
             content_remaining: None,
 
-            icy_metaint: 0,
-            icy_audio_remaining: 0,
-            icy_state: IcyDecoderState::Audio,
-            icy_meta_accum: Vec::new(),
-            latest_icy_metadata: None,
+            icy: IcyStripper::new(),
 
             audio_buf: Vec::with_capacity(2048),
             total_audio_bytes: 0,
@@ -713,19 +651,17 @@ impl HttpAudioStream {
 
     /// Returns the latest parsed ICY metadata block, if available.
     pub fn take_icy_metadata(&mut self) -> Option<Vec<u8>> {
-        self.latest_icy_metadata.take()
+        self.icy.take_metadata()
     }
 
     /// Configures the ICY metadata interval in audio bytes.
     pub fn set_icy_metaint(&mut self, interval: usize) {
-        self.icy_metaint = interval;
-        self.icy_audio_remaining = interval;
-        self.icy_state = IcyDecoderState::Audio;
+        self.icy.set_metaint(interval);
     }
 
     /// Returns current ICY metadata interval.
     pub fn icy_metaint(&self) -> usize {
-        self.icy_metaint
+        self.icy.metaint()
     }
 
     /// Returns total audio stream bytes polled by caller.
@@ -733,186 +669,24 @@ impl HttpAudioStream {
         self.total_audio_bytes
     }
 
-    fn process_chunked_body(&mut self) -> std::io::Result<()> {
-        while !self.raw_body_buf.is_empty() {
-            match self.chunk_state {
-                ChunkDecoderState::ReadSize => {
-                    let delim_pos = self
-                        .raw_body_buf
-                        .windows(2)
-                        .position(|w| w == b"\r\n")
-                        .map(|p| (p, 2))
-                        .or_else(|| {
-                            self.raw_body_buf
-                                .iter()
-                                .position(|&b| b == b'\n')
-                                .map(|p| (p, 1))
-                        });
-
-                    if let Some((pos, delim_len)) = delim_pos {
-                        let line_slice = &self.raw_body_buf[..pos];
-                        let line_str = core::str::from_utf8(line_slice).map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "Invalid UTF-8 in chunk size line",
-                            )
-                        })?;
-                        let hex_str = line_str.split(';').next().unwrap_or("").trim();
-                        let chunk_size = usize::from_str_radix(hex_str, 16).map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Invalid chunk size hex: {hex_str}"),
-                            )
-                        })?;
-
-                        if chunk_size > Self::MAX_CHUNK_SIZE {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Chunk size {chunk_size} exceeds maximum allowed {}", Self::MAX_CHUNK_SIZE),
-                            ));
-                        }
-
-                        self.raw_body_buf.drain(..pos + delim_len);
-
-                        if chunk_size == 0 {
-                            self.chunk_state = ChunkDecoderState::ReadTrailer;
-                        } else {
-                            self.chunk_state = ChunkDecoderState::ReadData(chunk_size);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                ChunkDecoderState::ReadData(rem) => {
-                    let take = self.raw_body_buf.len().min(rem);
-                    if take > 0 {
-                        self.unchunked_buf.extend_from_slice(&self.raw_body_buf[..take]);
-                        self.raw_body_buf.drain(..take);
-                        let new_rem = rem - take;
-                        if new_rem == 0 {
-                            self.chunk_state = ChunkDecoderState::ReadCrlf;
-                        } else {
-                            self.chunk_state = ChunkDecoderState::ReadData(new_rem);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                ChunkDecoderState::ReadCrlf => {
-                    if self.raw_body_buf.starts_with(b"\r\n") {
-                        self.raw_body_buf.drain(..2);
-                        self.chunk_state = ChunkDecoderState::ReadSize;
-                    } else if self.raw_body_buf.starts_with(b"\n") {
-                        self.raw_body_buf.drain(..1);
-                        self.chunk_state = ChunkDecoderState::ReadSize;
-                    } else if self.raw_body_buf.is_empty() || self.raw_body_buf == b"\r" {
-                        break;
-                    } else {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Missing CRLF after chunk data",
-                        ));
-                    }
-                }
-                ChunkDecoderState::ReadTrailer => {
-                    if self.raw_body_buf.starts_with(b"\r\n") {
-                        self.raw_body_buf.drain(..2);
-                        self.chunk_state = ChunkDecoderState::Eof;
-                        self.eof = true;
-                        break;
-                    } else if self.raw_body_buf.starts_with(b"\n") {
-                        self.raw_body_buf.drain(..1);
-                        self.chunk_state = ChunkDecoderState::Eof;
-                        self.eof = true;
-                        break;
-                    } else if let Some(p) = self.raw_body_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        self.raw_body_buf.drain(..p + 4);
-                        self.chunk_state = ChunkDecoderState::Eof;
-                        self.eof = true;
-                        break;
-                    } else if let Some(p) = self.raw_body_buf.windows(2).position(|w| w == b"\n\n") {
-                        self.raw_body_buf.drain(..p + 2);
-                        self.chunk_state = ChunkDecoderState::Eof;
-                        self.eof = true;
-                        break;
-                    } else {
-                        break;
-                    }
-                }
-                ChunkDecoderState::Eof => {
-                    self.raw_body_buf.clear();
-                    self.eof = true;
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn process_icy_stripping(&mut self) {
-        if self.icy_metaint == 0 {
-            self.audio_buf.append(&mut self.unchunked_buf);
-            return;
-        }
-
-        while !self.unchunked_buf.is_empty() {
-            match self.icy_state {
-                IcyDecoderState::Audio => {
-                    if self.icy_audio_remaining > 0 {
-                        let take = self.unchunked_buf.len().min(self.icy_audio_remaining);
-                        self.audio_buf.extend_from_slice(&self.unchunked_buf[..take]);
-                        self.unchunked_buf.drain(..take);
-                        self.icy_audio_remaining -= take;
-                    }
-                    if self.icy_audio_remaining == 0 {
-                        self.icy_state = IcyDecoderState::MetaLen;
-                    }
-                }
-                IcyDecoderState::MetaLen => {
-                    let len_byte = self.unchunked_buf.remove(0);
-                    let meta_len = (len_byte as usize) * 16;
-                    if meta_len == 0 {
-                        self.icy_audio_remaining = self.icy_metaint;
-                        self.icy_state = IcyDecoderState::Audio;
-                    } else {
-                        self.icy_meta_accum.clear();
-                        self.icy_state = IcyDecoderState::MetaData { remaining: meta_len };
-                    }
-                }
-                IcyDecoderState::MetaData { remaining } => {
-                    let take = self.unchunked_buf.len().min(remaining);
-                    self.icy_meta_accum.extend_from_slice(&self.unchunked_buf[..take]);
-                    self.unchunked_buf.drain(..take);
-                    let new_rem = remaining - take;
-                    if new_rem == 0 {
-                        if !self.icy_meta_accum.is_empty() {
-                            let trimmed = self
-                                .icy_meta_accum
-                                .iter()
-                                .rposition(|&b| b != 0)
-                                .map_or(&[][..], |i| &self.icy_meta_accum[..=i]);
-                            if !trimmed.is_empty() {
-                                self.latest_icy_metadata = Some(trimmed.to_vec());
-                            }
-                            self.icy_meta_accum.clear();
-                        }
-                        self.icy_audio_remaining = self.icy_metaint;
-                        self.icy_state = IcyDecoderState::Audio;
-                    } else {
-                        self.icy_state = IcyDecoderState::MetaData { remaining: new_rem };
-                    }
-                }
-            }
-        }
-    }
-
+    /// De-chunks (when chunked) and ICY-strips everything in `raw_body_buf` into `audio_buf`
+    /// (shared state machines: [`ChunkedDecoder`], [`IcyStripper`]).
     fn process_raw_body(&mut self) -> std::io::Result<()> {
         if self.is_chunked {
-            self.process_chunked_body()?;
+            let n = self.chunk.decode_in_place(&mut self.raw_body_buf).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid chunked framing")
+            })?;
+            self.unchunked_buf.extend_from_slice(&self.raw_body_buf[..n]);
+            self.raw_body_buf.clear();
+            if self.chunk.is_done() {
+                self.eof = true;
+            }
         } else {
             self.unchunked_buf.append(&mut self.raw_body_buf);
         }
-        self.process_icy_stripping();
+        let n = self.icy.strip_in_place(&mut self.unchunked_buf);
+        self.audio_buf.extend_from_slice(&self.unchunked_buf[..n]);
+        self.unchunked_buf.clear();
         Ok(())
     }
 
@@ -952,167 +726,96 @@ impl HttpAudioStream {
 
             self.header_buf.extend_from_slice(&temp[..n]);
 
-            let delim_match = self
-                .header_buf
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|p| (p, 4))
-                .or_else(|| {
-                    self.header_buf
-                        .windows(2)
-                        .position(|w| w == b"\n\n")
-                        .map(|p| (p, 2))
-                });
+            let Some(head_len) = find_head_end(&self.header_buf) else {
+                return Ok(false);
+            };
+            let head = ResponseHead(&self.header_buf[..head_len]);
+            let Some(code) = head.status() else {
+                self.header_buf.clear();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Non-200 HTTP response",
+                ));
+            };
 
-            if let Some((pos, delim_len)) = delim_match {
-                let header_slice = &self.header_buf[..pos];
-                let header_str = String::from_utf8_lossy(header_slice);
-                let status_line = header_str.lines().next().unwrap_or("");
-                let is_valid_proto =
-                    status_line.starts_with("HTTP/1.") || status_line.starts_with("ICY ");
-
-                let status_code: Option<u16> = status_line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse().ok());
-
-                let code = match status_code {
-                    Some(c) if is_valid_proto => c,
-                    _ => {
-                        self.header_buf.clear();
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Non-200 HTTP response",
-                        ));
-                    }
-                };
-
-                // Check for redirects: 301, 302, 303, 307, 308
-                if matches!(code, 301 | 302 | 303 | 307 | 308) {
-                    if self.redirect_count >= Self::MAX_REDIRECTS {
-                        self.header_buf.clear();
-                        self.fault = Some(StreamError::TooManyRedirects);
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Too many redirects",
-                        ));
-                    }
-
-                    let location = header_str
-                        .lines()
-                        .find_map(|line| {
-                            let trimmed = line.trim();
-                            if let Some(pos) = trimmed.find(':') {
-                                if trimmed[..pos].trim().eq_ignore_ascii_case("location") {
-                                    Some(trimmed[pos + 1..].trim())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "Redirect response without Location header",
-                            )
-                        })?;
-
-                    // Same-origin Location (`/path`) stays on the current server; anything else
-                    // must be an absolute `http://` URL.
-                    let (new_addr, host_port, new_path) = match (location.starts_with('/'), self.cur_addr) {
-                        (true, Some(addr)) if !location.starts_with("//") => {
-                            (addr, self.cur_host.clone(), location.to_string())
-                        }
-                        _ => parse_http_location(location)?,
-                    };
-                    let new_request = format_redirect_request(
-                        &self.request_template,
-                        &host_port,
-                        &new_path,
-                    );
-
-                    let new_stream = open_stream(new_addr, new_request.as_bytes()).inspect_err(|_| {
-                        self.fault = Some(StreamError::ConnectFailed);
-                    })?;
-
-                    self.stream = Some(new_stream);
-                    self.cur_addr = Some(new_addr);
-                    self.cur_host = host_port;
-                    self.redirect_count += 1;
+            // Redirects: 301, 302, 303, 307, 308 (shared `RedirectPolicy`)
+            if RedirectPolicy::is_redirect(code) {
+                if let Err(e) = self.redirects.follow() {
                     self.header_buf.clear();
-                    continue;
-                }
-
-                // Verify 200 or 206 status (HALNET-406)
-                if code != 200 && code != 206 {
-                    self.header_buf.clear();
+                    self.fault = Some(e);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "Non-200 HTTP response",
+                        "Too many redirects",
                     ));
                 }
 
-                // Check for Transfer-Encoding: chunked
-                self.is_chunked = header_str.lines().any(|l| {
-                    let trimmed = l.trim();
-                    if let Some(pos) = trimmed.find(':') {
-                        trimmed[..pos].trim().eq_ignore_ascii_case("transfer-encoding")
-                            && trimmed[pos + 1..].to_ascii_lowercase().contains("chunked")
-                    } else {
-                        false
-                    }
-                });
+                let location = head.header(b"location").ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Redirect response without Location header",
+                    )
+                })?;
+                let target = RedirectPolicy::classify(location).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Unsupported Location in redirect",
+                    )
+                })?;
 
-                // Check for icy-metaint
-                if let Some(metaint) = header_str.lines().find_map(|l| {
-                    let trimmed = l.trim();
-                    if let Some(pos) = trimmed.find(':') {
-                        if trimmed[..pos].trim().eq_ignore_ascii_case("icy-metaint") {
-                            trimmed[pos + 1..].trim().parse::<usize>().ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }) {
-                    self.icy_metaint = metaint;
-                    self.icy_audio_remaining = metaint;
-                    self.icy_state = IcyDecoderState::Audio;
-                }
-
-                // Declared body length (identity encoding only), to tell truncation from EOF
-                let content_length = if self.is_chunked {
-                    None
-                } else {
-                    header_str.lines().find_map(|l| {
-                        let trimmed = l.trim();
-                        let pos = trimmed.find(':')?;
-                        if trimmed[..pos].trim().eq_ignore_ascii_case("content-length") {
-                            trimmed[pos + 1..].trim().parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    })
+                // Same-origin Location (`/path`) stays on the current server; anything else
+                // is an absolute `http://` URL, resolved here (host names included).
+                let (new_addr, host_port, new_path) = match (target, self.cur_addr) {
+                    (RedirectTarget::SameOrigin { path }, Some(addr)) => (
+                        addr,
+                        self.cur_host.clone(),
+                        String::from_utf8_lossy(path).into_owned(),
+                    ),
+                    _ => parse_http_location(&String::from_utf8_lossy(location))?,
                 };
+                let new_request = RedirectPolicy::rewrite_request(
+                    self.request_template.as_bytes(),
+                    host_port.as_bytes(),
+                    new_path.as_bytes(),
+                );
 
-                // Capture raw response headers (including delimiter)
-                self.response_headers = Some(self.header_buf[..pos + delim_len].to_vec());
+                let new_stream = open_stream(new_addr, &new_request).inspect_err(|_| {
+                    self.fault = Some(StreamError::ConnectFailed);
+                })?;
 
-                let body_start = pos + delim_len;
-                let leftover = self.header_buf.len() - body_start;
-                if leftover > 0 {
-                    self.raw_body_buf.extend_from_slice(&self.header_buf[body_start..]);
-                }
-                self.content_remaining = content_length.map(|l| l.saturating_sub(leftover as u64));
+                self.stream = Some(new_stream);
+                self.cur_addr = Some(new_addr);
+                self.cur_host = host_port;
                 self.header_buf.clear();
-                self.headers_parsed = true;
-                return Ok(true);
-            } else {
-                return Ok(false);
+                continue;
             }
+
+            // Verify 200 or 206 status (HALNET-406)
+            if code != 200 && code != 206 {
+                self.header_buf.clear();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Non-200 HTTP response",
+                ));
+            }
+
+            self.is_chunked = head.is_chunked();
+            if let Some(metaint) = head.icy_metaint() {
+                self.icy.set_metaint(metaint);
+            }
+            // Declared body length (identity encoding only), to tell truncation from EOF
+            let content_length = if self.is_chunked { None } else { head.content_length() };
+
+            // Capture raw response headers (including delimiter)
+            self.response_headers = Some(self.header_buf[..head_len].to_vec());
+
+            let leftover = self.header_buf.len() - head_len;
+            if leftover > 0 {
+                self.raw_body_buf.extend_from_slice(&self.header_buf[head_len..]);
+            }
+            self.content_remaining = content_length.map(|l| l.saturating_sub(leftover as u64));
+            self.header_buf.clear();
+            self.headers_parsed = true;
+            return Ok(true);
         }
         Ok(true)
     }
@@ -1169,10 +872,7 @@ impl HttpAudioStream {
                 self.eof = true;
                 let complete = if self.is_chunked {
                     // A last-chunk was seen (a missing final CRLF is tolerated).
-                    matches!(
-                        self.chunk_state,
-                        ChunkDecoderState::Eof | ChunkDecoderState::ReadTrailer
-                    )
+                    self.chunk.last_chunk_seen()
                 } else {
                     self.content_remaining.is_none_or(|r| r == 0)
                 };
@@ -1244,7 +944,7 @@ impl HttpAudioStream {
         self.unchunked_buf.clear();
         self.audio_buf.clear();
         self.response_headers = None;
-        self.latest_icy_metadata = None;
+        let _ = self.icy.take_metadata();
     }
 }
 
@@ -1969,7 +1669,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(http.is_eof());
-        assert!(!http.raw_body_buf.is_empty());
+        // The incomplete chunk-size line is held by the chunk decoder, never delivered as audio
+        // (before Task 9 these bytes sat in `raw_body_buf`).
+        assert!(!http.chunk.last_chunk_seen());
+        assert!(http.audio_buf.is_empty());
         handle.join().unwrap();
     }
 }
