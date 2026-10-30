@@ -120,43 +120,6 @@ where
 // registers through `AudioBackend::set_hw_volume` (Task 7); re-exported for existing callers.
 pub use louder_esp32_app::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
 
-/// Case-insensitively searches for `icy-metaint:` header in raw HTTP response headers
-/// and parses the integer metadata interval if present.
-pub fn parse_icy_metaint_header(headers: &[u8]) -> Option<usize> {
-    const NEEDLE: &[u8] = b"icy-metaint:";
-    let nlen = NEEDLE.len();
-    if headers.len() < nlen {
-        return None;
-    }
-    let max_pos = headers.len() - nlen;
-    for i in 0..=max_pos {
-        let mut matches = true;
-        for j in 0..nlen {
-            if headers[i + j].to_ascii_lowercase() != NEEDLE[j] {
-                matches = false;
-                break;
-            }
-        }
-        if matches {
-            let mut pos = i + nlen;
-            while pos < headers.len() && (headers[pos] == b' ' || headers[pos] == b'\t') {
-                pos += 1;
-            }
-            let mut val: usize = 0;
-            let mut found_digit = false;
-            while pos < headers.len() && headers[pos].is_ascii_digit() {
-                val = val.saturating_mul(10).saturating_add((headers[pos] - b'0') as usize);
-                found_digit = true;
-                pos += 1;
-            }
-            if found_digit && val > 0 {
-                return Some(val);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(not(target_arch = "xtensa"))]
 fn main() {
     let board = BoardModel::active();
@@ -332,17 +295,6 @@ fn main() {
     }
 }
 
-/// Encodes ESP32 I2S0_CLKM_CONF_REG fractional divider fields (ESP32 TRM Reg 12.6, CODE-MAIN-001):
-/// - bits [7:0] = div_num (integral divider)
-/// - bits [13:8] = div_b (fractional numerator)
-/// - bits [19:14] = div_a (fractional denominator)
-pub const fn encode_i2s0_clkm_conf(orig: u32, div_num: u32, div_b: u32, div_a: u32) -> u32 {
-    (orig & !0x000F_FFFF)
-        | (div_num & 0xFF)
-        | ((div_b & 0x3F) << 8)
-        | ((div_a & 0x3F) << 14)
-}
-
 #[cfg(target_arch = "xtensa")]
 mod xtensa_hw {
     extern crate alloc;
@@ -370,9 +322,13 @@ mod xtensa_hw {
     };
     use esp_storage::FlashStorage;
     use louder_esp32_app::amp::percent_to_attenuation;
-    use louder_esp32_app::board::{
-        BASEMENT_PLAYER_MAC, DEFAULT_WIFI_SSID,
+    use louder_esp32_app::backend_device::{
+        program_i2s_clock, I2sClockRegisters, I2S0_CLKM_CONF_ADDR, I2S0_SAMPLE_RATE_CONF_ADDR,
     };
+    use louder_esp32_app::board::{
+        BASEMENT_PLAYER_MAC, DEFAULT_LMS_SERVER_IP, DEFAULT_WIFI_SSID,
+    };
+    use louder_esp32_app::net_device::{HttpStreamState, SlimLinkState};
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{DeadManLeaseWatchdog, HttpControlAction};
     use louder_esp32_app::MemConfigStore;
@@ -619,6 +575,42 @@ mod xtensa_hw {
         }
     }
 
+    /// I2S0 clock registers (`backend_device` documents the layout), volatile access.
+    pub(crate) struct DeviceClockRegs;
+
+    #[allow(unsafe_code)]
+    impl I2sClockRegisters for DeviceClockRegs {
+        fn read_clkm_conf(&mut self) -> u32 {
+            // SAFETY: fixed, always-mapped I2S0 register; I2S0 is owned by this firmware.
+            unsafe { core::ptr::read_volatile(I2S0_CLKM_CONF_ADDR as *const u32) }
+        }
+        fn write_clkm_conf(&mut self, value: u32) {
+            // SAFETY: as above.
+            unsafe { core::ptr::write_volatile(I2S0_CLKM_CONF_ADDR as *mut u32, value) }
+        }
+        fn read_sample_rate_conf(&mut self) -> u32 {
+            // SAFETY: as above.
+            unsafe { core::ptr::read_volatile(I2S0_SAMPLE_RATE_CONF_ADDR as *const u32) }
+        }
+        fn write_sample_rate_conf(&mut self, value: u32) {
+            // SAFETY: as above.
+            unsafe { core::ptr::write_volatile(I2S0_SAMPLE_RATE_CONF_ADDR as *mut u32, value) }
+        }
+    }
+
+    /// Size of the I2S TX DMA stream buffer (`dma_tx_stream_buffer!` in [`init_i2s_pipeline`]).
+    const I2S_DMA_BUFFER_BYTES: usize = 8192;
+
+    /// Stereo frames queued in the I2S DMA buffer, updated by the driver after every push
+    /// (`AudioBackend::dma_outstanding_frames`).
+    pub(crate) static DMA_OUTSTANDING_FRAMES: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+
+    fn note_dma_fill(available_bytes: usize) {
+        let queued = I2S_DMA_BUFFER_BYTES.saturating_sub(available_bytes) / 8;
+        DMA_OUTSTANDING_FRAMES.store(queued as u32, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Hardware I2S0 + DMA_I2S0 audio output driver (`BCK=GPIO26`, `WS=GPIO25`, `DOUT=GPIO22`).
     pub struct Esp32HardwareI2sDma<'d> {
         transfer: Option<
@@ -717,6 +709,7 @@ mod xtensa_hw {
                         }
                     }
                 }
+                note_dma_fill(transfer.available_bytes());
             }
         }
     }
@@ -786,38 +779,18 @@ mod xtensa_hw {
                     break;
                 }
             }
+            note_dma_fill(transfer.available_bytes());
             Ok(total_written)
         }
 
-        #[allow(unsafe_code)]
+        /// Programs the I2S0 dividers AND the bit-clock divider from the verified clock table
+        /// (`backend_device::program_i2s_clock`); a rate missing from the table is rejected
+        /// without touching the hardware (no 44.1 kHz fallback).
         fn set_clock_rate(&mut self, sample_rate_hz: u32) -> Result<(), OutputError> {
-            if !(8_000..=192_000).contains(&sample_rate_hz) {
-                return Err(OutputError::UnsupportedSampleRate(sample_rate_hz));
-            }
             if self.sample_rate_hz != sample_rate_hz {
+                program_i2s_clock(&mut DeviceClockRegs, sample_rate_hz)
+                    .map_err(|_| OutputError::UnsupportedSampleRate(sample_rate_hz))?;
                 self.sample_rate_hz = sample_rate_hz;
-                #[cfg(target_arch = "xtensa")]
-                {
-                    const I2S0_CLKM_CONF_REG: *mut u32 = 0x3FF4_F0AC as *mut u32;
-                    let (div_num, div_b, div_a): (u32, u32, u32) = match sample_rate_hz {
-                        44_100 => (14, 11, 63),
-                        48_000 => (13, 1, 48),
-                        32_000 => (19, 17, 32),
-                        24_000 => (26, 1, 24),
-                        22_050 => (28, 22, 63),
-                        16_000 => (39, 1, 16),
-                        12_000 => (52, 1, 12),
-                        11_025 => (56, 44, 63),
-                        88_200 => (7, 11, 63),
-                        96_000 => (6, 25, 48),
-                        _ => (14, 11, 63),
-                    };
-                    unsafe {
-                        let cur = core::ptr::read_volatile(I2S0_CLKM_CONF_REG);
-                        let new_val = encode_i2s0_clkm_conf(cur, div_num, div_b, div_a);
-                        core::ptr::write_volatile(I2S0_CLKM_CONF_REG, new_val);
-                    }
-                }
             }
             Ok(())
         }
@@ -848,10 +821,13 @@ mod xtensa_hw {
         )
     }
 
-    pub(crate) static MP3_DEC_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static MP3_DEC_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+    /// The firmware's only MP3 decoder (no heap MP3 decoder without `std-codecs`). Taken once at
+    /// bring-up and parked in the pipeline's MP3 slot (`StreamPipeline::mp3_spare`), from where
+    /// the coordinator uses and returns it for every MP3 track.
     #[allow(unsafe_code)]
-    pub(crate) fn take_static_mp3_decoder() -> &'static mut squeezelite_decoders::StaticMp3Decoder {
+    fn take_static_mp3_decoder() -> &'static mut squeezelite_decoders::StaticMp3Decoder {
         assert!(
             !MP3_DEC_TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
             "StaticMp3Decoder already taken"
@@ -874,9 +850,6 @@ mod xtensa_hw {
         slim_tx_buf: [u8; 2048],
         audio_rx_buf: [u8; 4096],
         audio_tx_buf: [u8; 512],
-        slim_acc_buf: [u8; 1536],
-        audio_req_buf: [u8; 512],
-        audio_header_buf: [u8; 1024],
     }
 
     impl FirmwareBssBuffers {
@@ -888,9 +861,6 @@ mod xtensa_hw {
                 slim_tx_buf: [0u8; 2048],
                 audio_rx_buf: [0u8; 4096],
                 audio_tx_buf: [0u8; 512],
-                slim_acc_buf: [0u8; 1536],
-                audio_req_buf: [0u8; 512],
-                audio_header_buf: [0u8; 1024],
             }
         }
     }
@@ -1017,17 +987,9 @@ mod xtensa_hw {
         stream_storage: &'static mut [u8],
         output_storage: &'static mut [u8],
         sink: EspI2sSink<Esp32HardwareI2sDma<'static>>,
-    ) -> (
-        &'static mut HwStreamPipeline,
-        &'static mut [u8; 2064],
-        &'static mut [u8; 1536],
-        &'static mut [u8; 1536],
-    ) {
+    ) -> PipelineStatics {
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_PIPELINE: core::mem::MaybeUninit<HwStreamPipeline> =
-            core::mem::MaybeUninit::uninit();
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut STATIC_RESP_BUF: core::mem::MaybeUninit<[u8; 2064]> =
             core::mem::MaybeUninit::uninit();
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_HTTP_RESP_BUF: core::mem::MaybeUninit<[u8; 1536]> =
@@ -1057,9 +1019,8 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).write_scratch).write_bytes(0, 1);
             core::ptr::addr_of_mut!((*ptr).output_i32_scratch).write_bytes(0, 1);
             core::ptr::addr_of_mut!((*ptr).current_eq_preset).write(EqPreset::Flat);
-
-            let resp_ptr = (*core::ptr::addr_of_mut!(STATIC_RESP_BUF)).as_mut_ptr();
-            resp_ptr.write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*ptr).user_muted).write(false);
+            core::ptr::addr_of_mut!((*ptr).mp3_spare).write(Some(take_static_mp3_decoder()));
 
             let http_resp_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_RESP_BUF)).as_mut_ptr();
             http_resp_ptr.write_bytes(0, 1);
@@ -1067,7 +1028,7 @@ mod xtensa_hw {
             let http_tx_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_TX_BUF)).as_mut_ptr();
             http_tx_ptr.write_bytes(0, 1);
 
-            (&mut *ptr, &mut *resp_ptr, &mut *http_resp_ptr, &mut *http_tx_ptr)
+            (&mut *ptr, &mut *http_resp_ptr, &mut *http_tx_ptr)
         }
     }
 
@@ -1177,10 +1138,10 @@ mod xtensa_hw {
         AMP.init(AmpManager::for_active_board(i2c_bus))
     }
 
-    /// Static pipeline + the static buffers handed out with it (`init_static_pipeline`).
+    /// Static pipeline + the static HTTP-server buffers handed out with it
+    /// (`init_static_pipeline`).
     type PipelineStatics = (
         &'static mut HwStreamPipeline,
-        &'static mut [u8; 2064],
         &'static mut [u8; 1536],
         &'static mut [u8; 1536],
     );
@@ -1233,10 +1194,28 @@ mod xtensa_hw {
         CYD_BRIDGE.init(CydUartBridge::new(uart2_port))
     }
 
-    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`].
+    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`]. `strm s` with server
+    /// IP 0.0.0.0 streams from the LMS the control link uses (Task 10 makes it configurable).
+    /// Server frames are received into a static buffer in `.dram2_uninit` (which does not
+    /// shrink `.stack`) instead of a 2 KB buffer on the `slimproto_session` stack.
+    #[allow(unsafe_code)]
     #[inline(never)]
     fn init_coordinator() -> &'static mut PlayerCoordinator {
-        COORDINATOR.init(PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT"))
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut SERVER_FRAME_BUF: core::mem::MaybeUninit<
+            [u8; louder_esp32_app::coordinator::SERVER_FRAME_BUF_LEN],
+        > = core::mem::MaybeUninit::uninit();
+        // SAFETY: called once at bring-up (`COORDINATOR.init` panics on a second call); the
+        // buffer is zeroed before the only reference to it is handed out.
+        let frame_buf: &'static mut [u8] = unsafe {
+            let ptr = (*core::ptr::addr_of_mut!(SERVER_FRAME_BUF)).as_mut_ptr();
+            ptr.write_bytes(0, 1);
+            &mut *ptr
+        };
+        let coordinator = COORDINATOR.init(PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT"));
+        coordinator.lms_ip = DEFAULT_LMS_SERVER_IP;
+        coordinator.set_frame_buffer(frame_buf);
+        coordinator
     }
 
     /// Bring-up stage: `esp-radio` Wi-Fi controller configured as a station for
@@ -1479,9 +1458,6 @@ mod xtensa_hw {
             ref mut slim_tx_buf,
             ref mut audio_rx_buf,
             ref mut audio_tx_buf,
-            ref mut slim_acc_buf,
-            ref mut audio_req_buf,
-            ref mut audio_header_buf,
         } = fw_bufs;
 
         #[allow(unsafe_code)]
@@ -1609,7 +1585,7 @@ mod xtensa_hw {
         let fault = Input::new(peripherals.GPIO34, InputConfig::default().with_pull(Pull::None));
 
         let amp = init_amp_i2c(peripherals.I2C0, peripherals.GPIO21, peripherals.GPIO27);
-        let (pipeline, pending_resp_buf, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
+        let (pipeline, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
             peripherals.I2S0,
             peripherals.DMA_I2S0,
             peripherals.GPIO26,
@@ -1720,12 +1696,10 @@ mod xtensa_hw {
             cyd_bridge,
             pipeline,
             coordinator,
+            slim_link: SlimLinkState::new(),
+            stream_state: HttpStreamState::new(),
             settings_scratch,
-            pending_resp_buf,
             http_resp_buf,
-            slim_acc_buf,
-            audio_req_buf,
-            audio_header_buf,
             wifi_sta_creds,
             audio_cfg,
             settings_seq,
@@ -1745,32 +1719,12 @@ mod xtensa_hw {
             pending_http_closing: false,
             pending_close_deadline_ms: 0,
             helo_sent: false,
-            last_stat_ms: 0,
             last_connect_attempt_ms: 0,
             last_slim_connect_ms: 0,
-            slim_acc_len: 0,
-            audio_stream_active: false,
-            audio_req_sent: false,
-            audio_req_sent_offset: 0,
-            audio_headers_stripped: false,
-            audio_req_len: 0,
-            audio_header_len: 0,
-            audio_header_window: 0,
-            pending_resp_len: 0,
-            pending_resp_sent: 0,
             last_fault_check_ms: 0,
             latest_telemetry,
             last_cyd_progress_ms: 0,
-            audio_http_eof: false,
-            decode_ready_sent: false,
-            track_started_sent: false,
-            threshold_sent: false,
-            icy_meta_interval: 0,
-            icy_meta_next: 0,
-            icy_meta_left: 0,
             now_ms: 0,
-            step_frames: 0,
-            tick_playing: false,
         }))
     }
 }
@@ -1939,35 +1893,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_icy_metaint_header() {
-        let h1 = b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\nicy-metaint: 16000\r\n\r\n";
-        assert_eq!(parse_icy_metaint_header(h1), Some(16000));
-
-        let h2 = b"HTTP/1.1 200 OK\r\nICY-METAINT:\t32768\r\nServer: Icecast\r\n\r\n";
-        assert_eq!(parse_icy_metaint_header(h2), Some(32768));
-
-        let h3 = b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n\r\n";
-        assert_eq!(parse_icy_metaint_header(h3), None);
-
-        let h4 = b"icy-metaint: 0\r\n";
-        assert_eq!(parse_icy_metaint_header(h4), None);
-    }
-
-    #[test]
     fn test_lms_gain_to_tas5805m_vol_reg() {
         assert_eq!(lms_gain_to_tas5805m_vol_reg(0), 0xFF); // Mute
         assert_eq!(lms_gain_to_tas5805m_vol_reg(65536), 0x30); // 0.0 dB (100%)
         assert_eq!(lms_gain_to_tas5805m_vol_reg(1842), 0x5D); // -22.5 dB (55%)
-    }
-
-    #[test]
-    fn test_encode_i2s0_clkm_conf() {
-        let orig = 0x1230_0000;
-        let encoded = encode_i2s0_clkm_conf(orig, 6, 1, 2);
-        assert_eq!(encoded & 0xFF, 6);
-        assert_eq!((encoded >> 8) & 0x3F, 1);
-        assert_eq!((encoded >> 14) & 0x3F, 2);
-        assert_eq!(encoded & !0x000F_FFFF, orig);
     }
 
     #[test]

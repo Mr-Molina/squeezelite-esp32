@@ -1,72 +1,70 @@
-//! Embassy task skeleton for the device firmware (Task 8, spec §3.1).
+//! Embassy task skeleton for the device firmware (Task 8, spec §3.1), driving the shared
+//! [`PlayerCoordinator`](louder_esp32_app::PlayerCoordinator) engine (Task 9).
 //!
 //! # What this module is
 //!
-//! The pre-embassy firmware ran ONE cooperative superloop on core 0. Task 8 re-wraps that loop,
-//! without changing behavior, into the embassy task layout of spec §3.1:
+//! The firmware's work is split into the embassy tasks of spec §3.1. Since Task 9 the player
+//! protocol (SlimProto frames, `STAT` events, HTTP audio fetch, decoder selection, `RESP`/`META`/
+//! `DSCO`) is NOT implemented here any more: the `slimproto_session` task runs
+//! `PlayerCoordinator::tick` over the device trait implementations ([`net_device`] over the
+//! smoltcp sockets, [`backend_device`] over the amplifier and the I2S0 clock), the very engine
+//! the host tests and the session-replay fixture exercise. The decode and output tasks drive the
+//! pipeline through the coordinator's pump path (`pump_decode` / `pump_output`), so every state
+//! transition is seen by the engine.
 //!
-//! | task                | superloop blocks it now owns                                              |
-//! |---------------------|---------------------------------------------------------------------------|
-//! | `watchdog_lease`    | WDT feed + loop timestamp, Gate 3 network lease, 2 s amp fault/telemetry  |
-//! | `bt_a2dp`           | lazy BT controller bring-up, A2DP sink poll                               |
-//! | `net_stack`         | Wi-Fi STA connect drive, smoltcp poll + DHCPv4 events                     |
-//! | `http_control`      | Gate 4 port-80 server + deferred reboot actions                           |
-//! | `slimproto_session` | LMS control socket (HELO/STAT/frames), `STMs`, `STMd`/`STMu` emission     |
-//! | `audio_fetch`       | HTTP audio socket (request, headers/RESP, ICY-aware ingest, EOF)          |
-//! | `cyd_bridge`        | CYD command poll, 1 s progress update                                     |
-//! | `decode_pump`       | decode burst of the legacy firmware tick, post-EOF tail decode            |
-//! | `i2s_feed`          | DMA-first top-ups of the legacy firmware tick, DAC gate, silence pump     |
-//! | `config_writer`     | stub (Task 10 adds debounced persistence; persistence stays inline today) |
+//! | task                | work                                                                       |
+//! |---------------------|----------------------------------------------------------------------------|
+//! | `watchdog_lease`    | WDT feed + lap timestamp, Gate 3 network lease, 2 s amp fault/telemetry     |
+//! | `bt_a2dp`           | lazy BT controller bring-up, A2DP sink poll (feeds the pipeline when idle)  |
+//! | `net_stack`         | Wi-Fi STA connect drive, smoltcp poll + DHCPv4 events                       |
+//! | `http_control`      | Gate 4 port-80 server + deferred reboot actions, settings persistence       |
+//! | `slimproto_session` | LMS control socket: connect, `HELO`/`SETD` (`hello`), `coordinator.tick`    |
+//! | `cyd_bridge`        | CYD command poll, 1 s progress update                                      |
+//! | `decode_pump`       | `coordinator.pump_decode` (one frame, or a short resync burst)             |
+//! | `i2s_feed`          | `coordinator.pump_output` before/after decoding, DAC gate, silence pump    |
+//! | `config_writer`     | stub (Task 10 adds debounced persistence)                                  |
 //!
-//! The protocol/stream logic is still the legacy inline code, moved verbatim into one `fn` per
-//! block (locals became fields of [`FirmwareState`]); Task 9 replaces it with
-//! `PlayerCoordinator::tick` over the device trait impls.
+//! The HTTP audio fetch (spec's `audio_fetch` task) is step 3 of `coordinator.tick`, so it runs
+//! inside `slimproto_session`; the separate task is gone until the network/audio split.
 //!
-//! # Why a phase ring (behavior preservation)
+//! [`net_device`]: louder_esp32_app::net_device
+//! [`backend_device`]: louder_esp32_app::backend_device
 //!
-//! The superloop ran its blocks in a fixed order with one shared timestamp per iteration, and
-//! several blocks depend on that order (e.g. the I2S DMA is topped up BEFORE a ~4.5 ms MP3 frame
-//! decode, then again after it; `STMs`/`STMd`/`STMu` are evaluated after the audio step of the
-//! same iteration). Free-running embassy tasks would interleave in run-queue order instead. So
-//! the ring tasks hand a baton around in exactly the legacy order ([`PHASE_ORDER`]): each task
-//! waits on its own signal, runs the block named by the phase it received, then signals the
-//! owner of the next phase. One full lap == one legacy loop iteration. Exactly one task holds
-//! the baton at any time, so the shared state is only ever borrowed by one block at a time and
-//! never across an `.await`. Task 9+ replace the baton with the `CTRL`/`EVT` channels below and
-//! real wakeups as the inline code is deleted.
+//! # Why a phase ring
+//!
+//! The tasks still hand a baton around in a fixed order ([`PHASE_ORDER`]), one block per hand-off,
+//! one lap == one iteration of the former superloop. That keeps the DMA-first audio order (top
+//! up the I2S DMA BEFORE a ~4.5 ms MP3 frame decode, then again after it) and guarantees that the
+//! shared state is only ever borrowed by one block at a time and never across an `.await`, so no
+//! network/audio concurrency is introduced here (real concurrency, with the `CTRL`/`EVT`
+//! channels below, comes with the core-1 audio migration).
 //!
 //! # Core placement
 //!
 //! Spec §3.1 places `decode_pump` and `i2s_feed` on core 1. Core-1 start under esp-rtos is NOT
-//! yet validated on hardware (Spike S1 owner gate pending), and today the audio path runs on
-//! core 0 with core 1 executing only a NOP heartbeat. Therefore, in BOTH build configurations,
-//! the audio tasks run on the core-0 executor (they are ring members, which also keeps the
-//! DMA-first ordering above). Core 1 is started by:
+//! yet validated on hardware (Spike S1 owner gate pending), so in BOTH build configurations the
+//! audio tasks run on the core-0 executor as ring members. Core 1 is started by:
 //! - default: the battle-tested manual path (park APP_CPU, copy the PRO flash-MMU/cache
 //!   registers, `CpuControl::start_app_core` running the IRAM NOP heartbeat loop);
 //! - feature `esp-rtos-core1`: `esp_rtos::start_second_core` running an embassy executor whose
-//!   only task is `core1_heartbeat`. Moving `decode_pump`/`i2s_feed` there (and replacing the
-//!   ring hand-off between them and core 0 with `CTRL`/`EVT` + the SPSC rings) is the follow-up
-//!   once the S1 owner gate passes.
+//!   only task is `core1_heartbeat`.
 //!
 //! # Memory
 //!
-//! The stack gate is headroom-based (Task 8 ruling): core-0 stack headroom at the boot peak and
-//! in steady state must stay at or above e5b44cd's. `.stack` is the remainder of `dram_seg`
-//! after `.data`/`.bss`, so a static costs the same RAM as a permanent stack slot; what matters
-//! is what sits on the stack under the deepest callees. Hence [`FirmwareState`] and the large
-//! values it points at (amp, CYD bridge, coordinator, smoltcp interface + sockets, UDP
-//! placeholder buffers) are built in place in statics by small `#[inline(never)]` bring-up
-//! stages in `main.rs`, and each legacy block runs in its own `#[inline(never)]` frame. The
-//! per-frame accounting is in the Task 8 report.
+//! The stack gate is headroom-based (Task 8 ruling). [`FirmwareState`] and the large values it
+//! points at live in statics built in place during bring-up, and each block runs in its own
+//! `#[inline(never)]` frame. The coordinator keeps its large temporaries (server frame buffer,
+//! stream read chunk) in out-of-line helpers, and the device stream source hands the response
+//! head / ICY block over by callback, so no 4 KB value is ever built on this stack.
 #![cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use squeezelite_proto::AudioFormat;
 
-/// Stream parameters handed from the coordinator to the audio tasks on `strm s` (Task 9 wires it).
-#[allow(dead_code)] // Task 9 wires the channels
+/// Stream parameters handed from the coordinator to the audio tasks on `strm s` (wired by the
+/// core-1 audio migration).
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamParams {
     pub format: AudioFormat,
@@ -78,7 +76,7 @@ pub struct StreamParams {
 }
 
 /// Coordinator (core 0) -> audio tasks command.
-#[allow(dead_code)] // Task 9 wires the channels
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoordinatorCmd {
     Start(StreamParams),
@@ -91,7 +89,7 @@ pub enum CoordinatorCmd {
 }
 
 /// Audio tasks -> coordinator event.
-#[allow(dead_code)] // Task 9 wires the channels
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioEvent {
     FirstFrameWritten,
@@ -102,16 +100,16 @@ pub enum AudioEvent {
 }
 
 /// Depth of [`CTRL`] and [`EVT`].
-#[allow(dead_code)] // Task 9 wires the channels
+#[allow(dead_code)]
 pub const CHANNEL_DEPTH: usize = 8;
 
-/// Coordinator -> audio command channel. Defined now, wired by Task 9 (until then nothing sends
-/// on it, so the linker drops it from the device image).
-#[allow(dead_code)] // Task 9 wires the channels
+/// Coordinator -> audio command channel. Unused while the audio tasks are ring members on core
+/// 0 (the linker drops it); wired by the core-1 audio migration.
+#[allow(dead_code)]
 pub static CTRL: Channel<CriticalSectionRawMutex, CoordinatorCmd, CHANNEL_DEPTH> = Channel::new();
 
-/// Audio -> coordinator event channel. Defined now, wired by Task 9.
-#[allow(dead_code)] // Task 9 wires the channels
+/// Audio -> coordinator event channel. Wired by the core-1 audio migration.
+#[allow(dead_code)]
 pub static EVT: Channel<CriticalSectionRawMutex, AudioEvent, CHANNEL_DEPTH> = Channel::new();
 
 /// Members of the core-0 phase ring (every spec §3.1 task except the `config_writer` stub).
@@ -122,24 +120,23 @@ pub enum RingTask {
     NetStack,
     HttpControl,
     SlimprotoSession,
-    AudioFetch,
     CydBridge,
     DecodePump,
     I2sFeed,
 }
 
 impl RingTask {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 8;
 
     pub const fn index(self) -> usize {
         self as usize
     }
 }
 
-/// One block of the legacy superloop. Discriminants follow [`PHASE_ORDER`].
+/// One block of the lap. Discriminants follow [`PHASE_ORDER`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// `wdt.feed()` + the iteration timestamp shared by every later phase of the lap.
+    /// `wdt.feed()` + the lap timestamp shared by every later phase of the lap.
     WatchdogFeed,
     /// Lazy BT controller bring-up, A2DP sink poll.
     Bluetooth,
@@ -151,47 +148,36 @@ pub enum Phase {
     NetPoll,
     /// Gate 4 port-80 server + deferred reboot action.
     HttpServe,
-    /// LMS control socket: connect, RESP flush, HELO/STAT, frame receive + dispatch.
-    SlimControl,
-    /// HTTP audio socket: request, headers/RESP, body ingest, EOF.
-    AudioStream,
-    /// Legacy firmware tick step 0: CYD command poll.
+    /// LMS control socket upkeep, `HELO`, then one `PlayerCoordinator::tick` (server frame,
+    /// HTTP audio fetch, audio step, deferred `STAT`s and heartbeat).
+    SlimSession,
+    /// CYD command poll.
     CydCommand,
-    /// Legacy firmware tick step 1: drain pending PCM + top up the I2S DMA before decoding.
+    /// `pump_output` before decoding (drain pending PCM, top up the I2S DMA).
     OutputTopUp,
-    /// Legacy firmware tick step 2: decode at most one frame (or a short resync burst).
+    /// `pump_decode`: at most one frame (or a short resync burst).
     DecodeBurst,
-    /// Legacy firmware tick step 3 + tail: top up again, DAC gate, then the silence pump.
+    /// `pump_output` again, rate sync, DAC gate, then the silence pump.
     OutputTopUpAndSilence,
-    /// `STMs` once the first frame has been played.
-    StatTrackStarted,
-    /// Post-EOF stream-buffer tail decode.
-    DecodeEofDrain,
-    /// `STMd` then `STMu`.
-    StatDecodeReadyUnderrun,
     /// 2 s TAS58xx fault recovery + telemetry.
     AmpHealth,
     /// 1 s CYD progress update.
     CydProgress,
 }
 
-/// The legacy superloop order, one entry per block. One lap of the ring == one legacy iteration.
-pub const PHASE_ORDER: [Phase; 17] = [
+/// The lap order, one entry per block.
+pub const PHASE_ORDER: [Phase; 13] = [
     Phase::WatchdogFeed,
     Phase::Bluetooth,
     Phase::WifiConnect,
     Phase::LeaseCheck,
     Phase::NetPoll,
     Phase::HttpServe,
-    Phase::SlimControl,
-    Phase::AudioStream,
+    Phase::SlimSession,
     Phase::CydCommand,
     Phase::OutputTopUp,
     Phase::DecodeBurst,
     Phase::OutputTopUpAndSilence,
-    Phase::StatTrackStarted,
-    Phase::DecodeEofDrain,
-    Phase::StatDecodeReadyUnderrun,
     Phase::AmpHealth,
     Phase::CydProgress,
 ];
@@ -204,12 +190,9 @@ impl Phase {
             Phase::Bluetooth => RingTask::BtA2dp,
             Phase::WifiConnect | Phase::NetPoll => RingTask::NetStack,
             Phase::HttpServe => RingTask::HttpControl,
-            Phase::SlimControl | Phase::StatTrackStarted | Phase::StatDecodeReadyUnderrun => {
-                RingTask::SlimprotoSession
-            }
-            Phase::AudioStream => RingTask::AudioFetch,
+            Phase::SlimSession => RingTask::SlimprotoSession,
             Phase::CydCommand | Phase::CydProgress => RingTask::CydBridge,
-            Phase::DecodeBurst | Phase::DecodeEofDrain => RingTask::DecodePump,
+            Phase::DecodeBurst => RingTask::DecodePump,
             Phase::OutputTopUp | Phase::OutputTopUpAndSilence => RingTask::I2sFeed,
         }
     }
@@ -225,18 +208,16 @@ pub(crate) use device::{run_core0_executor, FirmwareState, Shared, UDP_PLACEHOLD
 #[cfg(all(target_arch = "xtensa", feature = "esp-rtos-core1"))]
 pub(crate) use device::run_core1_executor;
 
-/// Device glue: the shared superloop state, the ring tasks and the legacy blocks they run.
+/// Device glue: the shared state, the ring tasks, and the blocks they run.
 #[cfg(target_arch = "xtensa")]
 mod device {
-    extern crate alloc;
-
     use super::{Phase, RingTask, PHASE_ORDER};
     use crate::xtensa_hw::{
-        now_millis, persist_audio_config, take_static_mp3_decoder, Core1Ctl, Esp32I2cBus,
+        now_millis, persist_audio_config, Core1Ctl, DeviceClockRegs, Esp32I2cBus,
         Esp32Uart2Port, Esp32VhciTransport, HwStreamPipeline, SmolDevice, CORE1_HEARTBEAT,
-        MP3_DEC_TAKEN,
+        DMA_OUTSTANDING_FRAMES,
     };
-    use crate::{lms_gain_to_tas5805m_vol_reg, parse_icy_metaint_header, BASEMENT_HELO_CAPABILITIES};
+    use crate::BASEMENT_HELO_CAPABILITIES;
     use core::cell::RefCell;
     use core::future::Future;
     use core::pin::pin;
@@ -250,34 +231,41 @@ mod device {
     use esp_rtos::embassy::Executor;
     use esp_storage::FlashStorage;
     use louder_esp32_app::amp::percent_to_attenuation;
-    use louder_esp32_app::board::{BASEMENT_PLAYER_MAC, DEFAULT_LMS_SERVER_IP, DEFAULT_LMS_SERVER_PORT};
+    use louder_esp32_app::backend_device::Esp32AudioBackend;
+    use louder_esp32_app::board::{DEFAULT_LMS_SERVER_IP, DEFAULT_LMS_SERVER_PORT};
     use louder_esp32_app::bt_a2dp::BtA2dpSink;
     use louder_esp32_app::http_control::{
         handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
         LeaseHealth,
     };
+    use louder_esp32_app::io_traits::{NetAddr, SlimTransport};
+    use louder_esp32_app::net_device::{
+        HttpStreamState, SlimLinkState, SmoltcpSlimTransport, SmoltcpStreamSource, TcpPhase,
+        TcpSocketOps,
+    };
     use louder_esp32_app::ota_safety::{OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET, SETTINGS_JOURNAL_OFFSET};
     use louder_esp32_app::pipeline::ActiveDecoder;
-    use louder_esp32_app::{AmpManager, AudioOutputSink, CydUartBridge, PlayerCoordinator};
-    use smoltcp::iface::{Interface as SmolInterface, SocketHandle, SocketSet};
-    use smoltcp::socket::{dhcpv4, tcp};
-    use smoltcp::time::Instant as SmolInstant;
+    use louder_esp32_app::{AmpManager, CydUartBridge, PlayerCoordinator, PlayerState};
+    use smoltcp::iface::{Context as SmolContext, Interface as SmolInterface, SocketHandle, SocketSet};
+    use smoltcp::socket::{dhcpv4, tcp, AnySocket};
+    use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
     use squeezelite_audio_core::EqPreset;
     use squeezelite_config::AudioConfig;
     use squeezelite_cyd_link::CydMessage;
     use squeezelite_decoders::PcmDecoder;
-    use squeezelite_proto::{
-        sample_rate_from_index, AutostartMode, DisconnectReason, Endianness, ParseError,
-        ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
-        StreamCommandType,
-    };
+    use squeezelite_proto::SlimprotoBuilder;
     use static_cell::StaticCell;
 
-    /// Every local of the legacy superloop, plus the hardware it drove. Field names are the
-    /// legacy local names so the moved blocks read the same as before (`x` became `s.x`). The
-    /// large members are `&'static mut` into statics built in place during bring-up, which keeps
-    /// the boot stack within budget (see the module docs).
+    /// `HELO` device id (12 = SqueezeESP32/squeezelite).
+    const HELO_DEVICE_ID: u8 = 12;
+    /// Audio-socket connect/retransmit timeout: an unreachable stream server ends in `STMn`
+    /// instead of a connect that never resolves.
+    const STREAM_SOCKET_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
+
+    /// Shared firmware state: the hardware, the engine, and the few device-side loop variables
+    /// the non-protocol blocks need. The large members are `&'static mut` into statics built in
+    /// place during bring-up (see the module docs).
     pub(crate) struct FirmwareState {
         // --- hardware kept alive for the life of the firmware ---
         pub(crate) wdt: Wdt<esp_hal::peripherals::TIMG0<'static>>,
@@ -302,20 +290,19 @@ mod device {
         pub(crate) cyd_bridge: &'static mut CydUartBridge<Esp32Uart2Port<'static>>,
         pub(crate) pipeline: &'static mut HwStreamPipeline,
         pub(crate) coordinator: &'static mut PlayerCoordinator,
+        // --- device I/O adapter state (net_device) ---
+        pub(crate) slim_link: SlimLinkState,
+        pub(crate) stream_state: HttpStreamState,
         // --- static buffers ---
         pub(crate) settings_scratch: &'static mut [u8; 4096],
-        pub(crate) pending_resp_buf: &'static mut [u8; 2064],
         pub(crate) http_resp_buf: &'static mut [u8; 1536],
-        pub(crate) slim_acc_buf: &'static mut [u8; 1536],
-        pub(crate) audio_req_buf: &'static mut [u8; 512],
-        pub(crate) audio_header_buf: &'static mut [u8; 1024],
         // --- boot configuration ---
         pub(crate) wifi_sta_creds: WifiStaCredentials,
         pub(crate) audio_cfg: AudioConfig,
         pub(crate) settings_seq: u32,
         pub(crate) settings_dirty: bool,
         pub(crate) current_vol_pct: u8,
-        // --- legacy loop variables ---
+        // --- loop variables ---
         pub(crate) local_port_counter: u16,
         pub(crate) bt_audio_active: bool,
         pub(crate) boot_ms: u64,
@@ -329,44 +316,22 @@ mod device {
         pub(crate) pending_http_started_ms: u64,
         pub(crate) pending_http_closing: bool,
         pub(crate) pending_close_deadline_ms: u64,
+        /// `HELO` went out on the current control connection.
         pub(crate) helo_sent: bool,
-        pub(crate) last_stat_ms: u64,
         pub(crate) last_connect_attempt_ms: u64,
         pub(crate) last_slim_connect_ms: u64,
-        pub(crate) slim_acc_len: usize,
-        pub(crate) audio_stream_active: bool,
-        pub(crate) audio_req_sent: bool,
-        pub(crate) audio_req_sent_offset: usize,
-        pub(crate) audio_headers_stripped: bool,
-        pub(crate) audio_req_len: usize,
-        pub(crate) audio_header_len: usize,
-        pub(crate) audio_header_window: u32,
-        pub(crate) pending_resp_len: usize,
-        pub(crate) pending_resp_sent: usize,
         pub(crate) last_fault_check_ms: u64,
         pub(crate) latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         pub(crate) last_cyd_progress_ms: u64,
-        pub(crate) audio_http_eof: bool,
-        pub(crate) decode_ready_sent: bool,
-        pub(crate) track_started_sent: bool,
-        pub(crate) threshold_sent: bool,
-        pub(crate) icy_meta_interval: usize,
-        pub(crate) icy_meta_next: usize,
-        pub(crate) icy_meta_left: usize,
-        // --- per-lap values (legacy per-iteration locals) ---
-        /// Legacy `let now_ms = now_millis();` at the top of each iteration.
+        /// The lap timestamp (`now_millis()` at the top of each lap).
         pub(crate) now_ms: u64,
-        /// Legacy `step_frames` (frames the firmware tick wrote this iteration).
-        pub(crate) step_frames: usize,
-        /// Legacy firmware tick's `coordinator.state == Playing` check, taken after the CYD poll.
-        pub(crate) tick_playing: bool,
     }
 
     /// Number of UDP placeholder sockets in the smoltcp set (spec §3.6).
     pub(crate) const UDP_PLACEHOLDER_SOCKETS: usize = 2;
 
-    /// The superloop state shared by the ring tasks. Only the baton holder borrows it, and never
-    /// across an `.await`, so the `RefCell` borrow can not fail.
+    /// The state shared by the ring tasks. Only the baton holder borrows it, and never across
+    /// an `.await`, so the `RefCell` borrow can not fail.
     pub(crate) struct Shared(RefCell<FirmwareState>);
 
     impl Shared {
@@ -389,8 +354,8 @@ mod device {
         }
     }
 
-    /// Runs one legacy block. Routing by [`Phase::owner`] guarantees each block executes inside
-    /// the task named in the module table.
+    /// Runs one block. Routing by [`Phase::owner`] guarantees each block executes inside the
+    /// task named in the module table.
     fn run_phase(s: &mut FirmwareState, phase: Phase) {
         match phase {
             Phase::WatchdogFeed => watchdog_feed(s),
@@ -399,15 +364,11 @@ mod device {
             Phase::LeaseCheck => lease_check(s),
             Phase::NetPoll => net_poll(s),
             Phase::HttpServe => http_serve(s),
-            Phase::SlimControl => slim_control(s),
-            Phase::AudioStream => audio_stream(s),
+            Phase::SlimSession => slim_session(s),
             Phase::CydCommand => cyd_command(s),
             Phase::OutputTopUp => output_top_up_first(s),
             Phase::DecodeBurst => decode_burst(s),
             Phase::OutputTopUpAndSilence => output_top_up_final(s),
-            Phase::StatTrackStarted => stat_track_started(s),
-            Phase::DecodeEofDrain => decode_eof_drain(s),
-            Phase::StatDecodeReadyUnderrun => stat_decode_ready_underrun(s),
             Phase::AmpHealth => amp_health(s),
             Phase::CydProgress => cyd_progress(s),
         }
@@ -437,16 +398,10 @@ mod device {
         run_ring(RingTask::HttpControl, shared).await
     }
 
-    /// Core 0: LMS slimproto session.
+    /// Core 0: LMS slimproto session (`PlayerCoordinator::tick`, including the HTTP audio fetch).
     #[embassy_executor::task]
     async fn slimproto_session(shared: &'static Shared) -> ! {
         run_ring(RingTask::SlimprotoSession, shared).await
-    }
-
-    /// Core 0: HTTP audio stream fetch into the stream ring.
-    #[embassy_executor::task]
-    async fn audio_fetch(shared: &'static Shared) -> ! {
-        run_ring(RingTask::AudioFetch, shared).await
     }
 
     /// Core 0: CYD display UART bridge.
@@ -476,8 +431,8 @@ mod device {
         core::future::pending::<()>().await
     }
 
-    /// Spawns the core-0 tasks, hands the baton to the first phase and runs the executor in
-    /// place of the legacy superloop. Never returns.
+    /// Spawns the core-0 tasks, hands the baton to the first phase and runs the executor.
+    /// Never returns.
     pub(crate) fn run_core0_executor(shared: &'static Shared) -> ! {
         static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
         EXECUTOR0.init(Executor::new()).run(|spawner| {
@@ -486,7 +441,6 @@ mod device {
             spawner.spawn(net_stack(shared).unwrap());
             spawner.spawn(http_control(shared).unwrap());
             spawner.spawn(slimproto_session(shared).unwrap());
-            spawner.spawn(audio_fetch(shared).unwrap());
             spawner.spawn(cyd_bridge(shared).unwrap());
             // Core-0 placement of the audio tasks: see "Core placement" in the module docs.
             spawner.spawn(decode_pump(shared).unwrap());
@@ -519,8 +473,111 @@ mod device {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Legacy superloop blocks, in PHASE_ORDER. Bodies are the pre-embassy inline code verbatim
-    // (locals -> `s.` fields); `#[inline(never)]` keeps each block in its own stack frame so only
+    // smoltcp binding of the device I/O adapters (`net_device`)
+    // ------------------------------------------------------------------------------------------
+
+    /// A smoltcp TCP socket borrowed for one block, as [`TcpSocketOps`]. Only the audio socket
+    /// gets `connect` (interface context, local address and the rotating local port).
+    struct SmolTcp<'a> {
+        sock: &'a mut tcp::Socket<'static>,
+        connect: Option<(&'a mut SmolContext, [u8; 4], &'a mut u16)>,
+    }
+
+    impl<'a> SmolTcp<'a> {
+        fn new(sock: &'a mut tcp::Socket<'static>) -> Self {
+            Self { sock, connect: None }
+        }
+    }
+
+    /// Next local port in 49152..=65535 (the firmware's rotating ephemeral ports).
+    fn next_local_port(counter: &mut u16) -> u16 {
+        *counter = 49152 + ((counter.wrapping_add(1) - 49152) & 0x3FFF);
+        *counter
+    }
+
+    impl TcpSocketOps for SmolTcp<'_> {
+        fn phase(&self) -> TcpPhase {
+            match self.sock.state() {
+                tcp::State::Closed | tcp::State::Listen => TcpPhase::Closed,
+                tcp::State::SynSent | tcp::State::SynReceived => TcpPhase::Connecting,
+                tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2 => {
+                    TcpPhase::Established
+                }
+                tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait => TcpPhase::PeerClosed,
+            }
+        }
+
+        fn connect(&mut self, remote: NetAddr) -> bool {
+            let Some((cx, local_ip, port)) = self.connect.as_mut() else {
+                return false;
+            };
+            self.sock.abort();
+            self.sock.set_timeout(Some(STREAM_SOCKET_TIMEOUT));
+            let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(remote.ip)), remote.port);
+            let local_ep = (IpAddress::Ipv4(Ipv4Address::from(*local_ip)), next_local_port(port));
+            self.sock.connect(cx, remote_ep, local_ep).is_ok()
+        }
+
+        fn abort(&mut self) {
+            self.sock.abort();
+        }
+
+        fn send_capacity(&self) -> usize {
+            self.sock.send_capacity()
+        }
+
+        fn send_queue(&self) -> usize {
+            self.sock.send_queue()
+        }
+
+        fn send_slice(&mut self, data: &[u8]) -> usize {
+            self.sock.send_slice(data).unwrap_or(0)
+        }
+
+        fn recv_queue(&self) -> usize {
+            self.sock.recv_queue()
+        }
+
+        fn recv_capacity(&self) -> usize {
+            self.sock.recv_capacity()
+        }
+
+        fn peek_slice(&mut self, buf: &mut [u8]) -> usize {
+            self.sock.peek_slice(buf).unwrap_or(0)
+        }
+
+        fn recv_slice(&mut self, buf: &mut [u8]) -> usize {
+            self.sock.recv_slice(buf).unwrap_or(0)
+        }
+    }
+
+    /// The control and audio sockets, borrowed together (disjoint) out of the socket set.
+    fn slim_and_audio_sockets<'a>(
+        sockets: &'a mut SocketSet<'static>,
+        slim_handle: SocketHandle,
+        audio_handle: SocketHandle,
+    ) -> Option<(&'a mut tcp::Socket<'static>, &'a mut tcp::Socket<'static>)> {
+        let (mut slim, mut audio) = (None, None);
+        for (handle, socket) in sockets.iter_mut() {
+            if handle == slim_handle {
+                slim = tcp::Socket::downcast_mut(socket);
+            } else if handle == audio_handle {
+                audio = tcp::Socket::downcast_mut(socket);
+            }
+        }
+        Some((slim?, audio?))
+    }
+
+    /// LMS still owns the output: an LMS stream is connecting/open and its track has not ended.
+    fn lms_audio_active(coordinator: &PlayerCoordinator) -> bool {
+        coordinator.stream_active() && coordinator.state != PlayerState::Stopped
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Blocks, in PHASE_ORDER. `#[inline(never)]` keeps each block in its own stack frame so only
     // one block's temporaries are live at a time.
     // ------------------------------------------------------------------------------------------
 
@@ -531,7 +588,9 @@ mod device {
         s.now_ms = now_millis();
     }
 
-    /// `bt_a2dp`: lazy BT controller bring-up after the DHCP lease, then A2DP sink poll.
+    /// `bt_a2dp`: lazy BT controller bring-up after the DHCP lease, then A2DP sink poll. A2DP
+    /// audio feeds the pipeline only while LMS does not own the output; the coordinator is told
+    /// (`begin_external_playback`) so it reports nothing about it to LMS.
     #[inline(never)]
     fn bt_poll(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
@@ -550,10 +609,15 @@ mod device {
             }
         }
 
+        // An LMS track took over the output: A2DP has to start over when LMS is done.
+        if s.bt_audio_active && lms_audio_active(s.coordinator) {
+            s.bt_audio_active = false;
+        }
+
         // Poll Bluetooth Classic A2DP Sink
         if let Some(ref mut transport) = s.bt_transport {
             s.bt_sink.poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                if !s.audio_stream_active {
+                if !lms_audio_active(s.coordinator) {
                     if s.coordinator.current_sample_rate != sample_rate_hz
                         || s.pipeline.sample_rate != sample_rate_hz
                     {
@@ -561,12 +625,10 @@ mod device {
                         let _ = s.pipeline.set_sample_rate(sample_rate_hz);
                     }
                     if !s.bt_audio_active {
-                        if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                            MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                        }
+                        // A replaced MP3 decoder is parked by `set_decoder` for the next track.
                         s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                        s.pipeline.sink.set_mute(false);
-                        s.coordinator.state = louder_esp32_app::PlayerState::Playing;
+                        s.pipeline.set_mute(false);
+                        s.coordinator.begin_external_playback();
                         if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                             let _ = s.amp.start_playback_via_hiz();
                         }
@@ -576,12 +638,12 @@ mod device {
                 }
             });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() && !s.audio_stream_active {
+            if s.bt_audio_active && !s.bt_sink.is_streaming() && !lms_audio_active(s.coordinator) {
                 if s.pipeline.stream_buffer.available_read() == 0
                     && s.pipeline.output_buffer.available_read() == 0
                     && !s.pipeline.has_pending_pcm()
                 {
-                    s.coordinator.state = louder_esp32_app::PlayerState::Stopped;
+                    s.coordinator.end_external_playback();
                     s.bt_audio_active = false;
                 }
             }
@@ -661,20 +723,20 @@ mod device {
                 );
             }
             Some(dhcpv4::Event::Deconfigured) => {
+                // Every connection is gone with the address; the coordinator sees the audio
+                // stream fail on its next poll.
                 s.assigned_ip = None;
                 s.smol_iface.update_ip_addrs(|addrs| addrs.clear());
                 s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
                 s.helo_sent = false;
-                s.audio_stream_active = false;
                 s.pending_http_body = &[];
                 s.pending_http_closing = false;
             }
             None => {}
         }
     }
-
     /// `http_control`: Gate 4 port-80 control/recovery server, then its deferred reboot action.
     #[inline(never)]
     fn http_serve(s: &mut FirmwareState) {
@@ -716,7 +778,7 @@ mod device {
                 }
             }
 
-            // Immediate recycling of closing s.sockets once FIN/ACK handshake completes (TimeWait) or on timeout
+            // Immediate recycling of closing sockets once FIN/ACK handshake completes (TimeWait) or on timeout
             if s.pending_http_closing {
                 if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
                     || now_ms >= s.pending_close_deadline_ms
@@ -883,19 +945,20 @@ mod device {
                                     }
                                 }
                                 if let Some(m) = mute {
-                                    s.pipeline.sink.set_mute(m);
+                                    // User mute: survives the next output write.
+                                    s.pipeline.set_mute(m);
                                 }
-                                if ir_code != 0 {
-                                    let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                    if slim_sock.may_send() {
-                                        let mut ir_buf = [0u8; 32];
-                                        if let Ok(ir_len) = SlimprotoBuilder::build_ir(
-                                            now_ms as u32,
-                                            ir_code,
-                                            &mut ir_buf,
-                                        ) {
-                                            let _ = slim_sock.send_slice(&ir_buf[..ir_len]);
-                                        }
+                                if ir_code != 0 && s.helo_sent {
+                                    let mut ir_buf = [0u8; 32];
+                                    if let Ok(ir_len) =
+                                        SlimprotoBuilder::build_ir(now_ms as u32, ir_code, &mut ir_buf)
+                                    {
+                                        let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+                                        let mut link = SmoltcpSlimTransport::new(
+                                            SmolTcp::new(slim_sock),
+                                            &mut s.slim_link,
+                                        );
+                                        let _ = link.send(&ir_buf[..ir_len]);
                                     }
                                 }
                             }
@@ -937,878 +1000,126 @@ mod device {
         }
     }
 
-    /// `slimproto_session`: LMS control connection (half-close reset, connect, RESP flush,
-    /// HELO/SETD/STAT heartbeats, frame receive and dispatch) once the IPv4 lease is active.
+    /// `slimproto_session`: control-link upkeep (half-close reset, 1 s-rate-limited connect to
+    /// LMS), then [`slim_tick`] once the IPv4 lease is active.
     #[inline(never)]
-    fn slim_control(s: &mut FirmwareState) {
+    fn slim_session(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
-        // Drive SlimProto Client (`10.0.0.10:3483`) once IPv4 lease is active
-        if let Some(local_ip) = s.assigned_ip {
-            // Half-closed / closing state detection: if remote sent FIN or is closing,
-            // abort socket so we immediately reconnect rather than lingering in CloseWait.
-            {
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if slim_sock.is_open()
-                    && matches!(
-                        slim_sock.state(),
-                        tcp::State::CloseWait
-                            | tcp::State::TimeWait
-                            | tcp::State::Closing
-                            | tcp::State::LastAck
-                            | tcp::State::FinWait1
-                            | tcp::State::FinWait2
-                    )
-                {
-                    slim_sock.abort();
-                    s.helo_sent = false;
-                    s.slim_acc_len = 0;
-                }
-            }
-
-            // Connect to LMS if closed (rate-limited to 1s)
-            {
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if !slim_sock.is_open()
-                    && (s.last_slim_connect_ms == 0
-                        || now_ms.saturating_sub(s.last_slim_connect_ms) >= 1_000)
-                {
-                    s.last_slim_connect_ms = now_ms;
-                    s.helo_sent = false;
-                    s.slim_acc_len = 0;
-                    let remote_ep = (
-                        IpAddress::Ipv4(Ipv4Address::from(DEFAULT_LMS_SERVER_IP)),
-                        DEFAULT_LMS_SERVER_PORT,
-                    );
-                    s.local_port_counter = 49152 + ((s.local_port_counter.wrapping_add(1) - 49152) & 0x3FFF);
-                    let local_ep = (
-                        IpAddress::Ipv4(Ipv4Address::from(local_ip)),
-                        s.local_port_counter,
-                    );
-                    let _ = slim_sock.connect(s.smol_iface.context(), remote_ep, local_ep);
-                }
-            }
-
-            // Flush pending RESP bytes before any STAT/HELO frames
-            if s.pending_resp_sent < s.pending_resp_len {
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if slim_sock.may_send() {
-                    if let Ok(n) = slim_sock.send_slice(&s.pending_resp_buf[s.pending_resp_sent..s.pending_resp_len]) {
-                        s.pending_resp_sent += n;
-                    }
-                }
-            }
-
-            // Initial HELO + SETD ("BASEMENT") + STAT Heartbeat, and periodic Heartbeats
-            {
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if slim_sock.may_send() && !s.helo_sent && s.pending_resp_sent == s.pending_resp_len {
-                    let mut helo_buf = [0u8; 256];
-                    if let Ok(helo_len) = SlimprotoBuilder::build_helo(
-                        &BASEMENT_PLAYER_MAC,
-                        12,
-                        BASEMENT_HELO_CAPABILITIES,
-                        &mut helo_buf,
-                    ) {
-                        if slim_sock.send_slice(&helo_buf[..helo_len]).is_ok() {
-                            let mut setd_buf = [0u8; 128];
-                            if let Ok(setd_len) = SlimprotoBuilder::build_setd_name(
-                                s.coordinator.player_name.as_str(),
-                                &mut setd_buf,
-                            ) {
-                                let _ = slim_sock.send_slice(&setd_buf[..setd_len]);
-                            }
-
-                            let mut stat_buf = [0u8; 128];
-                            if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                                StatEvent::Heartbeat,
-                                s.pipeline.stream_buffer_available() as u32,
-                                s.pipeline.output_buffer_available() as u32,
-                                s.pipeline.frames_played,
-                                s.coordinator.current_sample_rate,
-                                s.coordinator.stream_bytes_received,
-                                now_ms as u32,
-                                0,
-                                &mut stat_buf,
-                            ) {
-                                let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
-                            }
-
-                            s.helo_sent = true;
-                            s.last_stat_ms = now_ms;
-                            s.coordinator.state = louder_esp32_app::PlayerState::Connected;
-                        }
-                    }
-                } else {
-                    let stat_interval_ms: u64 = if s.coordinator.state == louder_esp32_app::PlayerState::Playing {
-                        1_000
-                    } else {
-                        5_000
-                    };
-                    if slim_sock.may_send()
-                        && s.helo_sent
-                        && s.pending_resp_sent == s.pending_resp_len
-                        && now_ms.saturating_sub(s.last_stat_ms) >= stat_interval_ms
-                    {
-                        s.last_stat_ms = now_ms;
-                        let mut stat_buf = [0u8; 128];
-                        if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                            StatEvent::Heartbeat,
-                            s.pipeline.stream_buffer_available() as u32,
-                            s.pipeline.output_buffer_available() as u32,
-                            s.pipeline.frames_played,
-                            s.coordinator.current_sample_rate,
-                            s.coordinator.stream_bytes_received,
-                            now_ms as u32,
-                            0,
-                            &mut stat_buf,
-                        ) {
-                            let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
-                        }
-                    }
-                }
-            }
-
-            // Read incoming SlimProto bytes into accumulation buffer
-            {
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if slim_sock.can_recv() && s.slim_acc_len < s.slim_acc_buf.len() {
-                    let n = slim_sock
-                        .recv_slice(&mut s.slim_acc_buf[s.slim_acc_len..])
-                        .unwrap_or(0);
-                    s.slim_acc_len += n;
-                }
-            }
-
-            // Drain all complete frames from accumulation buffer
-            while s.slim_acc_len >= 6 {
-                match SlimprotoParser::parse_frame(&s.slim_acc_buf[..s.slim_acc_len]) {
-                    Ok((cmd, consumed)) => {
-                        if let Some(setting) = cmd.device_setting() {
-                            if setting.id == 0 {
-                                let name_bytes = if let Some(pos) =
-                                    setting.data.iter().position(|&b| b == 0)
-                                {
-                                    &setting.data[..pos]
-                                } else {
-                                    setting.data
-                                };
-                                if !name_bytes.is_empty() {
-                                    if let Ok(name_str) = core::str::from_utf8(name_bytes) {
-                                        s.coordinator.player_name.clear();
-                                        let _ = s.coordinator.player_name.push_str(name_str);
-                                    }
-                                }
-                                let mut tx_buf = [0u8; 128];
-                                if let Ok(tx_len) = SlimprotoBuilder::build_setd_name(
-                                    s.coordinator.player_name.as_str(),
-                                    &mut tx_buf,
-                                ) {
-                                    let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                    if slim_sock.may_send() {
-                                        let _ = slim_sock.send_slice(&tx_buf[..tx_len]);
-                                    }
-                                }
-                            }
-                        } else {
-                            match cmd {
-                                ServerCommand::AudioGain {
-                                    gain_left,
-                                    gain_right,
-                                    ..
-                                } => {
-                                    let max_gain = core::cmp::max(gain_left, gain_right);
-                                    let vol_reg = lms_gain_to_tas5805m_vol_reg(max_gain);
-                                    if s.amp.current_volume() != vol_reg {
-                                        let _ = s.amp.set_volume(vol_reg);
-                                    }
-                                    let eff_gain = if max_gain > 0 { 65536 } else { 0 };
-                                    s.pipeline.set_volume(eff_gain, eff_gain);
-                                    let new_pct = if vol_reg >= 0xFF {
-                                        0
-                                    } else {
-                                        100u8.saturating_sub(vol_reg.saturating_sub(0x30))
-                                    };
-                                    s.current_vol_pct = new_pct;
-                                    s.audio_cfg.volume = new_pct;
-                                    if persist_audio_config(s.settings_scratch, &s.audio_cfg, &mut s.settings_seq) {
-                                        s.settings_dirty = true;
-                                    }
-                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(new_pct));
-                                }
-                                ServerCommand::Stream {
-                                    command,
-                                    autostart,
-                                    format,
-                                    pcm_sample_size,
-                                    pcm_sample_rate,
-                                    pcm_channels,
-                                    pcm_endianness,
-                                    flags,
-                                    replay_gain,
-                                    server_port,
-                                    server_ip,
-                                    http_headers,
-                                    ..
-                                } => {
-                                    match command {
-                                        StreamCommandType::Timestamp => {
-                                            let mut stat_buf = [0u8; 128];
-                                            if let Ok(stat_len) =
-                                                StatBuilder::build_stat_with_metrics(
-                                                    StatEvent::Heartbeat,
-                                                    s.pipeline.stream_buffer_available() as u32,
-                                                    s.pipeline.output_buffer_available() as u32,
-                                                    s.pipeline.frames_played,
-                                                    s.coordinator.current_sample_rate,
-                                                    s.coordinator.stream_bytes_received,
-                                                    now_ms as u32,
-                                                    replay_gain,
-                                                    &mut stat_buf,
-                                                )
-                                            {
-                                                let slim_sock =
-                                                    s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                                if slim_sock.may_send() {
-                                                    let _ = slim_sock
-                                                        .send_slice(&stat_buf[..stat_len]);
-                                                }
-                                            }
-                                        }
-                                        StreamCommandType::Start => {
-                                            s.icy_meta_interval = 0;
-                                            s.icy_meta_next = 0;
-                                            s.icy_meta_left = 0;
-                                            s.audio_header_window = 0;
-                                            s.pending_resp_len = 0;
-                                            s.pending_resp_sent = 0;
-
-                                            s.pipeline.flush();
-                                            s.pipeline.frames_played = 0;
-                                            s.coordinator.frames_played = 0;
-                                            s.coordinator.stream_bytes_received = 0;
-                                            s.audio_http_eof = false;
-                                            s.decode_ready_sent = false;
-                                            s.track_started_sent = false;
-                                            s.threshold_sent = false;
-
-                                            s.coordinator.autostart_mode =
-                                                AutostartMode::from_strm(autostart, flags);
-                                            s.coordinator.awaiting_cont =
-                                                s.coordinator.autostart_mode.requires_cont();
-                                            s.coordinator.current_format = Some(format);
-
-                                            let sample_rate =
-                                                PlayerCoordinator::decode_pcm_sample_rate_hz(
-                                                    pcm_sample_rate,
-                                                )
-                                                .unwrap_or_else(|| {
-                                                    sample_rate_from_index(pcm_sample_rate)
-                                                });
-                                            s.coordinator.current_sample_rate = sample_rate;
-                                            let _ = s.pipeline.set_sample_rate(sample_rate);
-
-                                            let bits = PlayerCoordinator::normalize_pcm_bits(
-                                                pcm_sample_size,
-                                            );
-                                            let channels =
-                                                PlayerCoordinator::normalize_pcm_channels(
-                                                    pcm_channels,
-                                                );
-                                            let is_be = matches!(
-                                                pcm_endianness,
-                                                Endianness::BigEndian
-                                            );
-                                            if format == squeezelite_proto::AudioFormat::Mp3 {
-                                                match s.pipeline.decoder {
-                                                    ActiveDecoder::Mp3(ref mut dec) => {
-                                                        dec.reset_in_place();
-                                                    }
-                                                    _ => {
-                                                        s.pipeline.set_decoder(ActiveDecoder::Mp3(take_static_mp3_decoder()));
-                                                    }
-                                                }
-                                                s.pipeline.sink.set_mute(false);
-                                            } else if format == squeezelite_proto::AudioFormat::Flac {
-                                                if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                                                    MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                                                }
-                                                match s.pipeline.decoder {
-                                                    ActiveDecoder::Flac(ref mut dec) => {
-                                                        dec.flush();
-                                                    }
-                                                    _ => {
-                                                        s.pipeline.set_decoder(ActiveDecoder::Flac(alloc::boxed::Box::new(squeezelite_decoders::FlacDecoder::new())));
-                                                    }
-                                                }
-                                                s.pipeline.sink.set_mute(false);
-                                            } else if format == squeezelite_proto::AudioFormat::Pcm {
-                                                if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                                                    MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                                                }
-                                                s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be)));
-                                                s.pipeline.sink.set_mute(false);
-                                            } else {
-                                                if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                                                    MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                                                }
-                                                s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be)));
-                                                s.pipeline.sink.set_mute(true);
-                                            }
-
-                                            s.pipeline.sink.driver.pump_silence_if_needed(false, false);
-                                            if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                                let _ = s.amp.clear_faults();
-                                                let _ = s.amp.start_playback_via_hiz();
-                                            }
-
-                                            if http_headers.is_empty() {
-                                                let req = b"GET /stream.mp3 HTTP/1.0\r\n\r\n";
-                                                s.audio_req_buf[..req.len()].copy_from_slice(req);
-                                                s.audio_req_len = req.len();
-                                            } else {
-                                                let copy_len = http_headers.len().min(s.audio_req_buf.len());
-                                                s.audio_req_buf[..copy_len]
-                                                    .copy_from_slice(&http_headers[..copy_len]);
-                                                s.audio_req_len = copy_len;
-                                            }
-
-                                            let audio_sock =
-                                                s.sockets.get_mut::<tcp::Socket>(s.audio_handle);
-                                            audio_sock.abort();
-                                            let audio_remote_ip = if server_ip == [0, 0, 0, 0] {
-                                                DEFAULT_LMS_SERVER_IP
-                                            } else {
-                                                server_ip
-                                            };
-                                            let audio_remote_port = if server_port == 0 {
-                                                9000
-                                            } else {
-                                                server_port
-                                            };
-                                            let remote_ep = (
-                                                IpAddress::Ipv4(Ipv4Address::from(
-                                                    audio_remote_ip,
-                                                )),
-                                                audio_remote_port,
-                                            );
-                                            s.local_port_counter = 49152 + ((s.local_port_counter.wrapping_add(1) - 49152) & 0x3FFF);
-                                            let local_ep = (
-                                                IpAddress::Ipv4(Ipv4Address::from(local_ip)),
-                                                s.local_port_counter,
-                                            );
-                                            let _ = audio_sock.connect(
-                                                s.smol_iface.context(),
-                                                remote_ep,
-                                                local_ep,
-                                            );
-                                            s.audio_stream_active = true;
-                                            s.audio_req_sent = false;
-                                            s.audio_req_sent_offset = 0;
-                                            s.audio_headers_stripped = false;
-                                            s.audio_header_len = 0;
-
-                                            if s.pending_resp_sent == s.pending_resp_len {
-                                                let slim_sock =
-                                                    s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                                if slim_sock.may_send() {
-                                                    let mut stat_buf = [0u8; 128];
-                                                    if let Ok(stat_len) =
-                                                        StatBuilder::build_stat_with_metrics(
-                                                            StatEvent::Connected,
-                                                            s.pipeline.stream_buffer_available()
-                                                                as u32,
-                                                            s.pipeline.output_buffer_available()
-                                                                as u32,
-                                                            s.pipeline.frames_played,
-                                                            s.coordinator.current_sample_rate,
-                                                            s.coordinator.stream_bytes_received,
-                                                            now_ms as u32,
-                                                            0,
-                                                            &mut stat_buf,
-                                                        )
-                                                    {
-                                                        let _ = slim_sock
-                                                            .send_slice(&stat_buf[..stat_len]);
-                                                    }
-                                                }
-                                            }
-
-                                            s.coordinator.state =
-                                                louder_esp32_app::PlayerState::Playing;
-                                        }
-                                        StreamCommandType::Pause => {
-                                            s.coordinator.state =
-                                                louder_esp32_app::PlayerState::Paused;
-                                            s.pipeline.sink.set_mute(true);
-                                            let slim_sock =
-                                                s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                            if slim_sock.may_send() {
-                                                let mut stat_buf = [0u8; 128];
-                                                if let Ok(stat_len) =
-                                                    StatBuilder::build_stat_with_metrics(
-                                                        StatEvent::TrackPaused,
-                                                        s.pipeline.stream_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.output_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.frames_played,
-                                                        s.coordinator.current_sample_rate,
-                                                        s.coordinator.stream_bytes_received,
-                                                        now_ms as u32,
-                                                        0,
-                                                        &mut stat_buf,
-                                                    )
-                                                {
-                                                    let _ = slim_sock
-                                                        .send_slice(&stat_buf[..stat_len]);
-                                                }
-                                            }
-                                        }
-                                        StreamCommandType::Resume => {
-                                            s.coordinator.state =
-                                                louder_esp32_app::PlayerState::Playing;
-                                            s.pipeline.sink.set_mute(false);
-                                            let slim_sock =
-                                                s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                            if slim_sock.may_send() {
-                                                let mut stat_buf = [0u8; 128];
-                                                if let Ok(stat_len) =
-                                                    StatBuilder::build_stat_with_metrics(
-                                                        StatEvent::TrackResumed,
-                                                        s.pipeline.stream_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.output_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.frames_played,
-                                                        s.coordinator.current_sample_rate,
-                                                        s.coordinator.stream_bytes_received,
-                                                        now_ms as u32,
-                                                        0,
-                                                        &mut stat_buf,
-                                                    )
-                                                {
-                                                    let _ = slim_sock
-                                                        .send_slice(&stat_buf[..stat_len]);
-                                                }
-                                            }
-                                        }
-                                        StreamCommandType::Stop => {
-                                            s.coordinator.state =
-                                                louder_esp32_app::PlayerState::Stopped;
-                                            s.audio_stream_active = false;
-                                            s.audio_http_eof = false;
-                                            s.decode_ready_sent = false;
-                                            s.track_started_sent = false;
-                                            s.threshold_sent = false;
-                                            s.sockets
-                                                .get_mut::<tcp::Socket>(s.audio_handle)
-                                                .abort();
-                                            s.pipeline.sink.set_mute(true);
-                                            let slim_sock =
-                                                s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                            if slim_sock.may_send() {
-                                                let mut stat_buf = [0u8; 128];
-                                                if let Ok(stat_len) =
-                                                    StatBuilder::build_stat_with_metrics(
-                                                        StatEvent::TrackStopped,
-                                                        s.pipeline.stream_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.output_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.frames_played,
-                                                        s.coordinator.current_sample_rate,
-                                                        s.coordinator.stream_bytes_received,
-                                                        now_ms as u32,
-                                                        0,
-                                                        &mut stat_buf,
-                                                    )
-                                                {
-                                                    let _ = slim_sock
-                                                        .send_slice(&stat_buf[..stat_len]);
-                                                }
-                                            }
-                                        }
-                                        StreamCommandType::Flush => {
-                                            s.audio_stream_active = false;
-                                            s.audio_http_eof = false;
-                                            s.decode_ready_sent = false;
-                                            s.track_started_sent = false;
-                                            s.threshold_sent = false;
-                                            s.sockets
-                                                .get_mut::<tcp::Socket>(s.audio_handle)
-                                                .abort();
-                                            s.pipeline.flush();
-                                            let slim_sock =
-                                                s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                            if slim_sock.may_send() {
-                                                let mut stat_buf = [0u8; 128];
-                                                if let Ok(stat_len) =
-                                                    StatBuilder::build_stat_with_metrics(
-                                                        StatEvent::StreamFlushed,
-                                                        s.pipeline.stream_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.output_buffer_available()
-                                                            as u32,
-                                                        s.pipeline.frames_played,
-                                                        s.coordinator.current_sample_rate,
-                                                        s.coordinator.stream_bytes_received,
-                                                        now_ms as u32,
-                                                        0,
-                                                        &mut stat_buf,
-                                                    )
-                                                {
-                                                    let _ = slim_sock
-                                                        .send_slice(&stat_buf[..stat_len]);
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                ServerCommand::SetDevice { sample_rate } => {
-                                    if sample_rate > u8::MAX as u32 {
-                                        s.coordinator.current_sample_rate = sample_rate;
-                                        let _ = s.pipeline.set_sample_rate(sample_rate);
-                                    }
-                                }
-                                ServerCommand::Flush => {
-                                    s.audio_stream_active = false;
-                                    s.audio_http_eof = false;
-                                    s.decode_ready_sent = false;
-                                    s.track_started_sent = false;
-                                    s.threshold_sent = false;
-                                    s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
-                                    s.pipeline.flush();
-                                    let slim_sock =
-                                        s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                    if slim_sock.may_send() {
-                                        let mut stat_buf = [0u8; 128];
-                                        if let Ok(stat_len) =
-                                            StatBuilder::build_stat_with_metrics(
-                                                StatEvent::StreamFlushed,
-                                                s.pipeline.stream_buffer_available() as u32,
-                                                s.pipeline.output_buffer_available() as u32,
-                                                s.pipeline.frames_played,
-                                                s.coordinator.current_sample_rate,
-                                                s.coordinator.stream_bytes_received,
-                                                now_ms as u32,
-                                                0,
-                                                &mut stat_buf,
-                                            )
-                                        {
-                                            let _ =
-                                                slim_sock.send_slice(&stat_buf[..stat_len]);
-                                        }
-                                    }
-                                }
-                                ServerCommand::Unknown { opcode, payload } => {
-                                    if let Some((_spdif, dac_enable)) = cmd.audio_enable() {
-                                        s.coordinator.dac_enabled = dac_enable;
-                                        s.pipeline.sink.set_mute(!dac_enable);
-                                    } else if let Some(metaint) = cmd.stream_continue() {
-                                        s.coordinator.awaiting_cont = false;
-                                        if metaint > 0 && s.icy_meta_interval == 0 {
-                                            let interval = metaint as usize;
-                                            let already = (s.coordinator.stream_bytes_received as usize) % interval;
-                                            s.icy_meta_interval = interval;
-                                            s.icy_meta_next = interval - already;
-                                            s.icy_meta_left = 0;
-                                        }
-                                        if !s.threshold_sent && !s.coordinator.autostart_mode.is_auto() {
-                                            let mut stat_buf = [0u8; 128];
-                                            if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                                                StatEvent::BUFFER_THRESHOLD,
-                                                s.pipeline.stream_buffer_available() as u32,
-                                                s.pipeline.output_buffer_available() as u32,
-                                                s.pipeline.frames_played,
-                                                s.coordinator.current_sample_rate,
-                                                s.coordinator.stream_bytes_received,
-                                                now_ms as u32,
-                                                0,
-                                                &mut stat_buf,
-                                            ) {
-                                                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                                if slim_sock.may_send() && slim_sock.send_slice(&stat_buf[..stat_len]) == Ok(stat_len) {
-                                                    s.threshold_sent = true;
-                                                }
-                                            }
-                                        }
-                                    } else if opcode == [b'c', b'o', b'd', b'c'] && !payload.is_empty() {
-                                        let codc_fmt = squeezelite_proto::AudioFormat::from_byte(payload[0]);
-                                        s.coordinator.current_format = Some(codc_fmt);
-                                        if codc_fmt == squeezelite_proto::AudioFormat::Mp3 {
-                                            match s.pipeline.decoder {
-                                                ActiveDecoder::Mp3(ref mut dec) => {
-                                                    dec.reset_in_place();
-                                                }
-                                                _ => {
-                                                    s.pipeline.set_decoder(ActiveDecoder::Mp3(take_static_mp3_decoder()));
-                                                }
-                                            }
-                                            s.pipeline.sink.set_mute(false);
-                                        } else if codc_fmt == squeezelite_proto::AudioFormat::Flac {
-                                            if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                                                MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                                            }
-                                            match s.pipeline.decoder {
-                                                ActiveDecoder::Flac(ref mut dec) => {
-                                                    dec.flush();
-                                                }
-                                                _ => {
-                                                    s.pipeline.set_decoder(ActiveDecoder::Flac(alloc::boxed::Box::new(squeezelite_decoders::FlacDecoder::new())));
-                                                }
-                                            }
-                                            s.pipeline.sink.set_mute(false);
-                                        } else if codc_fmt == squeezelite_proto::AudioFormat::Pcm {
-                                            if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                                                MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                                            }
-                                            let bits = if payload.len() > 1 {
-                                                PlayerCoordinator::normalize_pcm_bits(payload[1])
-                                            } else {
-                                                16
-                                            };
-                                            let channels = if payload.len() > 3 {
-                                                PlayerCoordinator::normalize_pcm_channels(payload[3])
-                                            } else {
-                                                2
-                                            };
-                                            let is_be = if payload.len() > 4 {
-                                                matches!(Endianness::from_byte(payload[4]), Endianness::BigEndian)
-                                            } else {
-                                                true
-                                            };
-                                            s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(bits, channels, is_be)));
-                                            s.pipeline.sink.set_mute(false);
-                                        } else {
-                                            if matches!(s.pipeline.decoder, ActiveDecoder::Mp3(_)) {
-                                                MP3_DEC_TAKEN.store(false, core::sync::atomic::Ordering::Release);
-                                            }
-                                            // Unsupported compressed codec: mute sink to avoid loud PCM static noise
-                                            s.pipeline.sink.set_mute(true);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if consumed > 0 {
-                            s.slim_acc_buf.copy_within(consumed..s.slim_acc_len, 0);
-                            s.slim_acc_len -= consumed;
-                        } else {
-                            break;
-                        }
-                    }
-                    Err(ParseError::BufferTooShort) => {
-                        if s.slim_acc_len >= s.slim_acc_buf.len() {
-                            s.slim_acc_buf.copy_within(1..s.slim_acc_len, 0);
-                            s.slim_acc_len -= 1;
-                        }
-                        break;
-                    }
-                    Err(_) => {
-                        if s.slim_acc_len > 0 {
-                            s.slim_acc_buf.copy_within(1..s.slim_acc_len, 0);
-                            s.slim_acc_len -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// `audio_fetch`: HTTP audio socket (request, header strip + RESP, ICY-aware body ingest,
-    /// EOF -> DSCO) while a stream is active and the IPv4 lease holds.
-    #[inline(never)]
-    fn audio_stream(s: &mut FirmwareState) {
-        let now_ms = s.now_ms;
-        if s.assigned_ip.is_none() {
+        let Some(local_ip) = s.assigned_ip else {
             return;
-        }
-        // Drive audio_sock HTTP streaming when active
-        if s.audio_stream_active {
-            // Send HTTP GET request headers with offset tracking
+        };
+        // Half-closed / closing control link: abort it so it reconnects at once instead of
+        // lingering in CloseWait.
+        {
+            let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+            if slim_sock.is_open()
+                && matches!(
+                    slim_sock.state(),
+                    tcp::State::CloseWait
+                        | tcp::State::TimeWait
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                )
             {
-                let audio_sock = s.sockets.get_mut::<tcp::Socket>(s.audio_handle);
-                if audio_sock.may_send() && !s.audio_req_sent {
-                    if let Ok(n) = audio_sock.send_slice(&s.audio_req_buf[s.audio_req_sent_offset..s.audio_req_len]) {
-                        s.audio_req_sent_offset += n;
-                        if s.audio_req_sent_offset >= s.audio_req_len {
-                            s.audio_req_sent = true;
-                        }
-                    }
+                slim_sock.abort();
+                s.helo_sent = false;
+            }
+        }
+        // Connect to LMS if closed (rate-limited to 1 s)
+        {
+            let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+            if !slim_sock.is_open()
+                && (s.last_slim_connect_ms == 0
+                    || now_ms.saturating_sub(s.last_slim_connect_ms) >= 1_000)
+            {
+                s.last_slim_connect_ms = now_ms;
+                s.helo_sent = false;
+                s.slim_link.reset();
+                let remote_ep = (
+                    IpAddress::Ipv4(Ipv4Address::from(DEFAULT_LMS_SERVER_IP)),
+                    DEFAULT_LMS_SERVER_PORT,
+                );
+                let local_ep = (
+                    IpAddress::Ipv4(Ipv4Address::from(local_ip)),
+                    next_local_port(&mut s.local_port_counter),
+                );
+                let _ = slim_sock.connect(s.smol_iface.context(), remote_ep, local_ep);
+            }
+        }
+        slim_tick(s, local_ip);
+    }
+
+    /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`), then one
+    /// `PlayerCoordinator::tick` over the device adapters: at most one server frame, the HTTP
+    /// audio fetch, one audio step, deferred `STAT`/`RESP`/`META`/`DSCO` and the heartbeat. The
+    /// tick also runs while the control link is down, so buffered and streaming audio keeps
+    /// playing. A server volume change (`audg`) is mirrored to the CYD and the settings journal.
+    #[inline(never)]
+    fn slim_tick(s: &mut FirmwareState, local_ip: [u8; 4]) {
+        let now_ms = s.now_ms as u32;
+        let FirmwareState {
+            ref mut sockets,
+            ref mut smol_iface,
+            slim_handle,
+            audio_handle,
+            ref mut coordinator,
+            ref mut pipeline,
+            ref mut amp,
+            ref mut cyd_bridge,
+            ref mut slim_link,
+            ref mut stream_state,
+            ref mut local_port_counter,
+            ref mut helo_sent,
+            ref mut current_vol_pct,
+            ref mut audio_cfg,
+            ref mut settings_scratch,
+            ref mut settings_seq,
+            ref mut settings_dirty,
+            ..
+        } = *s;
+        let Some((slim_sock, audio_sock)) =
+            slim_and_audio_sockets(sockets, slim_handle, audio_handle)
+        else {
+            return;
+        };
+
+        let mut transport = SmoltcpSlimTransport::new(SmolTcp::new(slim_sock), &mut *slim_link);
+        if transport.connected() && !*helo_sent {
+            *helo_sent = coordinator
+                .hello(&mut transport, HELO_DEVICE_ID, BASEMENT_HELO_CAPABILITIES, now_ms)
+                .is_ok();
+            if !*helo_sent {
+                // Never let a `STAT` reach LMS before the `HELO`: retry next lap.
+                return;
+            }
+        }
+        let mut source = SmoltcpStreamSource::new(
+            SmolTcp {
+                sock: audio_sock,
+                connect: Some((smol_iface.context(), local_ip, local_port_counter)),
+            },
+            &mut *stream_state,
+        );
+        let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        // A dead control link is handled by `slim_session` (reconnect + HELO); the tick's own
+        // errors need no action here.
+        let _ = coordinator.tick(&mut transport, &mut source, &mut backend, pipeline, now_ms);
+
+        if let Some(msg) = coordinator.take_cyd_message() {
+            if let CydMessage::Volume(pct) = msg {
+                *current_vol_pct = pct;
+                audio_cfg.volume = pct;
+                if persist_audio_config(settings_scratch, audio_cfg, settings_seq) {
+                    *settings_dirty = true;
                 }
             }
-
-            // Process incoming HTTP stream bytes
-            if !s.audio_headers_stripped {
-                let mut header_matched = false;
-                let audio_sock = s.sockets.get_mut::<tcp::Socket>(s.audio_handle);
-                if audio_sock.can_recv() {
-                    let _ = audio_sock.recv(|rx_buf| {
-                        let mut consumed = 0;
-                        while consumed < rx_buf.len() {
-                            let b = rx_buf[consumed];
-                            consumed += 1;
-                            s.audio_header_window = (s.audio_header_window << 8) | (b as u32);
-                            if s.audio_header_len < s.audio_header_buf.len() {
-                                s.audio_header_buf[s.audio_header_len] = b;
-                                s.audio_header_len += 1;
-                            }
-                            if s.audio_header_window == 0x0D0A_0D0A
-                                || (s.audio_header_window & 0xFFFF) == 0x0A0A
-                            {
-                                header_matched = true;
-                                break;
-                            }
-                        }
-                        (consumed, ())
-                    });
-                }
-
-                if header_matched {
-                    s.audio_headers_stripped = true;
-
-                    if s.icy_meta_interval == 0 {
-                        if let Some(interval) = parse_icy_metaint_header(&s.audio_header_buf[..s.audio_header_len]) {
-                            s.icy_meta_interval = interval;
-                            s.icy_meta_next = interval;
-                            s.icy_meta_left = 0;
-                        }
-                    }
-
-                    if let Ok(resp_len) = SlimprotoBuilder::build_resp(
-                        &s.audio_header_buf[..s.audio_header_len],
-                        s.pending_resp_buf,
-                    ) {
-                        s.pending_resp_len = resp_len;
-                        s.pending_resp_sent = 0;
-                        let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                        if slim_sock.may_send() {
-                            if let Ok(n) = slim_sock.send_slice(&s.pending_resp_buf[..resp_len]) {
-                                s.pending_resp_sent = n;
-                            }
-                        }
-                    }
-
-                    if !s.threshold_sent && !s.coordinator.autostart_mode.is_auto() && !s.coordinator.awaiting_cont {
-                        if s.pending_resp_sent == s.pending_resp_len {
-                            let mut stat_buf = [0u8; 128];
-                            if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                                StatEvent::BUFFER_THRESHOLD,
-                                s.pipeline.stream_buffer_available() as u32,
-                                s.pipeline.output_buffer_available() as u32,
-                                s.pipeline.frames_played,
-                                s.coordinator.current_sample_rate,
-                                s.coordinator.stream_bytes_received,
-                                now_ms as u32,
-                                0,
-                                &mut stat_buf,
-                            ) {
-                                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                if slim_sock.may_send() && slim_sock.send_slice(&stat_buf[..stat_len]) == Ok(stat_len) {
-                                    s.threshold_sent = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if !s.audio_http_eof && !s.coordinator.awaiting_cont {
-                let mut audio_rx_chunk = [0u8; 512];
-                for _ in 0..32 {
-                    if !s.sockets.get_mut::<tcp::Socket>(s.audio_handle).can_recv() {
-                        break;
-                    }
-                    if s.icy_meta_interval > 0 && s.icy_meta_next == 0 {
-                        if s.icy_meta_left == 0 {
-                            let mut c = [0u8; 1];
-                            let n = s.sockets
-                                .get_mut::<tcp::Socket>(s.audio_handle)
-                                .recv_slice(&mut c)
-                                .unwrap_or(0);
-                            if n == 0 {
-                                break;
-                            }
-                            s.icy_meta_left = (c[0] as usize) * 16;
-                            if s.icy_meta_left == 0 {
-                                s.icy_meta_next = s.icy_meta_interval;
-                                continue;
-                            }
-                        }
-                        if s.icy_meta_left > 0 {
-                            let to_skip = s.icy_meta_left.min(audio_rx_chunk.len());
-                            let n = s.sockets
-                                .get_mut::<tcp::Socket>(s.audio_handle)
-                                .recv_slice(&mut audio_rx_chunk[..to_skip])
-                                .unwrap_or(0);
-                            if n == 0 {
-                                break;
-                            }
-                            s.icy_meta_left -= n;
-                            if s.icy_meta_left == 0 {
-                                s.icy_meta_next = s.icy_meta_interval;
-                            }
-                            continue;
-                        }
-                    } else {
-                        let avail_write = s.pipeline.stream_buffer.available_write();
-                        if avail_write == 0 {
-                            break;
-                        }
-                        let max_chunk = if s.icy_meta_interval > 0 {
-                            audio_rx_chunk.len().min(s.icy_meta_next).min(avail_write)
-                        } else {
-                            audio_rx_chunk.len().min(avail_write)
-                        };
-                        if max_chunk == 0 {
-                            break;
-                        }
-                        let n = s.sockets
-                            .get_mut::<tcp::Socket>(s.audio_handle)
-                            .recv_slice(&mut audio_rx_chunk[..max_chunk])
-                            .unwrap_or(0);
-                        if n > 0 {
-                            let ingested = s.pipeline.ingest_stream_data(&audio_rx_chunk[..n]).unwrap_or(0);
-                            s.coordinator.stream_bytes_received += ingested as u64;
-                            if s.icy_meta_interval > 0 {
-                                s.icy_meta_next = s.icy_meta_next.saturating_sub(ingested);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Check HTTP socket EOF:
-            let sock_eof = {
-                let audio_sock = s.sockets.get_mut::<tcp::Socket>(s.audio_handle);
-                s.audio_req_sent
-                    && s.audio_headers_stripped
-                    && !audio_sock.can_recv()
-                    && !audio_sock.may_recv()
-            };
-            if sock_eof && !s.audio_http_eof {
-                s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
-                s.audio_http_eof = true;
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if slim_sock.may_send() {
-                    let mut dsco_buf = [0u8; 32];
-                    if let Ok(dsco_len) = SlimprotoBuilder::build_dsco(
-                        DisconnectReason::ConnectionClosed,
-                        &mut dsco_buf,
-                    ) {
-                        let _ = slim_sock.send_slice(&dsco_buf[..dsco_len]);
-                    }
-                }
-            }
+            let _ = cyd_bridge.send_message(&msg);
         }
     }
 
-    /// `cyd_bridge`: legacy firmware tick step 0 — apply one pending CYD command.
+    /// `cyd_bridge`: apply one pending CYD command.
     #[inline(never)]
     fn cyd_command(s: &mut FirmwareState) {
         if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
@@ -1818,79 +1129,29 @@ mod device {
         }
     }
 
-    /// One legacy DMA top-up loop: drain pending decoded PCM into the output ring and push the
-    /// output ring into the I2S0 DMA, up to 16 rounds (legacy tick steps 1 and 3).
-    #[inline(never)]
-    fn output_top_up(s: &mut FirmwareState) {
-        for _ in 0..16 {
-            if s.pipeline.has_pending_pcm() && s.pipeline.output_buffer.available_write() >= 8 {
-                let _ = s.pipeline.process_decode_step();
-            }
-            if !s.coordinator.dac_enabled || s.pipeline.output_buffer.available_read() < 8 {
-                break;
-            }
-            let written = s.pipeline.process_output_step().unwrap_or(0);
-            s.step_frames += written;
-            s.coordinator.frames_played = s.pipeline.frames_played;
-            if written == 0 {
-                break;
-            }
-        }
-    }
-
-    /// `i2s_feed`: legacy firmware tick step 1 — fast O(1) drain of pending decoded PCM and an
-    /// I2S0 DMA top-up BEFORE spending ~4.5 ms decoding a new MP3 frame.
+    /// `i2s_feed`: drain decoded PCM and top up the I2S0 DMA (up to 16 sink writes) BEFORE
+    /// spending ~4.5 ms decoding a new MP3 frame.
     #[inline(never)]
     fn output_top_up_first(s: &mut FirmwareState) {
-        s.step_frames = 0;
-        s.tick_playing = s.coordinator.state == louder_esp32_app::PlayerState::Playing;
-        if s.tick_playing {
-            output_top_up(s);
-        }
+        s.coordinator.pump_output(s.pipeline, 16);
     }
 
-    /// `decode_pump`: legacy firmware tick step 2 — with the DMA topped up, decode at most one
-    /// audio frame (or a fast resync/skip of up to 16 chunks) if no pending PCM remains and the
-    /// output ring has space.
+    /// `decode_pump`: with the DMA topped up, decode at most one audio frame (or a resync /
+    /// tag-skip burst of up to 16 steps for MP3 and FLAC, 4 otherwise).
     #[inline(never)]
     fn decode_burst(s: &mut FirmwareState) {
-        if !s.tick_playing {
-            return;
-        }
-        let max_decode_steps = match s.pipeline.decoder {
+        let max_steps = match s.pipeline.decoder {
             ActiveDecoder::Mp3(_) | ActiveDecoder::Flac(_) => 16,
             _ => 4,
         };
-        for _ in 0..max_decode_steps {
-            if !s.pipeline.has_pending_pcm()
-                && s.pipeline.output_buffer.available_write() >= 1024
-                && s.pipeline.stream_buffer.available_read() > 0
-            {
-                let prev_out = s.pipeline.output_buffer.available_read();
-                let res = s.pipeline.process_decode_step();
-                if s.pipeline.has_pending_pcm() || s.pipeline.output_buffer.available_read() > prev_out {
-                    break;
-                }
-                if !matches!(res, Ok(c) if c > 0) {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        s.coordinator.pump_decode(s.pipeline, max_steps);
     }
 
-    /// `i2s_feed`: legacy firmware tick step 3 + tail (top up the DMA with the new frames, drain
-    /// pending PCM, sync the coordinator rate, stop the amp when the DAC is disabled), then the
-    /// legacy loop's silence pump.
+    /// `i2s_feed`: top up the DMA with the new frames, sync the coordinator rate, keep the amp
+    /// stopped while the DAC is disabled, then pump silence when there is nothing to play.
     #[inline(never)]
     fn output_top_up_final(s: &mut FirmwareState) {
-        if s.tick_playing {
-            output_top_up(s);
-            if s.pipeline.has_pending_pcm() && s.pipeline.output_buffer.available_write() >= 8 {
-                let _ = s.pipeline.process_decode_step();
-            }
-        }
+        s.coordinator.pump_output(s.pipeline, 16);
         s.coordinator.current_sample_rate = s.pipeline.sample_rate;
 
         if !s.coordinator.dac_enabled {
@@ -1900,117 +1161,9 @@ mod device {
         let has_buffered_audio =
             s.pipeline.output_buffer.available_read() >= 8 || s.pipeline.has_pending_pcm();
         s.pipeline.sink.driver.pump_silence_if_needed(
-            s.coordinator.state == louder_esp32_app::PlayerState::Playing,
+            s.coordinator.state == PlayerState::Playing,
             has_buffered_audio,
         );
-    }
-
-    /// `slimproto_session`: `STMs` once the first decoded frame has been played.
-    #[inline(never)]
-    fn stat_track_started(s: &mut FirmwareState) {
-        let now_ms = s.now_ms;
-        if s.audio_stream_active
-            && !s.track_started_sent
-            && s.pipeline.frames_played > 0
-            && s.pending_resp_sent == s.pending_resp_len
-        {
-            let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-            if slim_sock.may_send() {
-                let mut stat_buf = [0u8; 128];
-                if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                    StatEvent::TrackStarted,
-                    s.pipeline.stream_buffer_available() as u32,
-                    s.pipeline.output_buffer_available() as u32,
-                    s.pipeline.frames_played,
-                    s.coordinator.current_sample_rate,
-                    s.coordinator.stream_bytes_received,
-                    now_ms as u32,
-                    0,
-                    &mut stat_buf,
-                ) {
-                    if slim_sock.send_slice(&stat_buf[..stat_len]) == Ok(stat_len) {
-                        s.track_started_sent = true;
-                    }
-                }
-            }
-        }
-    }
-
-    /// `decode_pump`: after HTTP EOF, decode the stream-ring tail (dropping a truncated frame).
-    #[inline(never)]
-    fn decode_eof_drain(s: &mut FirmwareState) {
-        if s.audio_stream_active && s.audio_http_eof {
-            if !s.pipeline.has_pending_pcm() && s.pipeline.stream_buffer.available_read() > 0 {
-                if matches!(s.pipeline.process_decode_step(), Err(squeezelite_decoders::DecoderError::NeedMoreData)) {
-                    s.pipeline.stream_buffer.flush();
-                }
-            }
-        }
-    }
-
-    /// `slimproto_session`: `STMd` once the stream is fully decoded, then `STMu` + stop once
-    /// the output has drained.
-    #[inline(never)]
-    fn stat_decode_ready_underrun(s: &mut FirmwareState) {
-        let now_ms = s.now_ms;
-        if s.audio_stream_active
-            && s.audio_http_eof
-            && !s.decode_ready_sent
-            && !s.pipeline.has_pending_pcm()
-            && s.pipeline.stream_buffer.available_read() == 0
-            && s.pending_resp_sent == s.pending_resp_len
-        {
-            let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-            if slim_sock.may_send() {
-                let mut stat_buf = [0u8; 128];
-                if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                    StatEvent::DecodeReady,
-                    s.pipeline.stream_buffer_available() as u32,
-                    s.pipeline.output_buffer_available() as u32,
-                    s.pipeline.frames_played,
-                    s.coordinator.current_sample_rate,
-                    s.coordinator.stream_bytes_received,
-                    now_ms as u32,
-                    0,
-                    &mut stat_buf,
-                ) {
-                    if slim_sock.send_slice(&stat_buf[..stat_len]) == Ok(stat_len) {
-                        s.decode_ready_sent = true;
-                    }
-                }
-            }
-        }
-
-        if s.audio_stream_active
-            && s.audio_http_eof
-            && s.decode_ready_sent
-            && !s.pipeline.has_pending_pcm()
-            && s.pipeline.stream_buffer.available_read() == 0
-            && s.pipeline.output_buffer.available_read() == 0
-            && s.step_frames == 0
-        {
-            if s.pending_resp_sent == s.pending_resp_len {
-                let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                if slim_sock.may_send() {
-                    let mut stat_buf = [0u8; 128];
-                    if let Ok(stat_len) = StatBuilder::build_stat_with_metrics(
-                        StatEvent::TrackUnderrun,
-                        s.pipeline.stream_buffer_available() as u32,
-                        s.pipeline.output_buffer_available() as u32,
-                        s.pipeline.frames_played,
-                        s.coordinator.current_sample_rate,
-                        s.coordinator.stream_bytes_received,
-                        now_ms as u32,
-                        0,
-                        &mut stat_buf,
-                    ) {
-                        let _ = slim_sock.send_slice(&stat_buf[..stat_len]);
-                    }
-                }
-                s.audio_stream_active = false;
-                s.coordinator.state = louder_esp32_app::PlayerState::Stopped;
-            }
-        }
     }
 
     /// `watchdog_lease`: TAS58xx fault recovery + telemetry refresh every 2 s.
@@ -2061,8 +1214,10 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_ring_matches_legacy_superloop_order() {
-        // Owner sequence of one lap == the order the pre-embassy superloop ran its blocks.
+    fn test_phase_ring_keeps_dma_first_audio_order() {
+        // Owner sequence of one lap. The audio steps keep the pre-Task-9 superloop order: the
+        // I2S DMA is topped up before and after the decode burst, after the slimproto session
+        // (whose coordinator tick also fetches the HTTP audio).
         let owners: Vec<RingTask> = PHASE_ORDER.iter().map(|p| p.owner()).collect();
         assert_eq!(
             owners,
@@ -2073,15 +1228,11 @@ mod tests {
                 RingTask::WatchdogLease,    // Gate 3 lease
                 RingTask::NetStack,         // smoltcp poll + DHCP
                 RingTask::HttpControl,      // Gate 4 server + deferred action
-                RingTask::SlimprotoSession, // LMS control socket
-                RingTask::AudioFetch,       // audio socket
-                RingTask::CydBridge,        // firmware tick: CYD command
-                RingTask::I2sFeed,          // firmware tick: DMA top-up before decode
-                RingTask::DecodePump,       // firmware tick: decode burst
-                RingTask::I2sFeed,          // firmware tick: top-up + DAC gate, silence pump
-                RingTask::SlimprotoSession, // STMs
-                RingTask::DecodePump,       // post-EOF tail decode
-                RingTask::SlimprotoSession, // STMd / STMu
+                RingTask::SlimprotoSession, // HELO + PlayerCoordinator::tick
+                RingTask::CydBridge,        // CYD command
+                RingTask::I2sFeed,          // pump_output before decode
+                RingTask::DecodePump,       // pump_decode
+                RingTask::I2sFeed,          // pump_output + DAC gate, silence pump
                 RingTask::WatchdogLease,    // amp fault + telemetry
                 RingTask::CydBridge,        // CYD progress
             ]
@@ -2109,7 +1260,6 @@ mod tests {
             RingTask::NetStack,
             RingTask::HttpControl,
             RingTask::SlimprotoSession,
-            RingTask::AudioFetch,
             RingTask::CydBridge,
             RingTask::DecodePump,
             RingTask::I2sFeed,
