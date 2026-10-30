@@ -26,7 +26,7 @@ use squeezelite_proto::{
     STRM_FLAG_SERVER_REBOOT,
 };
 
-use crate::amp::lms_gain_to_tas5805m_vol_reg;
+use crate::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
 use crate::io_traits::{
     AudioBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
@@ -240,7 +240,8 @@ impl PlayerCoordinator {
 
     /// Runs one coordinator cycle (`RUST-01..RUST-10`):
     ///
-    /// 1. resumes a pending stream `connect` (one that returned [`StreamError::WouldBlock`]);
+    /// 1. resumes a pending stream `connect` (one that returned [`StreamError::WouldBlock`]):
+    ///    success sends `STMc`, failure is reported like an immediate one (`STMn` + `DSCO(3)`);
     /// 2. receives at most one server frame from `transport` and handles it (any CYD update it
     ///    produces is available from [`Self::take_cyd_message`]);
     /// 3. moves HTTP audio bytes from `source` into the pipeline stream buffer;
@@ -261,7 +262,7 @@ impl PlayerCoordinator {
         now_ms: u32,
     ) -> Result<(), TransportError> {
         self.last_tick_frames = 0;
-        self.resume_stream_connect(source);
+        self.resume_stream_connect(transport, source, pipeline, now_ms)?;
 
         let mut link_lost = false;
         let mut frame = [0u8; SERVER_FRAME_BUF_LEN];
@@ -289,18 +290,70 @@ impl PlayerCoordinator {
     }
 
     /// Repeats a `connect` that previously returned [`StreamError::WouldBlock`].
-    fn resume_stream_connect<R: StreamSource>(&mut self, source: &mut R) {
+    fn resume_stream_connect<S: AudioOutputSink, T: SlimTransport, R: StreamSource>(
+        &mut self,
+        transport: &mut T,
+        source: &mut R,
+        pipeline: &StreamPipeline<'_, S>,
+        now_ms: u32,
+    ) -> Result<(), TransportError> {
         let result = match &self.stream {
             StreamLink::Connecting { addr, request } => source.connect(*addr, request),
-            _ => return,
+            _ => return Ok(()),
         };
         match result {
-            Ok(()) => self.stream = StreamLink::Open,
-            Err(StreamError::WouldBlock) => {}
-            // The request was sent but the response failed (bad status, closed, too many
-            // redirects): the stream ends, as when polling fails (`COORD-508`).
-            Err(_) => self.fail_stream(source),
+            Ok(()) => {
+                self.stream = StreamLink::Open;
+                self.report_stream_connected(transport, pipeline, now_ms)
+            }
+            Err(StreamError::WouldBlock) => Ok(()),
+            Err(_) => {
+                self.pending_cyd = Some(CydMessage::PlaybackState(PlayState::Stopped));
+                self.report_stream_unreachable(transport, source, pipeline, now_ms)
+            }
         }
+    }
+
+    /// `STMc`: the stream connected (response accepted).
+    fn report_stream_connected<S: AudioOutputSink, T: SlimTransport>(
+        &self,
+        transport: &mut T,
+        pipeline: &StreamPipeline<'_, S>,
+        now_ms: u32,
+    ) -> Result<(), TransportError> {
+        send_stat(
+            transport,
+            StatEvent::Connected,
+            pipeline.stream_buffer_available() as u32,
+            pipeline.output_buffer_available() as u32,
+            pipeline.frames_played as u32,
+            now_ms,
+        )
+    }
+
+    /// A stream that never delivered audio failed to connect (TCP failure, bad status, failed
+    /// redirect hop, ...), immediately or after `WouldBlock`: `STMn` + `DSCO(3)`, Stopped. The
+    /// same reason is also left in `pending_dsco`, so the heartbeat repeats the `DSCO`.
+    fn report_stream_unreachable<S: AudioOutputSink, T: SlimTransport, R: StreamSource>(
+        &mut self,
+        transport: &mut T,
+        source: &mut R,
+        pipeline: &StreamPipeline<'_, S>,
+        now_ms: u32,
+    ) -> Result<(), TransportError> {
+        source.abort();
+        self.stream = StreamLink::Idle;
+        self.state = PlayerState::Stopped;
+        self.pending_dsco = Some(DisconnectReason::Unreachable);
+        send_stat(
+            transport,
+            StatEvent::NotSupported,
+            pipeline.stream_buffer_available() as u32,
+            pipeline.output_buffer_available() as u32,
+            pipeline.frames_played as u32,
+            now_ms,
+        )?;
+        send_dsco(transport, DisconnectReason::Unreachable)
     }
 
     /// Drops a failed stream and marks it ended.
@@ -402,38 +455,17 @@ impl PlayerCoordinator {
                             let request = Self::build_http_request(http_headers);
 
                             match source.connect(addr, &request) {
-                                Err(StreamError::ConnectFailed) => {
-                                    self.state = PlayerState::Stopped;
-                                    self.pending_dsco = Some(DisconnectReason::Unreachable);
-                                    send_stat(
-                                        transport,
-                                        StatEvent::NotSupported,
-                                        pipeline.stream_buffer_available() as u32,
-                                        pipeline.output_buffer_available() as u32,
-                                        pipeline.frames_played as u32,
-                                        now_ms,
-                                    )?;
-                                    send_dsco(transport, DisconnectReason::Unreachable)?;
-                                    return Ok(Some(CydMessage::PlaybackState(PlayState::Stopped)));
+                                Ok(()) => {
+                                    self.stream = StreamLink::Open;
+                                    self.report_stream_connected(transport, pipeline, now_ms)?;
                                 }
-                                result => {
-                                    // The connection to the stream server is up (`STMc`); the
-                                    // response may still be pending or may already have failed.
-                                    match result {
-                                        Ok(()) => self.stream = StreamLink::Open,
-                                        Err(StreamError::WouldBlock) => {
-                                            self.stream = StreamLink::Connecting { addr, request };
-                                        }
-                                        Err(_) => self.fail_stream(source),
-                                    }
-                                    send_stat(
-                                        transport,
-                                        StatEvent::Connected,
-                                        pipeline.stream_buffer_available() as u32,
-                                        pipeline.output_buffer_available() as u32,
-                                        pipeline.frames_played as u32,
-                                        now_ms,
-                                    )?;
+                                // Response still pending: `STMc` (or `STMn`) once it resolves.
+                                Err(StreamError::WouldBlock) => {
+                                    self.stream = StreamLink::Connecting { addr, request };
+                                }
+                                Err(_) => {
+                                    self.report_stream_unreachable(transport, source, pipeline, now_ms)?;
+                                    return Ok(Some(CydMessage::PlaybackState(PlayState::Stopped)));
                                 }
                             }
                         }
@@ -592,8 +624,8 @@ impl PlayerCoordinator {
                 digital_atten,
                 ..
             } => {
-                let (eff_gain_left, eff_gain_right) = if digital_atten == 0 {
-                    if gain_left == 0
+                let pct = if digital_atten == 0 {
+                    let (eff_gain_left, eff_gain_right) = if gain_left == 0
                         && gain_right == 0
                         && self.volume.gain_left > 0
                         && self.volume.gain_right > 0
@@ -603,22 +635,31 @@ impl PlayerCoordinator {
                         let l = if gain_left > 0 { 65536 } else { 0 };
                         let r = if gain_right > 0 { 65536 } else { 0 };
                         (l, r)
-                    }
-                } else {
-                    (gain_left, gain_right)
-                };
-                self.volume.gain_left = eff_gain_left;
-                self.volume.gain_right = eff_gain_right;
-                pipeline.set_volume(eff_gain_left, eff_gain_right);
-                // The amplifier tracks the server's requested gain (TAS 0x4C/0x4D).
-                backend.set_hw_volume(
-                    lms_gain_to_tas5805m_vol_reg(gain_left),
-                    lms_gain_to_tas5805m_vol_reg(gain_right),
-                );
+                    };
+                    self.volume.gain_left = eff_gain_left;
+                    self.volume.gain_right = eff_gain_right;
+                    pipeline.set_volume(eff_gain_left, eff_gain_right);
+                    backend.set_hw_volume(
+                        lms_gain_to_tas5805m_vol_reg(gain_left),
+                        lms_gain_to_tas5805m_vol_reg(gain_right),
+                    );
 
-                // COORD-507: Map 16.16 fixed-point (65536 = 100%) to 0-100 percentage using u64 to prevent u32 overflow
-                let avg_gain = ((eff_gain_left as u64 + eff_gain_right as u64) / 2) as u32;
-                let pct = core::cmp::min(100, ((avg_gain as u64 * 100) / 65536).min(100) as u8);
+                    // COORD-507: Map 16.16 fixed-point (65536 = 100%) to 0-100 percentage using u64 to prevent u32 overflow
+                    let avg_gain = ((eff_gain_left as u64 + eff_gain_right as u64) / 2) as u32;
+                    core::cmp::min(100, ((avg_gain as u64 * 100) / 65536).min(100) as u8)
+                } else {
+                    // Device policy: the amplifier attenuates (one TAS register code from the
+                    // louder channel, applied to both), software gain stays at unity (or 0 for
+                    // mute), so the volume is never applied twice.
+                    let max_gain = core::cmp::max(gain_left, gain_right);
+                    let vol_reg = lms_gain_to_tas5805m_vol_reg(max_gain);
+                    backend.set_hw_volume(vol_reg, vol_reg);
+                    let eff_gain = if max_gain > 0 { 65536 } else { 0 };
+                    self.volume.gain_left = eff_gain;
+                    self.volume.gain_right = eff_gain;
+                    pipeline.set_volume(eff_gain, eff_gain);
+                    lms_gain_to_hardware_volume_percent(max_gain)
+                };
 
                 Ok(Some(CydMessage::Volume(pct)))
             }
@@ -1068,7 +1109,9 @@ mod tests {
     //! ([`LoopbackTransport`], [`FakeStreamSource`] behind [`GatedSource`], [`MockBackend`]).
     //! End-to-end coverage over real sockets lives in `tests/session_replay.rs`.
     use super::*;
-    use crate::io_traits::{FakeStreamSource, LoopbackTransport, MockBackend, Segments};
+    use crate::io_traits::{
+        FakeStreamSource, HeaderBuf, LoopbackTransport, MetaBuf, MockBackend, Segments,
+    };
     use squeezelite_audio_core::MockAudioSink;
     use std::string::{String, ToString};
     use std::vec;
@@ -1165,11 +1208,11 @@ mod tests {
             self.inner.poll_bytes(out)
         }
 
-        fn take_response_headers(&mut self) -> Option<heapless::Vec<u8, 1024>> {
+        fn take_response_headers(&mut self) -> Option<HeaderBuf> {
             self.inner.take_response_headers()
         }
 
-        fn take_icy_metadata(&mut self) -> Option<heapless::Vec<u8, 256>> {
+        fn take_icy_metadata(&mut self) -> Option<MetaBuf> {
             self.inner.take_icy_metadata()
         }
 
@@ -1294,11 +1337,14 @@ mod tests {
         assert_eq!(rec[0], 1000 << 16);
         assert_eq!(rec[1], -1000 << 16);
 
-        // Volume adjustment with digital_atten: 1 (50%)
+        // Volume adjustment with digital_atten: 1 (gain 0.5 = -6 dB): the amplifier attenuates,
+        // software gain stays at unity (device policy, no double attenuation)
         let cyd_vol = rig.command(&mut pipeline, &audg_frame(32768, 32768, 1), 200);
-        assert_eq!(cyd_vol, Some(CydMessage::Volume(50)));
+        assert_eq!(cyd_vol, Some(CydMessage::Volume(91)));
         let reg = lms_gain_to_tas5805m_vol_reg(32768);
+        assert_eq!(reg, 0x39);
         assert_eq!(rig.backend.hw_vol, (reg, reg));
+        assert_eq!((rig.coord.volume.gain_left, rig.coord.volume.gain_right), (65536, 65536));
 
         // Pause
         let cyd_pause = rig.command(&mut pipeline, &simple_strm(b'p'), 250);
@@ -1646,10 +1692,10 @@ mod tests {
     }
 
     #[test]
-    fn test_latin1_headers_and_poll_http_error_drops_stream() {
-        // COORD-503, COORD-508, COORD-509:
-        // Non-UTF8 (Latin-1) headers are sent with each non-ASCII byte replaced by '?', and an
-        // HTTP 404 answer drops the stream and ends it.
+    fn test_latin1_headers_and_http_error_reports_unreachable() {
+        // COORD-503, COORD-509: Non-UTF8 (Latin-1) headers are sent with each non-ASCII byte
+        // replaced by '?'. An HTTP 404 answer arriving after the connect went pending is a
+        // connect failure: STMn + DSCO(3), Stopped (no STMc).
         static NOT_FOUND: Segments = &[b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"];
         let mac = [0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let mut rig = Rig::with_source(mac, "TestPlayer", GatedSource::new(b"/caf?.pcm", NOT_FOUND));
@@ -1672,14 +1718,77 @@ mod tests {
         assert_eq!(pipeline.stream_buffer_available(), 0);
         assert!(rig.coord.stream_active());
         assert_eq!(rig.src.last_request, b"GET /caf?.pcm HTTP/1.0\r\n\r\n");
+        assert!(rig.sent.is_empty(), "STMc waits for the response");
 
-        // The 404 answer arrives: the stream is dropped (COORD-508)
+        // The 404 answer arrives
         rig.src.hold_connect = false;
         rig.tick(&mut pipeline, 110).unwrap();
         assert!(!rig.coord.stream_active());
-        assert!(rig.coord.is_stream_eof());
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+        assert_eq!(rig.coord.take_cyd_message(), Some(CydMessage::PlaybackState(PlayState::Stopped)));
+        assert_eq!(rig.lines(), ["STAT:STMn", "DSCO:3", "DSCO:3"]);
+    }
 
-        assert_eq!(rig.lines()[0], "STAT:STMc");
+    #[test]
+    fn test_poll_error_after_connect_drops_stream() {
+        // COORD-508: a stream that connected and then fails while polling (truncated chunked
+        // body) is dropped and marked ended; it is not a connect failure.
+        static TRUNCATED: Segments =
+            &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n\x01\x00\xff\x00"];
+        let mac = [0x33, 0x44, 0x55, 0x66, 0x77, 0x89];
+        let mut rig = Rig::with_source(mac, "TestPlayer", GatedSource::new(b"/stream.mp3", TRUNCATED));
+
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        rig.command(&mut pipeline, &strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[]), 10);
+        for _ in 0..10 {
+            if !rig.coord.stream_active() {
+                break;
+            }
+            rig.tick(&mut pipeline, 20).unwrap();
+        }
+        assert!(!rig.coord.stream_active());
+        assert!(rig.coord.is_stream_eof());
+        assert_eq!(rig.coord.stream_bytes_received, 4);
+        assert_eq!(rig.lines()[..2], ["STAT:STMc", "RESP"]);
+        assert!(!rig.lines().contains(&"STAT:STMn".to_string()));
+    }
+
+    #[test]
+    fn test_redirect_failure_is_connect_failure_immediately_or_after_wouldblock() {
+        // A redirect whose target cannot be fetched fails the connect. Whether that surfaces on
+        // the first `connect` call or after `WouldBlock`, the result is identical.
+        static REDIRECT: Segments = &[b"HTTP/1.0 302 Found\r\nLocation: /gone\r\n\r\n"];
+        let run = |hold_connect: bool| {
+            let mac = [0x33, 0x44, 0x55, 0x66, 0x77, 0x8A];
+            let mut rig = Rig::with_source(mac, "TestPlayer", GatedSource::new(b"/r", REDIRECT));
+            rig.src.hold_connect = hold_connect;
+            let mut stream_storage = [0u8; 1024];
+            let mut output_storage = [0u8; 1024];
+            let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+            let start = strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], b"GET /r HTTP/1.0\r\n\r\n");
+            let mut cyd = rig.command(&mut pipeline, &start, 10);
+            if hold_connect {
+                assert_eq!(cyd, Some(CydMessage::PlaybackState(PlayState::Playing)));
+                assert!(rig.sent.is_empty());
+                rig.src.hold_connect = false;
+                rig.tick(&mut pipeline, 20).unwrap();
+                cyd = rig.coord.take_cyd_message();
+            }
+            assert_eq!(rig.src.inner.redirects_followed, 1);
+            assert_eq!(cyd, Some(CydMessage::PlaybackState(PlayState::Stopped)));
+            assert_eq!(rig.coord.state, PlayerState::Stopped);
+            assert!(!rig.coord.stream_active());
+            assert!(!rig.coord.is_stream_eof());
+            rig.lines()
+        };
+        let immediate = run(false);
+        let resumed = run(true);
+        assert_eq!(immediate, ["STAT:STMn", "DSCO:3", "DSCO:3"]);
+        assert_eq!(resumed, immediate);
     }
 
     #[test]
@@ -1888,6 +1997,7 @@ mod tests {
         rig.command(&mut pipeline, &audg_frame(0, 0, 0), 100);
         assert_eq!(rig.coord.volume.gain_left, 65536);
         assert_eq!(rig.coord.volume.gain_right, 65536);
+        assert_eq!(rig.backend.hw_vol, (0xFF, 0xFF));
 
         // 4-byte player name [0, 'B', 'o', 'b'] updates player_name and replies with SETD without altering current_sample_rate
         rig.command(&mut pipeline, &server_frame(b"setd", &[0x00, b'B', b'o', b'b']), 200);
@@ -1910,6 +2020,28 @@ mod tests {
         assert!(rig.coord.is_stream_eof());
         rig.coord.reset();
         assert!(!rig.coord.is_stream_eof());
+    }
+
+    #[test]
+    fn test_audg_hardware_volume_policy() {
+        let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x04], "Test");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Unequal channels: the louder one sets both TAS channels; software gain unity.
+        // 1842 = LMS 51% slider (-31 dB) -> 55% -> 0x5D (-22.5 dB)
+        let msg = rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 10);
+        assert_eq!(msg, Some(CydMessage::Volume(55)));
+        assert_eq!(rig.backend.hw_vol, (0x5D, 0x5D));
+        assert_eq!(pipeline.volume.gain_left, 65536);
+        assert_eq!(pipeline.volume.gain_right, 65536);
+
+        // Zero gain: amplifier muted, software gain 0
+        let msg = rig.command(&mut pipeline, &audg_frame(0, 0, 1), 20);
+        assert_eq!(msg, Some(CydMessage::Volume(0)));
+        assert_eq!(rig.backend.hw_vol, (0xFF, 0xFF));
+        assert_eq!((rig.coord.volume.gain_left, rig.coord.volume.gain_right), (0, 0));
     }
 
     #[test]
@@ -1947,7 +2079,7 @@ mod tests {
         let start = strm_frame(b's', true, 0, 0, 9000, [0, 0, 0, 0], &[]);
         rig.command(&mut pipeline, &start, 10);
         assert!(rig.coord.stream_active());
-        assert_eq!(rig.lines(), ["STAT:STMc"]);
+        assert!(rig.sent.is_empty(), "STMc waits for the response");
         // server_ip 0.0.0.0 streams from the LMS address
         assert_eq!(rig.src.last_request, DEFAULT_HTTP_REQUEST);
 
@@ -1956,6 +2088,7 @@ mod tests {
 
         rig.src.hold_connect = false;
         rig.tick(&mut pipeline, 30).unwrap();
+        assert_eq!(rig.lines(), ["STAT:STMc", "RESP"]);
         assert_eq!(rig.src.inner.connects, 1);
         assert_eq!(rig.src.inner.last_addr, Some(NetAddr { ip: [127, 0, 0, 1], port: 9000 }));
         for _ in 0..10 {

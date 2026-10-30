@@ -118,6 +118,8 @@ fn drain<S: StreamSource>(s: &mut S, read_len: usize, metaint: usize) -> Drained
         assert!(n <= read_len, "poll_bytes overran the output buffer");
         d.body.extend_from_slice(&buf[..n]).expect("body too long");
         if let Some(m) = s.take_icy_metadata() {
+            // The conformance blocks are small; keep the copy small too.
+            let m = Vec::from_slice(&m).expect("conformance metadata block over 256 bytes");
             d.icy.push(m).expect("too many metadata blocks");
         }
         if s.is_eof() {

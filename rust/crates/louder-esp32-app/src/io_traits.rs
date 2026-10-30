@@ -58,6 +58,16 @@ pub enum ClockError {
 /// [`StreamError::TooManyRedirects`].
 pub const MAX_REDIRECTS: usize = 3;
 
+/// Capacity of a captured HTTP response head (C squeezelite `MAX_HEADER` parity).
+pub const MAX_RESPONSE_HEAD: usize = 4096;
+/// Capacity of an ICY metadata block; the largest block ICY can carry is 255 * 16 = 4080 bytes.
+pub const MAX_ICY_METADATA: usize = 4096;
+
+/// Raw HTTP response head as returned by [`StreamSource::take_response_headers`].
+pub type HeaderBuf = Vec<u8, MAX_RESPONSE_HEAD>;
+/// ICY metadata block as returned by [`StreamSource::take_icy_metadata`].
+pub type MetaBuf = Vec<u8, MAX_ICY_METADATA>;
+
 /// Message-framed Slimproto control connection (TCP port 3483 to the server).
 ///
 /// Length-prefix framing is the adapter's concern: `poll_frame` yields one complete Slimproto
@@ -88,17 +98,18 @@ pub trait SlimTransport {
 /// * `is_eof` is `true` only once the response ended cleanly and every byte has been delivered.
 ///   A connection that drops early is reported as [`StreamError::Disconnected`] instead.
 /// * `take_response_headers` returns the raw headers of the final (non-redirect) response,
-///   including the terminating blank line, once.
+///   including the terminating blank line, once (at most [`MAX_RESPONSE_HEAD`] bytes; a longer
+///   head is cut at a line boundary and re-terminated).
 /// * `take_icy_metadata` returns the most recent complete metadata block (trailing NUL padding
-///   removed, truncated to 256 bytes), once. Partial blocks are never exposed. An
+///   removed, at most [`MAX_ICY_METADATA`] bytes, so every ICY block fits), once. Partial blocks are never exposed. An
 ///   `icy-metaint` response header configures the interval; `set_icy_metaint` overrides it
 ///   (`0` disables stripping).
 /// * After `abort`, `poll_bytes` returns [`StreamError::Disconnected`] until the next `connect`.
 pub trait StreamSource {
     fn connect(&mut self, addr: NetAddr, http_request: &[u8]) -> Result<(), StreamError>;
     fn poll_bytes(&mut self, out: &mut [u8]) -> Result<usize, StreamError>;
-    fn take_response_headers(&mut self) -> Option<Vec<u8, 1024>>;
-    fn take_icy_metadata(&mut self) -> Option<Vec<u8, 256>>;
+    fn take_response_headers(&mut self) -> Option<HeaderBuf>;
+    fn take_icy_metadata(&mut self) -> Option<MetaBuf>;
     fn set_icy_metaint(&mut self, interval: usize);
     fn is_eof(&self) -> bool;
     fn abort(&mut self);
@@ -117,8 +128,9 @@ pub trait AudioBackend {
 // LoopbackTransport
 // ---------------------------------------------------------------------------
 
-/// Largest frame a [`LoopbackTransport`] can hold.
-pub const LOOPBACK_FRAME_CAP: usize = 1536;
+/// Largest frame a [`LoopbackTransport`] can hold: a `RESP`/`META` frame carrying a full
+/// [`MAX_RESPONSE_HEAD`] / [`MAX_ICY_METADATA`] payload behind its 8-byte header.
+pub const LOOPBACK_FRAME_CAP: usize = 8 + MAX_RESPONSE_HEAD;
 /// Number of frames each direction of a [`LoopbackTransport`] can queue.
 pub const LOOPBACK_QUEUE_DEPTH: usize = 8;
 
@@ -327,14 +339,14 @@ pub struct FakeStreamSource {
     segments: Segments,
     seg_idx: usize,
     seg_off: usize,
-    headers: Option<Vec<u8, 1024>>,
+    headers: Option<HeaderBuf>,
     chunked: bool,
     chunk: ChunkState,
     icy_metaint: usize,
     icy_remaining: usize,
     icy_state: IcyState,
-    icy_accum: Vec<u8, 256>,
-    icy_meta: Option<Vec<u8, 256>>,
+    icy_accum: MetaBuf,
+    icy_meta: Option<MetaBuf>,
 }
 
 impl FakeStreamSource {
@@ -465,7 +477,7 @@ impl FakeStreamSource {
                 None
             }
             IcyState::Meta { remaining } => {
-                // Blocks longer than the 256-byte capacity are truncated.
+                // Every ICY block (<= 4080 bytes) fits the capacity; push cannot fail.
                 let _ = self.icy_accum.push(b);
                 if remaining == 1 {
                     let end = self.icy_accum.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
@@ -478,6 +490,62 @@ impl FakeStreamSource {
                     self.icy_state = IcyState::Meta { remaining: remaining - 1 };
                 }
                 None
+            }
+        }
+    }
+}
+
+impl FakeStreamSource {
+    /// Request/redirect loop of `connect`. The response head is accumulated in `self.headers`
+    /// (no head-sized stack buffer); the caller clears it on error.
+    fn follow_routes(&mut self, http_request: &[u8]) -> Result<(), StreamError> {
+        let mut path: Vec<u8, 128> =
+            Vec::from_slice(request_path(http_request).ok_or(StreamError::BadResponse)?)
+                .map_err(|_| StreamError::BadResponse)?;
+        loop {
+            let route = self.find_route(&path).ok_or(StreamError::BadResponse)?;
+
+            // Read through the end of the header block.
+            let hdr = self.headers.insert(HeaderBuf::new());
+            let (mut idx, mut off) = (0usize, 0usize);
+            'headers: loop {
+                let seg = route.segments.get(idx).ok_or(StreamError::BadResponse)?;
+                while off < seg.len() {
+                    hdr.push(seg[off]).map_err(|_| StreamError::BadResponse)?;
+                    off += 1;
+                    if hdr.ends_with(b"\r\n\r\n") {
+                        break 'headers;
+                    }
+                }
+                idx += 1;
+                off = 0;
+            }
+
+            match status_code(hdr).ok_or(StreamError::BadResponse)? {
+                200 | 206 => {
+                    let chunked = header_value(hdr, b"transfer-encoding")
+                        .is_some_and(|v| v.eq_ignore_ascii_case(b"chunked"));
+                    let metaint = header_value(hdr, b"icy-metaint").and_then(parse_usize);
+                    self.chunked = chunked;
+                    if let Some(m) = metaint {
+                        self.set_icy_metaint(m);
+                    }
+                    self.segments = route.segments;
+                    self.seg_idx = idx;
+                    self.seg_off = off;
+                    self.phase = Phase::Streaming;
+                    return Ok(());
+                }
+                301 | 302 | 303 | 307 | 308 => {
+                    let loc = header_value(hdr, b"location").ok_or(StreamError::BadResponse)?;
+                    let next: Result<Vec<u8, 128>, _> = Vec::from_slice(location_path(loc));
+                    self.redirects_followed += 1;
+                    if self.redirects_followed > MAX_REDIRECTS {
+                        return Err(StreamError::TooManyRedirects);
+                    }
+                    path = next.map_err(|_| StreamError::BadResponse)?;
+                }
+                _ => return Err(StreamError::BadResponse),
             }
         }
     }
@@ -564,54 +632,11 @@ impl StreamSource for FakeStreamSource {
         if self.fail_connect {
             return Err(StreamError::ConnectFailed);
         }
-
-        let mut path: Vec<u8, 128> =
-            Vec::from_slice(request_path(http_request).ok_or(StreamError::BadResponse)?)
-                .map_err(|_| StreamError::BadResponse)?;
-        loop {
-            let route = self.find_route(&path).ok_or(StreamError::BadResponse)?;
-
-            // Read through the end of the header block.
-            let mut hdr: Vec<u8, 1024> = Vec::new();
-            let (mut idx, mut off) = (0usize, 0usize);
-            'headers: loop {
-                let seg = route.segments.get(idx).ok_or(StreamError::BadResponse)?;
-                while off < seg.len() {
-                    hdr.push(seg[off]).map_err(|_| StreamError::BadResponse)?;
-                    off += 1;
-                    if hdr.ends_with(b"\r\n\r\n") {
-                        break 'headers;
-                    }
-                }
-                idx += 1;
-                off = 0;
-            }
-
-            match status_code(&hdr).ok_or(StreamError::BadResponse)? {
-                200 | 206 => {
-                    self.chunked = header_value(&hdr, b"transfer-encoding")
-                        .is_some_and(|v| v.eq_ignore_ascii_case(b"chunked"));
-                    if let Some(m) = header_value(&hdr, b"icy-metaint").and_then(parse_usize) {
-                        self.set_icy_metaint(m);
-                    }
-                    self.headers = Some(hdr);
-                    self.segments = route.segments;
-                    self.seg_idx = idx;
-                    self.seg_off = off;
-                    self.phase = Phase::Streaming;
-                    return Ok(());
-                }
-                301 | 302 | 303 | 307 | 308 => {
-                    let loc = header_value(&hdr, b"location").ok_or(StreamError::BadResponse)?;
-                    self.redirects_followed += 1;
-                    if self.redirects_followed > MAX_REDIRECTS {
-                        return Err(StreamError::TooManyRedirects);
-                    }
-                    path = Vec::from_slice(location_path(loc)).map_err(|_| StreamError::BadResponse)?;
-                }
-                _ => return Err(StreamError::BadResponse),
-            }
+        let result = self.follow_routes(http_request);
+        if result.is_err() {
+            self.headers = None;
         }
+        result
     }
 
     fn poll_bytes(&mut self, out: &mut [u8]) -> Result<usize, StreamError> {
@@ -659,11 +684,11 @@ impl StreamSource for FakeStreamSource {
         Ok(n)
     }
 
-    fn take_response_headers(&mut self) -> Option<Vec<u8, 1024>> {
+    fn take_response_headers(&mut self) -> Option<HeaderBuf> {
         self.headers.take()
     }
 
-    fn take_icy_metadata(&mut self) -> Option<Vec<u8, 256>> {
+    fn take_icy_metadata(&mut self) -> Option<MetaBuf> {
         self.icy_meta.take()
     }
 

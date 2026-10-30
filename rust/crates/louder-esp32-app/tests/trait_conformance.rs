@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use louder_esp32_app::io_traits::conformance::ROUTES;
 use louder_esp32_app::io_traits::{
-    run_stream_source_conformance, AudioBackend, ClockError, FakeStreamSource, LoopbackTransport,
-    MockBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
+    run_stream_source_conformance, AudioBackend, ClockError, FakeStreamSource, HeaderBuf,
+    LoopbackTransport, MetaBuf, MockBackend, NetAddr, SlimTransport, StreamError, StreamSource,
+    TransportError, MAX_RESPONSE_HEAD,
 };
 use louder_esp32_app::network::{HttpAudioStream, SlimprotoClient};
 use louder_esp32_app::{SlimprotoBuilder, SlimprotoParser};
@@ -189,10 +190,10 @@ impl StreamSource for ToMock {
         }
         Ok(n)
     }
-    fn take_response_headers(&mut self) -> Option<heapless::Vec<u8, 1024>> {
+    fn take_response_headers(&mut self) -> Option<HeaderBuf> {
         StreamSource::take_response_headers(&mut self.inner)
     }
-    fn take_icy_metadata(&mut self) -> Option<heapless::Vec<u8, 256>> {
+    fn take_icy_metadata(&mut self) -> Option<MetaBuf> {
         StreamSource::take_icy_metadata(&mut self.inner)
     }
     fn set_icy_metaint(&mut self, interval: usize) {
@@ -545,45 +546,29 @@ fn test_slimproto_transport_disconnect_drains_then_errors() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_http_audio_stream_long_headers_truncate_at_line_boundary() {
-    // Every pad line ends in 'E', so a cut inside a line is visible. Total head is far over 1024.
+fn test_http_audio_stream_long_headers_survive_up_to_cap() {
+    // A ~3.5 KB head (far over the old 1024-byte cap) arrives whole. The line-boundary cut for
+    // heads over MAX_RESPONSE_HEAD is unit-tested in `network::tests`.
     let mut head = String::from("HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n");
     let mut i = 0;
-    while head.len() < 1500 {
-        head.push_str(&format!("X-Pad-{i:02}: {}E\r\n", "v".repeat(30 + i % 7)));
+    while head.len() < 3500 {
+        head.push_str(&format!("X-Pad-{i:03}: {}E\r\n", "v".repeat(30 + i % 7)));
         i += 1;
     }
     head.push_str("icy-metaint: 16000\r\n\r\n");
+    assert!(head.len() < MAX_RESPONSE_HEAD);
     let addr = spawn_scripted_server(vec![head.clone().into_bytes()], true);
     let mut s = HttpAudioStream::new();
     connect_blocking(&mut s, addr).unwrap();
 
     let h = StreamSource::take_response_headers(&mut s).expect("headers captured");
-    assert!(h.len() <= 1024);
-    assert!(h.len() > 900, "should keep as much as fits, got {}", h.len());
-    assert!(h.starts_with(b"HTTP/1.0 200 OK\r\n"), "status line intact");
-    assert!(h.ends_with(b"\r\n\r\n"), "terminating blank line present");
-    let text = core::str::from_utf8(&h).unwrap();
-    let body = text.strip_suffix("\r\n\r\n").unwrap();
-    let mut lines = body.split("\r\n");
-    assert_eq!(lines.next(), Some("HTTP/1.0 200 OK"));
-    let mut n = 0;
-    for line in lines {
-        let (name, value) = line.split_once(": ").expect("complete `name: value` line");
-        assert!(!name.is_empty());
-        if name.starts_with("X-Pad-") {
-            assert!(value.ends_with('E'), "partial header value: {line:?}");
-        }
-        assert!(head.contains(&format!("{line}\r\n")), "line not from the response: {line:?}");
-        n += 1;
-    }
-    assert!(n > 10, "kept {n} header lines");
-    assert!(!text.contains("icy-metaint"), "dropped lines are dropped whole");
+    assert_eq!(&h[..], head.as_bytes(), "head delivered un-truncated");
 }
 
 #[test]
-fn test_http_audio_stream_icy_metadata_truncated_to_256() {
-    // 20 * 16 = 320-byte metadata block after 16 audio bytes.
+fn test_http_audio_stream_icy_metadata_over_300_bytes_untruncated() {
+    // 20 * 16 = 320-byte metadata block (312 bytes + NUL padding) after 16 audio bytes; it used
+    // to be cut to 256 bytes.
     let mut body = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
     body.extend_from_slice(&[b'A'; 16]);
     body.push(20);
@@ -614,6 +599,6 @@ fn test_http_audio_stream_icy_metadata_truncated_to_256() {
     }
     assert_eq!(audio.len(), 32);
     let m = icy.expect("metadata block");
-    assert_eq!(m.len(), 256, "truncated to the trait limit");
-    assert_eq!(&m[..], &meta[..256]);
+    assert_eq!(m.len(), 312, "whole block, only the NUL padding removed");
+    assert_eq!(&m[..], &meta[..312]);
 }

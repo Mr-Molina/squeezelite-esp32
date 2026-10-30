@@ -6,7 +6,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
-use crate::io_traits::{NetAddr, SlimTransport, StreamError, StreamSource, TransportError};
+use crate::io_traits::{
+    HeaderBuf, MetaBuf, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
+};
 use squeezelite_proto::{
     DiscoveredServer, DiscoveryBuilder, DiscoveryParser, DisconnectReason, ParseError, ServerCommand,
     SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
@@ -1324,10 +1326,13 @@ impl StreamSource for HttpAudioStream {
         }
     }
 
-    /// Raw head of the final response. A head longer than 1024 bytes is cut at the last line
+    /// Raw head of the final response. A head longer than
+    /// [`MAX_RESPONSE_HEAD`](crate::io_traits::MAX_RESPONSE_HEAD) bytes is cut at the last line
     /// boundary that leaves room for the terminating blank line (never inside a header line, so
-    /// no partial value such as `icy-metaint: 1` survives), then the blank line is appended.
-    fn take_response_headers(&mut self) -> Option<heapless::Vec<u8, 1024>> {
+    /// no partial value such as `icy-metaint: 1` survives), then the blank line is appended. With
+    /// the current capacities this cannot trigger through the socket path
+    /// (`MAX_HTTP_HEADER_LEN` rejects longer heads first); it guards the trait contract.
+    fn take_response_headers(&mut self) -> Option<HeaderBuf> {
         let raw = HttpAudioStream::take_response_headers(self)?;
         let mut out = heapless::Vec::new();
         if raw.len() <= out.capacity() {
@@ -1343,7 +1348,7 @@ impl StreamSource for HttpAudioStream {
         Some(out)
     }
 
-    fn take_icy_metadata(&mut self) -> Option<heapless::Vec<u8, 256>> {
+    fn take_icy_metadata(&mut self) -> Option<MetaBuf> {
         let raw = HttpAudioStream::take_icy_metadata(self)?;
         let mut out = heapless::Vec::new();
         let _ = out.extend_from_slice(&raw[..raw.len().min(out.capacity())]);
@@ -1367,6 +1372,45 @@ impl StreamSource for HttpAudioStream {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn test_take_response_headers_cuts_long_head_at_line_boundary() {
+        // Every pad line ends in 'E', so a cut inside a line is visible. The head is far over
+        // MAX_RESPONSE_HEAD (unreachable through the socket path, which caps heads first).
+        let limit = crate::io_traits::MAX_RESPONSE_HEAD;
+        let mut head = String::from("HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n");
+        let mut i = 0;
+        while head.len() < limit + 900 {
+            head.push_str(&format!("X-Pad-{i:03}: {}E\r\n", "v".repeat(30 + i % 7)));
+            i += 1;
+        }
+        head.push_str("icy-metaint: 16000\r\n\r\n");
+
+        let mut s = HttpAudioStream::new();
+        s.response_headers = Some(head.clone().into_bytes());
+        let h = StreamSource::take_response_headers(&mut s).expect("headers captured");
+        assert!(h.len() <= limit);
+        assert!(h.len() > limit - 100, "should keep as much as fits, got {}", h.len());
+        assert!(h.starts_with(b"HTTP/1.0 200 OK\r\n"), "status line intact");
+        assert!(h.ends_with(b"\r\n\r\n"), "terminating blank line present");
+        let text = core::str::from_utf8(&h).unwrap();
+        let body = text.strip_suffix("\r\n\r\n").unwrap();
+        let mut lines = body.split("\r\n");
+        assert_eq!(lines.next(), Some("HTTP/1.0 200 OK"));
+        let mut n = 0;
+        for line in lines {
+            let (name, value) = line.split_once(": ").expect("complete `name: value` line");
+            assert!(!name.is_empty());
+            if name.starts_with("X-Pad-") {
+                assert!(value.ends_with('E'), "partial header value: {line:?}");
+            }
+            assert!(head.contains(&format!("{line}\r\n")), "line not from the response: {line:?}");
+            n += 1;
+        }
+        assert!(n > 50, "kept {n} header lines");
+        assert!(!text.contains("icy-metaint"), "dropped lines are dropped whole");
+        assert!(StreamSource::take_response_headers(&mut s).is_none(), "taken once");
+    }
 
     #[test]
     fn test_slimproto_client_handshake_and_stat() {
