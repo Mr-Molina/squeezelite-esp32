@@ -426,7 +426,11 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> SmoltcpStreamSource<S, St>
         st.head_ready = true;
         st.request = Vec::new();
         st.template = Vec::new();
-        st.phase = if st.remaining == Some(0) { StreamPhase::Done } else { StreamPhase::Body };
+        st.phase = StreamPhase::Body;
+        if st.remaining == Some(0) {
+            st.phase = StreamPhase::Done;
+            self.sock.abort();
+        }
         Ok(true)
     }
 
@@ -441,6 +445,7 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> SmoltcpStreamSource<S, St>
         };
         if complete {
             st.phase = StreamPhase::Done;
+            self.sock.abort();
             Ok(0)
         } else {
             self.fail(StreamError::Disconnected)
@@ -554,7 +559,9 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> StreamSource for SmoltcpSt
             let audio = st.icy.strip_in_place(&mut out[..audio]);
             let ended = if st.chunked { st.chunk.is_done() } else { st.remaining == Some(0) };
             if ended {
+                // Complete: release the connection (it is never reused).
                 st.phase = StreamPhase::Done;
+                self.sock.abort();
             }
             if audio > 0 || ended {
                 return Ok(audio);

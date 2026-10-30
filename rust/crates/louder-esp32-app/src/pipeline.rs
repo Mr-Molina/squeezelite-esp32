@@ -171,6 +171,11 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub output_i32_scratch: [i32; OUTPUT_I32_SCRATCH_SAMPLES],
     pub current_eq_preset: EqPreset,
     pub user_muted: bool,
+    /// MP3 decoder parked while another decoder is active, reused by
+    /// [`Self::use_mp3_decoder`]. Firmware bring-up hands its static MP3 decoder in here once
+    /// (there is no heap MP3 decoder without `std-codecs`); [`Self::set_decoder`] parks a
+    /// replaced MP3 decoder here, so the static one is never lost or duplicated.
+    pub mp3_spare: Option<Mp3Handle>,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -199,6 +204,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             output_i32_scratch: [0i32; OUTPUT_I32_SCRATCH_SAMPLES],
             current_eq_preset: EqPreset::Flat,
             user_muted: false,
+            mp3_spare: None,
         }
     }
 
@@ -412,9 +418,37 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.volume.gain_right = right_gain;
     }
 
-    /// Sets the active audio decoder.
+    /// Sets the active audio decoder. A replaced MP3 decoder is parked in [`Self::mp3_spare`]
+    /// (when the slot is free) for the next MP3 track.
     pub fn set_decoder(&mut self, decoder: ActiveDecoder) {
-        self.decoder = decoder;
+        if let ActiveDecoder::Mp3(previous) = core::mem::replace(&mut self.decoder, decoder) {
+            if self.mp3_spare.is_none() {
+                self.mp3_spare = Some(previous);
+            }
+        }
+    }
+
+    /// Makes an MP3 decoder active, reset to the start of a stream: the current one if it is
+    /// already MP3, else the parked one, else a fresh one (`std-codecs` builds). Returns `false`
+    /// when this build has no MP3 decoder available (decoder left unchanged).
+    pub fn use_mp3_decoder(&mut self) -> bool {
+        if let ActiveDecoder::Mp3(current) = &mut self.decoder {
+            current.flush();
+            return true;
+        }
+        let decoder = match self.mp3_spare.take() {
+            Some(parked) => {
+                let mut parked = ActiveDecoder::Mp3(parked);
+                parked.flush();
+                parked
+            }
+            None => match ActiveDecoder::new_mp3() {
+                Some(fresh) => fresh,
+                None => return false,
+            },
+        };
+        self.set_decoder(decoder);
+        true
     }
 
     /// Applies a 10-band biquad graphic equalizer preset to the audio pipeline.
@@ -457,7 +491,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// decoder unchanged.
     pub fn select_format(&mut self, format_byte: u8) {
         let decoder = match format_byte {
-            b'm' | b'M' => ActiveDecoder::new_mp3(),
+            b'm' | b'M' => {
+                self.use_mp3_decoder();
+                return;
+            }
             b'f' | b'F' => Some(ActiveDecoder::new_flac()),
             b'a' | b'A' => ActiveDecoder::new_aac(),
             b'o' | b'O' => ActiveDecoder::new_vorbis(),

@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use squeezelite_audio_core::output::AudioOutputSink;
 use squeezelite_audio_core::VolumeScale;
 use squeezelite_cyd_link::{CydCommand, CydMessage, PlayState};
-use squeezelite_decoders::PcmDecoder;
+use squeezelite_decoders::{DecoderError, PcmDecoder};
 use squeezelite_proto::{
     sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason, Endianness,
     ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent, StreamCommandType,
@@ -38,6 +38,9 @@ pub const SERVER_FRAME_BUF_LEN: usize = 2048;
 
 /// HTTP request sent when a `strm s` carries no request headers (`COORD-503`).
 const DEFAULT_HTTP_REQUEST: &[u8] = b"GET /stream.mp3 HTTP/1.0\r\n\r\n";
+
+/// Free output-ring space [`PlayerCoordinator::pump_decode`] requires before decoding.
+pub const PUMP_DECODE_MIN_OUTPUT_SPACE: usize = 1024;
 
 /// Helper trait to construct `PcmDecoder` with standard configuration.
 pub trait PcmDecoderExt {
@@ -99,6 +102,8 @@ pub struct PlayerCoordinator {
     pub pending_track_started: bool,
     pub pending_underrun: bool,
     pub pending_dsco: Option<DisconnectReason>,
+    /// `STMl` (buffer threshold / ready to start) waits for the next heartbeat.
+    pub pending_buffer_threshold: bool,
     /// Response head of the audio stream, forwarded to LMS as `RESP` on the next heartbeat.
     pub pending_resp: Option<Vec<u8>>,
     /// ICY metadata block, forwarded to LMS as `META` on the next heartbeat.
@@ -113,6 +118,13 @@ pub struct PlayerCoordinator {
     stream: StreamLink,
     pending_cyd: Option<CydMessage>,
     last_tick_frames: usize,
+    /// `STMs` was reported (or is pending) for the current track.
+    track_started_reported: bool,
+    /// `STMl` was reported (or is pending) for the current track.
+    buffer_threshold_reported: bool,
+    /// Buffer server frames are received into (see [`Self::set_frame_buffer`]); `None` uses a
+    /// [`SERVER_FRAME_BUF_LEN`]-byte stack buffer.
+    frame_buffer: Option<&'static mut [u8]>,
 }
 
 impl PlayerCoordinator {
@@ -141,6 +153,7 @@ impl PlayerCoordinator {
             pending_track_started: false,
             pending_underrun: false,
             pending_dsco: None,
+            pending_buffer_threshold: false,
             pending_resp: None,
             pending_meta: None,
             dac_enabled: true,
@@ -151,7 +164,59 @@ impl PlayerCoordinator {
             stream: StreamLink::Idle,
             pending_cyd: None,
             last_tick_frames: 0,
+            track_started_reported: false,
+            buffer_threshold_reported: false,
+            frame_buffer: None,
         }
+    }
+
+    /// Receive server frames into `buffer` instead of a [`SERVER_FRAME_BUF_LEN`]-byte stack
+    /// buffer (the firmware passes a static one, keeping 2 KB off the task stack). A frame
+    /// longer than `buffer` is dropped by the transport.
+    pub fn set_frame_buffer(&mut self, buffer: &'static mut [u8]) {
+        self.frame_buffer = Some(buffer);
+    }
+
+    /// Announces the player on a freshly connected control link: `HELO` (this player's MAC,
+    /// `device_id`, `capabilities`) and the player name (`SETD`), and arms an immediate
+    /// heartbeat so LMS gets a `STAT` on the next tick. A player that was never connected
+    /// becomes [`PlayerState::Connected`]; a reconnect leaves the play state alone.
+    pub fn hello<T: SlimTransport>(
+        &mut self,
+        transport: &mut T,
+        device_id: u8,
+        capabilities: &str,
+        now_ms: u32,
+    ) -> Result<(), TransportError> {
+        let mut buf = [0u8; 256];
+        let len = SlimprotoBuilder::build_helo(&self.mac, device_id, capabilities, &mut buf)
+            .map_err(|_| TransportError::Io)?;
+        transport.send(&buf[..len])?;
+        send_setd_name(transport, &self.player_name)?;
+        if self.state == PlayerState::Disconnected {
+            self.state = PlayerState::Connected;
+        }
+        self.last_heartbeat_ms = now_ms.wrapping_sub(self.heartbeat_interval_ms);
+        Ok(())
+    }
+
+    /// Another audio source (device: Bluetooth A2DP) starts feeding the pipeline while no LMS
+    /// stream plays: [`PlayerState::Playing`], with every per-track LMS event cleared, `STMs`
+    /// marked as reported and a finished LMS stream detached, so nothing about it is reported
+    /// to LMS.
+    pub fn begin_external_playback(&mut self) {
+        self.reset();
+        self.stream = StreamLink::Idle;
+        self.buffer_threshold_bytes = 0;
+        self.track_started_reported = true;
+        self.buffer_threshold_reported = true;
+        self.pending_buffer_threshold = false;
+        self.state = PlayerState::Playing;
+    }
+
+    /// The external source stopped and its audio drained: [`PlayerState::Stopped`].
+    pub fn end_external_playback(&mut self) {
+        self.state = PlayerState::Stopped;
     }
 
     /// Sets the stream EOF indicator.
@@ -263,10 +328,65 @@ impl PlayerCoordinator {
     ) -> Result<(), TransportError> {
         self.last_tick_frames = 0;
         self.resume_stream_connect(transport, source, pipeline, now_ms)?;
+        let link_lost = self.receive_command(transport, source, backend, pipeline, now_ms)?;
+        let _ = self.poll_stream(source, pipeline);
+        self.last_tick_frames = self.process_audio_step(pipeline);
 
-        let mut link_lost = false;
+        if link_lost {
+            return Err(TransportError::Disconnected);
+        }
+        self.check_heartbeat(transport, pipeline, now_ms)
+    }
+
+    /// Step 2 of [`Self::tick`]: receives at most one server frame and handles it. Returns
+    /// whether the control link is gone. Uses the buffer from [`Self::set_frame_buffer`], or
+    /// a stack buffer in a separate out-of-line frame that is gone again before decoding.
+    #[inline(never)]
+    fn receive_command<S: AudioOutputSink, T: SlimTransport, R: StreamSource, B: AudioBackend>(
+        &mut self,
+        transport: &mut T,
+        source: &mut R,
+        backend: &mut B,
+        pipeline: &mut StreamPipeline<'_, S>,
+        now_ms: u32,
+    ) -> Result<bool, TransportError> {
+        match self.frame_buffer.take() {
+            Some(buffer) => {
+                let result =
+                    self.receive_into(buffer, transport, source, backend, pipeline, now_ms);
+                self.frame_buffer = Some(buffer);
+                result
+            }
+            None => self.receive_on_stack(transport, source, backend, pipeline, now_ms),
+        }
+    }
+
+    /// [`Self::receive_command`] without a configured frame buffer.
+    #[inline(never)]
+    fn receive_on_stack<S: AudioOutputSink, T: SlimTransport, R: StreamSource, B: AudioBackend>(
+        &mut self,
+        transport: &mut T,
+        source: &mut R,
+        backend: &mut B,
+        pipeline: &mut StreamPipeline<'_, S>,
+        now_ms: u32,
+    ) -> Result<bool, TransportError> {
         let mut frame = [0u8; SERVER_FRAME_BUF_LEN];
-        match transport.poll_frame(&mut frame) {
+        self.receive_into(&mut frame, transport, source, backend, pipeline, now_ms)
+    }
+
+    /// Receives at most one server frame into `frame` and handles it.
+    #[inline(never)]
+    fn receive_into<S: AudioOutputSink, T: SlimTransport, R: StreamSource, B: AudioBackend>(
+        &mut self,
+        frame: &mut [u8],
+        transport: &mut T,
+        source: &mut R,
+        backend: &mut B,
+        pipeline: &mut StreamPipeline<'_, S>,
+        now_ms: u32,
+    ) -> Result<bool, TransportError> {
+        match transport.poll_frame(frame) {
             Ok(Some(len)) => {
                 if let Ok((cmd, _)) = SlimprotoParser::parse_frame(&frame[..len]) {
                     if let Some(msg) =
@@ -275,18 +395,11 @@ impl PlayerCoordinator {
                         self.pending_cyd = Some(msg);
                     }
                 }
+                Ok(false)
             }
-            Ok(None) | Err(TransportError::WouldBlock) | Err(TransportError::Io) => {}
-            Err(TransportError::Disconnected) => link_lost = true,
+            Ok(None) | Err(TransportError::WouldBlock) | Err(TransportError::Io) => Ok(false),
+            Err(TransportError::Disconnected) => Ok(true),
         }
-
-        let _ = self.poll_stream(source, pipeline);
-        self.last_tick_frames = self.process_audio_step(pipeline);
-
-        if link_lost {
-            return Err(TransportError::Disconnected);
-        }
-        self.check_heartbeat(transport, pipeline, now_ms)
     }
 
     /// Repeats a `connect` that previously returned [`StreamError::WouldBlock`].
@@ -304,6 +417,7 @@ impl PlayerCoordinator {
         match result {
             Ok(()) => {
                 self.stream = StreamLink::Open;
+                self.arm_buffer_threshold();
                 self.report_stream_connected(transport, pipeline, now_ms)
             }
             Err(StreamError::WouldBlock) => Ok(()),
@@ -316,7 +430,7 @@ impl PlayerCoordinator {
 
     /// `STMc`: the stream connected (response accepted).
     fn report_stream_connected<S: AudioOutputSink, T: SlimTransport>(
-        &self,
+        &mut self,
         transport: &mut T,
         pipeline: &StreamPipeline<'_, S>,
         now_ms: u32,
@@ -354,6 +468,149 @@ impl PlayerCoordinator {
             now_ms,
         )?;
         send_dsco(transport, DisconnectReason::Unreachable)
+    }
+
+    /// `STMl` for a stream that does not start by itself (autostart off): once it is connected
+    /// and not waiting for `cont`, at most once per track (LMS answers with `strm u`).
+    fn arm_buffer_threshold(&mut self) {
+        if !self.autostart_mode.is_auto()
+            && !self.awaiting_cont
+            && self.stream == StreamLink::Open
+            && !self.buffer_threshold_reported
+        {
+            self.buffer_threshold_reported = true;
+            self.pending_buffer_threshold = true;
+        }
+    }
+
+    /// Installs the decoder for `format` (`strm s`, `codc`): MP3 from the pipeline's MP3 slot
+    /// (see [`StreamPipeline::use_mp3_decoder`]), FLAC reusing the current FLAC decoder, PCM
+    /// with the given layout. A format this build cannot decode gets a PCM decoder with the
+    /// output muted (never the previous decoder, which would turn the bytes into noise) until
+    /// the next `strm s`. Returns whether the format is decodable.
+    fn select_decoder<S: AudioOutputSink>(
+        pipeline: &mut StreamPipeline<'_, S>,
+        format: AudioFormat,
+        bits: u8,
+        channels: u8,
+        big_endian: bool,
+    ) -> bool {
+        let supported = match format {
+            AudioFormat::Mp3 => pipeline.use_mp3_decoder(),
+            AudioFormat::Flac => {
+                if !matches!(pipeline.decoder, ActiveDecoder::Flac(_)) {
+                    pipeline.set_decoder(ActiveDecoder::new_flac());
+                }
+                true
+            }
+            AudioFormat::Aac => ActiveDecoder::new_aac().map(|d| pipeline.set_decoder(d)).is_some(),
+            AudioFormat::Ogg => {
+                ActiveDecoder::new_vorbis().map(|d| pipeline.set_decoder(d)).is_some()
+            }
+            AudioFormat::Pcm => {
+                pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::with_config(
+                    bits, big_endian, channels,
+                )));
+                true
+            }
+            AudioFormat::Opus | AudioFormat::Alac | AudioFormat::Unknown(_) => false,
+        };
+        if !supported {
+            pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::with_config(bits, big_endian, channels)));
+            pipeline.set_mute(true);
+        }
+        supported
+    }
+
+    /// Drops the stream-ring tail when the stream has ended and the decoder cannot make
+    /// anything of what is left (a truncated last frame), so the track can finish
+    /// (`STMd`/`STMu`) instead of waiting forever for bytes that will never come.
+    fn drop_undecodable_tail<S: AudioOutputSink>(
+        &self,
+        pipeline: &mut StreamPipeline<'_, S>,
+        decoded: &Result<usize, DecoderError>,
+    ) {
+        if self.stream_eof
+            && matches!(decoded, Err(DecoderError::NeedMoreData))
+            && !pipeline.has_pending_pcm()
+        {
+            pipeline.stream_buffer.flush();
+        }
+    }
+
+    /// Records sink output: the first frames of a track make `STMs` pending.
+    fn note_output(&mut self, written: usize) {
+        if written > 0 && !self.track_started_reported {
+            self.track_started_reported = true;
+            self.pending_track_started = true;
+        }
+    }
+
+    /// Output half of the audio step, for platforms that schedule decoding and output
+    /// separately (device: top up the I2S DMA before and after each decode burst). Moves
+    /// decoded PCM still pending into the output ring and writes the ring to the sink, up to
+    /// `max_rounds` sink writes, while [`PlayerState::Playing`] with the DAC enabled. Returns
+    /// the frames written.
+    pub fn pump_output<S: AudioOutputSink>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+        max_rounds: usize,
+    ) -> usize {
+        if self.state != PlayerState::Playing {
+            return 0;
+        }
+        let mut total = 0;
+        for _ in 0..max_rounds {
+            if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
+                let _ = pipeline.process_decode_step();
+            }
+            if !self.dac_enabled || pipeline.output_buffer.available_read() < 8 {
+                break;
+            }
+            let written = pipeline.process_output_step().unwrap_or(0);
+            self.note_output(written);
+            total += written;
+            if written == 0 {
+                break;
+            }
+        }
+        if pipeline.has_pending_pcm() && pipeline.output_buffer.available_write() >= 8 {
+            let _ = pipeline.process_decode_step();
+        }
+        self.frames_played = pipeline.frames_played;
+        total
+    }
+
+    /// Decode half of the audio step (see [`Self::pump_output`]): while
+    /// [`PlayerState::Playing`], with no decoded PCM pending and at least
+    /// [`PUMP_DECODE_MIN_OUTPUT_SPACE`] bytes free in the output ring, decodes until one step
+    /// produced audio, or for at most `max_steps` steps that only consumed input (resync,
+    /// tag skip). After the stream ended an undecodable tail is dropped.
+    pub fn pump_decode<S: AudioOutputSink>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+        max_steps: usize,
+    ) {
+        if self.state != PlayerState::Playing {
+            return;
+        }
+        for _ in 0..max_steps {
+            if pipeline.has_pending_pcm()
+                || pipeline.output_buffer.available_write() < PUMP_DECODE_MIN_OUTPUT_SPACE
+                || pipeline.stream_buffer.available_read() == 0
+            {
+                break;
+            }
+            let before = pipeline.output_buffer.available_read();
+            let decoded = pipeline.process_decode_step();
+            self.drop_undecodable_tail(pipeline, &decoded);
+            if pipeline.has_pending_pcm() || pipeline.output_buffer.available_read() > before {
+                break;
+            }
+            if !matches!(decoded, Ok(consumed) if consumed > 0) {
+                break;
+            }
+        }
     }
 
     /// Drops a failed stream and marks it ended.
@@ -440,9 +697,14 @@ impl PlayerCoordinator {
                         self.pending_dsco = None;
                         self.pending_resp = None;
                         self.pending_meta = None;
+                        self.pending_buffer_threshold = false;
+                        self.track_started_reported = false;
+                        self.buffer_threshold_reported = false;
                         self.stream_bytes_received = 0;
                         self.close_stream(source);
                         self.stream_eof = false;
+                        // A mute for an undecodable previous track ends with it.
+                        pipeline.user_muted = false;
 
                         self.autostart_mode = AutostartMode::from_strm(autostart, flags);
                         self.autostart = self.autostart_mode.is_auto();
@@ -457,6 +719,7 @@ impl PlayerCoordinator {
                             match source.connect(addr, &request) {
                                 Ok(()) => {
                                     self.stream = StreamLink::Open;
+                                    self.arm_buffer_threshold();
                                     self.report_stream_connected(transport, pipeline, now_ms)?;
                                 }
                                 // Response still pending: `STMc` (or `STMn`) once it resolves.
@@ -479,23 +742,19 @@ impl PlayerCoordinator {
                         let channels = Self::normalize_pcm_channels(pcm_channels);
                         let is_be = matches!(pcm_endianness, Endianness::BigEndian);
 
-                        // Reconfigure pipeline decoder according to format. A codec missing from
-                        // this build (see `std-codecs`) leaves the current decoder in place.
-                        let decoder = match format {
-                            AudioFormat::Mp3 => ActiveDecoder::new_mp3(),
-                            AudioFormat::Flac => Some(ActiveDecoder::new_flac()),
-                            AudioFormat::Aac => ActiveDecoder::new_aac(),
-                            AudioFormat::Ogg => ActiveDecoder::new_vorbis(),
-                            _ => Some(ActiveDecoder::Pcm(PcmDecoder::with_config(bits, is_be, channels))),
-                        };
-                        if let Some(decoder) = decoder {
-                            pipeline.set_decoder(decoder);
-                        }
+                        // Reconfigure the pipeline decoder for the format (a format this build
+                        // cannot decode plays muted PCM; see `select_decoder`).
+                        Self::select_decoder(pipeline, format, bits, channels, is_be);
 
                         let _ = pipeline.set_sample_rate(sample_rate);
                         // An unsupported rate keeps the current clock for now (the STMn reply
                         // to an unsupported rate is a separate behavior change).
                         let _ = backend.set_sample_rate(sample_rate);
+                        // Track start powers the amplifier (device: Hi-Z -> Play when idle),
+                        // unless LMS disabled the DAC (`aude`).
+                        if self.dac_enabled {
+                            backend.set_power(true);
+                        }
 
                         let requested_threshold = (threshold_kb as usize).saturating_mul(1024);
                         let max_safe_threshold = pipeline.stream_buffer.capacity().saturating_sub(1024);
@@ -703,7 +962,7 @@ impl PlayerCoordinator {
                 }
                 Ok(None)
             }
-            ServerCommand::Unknown { opcode, payload: _ } => {
+            ServerCommand::Unknown { opcode, payload } => {
                 if let Some((_spdif, dac_enable)) = cmd.audio_enable() {
                     self.dac_enabled = dac_enable;
                     pipeline.sink.set_mute(!dac_enable);
@@ -713,6 +972,17 @@ impl PlayerCoordinator {
                     if metaint > 0 && self.stream_active() {
                         source.set_icy_metaint(metaint as usize);
                     }
+                    self.arm_buffer_threshold();
+                } else if opcode == *b"codc" && !payload.is_empty() {
+                    // Codec change: format, sample size, rate, channels, endianness.
+                    let format = AudioFormat::from_byte(payload[0]);
+                    let bits = payload.get(1).map_or(16, |&b| Self::normalize_pcm_bits(b));
+                    let channels = payload.get(3).map_or(2, |&b| Self::normalize_pcm_channels(b));
+                    let is_be = payload
+                        .get(4)
+                        .is_none_or(|&b| matches!(Endianness::from_byte(b), Endianness::BigEndian));
+                    self.current_format = Some(format);
+                    Self::select_decoder(pipeline, format, bits, channels, is_be);
                 } else if let Some(setting) = cmd.device_setting() {
                     if setting.id == 0 {
                         if !setting.data.is_empty() {
@@ -749,26 +1019,34 @@ impl PlayerCoordinator {
         pipeline.flush();
     }
 
-    /// Collects the response head and ICY metadata the source has captured.
+    /// Collects the response head and ICY metadata the source has captured (through the
+    /// callback takes, so no 4 KB `HeaderBuf`/`MetaBuf` value lands on this stack).
     fn take_stream_side_data<R: StreamSource>(&mut self, source: &mut R) {
-        if let Some(headers) = source.take_response_headers() {
-            self.pending_resp = Some(headers.to_vec());
-        }
-        if let Some(meta) = source.take_icy_metadata() {
-            self.pending_meta = Some(meta.to_vec());
-        }
+        let resp = &mut self.pending_resp;
+        source.take_response_headers_with(&mut |head| *resp = Some(head.to_vec()));
+        let meta = &mut self.pending_meta;
+        source.take_icy_metadata_with(&mut |block| *meta = Some(block.to_vec()));
     }
 
     /// Moves HTTP audio bytes from `source` into the pipeline stream buffer.
     ///
     /// Stops when no bytes are available right now (`HALNET-405`) or the stream buffer is full,
     /// records a clean end of stream in `stream_eof`, and drops the stream (also setting
-    /// `stream_eof`) when `poll_bytes` fails (`COORD-508`).
+    /// `stream_eof`) when `poll_bytes` fails (`COORD-508`). While a `cont` is awaited only the
+    /// response head is collected: the body (and its ICY framing) starts after `cont`. Kept
+    /// out of line so its read chunk is off the stack again before decoding starts.
+    #[inline(never)]
     fn poll_stream<S: AudioOutputSink, R: StreamSource>(
         &mut self,
         source: &mut R,
         pipeline: &mut StreamPipeline<'_, S>,
     ) -> Result<usize, StreamError> {
+        if self.awaiting_cont {
+            if self.stream == StreamLink::Open {
+                self.take_stream_side_data(source);
+            }
+            return Ok(0);
+        }
         let mut total_written = 0;
         let mut chunk = [0u8; 1024];
         while self.stream == StreamLink::Open {
@@ -862,14 +1140,12 @@ impl PlayerCoordinator {
         }
 
         // Try decoding a frame chunk
-        let _ = pipeline.process_decode_step();
+        let decoded = pipeline.process_decode_step();
+        self.drop_undecodable_tail(pipeline, &decoded);
 
         // Write frames to the output sink
-        let is_first_write = self.frames_played == 0;
         let written = pipeline.process_output_step().unwrap_or(0);
-        if written > 0 && is_first_write {
-            self.pending_track_started = true;
-        }
+        self.note_output(written);
         self.frames_played = pipeline.frames_played;
 
         // Re-evaluate EOF / underrun transition after draining output buffer
@@ -958,12 +1234,19 @@ impl PlayerCoordinator {
         pipeline: &StreamPipeline<'_, S>,
         now_ms: u32,
     ) -> Result<(), TransportError> {
-        if let Some(resp) = self.pending_resp.take() {
-            send_payload_frame(transport, &resp, SlimprotoBuilder::build_resp)?;
+        if let Some(resp) = &self.pending_resp {
+            let sent = send_payload_frame(transport, resp, SlimprotoBuilder::build_resp);
+            settle_pending(&mut self.pending_resp, sent)?;
         }
 
-        if let Some(meta) = self.pending_meta.take() {
-            send_payload_frame(transport, &meta, SlimprotoBuilder::build_meta)?;
+        if let Some(meta) = &self.pending_meta {
+            let sent = send_payload_frame(transport, meta, SlimprotoBuilder::build_meta);
+            settle_pending(&mut self.pending_meta, sent)?;
+        }
+
+        if self.pending_buffer_threshold {
+            self.send_metrics_stat(transport, StatEvent::BUFFER_THRESHOLD, pipeline, now_ms)?;
+            self.pending_buffer_threshold = false;
         }
 
         if self.pending_track_started {
@@ -1022,6 +1305,18 @@ impl PlayerCoordinator {
             _ => PlayState::Stopped,
         }
     }
+}
+
+/// Outcome of sending a deferred `RESP`/`META`: sent or failed for good clears it, `WouldBlock`
+/// keeps it for the next tick (a frame that can never be sent must not block the link).
+fn settle_pending(
+    pending: &mut Option<Vec<u8>>,
+    sent: Result<(), TransportError>,
+) -> Result<(), TransportError> {
+    if sent != Err(TransportError::WouldBlock) {
+        *pending = None;
+    }
+    sent
 }
 
 /// Sends a compact `STAT` (frame counter as byte counter, elapsed time from the timestamp).
@@ -1111,7 +1406,9 @@ mod tests {
     use super::*;
     use crate::io_traits::{
         FakeStreamSource, HeaderBuf, LoopbackTransport, MetaBuf, MockBackend, Segments,
+        LOOPBACK_QUEUE_DEPTH,
     };
+    use std::boxed::Box;
     use squeezelite_audio_core::MockAudioSink;
     use std::string::{String, ToString};
     use std::vec;
@@ -2096,6 +2393,290 @@ mod tests {
         }
         assert_eq!(pipeline.frames_played, 2);
         assert_eq!(rig.lines()[..3], ["STAT:STMc", "RESP", "STAT:STMs"]);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Task 9: device path through the coordinator (pumps, decoder provider, codc, STMl, ...)
+    // -----------------------------------------------------------------------------------------
+
+    /// `strm_frame` with another format byte.
+    fn strm_frame_fmt(format: u8, autostart: bool, server_port: u16) -> Vec<u8> {
+        let mut f = strm_frame(b's', autostart, 0, 0, server_port, [127, 0, 0, 1], &[]);
+        f[8 + 2] = format;
+        f
+    }
+
+    #[test]
+    fn test_device_pumps_play_audio_and_stms_is_reported_once() {
+        let mut rig = Rig::with_source([1; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.src.hold_data = true;
+        rig.command(&mut pipeline, &strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[]), 10);
+        // The device feeds the stream ring outside the tick, then pumps decode/output itself.
+        pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+        rig.coord.pump_decode(&mut pipeline, 4);
+        assert_eq!(rig.coord.pump_output(&mut pipeline, 16), 2);
+        assert_eq!(pipeline.frames_played, 2);
+        rig.tick(&mut pipeline, 20).unwrap();
+        rig.tick(&mut pipeline, 30).unwrap();
+        let stms = rig.lines().iter().filter(|l| *l == "STAT:STMs").count();
+        assert_eq!(stms, 1, "{:?}", rig.lines());
+        // Output stays gated by the play state and the DAC enable.
+        rig.coord.dac_enabled = false;
+        pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+        rig.coord.pump_decode(&mut pipeline, 4);
+        assert_eq!(rig.coord.pump_output(&mut pipeline, 16), 0);
+    }
+
+    static TRUNCATED_TAIL: Segments = &[OK_HEAD, TWO_FRAMES, &[0x03, 0x00, 0xFD]];
+
+    #[test]
+    fn test_eof_with_undecodable_tail_still_ends_the_track() {
+        // A stream ending in a partial frame used to leave the tail in the stream ring forever
+        // (no STMd/STMu). The device firmware dropped it; the coordinator now does too.
+        let mut rig = Rig::with_source([2; 6], "T", GatedSource::new(b"/stream.mp3", TRUNCATED_TAIL));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[]), 10);
+        for t in 0..20 {
+            rig.tick(&mut pipeline, 20 + t).unwrap();
+        }
+        assert_eq!(pipeline.frames_played, 2);
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+        assert_eq!(
+            rig.lines(),
+            ["STAT:STMc", "RESP", "STAT:STMs", "STAT:STMd", "DSCO:0", "STAT:STMu"]
+        );
+    }
+
+    #[test]
+    fn test_pump_decode_drops_undecodable_tail_after_eof() {
+        let mut rig = Rig::with_source([3; 6], "T", GatedSource::new(b"/stream.mp3", TRUNCATED_TAIL));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[]), 10);
+        rig.src.hold_data = false;
+        for _ in 0..10 {
+            let _ = rig.coord.poll_stream(&mut rig.src, &mut pipeline);
+        }
+        assert!(rig.coord.stream_eof);
+        for _ in 0..4 {
+            rig.coord.pump_decode(&mut pipeline, 4);
+            rig.coord.pump_output(&mut pipeline, 16);
+        }
+        assert_eq!(pipeline.stream_buffer.available_read(), 0, "partial frame dropped");
+    }
+
+    #[test]
+    fn test_codc_selects_the_decoder() {
+        let mut rig = Rig::new([4; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &server_frame(b"codc", b"f"), 10);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+        assert_eq!(rig.coord.current_format, Some(AudioFormat::Flac));
+        rig.command(&mut pipeline, &server_frame(b"codc", b"m"), 20);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Mp3(_)));
+        // PCM: format, sample size, rate, channels, endianness ('1' = little endian).
+        rig.command(&mut pipeline, &server_frame(b"codc", b"p231\x01"), 30);
+        match &pipeline.decoder {
+            ActiveDecoder::Pcm(d) => {
+                assert_eq!((d.bits_per_sample, d.channels, d.big_endian), (24, 1, false));
+            }
+            _ => panic!("PCM decoder expected"),
+        }
+        assert!(rig.lines().is_empty(), "codc has no reply");
+    }
+
+    #[test]
+    fn test_unsupported_format_installs_pcm_muted_until_next_track() {
+        let mut rig = Rig::new([5; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame_fmt(b'm', true, 0), 10);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Mp3(_)));
+        // Opus is not decodable: never feed its bytes to the previous (MP3) decoder.
+        rig.command(&mut pipeline, &strm_frame_fmt(b'u', true, 0), 20);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
+        assert!(pipeline.user_muted);
+        pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+        rig.tick(&mut pipeline, 30).unwrap();
+        assert!(pipeline.sink.muted, "output stays muted");
+        rig.command(&mut pipeline, &strm_frame_fmt(b'p', true, 0), 40);
+        assert!(!pipeline.user_muted, "a supported track clears the mute");
+    }
+
+    #[test]
+    fn test_mp3_decoder_comes_from_the_pipeline_slot_and_returns_to_it() {
+        // Firmware builds have no heap MP3 decoder: bring-up parks the static one in the
+        // pipeline's MP3 slot. The coordinator must use (and give back) that very decoder.
+        let mut rig = Rig::new([6; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        let parked = Box::new(squeezelite_decoders::Mp3Decoder::new());
+        let id: *const squeezelite_decoders::Mp3Decoder = &*parked;
+        pipeline.mp3_spare = Some(parked);
+        let current_mp3 = |p: &TestPipeline<'_>| match &p.decoder {
+            ActiveDecoder::Mp3(d) => &**d as *const squeezelite_decoders::Mp3Decoder,
+            _ => core::ptr::null(),
+        };
+
+        rig.command(&mut pipeline, &strm_frame_fmt(b'm', true, 0), 10);
+        assert_eq!(current_mp3(&pipeline), id, "the parked decoder is used");
+        assert!(pipeline.mp3_spare.is_none());
+
+        rig.command(&mut pipeline, &strm_frame_fmt(b'f', true, 0), 20);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+        assert_eq!(pipeline.mp3_spare.as_deref().map(|d| d as *const _), Some(id), "parked again");
+
+        rig.command(&mut pipeline, &strm_frame_fmt(b'm', true, 0), 30);
+        rig.command(&mut pipeline, &strm_frame_fmt(b'm', true, 0), 40);
+        assert_eq!(current_mp3(&pipeline), id, "MP3 after MP3 keeps the same decoder");
+    }
+
+    #[test]
+    fn test_hello_sends_helo_and_setd_and_arms_the_first_heartbeat() {
+        let mut rig = Rig::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], "Kitchen");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.coord.last_heartbeat_ms = 5_000;
+        rig.coord.hello(&mut rig.lms, 12, "Model=squeezeesp32,flc,pcm", 5_100).unwrap();
+        rig.drain_sent();
+        assert_eq!(rig.lines(), ["HELO", "SETD"]);
+        assert_eq!(&rig.sent[0].1[2..8], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert!(rig.sent[0].1.ends_with(b"Model=squeezeesp32,flc,pcm"));
+        assert_eq!(&rig.sent[1].1[1..], b"Kitchen");
+        assert_eq!(rig.coord.state, PlayerState::Connected);
+        rig.tick(&mut pipeline, 5_101).unwrap();
+        assert_eq!(rig.lines()[2], "STAT:STMt", "heartbeat right after HELO");
+    }
+
+    #[test]
+    fn test_resp_waits_for_room_instead_of_being_dropped() {
+        let mut rig = Rig::with_source([7; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.src.hold_data = true;
+        rig.lms.inject_frame(&strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[])).unwrap();
+        // Fill the send queue so everything after STMc would block.
+        for _ in 0..LOOPBACK_QUEUE_DEPTH - 1 {
+            rig.lms.send(b"FILL\0\0\0\0").unwrap();
+        }
+        let _ = rig.coord.tick(&mut rig.lms, &mut rig.src, &mut rig.backend, &mut pipeline, 10);
+        assert!(rig.coord.pending_resp.is_some(), "RESP kept for the next tick");
+        rig.drain_sent();
+        rig.sent.clear();
+        rig.tick(&mut pipeline, 20).unwrap();
+        assert_eq!(rig.lines()[0], "RESP");
+    }
+
+    #[test]
+    fn test_non_autostart_stream_sends_stml_after_resp() {
+        let mut rig = Rig::with_source([8; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame(b's', false, 1, 0, 9000, [127, 0, 0, 1], &[]), 10);
+        for t in 0..4 {
+            rig.tick(&mut pipeline, 20 + t).unwrap();
+        }
+        let lines = rig.lines();
+        assert_eq!(lines[..3], ["STAT:STMc", "RESP", "STAT:STMl"], "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| *l == "STAT:STMl").count(), 1);
+    }
+
+    #[test]
+    fn test_cont_wait_holds_the_body_then_releases_it_with_metaint_and_stml() {
+        static ICY_BODY: Segments = &[OK_HEAD, b"\x01\x00\xFF\x00\x01Hi\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x02\x00\xFE\x00"];
+        let mut rig = Rig::with_source([9; 6], "T", GatedSource::new(b"/stream.mp3", ICY_BODY));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        let mut start = strm_frame(b's', false, 0, 0, 9000, [127, 0, 0, 1], &[]);
+        start[8 + 11] = squeezelite_proto::STRM_FLAG_CONT_WAIT; // flags
+        rig.command(&mut pipeline, &start, 10);
+        assert!(rig.coord.awaiting_cont);
+        for t in 0..4 {
+            rig.tick(&mut pipeline, 20 + t).unwrap();
+        }
+        assert_eq!(pipeline.stream_buffer.available_read(), 0, "no body before cont");
+        assert_eq!(rig.lines(), ["STAT:STMc", "RESP"]);
+        rig.command(&mut pipeline, &server_frame(b"cont", &4u32.to_be_bytes()), 30);
+        for t in 0..4 {
+            rig.tick(&mut pipeline, 40 + t).unwrap();
+        }
+        assert_eq!(rig.coord.stream_bytes_received, 8, "ICY block stripped from the start");
+        assert!(rig.lines().contains(&"STAT:STMl".to_string()), "{:?}", rig.lines());
+        assert!(rig.lines().contains(&"META".to_string()));
+    }
+
+    #[test]
+    fn test_track_start_powers_the_amplifier_when_the_dac_is_enabled() {
+        let mut rig = Rig::new([10; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame_fmt(b'p', true, 0), 10);
+        assert!(rig.backend.powered);
+        rig.command(&mut pipeline, &server_frame(b"aude", &[1, 0]), 20);
+        rig.command(&mut pipeline, &strm_frame_fmt(b'p', true, 0), 30);
+        assert!(!rig.backend.powered, "DAC disabled: track start does not power the amp");
+    }
+
+    #[test]
+    fn test_external_playback_reports_nothing_to_lms() {
+        let mut rig = Rig::with_source([11; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        // An LMS track plays to the end (STMd ... STMu leave per-track flags behind).
+        rig.command(&mut pipeline, &strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[]), 10);
+        for t in 0..20 {
+            rig.tick(&mut pipeline, 20 + t).unwrap();
+        }
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+        rig.sent.clear();
+        // Bluetooth takes over the pipeline.
+        rig.coord.begin_external_playback();
+        pipeline.flush();
+        pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+        for t in 0..10 {
+            rig.coord.pump_decode(&mut pipeline, 4);
+            rig.coord.pump_output(&mut pipeline, 16);
+            rig.tick(&mut pipeline, 100 + t).unwrap();
+        }
+        assert_eq!(rig.coord.state, PlayerState::Playing, "no LMS end-of-track logic");
+        assert!(rig.lines().iter().all(|l| l == "STAT:STMt"), "{:?}", rig.lines());
+        rig.coord.end_external_playback();
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+    }
+
+    #[test]
+    fn test_external_frame_buffer_receives_frames_and_bounds_their_size() {
+        // The firmware hands the coordinator a static frame buffer (off the task stack).
+        let mut rig = Rig::new([12; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.coord.set_frame_buffer(Box::leak(Box::new([0u8; 64])));
+        rig.command(&mut pipeline, &server_frame(b"setd", b"\x00Den"), 10);
+        assert_eq!(rig.coord.player_name.as_str(), "Den");
+        // A frame larger than the buffer is dropped by the transport (Io) and skipped.
+        let long_name = [b'x'; 80];
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&long_name);
+        rig.command(&mut pipeline, &server_frame(b"setd", &payload), 20);
+        assert_eq!(rig.coord.player_name.as_str(), "Den");
+        assert_eq!(rig.lines(), ["SETD"]);
     }
 
     #[test]
