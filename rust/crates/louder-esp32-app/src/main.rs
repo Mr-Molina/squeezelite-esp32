@@ -1215,6 +1215,8 @@ mod xtensa_hw {
         let coordinator = COORDINATOR.init(PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT"));
         coordinator.lms_ip = DEFAULT_LMS_SERVER_IP;
         coordinator.set_frame_buffer(frame_buf);
+        // Decode/output run only in the DMA-first pump phases (`tasks.rs`), never inside tick.
+        coordinator.external_audio_pump = true;
         coordinator
     }
 

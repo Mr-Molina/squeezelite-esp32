@@ -10,7 +10,7 @@ use crate::io_traits::{
     HeaderBuf, MetaBuf, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
 use crate::stream_codec::{
-    find_head_end, request_host, ChunkedDecoder, IcyStripper, RedirectPolicy, RedirectTarget,
+    find_head_end, request_host, truncate_head, ChunkedDecoder, IcyStripper, RedirectPolicy, RedirectTarget,
     ResponseHead,
 };
 use squeezelite_proto::{
@@ -1013,17 +1013,8 @@ impl StreamSource for HttpAudioStream {
     /// (`MAX_HTTP_HEADER_LEN` rejects longer heads first); it guards the trait contract.
     fn take_response_headers(&mut self) -> Option<HeaderBuf> {
         let raw = HttpAudioStream::take_response_headers(self)?;
-        let mut out = heapless::Vec::new();
-        if raw.len() <= out.capacity() {
-            let _ = out.extend_from_slice(&raw);
-        } else {
-            // `raw[..cut]` must leave 4 bytes for "\r\n\r\n"; cut before the last CRLF at or
-            // before that limit.
-            let limit = out.capacity() - 4;
-            let cut = raw[..limit + 2].windows(2).rposition(|w| w == b"\r\n").unwrap_or(0);
-            let _ = out.extend_from_slice(&raw[..cut]);
-            let _ = out.extend_from_slice(b"\r\n\r\n");
-        }
+        let mut out = HeaderBuf::new();
+        let _ = out.extend_from_slice(&truncate_head(&raw, out.capacity()));
         Some(out)
     }
 

@@ -19,6 +19,7 @@
 //! | `net_stack`         | Wi-Fi STA connect drive, smoltcp poll + DHCPv4 events                       |
 //! | `http_control`      | Gate 4 port-80 server + deferred reboot actions, settings persistence       |
 //! | `slimproto_session` | LMS control socket: connect, `HELO`/`SETD` (`hello`), `coordinator.tick`    |
+//! |                     | (protocol + play state only; never decodes: `external_audio_pump`)         |
 //! | `cyd_bridge`        | CYD command poll, 1 s progress update                                      |
 //! | `decode_pump`       | `coordinator.pump_decode` (one frame, or a short resync burst)             |
 //! | `i2s_feed`          | `coordinator.pump_output` before/after decoding, DAC gate, silence pump    |
@@ -1053,9 +1054,10 @@ mod device {
 
     /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`), then one
     /// `PlayerCoordinator::tick` over the device adapters: at most one server frame, the HTTP
-    /// audio fetch, one audio step, deferred `STAT`/`RESP`/`META`/`DSCO` and the heartbeat. The
-    /// tick also runs while the control link is down, so buffered and streaming audio keeps
-    /// playing. A server volume change (`audg`) is mirrored to the CYD and the settings journal.
+    /// audio fetch, play-state evaluation, deferred `STAT`/`RESP`/`META`/`DSCO` and the
+    /// heartbeat. It never decodes or writes to the sink (`external_audio_pump`, set at
+    /// bring-up): the pump phases own that, DMA first. The tick also runs while the control
+    /// link is down, so the stream keeps being fetched. A server volume change (`audg`) is mirrored to the CYD and the settings journal.
     #[inline(never)]
     fn slim_tick(s: &mut FirmwareState, local_ip: [u8; 4]) {
         let now_ms = s.now_ms as u32;

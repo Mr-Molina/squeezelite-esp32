@@ -519,6 +519,22 @@ impl<'a> ResponseHead<'a> {
     }
 }
 
+/// `head` cut to at most `max_len` bytes without splitting a header line: everything up to
+/// the last complete line that leaves room for the terminating blank line, which is then
+/// appended (`\r\n\r\n`). A head that already fits is returned unchanged.
+pub fn truncate_head(head: &[u8], max_len: usize) -> Vec<u8> {
+    if head.len() <= max_len {
+        return head.to_vec();
+    }
+    let limit = max_len.saturating_sub(4);
+    let window = &head[..(limit + 2).min(head.len())];
+    let cut = window.windows(2).rposition(|w| w == b"\r\n").unwrap_or(0);
+    let mut out = Vec::with_capacity(cut + 4);
+    out.extend_from_slice(&head[..cut]);
+    out.extend_from_slice(b"\r\n\r\n");
+    out
+}
+
 /// Value of the `Host` header in a raw request, blanks trimmed (`None` if absent or empty).
 pub fn request_host(request: &[u8]) -> Option<&[u8]> {
     header_in(request, b"host").filter(|h| !h.is_empty())
@@ -764,6 +780,16 @@ mod tests {
         assert_eq!(ResponseHead(b"HTTP/1.0 404 Not Found\r\nX-RateLimit: 200\r\n\r\n").status(), Some(404));
         assert_eq!(ResponseHead(b"FOO 200 OK\r\n\r\n").status(), None);
         assert!(!ResponseHead(b"HTTP/1.0 200 OK\r\n\r\n").is_chunked());
+    }
+
+    #[test]
+    fn head_truncation_keeps_whole_lines() {
+        let head = b"HTTP/1.0 200 OK\r\nA: 1111\r\nB: 2222\r\n\r\n";
+        assert_eq!(truncate_head(head, 64), head.to_vec());
+        let cut = truncate_head(head, 30);
+        assert_eq!(cut, b"HTTP/1.0 200 OK\r\nA: 1111\r\n\r\n".to_vec());
+        assert!(cut.len() <= 30);
+        assert_eq!(truncate_head(head, 8), b"\r\n\r\n".to_vec());
     }
 
     #[test]

@@ -115,6 +115,11 @@ pub struct PlayerCoordinator {
     /// IPv4 address of the LMS server. A `strm s` whose `server_ip` is `0.0.0.0` streams from
     /// this address (bring-up sets it to the control connection's peer; defaults to loopback).
     pub lms_ip: [u8; 4],
+    /// Decode and sink output are scheduled by the caller through [`Self::pump_decode`] /
+    /// [`Self::pump_output`] (device: DMA-first pump phases); [`Self::tick`] then only
+    /// evaluates the play state and never decodes or writes to the sink itself. `false`
+    /// (default, host): `tick` runs one decode + output step.
+    pub external_audio_pump: bool,
     stream: StreamLink,
     pending_cyd: Option<CydMessage>,
     last_tick_frames: usize,
@@ -161,6 +166,7 @@ impl PlayerCoordinator {
             player_name,
             stream_eof: false,
             lms_ip: [127, 0, 0, 1],
+            external_audio_pump: false,
             stream: StreamLink::Idle,
             pending_cyd: None,
             last_tick_frames: 0,
@@ -330,7 +336,13 @@ impl PlayerCoordinator {
         self.resume_stream_connect(transport, source, pipeline, now_ms)?;
         let link_lost = self.receive_command(transport, source, backend, pipeline, now_ms)?;
         let _ = self.poll_stream(source, pipeline);
-        self.last_tick_frames = self.process_audio_step(pipeline);
+        self.last_tick_frames = if self.external_audio_pump {
+            // Decode/output belong to the caller's pump phases; only the play state moves here.
+            self.evaluate_state(pipeline);
+            0
+        } else {
+            self.process_audio_step(pipeline)
+        };
 
         if link_lost {
             return Err(TransportError::Disconnected);
@@ -498,8 +510,10 @@ impl PlayerCoordinator {
         let supported = match format {
             AudioFormat::Mp3 => pipeline.use_mp3_decoder(),
             AudioFormat::Flac => {
-                if !matches!(pipeline.decoder, ActiveDecoder::Flac(_)) {
-                    pipeline.set_decoder(ActiveDecoder::new_flac());
+                match &mut pipeline.decoder {
+                    // Same codec again (`codc`): restart the decoder at a frame boundary.
+                    ActiveDecoder::Flac(current) => current.flush(),
+                    _ => pipeline.set_decoder(ActiveDecoder::new_flac()),
                 }
                 true
             }
@@ -985,8 +999,10 @@ impl PlayerCoordinator {
                     Self::select_decoder(pipeline, format, bits, channels, is_be);
                 } else if let Some(setting) = cmd.device_setting() {
                     if setting.id == 0 {
-                        if !setting.data.is_empty() {
-                            if let Ok(name) = core::str::from_utf8(setting.data) {
+                        // LMS NUL-terminates the name; never keep (or echo) the terminator.
+                        let data = setting.data.split(|&b| b == 0).next().unwrap_or(&[]);
+                        if !data.is_empty() {
+                            if let Ok(name) = core::str::from_utf8(data) {
                                 self.player_name.clear();
                                 let _ = self.player_name.push_str(name);
                             }
@@ -1234,9 +1250,12 @@ impl PlayerCoordinator {
         pipeline: &StreamPipeline<'_, S>,
         now_ms: u32,
     ) -> Result<(), TransportError> {
-        if let Some(resp) = &self.pending_resp {
-            let sent = send_payload_frame(transport, resp, SlimprotoBuilder::build_resp);
-            settle_pending(&mut self.pending_resp, sent)?;
+        if let Some(head) = self.pending_resp.take() {
+            let (sent, head) = send_resp(transport, head);
+            if sent == Err(TransportError::WouldBlock) {
+                self.pending_resp = Some(head);
+            }
+            sent?;
         }
 
         if let Some(meta) = &self.pending_meta {
@@ -1304,6 +1323,22 @@ impl PlayerCoordinator {
             PlayerState::Paused => PlayState::Paused,
             _ => PlayState::Stopped,
         }
+    }
+}
+
+/// Sends a `RESP`. A head the transport can never take (`Io`, e.g. larger than the device's
+/// 2 KB control-socket buffer) is cut at a header-line boundary, halving the limit until it
+/// fits, rather than dropped. Returns the outcome and the head as last tried.
+fn send_resp<T: SlimTransport>(
+    transport: &mut T,
+    mut head: Vec<u8>,
+) -> (Result<(), TransportError>, Vec<u8>) {
+    loop {
+        let sent = send_payload_frame(transport, &head, SlimprotoBuilder::build_resp);
+        if sent != Err(TransportError::Io) || head.len() <= 64 {
+            return (sent, head);
+        }
+        head = crate::stream_codec::truncate_head(&head, head.len() / 2);
     }
 }
 
@@ -2677,6 +2712,114 @@ mod tests {
         rig.command(&mut pipeline, &server_frame(b"setd", &payload), 20);
         assert_eq!(rig.coord.player_name.as_str(), "Den");
         assert_eq!(rig.lines(), ["SETD"]);
+    }
+
+    #[test]
+    fn test_external_audio_pump_keeps_decode_and_output_out_of_tick() {
+        // Device: the pump phases own decode/output; tick must not play audio on its own,
+        // but state transitions (Buffering -> Playing, STMs from pumped output) still happen.
+        let mut rig = Rig::new([13; 6], "T");
+        rig.coord.external_audio_pump = true;
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame(b's', true, 1, 0, 0, [0, 0, 0, 0], &[]), 10);
+        assert_eq!(rig.coord.state, PlayerState::Buffering);
+        pipeline.ingest_stream_data(&[0u8; 1100]).unwrap();
+        rig.tick(&mut pipeline, 20).unwrap();
+        assert_eq!(rig.coord.state, PlayerState::Playing, "threshold reached in tick");
+        assert_eq!(pipeline.frames_played, 0, "tick wrote nothing to the sink");
+        assert_eq!(pipeline.sink.recorded_samples().len(), 0);
+        assert_eq!(pipeline.stream_buffer.available_read(), 1100, "tick decoded nothing");
+        rig.coord.pump_decode(&mut pipeline, 4);
+        assert!(rig.coord.pump_output(&mut pipeline, 16) > 0);
+        rig.tick(&mut pipeline, 30).unwrap();
+        assert!(rig.lines().contains(&"STAT:STMs".to_string()));
+    }
+
+    #[test]
+    fn test_setd_name_is_cut_at_the_first_nul() {
+        let mut rig = Rig::new([14; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &server_frame(b"setd", b"\x00Kitchen\x00\x00junk"), 10);
+        assert_eq!(rig.coord.player_name.as_str(), "Kitchen");
+        assert_eq!(&rig.sent[0].1[1..], b"Kitchen", "no NUL echoed back");
+        // A name that is empty before its NUL keeps the current name.
+        rig.command(&mut pipeline, &server_frame(b"setd", b"\x00\x00"), 20);
+        assert_eq!(rig.coord.player_name.as_str(), "Kitchen");
+    }
+
+    #[test]
+    fn test_codc_reselecting_flac_flushes_the_decoder() {
+        let mut rig = Rig::new([15; 6], "T");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &server_frame(b"codc", b"f"), 10);
+        let id = match &mut pipeline.decoder {
+            ActiveDecoder::Flac(d) => {
+                d.pending_pcm.extend_from_slice(&[1, 2, 3, 4]);
+                d.stream_buf.extend_from_slice(b"stale");
+                &**d as *const squeezelite_decoders::FlacDecoder
+            }
+            _ => panic!("FLAC expected"),
+        };
+        rig.command(&mut pipeline, &server_frame(b"codc", b"f"), 20);
+        match &pipeline.decoder {
+            ActiveDecoder::Flac(d) => {
+                assert_eq!(&**d as *const _, id, "same decoder kept");
+                assert!(d.pending_pcm.is_empty() && d.stream_buf.is_empty(), "and flushed");
+            }
+            _ => panic!("FLAC expected"),
+        }
+    }
+
+    /// Transport whose send path refuses frames over `max` bytes (like a 2 KB socket buffer).
+    struct SmallTx {
+        inner: LoopbackTransport,
+        max: usize,
+    }
+
+    impl SlimTransport for SmallTx {
+        fn poll_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+            self.inner.poll_frame(buf)
+        }
+        fn send(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+            if frame.len() > self.max {
+                return Err(TransportError::Io);
+            }
+            self.inner.send(frame)
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_oversized_resp_is_sent_truncated_at_a_line_boundary() {
+        let mut head = b"HTTP/1.0 200 OK\r\n".to_vec();
+        for i in 0..120 {
+            head.extend_from_slice(format!("X-Pad-{i:03}: {}E\r\n", "v".repeat(20)).as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+        assert!(head.len() > 3000);
+        let mut coord = PlayerCoordinator::new([16; 6], "T");
+        coord.last_heartbeat_ms = 0;
+        coord.pending_resp = Some(head.clone());
+        let mut tx = SmallTx { inner: LoopbackTransport::new(), max: 2048 };
+        let mut stream_storage = [0u8; 256];
+        let mut output_storage = [0u8; 256];
+        let pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        coord.check_heartbeat(&mut tx, &pipeline, 10).unwrap();
+        assert!(coord.pending_resp.is_none());
+        let frame = tx.inner.pop_sent().expect("RESP sent");
+        assert_eq!(&frame[..4], b"RESP");
+        let payload = &frame[8..];
+        assert!(frame.len() <= 2048);
+        assert!(payload.ends_with(b"E\r\n\r\n"), "cut after a whole header line, blank line added");
+        assert!(head.starts_with(&payload[..payload.len() - 2]));
     }
 
     #[test]
