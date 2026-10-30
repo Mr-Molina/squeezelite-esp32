@@ -26,6 +26,12 @@ extern crate std;
 
 use core::fmt;
 
+/// Bluetooth Classic/LE local name (HCI name, EIR, LE advertising/scan response, SDP
+/// ServiceName). The BT stack keeps its P0/P1 behaviour (spec §3.1), so this is the player's
+/// first-boot name and does not follow a later rename (`setd`); the fixed SDP record layout needs
+/// exactly 8 bytes (checked at compile time where the record is built).
+const BT_LOCAL_NAME: &[u8] = crate::board::first_boot_defaults::PLAYER_NAME.as_bytes();
+
 // ============================================================================
 // HCI Transport Trait
 // ============================================================================
@@ -1053,9 +1059,9 @@ impl BtA2dpSink {
                 Self::send_cmd(transport, OPCODE_SET_EVENT_MASK, &mask)
             }
             InitStep::WriteLocalName => {
-                // HCI_Write_Local_Name (0x0C13) -> "BASEMENT" + 0
+                // HCI_Write_Local_Name (0x0C13) -> BT_LOCAL_NAME + 0
                 let mut name_param = [0u8; 248];
-                let name = b"BASEMENT";
+                let name = BT_LOCAL_NAME;
                 name_param[..name.len()].copy_from_slice(name);
                 Self::send_cmd(transport, OPCODE_WRITE_LOCAL_NAME, &name_param)
             }
@@ -1074,8 +1080,8 @@ impl BtA2dpSink {
                 eir_param[0] = 0x00; // FEC Not Required
                 let mut offset = 1;
 
-                // AD 1: Complete Local Name (0x09) "BASEMENT"
-                let name = b"BASEMENT";
+                // AD 1: Complete Local Name (0x09) BT_LOCAL_NAME
+                let name = BT_LOCAL_NAME;
                 eir_param[offset] = (1 + name.len()) as u8;
                 eir_param[offset + 1] = 0x09;
                 eir_param[offset + 2..offset + 2 + name.len()].copy_from_slice(name);
@@ -1146,8 +1152,8 @@ impl BtA2dpSink {
                 // Length byte + data
                 // Flags: len 2, type 0x01, value 0x1A
                 // UUID: len 3, type 0x03, 0x110B
-                // Name: len 9, type 0x09, "BASEMENT"
-                let name = b"BASEMENT";
+                // Name: len 1 + name, type 0x09, BT_LOCAL_NAME
+                let name = BT_LOCAL_NAME;
                 let len = 3 + 4 + (2 + name.len());
                 param[0] = len as u8;
                 let mut off = 1;
@@ -1171,7 +1177,7 @@ impl BtA2dpSink {
             }
             InitStep::LeSetScanResponseData => {
                 let mut param = [0u8; 32];
-                let name = b"BASEMENT";
+                let name = BT_LOCAL_NAME;
                 param[0] = (2 + name.len()) as u8;
                 param[1] = (1 + name.len()) as u8;
                 param[2] = 0x09;
@@ -1897,18 +1903,30 @@ impl BtA2dpSink {
         // 0x0004: ProtocolDescriptorList [21 bytes]
         // 0x0005: DES { UUID16(0x1002 PublicBrowseRoot) } [8 bytes]
         // 0x0009: BluetoothProfileDescriptorList [13 bytes]
-        // 0x0100: Text("BASEMENT") [13 bytes]
+        // 0x0100: Text(BT_LOCAL_NAME, 8 bytes) [13 bytes]
         // 0x0311: Uint16(0x0001) [6 bytes]
-        const RECORD_ATTRS: [u8; 77] = [
+        const RECORD_ATTRS: [u8; 77] = {
+            let mut attrs = [
             0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01,
             0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x0B,
             0x09, 0x00, 0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x19, 0x35,
             0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03,
             0x09, 0x00, 0x05, 0x35, 0x03, 0x19, 0x10, 0x02,
             0x09, 0x00, 0x09, 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0D, 0x09, 0x01, 0x03,
-            0x09, 0x01, 0x00, 0x25, 0x08, b'B', b'A', b'S', b'E', b'M', b'E', b'N', b'T',
+            0x09, 0x01, 0x00, 0x25, 0x08, 0, 0, 0, 0, 0, 0, 0, 0,
             0x09, 0x03, 0x11, 0x09, 0x00, 0x01,
         ];
+            // ServiceName (0x0100) is a Text(8) element at bytes 63..71; this fixed record
+            // layout only fits an 8-byte name.
+            const NAME_AT: usize = 63;
+            assert!(BT_LOCAL_NAME.len() == 8 && attrs[NAME_AT - 2] == 0x25 && attrs[NAME_AT - 1] == 0x08);
+            let mut i = 0;
+            while i < 8 {
+                attrs[NAME_AT + i] = BT_LOCAL_NAME[i];
+                i += 1;
+            }
+            attrs
+        };
 
         match pdu_id {
             0x02 => {
@@ -2324,8 +2342,8 @@ mod tests {
         // Verify key parameters in sent commands:
         // 1. Reset (0x0C03)
         assert_eq!(u16::from_le_bytes([transport.tx_packets[0][1], transport.tx_packets[0][2]]), OPCODE_RESET);
-        // 3. Write Local Name contains "BASEMENT"
-        assert_eq!(&transport.tx_packets[2][4..12], b"BASEMENT");
+        // 3. Write Local Name contains the BT local name
+        assert_eq!(&transport.tx_packets[2][4..12], BT_LOCAL_NAME);
         // 4. Class Of Device: 0x240414
         assert_eq!(&transport.tx_packets[3][4..7], &[0x14, 0x04, 0x24]);
         // 5. Simple Pairing Mode: 0x01
@@ -2586,8 +2604,8 @@ mod tests {
         let last_tx = transport.tx_packets.last().unwrap();
         assert_eq!(u16::from_le_bytes([last_tx[7], last_tx[8]]), 0x0050); // Peer SCID
         assert_eq!(last_tx[9], 0x07); // SDP ServiceSearchAttributeResponse
-        // Contains "BASEMENT" in service name
-        assert!(last_tx.windows(8).any(|w| w == b"BASEMENT"));
+        // Contains the BT local name in the service name
+        assert!(last_tx.windows(8).any(|w| w == BT_LOCAL_NAME));
 
         // 2. Search for HFP (0x111E) -> Must reject with empty match [0x35, 0x00]
         let sdp_req_hfp = [

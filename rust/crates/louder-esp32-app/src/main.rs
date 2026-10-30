@@ -30,6 +30,8 @@ use louder_esp32_app::{
 #[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::io_traits::MockBackend;
 #[cfg(not(target_arch = "xtensa"))]
+use louder_esp32_app::board::first_boot_defaults;
+#[cfg(not(target_arch = "xtensa"))]
 use squeezelite_config::AudioConfig;
 #[cfg(not(target_arch = "xtensa"))]
 use squeezelite_decoders::PcmDecoder;
@@ -37,7 +39,7 @@ use squeezelite_decoders::PcmDecoder;
 mod tasks;
 
 /// SqueezeESP32 HELO capability string broadcasted to LMS server during SlimProto handshake (`WO-155`).
-pub const BASEMENT_HELO_CAPABILITIES: &str =
+pub const HELO_CAPABILITIES: &str =
     "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,HasDigitalOut=1,MaxSampleRate=96000,flc,pcm,wav,aif,mp3";
 
 /// Executes one integrated firmware tick across the CYD UART bridge, audio pipeline,
@@ -137,14 +139,10 @@ fn main() {
     let mut nvs_backend = NvsFlashBackend::new(flash_partition);
     let mut config_store = MemConfigStore::<16>::new();
 
-    let mut audio_cfg = AudioConfig::default();
-    audio_cfg.player_name.clear();
-    let raw_name = std::env::var("SL_PLAYER_NAME")
-        .unwrap_or_else(|_| louder_esp32_app::board::DEFAULT_PLAYER_NAME.to_string());
-    let safe_len = raw_name.floor_char_boundary(32.min(raw_name.len()));
-    let _ = audio_cfg.player_name.push_str(&raw_name[..safe_len]);
-    audio_cfg.lms_server_ip = Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_IP);
-    audio_cfg.lms_server_port = Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_PORT);
+    let mut audio_cfg = first_boot_defaults::audio_config();
+    if let Ok(raw_name) = std::env::var("SL_PLAYER_NAME") {
+        audio_cfg.set_player_name(&raw_name);
+    }
 
     if let Ok(server_override) = std::env::var("SL_LMS_SERVER") {
         if let Ok(sock) = server_override.parse::<std::net::SocketAddr>() {
@@ -198,10 +196,8 @@ fn main() {
         44100,
     );
 
-    // 4. Derive MAC address: use BASEMENT_PLAYER_MAC for "BASEMENT", or deterministic test MAC (INFRA-801, HW-PREP-05)
-    let mac = if audio_cfg.player_name.as_str() == louder_esp32_app::board::DEFAULT_PLAYER_NAME {
-        louder_esp32_app::board::BASEMENT_PLAYER_MAC
-    } else {
+    // 4. Host demo MAC: a deterministic test MAC per board (the device uses its efuse STA MAC).
+    let mac = {
         let suffix = match board {
             BoardModel::LouderEsp32Wrover => 0x01,
             BoardModel::LouderEsp32PlusS3 => 0x02,
@@ -244,8 +240,8 @@ fn main() {
     println!("Ready for LMS auto-discovery on UDP 3483...");
 
     // 7. Optional Live LMS Network Connection & Firmware Tick Execution Loop (HALNET-409, HW-PREP-05)
-    let lms_ip = std::net::Ipv4Addr::from(audio_cfg.lms_server_ip.unwrap_or(louder_esp32_app::board::DEFAULT_LMS_SERVER_IP));
-    let lms_port = audio_cfg.lms_server_port.unwrap_or(louder_esp32_app::board::DEFAULT_LMS_SERVER_PORT);
+    let lms_ip = std::net::Ipv4Addr::from(audio_cfg.lms_server_ip.unwrap_or(first_boot_defaults::LMS_SERVER_IP));
+    let lms_port = audio_cfg.lms_server_port.unwrap_or(first_boot_defaults::LMS_SERVER_PORT);
     let lms_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(lms_ip, lms_port));
 
     let should_connect = std::env::var("SL_LMS_CONNECT").as_deref() == Ok("1") || cfg!(target_arch = "xtensa");
@@ -325,19 +321,20 @@ mod xtensa_hw {
     use louder_esp32_app::backend_device::{
         program_i2s_clock, I2sClockRegisters, I2S0_CLKM_CONF_ADDR, I2S0_SAMPLE_RATE_CONF_ADDR,
     };
-    use louder_esp32_app::board::{
-        BASEMENT_PLAYER_MAC, DEFAULT_LMS_SERVER_IP, DEFAULT_WIFI_SSID,
+    use louder_esp32_app::board::first_boot_defaults;
+    use louder_esp32_app::config_handle::{
+        resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigSource, JournalSector,
+        JournalSlot, RamJournal,
     };
     use louder_esp32_app::net_device::{HttpStreamState, SlimLinkState};
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{DeadManLeaseWatchdog, HttpControlAction};
-    use louder_esp32_app::MemConfigStore;
     use squeezelite_audio_core::EqPreset;
-    use squeezelite_config::AudioConfig;
+    use squeezelite_config::{FlashJournal, JournalView, WifiCredentials};
     use squeezelite_cyd_link::CydMessage;
     use louder_esp32_app::ota_safety::{
-        load_nvs_wifi_credentials_split_12kb, verify_otadata_erased, OtaSafetyError,
-        WifiStaCredentials, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
+        load_nvs_wifi_credentials_split_12kb, resolve_wifi_credentials, verify_otadata_erased,
+        OtaSafetyError, WifiStaCredentials, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
         OTADATA_SECTOR_1_OFFSET,
     };
     use smoltcp::iface::{
@@ -376,7 +373,12 @@ mod xtensa_hw {
     }
 
     static HW_ACK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    static HW_NACK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    /// Per-operation NACK counters (`/status.json` `i2c_nack_by_op`, spec §4.8). Counting only:
+    /// each replaces the single total counter's increment at the same place, so the bus
+    /// behaviour is unchanged and the total (`i2c_nacks`) is their sum.
+    static HW_NACK_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static HW_NACK_WRITE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static HW_NACK_WRITE_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
     pub struct SmolDevice<'a> {
         pub driver: &'a mut WifiInterface,
@@ -448,7 +450,17 @@ mod xtensa_hw {
         }
 
         pub fn hw_nack_count() -> u32 {
-            HW_NACK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+            let by_op = Self::hw_nack_by_op();
+            by_op.read.wrapping_add(by_op.write).wrapping_add(by_op.write_read)
+        }
+
+        pub fn hw_nack_by_op() -> louder_esp32_app::http_control::I2cNackByOp {
+            let load = |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
+            louder_esp32_app::http_control::I2cNackByOp {
+                read: load(&HW_NACK_READ),
+                write: load(&HW_NACK_WRITE),
+                write_read: load(&HW_NACK_WRITE_READ),
+            }
         }
     }
 
@@ -467,7 +479,7 @@ mod xtensa_hw {
                     }
                 }
                 Err(_) => {
-                    HW_NACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    HW_NACK_READ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     for byte in read.iter_mut() {
                         *byte = self.shadow_regs[self.current_reg as usize];
                         self.current_reg = self.current_reg.wrapping_add(1);
@@ -503,7 +515,7 @@ mod xtensa_hw {
                     HW_ACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 Err(_) => {
-                    HW_NACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    HW_NACK_WRITE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
             Ok(())
@@ -522,7 +534,7 @@ mod xtensa_hw {
                     }
                 }
                 Err(_) => {
-                    HW_NACK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    HW_NACK_WRITE_READ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     self.write(address, write)?;
                     self.read(address, read)?;
                 }
@@ -804,6 +816,8 @@ mod xtensa_hw {
         Instant::now().duration_since_epoch().as_millis()
     }
 
+    /// Boot resolution step 2 (Wi-Fi): the C firmware's NVS at 0x9000, read-only. Boot-time,
+    /// single-core read (APP_CPU is parked and esp-radio not started yet).
     #[inline(never)]
     fn load_nvs_wifi_credentials(
         flash: &mut FlashStorage<'_>,
@@ -816,9 +830,62 @@ mod xtensa_hw {
             },
             sta_mac,
             nvs_buf,
-            option_env!("SL_WIFI_SSID").or(Some(DEFAULT_WIFI_SSID)),
-            option_env!("SL_WIFI_PASS"),
+            None,
+            None,
         )
+    }
+
+    /// Boot resolution of the Wi-Fi STA credentials (spec §3.4): the settings journal's
+    /// (`journal_wifi`), else the C firmware's NVS (read only when the journal has none), else
+    /// the compile-time first-boot credentials; none at all resets into recovery, as before.
+    /// The result lives in `.dram2_uninit` for the life of the image (`/status.json` shows the
+    /// SSID), keeping it off the boot frame and out of `.bss` (which would shrink `.stack`).
+    #[allow(unsafe_code)]
+    #[inline(never)]
+    fn init_wifi_credentials(
+        flash: &mut FlashStorage<'_>,
+        nvs_scratch: &mut [u8; 12_288],
+        sta_mac: &[u8; 6],
+        journal_wifi: Option<&WifiCredentials>,
+    ) -> &'static WifiStaCredentials {
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut WIFI_STA_CREDS: core::mem::MaybeUninit<WifiStaCredentials> =
+            core::mem::MaybeUninit::uninit();
+        let resolved = resolve_boot_wifi(
+            journal_wifi,
+            || load_nvs_wifi_credentials(flash, sta_mac, nvs_scratch).ok(),
+            || default_wifi_credentials(sta_mac),
+        );
+        let Some((creds, source)) = resolved else {
+            println!(
+                "[ANTI-BRICK] No Wi-Fi credentials in the settings journal, 0x9000 NVS or the build -> resetting to recovery (0x10000)"
+            );
+            esp_hal::system::software_reset();
+        };
+        let source = match source {
+            ConfigSource::Journal => "settings journal",
+            ConfigSource::Nvs => "NVS 0x9000",
+            ConfigSource::Default => "first-boot default",
+        };
+        println!(
+            "[CONFIG] Wi-Fi STA SSID='{}' (pass_len={}) from {} for MAC {:02x?}",
+            creds.ssid.as_str(),
+            creds.password.len(),
+            source,
+            sta_mac
+        );
+        // SAFETY: bring-up calls this once, before anything else can name the static; it is
+        // fully written before the only (shared) reference is handed out.
+        unsafe { &*(*core::ptr::addr_of_mut!(WIFI_STA_CREDS)).write(creds) }
+    }
+
+    /// Boot resolution step 3 (Wi-Fi): the compile-time first-boot credentials, only when a
+    /// passphrase was compiled in (`SL_WIFI_PASS`, plain or `enc:`), with `SL_WIFI_SSID` or
+    /// [`first_boot_defaults::WIFI_SSID`].
+    #[inline(never)]
+    fn default_wifi_credentials(sta_mac: &[u8; 6]) -> Option<WifiStaCredentials> {
+        let ssid = option_env!("SL_WIFI_SSID").unwrap_or(first_boot_defaults::WIFI_SSID);
+        resolve_wifi_credentials(&[], sta_mac, Some(ssid), option_env!("SL_WIFI_PASS")).ok()
     }
 
     static MP3_DEC_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -869,9 +936,6 @@ mod xtensa_hw {
     #[link_section = ".dram2_uninit"]
     static mut APP_CORE_STACK: Stack<4096> = Stack::new();
     #[allow(unsafe_code)]
-    #[link_section = ".dram2_uninit"]
-    static mut SETTINGS_SCRATCH: [u8; 4096] = [0u8; 4096];
-    #[allow(unsafe_code)]
     #[unsafe(link_section = ".dram2_uninit")]
     static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 18 * 1024]> =
         core::mem::MaybeUninit::uninit();
@@ -911,58 +975,55 @@ mod xtensa_hw {
 
     use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
 
+    /// Boot resolution step 1 + runtime configuration statics (spec §3.4–3.5, Task 10).
+    ///
+    /// Reads both settings sectors (0x3FE000 / 0x3FF000) into `scratch` -- the only flash read
+    /// of the settings journal, at boot, single-core -- picks the newest valid journal, resolves
+    /// every audio/identity field (journal, else [`first_boot_defaults`]) and builds, in place in
+    /// `.dram2_uninit` (so neither `.stack` nor this frame carries them):
+    /// - the [`ConfigHandle`] holding the resolved [`AudioConfig`](squeezelite_config::AudioConfig);
+    /// - the [`RamJournal`]: DRAM sector image + which sector holds the newest journal and its
+    ///   sequence, so no later flash write ever needs to read flash.
+    #[allow(unsafe_code)]
     #[inline(never)]
-    fn load_boot_audio_config(
+    fn init_config(
         flash: &mut FlashStorage<'_>,
         scratch: &mut [u8; 12_288],
-    ) -> (AudioConfig, u32) {
+    ) -> (&'static ConfigHandle, &'static mut RamJournal<'static>) {
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut JOURNAL_IMAGE: core::mem::MaybeUninit<JournalSector> = core::mem::MaybeUninit::uninit();
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> = core::mem::MaybeUninit::uninit();
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> = core::mem::MaybeUninit::uninit();
+        static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        assert!(
+            !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
+            "config statics already initialised"
+        );
+
         let (sector_a, rest) = scratch.split_at_mut(4096);
         let (sector_b, _) = rest.split_at_mut(4096);
-        let _ = flash.read_nor(SETTINGS_JOURNAL_OFFSET, sector_a);
-        let _ = flash.read_nor(SETTINGS_JOURNAL_OFFSET + 4096, sector_b);
+        let _ = flash.read_nor(JournalSlot::A.offset(SETTINGS_JOURNAL_OFFSET), sector_a);
+        let _ = flash.read_nor(JournalSlot::B.offset(SETTINGS_JOURNAL_OFFSET), sector_b);
 
-        let meta_a = squeezelite_config::FlashJournal::read_sector_meta(sector_a);
-        let meta_b = squeezelite_config::FlashJournal::read_sector_meta(sector_b);
-        let active_seq = match (meta_a, meta_b) {
-            (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
-                if squeezelite_config::FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
-                    seq_a
-                } else {
-                    seq_b
-                }
-            }
-            (Ok((seq_a, _, _)), Err(_)) => seq_a,
-            (Err(_), Ok((seq_b, _, _))) => seq_b,
-            (Err(_), Err(_)) => 0,
-        };
+        let selected = FlashJournal::select_dual_sector(sector_a, sector_b);
+        let view = selected.and_then(|(index, _)| {
+            JournalView::new(if index == 0 { &sector_a[..] } else { &sector_b[..] }).ok()
+        });
+        let audio = resolve_boot_audio(view.as_ref(), &first_boot_defaults::audio_config());
+        let journal_wifi = view.and_then(|v| WifiCredentials::load_from(&v).ok().flatten());
+        let boot_slot = selected.map(|(index, seq)| (JournalSlot::from_index(index), seq));
 
-        let mut store = MemConfigStore::<8>::new();
-        if squeezelite_config::FlashJournal::load_from_dual_sectors(sector_a, sector_b, &mut store)
-            .is_ok()
-        {
-            (AudioConfig::load_from(&store).unwrap_or_default(), active_seq)
-        } else {
-            (AudioConfig::default(), 0)
-        }
-    }
-
-    #[inline(never)]
-    pub(crate) fn persist_audio_config(
-        scratch: &mut [u8; 4096],
-        cfg: &AudioConfig,
-        current_seq: &mut u32,
-    ) -> bool {
-        let next_seq = current_seq.wrapping_add(1);
-        let mut store = MemConfigStore::<8>::new();
-        if cfg.save_to(&mut store).is_err() {
-            return false;
-        }
-        scratch.fill(0xFF);
-        if squeezelite_config::FlashJournal::save_to_sector_with_seq(&store, scratch, next_seq).is_ok() {
-            *current_seq = next_seq;
-            true
-        } else {
-            false
+        // SAFETY: called once (TAKEN); each static is fully written before the only reference
+        // to it is handed out, and nothing else names these statics.
+        unsafe {
+            let image = (*core::ptr::addr_of_mut!(JOURNAL_IMAGE)).as_mut_ptr();
+            image.write_bytes(0xFF, 1);
+            let journal = (*core::ptr::addr_of_mut!(RAM_JOURNAL))
+                .write(RamJournal::new(&mut *image, boot_slot, journal_wifi));
+            let config = (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
+            (&*config, journal)
         }
     }
 
@@ -1069,7 +1130,25 @@ mod xtensa_hw {
                     .park_core(esp_hal::system::Cpu::AppCpu);
             }
         }
+
+        /// Restarts APP_CPU after a runtime settings flash write (`runtime-flash-persist` only;
+        /// see `tasks::runtime_flash_commit`). Default build: the manual path's core 1 runs the
+        /// IRAM NOP heartbeat, so it resumes where it was parked.
+        #[cfg(feature = "runtime-flash-persist")]
+        pub(crate) fn unpark_after_flash_write(&mut self) {
+            #[cfg(not(feature = "esp-rtos-core1"))]
+            self.cpu_ctrl.unpark_core(esp_hal::system::Cpu::AppCpu);
+        }
     }
+
+    // `runtime-flash-persist` parks APP_CPU mid-flight at runtime. Under `esp-rtos-core1` core 1
+    // runs an embassy executor that takes critical sections; parked while holding the
+    // multicore critical-section lock, it would deadlock core 0's next flash call. Only the
+    // manual core-1 path (IRAM NOP loop, never locks) is allowed with the runtime commit.
+    #[cfg(all(feature = "runtime-flash-persist", feature = "esp-rtos-core1"))]
+    compile_error!(
+        "`runtime-flash-persist` requires the manual core-1 path: it can not be combined with `esp-rtos-core1`"
+    );
 
     /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio + the UDP placeholders (§3.6).
     const SOCKET_SLOTS: usize = 4 + UDP_PLACEHOLDER_SOCKETS;
@@ -1194,13 +1273,19 @@ mod xtensa_hw {
         CYD_BRIDGE.init(CydUartBridge::new(uart2_port))
     }
 
-    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`]. `strm s` with server
-    /// IP 0.0.0.0 streams from the LMS the control link uses (Task 10 makes it configurable).
+    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`], with this board's
+    /// efuse STA MAC (HELO; smoltcp uses the same MAC), the boot-resolved player name (`SETD`
+    /// after HELO, `setd` id-0 replies) and LMS address (`strm s` with server IP 0.0.0.0 streams
+    /// from it), and the [`ConfigHandle`] a `setd` id-0 name change persists through.
     /// Server frames are received into a static buffer in `.dram2_uninit` (which does not
     /// shrink `.stack`) instead of a 2 KB buffer on the `slimproto_session` stack.
     #[allow(unsafe_code)]
     #[inline(never)]
-    fn init_coordinator() -> &'static mut PlayerCoordinator {
+    fn init_coordinator(
+        sta_mac: [u8; 6],
+        config: &'static ConfigHandle,
+        lms_ip: [u8; 4],
+    ) -> &'static mut PlayerCoordinator {
         #[unsafe(link_section = ".dram2_uninit")]
         static mut SERVER_FRAME_BUF: core::mem::MaybeUninit<
             [u8; louder_esp32_app::coordinator::SERVER_FRAME_BUF_LEN],
@@ -1212,8 +1297,13 @@ mod xtensa_hw {
             ptr.write_bytes(0, 1);
             &mut *ptr
         };
-        let coordinator = COORDINATOR.init(PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT"));
-        coordinator.lms_ip = DEFAULT_LMS_SERVER_IP;
+        let coordinator = COORDINATOR.init(PlayerCoordinator::new(sta_mac, "SqueezeESP32"));
+        config.read(|c| {
+            coordinator.player_name.clear();
+            let _ = coordinator.player_name.push_str(c.player_name.as_str());
+        });
+        coordinator.lms_ip = lms_ip;
+        coordinator.config = Some(config);
         coordinator.set_frame_buffer(frame_buf);
         // Decode/output run only in the DMA-first pump phases (`tasks.rs`), never inside tick.
         coordinator.external_audio_pump = true;
@@ -1462,35 +1552,23 @@ mod xtensa_hw {
             ref mut audio_tx_buf,
         } = fw_bufs;
 
-        #[allow(unsafe_code)]
-        let settings_scratch: &mut [u8; 4096] =
-            unsafe { &mut *core::ptr::addr_of_mut!(SETTINGS_SCRATCH) };
-
-        let wifi_sta_creds = {
+        // Boot config resolution (spec §3.4), each field independently: settings FlashJournal,
+        // then (Wi-Fi only) the C firmware's NVS, then the compile-time first-boot defaults.
+        let (config, journal) = {
             let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
-            match load_nvs_wifi_credentials(&mut flash, &sta_mac, boot_scratch) {
-                Ok(c) => c,
-                Err(e) => {
-                    println!(
-                        "[ANTI-BRICK] Could not resolve Wi-Fi credentials from 0x9000 NVS ({:?}) -> resetting to recovery (0x10000)",
-                        e
-                    );
-                    esp_hal::system::software_reset();
-                }
-            }
+            init_config(&mut flash, boot_scratch)
         };
         wdt.feed();
-        println!(
-            "[NVS 0x9000] Loaded Wi-Fi STA SSID='{}' (pass_len={}) for MAC {:02x?}",
-            wifi_sta_creds.ssid.as_str(),
-            wifi_sta_creds.password.len(),
-            sta_mac
-        );
-
-        let (audio_cfg, settings_seq) = {
+        let wifi_sta_creds = {
             let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
-            load_boot_audio_config(&mut flash, boot_scratch)
+            init_wifi_credentials(&mut flash, boot_scratch, &sta_mac, journal.wifi())
         };
+        let (lms_ip, lms_port) = config.read(|c| {
+            (
+                c.lms_server_ip.unwrap_or(first_boot_defaults::LMS_SERVER_IP),
+                c.lms_server_port.unwrap_or(first_boot_defaults::LMS_SERVER_PORT),
+            )
+        });
         ring_storage.fill(0);
         wdt.feed();
 
@@ -1604,15 +1682,17 @@ mod xtensa_hw {
         let _ = fault.is_high();
         wdt.feed();
 
-        let coordinator = init_coordinator();
+        let coordinator = init_coordinator(sta_mac, config, lms_ip);
         println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
 
-        // Apply saved audio configuration from 0x3F0000 settings partition
-        let current_vol_pct = audio_cfg.volume;
+        // Apply the boot-resolved audio configuration (volume, AGAIN, EQ, loudness).
+        let (current_vol_pct, again_code, eq_preset, loudness) = config.read(|c| {
+            (c.volume, c.analog_gain_code, c.equalizer_preset, c.loudness_enabled)
+        });
         let init_vol_reg = percent_to_attenuation(current_vol_pct);
-        amp_apply_boot_config(amp, init_vol_reg, audio_cfg.analog_gain_code);
-        pipeline.apply_eq_preset(EqPreset::from_u8(audio_cfg.equalizer_preset));
-        pipeline.set_loudness(audio_cfg.loudness_enabled);
+        amp_apply_boot_config(amp, init_vol_reg, again_code);
+        pipeline.apply_eq_preset(EqPreset::from_u8(eq_preset));
+        pipeline.set_loudness(loudness);
         let eff_gain = if current_vol_pct > 0 { 65536 } else { 0 };
         pipeline.set_volume(eff_gain, eff_gain);
         let _ = cyd_bridge.send_message(&CydMessage::Volume(current_vol_pct));
@@ -1632,7 +1712,7 @@ mod xtensa_hw {
         };
 
         // Initialize `esp-radio` Wi-Fi Controller & Station Interface
-        let wifi_controller = init_wifi(peripherals.WIFI, &wifi_sta_creds);
+        let wifi_controller = init_wifi(peripherals.WIFI, wifi_sta_creds);
         let mut sta_iface = WifiInterface::station();
         wdt.feed();
 
@@ -1700,12 +1780,12 @@ mod xtensa_hw {
             coordinator,
             slim_link: SlimLinkState::new(),
             stream_state: HttpStreamState::new(),
-            settings_scratch,
             http_resp_buf,
+            config,
+            journal,
             wifi_sta_creds,
-            audio_cfg,
-            settings_seq,
-            settings_dirty: false,
+            lms_ip,
+            lms_port,
             current_vol_pct,
             local_port_counter,
             bt_audio_active: false,
@@ -1869,11 +1949,7 @@ mod tests {
 
     #[test]
     fn test_audio_config_lms_defaults() {
-        let audio_cfg = AudioConfig {
-            lms_server_ip: Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_IP),
-            lms_server_port: Some(louder_esp32_app::board::DEFAULT_LMS_SERVER_PORT),
-            ..Default::default()
-        };
+        let audio_cfg: AudioConfig = first_boot_defaults::audio_config();
         assert_eq!(audio_cfg.lms_server_ip, Some([10, 0, 0, 10]));
         assert_eq!(audio_cfg.lms_server_port, Some(3483));
     }
@@ -1902,21 +1978,21 @@ mod tests {
     }
 
     #[test]
-    fn test_basement_helo_capabilities_flc_and_sample_rate() {
+    fn test_helo_capabilities_flc_and_sample_rate() {
         assert!(
-            BASEMENT_HELO_CAPABILITIES.contains(",flc,"),
+            HELO_CAPABILITIES.contains(",flc,"),
             "Capabilities must advertise native FLAC (,flc,)"
         );
         assert!(
-            BASEMENT_HELO_CAPABILITIES.contains("MaxSampleRate=96000"),
+            HELO_CAPABILITIES.contains("MaxSampleRate=96000"),
             "Capabilities must advertise MaxSampleRate=96000"
         );
         assert!(
-            BASEMENT_HELO_CAPABILITIES.contains(",pcm,"),
+            HELO_CAPABILITIES.contains(",pcm,"),
             "Capabilities must advertise pcm"
         );
         assert!(
-            BASEMENT_HELO_CAPABILITIES.contains(",mp3"),
+            HELO_CAPABILITIES.contains(",mp3"),
             "Capabilities must advertise mp3"
         );
     }

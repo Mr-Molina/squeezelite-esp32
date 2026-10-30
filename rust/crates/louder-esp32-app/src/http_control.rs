@@ -42,6 +42,19 @@ pub enum HttpControlAction {
     SetAnalogGain(u8),
 }
 
+/// Amp I2C NACK count per operation class (spec §4.8): the bus wrapper still swallows I2C
+/// errors (shadow-register fallback), so these counters keep faults from being fully silent.
+/// A NACKed `write_read` retries as a `write` + `read`, which count in their own classes too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct I2cNackByOp {
+    /// NACKed plain reads.
+    pub read: u32,
+    /// NACKed plain writes.
+    pub write: u32,
+    /// NACKed combined write-then-read transfers.
+    pub write_read: u32,
+}
+
 /// Live telemetry snapshot serialized into `GET /status.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpStatusSnapshot<'a> {
@@ -73,6 +86,8 @@ pub struct HttpStatusSnapshot<'a> {
     pub i2c_acks: u32,
     /// Total hardware `I2C0` NACK errors.
     pub i2c_nacks: u32,
+    /// `I2C0` NACK errors per operation class (`"i2c_nack_by_op":{"read":..,"write":..,"write_read":..}`).
+    pub i2c_nack_by_op: I2cNackByOp,
     /// Monotonic uptime in milliseconds since boot.
     pub uptime_ms: u64,
     /// Free PSRAM in external Quad-SPI RAM in bytes.
@@ -139,6 +154,7 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             vol_pct: 55,
             i2c_acks: 0,
             i2c_nacks: 0,
+            i2c_nack_by_op: I2cNackByOp::default(),
             uptime_ms: 0,
             psram_free_bytes: 3_538_944,
             psram_used_bytes: 655_360,
@@ -231,7 +247,7 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
     let mut writer = BufferWriter::new(out_buf);
     write!(
         writer,
-        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\"again_code\":{},\"settings_seq\":{},\"bt_enabled\":{},\"bt_connected\":{},\"bt_streaming\":{},\"bt_rx_pkts\":{},\"bt_frames\":{}}}",
+        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"i2c_nack_by_op\":{{\"read\":{},\"write\":{},\"write_read\":{}}},\"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\"again_code\":{},\"settings_seq\":{},\"bt_enabled\":{},\"bt_connected\":{},\"bt_streaming\":{},\"bt_rx_pkts\":{},\"bt_frames\":{}}}",
         JsonEscaped(REQUIRED_OTA_PROJECT_NAME),
         JsonEscaped(RUST_OTA_FIRMWARE_VERSION),
         snapshot.otadata_prearmed_factory,
@@ -260,6 +276,9 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.vol_pct,
         snapshot.i2c_acks,
         snapshot.i2c_nacks,
+        snapshot.i2c_nack_by_op.read,
+        snapshot.i2c_nack_by_op.write,
+        snapshot.i2c_nack_by_op.write_read,
         snapshot.uptime_ms,
         snapshot.psram_free_bytes,
         snapshot.psram_used_bytes,
@@ -339,23 +358,26 @@ pub fn handle_http_request_streaming(
             Some((resp.len(), &[], HttpControlAction::None))
         }
         ("GET", "/status.json") => {
-            let mut body_buf = [0u8; 1024];
-            let body_len = write_status_json(snapshot, &mut body_buf)?;
+            // The body is formatted straight into `out_buf` behind room for the header, then
+            // moved down once the header (which carries the body length) is known: no body
+            // scratch buffer on the stack.
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let body_len = write_status_json(snapshot, &mut out_buf[HEADER_ROOM..])?;
 
-            let mut header: String<160> = String::new();
-            let _ = write!(
+            let mut header: String<HEADER_ROOM> = String::new();
+            write!(
                 header,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
                 body_len
-            );
-            let header_bytes = header.as_bytes();
-            let total_len = header_bytes.len() + body_len;
-            if total_len > out_buf.len() {
-                return None;
-            }
-            out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
-            out_buf[header_bytes.len()..total_len].copy_from_slice(&body_buf[..body_len]);
-            Some((total_len, &[], HttpControlAction::None))
+            )
+            .ok()?;
+            let header_len = header.len();
+            out_buf.copy_within(HEADER_ROOM..HEADER_ROOM + body_len, header_len);
+            out_buf[..header_len].copy_from_slice(header.as_bytes());
+            Some((header_len + body_len, &[], HttpControlAction::None))
         }
         ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
             let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -1024,8 +1046,54 @@ mod tests {
         assert!(INDEX_HTML.contains("again0"));
     }
 
+    /// Worst case of every field: the response must still fit the device's 1,536-byte
+    /// response buffer (`STATIC_HTTP_RESP_BUF`) and HTTP socket TX buffer.
     #[test]
-    fn test_status_json_fits_in_1024_byte_buffer() {
+    fn test_status_json_worst_case_fits_the_device_response_buffer() {
+        let worst = HttpStatusSnapshot {
+            ip: [255; 4],
+            netmask: [255; 4],
+            gw: [255; 4],
+            ssid: "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"", // 32 escaped quotes
+            rssi: -100,
+            lms_ip: [255; 4],
+            lms_port: u16::MAX,
+            lms_cport: u16::MAX,
+            frames_played: u64::MAX,
+            amp_mode: "PowerDown",
+            vol_pct: 100,
+            i2c_acks: u32::MAX,
+            i2c_nacks: u32::MAX,
+            i2c_nack_by_op: I2cNackByOp { read: u32::MAX, write: u32::MAX, write_read: u32::MAX },
+            uptime_ms: u64::MAX,
+            psram_free_bytes: u32::MAX,
+            psram_used_bytes: u32::MAX,
+            core1_loops: u32::MAX,
+            codec: "Vorbis",
+            codec_sample_rate: u32::MAX,
+            eq_preset: "Loudness",
+            tas_fs_hz: u32::MAX,
+            tas_bck_ratio: u16::MAX,
+            again_code: u8::MAX,
+            settings_seq: u32::MAX,
+            bt_rx_pkts: u32::MAX,
+            bt_frames: u64::MAX,
+            ..Default::default()
+        };
+        let mut out_buf = [0u8; 1536];
+        let (len, _, _) = handle_http_request_streaming(b"GET /status.json HTTP/1.1\r\n\r\n", &worst, &mut out_buf)
+            .expect("worst-case status.json fits");
+        let resp = core::str::from_utf8(&out_buf[..len]).unwrap();
+        let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(head.contains(&format!("Content-Length: {}", body.len())));
+        assert!(body.starts_with('{') && body.ends_with('}'));
+        // A buffer too small for the body is refused, never truncated.
+        let mut small = [0u8; 600];
+        assert!(handle_http_request_streaming(b"GET /status.json HTTP/1.1\r\n\r\n", &worst, &mut small).is_none());
+    }
+
+    #[test]
+    fn test_status_json_fits_in_the_device_response_buffer() {
         let snap = HttpStatusSnapshot {
             ip: [172, 22, 1, 15],
             netmask: [255, 255, 255, 0],
@@ -1040,7 +1108,8 @@ mod tests {
             amp_mode: "Play",
             vol_pct: 55,
             i2c_acks: 42,
-            i2c_nacks: 0,
+            i2c_nacks: 5,
+            i2c_nack_by_op: I2cNackByOp { read: 1, write: 3, write_read: 1 },
             uptime_ms: 98_765,
             psram_free_bytes: 3_538_944,
             psram_used_bytes: 655_360,
@@ -1064,20 +1133,23 @@ mod tests {
             bt_rx_pkts: 0,
             bt_frames: 0,
         };
-        let mut out_buf = [0u8; 1024];
+        // Task 10: `i2c_nack_by_op` pushed a typical response past 1,024 bytes; the device
+        // response buffer and HTTP TX buffer are 1,536 bytes.
+        let mut out_buf = [0u8; 1536];
         let (len, static_body, action) = handle_http_request_streaming(
             b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n",
             &snap,
             &mut out_buf,
         )
-        .expect("status.json should fit in 1024-byte buffer");
+        .expect("status.json should fit in the 1,536-byte device buffer");
         assert_eq!(action, HttpControlAction::None);
         assert!(static_body.is_empty());
-        assert!(len > 600 && len <= 1024, "expected 600 < len <= 1024, got {len}");
+        assert!(len > 600 && len <= 1536, "expected 600 < len <= 1536, got {len}");
         let resp = core::str::from_utf8(&out_buf[..len]).expect("valid utf8");
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.contains("\"eq_preset\":\"Loudness\""));
         assert!(resp.contains("\"settings_seq\":7"));
+        assert!(resp.contains("\"i2c_nacks\":5,\"i2c_nack_by_op\":{\"read\":1,\"write\":3,\"write_read\":1},"));
         assert!(resp.contains("\"bt_enabled\":false"));
         assert!(resp.contains("\"bt_connected\":false"));
         assert!(resp.contains("\"bt_streaming\":false"));

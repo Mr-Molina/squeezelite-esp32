@@ -41,16 +41,37 @@ pub mod pins {
     pub const CYD_UART_RX: i32 = 44;
 }
 
-/// Default Lyrion Music Server (LMS) IPv4 address from target build context (`10.0.0.10`).
-pub const DEFAULT_LMS_SERVER_IP: [u8; 4] = [10, 0, 0, 10];
-/// Default Lyrion Music Server (LMS) SlimProto TCP/UDP port (`3483`).
-pub const DEFAULT_LMS_SERVER_PORT: u16 = 3483;
-/// Default deployed player node name (`"BASEMENT"` on `172.22.1.15`).
-pub const DEFAULT_PLAYER_NAME: &str = "BASEMENT";
-/// Default deployed Wi-Fi SSID (`"iot"` on `172.22.1.15`).
-pub const DEFAULT_WIFI_SSID: &str = "iot";
-/// Hardware MAC address of the `172.22.1.15` `"BASEMENT"` ESP32 unit (`c8:2e:18:be:b8:34`).
-pub const BASEMENT_PLAYER_MAC: [u8; 6] = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
+/// Compile-time first-boot seeds (spec §3.4, resolution step 3).
+///
+/// Boot resolves each field from the settings FlashJournal first, then (Wi-Fi only) the C
+/// firmware's NVS, and only then falls back to these values. They identify the deployment the
+/// firmware was first flashed for; after the first boot the journal (`setd` name, `/cmd.json`
+/// changes, LMS volume) is the source of truth. The player MAC is never a constant: HELO and
+/// smoltcp both use the efuse STA MAC.
+pub mod first_boot_defaults {
+    use squeezelite_config::AudioConfig;
+
+    /// Player name announced to LMS (`SETD`) until LMS or a user renames the player.
+    pub const PLAYER_NAME: &str = "BASEMENT";
+    /// Lyrion Music Server (LMS) IPv4 address.
+    pub const LMS_SERVER_IP: [u8; 4] = [10, 0, 0, 10];
+    /// LMS SlimProto TCP port.
+    pub const LMS_SERVER_PORT: u16 = 3483;
+    /// Wi-Fi SSID used with a compile-time `SL_WIFI_PASS` when neither the journal nor the NVS
+    /// holds credentials.
+    pub const WIFI_SSID: &str = "iot";
+
+    /// The audio/identity configuration of a board whose journal holds nothing: the
+    /// [`AudioConfig`] defaults (volume, EQ, analog gain, loudness) with this deployment's
+    /// name and LMS address.
+    pub fn audio_config() -> AudioConfig {
+        let mut cfg = AudioConfig::default();
+        cfg.set_player_name(PLAYER_NAME);
+        cfg.lms_server_ip = Some(LMS_SERVER_IP);
+        cfg.lms_server_port = Some(LMS_SERVER_PORT);
+        cfg
+    }
+}
 
 /// Board identity descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,12 +172,16 @@ mod tests {
     }
 
     #[test]
-    fn test_basement_deployment_constants() {
-        assert_eq!(DEFAULT_LMS_SERVER_IP, [10, 0, 0, 10]);
-        assert_eq!(DEFAULT_LMS_SERVER_PORT, 3483);
-        assert_eq!(DEFAULT_PLAYER_NAME, "BASEMENT");
-        assert_eq!(DEFAULT_WIFI_SSID, "iot");
-        assert_eq!(BASEMENT_PLAYER_MAC, [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34]);
+    fn test_first_boot_defaults() {
+        assert_eq!(first_boot_defaults::LMS_SERVER_IP, [10, 0, 0, 10]);
+        assert_eq!(first_boot_defaults::LMS_SERVER_PORT, 3483);
+        assert_eq!(first_boot_defaults::PLAYER_NAME, "BASEMENT");
+        assert_eq!(first_boot_defaults::WIFI_SSID, "iot");
+        let cfg = first_boot_defaults::audio_config();
+        assert_eq!(cfg.player_name.as_str(), first_boot_defaults::PLAYER_NAME);
+        assert_eq!(cfg.lms_server_ip, Some(first_boot_defaults::LMS_SERVER_IP));
+        assert_eq!(cfg.lms_server_port, Some(first_boot_defaults::LMS_SERVER_PORT));
+        assert!(cfg.validate().is_ok());
     }
 }
 

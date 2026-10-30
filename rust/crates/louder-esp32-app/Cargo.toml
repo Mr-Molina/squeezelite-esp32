@@ -22,6 +22,13 @@ std-codecs = ["squeezelite-decoders/std"]
 # with an embassy executor on core 1 (heartbeat task only; the audio tasks stay on core 0 until
 # the S1 owner gate validates core-1 bring-up on hardware). Both paths must compile.
 esp-rtos-core1 = []
+# Task 10, default OFF. Off: settings changes are debounced into the RAM journal and reach flash
+# only on the certified pre-reboot path (WO-109: runtime flash I/O deadlocked this board). On: the
+# `config_writer` task also commits the journal to flash at runtime, hazard-gated (not while
+# audio plays, APP_CPU parked, no flash reads, DRAM-only buffers, ping-pong sectors); rules in
+# `tasks.rs` `runtime_flash_commit`. Requires the manual core-1 path (not `esp-rtos-core1`).
+# Not hardware-certified: owner gate = power-cycle soak with settings churn idle + playing.
+runtime-flash-persist = []
 
 [dependencies]
 squeezelite-proto = { path = "../squeezelite-proto" }
@@ -41,6 +48,9 @@ log = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "xtensa"))'.dependencies]
 squeezelite-decoders = { path = "../squeezelite-decoders", features = ["std"] }
+# `ConfigHandle` (Task 10) locks an embassy-sync `CriticalSectionRawMutex`; host builds (the demo
+# binary, not only tests) need a `critical-section` implementation. esp-hal provides it on device.
+critical-section = { version = "1.2", features = ["std"] }
 
 [target.'cfg(target_arch = "xtensa")'.dependencies]
 esp-alloc = { version = "0.11.0", features = ["esp32", "internal-heap-stats"] }

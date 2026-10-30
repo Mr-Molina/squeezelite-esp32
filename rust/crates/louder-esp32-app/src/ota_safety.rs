@@ -1,6 +1,6 @@
 //! Pure-Rust Anti-Brick OTA Safety, NVS Wi-Fi Credential Decryptor, and `ota_header_check` Verifier.
 //!
-//! Enforces the 4MB flash invariants for target `172.22.1.15` (`"BASEMENT"`):
+//! Enforces the 4MB flash invariants for the deployed target (`172.22.1.15`):
 //! - `0x9000` (`0x4000`): `nvs` partition storing `"config"` -> `"ssid"` / `"password"` (`"enc:"` XOR)
 //! - `0xD000` (`0x2000`): `otadata` partition (`0xFF` = boot `recovery` factory partition at `0x10000`)
 //! - `0x10000` (`0x150000`): `recovery` (`factory` partition — NEVER modified by OTA)
@@ -715,7 +715,7 @@ mod tests {
     use super::*;
     use core::fmt::Write;
 
-    const BASEMENT_MAC: [u8; 6] = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
+    const FIXTURE_STA_MAC: [u8; 6] = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
 
     fn encrypt_for_test(plaintext: &str, sta_mac: &[u8; 6]) -> String<128> {
         let key = derive_wifi_nvs_key(sta_mac);
@@ -804,13 +804,13 @@ mod tests {
     #[test]
     fn decrypts_encrypted_and_plaintext_nvs_passwords_with_basement_mac() {
         let secret = "MyBasementIoTPass!2026";
-        let encrypted = encrypt_for_test(secret, &BASEMENT_MAC);
+        let encrypted = encrypt_for_test(secret, &FIXTURE_STA_MAC);
         assert!(encrypted.as_str().starts_with("enc:"));
 
-        let decrypted = decrypt_nvs_wifi_password(encrypted.as_str(), &BASEMENT_MAC).unwrap();
+        let decrypted = decrypt_nvs_wifi_password(encrypted.as_str(), &FIXTURE_STA_MAC).unwrap();
         assert_eq!(decrypted.as_str(), secret);
 
-        let plain = decrypt_nvs_wifi_password("PlainPass123\0", &BASEMENT_MAC).unwrap();
+        let plain = decrypt_nvs_wifi_password("PlainPass123\0", &FIXTURE_STA_MAC).unwrap();
         assert_eq!(plain.as_str(), "PlainPass123");
     }
 
@@ -829,7 +829,7 @@ mod tests {
             b"iot\0",
         );
 
-        let enc_pass = encrypt_for_test("SqueezeRustWiFi99", &BASEMENT_MAC);
+        let enc_pass = encrypt_for_test("SqueezeRustWiFi99", &FIXTURE_STA_MAC);
         let _span2 = write_nvs_blob_entry(
             &mut nvs[0..NVS_PAGE_SIZE],
             1 + span1,
@@ -839,7 +839,7 @@ mod tests {
             enc_pass.as_bytes(),
         );
 
-        let creds = parse_nvs_wifi_credentials(&nvs, &BASEMENT_MAC).unwrap();
+        let creds = parse_nvs_wifi_credentials(&nvs, &FIXTURE_STA_MAC).unwrap();
         assert_eq!(creds.ssid.as_str(), "iot");
         assert_eq!(creds.password.as_str(), "SqueezeRustWiFi99");
     }
@@ -850,7 +850,7 @@ mod tests {
         nvs[0..4].copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
 
         write_nvs_namespace_entry(&mut nvs, 0, "aplist", 2);
-        let enc_pass = encrypt_for_test("FallbackPass42", &BASEMENT_MAC);
+        let enc_pass = encrypt_for_test("FallbackPass42", &FIXTURE_STA_MAC);
         let mut json: String<192> = String::new();
         let _ = write!(
             json,
@@ -859,7 +859,7 @@ mod tests {
         );
         write_nvs_blob_entry(&mut nvs, 1, 2, NVS_TYPE_BLOB, "iot", json.as_bytes());
 
-        let creds = parse_nvs_wifi_credentials(&nvs, &BASEMENT_MAC).unwrap();
+        let creds = parse_nvs_wifi_credentials(&nvs, &FIXTURE_STA_MAC).unwrap();
         assert_eq!(creds.ssid.as_str(), "iot");
         assert_eq!(creds.password.as_str(), "FallbackPass42");
     }
@@ -932,7 +932,7 @@ mod tests {
             "ssid",
             b"iot\0",
         );
-        let enc_pass = encrypt_for_test("Page3SecretPass2026!", &BASEMENT_MAC);
+        let enc_pass = encrypt_for_test("Page3SecretPass2026!", &FIXTURE_STA_MAC);
         let _span2 = write_nvs_blob_entry(
             &mut full_nvs[page3_start..page3_start + NVS_PAGE_SIZE],
             span1,
@@ -948,7 +948,7 @@ mod tests {
                 let rel = (offset - NVS_PARTITION_OFFSET) as usize;
                 buf.copy_from_slice(&full_nvs[rel..rel + buf.len()]);
             },
-            &BASEMENT_MAC,
+            &FIXTURE_STA_MAC,
             &mut nvs_buf,
             None,
             None,
@@ -1008,7 +1008,7 @@ mod tests {
                 let rel = (offset - NVS_PARTITION_OFFSET) as usize;
                 buf.copy_from_slice(&full_nvs[rel..rel + buf.len()]);
             },
-            &BASEMENT_MAC,
+            &FIXTURE_STA_MAC,
             &mut nvs_buf,
             None,
             None,

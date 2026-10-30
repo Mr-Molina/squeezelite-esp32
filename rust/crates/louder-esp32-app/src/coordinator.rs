@@ -27,6 +27,7 @@ use squeezelite_proto::{
 };
 
 use crate::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
+use crate::config_handle::ConfigHandle;
 use crate::io_traits::{
     AudioBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
@@ -120,6 +121,9 @@ pub struct PlayerCoordinator {
     /// evaluates the play state and never decodes or writes to the sink itself. `false`
     /// (default, host): `tick` runs one decode + output step.
     pub external_audio_pump: bool,
+    /// Runtime configuration the player name is persisted through (spec §3.4: `setd` id-0
+    /// writes persist the name). `None` (host default): the name only lives in this struct.
+    pub config: Option<&'static ConfigHandle>,
     stream: StreamLink,
     pending_cyd: Option<CydMessage>,
     last_tick_frames: usize,
@@ -167,6 +171,7 @@ impl PlayerCoordinator {
             stream_eof: false,
             lms_ip: [127, 0, 0, 1],
             external_audio_pump: false,
+            config: None,
             stream: StreamLink::Idle,
             pending_cyd: None,
             last_tick_frames: 0,
@@ -947,8 +952,7 @@ impl PlayerCoordinator {
                 let bytes = sample_rate.to_be_bytes();
                 if bytes[0] == 0 && bytes[1..].iter().all(|&b| (0x20..=0x7E).contains(&b)) {
                     if let Ok(name) = core::str::from_utf8(&bytes[1..]) {
-                        self.player_name.clear();
-                        let _ = self.player_name.push_str(name);
+                        self.set_player_name(name);
                     }
                     send_setd_name(transport, &self.player_name)?;
                     return Ok(None);
@@ -1003,8 +1007,7 @@ impl PlayerCoordinator {
                         let data = setting.data.split(|&b| b == 0).next().unwrap_or(&[]);
                         if !data.is_empty() {
                             if let Ok(name) = core::str::from_utf8(data) {
-                                self.player_name.clear();
-                                let _ = self.player_name.push_str(name);
+                                self.set_player_name(name);
                             }
                         }
                         send_setd_name(transport, &self.player_name)?;
@@ -1014,6 +1017,18 @@ impl PlayerCoordinator {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// A `setd` id-0 name change (already cut at its first NUL): announced name, and persisted
+    /// through [`Self::config`] (the journal keeps at most 32 bytes, cut on a `char` boundary).
+    fn set_player_name(&mut self, name: &str) {
+        self.player_name.clear();
+        let _ = self.player_name.push_str(name);
+        if let Some(config) = self.config {
+            config.update(|c| {
+                c.set_player_name(name);
+            });
         }
     }
 
@@ -2749,6 +2764,38 @@ mod tests {
         // A name that is empty before its NUL keeps the current name.
         rig.command(&mut pipeline, &server_frame(b"setd", b"\x00\x00"), 20);
         assert_eq!(rig.coord.player_name.as_str(), "Kitchen");
+    }
+
+    #[test]
+    fn test_setd_name_change_persists_trimmed_name_through_config_handle() {
+        use crate::config_handle::ConfigHandle;
+        let config: &'static ConfigHandle =
+            Box::leak(Box::new(ConfigHandle::new(squeezelite_config::AudioConfig::default())));
+        let mut rig = Rig::new([16; 6], "T");
+        rig.coord.config = Some(config);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // id-0 set: the NUL-trimmed name reaches the handle and marks it dirty.
+        rig.command(&mut pipeline, &server_frame(b"setd", b"\x00Kitchen\x00\x00junk"), 10);
+        assert_eq!(config.read(|c| c.player_name.clone()).as_str(), "Kitchen");
+        assert!(config.is_dirty());
+        assert!(config.snapshot_if_dirty().is_some());
+        config.mark_clean();
+
+        // id-0 query: replies, persists nothing.
+        rig.command(&mut pipeline, &server_frame(b"setd", &[0x00]), 20);
+        assert!(!config.is_dirty());
+        // The same name again is not a change.
+        rig.command(&mut pipeline, &server_frame(b"setd", b"\x00Kitchen"), 30);
+        assert!(!config.is_dirty());
+
+        // The 4-byte (`SetDevice`) name form persists too.
+        rig.command(&mut pipeline, &server_frame(b"setd", &[0x00, b'B', b'o', b'b']), 40);
+        assert_eq!(rig.coord.player_name.as_str(), "Bob");
+        assert_eq!(config.read(|c| c.player_name.clone()).as_str(), "Bob");
+        assert!(config.is_dirty());
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod backend_device;
 pub mod board;
 pub mod bt_a2dp;
 pub mod clock_table;
+pub mod config_handle;
 pub mod coordinator;
 pub mod cyd;
 pub mod hal;

@@ -17,13 +17,13 @@
 //! | `watchdog_lease`    | WDT feed + lap timestamp, Gate 3 network lease, 2 s amp fault/telemetry     |
 //! | `bt_a2dp`           | lazy BT controller bring-up, A2DP sink poll (feeds the pipeline when idle)  |
 //! | `net_stack`         | Wi-Fi STA connect drive, smoltcp poll + DHCPv4 events                       |
-//! | `http_control`      | Gate 4 port-80 server + deferred reboot actions, settings persistence       |
+//! | `http_control`      | Gate 4 port-80 server + deferred reboot actions (settings flushed first)    |
 //! | `slimproto_session` | LMS control socket: connect, `HELO`/`SETD` (`hello`), `coordinator.tick`    |
 //! |                     | (protocol + play state only; never decodes: `external_audio_pump`)         |
 //! | `cyd_bridge`        | CYD command poll, 1 s progress update                                      |
 //! | `decode_pump`       | `coordinator.pump_decode` (one frame, or a short resync burst)             |
 //! | `i2s_feed`          | `coordinator.pump_output` before/after decoding, DAC gate, silence pump    |
-//! | `config_writer`     | stub (Task 10 adds debounced persistence)                                  |
+//! | `config_writer`     | debounced persistence (2 s quiet), RAM journal; flash: see "Settings"      |
 //!
 //! The HTTP audio fetch (spec's `audio_fetch` task) is step 3 of `coordinator.tick`, so it runs
 //! inside `slimproto_session`; the separate task is gone until the network/audio split.
@@ -49,6 +49,21 @@
 //!   registers, `CpuControl::start_app_core` running the IRAM NOP heartbeat loop);
 //! - feature `esp-rtos-core1`: `esp_rtos::start_second_core` running an embassy executor whose
 //!   only task is `core1_heartbeat`.
+//!
+//! # Settings persistence (Task 10, spec §3.5)
+//!
+//! Every runtime change (`setd` name in the coordinator, `/cmd.json` EQ/AGAIN/volume, LMS
+//! `audg` volume, CYD volume) goes through the [`ConfigHandle`]. `config_writer` polls it every
+//! `CONFIG_WRITER_POLL_MS` (100 ms) and, once a change has been quiet for `DEBOUNCE_MS` (2 s),
+//! serializes the snapshot into the RAM journal (DRAM sector image + next sequence, ping-pong
+//! target sector tracked in RAM since the boot load). Flash is written:
+//! - default build: ONLY on the reboot paths (`/recovery.json`, `/reboot.json`,
+//!   `/reboot_ota.json`), by `flush_settings_before_reboot` -- `flush_now`, then the certified
+//!   pre-reboot write with APP_CPU parked. No flash I/O at runtime (WO-108/WO-109 deadlock);
+//! - feature `runtime-flash-persist` (default OFF): additionally at runtime, hazard-gated, in
+//!   `runtime_flash_commit` (rules documented there).
+//!
+//! [`ConfigHandle`]: louder_esp32_app::config_handle::ConfigHandle
 //!
 //! # Memory
 //!
@@ -113,7 +128,7 @@ pub static CTRL: Channel<CriticalSectionRawMutex, CoordinatorCmd, CHANNEL_DEPTH>
 #[allow(dead_code)]
 pub static EVT: Channel<CriticalSectionRawMutex, AudioEvent, CHANNEL_DEPTH> = Channel::new();
 
-/// Members of the core-0 phase ring (every spec §3.1 task except the `config_writer` stub).
+/// Members of the core-0 phase ring (every spec §3.1 task except the timer-driven `config_writer`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingTask {
     WatchdogLease,
@@ -214,11 +229,11 @@ pub(crate) use device::run_core1_executor;
 mod device {
     use super::{Phase, RingTask, PHASE_ORDER};
     use crate::xtensa_hw::{
-        now_millis, persist_audio_config, Core1Ctl, DeviceClockRegs, Esp32I2cBus,
+        now_millis, Core1Ctl, DeviceClockRegs, Esp32I2cBus,
         Esp32Uart2Port, Esp32VhciTransport, HwStreamPipeline, SmolDevice, CORE1_HEARTBEAT,
         DMA_OUTSTANDING_FRAMES,
     };
-    use crate::BASEMENT_HELO_CAPABILITIES;
+    use crate::HELO_CAPABILITIES;
     use core::cell::RefCell;
     use core::future::Future;
     use core::pin::pin;
@@ -233,7 +248,7 @@ mod device {
     use esp_storage::FlashStorage;
     use louder_esp32_app::amp::percent_to_attenuation;
     use louder_esp32_app::backend_device::Esp32AudioBackend;
-    use louder_esp32_app::board::{DEFAULT_LMS_SERVER_IP, DEFAULT_LMS_SERVER_PORT};
+    use louder_esp32_app::config_handle::{ConfigHandle, ConfigWriter, RamJournal};
     use louder_esp32_app::bt_a2dp::BtA2dpSink;
     use louder_esp32_app::http_control::{
         handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
@@ -252,7 +267,6 @@ mod device {
     use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
     use squeezelite_audio_core::EqPreset;
-    use squeezelite_config::AudioConfig;
     use squeezelite_cyd_link::CydMessage;
     use squeezelite_decoders::PcmDecoder;
     use squeezelite_proto::SlimprotoBuilder;
@@ -295,13 +309,17 @@ mod device {
         pub(crate) slim_link: SlimLinkState,
         pub(crate) stream_state: HttpStreamState,
         // --- static buffers ---
-        pub(crate) settings_scratch: &'static mut [u8; 4096],
         pub(crate) http_resp_buf: &'static mut [u8; 1536],
-        // --- boot configuration ---
-        pub(crate) wifi_sta_creds: WifiStaCredentials,
-        pub(crate) audio_cfg: AudioConfig,
-        pub(crate) settings_seq: u32,
-        pub(crate) settings_dirty: bool,
+        // --- configuration (Task 10) ---
+        /// Runtime configuration every settings change goes through.
+        pub(crate) config: &'static ConfigHandle,
+        /// RAM settings journal (DRAM image + ping-pong target/sequence from the boot load).
+        pub(crate) journal: &'static mut RamJournal<'static>,
+        /// Boot-resolved Wi-Fi credentials (journal, else NVS, else first-boot default).
+        pub(crate) wifi_sta_creds: &'static WifiStaCredentials,
+        /// Boot-resolved LMS SlimProto target (journal, else first-boot default).
+        pub(crate) lms_ip: [u8; 4],
+        pub(crate) lms_port: u16,
         pub(crate) current_vol_pct: u8,
         // --- loop variables ---
         pub(crate) local_port_counter: u16,
@@ -425,11 +443,108 @@ mod device {
         run_ring(RingTask::I2sFeed, shared).await
     }
 
-    /// Debounced config persistence (spec §3.5). Stub until Task 10: today settings are still
-    /// journaled into `settings_scratch` inline and written to flash only before a reboot.
+    /// Poll period of `config_writer`: a change is journaled between `DEBOUNCE_MS` and
+    /// `DEBOUNCE_MS + CONFIG_WRITER_POLL_MS` after the last update.
+    pub(crate) const CONFIG_WRITER_POLL_MS: u64 = 100;
+
+    /// Core 0: debounced config persistence (spec §3.5, module docs "Settings persistence").
+    /// Not a ring member: it wakes on its own timer and borrows the shared state only between
+    /// ring hand-offs (no ring block holds the borrow across an `.await`).
     #[embassy_executor::task]
-    async fn config_writer() {
-        core::future::pending::<()>().await
+    async fn config_writer(shared: &'static Shared) -> ! {
+        let mut writer = ConfigWriter::new(shared.0.borrow().config, now_millis());
+        #[cfg(feature = "runtime-flash-persist")]
+        let mut flash_retry_at_ms = 0u64;
+        loop {
+            embassy_time::Timer::after_millis(CONFIG_WRITER_POLL_MS).await;
+            let Ok(mut s) = shared.0.try_borrow_mut() else {
+                continue;
+            };
+            config_writer_step(&mut s, &mut writer);
+            #[cfg(feature = "runtime-flash-persist")]
+            runtime_flash_commit(&mut s, &mut flash_retry_at_ms);
+        }
+    }
+
+    /// `config_writer`: one debounce step; a quiet dirty config is serialized into the RAM
+    /// journal (never flash).
+    #[inline(never)]
+    fn config_writer_step(s: &mut FirmwareState, writer: &mut ConfigWriter) {
+        writer.poll(s.config, &mut *s.journal, now_millis());
+    }
+
+    /// Feature `runtime-flash-persist` (default OFF): commit the RAM journal to flash at runtime.
+    ///
+    /// HAZARD (WO-108 / WO-109, hardware-proven deadlock on this board): esp-storage 0.10.0's
+    /// `FlashStorage::read_nor` calls `spiflash_read` WITHOUT parking APP_CPU, and
+    /// `spiflash_erase_sector` masks interrupts for 45-80 ms and reconfigures SPI1 without
+    /// disabling the SPI0 cache, while 4 MB PSRAM, XIP `.text` and esp-radio Wi-Fi interrupts are
+    /// live. The default build therefore never touches flash at runtime (the RAM journal reaches
+    /// flash only on the certified pre-reboot path). This gate allows a runtime commit only under
+    /// ALL of these rules:
+    /// 1. never while audio plays: the player is neither `Playing` nor `Buffering` and no
+    ///    Bluetooth stream is active;
+    /// 2. APP_CPU is parked through the certified `Core1Ctl::park_for_flash_write` for the whole
+    ///    erase + write, and unparked after (manual core-1 path only: `main.rs` refuses to build
+    ///    this feature with `esp-rtos-core1`);
+    /// 3. NO flash read: `erase` + `write_nor` only (no `read_nor`, no read-modify-write
+    ///    `FlashStorage::write`). The target sector and sequence come from the RAM journal, which
+    ///    carries them from the boot-time load;
+    /// 4. DRAM-only buffers: `write_nor` writes straight from the word-aligned RAM journal image
+    ///    in `.dram2_uninit` (no bounce buffer, nothing in PSRAM);
+    /// 5. dual-sector ping-pong at 0x3FE000 / 0x3FF000 with the FlashJournal sequence logic: the
+    ///    target is never the sector holding the newest valid journal, so power loss mid-write
+    ///    leaves the previous journal intact;
+    /// 6. a failed erase/write is retried after 60 s, never in a loop.
+    ///
+    /// Not hardware-certified: power-cycle persistence with this feature is an OWNER GATE (enable
+    /// it, then soak with settings changes during idle and during playback).
+    #[cfg(feature = "runtime-flash-persist")]
+    #[inline(never)]
+    fn runtime_flash_commit(s: &mut FirmwareState, retry_at_ms: &mut u64) {
+        const RETRY_MS: u64 = 60_000;
+        let now_ms = now_millis();
+        if now_ms < *retry_at_ms
+            || matches!(s.coordinator.state, PlayerState::Playing | PlayerState::Buffering)
+            || s.bt_audio_active
+        {
+            return;
+        }
+        let FirmwareState {
+            ref mut flash,
+            ref mut core1,
+            ref mut journal,
+            ..
+        } = *s;
+        let Some(image) = journal.pending_image() else {
+            return;
+        };
+        let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
+        let end = offset + louder_esp32_app::config_handle::JOURNAL_SECTOR_SIZE as u32;
+        core1.park_for_flash_write();
+        let written = flash.erase(offset, end).is_ok()
+            && flash.write_nor(offset, &image.sector[..image.used_len]).is_ok();
+        core1.unpark_after_flash_write();
+        if written {
+            journal.mark_flash_written();
+        } else {
+            *retry_at_ms = now_ms + RETRY_MS;
+        }
+    }
+
+    /// Before every reboot action: journal any pending change into RAM now (`flush_now`, no
+    /// debounce), then write the RAM journal to its ping-pong sector with the certified
+    /// pre-reboot sequence: APP_CPU parked first, DRAM buffer, sector erase + write. In the
+    /// default build this is the ONLY settings flash write (WO-109).
+    #[inline(never)]
+    fn flush_settings_before_reboot(s: &mut FirmwareState) {
+        s.config.flush_now(&mut *s.journal);
+        if let Some(image) = s.journal.pending_image() {
+            let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
+            s.core1.park_for_flash_write();
+            let _ = s.flash.erase(offset, offset + 4096);
+            let _ = s.flash.write(offset, image.sector);
+        }
     }
 
     /// Spawns the core-0 tasks, hands the baton to the first phase and runs the executor.
@@ -446,7 +561,7 @@ mod device {
             // Core-0 placement of the audio tasks: see "Core placement" in the module docs.
             spawner.spawn(decode_pump(shared).unwrap());
             spawner.spawn(i2s_feed(shared).unwrap());
-            spawner.spawn(config_writer().unwrap());
+            spawner.spawn(config_writer(shared).unwrap());
             let first = PHASE_ORDER[0];
             TURN[first.owner().index()].signal(first);
         })
@@ -864,7 +979,7 @@ mod device {
                         gw: s.assigned_gw,
                         ssid: s.wifi_sta_creds.ssid.as_str(),
                         rssi: s.wifi_controller.rssi().unwrap_or(-50),
-                        lms_ip: DEFAULT_LMS_SERVER_IP,
+                        lms_ip: s.lms_ip,
                         lms_port: 9000,
                         lms_cport: 9090,
                         otadata_prearmed_factory: true,
@@ -873,6 +988,7 @@ mod device {
                         vol_pct: s.current_vol_pct,
                         i2c_acks: Esp32I2cBus::hw_ack_count(),
                         i2c_nacks: Esp32I2cBus::hw_nack_count(),
+                        i2c_nack_by_op: Esp32I2cBus::hw_nack_by_op(),
                         uptime_ms: now_ms.saturating_sub(s.boot_ms),
                         psram_free_bytes,
                         psram_used_bytes,
@@ -889,7 +1005,7 @@ mod device {
                         tas_pll_locked,
                         tas_automuted,
                         again_code: s.amp.analog_gain_code(),
-                        settings_seq: s.settings_seq,
+                        settings_seq: s.journal.sequence(),
                         bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
                         bt_connected: s.bt_sink.is_connected(),
                         bt_streaming: s.bt_sink.is_streaming(),
@@ -920,17 +1036,11 @@ mod device {
                             HttpControlAction::SetEqPreset(preset_id) => {
                                 let preset = EqPreset::from_u8(preset_id);
                                 s.pipeline.apply_eq_preset(preset);
-                                s.audio_cfg.equalizer_preset = preset_id;
-                                if persist_audio_config(s.settings_scratch, &s.audio_cfg, &mut s.settings_seq) {
-                                    s.settings_dirty = true;
-                                }
+                                s.config.update(|c| c.equalizer_preset = preset_id);
                             }
                             HttpControlAction::SetAnalogGain(again_code) => {
                                 let _ = s.amp.set_analog_gain(again_code);
-                                s.audio_cfg.analog_gain_code = again_code;
-                                if persist_audio_config(s.settings_scratch, &s.audio_cfg, &mut s.settings_seq) {
-                                    s.settings_dirty = true;
-                                }
+                                s.config.update(|c| c.analog_gain_code = again_code);
                             }
                             HttpControlAction::PlayerIrCommand { ir_code, vol_pct, mute } => {
                                 if let Some(pct) = vol_pct {
@@ -940,10 +1050,7 @@ mod device {
                                     let eff_gain = if pct > 0 { 65536 } else { 0 };
                                     s.pipeline.set_volume(eff_gain, eff_gain);
                                     let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
-                                    s.audio_cfg.volume = pct;
-                                    if persist_audio_config(s.settings_scratch, &s.audio_cfg, &mut s.settings_seq) {
-                                        s.settings_dirty = true;
-                                    }
+                                    s.config.update(|c| c.volume = pct);
                                 }
                                 if let Some(m) = mute {
                                     // User mute: survives the next output write.
@@ -980,11 +1087,7 @@ mod device {
 
         // Execute deferred HTTP reboot action after flushing TCP response
         if s.pending_http_action != HttpControlAction::None && now_ms >= s.pending_action_deadline_ms {
-            if s.settings_dirty {
-                s.core1.park_for_flash_write();
-                let _ = s.flash.erase(SETTINGS_JOURNAL_OFFSET, SETTINGS_JOURNAL_OFFSET + 4096);
-                let _ = s.flash.write(SETTINGS_JOURNAL_OFFSET, s.settings_scratch);
-            }
+            flush_settings_before_reboot(s);
             match s.pending_http_action {
                 HttpControlAction::RebootToRecovery => {
                     println!("[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json -> resetting into factory recovery (0x10000)");
@@ -1038,10 +1141,7 @@ mod device {
                 s.last_slim_connect_ms = now_ms;
                 s.helo_sent = false;
                 s.slim_link.reset();
-                let remote_ep = (
-                    IpAddress::Ipv4(Ipv4Address::from(DEFAULT_LMS_SERVER_IP)),
-                    DEFAULT_LMS_SERVER_PORT,
-                );
+                let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(s.lms_ip)), s.lms_port);
                 let local_ep = (
                     IpAddress::Ipv4(Ipv4Address::from(local_ip)),
                     next_local_port(&mut s.local_port_counter),
@@ -1057,7 +1157,7 @@ mod device {
     /// audio fetch, play-state evaluation, deferred `STAT`/`RESP`/`META`/`DSCO` and the
     /// heartbeat. It never decodes or writes to the sink (`external_audio_pump`, set at
     /// bring-up): the pump phases own that, DMA first. The tick also runs while the control
-    /// link is down, so the stream keeps being fetched. A server volume change (`audg`) is mirrored to the CYD and the settings journal.
+    /// link is down, so the stream keeps being fetched. A server volume change (`audg`) is mirrored to the CYD and the [`ConfigHandle`] (debounced into the journal).
     #[inline(never)]
     fn slim_tick(s: &mut FirmwareState, local_ip: [u8; 4]) {
         let now_ms = s.now_ms as u32;
@@ -1075,10 +1175,7 @@ mod device {
             ref mut local_port_counter,
             ref mut helo_sent,
             ref mut current_vol_pct,
-            ref mut audio_cfg,
-            ref mut settings_scratch,
-            ref mut settings_seq,
-            ref mut settings_dirty,
+            config,
             ..
         } = *s;
         let Some((slim_sock, audio_sock)) =
@@ -1090,7 +1187,7 @@ mod device {
         let mut transport = SmoltcpSlimTransport::new(SmolTcp::new(slim_sock), &mut *slim_link);
         if transport.connected() && !*helo_sent {
             *helo_sent = coordinator
-                .hello(&mut transport, HELO_DEVICE_ID, BASEMENT_HELO_CAPABILITIES, now_ms)
+                .hello(&mut transport, HELO_DEVICE_ID, HELO_CAPABILITIES, now_ms)
                 .is_ok();
             if !*helo_sent {
                 // Never let a `STAT` reach LMS before the `HELO`: retry next lap.
@@ -1112,10 +1209,7 @@ mod device {
         if let Some(msg) = coordinator.take_cyd_message() {
             if let CydMessage::Volume(pct) = msg {
                 *current_vol_pct = pct;
-                audio_cfg.volume = pct;
-                if persist_audio_config(settings_scratch, audio_cfg, settings_seq) {
-                    *settings_dirty = true;
-                }
+                config.update(|c| c.volume = pct);
             }
             let _ = cyd_bridge.send_message(&msg);
         }
@@ -1126,6 +1220,10 @@ mod device {
     fn cyd_command(s: &mut FirmwareState) {
         if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
             if let Some(reply) = s.coordinator.handle_cyd_command(cmd, s.pipeline) {
+                if let CydMessage::Volume(pct) = reply {
+                    // A CYD volume change marks the config dirty (spec §3.5); debounced.
+                    s.config.update(|c| c.volume = pct.min(100));
+                }
                 let _ = s.cyd_bridge.flush_outbound(&reply);
             }
         }
