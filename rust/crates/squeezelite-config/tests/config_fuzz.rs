@@ -60,6 +60,9 @@ proptest! {
         v2 in proptest::collection::vec(any::<u8>(), 0..64),
         vol in any::<u8>(),
     ) {
+        // "vol" is the fixed key this property writes last; a generated k1 equal to it would be
+        // overwritten by the volume byte and could never read back as v1.
+        prop_assume!(k1 != "vol");
         let mut store = MemConfigStore::<16>::new();
         let _ = store.set(&k1, &v1);
         let _ = store.set(&k2, &v2);
