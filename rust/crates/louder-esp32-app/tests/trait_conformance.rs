@@ -602,3 +602,508 @@ fn test_http_audio_stream_icy_metadata_over_300_bytes_untruncated() {
     assert_eq!(m.len(), 312, "whole block, only the NUL padding removed");
     assert_eq!(&m[..], &meta[..312]);
 }
+
+// ---------------------------------------------------------------------------
+// Device adapters (`net_device`) over an in-memory socket shim
+// ---------------------------------------------------------------------------
+
+use louder_esp32_app::io_traits::conformance;
+use louder_esp32_app::net_device::{
+    server_frame_len, HttpStreamState, SlimLinkState, SmoltcpSlimTransport, SmoltcpStreamSource,
+    TcpPhase, TcpSocketOps,
+};
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+
+/// How the shim server ends a response once its segments are drained.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ShimEnd {
+    /// FIN: the socket reports `PeerClosed`.
+    Fin,
+    /// RST: the socket reports `Closed`.
+    Rst,
+    /// Keep the connection open.
+    Hold,
+}
+
+/// In-memory stand-in for a smoltcp TCP socket plus the HTTP server behind it.
+///
+/// * `connect` puts the socket in `Connecting` for `connect_polls` `phase()` calls, then
+///   `Established` (or `Closed` when `refuse` is set: a RST to the SYN).
+/// * Bytes sent are the request; once its head is complete the server picks the route by path
+///   (`ROUTES`, `extra` routes; anything else is a `404`) and queues its segments.
+/// * Each segment is one TCP read: `recv`/`peek` never cross a segment boundary, the next
+///   segment becomes readable once the current one is drained (HTTP mode). In `manual` mode the
+///   pushed pieces accumulate in the receive buffer, one more per socket call.
+/// * After the last segment the server ends per `end` (or the route's override).
+/// * In `manual` mode (slimproto tests) there is no server: tests push rx bytes directly.
+struct ShimSocket {
+    phase: Cell<TcpPhase>,
+    connect_polls: u32,
+    polls_left: Cell<u32>,
+    refuse: bool,
+    end: ShimEnd,
+    manual: bool,
+    extra: Vec<(Vec<u8>, Vec<Vec<u8>>, ShimEnd)>,
+    tx_cap: usize,
+    rx_cap: usize,
+    request: Vec<u8>,
+    requests: Vec<Vec<u8>>,
+    connects: Vec<NetAddr>,
+    rx: RefCell<VecDeque<u8>>,
+    pending: RefCell<VecDeque<Vec<u8>>>,
+    route_end: ShimEnd,
+    responded: bool,
+    sent: Vec<u8>,
+    queued: usize,
+}
+
+impl ShimSocket {
+    fn server() -> Self {
+        Self {
+            phase: Cell::new(TcpPhase::Closed),
+            connect_polls: 2,
+            polls_left: Cell::new(0),
+            refuse: false,
+            end: ShimEnd::Fin,
+            manual: false,
+            extra: Vec::new(),
+            tx_cap: 64,
+            rx_cap: 4096,
+            request: Vec::new(),
+            requests: Vec::new(),
+            connects: Vec::new(),
+            rx: RefCell::new(VecDeque::new()),
+            pending: RefCell::new(VecDeque::new()),
+            route_end: ShimEnd::Fin,
+            responded: false,
+            sent: Vec::new(),
+            queued: 0,
+        }
+    }
+
+    fn manual() -> Self {
+        Self {
+            manual: true,
+            phase: Cell::new(TcpPhase::Established),
+            tx_cap: 256,
+            rx_cap: 256,
+            ..Self::server()
+        }
+    }
+
+    fn route(mut self, path: &[u8], segments: &[&[u8]], end: ShimEnd) -> Self {
+        self.extra.push((path.to_vec(), segments.iter().map(|s| s.to_vec()).collect(), end));
+        self
+    }
+
+    fn push_rx(&mut self, bytes: &[u8]) {
+        self.pending.borrow_mut().push_back(bytes.to_vec());
+    }
+
+    /// Makes the next segment readable once the current one is drained; after the last one,
+    /// ends the connection as scripted.
+    fn refill(&self) {
+        let mut rx = self.rx.borrow_mut();
+        if self.manual {
+            // Like a real receive buffer: data that arrived accumulates (one piece per call).
+            if let Some(seg) = self.pending.borrow_mut().pop_front() {
+                rx.extend(seg);
+            }
+            return;
+        }
+        if rx.is_empty() {
+            if let Some(seg) = self.pending.borrow_mut().pop_front() {
+                rx.extend(seg);
+            } else if self.responded && !self.manual && self.phase.get() == TcpPhase::Established {
+                match self.route_end {
+                    ShimEnd::Fin => self.phase.set(TcpPhase::PeerClosed),
+                    ShimEnd::Rst => self.phase.set(TcpPhase::Closed),
+                    ShimEnd::Hold => {}
+                }
+            }
+        }
+    }
+
+    fn serve(&mut self) {
+        if self.manual || self.responded || !self.request.windows(4).any(|w| w == b"\r\n\r\n") {
+            return;
+        }
+        self.responded = true;
+        let line_end = self.request.iter().position(|&c| c == b'\r').unwrap();
+        let path = self.request[..line_end].split(|&c| c == b' ').nth(1).unwrap().to_vec();
+        self.requests.push(core::mem::take(&mut self.request));
+        let (segments, end): (Vec<Vec<u8>>, ShimEnd) =
+            if let Some((_, segs, end)) = self.extra.iter().find(|(p, _, _)| *p == path) {
+                (segs.clone(), *end)
+            } else if let Some((_, segs)) = ROUTES.iter().find(|(p, _)| *p == &path[..]) {
+                (segs.iter().map(|s| s.to_vec()).collect(), self.end)
+            } else {
+                (vec![b"HTTP/1.0 404 Not Found\r\n\r\n".to_vec()], self.end)
+            };
+        self.pending.borrow_mut().extend(segments);
+        self.route_end = end;
+    }
+}
+
+impl TcpSocketOps for ShimSocket {
+    fn phase(&self) -> TcpPhase {
+        if self.phase.get() == TcpPhase::Connecting {
+            if self.polls_left.get() == 0 {
+                self.phase.set(if self.refuse { TcpPhase::Closed } else { TcpPhase::Established });
+            } else {
+                self.polls_left.set(self.polls_left.get() - 1);
+            }
+        }
+        self.refill();
+        self.phase.get()
+    }
+
+    fn connect(&mut self, remote: NetAddr) -> bool {
+        self.abort();
+        self.connects.push(remote);
+        self.phase.set(TcpPhase::Connecting);
+        self.polls_left.set(self.connect_polls);
+        true
+    }
+
+    fn abort(&mut self) {
+        self.phase.set(TcpPhase::Closed);
+        self.request.clear();
+        self.rx.borrow_mut().clear();
+        self.pending.borrow_mut().clear();
+        self.responded = false;
+    }
+
+    fn send_capacity(&self) -> usize {
+        self.tx_cap
+    }
+
+    fn send_queue(&self) -> usize {
+        self.queued
+    }
+
+    fn send_slice(&mut self, data: &[u8]) -> usize {
+        if self.phase.get() != TcpPhase::Established {
+            return 0;
+        }
+        let n = data.len().min(self.tx_cap - self.queued);
+        self.request.extend_from_slice(&data[..n]);
+        self.sent.extend_from_slice(&data[..n]);
+        self.serve();
+        n
+    }
+
+    fn recv_queue(&self) -> usize {
+        self.refill();
+        self.rx.borrow().len()
+    }
+
+    fn recv_capacity(&self) -> usize {
+        self.rx_cap
+    }
+
+    fn peek_slice(&mut self, buf: &mut [u8]) -> usize {
+        self.refill();
+        let rx = self.rx.borrow();
+        let n = buf.len().min(rx.len());
+        for (dst, src) in buf.iter_mut().zip(rx.iter()) {
+            *dst = *src;
+        }
+        n
+    }
+
+    fn recv_slice(&mut self, buf: &mut [u8]) -> usize {
+        let n = self.peek_slice(buf);
+        self.rx.borrow_mut().drain(..n);
+        n
+    }
+}
+
+type DeviceSource = SmoltcpStreamSource<ShimSocket, HttpStreamState>;
+
+fn device_source(sock: ShimSocket) -> DeviceSource {
+    SmoltcpStreamSource::new(sock, HttpStreamState::new())
+}
+
+#[test]
+fn test_device_stream_source_passes_conformance() {
+    run_stream_source_conformance(|| device_source(ShimSocket::server()));
+}
+
+#[test]
+fn test_device_stream_source_conformance_over_keepalive_and_byte_writes() {
+    // The server keeps the connection open after the body (so only framing can end it) and the
+    // socket accepts a single request byte per send.
+    run_stream_source_conformance(|| {
+        let mut sock = ShimSocket::server();
+        sock.tx_cap = 1;
+        sock.connect_polls = 0;
+        device_source(sock)
+    });
+}
+
+const DEV_ADDR: NetAddr = NetAddr { ip: [10, 0, 0, 9], port: 9000 };
+
+fn dev_connect(s: &mut DeviceSource, request: &[u8]) -> Result<(), StreamError> {
+    for _ in 0..64 {
+        match s.connect(DEV_ADDR, request) {
+            Err(StreamError::WouldBlock) => {}
+            other => return other,
+        }
+    }
+    panic!("connect never resolved");
+}
+
+fn dev_read_to_end(s: &mut DeviceSource) -> Result<Vec<u8>, (Vec<u8>, StreamError)> {
+    let mut body = Vec::new();
+    let mut buf = [0u8; 16];
+    for _ in 0..512 {
+        match s.poll_bytes(&mut buf) {
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(e) => return Err((body, e)),
+        }
+        if s.is_eof() {
+            return Ok(body);
+        }
+    }
+    panic!("stream neither ended nor failed");
+}
+
+#[test]
+fn test_device_stream_connect_is_nonblocking_until_the_head_is_parsed() {
+    let mut s = device_source(ShimSocket::server());
+    assert_eq!(s.connect(DEV_ADDR, b"GET /plain HTTP/1.0\r\n\r\n"), Err(StreamError::WouldBlock));
+    assert_eq!(s.socket().connects, vec![DEV_ADDR]);
+    // Repeating the call resumes the same request (no second TCP connect).
+    dev_connect(&mut s, b"GET /plain HTTP/1.0\r\n\r\n").unwrap();
+    assert_eq!(s.socket().connects.len(), 1);
+    assert_eq!(s.socket().requests, vec![b"GET /plain HTTP/1.0\r\n\r\n".to_vec()]);
+    assert_eq!(dev_read_to_end(&mut s).unwrap(), conformance::PLAIN_BODY);
+}
+
+#[test]
+fn test_device_stream_refused_connect_is_connect_failed() {
+    let mut sock = ShimSocket::server();
+    sock.refuse = true;
+    let mut s = device_source(sock);
+    assert_eq!(dev_connect(&mut s, b"GET /plain HTTP/1.0\r\n\r\n"), Err(StreamError::ConnectFailed));
+    let mut buf = [0u8; 8];
+    assert_eq!(s.poll_bytes(&mut buf), Err(StreamError::Disconnected));
+}
+
+#[test]
+fn test_device_stream_drop_mid_chunked_body_is_disconnected_after_buffered_bytes() {
+    let sock = ShimSocket::server().route(
+        b"/t",
+        &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcd", b"ef"],
+        ShimEnd::Fin,
+    );
+    let mut s = device_source(sock);
+    dev_connect(&mut s, b"GET /t HTTP/1.1\r\n\r\n").unwrap();
+    let (body, err) = dev_read_to_end(&mut s).unwrap_err();
+    assert_eq!(body, b"abcdef", "bytes received before the drop are delivered first");
+    assert_eq!(err, StreamError::Disconnected);
+    assert!(!s.is_eof(), "an early drop is never EOF");
+}
+
+#[test]
+fn test_device_stream_short_content_length_is_disconnected() {
+    let sock = ShimSocket::server().route(
+        b"/cl",
+        &[b"HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\n0123", b"45"],
+        ShimEnd::Fin,
+    );
+    let mut s = device_source(sock);
+    dev_connect(&mut s, b"GET /cl HTTP/1.0\r\n\r\n").unwrap();
+    let (body, err) = dev_read_to_end(&mut s).unwrap_err();
+    assert_eq!((body.as_slice(), err), (&b"012345"[..], StreamError::Disconnected));
+}
+
+#[test]
+fn test_device_stream_reset_mid_close_delimited_body_is_disconnected() {
+    let sock = ShimSocket::server().route(b"/rst", &[b"HTTP/1.0 200 OK\r\n\r\nabc"], ShimEnd::Rst);
+    let mut s = device_source(sock);
+    dev_connect(&mut s, b"GET /rst HTTP/1.0\r\n\r\n").unwrap();
+    let (body, err) = dev_read_to_end(&mut s).unwrap_err();
+    assert_eq!((body.as_slice(), err), (&b"abc"[..], StreamError::Disconnected));
+}
+
+#[test]
+fn test_device_stream_content_length_reached_is_eof_without_close() {
+    let sock = ShimSocket::server().route(
+        b"/ka",
+        &[b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel", b"lo"],
+        ShimEnd::Hold,
+    );
+    let mut s = device_source(sock);
+    dev_connect(&mut s, b"GET /ka HTTP/1.1\r\n\r\n").unwrap();
+    assert_eq!(dev_read_to_end(&mut s).unwrap(), b"hello");
+    let mut buf = [0u8; 4];
+    assert_eq!(s.poll_bytes(&mut buf), Ok(0), "EOF is sticky");
+}
+
+#[test]
+fn test_device_stream_drop_during_head_is_disconnected() {
+    let sock = ShimSocket::server().route(b"/h", &[b"HTTP/1.0 200 OK\r\nConte"], ShimEnd::Fin);
+    let mut s = device_source(sock);
+    assert_eq!(dev_connect(&mut s, b"GET /h HTTP/1.0\r\n\r\n"), Err(StreamError::Disconnected));
+}
+
+#[test]
+fn test_device_stream_abort_errors_until_reconnect() {
+    let mut s = device_source(ShimSocket::server());
+    dev_connect(&mut s, b"GET /plain HTTP/1.0\r\n\r\n").unwrap();
+    let mut buf = [0u8; 8];
+    assert!(s.poll_bytes(&mut buf).unwrap() > 0);
+    s.abort();
+    for _ in 0..3 {
+        assert_eq!(s.poll_bytes(&mut buf), Err(StreamError::Disconnected));
+        assert!(!s.is_eof());
+    }
+    assert!(s.take_response_headers().is_none());
+    dev_connect(&mut s, b"GET /plain HTTP/1.0\r\n\r\n").unwrap();
+    assert_eq!(dev_read_to_end(&mut s).unwrap(), conformance::PLAIN_BODY);
+}
+
+#[test]
+fn test_device_stream_redirects_rewrite_request_and_follow_absolute_ipv4() {
+    let sock = ShimSocket::server()
+        .route(b"/abs", &[b"HTTP/1.0 302 Found\r\nLocation: http://10.0.0.7:8000/plain\r\n\r\n"], ShimEnd::Fin)
+        .route(b"/host", &[b"HTTP/1.0 302 Found\r\nLocation: http://lms.local/plain\r\n\r\n"], ShimEnd::Fin);
+    let mut s = device_source(sock);
+    dev_connect(&mut s, b"GET /r1 HTTP/1.0\r\nHost: 10.0.0.9:9000\r\nIcy-MetaData: 1\r\n\r\n").unwrap();
+    assert_eq!(
+        s.socket().requests.last().unwrap(),
+        b"GET /plain HTTP/1.0\r\nHost: 10.0.0.9:9000\r\nIcy-MetaData: 1\r\n\r\n"
+    );
+    assert_eq!(s.socket().connects, vec![DEV_ADDR, DEV_ADDR], "same-origin hop reconnects");
+
+    dev_connect(&mut s, b"GET /abs HTTP/1.0\r\n\r\n").unwrap();
+    assert_eq!(*s.socket().connects.last().unwrap(), NetAddr { ip: [10, 0, 0, 7], port: 8000 });
+    assert_eq!(s.socket().requests.last().unwrap(), b"GET /plain HTTP/1.0\r\nHost: 10.0.0.7:8000\r\n\r\n");
+    assert_eq!(dev_read_to_end(&mut s).unwrap(), conformance::PLAIN_BODY);
+
+    // No resolver on the device: a host-name Location cannot be followed.
+    assert_eq!(dev_connect(&mut s, b"GET /host HTTP/1.0\r\n\r\n"), Err(StreamError::ConnectFailed));
+}
+
+#[test]
+fn test_device_stream_side_data_by_callback_and_head_cap() {
+    let mut s = device_source(ShimSocket::server());
+    dev_connect(&mut s, b"GET /icy HTTP/1.0\r\n\r\n").unwrap();
+    let mut head = Vec::new();
+    assert!(s.take_response_headers_with(&mut |h| head.extend_from_slice(h)));
+    assert!(head.starts_with(b"HTTP/1.0 200 OK") && head.ends_with(b"\r\n\r\n"));
+    assert!(!s.take_response_headers_with(&mut |_| panic!("taken once")));
+    s.set_icy_metaint(conformance::ICY_METAINT);
+    let mut meta = Vec::new();
+    let mut buf = [0u8; 64];
+    while !s.is_eof() {
+        s.poll_bytes(&mut buf).unwrap();
+        s.take_icy_metadata_with(&mut |m| meta.extend_from_slice(m));
+    }
+    assert_eq!(meta, conformance::ICY_META);
+
+    // A head over MAX_RESPONSE_HEAD is a bad response.
+    let big: &'static [u8] = Box::leak(
+        [b"HTTP/1.0 200 OK\r\n".as_slice(), &[b'x'; MAX_RESPONSE_HEAD]].concat().into_boxed_slice(),
+    );
+    let mut s = device_source(ShimSocket::server().route(b"/big", &[big], ShimEnd::Hold));
+    assert_eq!(dev_connect(&mut s, b"GET /big HTTP/1.0\r\n\r\n"), Err(StreamError::BadResponse));
+}
+
+fn slim_frame(opcode: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    // Server -> client framing: 2-byte big-endian length (opcode + payload), opcode, payload.
+    let mut f = ((payload.len() + 4) as u16).to_be_bytes().to_vec();
+    f.extend_from_slice(opcode);
+    f.extend_from_slice(payload);
+    f
+}
+
+type DeviceSlim = SmoltcpSlimTransport<ShimSocket, SlimLinkState>;
+
+fn device_slim() -> DeviceSlim {
+    SmoltcpSlimTransport::new(ShimSocket::manual(), SlimLinkState::new())
+}
+
+#[test]
+fn test_device_slim_transport_frames_split_and_coalesced() {
+    let mut t = device_slim();
+    let a = slim_frame(b"strm", &[b't'; 24]);
+    let b = slim_frame(b"audg", &[0; 18]);
+    let mut both = a.clone();
+    both.extend_from_slice(&b);
+    // Split: header across two reads, payload across a third.
+    t.socket_mut().push_rx(&a[..3]);
+    t.socket_mut().push_rx(&a[3..10]);
+    t.socket_mut().push_rx(&a[10..]);
+    // Coalesced: two frames in one read.
+    t.socket_mut().push_rx(&both);
+    let mut buf = [0u8; 2048];
+    let mut got = Vec::new();
+    for _ in 0..16 {
+        if let Some(n) = t.poll_frame(&mut buf).unwrap() {
+            got.push(buf[..n].to_vec());
+        }
+    }
+    assert_eq!(got, vec![a.clone(), a, b]);
+    assert_eq!(t.poll_frame(&mut buf), Ok(None));
+    assert_eq!(server_frame_len(&got[2]), Ok(got[2].len()));
+}
+
+#[test]
+fn test_device_slim_transport_oversized_frame_dropped_then_recovers() {
+    let mut t = device_slim();
+    let big = slim_frame(b"strm", &[7u8; 600]);
+    let next = slim_frame(b"audg", &[1; 18]);
+    t.socket_mut().push_rx(&big[..200]);
+    t.socket_mut().push_rx(&big[200..]);
+    t.socket_mut().push_rx(&next);
+    let mut small = [0u8; 64];
+    assert_eq!(t.poll_frame(&mut small), Err(TransportError::Io), "too big for the caller");
+    let mut got = None;
+    for _ in 0..8 {
+        if let Some(n) = t.poll_frame(&mut small).unwrap() {
+            got = Some(small[..n].to_vec());
+            break;
+        }
+    }
+    assert_eq!(got.unwrap(), next, "the stream resynchronises on the next frame");
+
+    // A frame larger than the socket's receive buffer can never complete: dropped too.
+    let mut t = device_slim();
+    let huge = slim_frame(b"strm", &[7u8; 1000]);
+    t.socket_mut().push_rx(&huge[..256]);
+    let mut buf = [0u8; 2048];
+    assert_eq!(t.poll_frame(&mut buf), Err(TransportError::Io));
+}
+
+#[test]
+fn test_device_slim_transport_disconnect_drains_then_errors() {
+    let mut t = device_slim();
+    let a = slim_frame(b"strm", &[b'q'; 24]);
+    t.socket_mut().push_rx(&a);
+    t.socket_mut().push_rx(&a[..5]); // partial frame left behind by the closed peer
+    t.socket_mut().phase.set(TcpPhase::PeerClosed);
+    let mut buf = [0u8; 256];
+    assert_eq!(t.poll_frame(&mut buf), Ok(Some(a.len())));
+    assert_eq!(t.poll_frame(&mut buf), Err(TransportError::Disconnected));
+    assert!(!t.connected());
+    assert_eq!(t.send(b"HELO"), Err(TransportError::Disconnected));
+}
+
+#[test]
+fn test_device_slim_transport_send_is_whole_frame() {
+    let mut t = device_slim();
+    assert!(t.connected());
+    t.send(b"STAT0123").unwrap();
+    assert_eq!(t.socket().sent, b"STAT0123");
+    t.socket_mut().tx_cap = 4;
+    assert_eq!(t.send(b"STAT0123"), Err(TransportError::Io), "can never fit the tx buffer");
+    t.socket_mut().tx_cap = 16;
+    t.socket_mut().sent.clear();
+    t.socket_mut().queued = 12;
+    assert_eq!(t.send(b"STAT0123"), Err(TransportError::WouldBlock), "no partial frames");
+    assert!(t.socket().sent.is_empty());
+}

@@ -276,31 +276,10 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
-    /// Inspects the frame header in the buffer to determine expected frame length without borrowing scratch.
+    /// Inspects the frame header in the buffer to determine expected frame length without
+    /// borrowing scratch (shared with the device transport).
     fn peek_frame_len(buf: &[u8]) -> Result<usize, ParseError> {
-        if buf.len() < 6 {
-            return Err(ParseError::BufferTooShort);
-        }
-
-        if !buf[0].is_ascii_alphabetic() && buf[2..6].iter().all(|b| b.is_ascii_alphabetic()) {
-            let length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-            if length < 4 {
-                return Err(ParseError::InvalidFormat);
-            }
-            if length - 4 > SlimprotoParser::MAX_FRAME_LENGTH {
-                return Err(ParseError::PayloadTooLarge);
-            }
-            2usize.checked_add(length).ok_or(ParseError::PayloadTooLarge)
-        } else {
-            if buf.len() < 8 {
-                return Err(ParseError::BufferTooShort);
-            }
-            let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-            if length > SlimprotoParser::MAX_FRAME_LENGTH {
-                return Err(ParseError::PayloadTooLarge);
-            }
-            8usize.checked_add(length).ok_or(ParseError::PayloadTooLarge)
-        }
+        crate::net_device::server_frame_len(buf)
     }
 
     /// Polls the network stream, accumulating incoming TCP chunks,

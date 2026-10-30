@@ -7,6 +7,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks, clippy::needless_lifetimes)]
 
 pub mod amp;
+pub mod backend_device;
 pub mod board;
 pub mod bt_a2dp;
 pub mod clock_table;
@@ -17,6 +18,7 @@ pub mod http_control;
 pub mod io_traits;
 #[cfg(not(target_arch = "xtensa"))]
 pub mod network;
+pub mod net_device;
 pub mod ota_safety;
 pub mod pipeline;
 pub mod sink;

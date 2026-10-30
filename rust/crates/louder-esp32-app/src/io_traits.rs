@@ -105,6 +105,11 @@ pub trait SlimTransport {
 ///   `icy-metaint` response header configures the interval; `set_icy_metaint` overrides it
 ///   (`0` disables stripping).
 /// * After `abort`, `poll_bytes` returns [`StreamError::Disconnected`] until the next `connect`.
+/// * `take_response_headers_with` / `take_icy_metadata_with` are the same takes, handing the bytes
+///   to a callback instead of returning a [`HeaderBuf`] / [`MetaBuf`] by value (4 KB each).
+///   Implementations that keep the data in their own storage override them so callers on a small
+///   stack (the device) never materialise those values; the defaults go through the by-value
+///   methods.
 pub trait StreamSource {
     fn connect(&mut self, addr: NetAddr, http_request: &[u8]) -> Result<(), StreamError>;
     fn poll_bytes(&mut self, out: &mut [u8]) -> Result<usize, StreamError>;
@@ -113,6 +118,30 @@ pub trait StreamSource {
     fn set_icy_metaint(&mut self, interval: usize);
     fn is_eof(&self) -> bool;
     fn abort(&mut self);
+
+    /// [`StreamSource::take_response_headers`], handing the head to `f`. Returns whether there
+    /// was one.
+    fn take_response_headers_with(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+        match self.take_response_headers() {
+            Some(head) => {
+                f(&head);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`StreamSource::take_icy_metadata`], handing the block to `f`. Returns whether there was
+    /// one.
+    fn take_icy_metadata_with(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+        match self.take_icy_metadata() {
+            Some(meta) => {
+                f(&meta);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Audio output hardware (I2S clock, amplifier volume/mute/power, DMA state).
