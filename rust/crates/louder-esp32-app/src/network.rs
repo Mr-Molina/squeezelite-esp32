@@ -1251,10 +1251,18 @@ impl HttpAudioStream {
 const CONNECT_POLL_BUDGET: Duration = Duration::from_millis(100);
 
 impl StreamSource for HttpAudioStream {
-    /// Blocks for the TCP handshake (1500ms bound) and up to [`CONNECT_POLL_BUDGET`] per call
-    /// for the response head, then returns [`StreamError::WouldBlock`]; repeating the call
-    /// resumes the same request. Redirects are followed here, `Location` may be absolute
-    /// (`http://host[:port]/path`) or same-origin (`/path`).
+    /// Redirects are followed here; `Location` may be absolute (`http://host[:port]/path`) or
+    /// same-origin (`/path`). Repeating a call that returned [`StreamError::WouldBlock`] resumes
+    /// the same request.
+    ///
+    /// **This host implementation blocks.** Opening a connection ([`open_stream`]) takes a
+    /// blocking `connect` (1500 ms timeout) plus a blocking `write_all` of the request (1500 ms
+    /// write timeout), i.e. up to ~3 s. The first call does that once, and every redirect hop
+    /// followed inside a single call repeats it (up to [`HttpAudioStream::MAX_REDIRECTS`] hops),
+    /// so one call can block for ~12 s in the worst case. Only the wait for the response head
+    /// is bounded by [`CONNECT_POLL_BUDGET`] (100 ms between hops), after which `WouldBlock`
+    /// is returned. This blocking profile is specific to the `std::net` host adapter; the
+    /// device (smoltcp) implementation is independent and does not share it.
     fn connect(&mut self, addr: NetAddr, http_request: &[u8]) -> Result<(), StreamError> {
         if !self.connecting {
             let sock = SocketAddr::from((addr.ip, addr.port));
@@ -1316,16 +1324,20 @@ impl StreamSource for HttpAudioStream {
         }
     }
 
-    /// Raw head of the final response; truncated to 1024 bytes (keeping a terminating blank
-    /// line) if it is longer.
+    /// Raw head of the final response. A head longer than 1024 bytes is cut at the last line
+    /// boundary that leaves room for the terminating blank line (never inside a header line, so
+    /// no partial value such as `icy-metaint: 1` survives), then the blank line is appended.
     fn take_response_headers(&mut self) -> Option<heapless::Vec<u8, 1024>> {
         let raw = HttpAudioStream::take_response_headers(self)?;
         let mut out = heapless::Vec::new();
         if raw.len() <= out.capacity() {
             let _ = out.extend_from_slice(&raw);
         } else {
-            let keep = out.capacity() - 4;
-            let _ = out.extend_from_slice(&raw[..keep]);
+            // `raw[..cut]` must leave 4 bytes for "\r\n\r\n"; cut before the last CRLF at or
+            // before that limit.
+            let limit = out.capacity() - 4;
+            let cut = raw[..limit + 2].windows(2).rposition(|w| w == b"\r\n").unwrap_or(0);
+            let _ = out.extend_from_slice(&raw[..cut]);
             let _ = out.extend_from_slice(b"\r\n\r\n");
         }
         Some(out)
