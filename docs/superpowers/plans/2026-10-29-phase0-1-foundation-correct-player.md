@@ -387,3 +387,45 @@ impl Resampler {
 ## Spike findings
 
 (Recorded by Tasks 1–3 / 18 as they complete.)
+
+### S1 findings (embassy coexistence) — Task 1
+
+**Verdict:** embassy-executor async tasks coexist with `esp_rtos::start(...)` + esp-radio 1.0.0-beta.1 Wi-Fi/BLE(coex) on ESP32 at build/link level. **Fallback trigger: NOT needed** (esp-rtos threads / cooperative loop not required). **Hardware 10-min soak: PENDING OWNER GATE** (no hardware in this session; must be proven at first live cert, Task 18).
+
+**Integration crate:** `esp-rtos 0.4.0` itself provides embassy support behind its `embassy` feature (changelog: "The `esp-hal-embassy` crate has been merged into `esp-rtos`"). It supplies the `embassy-time-driver` implementation (1 MHz tick, queue via `embassy-time-queue-utils`), the `__pender`, and `esp_rtos::embassy::{Executor, InterruptExecutor}`. Do NOT add `esp-hal-embassy`, and do NOT enable any `platform-*`/`arch-*` feature on `embassy-executor` (esp-rtos docs say so; build confirmed with none enabled).
+
+**Exact versions (resolved against the existing `rust/Cargo.lock`, which is unchanged for all pre-existing crates):**
+
+| crate | version | notes |
+|---|---|---|
+| esp-hal | 1.2.2 | `esp32`, `unstable` (unchanged) |
+| esp-rtos | 0.4.0 | features `esp32`, `esp-radio`, `esp-alloc`, **`embassy`** (added) |
+| esp-radio | 1.0.0-beta.1 | vendored `rust/vendor/esp-radio` via `[patch.crates-io]`; features `esp32 wifi ble coex unstable` |
+| embassy-executor | 0.10.0 | default features only (`^0.10` is what esp-rtos requires) |
+| embassy-time | 0.5.1 | default features (no `generic-queue-*`; esp-rtos owns the queue) |
+| embassy-time-driver | 0.2.2 | pulled by esp-rtos with `tick-hz-1_000_000` |
+| embassy-time-queue-utils | 0.3.2 | pulled by esp-rtos |
+| embassy-net | **0.8.0** (`tcp`,`dhcpv4`,`medium-ethernet`) | pulls smoltcp **0.12.0** + heapless 0.8 = same as app. embassy-net 0.9.x needs smoltcp 0.13 / heapless 0.9: avoid |
+| embassy-net-driver | 0.2.0 | `esp_radio::wifi::Interface` implements it directly (no glue) |
+| embassy-sync | 0.8.0 (esp-rtos/esp-radio), 0.7.2 (embassy-net) | duplicates harmless |
+| static_cell | 2.1.1 | executors, net resources, core-1 stack |
+
+**Setup that built and linked** (`cargo +esp build --release -Zbuild-std=core,alloc --target xtensa-esp32-none-elf`, xtensa GCC on PATH; exit 0):
+1. `esp_hal::init`, heap (see gotcha 3), `esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0)` exactly as production does today.
+2. `esp_rtos::start_second_core(p.CPU_CTRL, p.FROM_CPU_INTR1, STACK.take(), || { EXEC1.init(Executor::new()).run(|s| { spawn core-1 tasks }) })`. The core-1 executor MUST be created and run inside that closure (it panics if the scheduler is not active on the current CPU).
+3. On core 0 (the main task, after `WifiController::new` + `Interface::station()` + `embassy_net::new`): `EXEC0.init(esp_rtos::embassy::Executor::new()).run(|s| { spawn ... })` replaces the superloop; never returns.
+4. Task spawn syntax in embassy-executor 0.10: `s.spawn(task_fn(args).unwrap())` (task fns return `Result<SpawnToken, SpawnError>`). `#[embassy_executor::task(pool_size = 2)]` works for one task fn used on both cores.
+5. Spike tasks: core 0 = heartbeat, `wifi_task` (`connect_async` / `wait_for_disconnect_async` loop), `net_task` (`embassy_net::Runner::run`), TCP echo on 7777 (`TcpSocket::accept`); core 1 = heartbeat + 250 ms worker. Echo rides embassy-net (smoltcp 0.12 inside), not the hand-rolled `SmolDevice` poll loop.
+6. Linked ELF contains `__pender` and `_embassy_time_schedule_wake`. Size (release, spike): text 590 449, data 12 276, bss 184 320 (incl. 64 KiB `.dram2_uninit` heap and `.stack`).
+
+**Interrupt/timer resources consumed:** TIMG0 `timer0` (esp-rtos scheduler tick AND embassy time driver, shared; no extra timer, no SYSTIMER on ESP32), `FROM_CPU_INTR0` (core-0 scheduler yield), `FROM_CPU_INTR1` (core-1 scheduler yield). Thread-mode embassy executors need NO interrupt (they sleep on a per-thread flag via the scheduler). `FROM_CPU_INTR2/3` remain free and are the only ones `esp_rtos::embassy::InterruptExecutor<2|3>` could use. TIMG0 `wdt` is separate and still feedable from a task (production feeds `timg0.wdt`).
+
+**Gotchas:**
+1. esp-radio `build.rs` panics "COEX is enabled but BLE is not": keep `ble` + `coex` together (production already does).
+2. `esp_rtos::start_on_second_core_only` does NOT support Wi-Fi/BLE; use `start` + `start_second_core`.
+3. DRAM budget: `heap_allocator!(size: 72 KiB)` + 16 KiB core-1 stack failed to LINK ("Main stack is smaller than 8192 bytes"). Linking passed with `heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64*1024)` + 24 KiB regular heap + 8 KiB core-1 stack (`.stack` = 0xFF00, `.bss` = 0xD100). The Task 8/9 refactor must re-budget stacks/heap against the production layout (production: 46 KiB heap + static pipeline buffers); check `.stack` stays above 8 KiB with `readelf -S`.
+4. Production `main.rs` (run_hardware_firmware) currently parks APP_CPU at entry (`park_core`), copies PRO flash MMU table + cache ctrl into the APP registers by hand (PSRAM workaround, ~lines 1310-1340) and starts core 1 with `cpu_ctrl.start_app_core(APP_CORE_STACK, app_core_loop)`. Switching to `esp_rtos::start_second_core` (which calls esp-hal `start_app_core_with_stack_guard_offset`) means that manual MMU/cache setup must still run before it and the park/start sequence must be re-validated on hardware. This is the single largest residual risk and is covered only by the owner gate below.
+5. Dependency trial in `louder-esp32-app` (esp-rtos `+embassy`, `embassy-executor 0.10.0`, `embassy-time 0.5.1`, `embassy-net 0.8.0`, `static_cell 2`): `cargo +esp build -p louder-esp32-app --release -Zbuild-std=core,alloc --target xtensa-esp32-none-elf` finished OK (59 s), no version conflicts, still one smoltcp (0.12.0). Cargo.lock grows ~360 lines (cordyceps, embassy-executor-macros/darling, etc.). Trial reverted; Task 8 owns the real Cargo.toml change.
+6. Duplicate-but-harmless versions: embassy-sync 0.6.2/0.7.2/0.8.0, heapless 0.8/0.9.3, embedded-io-async 0.6/0.7.
+
+**Pending owner gate:** Hardware 10-min soak: PENDING OWNER GATE — verify on first live cert (Task 18): no WDT reset, both cores' heartbeats advance, echo on 7777 works with Wi-Fi associated, and gotcha 4 (core-1 start with the MMU/cache workaround). If it fails, record the failure mode and fall back per Task 1 Step 4 (esp-rtos threads, then structured cooperative loop); Tasks 8-9 interfaces do not change either way.
