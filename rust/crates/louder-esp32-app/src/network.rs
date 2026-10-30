@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
+use crate::io_traits::{NetAddr, SlimTransport, StreamError, StreamSource, TransportError};
 use squeezelite_proto::{
     DiscoveredServer, DiscoveryBuilder, DiscoveryParser, DisconnectReason, ParseError, ServerCommand,
     SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
@@ -45,6 +46,8 @@ pub struct SlimprotoClient {
     mac: [u8; 6],
     model: String,
     acc_buf: Vec<u8>,
+    /// Cleared once the peer closes the connection or a write leaves a frame half-sent.
+    connected: bool,
 }
 
 impl SlimprotoClient {
@@ -74,6 +77,7 @@ impl SlimprotoClient {
             mac,
             model: model_name.to_string(),
             acc_buf: Vec::with_capacity(8192),
+            connected: true,
         };
 
         // HALNET-403: Send HELO while socket is still in blocking mode, then enable non-blocking mode
@@ -121,10 +125,20 @@ impl SlimprotoClient {
 
     /// Writes all bytes in `buf` to `stream`, retrying bounded times on `WouldBlock` (`HALNET-403`).
     fn write_all_bounded(stream: &mut TcpStream, buf: &[u8]) -> std::io::Result<()> {
-        let mut offset = 0;
+        let mut written = 0;
+        Self::write_all_tracked(stream, buf, &mut written)
+    }
+
+    /// Like [`Self::write_all_bounded`], additionally reporting in `offset` how many bytes were
+    /// accepted by the socket, so a caller can tell a clean failure from a half-written frame.
+    fn write_all_tracked(
+        stream: &mut TcpStream,
+        buf: &[u8],
+        offset: &mut usize,
+    ) -> std::io::Result<()> {
         let mut retries = 0u8;
-        while offset < buf.len() {
-            match stream.write(&buf[offset..]) {
+        while *offset < buf.len() {
+            match stream.write(&buf[*offset..]) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -132,7 +146,7 @@ impl SlimprotoClient {
                     ));
                 }
                 Ok(n) => {
-                    offset += n;
+                    *offset += n;
                     retries = 0;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -289,6 +303,21 @@ impl SlimprotoClient {
     /// Copies the active frame into `scratch` so that `ServerCommand<'a>` borrows
     /// from `scratch` rather than `self`, avoiding borrow-checker contention.
     pub fn poll_command<'a>(&mut self, scratch: &'a mut [u8]) -> std::io::Result<Option<ServerCommand<'a>>> {
+        let Some(consumed) = self.poll_raw_frame(scratch)? else {
+            return Ok(None);
+        };
+
+        // Single parse site at the end!
+        let (cmd, _) = SlimprotoParser::parse_frame(&scratch[..consumed])
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed frame"))?;
+        Ok(Some(cmd))
+    }
+
+    /// Accumulates incoming TCP data and copies the next complete frame (length prefix
+    /// included, exactly as received) into `scratch`, returning its length.
+    ///
+    /// Shared by [`Self::poll_command`] and the [`SlimTransport`] adapter.
+    fn poll_raw_frame(&mut self, scratch: &mut [u8]) -> std::io::Result<Option<usize>> {
         const MAX_ACC_BUF: usize = 8192;
 
         // 1. If self.acc_buf does not yet have a complete frame, read available bytes from self.stream
@@ -300,7 +329,10 @@ impl SlimprotoClient {
         if !has_complete_frame {
             let mut temp_buf = [0u8; 1024];
             match self.stream.read(&mut temp_buf) {
-                Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Server disconnected")),
+                Ok(0) => {
+                    self.connected = false;
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Server disconnected"));
+                }
                 Ok(n) => {
                     if self.acc_buf.len() + n > MAX_ACC_BUF {
                         self.acc_buf.clear();
@@ -311,7 +343,19 @@ impl SlimprotoClient {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                     // Non-blocking would block or timed out
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::NotConnected
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) {
+                        self.connected = false;
+                    }
+                    return Err(e);
+                }
             }
         }
 
@@ -347,10 +391,51 @@ impl SlimprotoClient {
         scratch[..consumed].copy_from_slice(&self.acc_buf[..consumed]);
         self.acc_buf.drain(..consumed);
 
-        // Single parse site at the end!
-        let (cmd, _) = SlimprotoParser::parse_frame(&scratch[..consumed])
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed frame"))?;
-        Ok(Some(cmd))
+        Ok(Some(consumed))
+    }
+}
+
+impl SlimTransport for SlimprotoClient {
+    /// Delivers one raw frame per call. Frames already accumulated stay deliverable after the
+    /// peer closes (the socket is only read when no complete frame is buffered); the disconnect
+    /// surfaces once they are drained.
+    fn poll_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        use std::io::ErrorKind;
+        self.poll_raw_frame(buf).map_err(|e| match e.kind() {
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof => TransportError::Disconnected,
+            ErrorKind::WouldBlock => TransportError::WouldBlock,
+            _ => TransportError::Io,
+        })
+    }
+
+    /// Sends one frame verbatim. `WouldBlock` is returned only when nothing was written, so the
+    /// caller can retry the whole frame; a failure after a partial write would desynchronise the
+    /// byte stream, so it closes the connection instead and reports `Disconnected`.
+    fn send(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+        use std::io::ErrorKind;
+        if !self.connected {
+            return Err(TransportError::Disconnected);
+        }
+        let mut written = 0;
+        match Self::write_all_tracked(&mut self.stream, frame, &mut written) {
+            Ok(()) => Ok(()),
+            Err(e) if written == 0 && e.kind() == ErrorKind::WouldBlock => {
+                Err(TransportError::WouldBlock)
+            }
+            Err(_) => {
+                self.connected = false;
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                Err(TransportError::Disconnected)
+            }
+        }
+    }
+
+    fn connected(&self) -> bool {
+        self.connected
     }
 }
 
@@ -458,9 +543,45 @@ fn format_redirect_request(template: &str, host_port: &str, path: &str) -> Strin
     req
 }
 
+/// Opens a TCP connection to `addr` and writes `request` while the socket is still blocking
+/// (1500ms connect/write timeout, `HALNET-410`); only then switches it to non-blocking mode
+/// (`HALNET-404`).
+fn open_stream(addr: SocketAddr, request: &[u8]) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(1500)))?;
+    stream.write_all(request)?;
+    stream.set_nonblocking(true)?;
+    Ok(stream)
+}
+
+/// Value of the `Host:` header in `request`, falling back to the socket address.
+fn host_of_request(request: &str, addr: SocketAddr) -> String {
+    request
+        .lines()
+        .find_map(|l| {
+            let t = l.trim();
+            (t.len() >= 5 && t[..5].eq_ignore_ascii_case("host:")).then(|| t[5..].trim().to_string())
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| addr.to_string())
+}
+
 /// Pure-Rust HTTP Audio Stream Client for fetching streamed audio over TCP.
+///
+/// Two ways to use it:
+/// * the original API: [`HttpAudioStream::connect`] (blocking connect, returns a connected
+///   stream) and [`HttpAudioStream::poll_audio_bytes`];
+/// * the [`StreamSource`] trait: [`HttpAudioStream::new`] creates an idle stream and the trait's
+///   `connect` (re)connects it. The inherent `is_eof`, `take_response_headers`,
+///   `take_icy_metadata` and `set_icy_metaint` shadow the trait methods on the concrete type
+///   and keep their original `Vec`-based signatures; call them through `StreamSource::` for the
+///   trait semantics (notably, the trait `is_eof` is never true for a connection that dropped
+///   early, while the inherent one reports any socket close).
 pub struct HttpAudioStream {
-    stream: TcpStream,
+    /// `None` while idle, after `abort`, and after a failed connect.
+    stream: Option<TcpStream>,
     header_buf: Vec<u8>,
     headers_parsed: bool,
     eof: bool,
@@ -469,12 +590,18 @@ pub struct HttpAudioStream {
     request_template: String,
     redirect_count: usize,
     response_headers: Option<Vec<u8>>,
+    /// Address and `Host` value of the server currently being read; same-origin (relative)
+    /// `Location` values resolve against these.
+    cur_addr: Option<SocketAddr>,
+    cur_host: String,
 
     // Chunked transfer decoding
     is_chunked: bool,
     chunk_state: ChunkDecoderState,
     raw_body_buf: Vec<u8>,
     unchunked_buf: Vec<u8>,
+    /// Body bytes still owed according to `Content-Length` (not chunked).
+    content_remaining: Option<u64>,
 
     // ICY metadata handling
     icy_metaint: usize,
@@ -486,6 +613,21 @@ pub struct HttpAudioStream {
     // Final pure audio buffer
     audio_buf: Vec<u8>,
     total_audio_bytes: u64,
+
+    // `StreamSource` bookkeeping
+    /// The socket closed before the response was complete (truncated chunked/`Content-Length`
+    /// body, or closed during the headers). `eof` is still set for the original API.
+    early_drop: bool,
+    /// A `StreamSource::connect` is in progress (`WouldBlock` was returned).
+    connecting: bool,
+    /// Precise error for the next `io::Error` that `poll_audio_bytes` returns.
+    fault: Option<StreamError>,
+}
+
+impl Default for HttpAudioStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpAudioStream {
@@ -494,44 +636,25 @@ impl HttpAudioStream {
     pub const MAX_BODY_BUF_LEN: usize = 65_536;
     pub const MAX_CHUNK_SIZE: usize = 1_048_576;
 
-    /// Connects to the HTTP streaming audio server and issues the initial GET request.
-    ///
-    /// Uses a 1500ms connect/write timeout (`HALNET-410`) and writes the full HTTP request
-    /// while the socket is still in blocking mode before enabling non-blocking mode (`HALNET-404`).
-    pub fn connect(server_addr: SocketAddr, http_headers: &str) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect_timeout(&server_addr, Duration::from_millis(1500))?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(1500)))?;
-
-        if !http_headers.is_empty() {
-            stream.write_all(http_headers.as_bytes())?;
-            if !http_headers.ends_with("\r\n\r\n") {
-                if http_headers.ends_with("\r\n") {
-                    stream.write_all(b"\r\n")?;
-                } else {
-                    stream.write_all(b"\r\n\r\n")?;
-                }
-            }
-        }
-
-        // HALNET-404: Transition to non-blocking mode only AFTER writing the HTTP request headers
-        stream.set_nonblocking(true)?;
-
-        Ok(Self {
-            stream,
+    /// Creates an idle, unconnected stream; use [`StreamSource::connect`] to start a request.
+    pub fn new() -> Self {
+        Self {
+            stream: None,
             header_buf: Vec::with_capacity(512),
             headers_parsed: false,
             eof: false,
 
-            request_template: http_headers.to_string(),
+            request_template: String::new(),
             redirect_count: 0,
             response_headers: None,
+            cur_addr: None,
+            cur_host: String::new(),
 
             is_chunked: false,
             chunk_state: ChunkDecoderState::ReadSize,
             raw_body_buf: Vec::with_capacity(2048),
             unchunked_buf: Vec::with_capacity(2048),
+            content_remaining: None,
 
             icy_metaint: 0,
             icy_audio_remaining: 0,
@@ -541,7 +664,34 @@ impl HttpAudioStream {
 
             audio_buf: Vec::with_capacity(2048),
             total_audio_bytes: 0,
-        })
+
+            early_drop: false,
+            connecting: false,
+            fault: None,
+        }
+    }
+
+    /// Connects to the HTTP streaming audio server and issues the initial GET request.
+    ///
+    /// Uses a 1500ms connect/write timeout (`HALNET-410`) and writes the full HTTP request
+    /// while the socket is still in blocking mode before enabling non-blocking mode (`HALNET-404`).
+    pub fn connect(server_addr: SocketAddr, http_headers: &str) -> std::io::Result<Self> {
+        let mut request = http_headers.as_bytes().to_vec();
+        if !http_headers.is_empty() && !http_headers.ends_with("\r\n\r\n") {
+            if http_headers.ends_with("\r\n") {
+                request.extend_from_slice(b"\r\n");
+            } else {
+                request.extend_from_slice(b"\r\n\r\n");
+            }
+        }
+        let stream = open_stream(server_addr, &request)?;
+
+        let mut this = Self::new();
+        this.stream = Some(stream);
+        this.request_template = http_headers.to_string();
+        this.cur_addr = Some(server_addr);
+        this.cur_host = host_of_request(http_headers, server_addr);
+        Ok(this)
     }
 
     /// Returns `true` if the server disconnected (EOF) and all pending audio bytes have been drained.
@@ -764,43 +914,27 @@ impl HttpAudioStream {
         Ok(())
     }
 
-    /// Polls audio stream bytes non-blockingly into `out`.
-    ///
-    /// During the initial header phase, incoming chunks are parsed to strip the HTTP response
-    /// header, follow redirects (`301`, `302`, `307`, `308`), and verify HTTP 200 / 206 status (`HALNET-406`).
-    /// Once parsed, raw audio stream bytes are de-chunked and stripped of ICY metadata before
-    /// being written directly to `out`, returning `Ok(0)` with `is_eof() == true` when finished (`HALNET-405`).
-    pub fn poll_audio_bytes(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-
-        // 1. Drain pending audio
-        if !self.audio_buf.is_empty() {
-            let n = out.len().min(self.audio_buf.len());
-            out[..n].copy_from_slice(&self.audio_buf[..n]);
-            self.audio_buf.drain(..n);
-            self.total_audio_bytes += n as u64;
-            return Ok(n);
-        }
-
-        if self.is_eof() {
-            return Ok(0);
-        }
-
-        // 2. Initial header parsing and redirect following
+    /// Header phase: reads and parses the HTTP response head, following redirects. Returns
+    /// `Ok(true)` once the final `200`/`206` response head has been consumed (any body bytes that
+    /// arrived with it stay in `raw_body_buf`, unprocessed), and `Ok(false)` while more data is
+    /// needed or if the socket closed (`eof`/`early_drop` are set in that case).
+    fn drive_headers(&mut self) -> std::io::Result<bool> {
         while !self.headers_parsed {
             let mut temp = [0u8; 1024];
-            let n = match self.stream.read(&mut temp) {
+            let Some(stream) = self.stream.as_mut() else {
+                return Err(std::io::ErrorKind::NotConnected.into());
+            };
+            let n = match stream.read(&mut temp) {
                 Ok(0) => {
                     self.eof = true;
-                    return Ok(0);
+                    self.early_drop = true;
+                    return Ok(false);
                 }
                 Err(ref e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    return Ok(0);
+                    return Ok(false);
                 }
                 Ok(n) => n,
                 Err(e) => return Err(e),
@@ -851,10 +985,11 @@ impl HttpAudioStream {
                     }
                 };
 
-                // Check for redirects: 301, 302, 307, 308
-                if matches!(code, 301 | 302 | 307 | 308) {
+                // Check for redirects: 301, 302, 303, 307, 308
+                if matches!(code, 301 | 302 | 303 | 307 | 308) {
                     if self.redirect_count >= Self::MAX_REDIRECTS {
                         self.header_buf.clear();
+                        self.fault = Some(StreamError::TooManyRedirects);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Too many redirects",
@@ -882,22 +1017,27 @@ impl HttpAudioStream {
                             )
                         })?;
 
-                    let (new_addr, host_port, new_path) = parse_http_location(location)?;
+                    // Same-origin Location (`/path`) stays on the current server; anything else
+                    // must be an absolute `http://` URL.
+                    let (new_addr, host_port, new_path) = match (location.starts_with('/'), self.cur_addr) {
+                        (true, Some(addr)) if !location.starts_with("//") => {
+                            (addr, self.cur_host.clone(), location.to_string())
+                        }
+                        _ => parse_http_location(location)?,
+                    };
                     let new_request = format_redirect_request(
                         &self.request_template,
                         &host_port,
                         &new_path,
                     );
 
-                    let mut new_stream =
-                        TcpStream::connect_timeout(&new_addr, Duration::from_millis(1500))?;
-                    new_stream.set_nodelay(true)?;
-                    new_stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-                    new_stream.set_write_timeout(Some(Duration::from_millis(1500)))?;
-                    new_stream.write_all(new_request.as_bytes())?;
-                    new_stream.set_nonblocking(true)?;
+                    let new_stream = open_stream(new_addr, new_request.as_bytes()).inspect_err(|_| {
+                        self.fault = Some(StreamError::ConnectFailed);
+                    })?;
 
-                    self.stream = new_stream;
+                    self.stream = Some(new_stream);
+                    self.cur_addr = Some(new_addr);
+                    self.cur_host = host_port;
                     self.redirect_count += 1;
                     self.header_buf.clear();
                     continue;
@@ -941,38 +1081,107 @@ impl HttpAudioStream {
                     self.icy_state = IcyDecoderState::Audio;
                 }
 
+                // Declared body length (identity encoding only), to tell truncation from EOF
+                let content_length = if self.is_chunked {
+                    None
+                } else {
+                    header_str.lines().find_map(|l| {
+                        let trimmed = l.trim();
+                        let pos = trimmed.find(':')?;
+                        if trimmed[..pos].trim().eq_ignore_ascii_case("content-length") {
+                            trimmed[pos + 1..].trim().parse::<u64>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                };
+
                 // Capture raw response headers (including delimiter)
                 self.response_headers = Some(self.header_buf[..pos + delim_len].to_vec());
 
                 let body_start = pos + delim_len;
-                if body_start < self.header_buf.len() {
+                let leftover = self.header_buf.len() - body_start;
+                if leftover > 0 {
                     self.raw_body_buf.extend_from_slice(&self.header_buf[body_start..]);
                 }
+                self.content_remaining = content_length.map(|l| l.saturating_sub(leftover as u64));
                 self.header_buf.clear();
                 self.headers_parsed = true;
-
-                self.process_raw_body()?;
-
-                if !self.audio_buf.is_empty() {
-                    let copied = out.len().min(self.audio_buf.len());
-                    out[..copied].copy_from_slice(&self.audio_buf[..copied]);
-                    self.audio_buf.drain(..copied);
-                    self.total_audio_bytes += copied as u64;
-                    return Ok(copied);
-                }
-                break;
+                return Ok(true);
             } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Polls audio stream bytes non-blockingly into `out`.
+    ///
+    /// During the initial header phase, incoming chunks are parsed to strip the HTTP response
+    /// header, follow redirects (`301`, `302`, `307`, `308`), and verify HTTP 200 / 206 status (`HALNET-406`).
+    /// Once parsed, raw audio stream bytes are de-chunked and stripped of ICY metadata before
+    /// being written directly to `out`, returning `Ok(0)` with `is_eof() == true` when finished (`HALNET-405`).
+    pub fn poll_audio_bytes(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        // 1. Drain pending audio
+        if !self.audio_buf.is_empty() {
+            let n = out.len().min(self.audio_buf.len());
+            out[..n].copy_from_slice(&self.audio_buf[..n]);
+            self.audio_buf.drain(..n);
+            self.total_audio_bytes += n as u64;
+            return Ok(n);
+        }
+
+        if self.is_eof() {
+            return Ok(0);
+        }
+
+        // 2. Initial header parsing and redirect following
+        if !self.headers_parsed {
+            if !self.drive_headers()? {
                 return Ok(0);
+            }
+            self.process_raw_body()?;
+            if !self.audio_buf.is_empty() {
+                let copied = out.len().min(self.audio_buf.len());
+                out[..copied].copy_from_slice(&self.audio_buf[..copied]);
+                self.audio_buf.drain(..copied);
+                self.total_audio_bytes += copied as u64;
+                return Ok(copied);
             }
         }
 
         // 3. Read body from TCP stream
         let mut temp = [0u8; 2048];
-        match self.stream.read(&mut temp) {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(std::io::ErrorKind::NotConnected.into());
+        };
+        match stream.read(&mut temp) {
             Ok(0) => {
+                // Settle bytes that arrived with the headers first, so the decoder state below
+                // reflects everything received.
+                self.process_raw_body()?;
                 self.eof = true;
+                let complete = if self.is_chunked {
+                    // A last-chunk was seen (a missing final CRLF is tolerated).
+                    matches!(
+                        self.chunk_state,
+                        ChunkDecoderState::Eof | ChunkDecoderState::ReadTrailer
+                    )
+                } else {
+                    self.content_remaining.is_none_or(|r| r == 0)
+                };
+                if !complete {
+                    self.early_drop = true;
+                }
             }
             Ok(n) => {
+                if let Some(r) = self.content_remaining.as_mut() {
+                    *r = r.saturating_sub(n as u64);
+                }
                 if self.raw_body_buf.len() + n > Self::MAX_BODY_BUF_LEN {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::OutOfMemory,
@@ -1001,6 +1210,144 @@ impl HttpAudioStream {
         } else {
             Ok(0)
         }
+    }
+}
+
+impl HttpAudioStream {
+    /// Maps an error from the original `io::Result` API onto a [`StreamError`].
+    fn stream_error(&mut self, e: &std::io::Error) -> StreamError {
+        use std::io::ErrorKind;
+        if let Some(fault) = self.fault.take() {
+            return fault;
+        }
+        match e.kind() {
+            ErrorKind::InvalidData | ErrorKind::InvalidInput | ErrorKind::OutOfMemory => {
+                StreamError::BadResponse
+            }
+            _ => StreamError::Disconnected,
+        }
+    }
+
+    /// Drops the connection and every buffered byte.
+    fn close(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        self.connecting = false;
+        self.headers_parsed = false;
+        self.eof = false;
+        self.early_drop = false;
+        self.header_buf.clear();
+        self.raw_body_buf.clear();
+        self.unchunked_buf.clear();
+        self.audio_buf.clear();
+        self.response_headers = None;
+        self.latest_icy_metadata = None;
+    }
+}
+
+/// `connect` waits up to this long for the response head before returning
+/// [`StreamError::WouldBlock`] (the caller repeats the same call).
+const CONNECT_POLL_BUDGET: Duration = Duration::from_millis(100);
+
+impl StreamSource for HttpAudioStream {
+    /// Blocks for the TCP handshake (1500ms bound) and up to [`CONNECT_POLL_BUDGET`] per call
+    /// for the response head, then returns [`StreamError::WouldBlock`]; repeating the call
+    /// resumes the same request. Redirects are followed here, `Location` may be absolute
+    /// (`http://host[:port]/path`) or same-origin (`/path`).
+    fn connect(&mut self, addr: NetAddr, http_request: &[u8]) -> Result<(), StreamError> {
+        if !self.connecting {
+            let sock = SocketAddr::from((addr.ip, addr.port));
+            *self = Self::new();
+            let stream = open_stream(sock, http_request).map_err(|_| StreamError::ConnectFailed)?;
+            let request = String::from_utf8_lossy(http_request).into_owned();
+            self.cur_host = host_of_request(&request, sock);
+            self.request_template = request;
+            self.cur_addr = Some(sock);
+            self.stream = Some(stream);
+            self.connecting = true;
+        }
+
+        let deadline = std::time::Instant::now() + CONNECT_POLL_BUDGET;
+        loop {
+            match self.drive_headers() {
+                Ok(true) => {
+                    self.connecting = false;
+                    return Ok(());
+                }
+                Ok(false) if self.eof => {
+                    // Closed before the response head was complete.
+                    self.close();
+                    return Err(StreamError::Disconnected);
+                }
+                Ok(false) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(StreamError::WouldBlock);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => {
+                    let err = self.stream_error(&e);
+                    self.close();
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Never blocks and never returns `WouldBlock`. Bytes received before a drop are delivered
+    /// first; then a connection that closed early (truncated chunked or `Content-Length` body)
+    /// yields [`StreamError::Disconnected`] instead of EOF.
+    fn poll_bytes(&mut self, out: &mut [u8]) -> Result<usize, StreamError> {
+        if self.stream.is_none() || self.connecting {
+            return Err(StreamError::Disconnected);
+        }
+        match self.poll_audio_bytes(out) {
+            Ok(0) if self.early_drop && self.audio_buf.is_empty() && self.unchunked_buf.is_empty() => {
+                Err(StreamError::Disconnected)
+            }
+            Ok(n) => Ok(n),
+            Err(e) => {
+                let err = self.stream_error(&e);
+                // Decoder state is unreliable after an error; make the failure sticky.
+                self.close();
+                Err(err)
+            }
+        }
+    }
+
+    /// Raw head of the final response; truncated to 1024 bytes (keeping a terminating blank
+    /// line) if it is longer.
+    fn take_response_headers(&mut self) -> Option<heapless::Vec<u8, 1024>> {
+        let raw = HttpAudioStream::take_response_headers(self)?;
+        let mut out = heapless::Vec::new();
+        if raw.len() <= out.capacity() {
+            let _ = out.extend_from_slice(&raw);
+        } else {
+            let keep = out.capacity() - 4;
+            let _ = out.extend_from_slice(&raw[..keep]);
+            let _ = out.extend_from_slice(b"\r\n\r\n");
+        }
+        Some(out)
+    }
+
+    fn take_icy_metadata(&mut self) -> Option<heapless::Vec<u8, 256>> {
+        let raw = HttpAudioStream::take_icy_metadata(self)?;
+        let mut out = heapless::Vec::new();
+        let _ = out.extend_from_slice(&raw[..raw.len().min(out.capacity())]);
+        Some(out)
+    }
+
+    fn set_icy_metaint(&mut self, interval: usize) {
+        HttpAudioStream::set_icy_metaint(self, interval);
+    }
+
+    fn is_eof(&self) -> bool {
+        HttpAudioStream::is_eof(self) && !self.early_drop
+    }
+
+    fn abort(&mut self) {
+        self.close();
     }
 }
 
