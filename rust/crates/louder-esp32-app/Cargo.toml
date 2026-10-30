@@ -16,6 +16,12 @@ board-louder-esp32-s3 = []
 # `cargo test` exercises the full codec set while `cargo +esp build --target xtensa-...` (default
 # features) keeps it off.
 std-codecs = ["squeezelite-decoders/std"]
+# Core-1 start path switch (Task 8, S1 sequencing note). Default (off): the battle-tested manual
+# path — park APP_CPU, copy the PRO flash-MMU/cache registers into the APP registers, then
+# `CpuControl::start_app_core` running the NOP heartbeat loop. On: `esp_rtos::start_second_core`
+# with an embassy executor on core 1 (heartbeat task only; the audio tasks stay on core 0 until
+# the S1 owner gate validates core-1 bring-up on hardware). Both paths must compile.
+esp-rtos-core1 = []
 
 [dependencies]
 squeezelite-proto = { path = "../squeezelite-proto" }
@@ -27,6 +33,10 @@ squeezelite-config = { path = "../squeezelite-config" }
 embedded-hal = { workspace = true }
 heapless = { workspace = true }
 bytemuck = "1.25"
+# Control/event channels between the core-0 coordinator and the audio tasks (`tasks.rs`).
+# 0.8.0 is the version esp-rtos/esp-radio already pull (Spike S1); host builds compile it too so
+# the channel types stay testable off-target.
+embassy-sync = "0.8.0"
 log = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "xtensa"))'.dependencies]
@@ -39,7 +49,13 @@ esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"] }
 esp-hal = { version = "1.2.2", features = ["esp32", "unstable"] }
 esp-println = { version = "0.18.0", features = ["esp32"] }
 esp-radio = { version = "1.0.0-beta.1", features = ["esp32", "wifi", "ble", "coex", "unstable"] }
-esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc"] }
+esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc", "embassy"] }
+# Spike S1: esp-rtos' own `embassy` feature supplies the time driver and
+# `esp_rtos::embassy::Executor`; no esp-hal-embassy, no embassy-executor `platform-*`/`arch-*`.
+embassy-executor = "0.10.0"
+# Used by the `esp-rtos-core1` heartbeat task only (Timer); time driver comes from esp-rtos.
+embassy-time = "0.5.1"
+static_cell = "2.1.1"
 esp-storage = { version = "0.10.0", features = ["esp32", "critical-section", "bytewise-read"] }
 smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "socket-dns", "multicast"] }
 
@@ -48,3 +64,5 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["medium-et
 # tests never build for xtensa).
 louder-esp32-app = { path = ".", default-features = false, features = ["std-codecs"] }
 embedded-hal-mock = { version = "0.11", default-features = false, features = ["eh1"] }
+# Host `critical-section` implementation so tests can exercise the embassy-sync channels.
+critical-section = { version = "1.2", features = ["std"] }
