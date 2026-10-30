@@ -431,3 +431,30 @@ impl Resampler {
 6. Duplicate-but-harmless versions: embassy-sync 0.6.2/0.7.2/0.8.0, heapless 0.8/0.9.3, embedded-io-async 0.6/0.7.
 
 **Pending owner gate:** Hardware 10-min soak: PENDING OWNER GATE — verify on first live cert (Task 18): no WDT reset, both cores' heartbeats advance, echo on 7777 works with Wi-Fi associated, and gotcha 4 (core-1 start with the MMU/cache workaround intact). If it fails, record the failure mode and fall back per Task 1 Step 4 (esp-rtos threads, then structured cooperative loop); Tasks 8-9 interfaces do not change either way.
+
+### S2 findings (smoltcp UDP/DNS feature budget) — Task 2
+
+**Verdict: WITHIN BUDGET; features enabled unconditionally (no `udp` gate needed).** `.bss` growth is -24 bytes (0 net; identical `.bss` section), flash growth is +10 220 bytes (+0.38% of ota_0). No sockets are allocated yet (Task 8 adds the 2 UDP placeholders + DNS), so these numbers are the cost of the feature flags alone; the per-socket buffer cost lands as `.bss`/stack in Task 8 and must be re-measured there.
+
+**Feature names (smoltcp 0.12.0, verified in `Cargo.toml` of the locked crate):** `socket-udp` (= `socket`), `socket-dns` (= `socket`, `proto-dns`), `multicast` (standalone, `= []`; enables IGMP join/leave + multicast group handling in `iface` for IPv4 with `proto-ipv4`). Final line in `rust/crates/louder-esp32-app/Cargo.toml` (xtensa-only dependency table): `features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "socket-dns", "multicast"]`. Notes: `socket-mdns` also exists in 0.12 (`= ["socket-dns"]`); it only adds mDNS-flavoured behaviour to the DNS socket (queries to 224.0.0.251) and was NOT enabled or measured; Task 8/P3 should add it only if the mDNS design needs a resolver rather than a hand-rolled responder over a plain UDP socket. DNS tunables (`dns-max-name-size-*`, `dns-max-result-count-*`, `dns-max-server-count-*`) are left at defaults. `Cargo.lock` is unchanged (feature flags only; no new crates).
+
+**Measurement method:** `cargo +esp build --target xtensa-esp32-none-elf --release -p louder-esp32-app -Zbuild-std=core,alloc` (xtensa GCC on PATH), same HEAD (`1ad1197`), baseline built first, then features added; `xtensa-esp32-elf-size` / `xtensa-esp32-elf-readelf -SW` on `target/xtensa-esp32-none-elf/release/louder-esp32-app`. (`b49854f` stage numbers were unavailable; baseline is the pre-change build at HEAD.) Host `cargo build -p louder-esp32-app` is green but does not compile smoltcp at all (it is an xtensa-only dependency), so it proves nothing about the features; the xtensa build is the real check.
+
+| metric (bytes) | baseline | with udp/dns/multicast | delta |
+|---|---|---|---|
+| `.text` (0xa6685 → 0xa89b1) | 681 605 | 690 609 | +9 004 |
+| `.rodata` (0x17590 → 0x17a38) | 95 632 | 96 824 | +1 192 |
+| `.rwtext` (IRAM) / `.rwtext.wifi` | 24 972 / 88 304 | same | 0 |
+| `.data` (0x4068 → 0x4080) | 16 488 | 16 512 | +24 |
+| `.data.wifi` / `.rodata.wifi` | 2 120 / 42 484 | same | 0 |
+| **flash-resident total (size text+data)** | 952 913 | 963 133 | **+10 220 (+1.07%)** |
+| `.bss` (0x12718) | 75 544 | 75 544 | **0** |
+| `.noinit` | 0 | 0 | 0 |
+| `.stack` (0x9038 → 0x9020) | 36 920 | 36 896 | -24 (layout side effect of the +24 `.data`) |
+| `.dram2_uninit` (heap) | 98 264 | 98 264 | 0 |
+| size(1) bss column (incl. stack + dram2) | 210 728 | 210 704 | -24 |
+| ELF file size | 1 215 104 | n/a | n/a |
+
+Flash headroom: 963 133 / 0x290000 (2 686 976) ota_0 = 35.8% used (baseline 35.5%), ~1.72 MB free. The `+24 B` `.data` is statics inside the smoltcp iface (multicast/UDP dispatch tables); the ~10 KB text is the interface's inbound UDP/IGMP/DNS-reply paths, which `smoltcp::iface` compiles in once the sockets features are on even with no socket in the set (so it is a floor, not a monomorphised-only cost).
+
+**Gate result:** budget "≤8 KB `.bss` growth with ≥8 KB headroom" holds trivially (0 growth; `.stack` still 36 896 B, far above the 8 192 B link-time minimum noted in S1 gotcha 3). **Caveat for Task 8:** the budget that actually matters is the socket set: each `udp::Socket` costs its rx/tx `PacketMetadata` + payload buffers, and `dns::Socket` costs its query slots + server list; size them small (e.g. 4 metadata slots, 512 B payload for the LMS discovery socket) and re-measure `.bss`/`.stack` then.
