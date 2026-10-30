@@ -14,7 +14,7 @@
 
 - Workspace gates after every task: `cargo test --workspace` green and `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean (run from `rust/`).
 - `#![forbid(unsafe_code)]` stays in `squeezelite-proto`, `squeezelite-audio-core`, `squeezelite-config`, `squeezelite-decoders`, `squeezelite-cyd-link`, `squeezelite-tas58xx`.
-- Device (xtensa) stage builds must keep Core 0 `.stack` = 36,528 B and fit current `.bss` budget with ≥8 KB headroom (spec S2); stage command per `WO-034` workflow (`espflash save-image`).
+- Device (xtensa) stage builds must keep Core 0 stack headroom at or above the `e5b44cd` baseline both at the boot peak and in steady state (headroom = `.stack` section minus the app frames stacked under the deepest callees, measured from `entry a1, N` frame sizes), and fit the `.bss` budget with ≥8 KB headroom (spec S2); per the Task 8 ruling this replaces the former fixed "`.stack` = 36,528 B" figure, which every new static breaks because `.stack` is the remainder of `dram_seg`. Stage command per `WO-034` workflow (`espflash save-image`).
 - No `#[cfg(...target_arch...)]` in `louder-esp32-app/src/{coordinator.rs,pipeline.rs}` from Task 7 on (enforced by test added in Task 7).
 - Flash I/O buffers in internal DRAM only; `FlashStorage` with `.multicore_auto_park()`; otadata pre-arm, 20 s WDT, and network-lease reset policies unchanged.
 - Anti-brick rule: never call `POST /reboot_ota.json` on hardware unless the owner asked.

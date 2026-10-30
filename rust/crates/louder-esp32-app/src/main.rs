@@ -384,7 +384,10 @@ mod xtensa_hw {
         WifiStaCredentials, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
         OTADATA_SECTOR_1_OFFSET,
     };
-    use smoltcp::iface::{Config as SmolIfaceConfig, Interface as SmolInterface, SocketSet, SocketStorage};
+    use smoltcp::iface::{
+        Config as SmolIfaceConfig, Interface as SmolInterface, SocketHandle, SocketSet, SocketStorage,
+    };
+    use static_cell::{ConstStaticCell, StaticCell};
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
     use smoltcp::socket::{dhcpv4, tcp, udp};
     use smoltcp::time::Instant as SmolInstant;
@@ -1134,49 +1137,280 @@ mod xtensa_hw {
         }
     }
 
-    /// Static (not stack) storage for the UDP placeholder sockets, so their RAM cost is visible
-    /// in `.bss` from Task 8 on.
-    fn take_udp_placeholder_buffers() -> &'static mut [UdpPlaceholderBuffers; UDP_PLACEHOLDER_SOCKETS] {
-        static UDP_BUFFERS: static_cell::StaticCell<[UdpPlaceholderBuffers; UDP_PLACEHOLDER_SOCKETS]> =
-            static_cell::StaticCell::new();
-        UDP_BUFFERS.init_with(|| [const { UdpPlaceholderBuffers::new() }; UDP_PLACEHOLDER_SOCKETS])
+    // ----------------------------------------------------------------------------------------
+    // Boot-stack budget (Task 8 ruling: headroom-based stack gate). Everything the firmware keeps
+    // for its whole life is built IN PLACE in a static, inside a small `#[inline(never)]`
+    // bring-up stage, instead of as a `bring_up` local that is later moved into the state. That
+    // keeps `bring_up`'s frame (which sits under every boot-time callee) small, and each stage's
+    // temporaries are released when it returns. The bytes show up in `.bss` instead of on the
+    // core-0 stack; the gate is the resulting stack headroom (boot peak and steady state) versus
+    // e5b44cd, recorded in the Task 8 report.
+    // ----------------------------------------------------------------------------------------
+
+    /// smoltcp socket slots. `ConstStaticCell` hands them out without a stack temporary.
+    static SOCKET_STORAGE: ConstStaticCell<[SocketStorage<'static>; SOCKET_SLOTS]> =
+        ConstStaticCell::new([SocketStorage::EMPTY; SOCKET_SLOTS]);
+    /// Spec §3.6 UDP placeholder buffers (static, never on the stack).
+    static UDP_BUFFERS: ConstStaticCell<[UdpPlaceholderBuffers; UDP_PLACEHOLDER_SOCKETS]> =
+        ConstStaticCell::new([const { UdpPlaceholderBuffers::new() }; UDP_PLACEHOLDER_SOCKETS]);
+    static AMP: StaticCell<AmpManager<Esp32I2cBus<'static>>> = StaticCell::new();
+    static CYD_BRIDGE: StaticCell<CydUartBridge<Esp32Uart2Port<'static>>> = StaticCell::new();
+    static COORDINATOR: StaticCell<PlayerCoordinator> = StaticCell::new();
+    static SMOL_IFACE: StaticCell<SmolInterface> = StaticCell::new();
+    /// The superloop state shared by the core-0 tasks.
+    static SHARED: StaticCell<Shared> = StaticCell::new();
+
+    /// Bring-up stage: I2C0 (SDA=21, SCL=27, 400 kHz) and the TAS58xx manager over it, built in
+    /// [`AMP`]. Construction only; the HIL amp init keeps its legacy place in [`bring_up`].
+    #[inline(never)]
+    fn init_amp_i2c(
+        i2c0: esp_hal::peripherals::I2C0<'static>,
+        sda: esp_hal::peripherals::GPIO21<'static>,
+        scl: esp_hal::peripherals::GPIO27<'static>,
+    ) -> &'static mut AmpManager<Esp32I2cBus<'static>> {
+        let i2c_cfg = I2cConfig::default().with_frequency(Rate::from_khz(400));
+        let hal_i2c = HalI2c::new(i2c0, i2c_cfg)
+            .expect("Failed to initialize I2C0")
+            .with_sda(sda)
+            .with_scl(scl);
+        let i2c_bus = Esp32I2cBus::new(hal_i2c);
+        AMP.init(AmpManager::for_active_board(i2c_bus))
     }
 
-    /// Upgrades a borrow of a local of [`run_hardware_firmware`] to `'static`.
-    ///
-    /// This is the third option the esp-rtos `Executor::run` docs list ("a local variable in a
-    /// function you know never returns, upgrading its lifetime"). It keeps the superloop state
-    /// where the superloop kept its locals (the core-0 main stack) instead of growing `.bss`.
-    ///
-    /// # Safety
-    /// `local` must live in the frame of a function that never returns (`-> !`, panic = abort so
-    /// no unwinding), and the caller must not touch the local again except through the returned
-    /// reference.
-    #[allow(unsafe_code)]
-    unsafe fn upgrade_never_returning_local<T>(local: &mut T) -> &'static mut T {
-        // SAFETY: forwarded to the caller (see above).
-        unsafe { &mut *(local as *mut T) }
+    /// Static pipeline + the static buffers handed out with it (`init_static_pipeline`).
+    type PipelineStatics = (
+        &'static mut HwStreamPipeline,
+        &'static mut [u8; 2064],
+        &'static mut [u8; 1536],
+        &'static mut [u8; 1536],
+    );
+
+    /// Bring-up stage: I2S0 TDM-Philips TX (BCK=26, WS=25, DOUT=22) with streaming DMA prefilled
+    /// with silence, then the I2S sink and the static audio pipeline around it. Building the
+    /// sink (a ~1 KB value) here keeps it out of [`bring_up`]'s frame; sink/pipeline
+    /// construction is pure memory initialisation that used to run a few statements later.
+    #[inline(never)]
+    fn init_i2s_pipeline(
+        i2s0: esp_hal::peripherals::I2S0<'static>,
+        dma: esp_hal::peripherals::DMA_I2S0<'static>,
+        bclk: esp_hal::peripherals::GPIO26<'static>,
+        ws: esp_hal::peripherals::GPIO25<'static>,
+        dout: esp_hal::peripherals::GPIO22<'static>,
+        stream_storage: &'static mut [u8],
+        output_storage: &'static mut [u8],
+    ) -> PipelineStatics {
+        let i2s_tdm_cfg = TdmConfig::new_tdm_philips()
+            .with_sample_rate(Rate::from_hz(44_100))
+            .with_data_format(DataFormat::Data32Channel32)
+            .with_channels(Channels::STEREO);
+        let mut tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
+        Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
+        let i2s = I2s::new(i2s0, dma, i2s_tdm_cfg).expect("Failed to initialize I2S0");
+        let i2s_tx = i2s.i2s_tx.with_bclk(bclk).with_ws(ws).with_dout(dout).build();
+        let i2s_transfer = i2s_tx
+            .write(tx_buffer)
+            .expect("Failed to start I2S0 TX streaming DMA");
+        let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
+        let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
+        init_static_pipeline(stream_storage, output_storage, sink)
+    }
+
+    /// Bring-up stage: UART2 @ 460 800 (TX=4, RX=36) and the CYD bridge over it, built in
+    /// [`CYD_BRIDGE`].
+    #[inline(never)]
+    fn init_cyd_uart(
+        uart2: esp_hal::peripherals::UART2<'static>,
+        tx: esp_hal::peripherals::GPIO4<'static>,
+        rx: esp_hal::peripherals::GPIO36<'static>,
+    ) -> &'static mut CydUartBridge<Esp32Uart2Port<'static>> {
+        let uart2_rx = Input::new(rx, InputConfig::default().with_pull(Pull::None));
+        let uart2_cfg = UartConfig::default().with_baudrate(460_800);
+        let hal_uart2 = Uart::new(uart2, uart2_cfg)
+            .expect("Failed to initialize UART2")
+            .with_tx(tx)
+            .with_rx(uart2_rx);
+        let uart2_port = Esp32Uart2Port::new(hal_uart2);
+        CYD_BRIDGE.init(CydUartBridge::new(uart2_port))
+    }
+
+    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`].
+    #[inline(never)]
+    fn init_coordinator() -> &'static mut PlayerCoordinator {
+        COORDINATOR.init(PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT"))
+    }
+
+    /// Bring-up stage: `esp-radio` Wi-Fi controller configured as a station for
+    /// `wifi_sta_creds` (any configuration failure resets into recovery, as before).
+    #[inline(never)]
+    fn init_wifi(
+        wifi: esp_hal::peripherals::WIFI<'static>,
+        wifi_sta_creds: &WifiStaCredentials,
+    ) -> WifiController<'static> {
+        let auth_cfg = if wifi_sta_creds.password.is_empty() {
+            AuthenticationMethodConfig::Open
+        } else {
+            match wifi_sta_creds.password.as_str().try_into() {
+                Ok(pw) => AuthenticationMethodConfig::WpaWpa2Personal(pw),
+                Err(_) => esp_hal::system::software_reset(),
+            }
+        };
+        let ssid_cfg = match wifi_sta_creds.ssid.as_str().try_into() {
+            Ok(s) => s,
+            Err(_) => esp_hal::system::software_reset(),
+        };
+        let sta_cfg = WifiModeConfig::Station(
+            StationConfig::default()
+                .with_ssid(ssid_cfg)
+                .with_authentication(auth_cfg)
+                .with_scan_method(esp_radio::wifi::sta::ScanMethod::AllChannels)
+                .with_beacon_timeout(30)
+                .with_failure_retry_cnt(3),
+        );
+        let wifi_cfg = ControllerConfig::default()
+            .with_static_rx_buf_num(6)
+            .with_dynamic_rx_buf_num(16)
+            .with_dynamic_tx_buf_num(16);
+        let mut wifi_controller = match WifiController::new(wifi, wifi_cfg) {
+            Ok(c) => c,
+            Err(_) => esp_hal::system::software_reset(),
+        };
+        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+        let _ = wifi_controller.set_max_tx_power(52);
+        if wifi_controller.set_config(&sta_cfg).is_err() {
+            esp_hal::system::software_reset();
+        }
+        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+        let _ = wifi_controller.set_max_tx_power(52);
+        wifi_controller
+    }
+
+    // The TAS58xx typestate transitions move ~320 B driver values around; when inlined into
+    // `bring_up` they made up most of its frame. These wrappers keep the legacy call sequences
+    // verbatim but in their own short-lived frames.
+
+    /// HIL step: initialise the TAS58xx (32-bit) and set unity volume.
+    #[inline(never)]
+    fn amp_hil_init(amp: &mut AmpManager<Esp32I2cBus<'static>>) {
+        let _ = amp.initialize(32);
+        let _ = amp.set_volume(VOL_UNITY_0DB);
+    }
+
+    /// Apply the saved volume register and analog gain.
+    #[inline(never)]
+    fn amp_apply_boot_config(amp: &mut AmpManager<Esp32I2cBus<'static>>, vol_reg: u8, again_code: u8) {
+        let _ = amp.set_volume(vol_reg);
+        let _ = amp.set_analog_gain(again_code);
+    }
+
+    /// Pre-loop amp start: clear faults, Hi-Z -> Play, first telemetry read.
+    #[inline(never)]
+    fn amp_start_playback(
+        amp: &mut AmpManager<Esp32I2cBus<'static>>,
+    ) -> Option<squeezelite_tas58xx::Tas5805mTelemetry> {
+        let mut latest_telemetry = None;
+        let _ = amp.clear_faults();
+        let _ = amp.start_playback_via_hiz();
+        if let Ok(telem) = amp.read_telemetry() {
+            latest_telemetry = telem;
+        }
+        latest_telemetry
+    }
+
+    /// Adds one socket to the set from its own frame (each smoltcp socket value is ~312 B and
+    /// would otherwise be a separate temporary in [`init_net_stack`]'s frame).
+    #[inline(never)]
+    fn add_socket<T: smoltcp::socket::AnySocket<'static>>(
+        sockets: &mut SocketSet<'static>,
+        socket: impl FnOnce() -> T,
+    ) -> SocketHandle {
+        sockets.add(socket())
+    }
+
+    /// Output of [`init_net_stack`].
+    struct NetStack {
+        smol_iface: &'static mut SmolInterface,
+        sockets: SocketSet<'static>,
+        dhcp_handle: SocketHandle,
+        http_handle: SocketHandle,
+        slim_handle: SocketHandle,
+        audio_handle: SocketHandle,
+        udp_placeholder_handles: [SocketHandle; UDP_PLACEHOLDER_SOCKETS],
+        local_port_counter: u16,
+    }
+
+    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for HTTP, slimproto, audio.
+    type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 3];
+
+    /// Bring-up stage: `smoltcp` Ethernet interface (in [`SMOL_IFACE`]) + DHCPv4 + TCP port 80 +
+    /// TCP SlimProto (3483) + audio socket + the spec §3.6 UDP placeholders, all in
+    /// [`SOCKET_STORAGE`].
+    #[inline(never)]
+    fn init_net_stack(sta_iface: &mut WifiInterface, sta_mac: [u8; 6], tcp_bufs: TcpBuffers) -> NetStack {
+        let [(http_rx_buf, http_tx_buf), (slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] =
+            tcp_bufs;
+        let hw_rng = Rng::new();
+        let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
+        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
+        let mut smol_cfg = SmolIfaceConfig::new(hw_addr);
+        smol_cfg.random_seed = rng_seed;
+        let local_port_counter: u16 = 49152 + ((hw_rng.random() as u16) & 0x3FFF);
+        let mut smol_dev = SmolDevice { driver: sta_iface };
+        let smol_iface = SMOL_IFACE.init(SmolInterface::new(
+            smol_cfg,
+            &mut smol_dev,
+            SmolInstant::from_millis(now_millis() as i64),
+        ));
+
+        let mut sockets = SocketSet::new(&mut SOCKET_STORAGE.take()[..]);
+
+        let dhcp_handle = add_socket(&mut sockets, || dhcpv4::Socket::new());
+
+        let http_handle = add_socket(&mut sockets, || {
+            tcp::Socket::new(tcp::SocketBuffer::new(http_rx_buf), tcp::SocketBuffer::new(http_tx_buf))
+        });
+
+        let slim_handle = add_socket(&mut sockets, || {
+            tcp::Socket::new(tcp::SocketBuffer::new(slim_rx_buf), tcp::SocketBuffer::new(slim_tx_buf))
+        });
+
+        let audio_handle = add_socket(&mut sockets, || {
+            tcp::Socket::new(tcp::SocketBuffer::new(audio_rx_buf), tcp::SocketBuffer::new(audio_tx_buf))
+        });
+
+        // Spec §3.6: two UDP placeholder sockets (LMS discovery / mDNS). Allocated now so the RAM
+        // budget measured from Task 8 on is the real one; never bound, so smoltcp ignores them
+        // until P3 binds them.
+        let udp_placeholder_handles = UDP_BUFFERS.take().each_mut().map(|bufs| {
+            add_socket(&mut sockets, || {
+                udp::Socket::new(
+                    udp::PacketBuffer::new(&mut bufs.rx_meta[..], &mut bufs.rx_payload[..]),
+                    udp::PacketBuffer::new(&mut bufs.tx_meta[..], &mut bufs.tx_payload[..]),
+                )
+            })
+        });
+
+        NetStack {
+            smol_iface,
+            sockets,
+            dhcp_handle,
+            http_handle,
+            slim_handle,
+            audio_handle,
+            udp_placeholder_handles,
+            local_port_counter,
+        }
     }
 
     /// Device entry: bring-up, then the embassy executor that replaces the legacy superloop.
     pub fn run_hardware_firmware() -> ! {
-        let mut socket_storage: [SocketStorage<'static>; SOCKET_SLOTS] =
-            [SocketStorage::EMPTY; SOCKET_SLOTS];
-        // SAFETY: this function never returns (`-> !`, panic = abort) and `socket_storage` is
-        // only reached through the upgraded borrow from here on.
-        #[allow(unsafe_code)]
-        let socket_storage = unsafe { upgrade_never_returning_local(&mut socket_storage) };
-        let mut shared = bring_up(socket_storage);
-        // SAFETY: as above, for the superloop state the core-0 tasks share.
-        #[allow(unsafe_code)]
-        let shared: &'static Shared = unsafe { upgrade_never_returning_local(&mut shared) };
-        crate::tasks::run_core0_executor(shared)
+        crate::tasks::run_core0_executor(bring_up())
     }
 
-    /// Hardware bring-up, in the legacy order, ending in the initial superloop state. Its own
-    /// frame (bring-up temporaries) is released before the executor starts.
+    /// Hardware bring-up, in the legacy order, ending in the initial superloop state (in
+    /// [`SHARED`]). Heavy steps run in `#[inline(never)]` stages that build their results in
+    /// statics, so this frame stays small (see "Boot-stack budget" above).
     #[inline(never)]
-    fn bring_up(socket_storage: &'static mut [SocketStorage<'static>; SOCKET_SLOTS]) -> Shared {
+    fn bring_up() -> &'static Shared {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let peripherals = esp_hal::init(config);
 
@@ -1374,60 +1608,31 @@ mod xtensa_hw {
         let mut pwdn = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
         let fault = Input::new(peripherals.GPIO34, InputConfig::default().with_pull(Pull::None));
 
-        let i2c_cfg = I2cConfig::default().with_frequency(Rate::from_khz(400));
-        let hal_i2c = HalI2c::new(peripherals.I2C0, i2c_cfg)
-            .expect("Failed to initialize I2C0")
-            .with_sda(peripherals.GPIO21)
-            .with_scl(peripherals.GPIO27);
-        let i2c_bus = Esp32I2cBus::new(hal_i2c);
-
-        let i2s_tdm_cfg = TdmConfig::new_tdm_philips()
-            .with_sample_rate(Rate::from_hz(44_100))
-            .with_data_format(DataFormat::Data32Channel32)
-            .with_channels(Channels::STEREO);
-        let mut tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
-        Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
-        let i2s = I2s::new(peripherals.I2S0, peripherals.DMA_I2S0, i2s_tdm_cfg)
-            .expect("Failed to initialize I2S0");
-        let i2s_tx = i2s
-            .i2s_tx
-            .with_bclk(peripherals.GPIO26)
-            .with_ws(peripherals.GPIO25)
-            .with_dout(peripherals.GPIO22)
-            .build();
-        let i2s_transfer = i2s_tx
-            .write(tx_buffer)
-            .expect("Failed to start I2S0 TX streaming DMA");
-        let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
-
-        let uart2_rx = Input::new(peripherals.GPIO36, InputConfig::default().with_pull(Pull::None));
-        let uart2_cfg = UartConfig::default().with_baudrate(460_800);
-        let hal_uart2 = Uart::new(peripherals.UART2, uart2_cfg)
-            .expect("Failed to initialize UART2")
-            .with_tx(peripherals.GPIO4)
-            .with_rx(uart2_rx);
-        let uart2_port = Esp32Uart2Port::new(hal_uart2);
-        let mut cyd_bridge = CydUartBridge::new(uart2_port);
+        let amp = init_amp_i2c(peripherals.I2C0, peripherals.GPIO21, peripherals.GPIO27);
+        let (pipeline, pending_resp_buf, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
+            peripherals.I2S0,
+            peripherals.DMA_I2S0,
+            peripherals.GPIO26,
+            peripherals.GPIO25,
+            peripherals.GPIO22,
+            stream_storage,
+            output_storage,
+        );
+        let cyd_bridge = init_cyd_uart(peripherals.UART2, peripherals.GPIO4, peripherals.GPIO36);
 
         // Execute 5-stage HIL self-verification
         pwdn.set_high();
-        let mut amp = AmpManager::for_active_board(i2c_bus);
-        let _ = amp.initialize(32);
-        let _ = amp.set_volume(VOL_UNITY_0DB);
+        amp_hil_init(amp);
         let _ = fault.is_high();
         wdt.feed();
 
-        let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
-        let (pipeline, pending_resp_buf, http_resp_buf, http_tx_buf) =
-            init_static_pipeline(stream_storage, output_storage, sink);
-        let coordinator = PlayerCoordinator::new(BASEMENT_PLAYER_MAC, "BASEMENT");
+        let coordinator = init_coordinator();
         println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
 
         // Apply saved audio configuration from 0x3F0000 settings partition
         let current_vol_pct = audio_cfg.volume;
         let init_vol_reg = percent_to_attenuation(current_vol_pct);
-        let _ = amp.set_volume(init_vol_reg);
-        let _ = amp.set_analog_gain(audio_cfg.analog_gain_code);
+        amp_apply_boot_config(amp, init_vol_reg, audio_cfg.analog_gain_code);
         pipeline.apply_eq_preset(EqPreset::from_u8(audio_cfg.equalizer_preset));
         pipeline.set_loudness(audio_cfg.loudness_enabled);
         let eff_gain = if current_vol_pct > 0 { 65536 } else { 0 };
@@ -1449,41 +1654,7 @@ mod xtensa_hw {
         };
 
         // Initialize `esp-radio` Wi-Fi Controller & Station Interface
-        let auth_cfg = if wifi_sta_creds.password.is_empty() {
-            AuthenticationMethodConfig::Open
-        } else {
-            match wifi_sta_creds.password.as_str().try_into() {
-                Ok(pw) => AuthenticationMethodConfig::WpaWpa2Personal(pw),
-                Err(_) => esp_hal::system::software_reset(),
-            }
-        };
-        let ssid_cfg = match wifi_sta_creds.ssid.as_str().try_into() {
-            Ok(s) => s,
-            Err(_) => esp_hal::system::software_reset(),
-        };
-        let sta_cfg = WifiModeConfig::Station(
-            StationConfig::default()
-                .with_ssid(ssid_cfg)
-                .with_authentication(auth_cfg)
-                .with_scan_method(esp_radio::wifi::sta::ScanMethod::AllChannels)
-                .with_beacon_timeout(30)
-                .with_failure_retry_cnt(3),
-        );
-        let wifi_cfg = ControllerConfig::default()
-            .with_static_rx_buf_num(6)
-            .with_dynamic_rx_buf_num(16)
-            .with_dynamic_tx_buf_num(16);
-        let mut wifi_controller = match WifiController::new(peripherals.WIFI, wifi_cfg) {
-            Ok(c) => c,
-            Err(_) => esp_hal::system::software_reset(),
-        };
-        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
-        let _ = wifi_controller.set_max_tx_power(52);
-        if wifi_controller.set_config(&sta_cfg).is_err() {
-            esp_hal::system::software_reset();
-        }
-        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
-        let _ = wifi_controller.set_max_tx_power(52);
+        let wifi_controller = init_wifi(peripherals.WIFI, &wifi_sta_creds);
         let mut sta_iface = WifiInterface::station();
         wdt.feed();
 
@@ -1498,62 +1669,28 @@ mod xtensa_hw {
         };
 
         // Initialize `smoltcp` Ethernet Interface + DHCPv4 + TCP Port 80 + TCP SlimProto (3483)
-        let hw_rng = Rng::new();
-        let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
-        let mut smol_cfg = SmolIfaceConfig::new(hw_addr);
-        smol_cfg.random_seed = rng_seed;
-        let local_port_counter: u16 = 49152 + ((hw_rng.random() as u16) & 0x3FFF);
-        let mut smol_dev = SmolDevice {
-            driver: &mut sta_iface,
-        };
-        let smol_iface = SmolInterface::new(
-            smol_cfg,
-            &mut smol_dev,
-            SmolInstant::from_millis(now_millis() as i64),
+        let NetStack {
+            smol_iface,
+            sockets,
+            dhcp_handle,
+            http_handle,
+            slim_handle,
+            audio_handle,
+            udp_placeholder_handles,
+            local_port_counter,
+        } = init_net_stack(
+            &mut sta_iface,
+            sta_mac,
+            [
+                (&mut http_rx_buf[..], &mut http_tx_buf[..]),
+                (&mut slim_rx_buf[..], &mut slim_tx_buf[..]),
+                (&mut audio_rx_buf[..], &mut audio_tx_buf[..]),
+            ],
         );
-
-        let mut sockets = SocketSet::new(&mut socket_storage[..]);
-
-        let dhcp_socket = dhcpv4::Socket::new();
-        let dhcp_handle = sockets.add(dhcp_socket);
-
-        let http_socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(&mut http_rx_buf[..]),
-            tcp::SocketBuffer::new(&mut http_tx_buf[..]),
-        );
-        let http_handle = sockets.add(http_socket);
-
-        let slim_socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(&mut slim_rx_buf[..]),
-            tcp::SocketBuffer::new(&mut slim_tx_buf[..]),
-        );
-        let slim_handle = sockets.add(slim_socket);
-
-        let audio_socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(&mut audio_rx_buf[..]),
-            tcp::SocketBuffer::new(&mut audio_tx_buf[..]),
-        );
-        let audio_handle = sockets.add(audio_socket);
-
-        // Spec §3.6: two UDP placeholder sockets (LMS discovery / mDNS). Allocated now so the RAM
-        // budget measured from Task 8 on is the real one; never bound, so smoltcp ignores them
-        // until P3 binds them.
-        let udp_placeholder_handles = take_udp_placeholder_buffers().each_mut().map(|bufs| {
-            sockets.add(udp::Socket::new(
-                udp::PacketBuffer::new(&mut bufs.rx_meta[..], &mut bufs.rx_payload[..]),
-                udp::PacketBuffer::new(&mut bufs.tx_meta[..], &mut bufs.tx_payload[..]),
-            ))
-        });
 
         let boot_ms = now_millis();
-        let mut latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry> = None;
         pipeline.sink.driver.pump_silence_if_needed(false, false);
-        let _ = amp.clear_faults();
-        let _ = amp.start_playback_via_hiz();
-        if let Ok(telem) = amp.read_telemetry() {
-            latest_telemetry = telem;
-        }
+        let latest_telemetry = amp_start_playback(amp);
 
         // ====================================================================
         // GATE 3 & GATE 4: Non-Blocking Runtime Loop with 45s/60s Dead-Man
@@ -1561,7 +1698,7 @@ mod xtensa_hw {
         // The loop body now runs as the embassy phase ring in `tasks.rs`; this is
         // its initial state (the legacy pre-loop `let mut` initializers).
         // ====================================================================
-        Shared::new(FirmwareState {
+        SHARED.init(Shared::new(FirmwareState {
             wdt,
             flash,
             core1,
@@ -1634,7 +1771,7 @@ mod xtensa_hw {
             now_ms: 0,
             step_frames: 0,
             tick_playing: false,
-        })
+        }))
     }
 }
 

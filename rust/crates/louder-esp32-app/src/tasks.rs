@@ -51,11 +51,14 @@
 //!
 //! # Memory
 //!
-//! [`FirmwareState`] lives in the frame of `run_hardware_firmware`, which never returns (the
-//! core-0 main stack, where the superloop locals lived), not in `.bss`. The new statics are the
-//! task arenas, the executor cell(s), the ring signals and the UDP placeholder buffers; every
-//! byte of them comes out of the core-0 `.stack` section (it is the remainder of `dram_seg`
-//! after `.data`/`.bss`), which is why they are kept to the minimum (sizes in the Task 8 report).
+//! The stack gate is headroom-based (Task 8 ruling): core-0 stack headroom at the boot peak and
+//! in steady state must stay at or above e5b44cd's. `.stack` is the remainder of `dram_seg`
+//! after `.data`/`.bss`, so a static costs the same RAM as a permanent stack slot; what matters
+//! is what sits on the stack under the deepest callees. Hence [`FirmwareState`] and the large
+//! values it points at (amp, CYD bridge, coordinator, smoltcp interface + sockets, UDP
+//! placeholder buffers) are built in place in statics by small `#[inline(never)]` bring-up
+//! stages in `main.rs`, and each legacy block runs in its own `#[inline(never)]` frame. The
+//! per-frame accounting is in the Task 8 report.
 #![cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -272,7 +275,9 @@ mod device {
     use static_cell::StaticCell;
 
     /// Every local of the legacy superloop, plus the hardware it drove. Field names are the
-    /// legacy local names so the moved blocks read the same as before (`x` became `s.x`).
+    /// legacy local names so the moved blocks read the same as before (`x` became `s.x`). The
+    /// large members are `&'static mut` into statics built in place during bring-up, which keeps
+    /// the boot stack within budget (see the module docs).
     pub(crate) struct FirmwareState {
         // --- hardware kept alive for the life of the firmware ---
         pub(crate) wdt: Wdt<esp_hal::peripherals::TIMG0<'static>>,
@@ -282,7 +287,7 @@ mod device {
         pub(crate) _fault: Input<'static>,
         pub(crate) wifi_controller: WifiController<'static>,
         pub(crate) sta_iface: WifiInterface,
-        pub(crate) smol_iface: SmolInterface,
+        pub(crate) smol_iface: &'static mut SmolInterface,
         pub(crate) sockets: SocketSet<'static>,
         pub(crate) dhcp_handle: SocketHandle,
         pub(crate) http_handle: SocketHandle,
@@ -293,10 +298,10 @@ mod device {
         pub(crate) bt_periph: Option<esp_hal::peripherals::BT<'static>>,
         pub(crate) bt_transport: Option<Esp32VhciTransport<'static>>,
         pub(crate) bt_sink: &'static mut BtA2dpSink,
-        pub(crate) amp: AmpManager<Esp32I2cBus<'static>>,
-        pub(crate) cyd_bridge: CydUartBridge<Esp32Uart2Port<'static>>,
+        pub(crate) amp: &'static mut AmpManager<Esp32I2cBus<'static>>,
+        pub(crate) cyd_bridge: &'static mut CydUartBridge<Esp32Uart2Port<'static>>,
         pub(crate) pipeline: &'static mut HwStreamPipeline,
-        pub(crate) coordinator: PlayerCoordinator,
+        pub(crate) coordinator: &'static mut PlayerCoordinator,
         // --- static buffers ---
         pub(crate) settings_scratch: &'static mut [u8; 4096],
         pub(crate) pending_resp_buf: &'static mut [u8; 2064],
