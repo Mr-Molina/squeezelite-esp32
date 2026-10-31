@@ -89,6 +89,9 @@ pub enum FadeMode {
     Out,
     /// C `FADE_INOUT`.
     InOut,
+    /// Any other `transition_type - '0'`: C stores it and no `_checkfade` branch matches, so
+    /// it arms nothing.
+    Other,
 }
 
 /// C `fade_state` (`squeezelite.h:659`).
@@ -641,6 +644,17 @@ mod tests {
                 (164, 36, ChunkGain::Fade(to_gain(0.64))),
             ]
         );
+    }
+
+    #[test]
+    fn test_other_transition_values_arm_nothing() {
+        // C keeps any `transition_type - '0'`; no _checkfade branch matches it.
+        let mut e = FadeEngine::new();
+        e.configure(FadeMode::Other, 5);
+        assert_eq!(e.check_fade(true, 0, 1 << 20, 44_100, 44_100), None);
+        assert_eq!(e.check_fade(true, 100, 1 << 20, 44_100, 44_100), None);
+        assert_eq!(e.check_fade(false, 100, 1 << 20, 44_100, 44_100), None);
+        assert_eq!(e.state(), FadeState::Inactive);
     }
 
     #[test]

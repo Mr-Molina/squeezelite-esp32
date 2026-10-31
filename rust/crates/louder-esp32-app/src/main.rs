@@ -1092,6 +1092,8 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).mp3_spare).write(Some(take_static_mp3_decoder()));
             core::ptr::addr_of_mut!((*ptr).boundary)
                 .write(louder_esp32_app::pipeline::TrackBoundary::new(44_100));
+            core::ptr::addr_of_mut!((*ptr).fade)
+                .write(squeezelite_audio_core::FadeEngine::new());
 
             let http_resp_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_RESP_BUF)).as_mut_ptr();
             http_resp_ptr.write_bytes(0, 1);

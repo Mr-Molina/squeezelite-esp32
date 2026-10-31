@@ -23,7 +23,7 @@ use squeezelite_decoders::{DecoderError, PcmDecoder};
 use squeezelite_proto::{
     build_capabilities, sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason,
     Endianness, ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
-    StreamCommandType, SQUEEZENETWORK_MARKER_IP, STRM_FLAG_SERVER_REBOOT, SYNCGROUP_ID_LEN,
+    StreamCommandType, TransitionType, SQUEEZENETWORK_MARKER_IP, STRM_FLAG_SERVER_REBOOT, SYNCGROUP_ID_LEN,
 };
 
 use crate::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
@@ -31,7 +31,7 @@ use crate::config_handle::ConfigHandle;
 use crate::io_traits::{
     AudioBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
-use crate::pipeline::{ActiveDecoder, StreamPipeline};
+use crate::pipeline::{ActiveDecoder, FadeMode, StreamPipeline};
 
 /// Size of the stack buffer [`PlayerCoordinator::tick`] receives one server frame into. A larger
 /// frame is dropped by the transport (reported as [`TransportError::Io`] and skipped).
@@ -114,6 +114,22 @@ enum StreamLink {
     Open,
 }
 
+/// C `output.fade_mode = strm->transition_type - '0'` (`slimproto.c:486`): '1' crossfade, '2'
+/// fade in, '3' fade out, '4' fade in and out; any other value is kept and arms nothing.
+///
+/// The variants map one to one, in declaration order, so this compiles to no lookup table
+/// (esp-hal links switch tables into DRAM `.data`, which comes out of the core-0 stack).
+fn fade_mode_from_strm(transition: TransitionType) -> FadeMode {
+    match transition {
+        TransitionType::None => FadeMode::None,
+        TransitionType::Crossfade => FadeMode::Cross,
+        TransitionType::FadeIn => FadeMode::In,
+        TransitionType::FadeOut => FadeMode::Out,
+        TransitionType::FadeInOut => FadeMode::InOut,
+        TransitionType::Unknown(_) => FadeMode::Other,
+    }
+}
+
 /// The `strm s` fields [`PlayerCoordinator::start_stream`] uses.
 struct StartParams<'a> {
     autostart: AutostartMode,
@@ -128,6 +144,10 @@ struct StartParams<'a> {
     output_threshold: u8,
     /// C `output.next_replay_gain` (16.16 fixed point).
     replay_gain: u32,
+    /// C `output.fade_mode` (`transition_type - '0'`).
+    fade_mode: FadeMode,
+    /// C `output.fade_secs` (`transition_period`).
+    fade_secs: u8,
     server_port: u16,
     server_ip: [u8; 4],
     http_headers: &'a [u8],
@@ -792,6 +812,8 @@ impl PlayerCoordinator {
         self.decode_running = false;
         self.decode_ready = false;
         self.pending_not_supported = true;
+        // C decode.c:103 runs `_checkfade(false)` for DECODE_ERROR as for DECODE_COMPLETE.
+        pipeline.fade_track_end();
         pipeline.stream_buffer.flush();
         if !self.output_started {
             self.state = PlayerState::Stopped;
@@ -949,8 +971,8 @@ impl PlayerCoordinator {
                 pcm_endianness,
                 threshold_kb,
                 spdif_enable: _,
-                trans_duration: _,
-                trans_type: _,
+                trans_duration,
+                trans_type,
                 flags,
                 output_threshold,
                 replay_gain,
@@ -971,6 +993,8 @@ impl PlayerCoordinator {
                             threshold_kb,
                             output_threshold,
                             replay_gain,
+                            fade_mode: fade_mode_from_strm(trans_type),
+                            fade_secs: trans_duration,
                             server_port,
                             server_ip,
                             http_headers,
@@ -1245,6 +1269,9 @@ impl PlayerCoordinator {
             .unwrap_or_else(|| sample_rate_from_index(p.pcm_sample_rate));
         // C slimproto.c:484-485: output.threshold and next_replay_gain for the new track.
         pipeline.begin_stream(rate_hint, p.replay_gain, p.output_threshold);
+        // C slimproto.c:486-488: fade_mode, fade_secs and invert for the new track. They arm
+        // fades at its first decoded frames and at the end of its decoding.
+        pipeline.set_transition(p.fade_mode, u32::from(p.fade_secs), p.flags & 0x03 == 0x03);
         // Nothing of an earlier track left to play (or another source's audio, which LMS
         // replaces): the clock can switch now, and the frame counters start at 0
         // (COORD-506/509; C resets them at the track start, which then comes first).
@@ -1615,6 +1642,8 @@ impl PlayerCoordinator {
             self.decode_running = false;
             self.decode_complete_sent = true;
             self.pending_decode_ready = true;
+            // C decode.c:103: `if (output.fade_mode) _checkfade(false)` (fade-out, in-out).
+            pipeline.fade_track_end();
         }
 
         // C slimproto.c:872-879: output RUNNING and empty, stream <= DISCONNECT, decode
@@ -4250,6 +4279,39 @@ mod tests {
                 "STAT:STMu",
             ]
         );
+    }
+
+    #[test]
+    fn test_strm_s_transition_and_invert_fade_out_at_decode_complete() {
+        use squeezelite_audio_core::fade::{FadeDir, FadeState};
+        let mut rig = gapless_rig(&[track_bytes(1, 600)]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+        let mut frame = strm_start(1, b'3', true);
+        // strm payload (after the 8-byte header): [9] transition_period, [10] transition_type,
+        // [11] flags. C slimproto.c:486-488: fade out, 1 s, invert ((flags & 0x03) == 0x03).
+        frame[8 + 9] = 1;
+        frame[8 + 10] = b'3';
+        frame[8 + 11] = 0x03;
+        rig.command(&mut p, &frame, now);
+        assert_eq!(p.fade.mode(), FadeMode::Out);
+        assert!(p.boundary.invert);
+        assert_eq!(p.fade.state(), FadeState::Inactive, "fade out arms nothing at the start");
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| count(&r.lines(), "STAT:STMd") == 1);
+        // C decode.c:103 `_checkfade(false)`: down over the last min(unread, 1 s) frames.
+        assert_ne!(p.fade.state(), FadeState::Inactive);
+        assert_eq!(p.fade.dir(), FadeDir::Down);
+        let dur = p.fade.duration_frames() as usize;
+        assert!(dur > 64 && dur < 600, "{dur}");
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| count(&r.lines(), "STAT:STMu") == 1);
+        let left: Vec<i32> = p.sink.samples.iter().step_by(2).copied().collect();
+        assert_eq!(left.len(), 600);
+        // Inverted throughout (track 1's left samples are positive).
+        assert!(left.iter().all(|&v| v < 0));
+        // Unfaded before the fade, attenuated at its end.
+        assert_eq!(left[600 - dur - 1], -((1000 + 599 - dur as i32) << 16));
+        assert!(left[599] > -((1599 << 16) / 2), "{}", left[599]);
     }
 
     #[test]

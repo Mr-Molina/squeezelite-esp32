@@ -757,6 +757,8 @@ mod device {
                     if !s.bt_audio_active {
                         // A replaced MP3 decoder is parked by `set_decoder` for the next track.
                         s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                        // C arms fades only from LMS codecs (`_checkfade`); Bluetooth gets none.
+                        s.pipeline.stop_fades();
                         s.pipeline.set_mute(false);
                         s.coordinator.begin_external_playback();
                         if s.amp.mode() != louder_esp32_app::AmpMode::Play {
