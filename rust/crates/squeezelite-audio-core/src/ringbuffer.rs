@@ -157,6 +157,32 @@ impl<'a> AudioRingBuffer<'a> {
         self.flush_internal();
     }
 
+    /// Discards the newest unread bytes so that only the oldest `keep` unread bytes remain:
+    /// the write position moves back to `keep` bytes past the read position. Returns the
+    /// number of bytes discarded; `keep >= available_read()` is a no-op.
+    ///
+    /// This is C squeezelite's `outputbuf->writep = output.track_start` (`output.c:466`): drop
+    /// what was written after a track boundary that playback has not reached.
+    ///
+    /// It takes `&mut self`, so it cannot run while [`Self::split`] handles exist. A concurrent
+    /// consumer may already have loaded the old write position and be copying out of the
+    /// region this frees, which the producer would then overwrite, so the operation is not
+    /// offered on [`Producer`]. With exclusive access it only shortens the unread region:
+    /// - the read position, and the already-read bytes behind it that
+    ///   [`Self::rewind_read`] may restore, are untouched;
+    /// - the new write position lies inside the old unread region, so every byte still
+    ///   unread was written before and stays readable in order.
+    pub fn truncate_unread(&mut self, keep: usize) -> usize {
+        let avail = self.available_read();
+        if keep >= avail {
+            return 0;
+        }
+        let r = self.read_pos.load(Ordering::Acquire);
+        let new_w = (r + keep) % self.capacity;
+        self.write_pos.store(new_w, Ordering::Release);
+        avail - keep
+    }
+
     /// Splits the ringbuffer into disjoint Producer and Consumer handles (CONC-001).
     pub fn split(&mut self) -> (Producer<'_, 'a>, Consumer<'_, 'a>) {
         (
@@ -517,5 +543,86 @@ mod tests {
         assert_eq!(consumer.available_read(), 4);
         consumer.flush();
         assert_eq!(consumer.available_read(), 0);
+    }
+
+    fn read_all(rb: &mut AudioRingBuffer<'_>) -> std::vec::Vec<u8> {
+        let mut out = std::vec![0u8; rb.available_read()];
+        if !out.is_empty() {
+            rb.read(&mut out).unwrap();
+        }
+        out
+    }
+
+    extern crate std;
+
+    #[test]
+    fn test_truncate_unread_keeps_oldest_bytes_and_writes_continue_after_them() {
+        let mut storage = [0u8; 16];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(b"currentNEXT").unwrap();
+        assert_eq!(rb.truncate_unread(7), 4);
+        assert_eq!(rb.available_read(), 7);
+        assert_eq!(rb.available_write(), 8);
+        // The next write lands right after the kept bytes.
+        rb.write(b"more").unwrap();
+        assert_eq!(read_all(&mut rb), b"currentmore");
+    }
+
+    #[test]
+    fn test_truncate_unread_no_op_when_keep_covers_all_unread() {
+        let mut storage = [0u8; 16];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(b"abcdef").unwrap();
+        assert_eq!(rb.truncate_unread(6), 0);
+        assert_eq!(rb.truncate_unread(usize::MAX), 0);
+        assert_eq!(read_all(&mut rb), b"abcdef");
+        // Empty ring: nothing to discard either.
+        assert_eq!(rb.truncate_unread(0), 0);
+        assert_eq!(rb.available_read(), 0);
+    }
+
+    #[test]
+    fn test_truncate_unread_across_wrap() {
+        let mut storage = [0u8; 8];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(b"xxxxx").unwrap();
+        let mut skip = [0u8; 5];
+        rb.read(&mut skip).unwrap();
+        // read = write = 5; 7 bytes wrap the end of storage.
+        rb.write(b"ABCdefg").unwrap();
+        assert_eq!(rb.truncate_unread(3), 4);
+        assert_eq!(rb.available_read(), 3);
+        rb.write(b"1234").unwrap();
+        assert_eq!(read_all(&mut rb), b"ABC1234");
+    }
+
+    #[test]
+    fn test_truncate_unread_preserves_rewindable_history() {
+        let mut storage = [0u8; 16];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(b"0123").unwrap();
+        let mut out = [0u8; 4];
+        rb.read(&mut out).unwrap();
+        rb.write(b"next").unwrap();
+        // Drop everything unread; the 4 bytes already read are still behind the read position.
+        assert_eq!(rb.truncate_unread(0), 4);
+        assert_eq!(rb.available_read(), 0);
+        rb.rewind_read(4);
+        assert_eq!(read_all(&mut rb), b"0123");
+    }
+
+    #[test]
+    fn test_truncate_unread_never_exposes_unwritten_bytes_to_rewind() {
+        let mut storage = [0xEEu8; 8];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(b"abcdefg").unwrap();
+        let mut out = [0u8; 2];
+        rb.read(&mut out).unwrap();
+        rb.truncate_unread(1);
+        // Write into the freed region, then rewind as far as allowed: only the 2 bytes read
+        // ("ab") come back, never stale or overwritten storage.
+        rb.write(b"XYZ").unwrap();
+        rb.rewind_read(usize::MAX);
+        assert_eq!(read_all(&mut rb), b"abcXYZ");
     }
 }
