@@ -108,13 +108,21 @@ impl<'a> AudioRingBuffer<'a> {
 
     /// Peeks data from the ringbuffer without advancing the read pointer.
     pub fn peek(&self, dst: &mut [u8]) -> usize {
+        self.peek_at(0, dst)
+    }
+
+    /// Peeks unread data starting `offset` bytes past the read position, without advancing
+    /// the read pointer. Returns the bytes copied (0 when `offset` is at or past the unread
+    /// data). The fade engine reads a crossfade's new-track samples this way (C `cross_ptr`,
+    /// `output.c:245`, `output_pack.c:366-376`).
+    pub fn peek_at(&self, offset: usize, dst: &mut [u8]) -> usize {
         let avail = self.available_read();
-        if avail == 0 {
+        if offset >= avail {
             return 0;
         }
 
-        let to_peek = core::cmp::min(dst.len(), avail);
-        let r = self.read_pos.load(Ordering::Relaxed);
+        let to_peek = core::cmp::min(dst.len(), avail - offset);
+        let r = (self.read_pos.load(Ordering::Relaxed) + offset) % self.capacity;
 
         let data_to_end = self.capacity - r;
         if to_peek <= data_to_end {
@@ -554,6 +562,37 @@ mod tests {
     }
 
     extern crate std;
+
+    #[test]
+    fn test_peek_at_reads_from_an_offset_without_consuming() {
+        let mut storage = [0u8; 8];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(&[1, 2, 3, 4, 5]).unwrap();
+        let mut dst = [0u8; 4];
+        assert_eq!(rb.peek_at(2, &mut dst), 3);
+        assert_eq!(&dst[..3], &[3, 4, 5]);
+        assert_eq!(rb.available_read(), 5);
+        // Past the unread bytes: nothing.
+        assert_eq!(rb.peek_at(5, &mut dst), 0);
+        assert_eq!(rb.peek_at(50, &mut dst), 0);
+    }
+
+    #[test]
+    fn test_peek_at_across_wrap() {
+        let mut storage = [0u8; 8];
+        let mut rb = AudioRingBuffer::new(&mut storage);
+        rb.write(&[0; 6]).unwrap();
+        rb.consume(6);
+        rb.write(&[10, 11, 12, 13, 14, 15]).unwrap(); // bytes 6, 7, then 0..4
+        let mut dst = [0u8; 3];
+        assert_eq!(rb.peek_at(1, &mut dst), 3);
+        assert_eq!(dst, [11, 12, 13]);
+        assert_eq!(rb.peek_at(3, &mut dst), 3);
+        assert_eq!(dst, [13, 14, 15]);
+        let mut all = [0u8; 6];
+        assert_eq!(rb.peek(&mut all), 6);
+        assert_eq!(all, [10, 11, 12, 13, 14, 15]);
+    }
 
     #[test]
     fn test_truncate_unread_keeps_oldest_bytes_and_writes_continue_after_them() {
