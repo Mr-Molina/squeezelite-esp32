@@ -375,9 +375,9 @@ impl<'a> ServerCommand<'a> {
 
     /// Extracts `(server_ip, syncgroup)` if this command is a `serv` frame.
     ///
-    /// C parity (`slimproto.c:651-666`): the syncgroup is the tail after the IPv4 address only
+    /// C parity (`slimproto.c:641-656`): the syncgroup is the tail after the IPv4 address only
     /// when it is exactly [`SYNCGROUP_ID_LEN`] bytes; any other tail means "no syncgroup" (C
-    /// frees `new_server_cap`). `0.0.0.1` is C's SqueezeNetwork marker (`slimproto.c:645`); it
+    /// frees `new_server_cap`). `0.0.0.1` is C's SqueezeNetwork marker (`slimproto.c:633-634`); it
     /// is returned as is for the caller to decide.
     pub fn switch_server(&self) -> Option<([u8; 4], Option<&'a [u8]>)> {
         match *self {
@@ -1032,20 +1032,20 @@ impl SlimprotoBuilder {
     }
 }
 
-/// Length of a `serv` SyncgroupID (C `slimproto.c:651`: `len - sizeof(serv_packet) == 10`).
+/// Length of a `serv` SyncgroupID (C `slimproto.c:641`: `len - sizeof(serv_packet) == 10`).
 pub const SYNCGROUP_ID_LEN: usize = 10;
 
-/// `serv` address that C maps to SqueezeNetwork (`slimproto.c:645`, `pkt[4..8] == 0.0.0.1`).
+/// `serv` address that C maps to SqueezeNetwork (`slimproto.c:633-634`, `pkt[4..8] == 0.0.0.1`).
 pub const SQUEEZENETWORK_MARKER_IP: [u8; 4] = [0, 0, 0, 1];
 
 /// Writes the `HELO` capability string.
 ///
-/// C builds it from three parts (`sendHELO`, `slimproto.c:128-178`):
+/// C builds it from three parts (`sendHELO`, `slimproto.c:128-185`):
 /// * `base_cap` (`embedded.h:47-49`): `Model=squeezeesp32,AccuratePlayPoints=1,HasDigitalOut=1,
 ///   HasPolarityInversion=1,Balance=1,Depth=<16|32>,Firmware=<VERSION>`;
 /// * `fixed_cap` (`slimproto.c:1068-1082`): `,ModelName=<model>,MaxSampleRate=<rate>` and one
 ///   `,<types>` per registered codec;
-/// * `var_cap` (`slimproto.c:1155-1168`): `,loc` for a local player and the `serv`
+/// * `var_cap` (`slimproto.c:1157-1174`): `,loc` for a local player and the `serv`
 ///   `,SyncgroupID=<10 chars>`, used for one `HELO` only.
 ///
 /// This writes the same fields in the same order, minus the ones the Rust firmware cannot back
@@ -1076,11 +1076,11 @@ pub fn build_capabilities<W: fmt::Write>(
 /// Delay before reconnecting after the server connection dropped, for the `attempt`-th
 /// consecutive drop (0 = first), with `seed` as the random source.
 ///
-/// C parity (MK5, `slimproto.c:1183-1192`): `reconnect_delay` starts at 1 s and doubles after
+/// C parity (MK5, `slimproto.c:1196-1203`): `reconnect_delay` starts at 1 s and doubles after
 /// every drop, capped at 30 s; the delay is `reconnect_delay * 1000 + rand() % 1000` ms. So the
 /// sequence is 1, 2, 4, 8, 16, 30, 30, ... s plus 0..999 ms of jitter. (The caller resets
-/// `attempt` to 0 after a session that lasted over 30 s, `slimproto.c:1179-1181`, and after a
-/// `serv` switch, `slimproto.c:1104`.)
+/// `attempt` to 0 after a session that lasted over 30 s, `slimproto.c:1191-1193`, and after a
+/// `serv` switch, `slimproto.c:1103`.)
 pub fn next_backoff_ms(attempt: u32, seed: u32) -> u32 {
     const CAP_S: u32 = 30;
     let base_s = if attempt >= 5 { CAP_S } else { (1u32 << attempt).min(CAP_S) };
@@ -1936,7 +1936,7 @@ mod tests {
     #[test]
     fn test_capabilities_string_exact() {
         // C parity: base_cap (embedded.h:47-49) + fixed_cap (slimproto.c:1068-1082) + var_cap
-        // (slimproto.c:1165-1168), minus what the Rust firmware cannot do yet.
+        // (slimproto.c:1171-1174), minus what the Rust firmware cannot do yet.
         let mut caps = CapBuf::new();
         build_capabilities("SqueezeESP32", "v0.1.0", 96_000, None, "flc,pcm,wav,aif,mp3", &mut caps)
             .unwrap();
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_backoff_sequence_capped_with_jitter() {
-        // C parity (slimproto.c:1183-1192): delay = reconnect_delay s + rand() % 1000 ms,
+        // C parity (slimproto.c:1196-1203): delay = reconnect_delay s + rand() % 1000 ms,
         // reconnect_delay 1, 2, 4, 8, 16, then capped at 30 s.
         let bases = [1_000u32, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
         for (attempt, &base) in bases.iter().enumerate() {
@@ -1990,7 +1990,7 @@ mod tests {
 
     #[test]
     fn test_serv_syncgroup_only_when_exactly_ten_bytes() {
-        // C parity (slimproto.c:651-666): a 10-byte tail is the SyncgroupID, anything else
+        // C parity (slimproto.c:641-656): a 10-byte tail is the SyncgroupID, anything else
         // clears it.
         let mut frame = b"serv\0\0\0\x0e".to_vec();
         frame.extend_from_slice(&[10, 0, 0, 5]);

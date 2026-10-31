@@ -649,20 +649,22 @@ fn write_authority(out: &mut Vec<u8>, addr: NetAddr) {
 }
 
 /// Reconnect policy of the LMS control connection: C `slimproto()`'s connect loop
-/// (`slimproto.c:1086-1213`, MK5 backoff), driven by the device's connection upkeep.
+/// (`slimproto.c:1094-1213`, MK5 backoff), driven by the device's connection upkeep.
 ///
 /// * A session (connected, `HELO` sent) that drops waits
 ///   [`squeezelite_proto::next_backoff_ms`]: 1, 2, 4, 8, 16, then 30 s plus up to 999 ms of
 ///   jitter, with the doubling reset after a session that lasted over 30 s
-///   (`slimproto.c:1176-1197`). Every later `HELO` carries the reconnect flag
-///   (`slimproto.c:1173-1175`).
-/// * A connect that fails waits 5 s (`slimproto.c:1132-1135`), except after a `serv` switch,
-///   where it falls back to the previous server at once (`slimproto.c:1127-1131`).
-/// * A `serv` switch connects to the new server at once, with the reconnect flag and the
-///   backoff cleared (`slimproto.c:1098-1105`).
+///   (`slimproto.c:1187-1203`). Every later `HELO` carries the reconnect flag
+///   (`slimproto.c:1187-1189`).
+/// * A connect that fails waits 5 s (`slimproto.c:1133-1134`), except after a `serv` switch,
+///   where it falls back to the previous server at once (`slimproto.c:1129-1131`).
+/// * A `serv` ends the session like a drop: C's `slimproto_run` loop exits on `new_server`
+///   (`slimproto.c:708`) and the post-session code still runs (reconnect flag, long-session
+///   reset, backoff delay with jitter, `slimproto.c:1187-1210`). Only then does the loop top
+///   switch servers, clearing the reconnect flag and the backoff (`slimproto.c:1096-1103`).
 ///
 /// Not ported: C rediscovers the server after `MAX_SERVER_RETRIES` failed connects
-/// (`slimproto.c:1137-1142`); this firmware has no discovery until Phase 3.
+/// (`slimproto.c:1137-1147`); this firmware has no discovery until Phase 3.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SlimReconnect {
     attempt: u32,
@@ -676,7 +678,7 @@ pub struct SlimReconnect {
 impl SlimReconnect {
     /// Delay after a failed connect (C `sleep(5)`).
     pub const CONNECT_FAILED_DELAY_MS: u64 = 5_000;
-    /// A session longer than this resets the backoff (C `slimproto.c:1179`).
+    /// A session longer than this resets the backoff (C `slimproto.c:1191`).
     pub const LONG_SESSION_MS: u64 = 30_000;
 
     pub const fn new() -> Self {
@@ -714,15 +716,7 @@ impl SlimReconnect {
     /// The connection is gone (closed, reset, refused or timed out). Returns the server to
     /// fall back to when the connect to a `serv` target failed.
     pub fn link_down(&mut self, now_ms: u64, seed: u32) -> Option<[u8; 4]> {
-        if let Some(start) = self.session_start_ms.take() {
-            self.connecting = false;
-            self.reconnect = true;
-            if now_ms.saturating_sub(start) > Self::LONG_SESSION_MS {
-                self.attempt = 0;
-            }
-            let delay = squeezelite_proto::next_backoff_ms(self.attempt, seed);
-            self.retry_at_ms = now_ms + u64::from(delay);
-            self.attempt = self.attempt.saturating_add(1);
+        if self.end_session(now_ms, seed) {
             self.previous_ip = None;
             return None;
         }
@@ -741,9 +735,35 @@ impl SlimReconnect {
         }
     }
 
-    /// `serv`: switch away from `current_ip` now.
-    pub fn server_switch(&mut self, now_ms: u64, current_ip: [u8; 4]) {
-        *self = Self { previous_ip: Some(current_ip), retry_at_ms: now_ms, ..Self::new() };
+    /// C's post-session code (`slimproto.c:1187-1210`) for a session that was up: reconnect
+    /// flag set (`:1187-1189`), backoff reset after a session over 30 s (`:1191-1193`), then
+    /// the `reconnect_delay` s + jitter wait and the doubling (`:1196-1203`). Returns `false`
+    /// when no session was up.
+    fn end_session(&mut self, now_ms: u64, seed: u32) -> bool {
+        let Some(start) = self.session_start_ms.take() else {
+            return false;
+        };
+        self.connecting = false;
+        self.reconnect = true;
+        if now_ms.saturating_sub(start) > Self::LONG_SESSION_MS {
+            self.attempt = 0;
+        }
+        let delay = squeezelite_proto::next_backoff_ms(self.attempt, seed);
+        self.retry_at_ms = now_ms + u64::from(delay);
+        self.attempt = self.attempt.saturating_add(1);
+        true
+    }
+
+    /// `serv`: leave the session to `current_ip`. C parity: the session ends like a drop and
+    /// waits the same post-session delay (`slimproto.c:708`, `1187-1210`); the server switch
+    /// at the loop top then clears the reconnect flag and the backoff (`slimproto.c:1096-1103`)
+    /// and remembers `current_ip` to fall back to (`slimproto.c:1097`, `1129-1131`).
+    pub fn server_switch(&mut self, now_ms: u64, current_ip: [u8; 4], seed: u32) {
+        self.end_session(now_ms, seed);
+        self.attempt = 0;
+        self.reconnect = false;
+        self.connecting = false;
+        self.previous_ip = Some(current_ip);
     }
 }
 
@@ -790,15 +810,50 @@ mod reconnect_tests {
         assert_eq!(r.link_down(6_000, 0), None);
         assert!(r.may_connect(6_000));
 
-        // serv: connect at once, reconnect flag cleared, fall back if the target is dead.
+        // A connect to a serv target that fails falls back to the previous server at once.
         r.connect_started();
         r.session_up(7_000);
-        r.link_down(8_000, 0);
-        assert!(r.reconnect_flag());
-        r.server_switch(8_001, [10, 0, 0, 1]);
-        assert!(r.may_connect(8_001) && !r.reconnect_flag());
+        r.server_switch(8_000, [10, 0, 0, 1], 0);
+        let at = (8_000..20_000).find(|&t| r.may_connect(t)).unwrap();
         r.connect_started();
-        assert_eq!(r.link_down(9_000, 0), Some([10, 0, 0, 1]));
-        assert!(r.may_connect(9_000));
+        assert_eq!(r.link_down(at + 500, 0), Some([10, 0, 0, 1]));
+        assert!(r.may_connect(at + 500));
+    }
+
+    #[test]
+    fn test_serv_switch_waits_the_post_session_backoff() {
+        // C parity: serv makes slimproto_run exit (slimproto.c:708), the post-session code
+        // waits reconnect_delay s + rand()%1000 ms (slimproto.c:1196-1210), and only then the
+        // loop top switches server, clearing reconnect and the backoff (slimproto.c:1096-1103).
+        let mut r = SlimReconnect::new();
+        // Two short sessions dropped: the backoff is at 4 s.
+        for t in [0u64, 10_000] {
+            r.connect_started();
+            r.session_up(t);
+            r.link_down(t + 1_000, 0);
+        }
+        r.connect_started();
+        r.session_up(40_000);
+        r.server_switch(41_000, [10, 0, 0, 9], 123);
+        assert!(!r.may_connect(41_000 + 4_122), "4 s + 123 ms jitter, as C's state dictates");
+        assert!(r.may_connect(41_000 + 4_123));
+        assert!(!r.reconnect_flag(), "HELO to the new server is not a reconnect");
+        // The backoff starts over for the new server.
+        r.connect_started();
+        r.session_up(50_000);
+        r.link_down(51_000, 0);
+        assert!(r.may_connect(52_000) && !r.may_connect(51_999));
+
+        // A session over 30 s resets the delay before the switch (slimproto.c:1191-1193).
+        let mut r = SlimReconnect::new();
+        for t in [0u64, 10_000, 20_000] {
+            r.connect_started();
+            r.session_up(t);
+            r.link_down(t + 1_000, 0);
+        }
+        r.connect_started();
+        r.session_up(100_000);
+        r.server_switch(140_000, [10, 0, 0, 9], 0);
+        assert!(r.may_connect(141_000) && !r.may_connect(140_999));
     }
 }

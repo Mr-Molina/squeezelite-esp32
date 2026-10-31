@@ -1129,11 +1129,12 @@ mod device {
             return;
         };
         let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-        // C parity (slimproto.c:780, 1098-1105): `serv` ends the session and connects to the
-        // new server at once.
+        // C parity: `serv` ends the session (`slimproto_run` exits on `new_server`,
+        // slimproto.c:708), the post-session backoff delay runs (slimproto.c:1187-1210), and
+        // only then the new server is connected (slimproto.c:1096-1103): `SlimReconnect`.
         if let Some(ip) = s.slim_switch_to.take() {
             slim_sock.abort();
-            s.slim_reconnect.server_switch(now_ms, s.lms_ip);
+            s.slim_reconnect.server_switch(now_ms, s.lms_ip, backoff_seed(now_ms));
             s.slim_was_open = false;
             s.helo_sent = false;
             s.lms_ip = ip;
@@ -1157,8 +1158,7 @@ mod device {
         let open = slim_sock.is_open();
         if s.slim_was_open && !open {
             s.helo_sent = false;
-            let seed = (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32;
-            if let Some(previous) = s.slim_reconnect.link_down(now_ms, seed) {
+            if let Some(previous) = s.slim_reconnect.link_down(now_ms, backoff_seed(now_ms)) {
                 // The `serv` target was unreachable: back to the previous server.
                 s.lms_ip = previous;
                 s.coordinator.lms_ip = previous;
@@ -1179,6 +1179,12 @@ mod device {
             }
         }
         slim_tick(s, local_ip);
+    }
+
+    /// Jitter source for the reconnect backoff (C uses `rand()`, `slimproto.c:1196`): the
+    /// scrambled lap clock.
+    fn backoff_seed(now_ms: u64) -> u32 {
+        (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32
     }
 
     /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`, with the

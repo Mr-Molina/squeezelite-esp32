@@ -3,10 +3,10 @@
 #   - STMf is the first reply to strm s, before the connect (slimproto.c:449).
 #   - STMo: output ran dry while the stream was still STREAMING_HTTP, once per track
 #     (slimproto.c:881-884, sentSTMo reset at strm s, slimproto.c:474).
-#   - DSCO:0 when the stream socket hits EOF (stream.c:508, sent by slimproto.c:805-807/910),
+#   - DSCO:0 when the stream socket hits EOF (stream.c:508, sent by slimproto.c:804-808/910),
 #     before STMd/STMu instead of after the output drained.
 #   - no idle STMt heartbeat after STMu: only while output is RUNNING (slimproto.c:890).
-#   - no STMq: strm q has no reply (slimproto.c:384-391; its STMf is for 'f' only).
+#   - no STMq: strm q has no reply (slimproto.c:386-394; its STMf is for 'f' only).
 HELO
 STAT:STMt
 STAT:STMf
