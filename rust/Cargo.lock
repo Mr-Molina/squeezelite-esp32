@@ -1533,6 +1533,7 @@ dependencies = [
  "heapless 0.8.0",
  "log",
  "louder-esp32-app",
+ "proptest",
  "smoltcp",
  "squeezelite-audio-core",
  "squeezelite-config",

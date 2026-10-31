@@ -153,6 +153,81 @@ impl ActiveDecoder {
     }
 }
 
+/// Output-ring bytes per stereo frame (two native-endian `i32` samples; C `BYTES_PER_FRAME`).
+const OUTPUT_FRAME_BYTES: usize = 8;
+
+/// The pending track boundary in the output ring: C squeezelite's `output.track_start`
+/// pointer, plus the `output.next_*` values that take effect when playback reaches it.
+///
+/// C keeps exactly one such pointer; a newer track start overwrites one playback has not
+/// reached yet (`flac.c:147`, `mad.c:256`, `pcm.c:216`). The pipeline therefore holds a single
+/// `Option<TrackMarker>` ([`StreamPipeline::track_marker`]), not a queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackMarker {
+    /// Unread output-ring bytes in front of the boundary (C `track_start - readp`). Always a
+    /// whole number of frames and never more than the unread bytes: the boundary never sits
+    /// behind the read position or past the write position.
+    pub bytes_ahead: u64,
+    /// Rate of the track that starts here (C `output.next_sample_rate`).
+    pub sample_rate: u32,
+    /// Replay gain of the track that starts here, 16.16 fixed point, 0 = none (C
+    /// `output.next_replay_gain`).
+    pub replay_gain: u32,
+    /// `strm s` output threshold (C `output.threshold`, tenths of a second) in frames at
+    /// [`Self::sample_rate`]. Stored for the output-start gate (Task 15); not applied yet.
+    pub output_threshold_frames: u32,
+}
+
+/// Track-boundary state of the output side (C `output.track_start`, `next_*`, `current_*`,
+/// `delay_active`, `track_started`; `decode.new_stream`). Built by [`TrackBoundary::new`] so
+/// firmware bring-up can initialise the whole group with one write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackBoundary {
+    marker: Option<TrackMarker>,
+    /// The boundary playback crossed and nobody has taken yet (C `output.track_started`).
+    crossed: Option<TrackMarker>,
+    /// The next decoded frames start a new track (C `decode.new_stream`).
+    new_stream: bool,
+    /// Rate for a new track whose decoder reports none (raw PCM): the `strm s` rate, or the
+    /// rate last set explicitly with [`StreamPipeline::set_sample_rate`].
+    stream_rate_hint: u32,
+    /// `strm s` output threshold, tenths of a second (C `output.threshold`).
+    output_threshold: u8,
+    /// Silent frames still to play for the boundary rate-change delay (C `output.pause_frames`
+    /// while `OUTPUT_PAUSE_FRAMES` from `output.c:139-147`).
+    silence_frames: u32,
+    /// The first half of the rate-change delay was played (C `output.delay_active`).
+    delay_active: bool,
+    /// Replay gain of the playing track, 16.16 fixed point, 0 = none (C
+    /// `output.current_replay_gain`). Stored with C semantics; Task 14's gain stage applies it.
+    pub current_replay_gain: u32,
+    /// Replay gain from the latest `strm s` (C `output.next_replay_gain`, `slimproto.c:485`).
+    pub next_replay_gain: u32,
+    /// Silence in ms played around a track boundary that changes the sample rate, half before
+    /// it at the old rate and half after it at the new one (C `output.rate_delay`, the `delay`
+    /// of `-r rates:delay`, `main.c:298`, `main.c:509`). Default 0: no silence.
+    pub rate_delay_ms: u32,
+}
+
+impl TrackBoundary {
+    /// No boundary pending; the first decoded frames start a track (C `decode_init` sets
+    /// `decode.new_stream`, `decode.c:223`).
+    pub const fn new(rate_hint: u32) -> Self {
+        Self {
+            marker: None,
+            crossed: None,
+            new_stream: true,
+            stream_rate_hint: rate_hint,
+            output_threshold: 0,
+            silence_frames: 0,
+            delay_active: false,
+            current_replay_gain: 0,
+            next_replay_gain: 0,
+            rate_delay_ms: 0,
+        }
+    }
+}
+
 /// The integrated audio pipeline engine.
 pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub stream_buffer: AudioRingBuffer<'a>,
@@ -176,6 +251,8 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     /// (there is no heap MP3 decoder without `std-codecs`); [`Self::set_decoder`] parks a
     /// replaced MP3 decoder here, so the static one is never lost or duplicated.
     pub mp3_spare: Option<Mp3Handle>,
+    /// Gapless track-boundary state (C `output.track_start` and friends).
+    pub boundary: TrackBoundary,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -205,6 +282,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             current_eq_preset: EqPreset::Flat,
             user_muted: false,
             mp3_spare: None,
+            boundary: TrackBoundary::new(sample_rate),
         }
     }
 
@@ -267,6 +345,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             };
 
             if frames_produced > 0 {
+                self.mark_track_start();
                 let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
                 self.equalizer.process_interleaved(active_pcm);
                 scale_samples_inplace(active_pcm, self.volume);
@@ -324,19 +403,17 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             }
         };
 
-        if let Some(rate) = self.decoder.sample_rate() {
-            if rate > 0 && rate != self.sample_rate {
-                let _ = self.sink.set_sample_rate(rate);
-                self.sample_rate = rate;
-            }
-        }
-
         // Only consume the exact bytes ingested by decoder (CONC-005)
         if consumed > 0 {
             self.stream_buffer.consume(consumed);
         }
 
         if frames_produced > 0 {
+            // The decoder's rate is the next track's rate, applied when playback reaches the
+            // track start (C parity: pcm.c:216-233, mad.c:254-256, flac.c:147-170 set
+            // `output.next_sample_rate` with `track_start`; output.c:154 switches). A rate
+            // change inside a track is ignored, as in C (only `new_stream` reads the rate).
+            self.mark_track_start();
             // Apply DSP across ALL produced samples exactly once before buffering:
             // 1. Equalizer preset and loudness contour in-place
             // 2. Volume scaling and attenuation in-place
@@ -370,29 +447,51 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     }
 
     /// Flushes output ringbuffer frames to the audio output sink (I2S DMA).
+    ///
+    /// Track boundaries follow C `_output_frames` (`output.c:126-166`): a chunk never runs past
+    /// the pending [`TrackMarker`], and a step that starts on it processes the track start
+    /// first ([`Self::active_marker_crossed`] then returns it) and plays on into the new track.
+    /// Returns the frames written to the sink, including rate-change silence.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_output_step(&mut self) -> Result<usize, S::Error> {
+        if self.boundary.silence_frames > 0 {
+            return self.write_boundary_silence();
+        }
+
         let bytes_avail = self.output_buffer.available_read();
-        if bytes_avail < 8 {
+        if bytes_avail < OUTPUT_FRAME_BYTES {
             return Ok(0); // Minimum 1 stereo frame (8 bytes)
         }
 
-        let to_read = core::cmp::min(self.write_scratch.len(), bytes_avail);
-        let bytes_to_read = (to_read / 8) * 8;
+        let mut to_read = core::cmp::min(self.write_scratch.len(), bytes_avail);
+        if let Some(marker) = self.boundary.marker {
+            if marker.bytes_ahead == 0 {
+                // C parity: output.c:127 `track_start == readp`, only with real frames to
+                // play (`frames == 0` is silence there, output.c:112-115).
+                self.reach_track_start(marker);
+                if self.boundary.silence_frames > 0 {
+                    return self.write_boundary_silence();
+                }
+            } else {
+                // C parity: output.c:163-166, the chunk ends exactly on the track start.
+                to_read = to_read.min(usize::try_from(marker.bytes_ahead).unwrap_or(usize::MAX));
+            }
+        }
+        let bytes_to_read = (to_read / OUTPUT_FRAME_BYTES) * OUTPUT_FRAME_BYTES;
         if bytes_to_read == 0 {
             return Ok(0);
         }
 
         // Non-destructive peek: frames remain in ringbuffer until sink write succeeds (LOGIC-603)
         let bytes_read = self.output_buffer.peek(&mut self.write_scratch[..bytes_to_read]);
-        if bytes_read < 8 {
+        if bytes_read < OUTPUT_FRAME_BYTES {
             return Ok(0);
         }
 
-        let frames_to_write = bytes_read / 8;
+        let frames_to_write = bytes_read / OUTPUT_FRAME_BYTES;
         let samples_count = frames_to_write * 2;
 
-        for (chunk, sample) in self.write_scratch[..frames_to_write * 8]
+        for (chunk, sample) in self.write_scratch[..frames_to_write * OUTPUT_FRAME_BYTES]
             .chunks_exact(4)
             .zip(self.output_i32_scratch[..samples_count].iter_mut())
         {
@@ -404,12 +503,198 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
         let written_frames = self.sink.write_frames(&self.output_i32_scratch[..frames_to_write * 2])?;
         // ONLY consume the exact number of frames successfully committed to the sink
-        self.output_buffer.consume(written_frames * 8);
+        self.consume_output(written_frames);
         if written_frames > 0 {
             self.frames_played = self.frames_played.wrapping_add(written_frames as u64);
         }
 
         Ok(written_frames)
+    }
+
+    /// Playback reached the pending track start (C parity: output.c:127-162).
+    ///
+    /// With a rate change and [`TrackBoundary::rate_delay_ms`] > 0 the first arrival only
+    /// queues `current_rate * delay / 2000` silent frames and leaves the boundary pending
+    /// (`delay_active`); the second arrival queues `next_rate * delay / 2000` frames and then
+    /// processes the track start, so the silence is split around the rate switch
+    /// (output.c:128-148). The track start: `frames_played = 0`, `track_started`, the clock
+    /// goes to the next rate, the next replay gain becomes current (Rust has no crossfade, so
+    /// C's crossfade exception never applies), and the boundary is cleared (output.c:149-162).
+    fn reach_track_start(&mut self, marker: TrackMarker) {
+        let delay = if self.sample_rate != marker.sample_rate { self.boundary.rate_delay_ms } else { 0 };
+        if delay > 0 {
+            if !self.boundary.delay_active {
+                self.boundary.silence_frames = delay_frames(self.sample_rate, delay);
+                self.boundary.delay_active = true;
+                return;
+            }
+            self.boundary.silence_frames = delay_frames(marker.sample_rate, delay);
+            self.boundary.delay_active = false;
+        }
+        self.frames_played = 0;
+        self.boundary.crossed = Some(marker);
+        // The clock switch is requested here, when the sink reaches the boundary. Frames of
+        // the previous track still queued in the sink's DMA then play at the new rate; C has
+        // the same window (output_i2s.c:627-643 switches after `_output_frames` and zeroes
+        // the DMA). Exact DMA-drain sequencing is Task 15. A refused rate keeps the old clock.
+        if marker.sample_rate != self.sample_rate && self.sink.set_sample_rate(marker.sample_rate).is_ok() {
+            self.sample_rate = marker.sample_rate;
+        }
+        self.boundary.current_replay_gain = marker.replay_gain;
+        self.boundary.marker = None;
+    }
+
+    /// Plays queued rate-change silence (C `OUTPUT_PAUSE_FRAMES` silence, output.c:86-96):
+    /// zero frames at the sink's current rate, not counted as played (output.c:277-280).
+    fn write_boundary_silence(&mut self) -> Result<usize, S::Error> {
+        let frames = (self.boundary.silence_frames as usize).min(OUTPUT_I32_SCRATCH_SAMPLES / 2);
+        self.output_i32_scratch[..frames * 2].fill(0);
+        if !self.user_muted {
+            self.sink.set_mute(false);
+        }
+        let written = self.sink.write_frames(&self.output_i32_scratch[..frames * 2])?;
+        self.boundary.silence_frames -= written.min(frames) as u32;
+        Ok(written)
+    }
+
+    /// The decoder produced frames: if they start a new stream, the track start is the
+    /// current write position of the output ring (C parity: pcm.c:214-216, flac.c:145-147,
+    /// mad.c:253-256 `output.track_start = outputbuf->writep` when `decode.new_stream`). The
+    /// rate is the decoder's, or the `strm s` rate when it reports none (raw PCM, C pcm.c
+    /// uses the `strm` rate the codec was opened with). A boundary playback has not reached
+    /// yet is overwritten (one C pointer).
+    fn mark_track_start(&mut self) {
+        if !self.boundary.new_stream {
+            return;
+        }
+        self.boundary.new_stream = false;
+        let sample_rate = self.decoder.sample_rate().unwrap_or(self.boundary.stream_rate_hint);
+        let output_threshold_frames =
+            (u64::from(self.boundary.output_threshold) * u64::from(sample_rate) / 10) as u32;
+        self.boundary.marker = Some(TrackMarker {
+            bytes_ahead: self.output_buffer.available_read() as u64,
+            sample_rate,
+            replay_gain: self.boundary.next_replay_gain,
+            output_threshold_frames,
+        });
+    }
+
+    /// The pending track boundary, if any (C `output.track_start != NULL`).
+    pub fn track_marker(&self) -> Option<&TrackMarker> {
+        self.boundary.marker.as_ref()
+    }
+
+    /// Sets the single pending boundary, replacing (and returning) one playback has not
+    /// reached yet, as C overwrites `output.track_start`. `bytes_ahead` is cut to whole
+    /// frames within the unread output, so the boundary cannot point past the written data.
+    /// The decoder sets it by itself on the first frames of a new stream; this is for
+    /// callers that write the output ring directly.
+    pub fn set_track_marker(&mut self, mut marker: TrackMarker) -> Option<TrackMarker> {
+        let unread = self.output_buffer.available_read() as u64;
+        marker.bytes_ahead = marker.bytes_ahead.min(unread) / OUTPUT_FRAME_BYTES as u64 * OUTPUT_FRAME_BYTES as u64;
+        self.boundary.marker.replace(marker)
+    }
+
+    /// The boundary playback crossed since the last call, once (C `output.track_started`,
+    /// which makes the status loop send `STMs`, `slimproto.c:851-855`).
+    pub fn active_marker_crossed(&mut self) -> Option<TrackMarker> {
+        self.boundary.crossed.take()
+    }
+
+    /// `strm s` (C `process_strm`, `slimproto.c:436-489`): the new stream's data replaces the
+    /// stream ring (C `stream_sock` flushes `streambuf`, `stream.c:624`, `stream.c:738`), the
+    /// old decoder's undelivered PCM goes with it (C `codec_open` closes the codec), and the
+    /// next track's values are stored: replay gain (C `next_replay_gain`) and output
+    /// threshold (C `output.threshold`), both C globals, so they also update a boundary still
+    /// pending. `rate_hint` is the `strm` rate, used when the decoder reports none.
+    ///
+    /// The output ring is NOT flushed: the previous track's tail keeps playing, which is how
+    /// C plays gaplessly.
+    pub fn begin_stream(&mut self, rate_hint: u32, replay_gain: u32, output_threshold: u8) {
+        self.stream_buffer.flush();
+        self.discard_decoder_backlog();
+        self.boundary.stream_rate_hint = rate_hint;
+        self.boundary.next_replay_gain = replay_gain;
+        self.boundary.output_threshold = output_threshold;
+        if let Some(marker) = self.boundary.marker.as_mut() {
+            marker.replay_gain = replay_gain;
+            marker.output_threshold_frames =
+                (u64::from(output_threshold) * u64::from(marker.sample_rate) / 10) as u32;
+        }
+    }
+
+    /// A codec was opened for a new stream (C `codec_open` sets `decode.new_stream`,
+    /// `decode.c:287`): its first decoded frames mark the next track start.
+    pub fn open_stream(&mut self) {
+        self.boundary.new_stream = true;
+    }
+
+    /// Drops decoded PCM not yet in the output ring and the decoder's own backlog (C has no
+    /// such buffer: its decoders write straight into `outputbuf`, so this is audio C would
+    /// not have decoded yet when the decoder stops).
+    pub fn discard_decoder_backlog(&mut self) {
+        self.decoder.flush();
+        self.pcm_pending_offset = 0;
+        self.pcm_pending_samples = 0;
+    }
+
+    /// `strm f` (C `output_flush_streaming`, output.c:461-470): drops everything written
+    /// after the pending track start (C `writep = track_start`) and clears it. Returns
+    /// whether there was one (C "flushed"). A track already playing is never touched.
+    pub fn flush_streaming(&mut self) -> bool {
+        match self.boundary.marker.take() {
+            Some(marker) => {
+                let keep = usize::try_from(marker.bytes_ahead).unwrap_or(usize::MAX);
+                self.output_buffer.truncate_unread(keep);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Consumes `frames` played frames from the output ring, keeping the boundary distance.
+    fn consume_output(&mut self, frames: usize) {
+        let bytes = frames * OUTPUT_FRAME_BYTES;
+        self.output_buffer.consume(bytes);
+        if let Some(marker) = self.boundary.marker.as_mut() {
+            marker.bytes_ahead = marker.bytes_ahead.saturating_sub(bytes as u64);
+        }
+    }
+
+    /// `strm a` (C `OUTPUT_SKIP_FRAMES`, output.c:68-82): drops up to `frames` output frames
+    /// unplayed and counts them as played. Returns the frames skipped.
+    ///
+    /// Deliberate divergence: the skip stops at a pending track start, so the output still
+    /// processes it (`STMs`, rate, gain). C advances `readp` past `track_start` and then never
+    /// sees `track_start == readp` until the ring wraps around (output.c:72-79, 127).
+    pub fn skip_output_frames(&mut self, frames: u64) -> u64 {
+        let mut held = (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u64;
+        if let Some(marker) = self.boundary.marker {
+            held = held.min(marker.bytes_ahead / OUTPUT_FRAME_BYTES as u64);
+        }
+        let skip = frames.min(held);
+        self.consume_output(skip as usize);
+        self.frames_played = self.frames_played.wrapping_add(skip);
+        skip
+    }
+
+    /// Moves the output read position back over up to `frames` already played frames (as far
+    /// as the ring still holds them) so they play again; a pending boundary moves away by the
+    /// same amount, so it stays on the track start. Returns the frames rewound.
+    pub fn rewind_output_frames(&mut self, frames: usize) -> usize {
+        let before = self.output_buffer.available_read();
+        self.output_buffer.rewind_read(frames.saturating_mul(OUTPUT_FRAME_BYTES));
+        let mut rewound = self.output_buffer.available_read() - before;
+        // Whole frames only: the ring may clamp to a byte count that splits a frame.
+        let partial = rewound % OUTPUT_FRAME_BYTES;
+        if partial != 0 {
+            self.output_buffer.consume(partial);
+            rewound -= partial;
+        }
+        if let Some(marker) = self.boundary.marker.as_mut() {
+            marker.bytes_ahead += rewound as u64;
+        }
+        rewound / OUTPUT_FRAME_BYTES
     }
 
     /// Sets digital volume level.
@@ -511,10 +796,12 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.process_decode_step()
     }
 
-    /// Sets sample rate on pipeline and output sink.
+    /// Sets sample rate on pipeline and output sink now. It is also the rate a new track
+    /// whose decoder reports none starts at (external sources such as Bluetooth set it).
     pub fn set_sample_rate(&mut self, rate: u32) -> Result<(), S::Error> {
         self.sink.set_sample_rate(rate)?;
         self.sample_rate = rate;
+        self.boundary.stream_rate_hint = rate;
         Ok(())
     }
 
@@ -533,7 +820,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.pcm_pending_samples > 0 || self.decoder.has_pending_pcm()
     }
 
-    /// Flushes both stream and output ringbuffers, clears pending PCM, and resets the decoder state.
+    /// Flushes both stream and output ringbuffers, clears pending PCM, and resets the decoder
+    /// state (`strm q`: C `decode_flush` + `output_flush`, output.c:440-458). The track
+    /// boundary goes too: no pending track start, no rate-change silence, `delay_active`
+    /// cleared (output.c:452), and the next decoded frames start a new track.
     pub fn flush(&mut self) {
         self.stream_buffer.flush();
         self.output_buffer.flush();
@@ -542,9 +832,19 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.sink.set_mute(true);
         self.pcm_pending_offset = 0;
         self.pcm_pending_samples = 0;
+        self.boundary.marker = None;
+        self.boundary.crossed = None;
+        self.boundary.silence_frames = 0;
+        self.boundary.delay_active = false;
+        self.boundary.new_stream = true;
     }
 }
 
+
+/// C `rate * delay / 2000`: half of a `delay` ms rate-change silence, in frames.
+fn delay_frames(rate: u32, delay_ms: u32) -> u32 {
+    u32::try_from(u64::from(rate) * u64::from(delay_ms) / 2000).unwrap_or(u32::MAX)
+}
 
 #[cfg(test)]
 mod tests {
@@ -904,6 +1204,13 @@ mod tests {
         let consumed = pipeline.process_decode_step().unwrap();
         assert_eq!(consumed, 52);
 
+        // Task 12 (C parity): the decoder's rate is the next track's rate (C
+        // `output.next_sample_rate`, pcm.c:233); the clock switches when playback reaches the
+        // track start (output.c:154), not when the frames are decoded.
+        assert_eq!(pipeline.track_marker().map(|m| m.sample_rate), Some(48000));
+        assert_eq!(pipeline.sink.sample_rate, 44100);
+        pipeline.process_output_step().unwrap();
+
         assert_eq!(pipeline.sample_rate, 48000);
         assert_eq!(pipeline.sink.sample_rate, 48000);
     }
@@ -1181,6 +1488,300 @@ mod tests {
 
         assert!(pipeline.frames_played > 0, "Frames played should be > 0, got {}", pipeline.frames_played);
         assert_eq!(pipeline.frames_played, 8820);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Task 12: gapless track boundary (C `output.track_start`, output.c:126-166)
+    // ---------------------------------------------------------------------------------------
+
+    /// Sink recording every sample plus the clock rate each write was made at.
+    struct RecSink {
+        samples: std::vec::Vec<i32>,
+        /// (rate at the time of the write, frames written)
+        writes: std::vec::Vec<(u32, usize)>,
+        rate: u32,
+        rate_changes: std::vec::Vec<u32>,
+    }
+
+    impl RecSink {
+        fn new() -> Self {
+            Self {
+                samples: std::vec::Vec::new(),
+                writes: std::vec::Vec::new(),
+                rate: 44_100,
+                rate_changes: std::vec::Vec::new(),
+            }
+        }
+    }
+
+    impl AudioOutputSink for RecSink {
+        type Error = OutputError;
+
+        fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
+            self.samples.extend_from_slice(frames);
+            self.writes.push((self.rate, frames.len() / 2));
+            Ok(frames.len() / 2)
+        }
+
+        fn set_sample_rate(&mut self, rate_hz: u32) -> Result<(), Self::Error> {
+            self.rate = rate_hz;
+            self.rate_changes.push(rate_hz);
+            Ok(())
+        }
+
+        fn set_mute(&mut self, _muted: bool) {}
+    }
+
+    /// 16-bit big-endian stereo PCM: frame `i` of `track` is (track * 1000 + i, -(track * 1000 + i)).
+    fn track_pcm(track: i16, frames: usize) -> std::vec::Vec<u8> {
+        let mut out = std::vec::Vec::new();
+        for i in 0..frames as i16 {
+            let v = track * 1000 + i;
+            out.extend_from_slice(&v.to_be_bytes());
+            out.extend_from_slice(&(-v).to_be_bytes());
+        }
+        out
+    }
+
+    /// The left samples a track_pcm() stream decodes to.
+    fn track_left(track: i16, frames: usize) -> std::vec::Vec<i32> {
+        (0..frames as i16).map(|i| i32::from(track * 1000 + i) << 16).collect()
+    }
+
+    fn left(samples: &[i32]) -> std::vec::Vec<i32> {
+        samples.iter().step_by(2).copied().collect()
+    }
+
+    fn rec_pipeline<'a>(stream: &'a mut [u8], output: &'a mut [u8]) -> StreamPipeline<'a, RecSink> {
+        StreamPipeline::new(stream, output, ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)), RecSink::new(), 44_100)
+    }
+
+    /// Ingests `bytes` and decodes until the stream ring is empty.
+    fn feed<S: AudioOutputSink>(p: &mut StreamPipeline<'_, S>, bytes: &[u8]) {
+        assert_eq!(p.ingest_stream_data(bytes).unwrap(), bytes.len());
+        while p.stream_buffer_available() > 0 || p.has_pending_pcm() {
+            p.process_decode_step().unwrap();
+        }
+    }
+
+    /// `strm s` + codec open for a PCM track, as the coordinator does it.
+    fn next_stream<S: AudioOutputSink>(p: &mut StreamPipeline<'_, S>, rate: u32, replay_gain: u32) {
+        p.begin_stream(rate, replay_gain, 0);
+        p.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
+        p.open_stream();
+    }
+
+    fn drain_output<S: AudioOutputSink>(p: &mut StreamPipeline<'_, S>) -> std::vec::Vec<Option<TrackMarker>> {
+        let mut crossings = std::vec::Vec::new();
+        for _ in 0..10_000 {
+            let written = p.process_output_step().unwrap_or(0);
+            crossings.push(p.active_marker_crossed());
+            if written == 0 && p.output_buffer_available() < 8 {
+                break;
+            }
+        }
+        crossings
+    }
+
+    #[test]
+    fn test_first_frames_of_new_stream_set_boundary_at_write_position() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        // C decode_init: new_stream = true, so the very first frames mark a track start.
+        feed(&mut p, &track_pcm(1, 100));
+        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
+        // Play 40 frames of track 1 (crossing its boundary), then the next track arrives.
+        p.process_output_step().unwrap();
+        assert!(p.active_marker_crossed().is_some());
+        let played = p.frames_played as usize;
+        next_stream(&mut p, 44_100, 0);
+        // strm s keeps the output ring (C slimproto.c:436-489 never flushes outputbuf).
+        assert_eq!(p.output_buffer_available(), (100 - played) * 8);
+        assert!(p.track_marker().is_none(), "no boundary until the new decoder writes");
+        feed(&mut p, &track_pcm(2, 50));
+        let marker = p.track_marker().copied().unwrap();
+        assert_eq!(marker.bytes_ahead, ((100 - played) * 8) as u64);
+        assert_eq!(marker.sample_rate, 44_100);
+    }
+
+    #[test]
+    fn test_output_is_clipped_at_boundary_and_crossing_resets_frames_played() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 70)); // 70 frames: one 64-frame step, then 6 frames up to the boundary
+        assert_eq!(p.process_output_step().unwrap(), 64);
+        assert!(p.active_marker_crossed().is_some());
+        next_stream(&mut p, 44_100, 0);
+        feed(&mut p, &track_pcm(2, 10));
+        // The chunk stops exactly at the boundary (C output.c:163-166).
+        assert_eq!(p.process_output_step().unwrap(), 6);
+        assert!(p.active_marker_crossed().is_none());
+        assert_eq!(p.frames_played, 70);
+        // The next step crosses first (frames_played = 0, C output.c:151), then plays track 2.
+        assert_eq!(p.process_output_step().unwrap(), 10);
+        assert!(p.active_marker_crossed().is_some());
+        assert_eq!(p.frames_played, 10);
+        let mut expected = track_left(1, 70);
+        expected.extend(track_left(2, 10));
+        assert_eq!(left(&p.sink.samples), expected);
+    }
+
+    #[test]
+    fn test_flush_clears_markers() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 20));
+        assert!(p.track_marker().is_some());
+        p.flush();
+        assert!(p.track_marker().is_none());
+        assert!(p.active_marker_crossed().is_none());
+        assert_eq!(p.output_buffer_available(), 0);
+        // After a full flush the next decoded frames start a new track again.
+        feed(&mut p, &track_pcm(2, 4));
+        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
+    }
+
+    #[test]
+    fn test_rate_change_at_boundary_with_rate_delay_inserts_split_silence() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.boundary.rate_delay_ms = 20; // C `-r 44100-48000:20`
+        feed(&mut p, &track_pcm(1, 30));
+        drain_output(&mut p);
+        next_stream(&mut p, 48_000, 0);
+        feed(&mut p, &track_pcm(2, 30));
+        assert_eq!(p.track_marker().map(|m| m.sample_rate), Some(48_000));
+        let crossings = drain_output(&mut p);
+        assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
+        // C output.c:138-148: current_rate * delay / 2000 silent frames at the old rate, the
+        // track start (rate switch), then next_rate * delay / 2000 at the new rate.
+        let first_half = 44_100 * 20 / 2000;
+        let second_half = 48_000 * 20 / 2000;
+        let l = left(&p.sink.samples);
+        assert_eq!(&l[..30], &track_left(1, 30)[..]);
+        assert!(l[30..30 + first_half + second_half].iter().all(|&v| v == 0));
+        assert_eq!(&l[30 + first_half + second_half..], &track_left(2, 30)[..]);
+        let frames_at = |rate: u32| -> usize {
+            p.sink.writes.iter().filter(|(r, _)| *r == rate).map(|(_, n)| n).sum()
+        };
+        assert_eq!(frames_at(44_100), 30 + first_half);
+        assert_eq!(frames_at(48_000), second_half + 30);
+        assert_eq!(p.sink.rate_changes, [48_000]);
+        assert_eq!(p.sample_rate, 48_000);
+        // Silence is not played audio (C output.c:277-280 counts only real frames).
+        assert_eq!(p.frames_played, 30);
+    }
+
+    #[test]
+    fn test_rate_change_without_rate_delay_switches_at_boundary_without_silence() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 30));
+        p.process_output_step().unwrap();
+        next_stream(&mut p, 48_000, 0);
+        feed(&mut p, &track_pcm(2, 30));
+        assert_eq!(p.sample_rate, 44_100, "decode must not switch the clock early");
+        drain_output(&mut p);
+        let mut expected = track_left(1, 30);
+        expected.extend(track_left(2, 30));
+        assert_eq!(left(&p.sink.samples), expected);
+        assert_eq!(p.sink.writes.iter().filter(|(r, _)| *r == 44_100).map(|(_, n)| n).sum::<usize>(), 30);
+        assert_eq!(p.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn test_replay_gain_switches_at_the_boundary() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.begin_stream(44_100, 0x1_0000, 0);
+        p.open_stream();
+        feed(&mut p, &track_pcm(1, 10));
+        p.process_output_step().unwrap();
+        assert_eq!(p.boundary.current_replay_gain, 0x1_0000);
+        next_stream(&mut p, 44_100, 0x8000);
+        feed(&mut p, &track_pcm(2, 10));
+        // C slimproto.c:485 stores next_replay_gain at strm s; output.c:158-160 applies it at the
+        // boundary. Until then the playing track keeps its gain.
+        assert_eq!(p.boundary.next_replay_gain, 0x8000);
+        assert_eq!(p.boundary.current_replay_gain, 0x1_0000);
+        drain_output(&mut p);
+        assert_eq!(p.boundary.current_replay_gain, 0x8000);
+    }
+
+    #[test]
+    fn test_flush_streaming_discards_only_the_next_track() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 100));
+        p.process_output_step().unwrap();
+        assert!(p.active_marker_crossed().is_some());
+        next_stream(&mut p, 44_100, 0);
+        feed(&mut p, &track_pcm(2, 50));
+        // C output_flush_streaming (output.c:461-470): writep = track_start, flushed.
+        assert!(p.flush_streaming());
+        assert!(p.track_marker().is_none());
+        assert_eq!(p.output_buffer_available(), 36 * 8);
+        // Nothing left to flush: not "flushed".
+        assert!(!p.flush_streaming());
+        let crossings = drain_output(&mut p);
+        assert!(crossings.iter().all(Option::is_none));
+        assert_eq!(left(&p.sink.samples), track_left(1, 100));
+    }
+
+    #[test]
+    fn test_flush_streaming_with_no_boundary_keeps_the_playing_track() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 100));
+        p.process_output_step().unwrap();
+        assert!(p.active_marker_crossed().is_some());
+        assert!(!p.flush_streaming());
+        assert_eq!(p.output_buffer_available(), 36 * 8);
+    }
+
+    #[test]
+    fn test_second_stream_before_boundary_overwrites_it() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 100));
+        p.process_output_step().unwrap();
+        assert!(p.active_marker_crossed().is_some());
+        next_stream(&mut p, 44_100, 0);
+        feed(&mut p, &track_pcm(2, 20));
+        let first = p.track_marker().copied().unwrap();
+        next_stream(&mut p, 44_100, 0);
+        feed(&mut p, &track_pcm(3, 20));
+        // One slot (C output.track_start): the newer track start replaces the unreached one.
+        let second = p.track_marker().copied().unwrap();
+        assert_eq!(second.bytes_ahead, first.bytes_ahead + 20 * 8);
+        let crossings = drain_output(&mut p);
+        assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
+        // strm s never flushes outputbuf: track 2's decoded part still plays (C), then track 3.
+        let mut expected = track_left(1, 100);
+        expected.extend(track_left(2, 20));
+        expected.extend(track_left(3, 20));
+        assert_eq!(left(&p.sink.samples), expected);
+        assert_eq!(p.frames_played, 20);
+    }
+
+    #[test]
+    fn test_skip_and_rewind_keep_the_boundary_on_the_track_start() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        feed(&mut p, &track_pcm(1, 100));
+        p.process_output_step().unwrap();
+        assert!(p.active_marker_crossed().is_some());
+        next_stream(&mut p, 44_100, 0);
+        feed(&mut p, &track_pcm(2, 10));
+        // Rewinding replays 16 already-played frames: the boundary moves 16 frames further away.
+        assert_eq!(p.rewind_output_frames(16), 16);
+        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some((36 + 16) * 8));
+        // A skip stops at the boundary, so the track start is still processed by the output.
+        assert_eq!(p.skip_output_frames(1_000), 52);
+        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
+        assert_eq!(p.process_output_step().unwrap(), 10);
+        assert!(p.active_marker_crossed().is_some());
+        assert_eq!(&left(&p.sink.samples)[64..], &track_left(2, 10)[..]);
     }
 }
 

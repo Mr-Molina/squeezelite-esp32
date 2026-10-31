@@ -74,5 +74,7 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["medium-et
 # tests never build for xtensa).
 louder-esp32-app = { path = ".", default-features = false, features = ["std-codecs"] }
 embedded-hal-mock = { version = "0.11", default-features = false, features = ["eh1"] }
+# Task 12: `tests/marker_fuzz.rs` (track-boundary invariants under rewind/skip/flush).
+proptest = { workspace = true }
 # Host `critical-section` implementation so tests can exercise the embassy-sync channels.
 critical-section = { version = "1.2", features = ["std"] }
