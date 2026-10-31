@@ -26,7 +26,7 @@ use squeezelite_proto::{
     StreamCommandType, TransitionType, SQUEEZENETWORK_MARKER_IP, STRM_FLAG_SERVER_REBOOT, SYNCGROUP_ID_LEN,
 };
 
-use crate::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
+use crate::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg, percent_to_lms_gain};
 use crate::config_handle::ConfigHandle;
 use crate::io_traits::{
     AudioBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
@@ -448,17 +448,19 @@ impl PlayerCoordinator {
 
     /// C `set_volume(left, right)` (output_embedded.c:118-126) for an `audg`.
     ///
-    /// - A backend with hardware volume (the device's TAS5805M) does the attenuation and the
-    ///   software volume stays unity, as C skips `output.gainL/R` when its `volume_cb` handles
-    ///   the volume. Rust enhancement (Task 7 ruling; C has no TAS5805M driver): one register
-    ///   code from the louder channel drives both amplifier channels. The software gain is 0
-    ///   for a 0 gain, as C's I2S volume callback asserts the mute GPIO on `(left | right) ==
-    ///   0` (output_i2s.c:496).
+    /// - A backend with hardware volume (the device's TAS5805M) does the attenuation, as C
+    ///   skips `output.gainL/R` when its `volume_cb` handles the volume. Rust enhancement (Task
+    ///   7 ruling; C has no TAS5805M driver): one register code from the louder channel drives
+    ///   both amplifier channels. The balance C keeps with independent `gainL`/`gainR`
+    ///   (output.c:54-55; `Balance=1`, embedded.h:47) is the software gain: each channel's
+    ///   ratio to the louder one, `l * 65536 / max(l, r)` (Task 14 fix round), exactly unity
+    ///   when `l == r`, so equal gains behave as Task 7. Both are 0 for a 0 gain, as C's I2S
+    ///   volume callback asserts the mute GPIO on `(left | right) == 0` (output_i2s.c:496).
     /// - Otherwise (host, any backend without hardware volume) the gains go into the software
     ///   gain stage per channel, as C (output_embedded.c:120-124).
     ///
     /// Replay gain, fade, polarity and channel select are applied in software either way.
-    fn set_volume<B: AudioBackend, S: AudioOutputSink>(
+    pub fn set_volume<B: AudioBackend, S: AudioOutputSink>(
         &mut self,
         left: u32,
         right: u32,
@@ -472,14 +474,42 @@ impl PlayerCoordinator {
             let louder = left.max(right);
             let reg = lms_gain_to_tas5805m_vol_reg(louder);
             backend.set_hw_volume(reg, reg);
-            let soft = if louder > 0 { UNITY_GAIN } else { 0 };
-            (soft, soft)
+            if louder == 0 {
+                (0, 0)
+            } else {
+                // In u64: `l << 16` overflows u32 at l = 0x10000 (balanced full volume).
+                let ratio = |g: u32| ((u64::from(g) << 16) / u64::from(louder)) as u32;
+                (ratio(left), ratio(right))
+            }
         } else {
             (left, right)
         };
         self.volume.gain_left = soft_left;
         self.volume.gain_right = soft_right;
         pipeline.set_volume(soft_left, soft_right);
+    }
+
+    /// A local volume change in percent (CYD, HTTP/IR, boot): the louder channel goes to
+    /// `percent` on the LMS curve ([`percent_to_lms_gain`], so the amplifier register is
+    /// `percent_to_attenuation(percent)`), the other keeps its ratio to it from the volume LMS
+    /// last asked for, and the result goes through [`Self::set_volume`], the single volume
+    /// entry. After a `(0, 0)` volume the balance is unknown and both channels get the level.
+    pub fn set_volume_percent<B: AudioBackend, S: AudioOutputSink>(
+        &mut self,
+        percent: u8,
+        backend: &mut B,
+        pipeline: &mut StreamPipeline<'_, S>,
+    ) {
+        let level = percent_to_lms_gain(percent);
+        let (left, right) = pipeline.requested_volume_q16();
+        let louder = left.max(right);
+        let (left, right) = if louder == 0 {
+            (level, level)
+        } else {
+            let scale = |g: u32| (u64::from(level) * u64::from(g) / u64::from(louder)) as u32;
+            (scale(left), scale(right))
+        };
+        self.set_volume(left, right, backend, pipeline);
     }
 
     /// Queues a CYD update. A full queue (a caller that stopped draining it) drops the oldest.
@@ -1743,9 +1773,10 @@ impl PlayerCoordinator {
         let mut msgs = heapless::Vec::new();
         let _ = msgs.push(CydMessage::PlaybackState(self.cyd_playback_state()));
 
-        let avg_gain = ((self.volume.gain_left as u64 + self.volume.gain_right as u64) / 2) as u32;
-        let pct = core::cmp::min(100, ((avg_gain as u64 * 100) / 65536).min(100) as u8);
-        let _ = msgs.push(CydMessage::Volume(pct));
+        // The louder side of the requested volume, as the audg CYD note: a balance ratio in
+        // the software gain must not read as a lower volume.
+        let (left, right) = pipeline.requested_volume_q16();
+        let _ = msgs.push(CydMessage::Volume(lms_gain_to_hardware_volume_percent(left.max(right))));
 
         let elapsed_secs = if self.current_sample_rate > 0 {
             (pipeline.frames_played / (self.current_sample_rate as u64)) as u32
@@ -1764,9 +1795,10 @@ impl PlayerCoordinator {
     }
 
     /// Handles an interactive command from the CYD front panel display.
-    pub fn handle_cyd_command<S: AudioOutputSink>(
+    pub fn handle_cyd_command<B: AudioBackend, S: AudioOutputSink>(
         &mut self,
         cmd: CydCommand,
+        backend: &mut B,
         pipeline: &mut StreamPipeline<S>,
     ) -> Option<CydMessage> {
         match cmd {
@@ -1796,10 +1828,9 @@ impl PlayerCoordinator {
                 }
             }
             CydCommand::SetVolume(vol) => {
-                let gain = ((vol.min(100) as u32) * 65536) / 100;
-                self.volume.gain_left = gain;
-                self.volume.gain_right = gain;
-                pipeline.set_volume(gain, gain);
+                // Through the single volume entry: the device policy applies and the balance
+                // LMS set is kept.
+                self.set_volume_percent(vol, backend, pipeline);
                 Some(CydMessage::Volume(vol))
             }
             CydCommand::QueryStatus => {
@@ -2449,7 +2480,7 @@ mod tests {
         coordinator.buffer_threshold_bytes = 1024;
         pipeline.sink.set_mute(false);
 
-        let msg = coordinator.handle_cyd_command(CydCommand::Pause, &mut pipeline);
+        let msg = coordinator.handle_cyd_command(CydCommand::Pause, &mut MockBackend::new(), &mut pipeline);
         assert_eq!(msg, Some(CydMessage::PlaybackState(PlayState::Paused)));
         assert_eq!(coordinator.state, PlayerState::Paused);
         assert_eq!(coordinator.buffer_threshold_bytes, 0);
@@ -2460,14 +2491,14 @@ mod tests {
         coordinator.buffer_threshold_bytes = 2048;
         pipeline.sink.set_mute(false);
 
-        let msg = coordinator.handle_cyd_command(CydCommand::Toggle, &mut pipeline);
+        let msg = coordinator.handle_cyd_command(CydCommand::Toggle, &mut MockBackend::new(), &mut pipeline);
         assert_eq!(msg, Some(CydMessage::PlaybackState(PlayState::Paused)));
         assert_eq!(coordinator.state, PlayerState::Paused);
         assert_eq!(coordinator.buffer_threshold_bytes, 0);
         assert!(pipeline.sink.muted);
 
         // 3. CydCommand::Toggle while Paused transitions back to Playing
-        let msg = coordinator.handle_cyd_command(CydCommand::Toggle, &mut pipeline);
+        let msg = coordinator.handle_cyd_command(CydCommand::Toggle, &mut MockBackend::new(), &mut pipeline);
         assert_eq!(msg, Some(CydMessage::PlaybackState(PlayState::Playing)));
         assert_eq!(coordinator.state, PlayerState::Playing);
         assert!(!pipeline.sink.muted);
@@ -2965,6 +2996,89 @@ mod tests {
     }
 
     #[test]
+    fn test_audg_balance_over_hardware_volume() {
+        let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x09], "Test");
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut pipeline = pcm_pipeline(&mut s, &mut o);
+        let sw = |p: &TestPipeline<'_>| (p.gain_stage.volume_l_q16, p.gain_stage.volume_r_q16);
+        // Balanced full volume: exactly unity, not 0 (u32 l << 16 would wrap to 0).
+        rig.command(&mut pipeline, &audg_frame(0x1_0000, 0x1_0000, 1), 10);
+        assert_eq!(sw(&pipeline), (0x1_0000, 0x1_0000));
+        assert_eq!(rig.backend.hw_vol, (0x30, 0x30));
+        // Above unity (LMS never sends it, but no wrap either).
+        rig.command(&mut pipeline, &audg_frame(u32::MAX, u32::MAX, 1), 11);
+        assert_eq!(sw(&pipeline), (0x1_0000, 0x1_0000));
+        // Hard left / hard right: the amplifier from the louder side, the other side silent.
+        rig.command(&mut pipeline, &audg_frame(0x8000, 0, 1), 12);
+        assert_eq!(sw(&pipeline), (0x1_0000, 0));
+        assert_eq!(rig.backend.hw_vol, (0x39, 0x39));
+        rig.command(&mut pipeline, &audg_frame(0, 0x8000, 1), 13);
+        assert_eq!(sw(&pipeline), (0, 0x1_0000));
+        assert_eq!(rig.backend.hw_vol, (0x39, 0x39));
+        // Partial balance: ratio exact to Q16.
+        rig.command(&mut pipeline, &audg_frame(0x4000, 0x1_0000, 1), 14);
+        assert_eq!(sw(&pipeline), (0x4000, 0x1_0000));
+        assert_eq!(rig.backend.hw_vol, (0x30, 0x30));
+        // The output applies it: right side at full, left at a quarter.
+        let mut frame = [4000 << 16, 4000 << 16];
+        pipeline.gain_stage.apply(&mut frame);
+        assert_eq!(frame, [1000 << 16, 4000 << 16]);
+    }
+
+    #[test]
+    fn test_local_volume_changes_keep_the_balance() {
+        // CYD SetVolume (and the HTTP/IR and boot paths, through the same entry) set the level
+        // through the hardware/software policy and keep LMS's L/R ratio.
+        let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x0A], "Test");
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut pipeline = pcm_pipeline(&mut s, &mut o);
+        rig.command(&mut pipeline, &audg_frame(0x1_0000, 0x4000, 1), 10);
+        assert_eq!((pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16), (0x1_0000, 0x4000));
+        let msg = rig.coord.handle_cyd_command(CydCommand::SetVolume(50), &mut rig.backend, &mut pipeline);
+        assert_eq!(msg, Some(CydMessage::Volume(50)));
+        // The amplifier gets the 50 % register (same as percent_to_attenuation), the software
+        // keeps the quarter on the right.
+        assert_eq!(rig.backend.hw_vol, (crate::amp::percent_to_attenuation(50), crate::amp::percent_to_attenuation(50)));
+        assert_eq!(pipeline.gain_stage.volume_l_q16, 0x1_0000);
+        assert!(pipeline.gain_stage.volume_r_q16.abs_diff(0x4000) <= 2, "{}", pipeline.gain_stage.volume_r_q16);
+        // The requested volume (Task 16's loudness input) follows: louder side at the 50 % level.
+        let (l, r) = pipeline.requested_volume_q16();
+        assert_eq!(lms_gain_to_hardware_volume_percent(l.max(r)), 50);
+        assert!((u64::from(r) * 4).abs_diff(u64::from(l)) <= 4, "({l}, {r})");
+        // The percent entry used by HTTP/IR and boot behaves the same.
+        rig.coord.set_volume_percent(80, &mut rig.backend, &mut pipeline);
+        assert_eq!(rig.backend.hw_vol.0, crate::amp::percent_to_attenuation(80));
+        assert_eq!(pipeline.gain_stage.volume_l_q16, 0x1_0000);
+        assert!(pipeline.gain_stage.volume_r_q16.abs_diff(0x4000) <= 2);
+        // Without hardware volume the level goes into software, still balanced.
+        rig.backend.hw_volume = false;
+        rig.coord.set_volume_percent(100, &mut rig.backend, &mut pipeline);
+        assert_eq!(pipeline.gain_stage.volume_l_q16, 0x1_0000);
+        assert!(pipeline.gain_stage.volume_r_q16.abs_diff(0x4000) <= 2);
+        // 0 % silences; balance is unknown after a (0, 0) and the next level is centred.
+        rig.coord.set_volume_percent(0, &mut rig.backend, &mut pipeline);
+        assert_eq!((pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16), (0, 0));
+        rig.coord.set_volume_percent(100, &mut rig.backend, &mut pipeline);
+        assert_eq!((pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16), (0x1_0000, 0x1_0000));
+    }
+
+    #[test]
+    fn test_cyd_telemetry_volume_from_requested_volume() {
+        // Hard-left balance must not read as half volume: the percent is the louder side's,
+        // as the audg CYD note.
+        let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x0B], "Test");
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut pipeline = pcm_pipeline(&mut s, &mut o);
+        let note = rig.command(&mut pipeline, &audg_frame(1842, 0, 1), 10);
+        assert_eq!(note, Some(CydMessage::Volume(55)));
+        assert_eq!(rig.coord.sync_cyd_telemetry(&pipeline)[1], CydMessage::Volume(55));
+        rig.command(&mut pipeline, &audg_frame(0, 0x1_0000, 1), 20);
+        assert_eq!(rig.coord.sync_cyd_telemetry(&pipeline)[1], CydMessage::Volume(100));
+        rig.command(&mut pipeline, &audg_frame(0, 0, 1), 30);
+        assert_eq!(rig.coord.sync_cyd_telemetry(&pipeline)[1], CydMessage::Volume(0));
+    }
+
+    #[test]
     fn test_audg_software_volume_without_hardware_volume() {
         // C parity: output_embedded.c:118-126, no volume_cb: output.gainL/R = the gains, per
         // channel (balance kept), applied by the gain stage.
@@ -2990,13 +3104,19 @@ mod tests {
         let mut output_storage = [0u8; 1024];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // Unequal channels: the louder one sets both TAS channels; software gain unity.
+        // Unequal channels: the louder one sets both TAS channels (Task 7), and the software
+        // gain keeps the balance as the per-channel ratio to it (Task 14 fix round: C honors
+        // independent L/R gains, output.c:54-55; Balance=1, embedded.h:47).
         // 1842 = LMS 51% slider (-31 dB) -> 55% -> 0x5D (-22.5 dB)
         let msg = rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 10);
         assert_eq!(msg, Some(CydMessage::Volume(55)));
         assert_eq!(rig.backend.hw_vol, (0x5D, 0x5D));
         assert_eq!(pipeline.gain_stage.volume_l_q16, 65536);
-        assert_eq!(pipeline.gain_stage.volume_r_q16, 65536);
+        assert_eq!(pipeline.gain_stage.volume_r_q16, 900 * 65536 / 1842);
+        // Equal channels: exactly unity in software, as Task 7.
+        rig.command(&mut pipeline, &audg_frame(1842, 1842, 1), 15);
+        assert_eq!((pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16), (65536, 65536));
+        rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 16);
         // The requested volume (C equalizer_set_volume's input, Task 16) is LMS's, per channel.
         assert_eq!(pipeline.requested_volume_q16(), (1842, 900));
 
@@ -3238,7 +3358,7 @@ mod tests {
         assert_eq!(
             caps.as_str(),
             concat!(
-                "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Depth=32,Firmware=v",
+                "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware=v",
                 env!("CARGO_PKG_VERSION"),
                 ",ModelName=SqueezeESP32,MaxSampleRate=192000,flc,pcm,wav,aif,mp3"
             )

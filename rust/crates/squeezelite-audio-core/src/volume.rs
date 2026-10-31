@@ -331,6 +331,24 @@ mod tests {
     }
 
     #[test]
+    fn test_gain_saturates_like_c() {
+        // C gain() clamps the 64-bit product to +-0x7fffffffffff before >> 16 (output_pack.c:
+        // 33-38): replay gain 4.0 on a near-full-scale sample lands on the i32 bounds, through
+        // the per-sample loop (gains 4.0, so not the unity fast path).
+        let g = GainStage { replay_gain_q16: 0x4_0000, ..GainStage::unity() };
+        assert_eq!(g.channel_gains(), (0x4_0000, 0x4_0000));
+        let mut s = [0x7fff_0000, -0x7fff_0000, 0x2000_0000, -0x2000_0001];
+        g.apply(&mut s);
+        assert_eq!(s, [i32::MAX, i32::MIN, i32::MAX, i32::MIN]);
+        // The composition itself saturates too: gain(vol, rg) = 16384.0 x 4.0 clamps to
+        // i32::MAX (output.c:54), and an out-of-range u32 volume first saturates to i32::MAX.
+        let g = GainStage { volume_l_q16: 0x4000_0000, volume_r_q16: u32::MAX, replay_gain_q16: 0x4_0000, ..GainStage::unity() };
+        assert_eq!(g.channel_gains(), (i32::MAX, i32::MAX));
+        assert_eq!(g.effective_q16(), (i32::MAX as u64, i32::MAX as u64));
+        assert_eq!(g.channel_gains().0, gain(0x4000_0000, 0x4_0000));
+    }
+
+    #[test]
     fn test_independent_left_right_volume() {
         let g = GainStage { volume_l_q16: 0x1_0000, volume_r_q16: 0x4000, ..GainStage::unity() };
         assert_eq!(g.effective_q16(), (0x1_0000, 0x4000));

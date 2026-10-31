@@ -587,6 +587,12 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Deliberate divergence (ruled in Task 13): during a fade up/down C negates the inverted
     /// gain a second time (output.c:57 then :229), so it plays non-inverted for the fade
     /// only, with a polarity flip at each fade edge. Here invert negates exactly once.
+    ///
+    /// C's per-call gain artifacts are not reproduced either: C composes `gainL/R` once per
+    /// `_output_frames` call (output.c:54-57) and multiplies the fade gain into it in place
+    /// (:227-228), so a call whose loop runs more than one chunk compounds the fade gains of
+    /// its chunks; and the replay-gain swap at crossfade completion (:209) reaches the gain
+    /// only on the next call. Rust recomposes the whole gain for every chunk.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     fn scale_chunk(&mut self, frames: usize, chunk_gain: ChunkGain) {
         let samples = &mut self.output_i32_scratch[..frames * 2];

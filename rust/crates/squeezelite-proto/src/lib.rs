@@ -1049,11 +1049,10 @@ pub const SQUEEZENETWORK_MARKER_IP: [u8; 4] = [0, 0, 0, 1];
 ///   `,SyncgroupID=<10 chars>`, used for one `HELO` only.
 ///
 /// This writes the same fields in the same order, minus the ones the Rust firmware cannot back
-/// (deliberate divergences): no `HasDigitalOut` (no SPDIF yet), no `Balance` (the device's
-/// TAS5805M hardware volume collapses `audg` L/R onto one amplifier gain; only a backend
-/// without hardware volume keeps L/R apart), no `,loc` (never a local player).
-/// `HasPolarityInversion=1` (C parity) since Task 14: the gain stage honors `strm` invert
-/// (output.c:57). `Depth=32` matches C's
+/// (deliberate divergences): no `HasDigitalOut` (no SPDIF yet), no `,loc` (never a local
+/// player). Since Task 14 (C parity): `HasPolarityInversion=1` (the gain stage honors `strm`
+/// invert, output.c:57) and `Balance=1` (independent L/R `audg` gains, in software, or as a
+/// software ratio over the device's hardware volume). `Depth=32` matches C's
 /// `BYTES_PER_FRAME == 8` branch: the Rust output ring holds 8-byte stereo `i32` frames.
 /// A target that cannot hold the whole string is an error, never a truncation.
 pub fn build_capabilities<W: fmt::Write>(
@@ -1065,8 +1064,11 @@ pub fn build_capabilities<W: fmt::Write>(
     out: &mut W,
 ) -> Result<(), ParseError> {
     let write = |out: &mut W| -> fmt::Result {
-        // C parity: embedded.h:47 base_cap, minus HasDigitalOut and Balance (see above).
-        write!(out, "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Depth=32,Firmware={firmware}")?;
+        // C parity: embedded.h:47 base_cap, minus HasDigitalOut (see above).
+        write!(
+            out,
+            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware={firmware}"
+        )?;
         write!(out, ",ModelName={model_name},MaxSampleRate={max_rate},{codecs}")?;
         if let Some(id) = syncgroup {
             write!(out, ",SyncgroupID={id}")?;
@@ -1943,14 +1945,16 @@ mod tests {
         let mut caps = CapBuf::new();
         build_capabilities("SqueezeESP32", "v0.1.0", 96_000, None, "flc,pcm,wav,aif,mp3", &mut caps)
             .unwrap();
-        // Task 14: HasPolarityInversion=1 now that the gain stage inverts (C embedded.h:47).
+        // Task 14: HasPolarityInversion=1 now that the gain stage inverts, and Balance=1 (C
+        // embedded.h:47).
         assert_eq!(
             caps.as_str(),
-            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Depth=32,Firmware=v0.1.0,\
+            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware=v0.1.0,\
              ModelName=SqueezeESP32,MaxSampleRate=96000,flc,pcm,wav,aif,mp3"
         );
         assert!(!caps.as_str().contains("HasDigitalOut"));
-        assert!(!caps.as_str().contains("Balance"));
+        // Task 14 fix round: Balance=1, honored by the per-channel software ratio.
+        assert!(caps.as_str().contains(",Balance=1,"));
 
         // A `serv` syncgroup is appended last, exactly as C's var_cap.
         let mut caps = CapBuf::new();
@@ -1958,7 +1962,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             caps.as_str(),
-            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Depth=32,Firmware=v0.1.0,\
+            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware=v0.1.0,\
              ModelName=SqueezeESP32,MaxSampleRate=192000,flc,SyncgroupID=0123456789"
         );
 

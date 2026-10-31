@@ -363,6 +363,9 @@ impl FadeEngine {
                 } else {
                     // C output.c:247-249: "unable to continue crossfade - too few samples". C
                     // leaves current_replay_gain alone here (only completion switches it).
+                    // Since Task 14 applies the current replay gain to all output, an aborted
+                    // crossfade plays the whole new track at the OLD track's replay gain:
+                    // C-faithful and audible, but rare (the decoder must stall mid-fade).
                     self.state = FadeState::Inactive;
                 }
             }

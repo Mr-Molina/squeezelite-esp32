@@ -75,7 +75,7 @@ pub fn run_firmware_tick_with_network<S, U, I>(
     pipeline: &mut StreamPipeline<'_, S>,
     cyd_bridge: &mut CydUartBridge<U>,
     amp: &mut AmpManager<I>,
-    net: Option<HostNet<'_>>,
+    mut net: Option<HostNet<'_>>,
     now_ms: u32,
 ) -> usize
 where
@@ -84,7 +84,14 @@ where
     I: I2c,
 {
     if let Ok(Some(cmd)) = cyd_bridge.poll_command() {
-        if let Some(reply) = coordinator.handle_cyd_command(cmd, pipeline) {
+        // The host backend when there is one, else a stand-in with no hardware volume, so the
+        // level goes into the software gain (C output_embedded.c:120-124).
+        let mut no_hw = MockBackend { hw_volume: false, ..MockBackend::default() };
+        let backend: &mut MockBackend = match &mut net {
+            Some(net) => net.backend,
+            None => &mut no_hw,
+        };
+        if let Some(reply) = coordinator.handle_cyd_command(cmd, backend, pipeline) {
             let _ = cyd_bridge.flush_outbound(&reply);
         }
     }
@@ -313,9 +320,9 @@ mod xtensa_hw {
         Interface as WifiInterface, PowerSaveMode, WifiController, WifiRxToken, WifiTxToken,
     };
     use esp_storage::FlashStorage;
-    use louder_esp32_app::amp::percent_to_attenuation;
     use louder_esp32_app::backend_device::{
-        program_i2s_clock, I2sClockRegisters, I2S0_CLKM_CONF_ADDR, I2S0_SAMPLE_RATE_CONF_ADDR,
+        program_i2s_clock, Esp32AudioBackend, I2sClockRegisters, I2S0_CLKM_CONF_ADDR,
+        I2S0_SAMPLE_RATE_CONF_ADDR,
     };
     use louder_esp32_app::board::first_boot_defaults;
     use louder_esp32_app::config_handle::{
@@ -1379,11 +1386,26 @@ mod xtensa_hw {
         let _ = amp.set_volume(VOL_UNITY_0DB);
     }
 
-    /// Apply the saved volume register and analog gain.
+    /// Apply the boot-resolved audio configuration: volume, analog gain, EQ and loudness.
+    /// Returns the volume percent. The volume goes through the coordinator's single volume
+    /// entry (register `percent_to_attenuation(percent)` as before, software gain per the
+    /// device policy, requested volume recorded for the loudness).
     #[inline(never)]
-    fn amp_apply_boot_config(amp: &mut AmpManager<Esp32I2cBus<'static>>, vol_reg: u8, again_code: u8) {
-        let _ = amp.set_volume(vol_reg);
+    fn amp_apply_boot_config(
+        coordinator: &mut PlayerCoordinator,
+        amp: &mut AmpManager<Esp32I2cBus<'static>>,
+        pipeline: &mut HwStreamPipeline,
+        config: &ConfigHandle,
+    ) -> u8 {
+        let (percent, again_code, eq_preset, loudness) = config.read(|c| {
+            (c.volume, c.analog_gain_code, c.equalizer_preset, c.loudness_enabled)
+        });
+        let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        coordinator.set_volume_percent(percent, &mut backend, pipeline);
         let _ = amp.set_analog_gain(again_code);
+        pipeline.apply_eq_preset(EqPreset::from_u8(eq_preset));
+        pipeline.set_loudness(loudness);
+        percent
     }
 
     /// Pre-loop amp start: clear faults, Hi-Z -> Play, first telemetry read.
@@ -1703,15 +1725,7 @@ mod xtensa_hw {
         println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
 
         // Apply the boot-resolved audio configuration (volume, AGAIN, EQ, loudness).
-        let (current_vol_pct, again_code, eq_preset, loudness) = config.read(|c| {
-            (c.volume, c.analog_gain_code, c.equalizer_preset, c.loudness_enabled)
-        });
-        let init_vol_reg = percent_to_attenuation(current_vol_pct);
-        amp_apply_boot_config(amp, init_vol_reg, again_code);
-        pipeline.apply_eq_preset(EqPreset::from_u8(eq_preset));
-        pipeline.set_loudness(loudness);
-        let eff_gain = if current_vol_pct > 0 { 65536 } else { 0 };
-        pipeline.set_volume(eff_gain, eff_gain);
+        let current_vol_pct = amp_apply_boot_config(coordinator, amp, pipeline, config);
         let _ = cyd_bridge.send_message(&CydMessage::Volume(current_vol_pct));
 
         // Start `esp-rtos` scheduler required by `esp-radio`

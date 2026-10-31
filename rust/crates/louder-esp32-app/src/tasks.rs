@@ -247,7 +247,6 @@ mod device {
     use esp_radio::wifi::{Interface as WifiInterface, WifiController};
     use esp_rtos::embassy::Executor;
     use esp_storage::FlashStorage;
-    use louder_esp32_app::amp::percent_to_attenuation;
     use louder_esp32_app::backend_device::Esp32AudioBackend;
     use louder_esp32_app::config_handle::{ConfigHandle, ConfigWriter, RamJournal};
     use louder_esp32_app::bt_a2dp::BtA2dpSink;
@@ -1063,10 +1062,11 @@ mod device {
                             HttpControlAction::PlayerIrCommand { ir_code, vol_pct, mute } => {
                                 if let Some(pct) = vol_pct {
                                     s.current_vol_pct = pct;
-                                    let vol_reg = percent_to_attenuation(pct);
-                                    let _ = s.amp.set_volume(vol_reg);
-                                    let eff_gain = if pct > 0 { 65536 } else { 0 };
-                                    s.pipeline.set_volume(eff_gain, eff_gain);
+                                    // The single volume entry: the TAS register for `pct`
+                                    // (as percent_to_attenuation), LMS's balance kept.
+                                    let mut backend =
+                                        Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+                                    s.coordinator.set_volume_percent(pct, &mut backend, s.pipeline);
                                     let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
                                     s.config.update(|c| c.volume = pct);
                                 }
@@ -1266,7 +1266,9 @@ mod device {
     #[inline(never)]
     fn cyd_command(s: &mut FirmwareState) {
         if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
-            if let Some(reply) = s.coordinator.handle_cyd_command(cmd, s.pipeline) {
+            // CYD SetVolume goes through the single volume entry (device policy, balance kept).
+            let mut backend = Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            if let Some(reply) = s.coordinator.handle_cyd_command(cmd, &mut backend, s.pipeline) {
                 if let CydMessage::Volume(pct) = reply {
                     // A CYD volume change marks the config dirty (spec §3.5); debounced.
                     s.config.update(|c| c.volume = pct.min(100));

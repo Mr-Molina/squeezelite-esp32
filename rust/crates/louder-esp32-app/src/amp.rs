@@ -32,6 +32,33 @@ pub fn lms_gain_to_hardware_volume_percent(gain: u32) -> u8 {
     p.clamp(1, 100) as u8
 }
 
+/// The LMS gain whose perceptual percentage ([`lms_gain_to_hardware_volume_percent`]) is
+/// `percent` (clamped to 100): 100 % is unity (LMS full volume, 0x10000), any other percent
+/// the smallest such gain. Either way its TAS register is exactly [`percent_to_attenuation`]'s.
+/// Lets the local percent-based volume paths (CYD, HTTP/IR, boot) go through the same
+/// gain-based volume entry as `audg`.
+pub fn percent_to_lms_gain(percent: u8) -> u32 {
+    let percent = percent.min(100);
+    if percent == 0 {
+        return 0;
+    }
+    if percent == 100 {
+        return 0x1_0000;
+    }
+    // The curve is monotonic in the gain and reaches every percent 1..=100 (1 at gain 1,
+    // 100 at 65536): binary search for the smallest gain at or above `percent`.
+    let (mut lo, mut hi) = (1u32, 65_536u32);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if lms_gain_to_hardware_volume_percent(mid) >= percent {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
 /// Maps LMS logarithmic mixer gain (`0..=65536`) to exact TAS5805M `0x4C` hardware volume register code.
 ///
 /// TAS5805M `DIG_VOL_CTRL` (register `0x4C`) is calibrated at 0.5 dB per step:
@@ -441,6 +468,20 @@ mod tests {
     use embedded_hal::i2c::ErrorKind;
     use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
     use squeezelite_tas58xx::registers;
+
+    #[test]
+    fn test_percent_to_lms_gain_round_trips_to_the_same_register() {
+        // Local volume paths speak percent; the single volume entry takes LMS gains. Every
+        // percent maps to a gain whose TAS register is exactly percent_to_attenuation's.
+        for p in 0..=100u8 {
+            let g = percent_to_lms_gain(p);
+            assert_eq!(lms_gain_to_hardware_volume_percent(g), p, "{p}% -> {g}");
+            assert_eq!(lms_gain_to_tas5805m_vol_reg(g), percent_to_attenuation(p), "{p}%");
+        }
+        assert_eq!(percent_to_lms_gain(0), 0);
+        assert_eq!(percent_to_lms_gain(100), 0x1_0000);
+        assert_eq!(percent_to_lms_gain(150), 0x1_0000);
+    }
 
     #[test]
     fn test_amp_manager_full_lifecycle() {
