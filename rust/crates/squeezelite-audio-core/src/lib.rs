@@ -18,4 +18,4 @@ pub use equalizer::{BiquadCoeffs, EqPreset, Equalizer};
 pub use fade::{FadeEngine, FadeMode};
 pub use output::{AudioOutputSink, MockAudioSink, OutputError};
 pub use ringbuffer::{AudioRingBuffer, RingBufferError};
-pub use volume::{scale_samples_inplace, VolumeScale};
+pub use volume::{scale_samples_inplace, ChannelMode, GainStage, VolumeScale};
