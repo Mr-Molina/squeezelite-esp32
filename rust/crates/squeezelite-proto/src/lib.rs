@@ -373,15 +373,22 @@ impl<'a> ServerCommand<'a> {
         }
     }
 
-    /// Extracts `(server_ip, sync_group)` if this command is a `serv` frame.
-    pub fn switch_server(&self) -> Option<([u8; 4], &'a [u8])> {
+    /// Extracts `(server_ip, syncgroup)` if this command is a `serv` frame.
+    ///
+    /// C parity (`slimproto.c:651-666`): the syncgroup is the tail after the IPv4 address only
+    /// when it is exactly [`SYNCGROUP_ID_LEN`] bytes; any other tail means "no syncgroup" (C
+    /// frees `new_server_cap`). `0.0.0.1` is C's SqueezeNetwork marker (`slimproto.c:645`); it
+    /// is returned as is for the caller to decide.
+    pub fn switch_server(&self) -> Option<([u8; 4], Option<&'a [u8]>)> {
         match *self {
             Self::Unknown {
                 opcode: [b's', b'e', b'r', b'v'],
                 payload,
             } if payload.len() >= 4 => {
                 let ip = [payload[0], payload[1], payload[2], payload[3]];
-                Some((ip, &payload[4..]))
+                let tail = &payload[4..];
+                let syncgroup = (tail.len() == SYNCGROUP_ID_LEN).then_some(tail);
+                Some((ip, syncgroup))
             }
             _ => None,
         }
@@ -1025,6 +1032,61 @@ impl SlimprotoBuilder {
     }
 }
 
+/// Length of a `serv` SyncgroupID (C `slimproto.c:651`: `len - sizeof(serv_packet) == 10`).
+pub const SYNCGROUP_ID_LEN: usize = 10;
+
+/// `serv` address that C maps to SqueezeNetwork (`slimproto.c:645`, `pkt[4..8] == 0.0.0.1`).
+pub const SQUEEZENETWORK_MARKER_IP: [u8; 4] = [0, 0, 0, 1];
+
+/// Writes the `HELO` capability string.
+///
+/// C builds it from three parts (`sendHELO`, `slimproto.c:128-178`):
+/// * `base_cap` (`embedded.h:47-49`): `Model=squeezeesp32,AccuratePlayPoints=1,HasDigitalOut=1,
+///   HasPolarityInversion=1,Balance=1,Depth=<16|32>,Firmware=<VERSION>`;
+/// * `fixed_cap` (`slimproto.c:1068-1082`): `,ModelName=<model>,MaxSampleRate=<rate>` and one
+///   `,<types>` per registered codec;
+/// * `var_cap` (`slimproto.c:1155-1168`): `,loc` for a local player and the `serv`
+///   `,SyncgroupID=<10 chars>`, used for one `HELO` only.
+///
+/// This writes the same fields in the same order, minus the ones the Rust firmware cannot back
+/// (deliberate divergences): no `HasDigitalOut` (no SPDIF yet), no `HasPolarityInversion` (the
+/// gain path has no inversion until Task 14), no `Balance` (the device collapses `audg` L/R onto
+/// one amplifier gain), no `,loc` (never a local player). `Depth=32` matches C's
+/// `BYTES_PER_FRAME == 8` branch: the Rust output ring holds 8-byte stereo `i32` frames.
+/// A target that cannot hold the whole string is an error, never a truncation.
+pub fn build_capabilities<W: fmt::Write>(
+    model_name: &str,
+    firmware: &str,
+    max_rate: u32,
+    syncgroup: Option<&str>,
+    codecs: &str,
+    out: &mut W,
+) -> Result<(), ParseError> {
+    let write = |out: &mut W| -> fmt::Result {
+        write!(out, "Model=squeezeesp32,AccuratePlayPoints=1,Depth=32,Firmware={firmware}")?;
+        write!(out, ",ModelName={model_name},MaxSampleRate={max_rate},{codecs}")?;
+        if let Some(id) = syncgroup {
+            write!(out, ",SyncgroupID={id}")?;
+        }
+        Ok(())
+    };
+    write(out).map_err(|_| ParseError::PayloadTooLarge)
+}
+
+/// Delay before reconnecting after the server connection dropped, for the `attempt`-th
+/// consecutive drop (0 = first), with `seed` as the random source.
+///
+/// C parity (MK5, `slimproto.c:1183-1192`): `reconnect_delay` starts at 1 s and doubles after
+/// every drop, capped at 30 s; the delay is `reconnect_delay * 1000 + rand() % 1000` ms. So the
+/// sequence is 1, 2, 4, 8, 16, 30, 30, ... s plus 0..999 ms of jitter. (The caller resets
+/// `attempt` to 0 after a session that lasted over 30 s, `slimproto.c:1179-1181`, and after a
+/// `serv` switch, `slimproto.c:1104`.)
+pub fn next_backoff_ms(attempt: u32, seed: u32) -> u32 {
+    const CAP_S: u32 = 30;
+    let base_s = if attempt >= 5 { CAP_S } else { (1u32 << attempt).min(CAP_S) };
+    base_s * 1000 + seed % 1000
+}
+
 /// Discovered Logitech Media Server details from UDP broadcast query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveredServer {
@@ -1543,7 +1605,7 @@ mod tests {
 
         let serv_frame = [0x00, 0x08, b's', b'e', b'r', b'v', 192, 168, 1, 99];
         let (cmd_serv, _) = SlimprotoParser::parse_frame(&serv_frame).unwrap();
-        assert_eq!(cmd_serv.switch_server(), Some(([192, 168, 1, 99], &[][..])));
+        assert_eq!(cmd_serv.switch_server(), Some(([192, 168, 1, 99], None)));
 
         let vers_frame = b"\x00\x09vers8.5.1";
         let (cmd_vers, _) = SlimprotoParser::parse_frame(vers_frame).unwrap();
@@ -1842,5 +1904,103 @@ mod tests {
             SlimprotoBuilder::build_ir(100, 0x1234, &mut short_buf),
             Err(ParseError::PayloadTooLarge)
         );
+    }
+
+    /// Fixed (non-SSL) string type for the capability tests.
+    struct CapBuf {
+        buf: [u8; 256],
+        len: usize,
+    }
+
+    impl CapBuf {
+        fn new() -> Self {
+            Self { buf: [0; 256], len: 0 }
+        }
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.buf[..self.len]).unwrap()
+        }
+    }
+
+    impl fmt::Write for CapBuf {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let end = self.len + s.len();
+            if end > self.buf.len() {
+                return Err(fmt::Error);
+            }
+            self.buf[self.len..end].copy_from_slice(s.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_capabilities_string_exact() {
+        // C parity: base_cap (embedded.h:47-49) + fixed_cap (slimproto.c:1068-1082) + var_cap
+        // (slimproto.c:1165-1168), minus what the Rust firmware cannot do yet.
+        let mut caps = CapBuf::new();
+        build_capabilities("SqueezeESP32", "v0.1.0", 96_000, None, "flc,pcm,wav,aif,mp3", &mut caps)
+            .unwrap();
+        assert_eq!(
+            caps.as_str(),
+            "Model=squeezeesp32,AccuratePlayPoints=1,Depth=32,Firmware=v0.1.0,\
+             ModelName=SqueezeESP32,MaxSampleRate=96000,flc,pcm,wav,aif,mp3"
+        );
+        assert!(!caps.as_str().contains("HasDigitalOut"));
+        assert!(!caps.as_str().contains("HasPolarityInversion"));
+        assert!(!caps.as_str().contains("Balance"));
+
+        // A `serv` syncgroup is appended last, exactly as C's var_cap.
+        let mut caps = CapBuf::new();
+        build_capabilities("SqueezeESP32", "v0.1.0", 192_000, Some("0123456789"), "flc", &mut caps)
+            .unwrap();
+        assert_eq!(
+            caps.as_str(),
+            "Model=squeezeesp32,AccuratePlayPoints=1,Depth=32,Firmware=v0.1.0,\
+             ModelName=SqueezeESP32,MaxSampleRate=192000,flc,SyncgroupID=0123456789"
+        );
+
+        // A target too small for the string is an error, never a silent truncation.
+        struct Tiny(usize);
+        impl fmt::Write for Tiny {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.0 += s.len();
+                if self.0 > 16 { Err(fmt::Error) } else { Ok(()) }
+            }
+        }
+        assert_eq!(
+            build_capabilities("M", "v", 1, None, "pcm", &mut Tiny(0)),
+            Err(ParseError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn test_backoff_sequence_capped_with_jitter() {
+        // C parity (slimproto.c:1183-1192): delay = reconnect_delay s + rand() % 1000 ms,
+        // reconnect_delay 1, 2, 4, 8, 16, then capped at 30 s.
+        let bases = [1_000u32, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
+        for (attempt, &base) in bases.iter().enumerate() {
+            assert_eq!(next_backoff_ms(attempt as u32, 0), base, "attempt {attempt}");
+            assert_eq!(next_backoff_ms(attempt as u32, 999), base + 999, "attempt {attempt}");
+            assert_eq!(next_backoff_ms(attempt as u32, 1_000), base, "jitter is seed % 1000");
+            assert_eq!(next_backoff_ms(attempt as u32, 12_345), base + 345);
+        }
+        // Never overflows, however many attempts.
+        assert_eq!(next_backoff_ms(u32::MAX, u32::MAX), 30_000 + u32::MAX % 1000);
+    }
+
+    #[test]
+    fn test_serv_syncgroup_only_when_exactly_ten_bytes() {
+        // C parity (slimproto.c:651-666): a 10-byte tail is the SyncgroupID, anything else
+        // clears it.
+        let mut frame = b"serv\0\0\0\x0e".to_vec();
+        frame.extend_from_slice(&[10, 0, 0, 5]);
+        frame.extend_from_slice(b"0123456789");
+        let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
+        assert_eq!(cmd.switch_server(), Some(([10, 0, 0, 5], Some(&b"0123456789"[..]))));
+
+        let mut frame = b"serv\0\0\0\x07".to_vec();
+        frame.extend_from_slice(&[10, 0, 0, 5, b'a', b'b', b'c']);
+        let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
+        assert_eq!(cmd.switch_server(), Some(([10, 0, 0, 5], None)));
     }
 }
