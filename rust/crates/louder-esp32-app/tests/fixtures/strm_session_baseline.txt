@@ -1,11 +1,19 @@
 # Baseline frozen at Task 4 — update only with a comment naming the task that changed behavior.
+# Task 11 (C squeezelite is the parity authority): re-pinned to C's sequencing.
+#   - STMf is the first reply to strm s, before the connect (slimproto.c:449).
+#   - STMo: output ran dry while the stream was still STREAMING_HTTP, once per track
+#     (slimproto.c:881-884, sentSTMo reset at strm s, slimproto.c:474).
+#   - DSCO:0 when the stream socket hits EOF (stream.c:508, sent by slimproto.c:805-807/910),
+#     before STMd/STMu instead of after the output drained.
+#   - no idle STMt heartbeat after STMu: only while output is RUNNING (slimproto.c:890).
+#   - no STMq: strm q has no reply (slimproto.c:384-391; its STMf is for 'f' only).
 HELO
 STAT:STMt
+STAT:STMf
 STAT:STMc
 RESP
 STAT:STMs
-STAT:STMd
+STAT:STMo
 DSCO:0
+STAT:STMd
 STAT:STMu
-STAT:STMt
-STAT:STMq

@@ -10,7 +10,8 @@
 //! the fixture itself is unchanged.
 //!
 //! The fixture is the regression net for the coordinator refactor: it must keep passing.
-//! A legitimate behavior change updates the fixture with a comment line naming the task.
+//! A legitimate behavior change updates the fixture with a comment line naming the task
+//! (Task 11 re-pinned it to C squeezelite's STAT/DSCO sequencing).
 #![cfg(not(target_arch = "xtensa"))]
 
 use std::io::{Read, Write};
@@ -324,9 +325,9 @@ fn test_baseline_session_replay() {
         ScriptStep::Server(strm_frame(b's', b'1', 0)),
         ScriptStep::StreamBytes(pcm_bytes(32 * 1024)),
         ScriptStep::StreamEof,
-        // one heartbeat interval elapses
+        // one heartbeat interval elapses (no STMt: output stopped after STMu)
         ScriptStep::AdvanceMs(1000),
-        // strm 'q'
+        // strm 'q' (no reply in C)
         ScriptStep::Server(strm_frame(b'q', b'0', 0)),
     ];
 
