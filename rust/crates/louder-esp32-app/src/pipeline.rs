@@ -31,6 +31,16 @@ pub const READ_SCRATCH_BYTES: usize = 1536;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
+/// Stream ring of the firmware when PSRAM is mapped: 512 KiB (C `-b 500:2000` asks 500 KiB;
+/// C parity: main/Kconfig.projbuild:465).
+pub const PSRAM_STREAM_RING_BYTES: usize = 524_288;
+/// Output ring of the firmware when PSRAM is mapped: 2000 KiB, about 5.8 s at 44.1 kHz (C
+/// parity: main/Kconfig.projbuild:465 `-b 500:2000`; main.c:410 `atoi(o) * 1024`). A crossfade
+/// can use up to 90 % of it (C output.c:330), 230,400 frames.
+pub const PSRAM_OUTPUT_RING_BYTES: usize = 2_000 * 1024;
+/// Size of the external PSRAM heap region (4 MiB, mapped at 0x3F80_0000).
+pub const PSRAM_HEAP_BYTES: usize = 4 * 1024 * 1024;
+
 /// Storage of the MP3 decoder carried by [`ActiveDecoder::Mp3`].
 ///
 /// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it (firmware) the
@@ -569,6 +579,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// inside the crossfade weights: Task 14's gain stage composes volume x replay gain x
     /// [`FadeEngine::gain_q16`] here, as C does.
     ///
+    /// TODO(Task 14): with a non-zero replay gain the level steps audibly at BOTH crossfade
+    /// edges (the old track's gain applies only inside the fade, the new track's only until
+    /// it ends), until the composite gain stage applies replay gain outside the crossfade.
+    ///
     /// Deliberate divergence: during a fade up/down C negates the inverted gain a second time
     /// (output.c:57 then :227-229), so it plays non-inverted for the fade only, with a
     /// polarity flip at each fade edge. Here invert negates exactly once, fade or not.
@@ -580,6 +594,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             // `prepare` checked that the new frames follow (output.c:231): the old samples are
             // already converted, so the byte scratch is free for them.
             let got = self.output_buffer.peek_at(offset, &mut self.write_scratch[..frames * OUTPUT_FRAME_BYTES]);
+            // `prepare` guarantees used > dur_f + size, so the whole chunk of new frames is
+            // there; a short read would mix only part of the chunk.
+            debug_assert_eq!(got, frames * OUTPUT_FRAME_BYTES, "crossfade new-track frames missing");
             for (sample, new) in samples.iter_mut().zip(self.write_scratch[..got].chunks_exact(4)) {
                 let new = i32::from_ne_bytes([new[0], new[1], new[2], new[3]]);
                 *sample = cross_sample(*sample, new, gain_out, gain_in);
@@ -701,9 +718,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     }
 
     /// Another audio source (Bluetooth) takes the output: no LMS transition applies to it.
-    /// C never arms a fade for it (only LMS codecs call `_checkfade`); the Rust source goes
-    /// through a decoder, so the mode is cleared, and a fade still running is dropped.
-    /// Polarity inversion is a player setting and stays, as in C.
+    ///
+    /// Declared divergence (cleaner): C's Bluetooth start (decode_external.c:147-154)
+    /// flushes outputbuf with `_buf_flush`, which leaves `output.fade` and `fade_mode`
+    /// untouched, so a fade the LMS track armed can still run over the Bluetooth audio. Here
+    /// the mode is cleared (the Rust Bluetooth audio goes through a decoder and would reach
+    /// `mark_track_start`), and a fade still due or running is dropped. Polarity inversion is
+    /// a player setting and stays, as in C.
     pub fn stop_fades(&mut self) {
         self.fade.configure(FadeMode::None, 0);
         self.fade.reset();

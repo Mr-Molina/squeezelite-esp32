@@ -757,7 +757,8 @@ mod device {
                     if !s.bt_audio_active {
                         // A replaced MP3 decoder is parked by `set_decoder` for the next track.
                         s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                        // C arms fades only from LMS codecs (`_checkfade`); Bluetooth gets none.
+                        // Declared divergence (cleaner): no LMS fade over Bluetooth audio (C's
+                        // `_buf_flush` leaves an armed fade running, decode_external.c:148).
                         s.pipeline.stop_fades();
                         s.pipeline.set_mute(false);
                         s.coordinator.begin_external_playback();
@@ -978,8 +979,8 @@ mod device {
                     };
                     let (psram_free_bytes, psram_used_bytes) = {
                         let stats = esp_alloc::HEAP.stats();
-                        let mut free = 3_538_944u32;
-                        let mut used = 655_360u32;
+                        let mut free = louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES;
+                        let mut used = louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES;
                         for r in stats.region_stats.iter().flatten() {
                             if r.size > 1024 * 1024 {
                                 free = r.free as u32;

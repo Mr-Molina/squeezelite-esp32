@@ -119,6 +119,10 @@ enum StreamLink {
 ///
 /// The variants map one to one, in declaration order, so this compiles to no lookup table
 /// (esp-hal links switch tables into DRAM `.data`, which comes out of the core-0 stack).
+///
+/// Pre-existing parser divergence (doc only): `TransitionType::from_byte` also maps the raw
+/// bytes 0x01-0x04 to modes (squeezelite-proto lib.rs:202-206), where C's `- '0'` gives values
+/// that arm no fade. LMS sends ASCII '0'-'4'.
 fn fade_mode_from_strm(transition: TransitionType) -> FadeMode {
     match transition {
         TransitionType::None => FadeMode::None,

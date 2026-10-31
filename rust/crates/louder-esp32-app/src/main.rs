@@ -1603,7 +1603,7 @@ mod xtensa_hw {
             const DPORT_PRO_CACHE_CTRL1_REG: *const u32 = 0x3FF0_0044 as *const u32;
             const SPI0_CACHE_SCTRL_REG: *const u32 = 0x3FF4_303C as *const u32;
             const EXTMEM_ORIGIN: usize = 0x3F80_0000;
-            const EXTMEM_SIZE: usize = 4 * 1024 * 1024;
+            const EXTMEM_SIZE: usize = louder_esp32_app::pipeline::PSRAM_HEAP_BYTES;
             let cache_ctrl1 = unsafe { core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL1_REG) };
             let spi0_sctrl = unsafe { core::ptr::read_volatile(SPI0_CACHE_SCTRL_REG) };
             let ext_sram_mapped = (cache_ctrl1 & (1 << 1)) == 0 && (spi0_sctrl & (1 << 2)) != 0;
@@ -1621,11 +1621,15 @@ mod xtensa_hw {
             }
         };
         let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(6144);
+        // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream buffer (512 KiB
+        // here) and a 2000 KiB output buffer. Both land in the PSRAM region (the internal
+        // regions are far smaller); the 4 MiB keeps ~1.2 MiB free for the FLAC decoder
+        // (3 x 64 KiB, twice while a track change swaps decoders) and the allocator.
         let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) =
             if psram_avail_bytes >= 1_048_576 {
                 (
-                    alloc::boxed::Box::leak(alloc::vec![0u8; 524_288].into_boxed_slice()),
-                    alloc::boxed::Box::leak(alloc::vec![0u8; 131_072].into_boxed_slice()),
+                    alloc::boxed::Box::leak(alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES].into_boxed_slice()),
+                    alloc::boxed::Box::leak(alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES].into_boxed_slice()),
                 )
             } else {
                 (bss_stream_storage, bss_output_storage)

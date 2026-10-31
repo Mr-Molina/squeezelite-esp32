@@ -12,6 +12,13 @@ use core::fmt::Write;
 use heapless::String;
 
 use crate::ota_safety::{REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION};
+use crate::pipeline::{PSRAM_HEAP_BYTES, PSRAM_OUTPUT_RING_BYTES, PSRAM_STREAM_RING_BYTES};
+
+/// `psram_used_bytes` reported when no PSRAM heap statistics exist: the firmware's two PSRAM
+/// rings (512 KiB stream + 2000 KiB output = 2,572,288 B).
+pub const DEFAULT_PSRAM_USED_BYTES: u32 = (PSRAM_STREAM_RING_BYTES + PSRAM_OUTPUT_RING_BYTES) as u32;
+/// `psram_free_bytes` to match [`DEFAULT_PSRAM_USED_BYTES`] in the 4 MiB region (1,622,016 B).
+pub const DEFAULT_PSRAM_FREE_BYTES: u32 = PSRAM_HEAP_BYTES as u32 - DEFAULT_PSRAM_USED_BYTES;
 
 /// Maximum time allowed from boot to establish Wi-Fi STA link + DHCPv4 lease before rolling back.
 pub const BOOT_LEASE_TIMEOUT_MS: u64 = 45_000;
@@ -156,8 +163,8 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             i2c_nacks: 0,
             i2c_nack_by_op: I2cNackByOp::default(),
             uptime_ms: 0,
-            psram_free_bytes: 3_538_944,
-            psram_used_bytes: 655_360,
+            psram_free_bytes: DEFAULT_PSRAM_FREE_BYTES,
+            psram_used_bytes: DEFAULT_PSRAM_USED_BYTES,
             core1_active: true,
             core1_loops: 0,
             codec: "PCM",
@@ -718,8 +725,8 @@ mod tests {
         assert!(resp.contains("\"frames_played\":1024"));
         assert!(resp.contains("\"amp_mode\":\"Play\""));
         assert!(resp.contains("\"vol_pct\":55"));
-        assert!(resp.contains("\"psram_free_bytes\":3538944"));
-        assert!(resp.contains("\"psram_used_bytes\":655360"));
+        assert!(resp.contains("\"psram_free_bytes\":1622016"));
+        assert!(resp.contains("\"psram_used_bytes\":2572288"));
         assert!(resp.contains("\"core1_active\":true"));
         assert!(resp.contains("\"core1_loops\":0"));
         assert!(resp.contains("\"codec\":\"PCM\""));
@@ -1031,7 +1038,7 @@ mod tests {
         let s = core::str::from_utf8(&buf[..written]).expect("valid utf8");
         assert!(s.starts_with('{'));
         assert!(s.ends_with('}'));
-        assert!(s.contains("\"psram_free_bytes\":3538944"));
+        assert!(s.contains("\"psram_free_bytes\":1622016"));
         assert!(s.contains("\"core1_active\":true"));
         assert!(s.contains("\"tas_fs_hz\":44100"));
         assert!(s.contains("\"eq_preset\":\"Flat\""));
@@ -1111,8 +1118,8 @@ mod tests {
             i2c_nacks: 5,
             i2c_nack_by_op: I2cNackByOp { read: 1, write: 3, write_read: 1 },
             uptime_ms: 98_765,
-            psram_free_bytes: 3_538_944,
-            psram_used_bytes: 655_360,
+            psram_free_bytes: DEFAULT_PSRAM_FREE_BYTES,
+            psram_used_bytes: DEFAULT_PSRAM_USED_BYTES,
             core1_active: true,
             core1_loops: 54_321,
             codec: "MP3",

@@ -267,8 +267,12 @@ impl FadeEngine {
                 return None;
             }
             // C output.c:329-330: at most what is left of the old track, and 90 % of the ring
-            // (the new track's frames must fit behind it during the fade). C floors
-            // `size * 0.9` in bytes; floored to frames here, which is the same frame count.
+            // (the new track's frames must fit behind it during the fade).
+            // C bug not reproduced: C floors `size * 0.9` in BYTES, which need not be frame
+            // aligned (a 131,072 B ring gives 117,964 B = 14,745.5 frames). When that cap
+            // binds, C's fade_start and moved track_start never equal readp, so neither the
+            // crossfade nor STMs fires. Rust floors to whole frames. At the firmware's 2000 KiB
+            // output ring the C value is aligned (1,843,200 B = 230,400 frames): exact parity.
             frames = frames.min(used_frames).min(size_frames * 9 / 10);
             let start_ahead = used_frames - frames;
             self.arm(FadeDir::Cross, start_ahead, frames);
