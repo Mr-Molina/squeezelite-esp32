@@ -124,6 +124,10 @@ struct StartParams<'a> {
     pcm_channels: u8,
     big_endian: bool,
     threshold_kb: u16,
+    /// C `output.threshold` (tenths of a second before output starts).
+    output_threshold: u8,
+    /// C `output.next_replay_gain` (16.16 fixed point).
+    replay_gain: u32,
     server_port: u16,
     server_ip: [u8; 4],
     http_headers: &'a [u8],
@@ -231,8 +235,6 @@ pub struct PlayerCoordinator {
     /// `serv` SyncgroupID for the next `HELO` (C `new_server_cap`).
     syncgroup: Option<[u8; SYNCGROUP_ID_LEN]>,
     last_tick_frames: usize,
-    /// `STMs` was reported (or is pending) for the current track.
-    track_started_reported: bool,
     /// `STMl` was reported (or is pending) for the current track (C `sentSTMl`).
     buffer_threshold_reported: bool,
     /// Buffer server frames are received into (see [`Self::set_frame_buffer`]); `None` uses a
@@ -298,7 +300,6 @@ impl PlayerCoordinator {
             server_switch: None,
             syncgroup: None,
             last_tick_frames: 0,
-            track_started_reported: false,
             buffer_threshold_reported: false,
             frame_buffer: None,
         }
@@ -378,7 +379,6 @@ impl PlayerCoordinator {
         self.reset();
         self.stream = StreamLink::Idle;
         self.buffer_threshold_bytes = 0;
-        self.track_started_reported = true;
         self.buffer_threshold_reported = true;
         self.output_underrun_reported = true;
         self.external_playback = true;
@@ -682,10 +682,14 @@ impl PlayerCoordinator {
     ) -> Result<(), TransportError> {
         source.abort();
         self.stream = StreamLink::Idle;
-        self.state = PlayerState::Stopped;
         self.stream_end = Some(DisconnectReason::Unreachable);
         self.pending_dsco = Some(DisconnectReason::Unreachable);
-        self.push_cyd(CydNote::State(PlayState::Stopped));
+        // The connect concerns the stream only: an output still RUNNING with the previous
+        // track's tail plays it out (then STMu), as C never touches the output here.
+        if !self.output_running() {
+            self.state = PlayerState::Stopped;
+            self.push_cyd(CydNote::State(PlayState::Stopped));
+        }
         self.report_stream_connected(transport, pipeline, now_ms)
     }
 
@@ -746,17 +750,28 @@ impl PlayerCoordinator {
         }
     }
 
-    /// Records sink output: the first frames of a track make `STMs` pending (C
-    /// `output.track_started`, `output.c:152`) and mark the output as running.
-    fn note_output(&mut self, written: usize) {
-        if written == 0 || self.external_playback {
-            return;
+    /// Records an output step. Playback crossing a track start makes `STMs` pending (C
+    /// parity: output.c:152 `track_started`, taken by slimproto.c:858-860 and sent at 911)
+    /// and the new track's rate current (C `status.current_sample_rate =
+    /// output.current_sample_rate`, slimproto.c:854). Frames reaching the sink mark the
+    /// output as running.
+    fn note_output<S: AudioOutputSink>(&mut self, pipeline: &mut StreamPipeline<'_, S>, written: usize) {
+        if pipeline.active_marker_crossed().is_some() {
+            self.current_sample_rate = pipeline.sample_rate;
+            if !self.external_playback {
+                self.pending_track_started = true;
+            }
         }
-        self.output_started = true;
-        if !self.track_started_reported {
-            self.track_started_reported = true;
-            self.pending_track_started = true;
+        if written > 0 && !self.external_playback {
+            self.output_started = true;
         }
+    }
+
+    /// C decodes only while `DECODE_RUNNING` (decode.c:73): an LMS track whose
+    /// decoder is still READY (before its threshold, or waiting for `strm u` with autostart
+    /// off) is not decoded, even while the previous track plays out of the output buffer.
+    fn decoder_may_run(&self) -> bool {
+        !(self.lms_track && self.decode_ready)
     }
 
     /// Checks a decode step for a decoder error. C parity: a decoder returning `DECODE_ERROR`
@@ -806,7 +821,7 @@ impl PlayerCoordinator {
                 break;
             }
             let written = pipeline.process_output_step().unwrap_or(0);
-            self.note_output(written);
+            self.note_output(pipeline, written);
             total += written;
             if written == 0 {
                 break;
@@ -829,7 +844,7 @@ impl PlayerCoordinator {
         pipeline: &mut StreamPipeline<'_, S>,
         max_steps: usize,
     ) {
-        if self.state != PlayerState::Playing {
+        if self.state != PlayerState::Playing || !self.decoder_may_run() {
             return;
         }
         for _ in 0..max_steps {
@@ -937,7 +952,7 @@ impl PlayerCoordinator {
                 trans_duration: _,
                 trans_type: _,
                 flags,
-                output_threshold: _,
+                output_threshold,
                 replay_gain,
                 server_port,
                 server_ip,
@@ -954,6 +969,8 @@ impl PlayerCoordinator {
                             pcm_channels,
                             big_endian: matches!(pcm_endianness, Endianness::BigEndian),
                             threshold_kb,
+                            output_threshold,
+                            replay_gain,
                             server_port,
                             server_ip,
                             http_headers,
@@ -1051,11 +1068,10 @@ impl PlayerCoordinator {
                     // C parity (slimproto.c:412-421, output.c:70-82): skip `interval` ms of
                     // output: consume up to interval * rate / 1000 frames of the output buffer
                     // (8-byte stereo i32 frames) and count them as played. No reply.
+                    // Task 12: the skip stops at a pending track start (see
+                    // `StreamPipeline::skip_output_frames`).
                     let frames = u64::from(replay_gain) * u64::from(pipeline.sample_rate) / 1000;
-                    let held = (pipeline.output_buffer.available_read() / 8) as u64;
-                    let skip = frames.min(held);
-                    pipeline.output_buffer.consume(skip as usize * 8);
-                    pipeline.frames_played = pipeline.frames_played.wrapping_add(skip);
+                    pipeline.skip_output_frames(frames);
                     self.frames_played = pipeline.frames_played;
                     // OUTPUT_SKIP_FRAMES replaced any START_AT / PAUSE_FRAMES wait and ends in
                     // RUNNING (slimproto.c:417, output.c:82).
@@ -1171,6 +1187,8 @@ impl PlayerCoordinator {
                         .is_none_or(|&b| matches!(Endianness::from_byte(b), Endianness::BigEndian));
                     self.current_format = Some(format);
                     self.decode_ready = Self::select_decoder(pipeline, format, bits, channels, is_be);
+                    // C decode.c:287: codec_open starts a new stream (next track start).
+                    pipeline.open_stream();
                 } else if let Some((ip, syncgroup)) = cmd.switch_server() {
                     self.switch_server(ip, syncgroup);
                 } else if let Some(setting) = cmd.device_setting() {
@@ -1208,16 +1226,36 @@ impl PlayerCoordinator {
         // the stream connected.
         self.send_metrics_stat(transport, StatEvent::StreamFlushed, pipeline, now_ms)?;
 
-        // COORD-509 & COORD-506: flush the pipeline and reset frame counters at track start.
-        // (C keeps the previous track playing for gapless: Task 12.)
+        // Task 12, C parity: `strm s` flushes only the stream buffer (stream_sock, stream.c:624,
+        // 738) and opens the codec; the output buffer and output state are untouched, so the
+        // previous track's tail keeps playing and the new track follows it gaplessly. The
+        // new decoder's first frames set the track boundary (pipeline `TrackMarker`).
+        // An output still RUNNING (Playing with audio out) stays Playing; otherwise the track
+        // starts from Buffering as before.
+        let output_continues = self.output_running();
+        let pending_stms = self.pending_track_started;
+        let was_external = self.external_playback;
         self.close_stream(source);
         self.reset();
-        pipeline.flush();
-        pipeline.frames_played = 0;
-        self.frames_played = 0;
+        if output_continues {
+            self.output_started = true;
+            self.pending_track_started = pending_stms;
+        }
+        let rate_hint = Self::decode_pcm_sample_rate_hz(p.pcm_sample_rate)
+            .unwrap_or_else(|| sample_rate_from_index(p.pcm_sample_rate));
+        // C slimproto.c:484-485: output.threshold and next_replay_gain for the new track.
+        pipeline.begin_stream(rate_hint, p.replay_gain, p.output_threshold);
+        // Nothing of an earlier track left to play (or another source's audio, which LMS
+        // replaces): the clock can switch now, and the frame counters start at 0
+        // (COORD-506/509; C resets them at the track start, which then comes first).
+        let output_idle = was_external || pipeline.output_buffer_available() == 0;
+        if output_idle {
+            pipeline.flush();
+            pipeline.frames_played = 0;
+            self.frames_played = 0;
+        }
         self.pending_resp = None;
         self.pending_meta = None;
-        self.track_started_reported = false;
         self.buffer_threshold_reported = false;
         self.stream_bytes_received = 0;
         self.lms_track = true;
@@ -1229,10 +1267,8 @@ impl PlayerCoordinator {
         self.awaiting_cont = self.autostart_mode.requires_cont();
         self.server_rebooting = (p.flags & STRM_FLAG_SERVER_REBOOT) != 0;
 
-        let sample_rate = Self::decode_pcm_sample_rate_hz(p.pcm_sample_rate)
-            .unwrap_or_else(|| sample_rate_from_index(p.pcm_sample_rate));
+        let sample_rate = rate_hint;
         self.current_format = Some(p.format);
-        self.current_sample_rate = sample_rate;
         let bits = Self::normalize_pcm_bits(p.pcm_sample_size);
         let channels = Self::normalize_pcm_channels(p.pcm_channels);
 
@@ -1249,24 +1285,37 @@ impl PlayerCoordinator {
             // is no error (no STMn); the track simply never starts. (A format this build
             // cannot decode also gets a muted PCM decoder, see `select_decoder`.)
             self.decode_ready = Self::select_decoder(pipeline, p.format, bits, channels, p.big_endian);
+            // codec_open: its first frames start the next track (C decode.c:287).
+            pipeline.open_stream();
         }
 
         // The clock must support a PCM track's rate. C has no clean equivalent (RESAMPLE16
         // resamples; output_i2s.c:638-641 only logs a failed i2s_set_sample_rates): mapped to
         // DECODE_ERROR, i.e. STMn from the status pass (slimproto.c:840), with no stream.
         // Compressed formats learn their rate from the decoder, so the strm field is a hint.
-        let clock = backend.set_sample_rate(sample_rate);
-        if clock.is_err() && p.format == AudioFormat::Pcm {
+        // With the previous track still to play the clock is only checked here: it switches
+        // when playback reaches the new track (C output.c:154, pipeline track boundary).
+        let clock_ok = if output_idle {
+            self.current_sample_rate = sample_rate;
+            backend.set_sample_rate(sample_rate).is_ok()
+        } else {
+            crate::clock_table::i2s_clock_config(sample_rate).is_some()
+        };
+        if !clock_ok && p.format == AudioFormat::Pcm {
             self.decode_ready = false;
             self.decode_failed = true;
             self.pending_not_supported = true;
-            self.state = PlayerState::Stopped;
-            pipeline.sink.set_mute(true);
-            backend.set_mute(true);
-            self.push_cyd(CydNote::State(PlayState::Stopped));
+            if !output_continues {
+                self.state = PlayerState::Stopped;
+                pipeline.sink.set_mute(true);
+                backend.set_mute(true);
+                self.push_cyd(CydNote::State(PlayState::Stopped));
+            }
             return Ok(());
         }
-        let _ = pipeline.set_sample_rate(sample_rate);
+        if output_idle {
+            let _ = pipeline.set_sample_rate(sample_rate);
+        }
         // Track start powers the amplifier (device: Hi-Z -> Play when idle), unless LMS
         // disabled the DAC (`aude`).
         if self.dac_enabled {
@@ -1306,8 +1355,11 @@ impl PlayerCoordinator {
             Err(_) => return self.report_stream_unreachable(transport, source, pipeline, now_ms),
         }
 
-        // STREAMING_BUFFERING until more than the threshold arrived (stream.c:527).
-        self.state = PlayerState::Buffering;
+        // STREAMING_BUFFERING until more than the threshold arrived (stream.c:527). A RUNNING
+        // output keeps playing meanwhile (gapless).
+        if !output_continues {
+            self.state = PlayerState::Buffering;
+        }
         self.push_cyd(CydNote::State(PlayState::Playing));
         Ok(())
     }
@@ -1332,9 +1384,10 @@ impl PlayerCoordinator {
 
     /// `strm f` and `flsh`. C parity (slimproto.c:374-385): `decode_flush`, the streaming
     /// part of the output is flushed, the stream disconnected, and `STMf` sent only if a
-    /// stream was disconnected or output flushed. Without gapless markers (Task 12) the
-    /// "streaming part" is the current track's output only while it has not started playing;
-    /// output already playing drains (then `STMu`, as in C).
+    /// stream was disconnected or output flushed. The "streaming part" is everything after
+    /// the pending track start (C `output_flush_streaming`, output.c:461-470: `writep =
+    /// track_start`): the next track queued behind a playing one, or a track whose output
+    /// has not started. A track already playing drains (then `STMu`, as in C).
     fn flush_command<S: AudioOutputSink, T: SlimTransport, R: StreamSource>(
         &mut self,
         transport: &mut T,
@@ -1343,8 +1396,10 @@ impl PlayerCoordinator {
         now_ms: u32,
     ) -> Result<(), TransportError> {
         let had_stream = self.stream_active();
-        let flushed_output = !self.output_started
-            && (pipeline.output_buffer.available_read() > 0 || pipeline.has_pending_pcm());
+        // C decode_flush(false): the decoder stops; PCM it decoded but did not deliver yet is
+        // audio C would not have decoded (its decoders write straight to outputbuf).
+        pipeline.discard_decoder_backlog();
+        let flushed_output = pipeline.flush_streaming();
         self.buffer_threshold_bytes = 0;
         self.close_stream(source);
         self.pending_track_started = false;
@@ -1358,9 +1413,6 @@ impl PlayerCoordinator {
             self.state = PlayerState::Stopped;
         }
         pipeline.stream_buffer.flush();
-        if !self.output_started {
-            pipeline.flush();
-        }
         if had_stream || flushed_output {
             send_stat(transport, StatEvent::StreamFlushed, 0, 0, pipeline.frames_played as u32, now_ms)?;
         }
@@ -1524,7 +1576,10 @@ impl PlayerCoordinator {
         // counts on this one pass only.
         let clean_end_this_pass = core::mem::take(&mut self.disconnect_ok_unseen);
         let streaming = self.stream_past_threshold && self.stream_active();
-        if self.state == PlayerState::Buffering
+        // Task 12: the decoder state is independent of the output (C decode.state vs
+        // output.state). A `strm s` that arrives while the previous track still plays leaves
+        // the player Playing (output RUNNING); its decoder starts here too.
+        if matches!(self.state, PlayerState::Buffering | PlayerState::Playing)
             && self.decode_ready
             && !self.awaiting_cont
             && (streaming || clean_end_this_pass)
@@ -1535,7 +1590,9 @@ impl PlayerCoordinator {
                 self.buffer_threshold_reported = true;
                 self.pending_buffer_threshold = true;
             }
-            if self.autostart_mode.is_auto() || self.output_start_requested {
+            if self.state == PlayerState::Playing {
+                // Output already RUNNING: `_start_output` changes nothing (slimproto.c:869).
+            } else if self.autostart_mode.is_auto() || self.output_start_requested {
                 self.state = PlayerState::Playing;
             } else {
                 // Rust decodes only while Playing, so the decoder starts with `strm u` (C
@@ -1610,13 +1667,15 @@ impl PlayerCoordinator {
         }
 
         // Try decoding a frame chunk
-        let decoded = pipeline.process_decode_step();
-        self.note_decode_result(pipeline, &decoded);
-        self.drop_undecodable_tail(pipeline, &decoded);
+        if self.decoder_may_run() {
+            let decoded = pipeline.process_decode_step();
+            self.note_decode_result(pipeline, &decoded);
+            self.drop_undecodable_tail(pipeline, &decoded);
+        }
 
         // Write frames to the output sink
         let written = pipeline.process_output_step().unwrap_or(0);
-        self.note_output(written);
+        self.note_output(pipeline, written);
         self.frames_played = pipeline.frames_played;
 
         // Re-evaluate EOF / underrun transition after draining output buffer
@@ -2089,7 +2148,11 @@ mod tests {
             }
         }
 
-        fn tick(&mut self, pipeline: &mut TestPipeline<'_>, now_ms: u32) -> Result<(), TransportError> {
+        fn tick<S: AudioOutputSink>(
+            &mut self,
+            pipeline: &mut StreamPipeline<'_, S>,
+            now_ms: u32,
+        ) -> Result<(), TransportError> {
             let result =
                 self.coord.tick(&mut self.lms, &mut self.src, &mut self.backend, pipeline, now_ms);
             self.drain_sent();
@@ -2097,9 +2160,9 @@ mod tests {
         }
 
         /// Delivers one server frame and runs the tick that handles it.
-        fn command(
+        fn command<S: AudioOutputSink>(
             &mut self,
-            pipeline: &mut TestPipeline<'_>,
+            pipeline: &mut StreamPipeline<'_, S>,
             frame: &[u8],
             now_ms: u32,
         ) -> Option<CydMessage> {
@@ -3889,10 +3952,14 @@ mod tests {
 
         // While buffering, the track keeps buffering and plays once started, even with
         // autostart off (C output already RUNNING when the decoder starts).
+        // Task 12 (C parity): this strm s arrives with the output RUNNING, which it never
+        // touches (slimproto.c:436-489), so the player stays Playing; the threshold gates
+        // the decoder (decode READY until slimproto.c:825-834), not the output.
         start_held(&mut rig, &mut pipeline, false, 1);
         rig.command(&mut pipeline, &strm_frame(b'p', false, 0, 100, 0, [0, 0, 0, 0], &[]), 3_000);
         rig.tick(&mut pipeline, 3_100).unwrap();
-        assert_eq!(rig.coord.state, PlayerState::Buffering, "threshold still gates the start");
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+        assert!(rig.coord.decode_ready && !rig.coord.decode_running, "threshold still gates the start");
         pipeline.ingest_stream_data(&[0u8; 1025]).unwrap();
         rig.tick(&mut pipeline, 3_200).unwrap();
         assert_eq!(rig.coord.state, PlayerState::Playing);
@@ -4004,5 +4071,431 @@ mod tests {
         rig.command(&mut pipeline, &server_frame(b"setd", b"\x00Den"), 20);
         rig.command(&mut pipeline, &server_frame(b"setd", &[0x00]), 30);
         assert_eq!(rig.lines(), ["SETD", "SETD"]);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Task 12: gapless track boundaries (C output.track_start, output.c:126-166)
+    // ---------------------------------------------------------------------------------------
+
+    /// Sink recording every sample and the clock rate each write was made at.
+    struct GaplessSink {
+        samples: Vec<i32>,
+        writes: Vec<(u32, usize)>,
+        rate: u32,
+        /// Frames accepted per write (a DMA queue with limited room).
+        limit: usize,
+    }
+
+    impl AudioOutputSink for GaplessSink {
+        type Error = squeezelite_audio_core::OutputError;
+
+        fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
+            let n = (frames.len() / 2).min(self.limit);
+            self.samples.extend_from_slice(&frames[..n * 2]);
+            self.writes.push((self.rate, n));
+            Ok(n)
+        }
+
+        fn set_sample_rate(&mut self, rate_hz: u32) -> Result<(), Self::Error> {
+            self.rate = rate_hz;
+            Ok(())
+        }
+
+        fn set_mute(&mut self, _muted: bool) {}
+    }
+
+    type GaplessPipeline<'a> = StreamPipeline<'a, GaplessSink>;
+
+    fn gapless_pipeline<'a>(stream: &'a mut [u8], output: &'a mut [u8]) -> GaplessPipeline<'a> {
+        StreamPipeline::new(
+            stream,
+            output,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            GaplessSink { samples: Vec::new(), writes: Vec::new(), rate: 44_100, limit: usize::MAX },
+            44_100,
+        )
+    }
+
+    /// 16-bit big-endian stereo PCM with a per-track pattern: frame `i` is
+    /// (track * 1000 + i, -(track * 1000 + i)).
+    fn track_bytes(track: i16, frames: usize) -> &'static [u8] {
+        let mut out = Vec::with_capacity(frames * 4);
+        for i in 0..frames as i16 {
+            let v = track * 1000 + i;
+            out.extend_from_slice(&v.to_be_bytes());
+            out.extend_from_slice(&(-v).to_be_bytes());
+        }
+        Box::leak(out.into_boxed_slice())
+    }
+
+    /// Every sample (left and right) a `track_bytes` stream decodes to.
+    fn track_samples(track: i16, frames: usize) -> Vec<i32> {
+        (0..frames as i16)
+            .flat_map(|i| {
+                let v = i32::from(track * 1000 + i);
+                [v << 16, -v << 16]
+            })
+            .collect()
+    }
+
+    fn segments(body: &'static [u8]) -> Segments {
+        Box::leak(vec![OK_HEAD, body].into_boxed_slice())
+    }
+
+    /// Rig serving `/t1`, `/t2`, ... with the given track bodies.
+    fn gapless_rig(tracks: &[&'static [u8]]) -> Rig {
+        const PATHS: [&[u8]; 4] = [b"/t1", b"/t2", b"/t3", b"/t4"];
+        let mut src = GatedSource::new(PATHS[0], segments(tracks[0]));
+        for (path, body) in PATHS[1..].iter().zip(&tracks[1..]) {
+            assert!(src.inner.add_route(path, segments(body)));
+        }
+        Rig::with_source([0x11, 0x22, 0x33, 0x44, 0x55, 0x66], "Gapless", src)
+    }
+
+    /// `strm s` for PCM 16-bit stereo big-endian at `rate_code`, threshold 0, requesting `/t<n>`.
+    fn strm_start(track: u8, rate_code: u8, autostart: bool) -> Vec<u8> {
+        let mut payload = vec![0u8; 24];
+        payload[0] = b's';
+        payload[1] = if autostart { b'1' } else { b'0' };
+        payload[2] = b'p';
+        payload[3] = b'1';
+        payload[4] = rate_code;
+        payload[5] = b'2';
+        payload[6] = b'0';
+        payload[18..20].copy_from_slice(&9000u16.to_be_bytes());
+        payload[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        payload.extend_from_slice(format!("GET /t{track} HTTP/1.0\r\n\r\n").as_bytes());
+        server_frame(b"strm", &payload)
+    }
+
+    /// STAT/DSCO lines only (the other frames are not about track boundaries).
+    fn status_lines(rig: &Rig) -> Vec<String> {
+        rig.lines().into_iter().filter(|l| l.starts_with("STAT") || l.starts_with("DSCO")).collect()
+    }
+
+    /// Ticks (10 ms apart, from `*now`) until `done` holds; records, for every `STMs`, the
+    /// sink frame index of the boundary it reports (frames written so far minus the frames
+    /// played since the crossing, which reset at it).
+    fn run_until(
+        rig: &mut Rig,
+        pipeline: &mut GaplessPipeline<'_>,
+        now: &mut u32,
+        stms_at: &mut Vec<usize>,
+        done: impl Fn(&Rig, &GaplessPipeline<'_>) -> bool,
+    ) {
+        for _ in 0..2_000 {
+            if done(rig, pipeline) {
+                return;
+            }
+            let before = rig.sent.len();
+            *now += 10;
+            rig.tick(pipeline, *now).unwrap();
+            if rig.coord.external_audio_pump {
+                // The device ring's pump phases (tasks.rs: output, decode, output).
+                rig.coord.pump_output(pipeline, 16);
+                rig.coord.pump_decode(pipeline, 4);
+                rig.coord.pump_output(pipeline, 16);
+            }
+            for (op, payload) in &rig.sent[before..] {
+                if op == b"STAT" && &payload[0..4] == b"STMs" {
+                    let sink_frames = pipeline.sink.samples.len() / 2;
+                    stms_at.push(sink_frames - pipeline.frames_played as usize);
+                }
+            }
+        }
+        panic!("condition not reached; sent {:?}", rig.lines());
+    }
+
+    fn count(lines: &[String], line: &str) -> usize {
+        lines.iter().filter(|l| *l == line).count()
+    }
+
+    #[test]
+    fn test_gapless_two_tracks_no_flush_one_stms_each() {
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 400));
+        let mut rig = gapless_rig(&[t1, t2]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        // Track 1 is fully decoded and still playing out of the output buffer.
+        assert!(p.output_buffer_available() > 0);
+        let played_before_strm = p.sink.samples.len();
+
+        // LMS sends the next track on STMd. C: no output flush, output stays RUNNING.
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+        assert!(p.sink.samples.len() > played_before_strm, "output kept playing through strm s");
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+
+        // Every byte of both tracks reached the sink, in order, with nothing in between.
+        let mut expected = track_samples(1, 600);
+        expected.extend(track_samples(2, 400));
+        assert_eq!(p.sink.samples, expected);
+        // Exactly one STMs per track; the second one at the boundary sample index.
+        assert_eq!(stms_at, [0, 600]);
+        assert_eq!(
+            status_lines(&rig),
+            [
+                "STAT:STMf", "STAT:STMc", "DSCO:0", "STAT:STMs", "STAT:STMd", // track 1
+                "STAT:STMf", "STAT:STMc", "DSCO:0", "STAT:STMd", // track 2 queued behind it
+                "STAT:STMs", // track 2 reaches the output
+                "STAT:STMu",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_gapless_through_the_device_pump_path() {
+        // Same engine on the device: decode and output run in the pump phases (Task 9).
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 400));
+        let mut rig = gapless_rig(&[t1, t2]);
+        rig.coord.external_audio_pump = true;
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        // The DMA takes 8 frames per write, so decoding runs ahead of playback.
+        p.sink.limit = 8;
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        assert!(p.output_buffer_available() > 0);
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        let mut expected = track_samples(1, 600);
+        expected.extend(track_samples(2, 400));
+        assert_eq!(p.sink.samples, expected);
+        assert_eq!(stms_at, [0, 600]);
+        assert_eq!(count(&rig.lines(), "STAT:STMs"), 2);
+    }
+
+    #[test]
+    fn test_marker_queued_while_paused_no_stms() {
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 100));
+        let mut rig = gapless_rig(&[t1, t2]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |_, p| p.track_marker().is_some());
+        // Pause with the next track queued behind the boundary (strm p, interval 0).
+        now += 10;
+        rig.command(&mut p, &simple_strm(b'p'), now);
+        assert_eq!(rig.coord.state, PlayerState::Paused);
+        let marker = *p.track_marker().unwrap();
+        let sink_len = p.sink.samples.len();
+        for _ in 0..50 {
+            now += 10;
+            rig.tick(&mut p, now).unwrap();
+        }
+        // C: a STOPPED output plays silence and never reaches track_start (output.c:111-127).
+        assert_eq!(p.track_marker(), Some(&marker), "boundary must wait while paused");
+        assert_eq!(p.sink.samples.len(), sink_len);
+        assert_eq!(count(&rig.lines(), "STAT:STMs"), 1, "no STMs while paused");
+        assert!(!rig.coord.pending_track_started);
+
+        // Resume: the tail plays, then the boundary is crossed once.
+        now += 10;
+        rig.command(&mut p, &simple_strm(b'u'), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        assert_eq!(stms_at, [0, 600]);
+        let mut expected = track_samples(1, 600);
+        expected.extend(track_samples(2, 100));
+        assert_eq!(p.sink.samples, expected);
+    }
+
+    #[test]
+    fn test_strm_f_discards_only_next_track_and_current_keeps_playing() {
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 100));
+        let mut rig = gapless_rig(&[t1, t2]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |_, p| p.track_marker().is_some());
+        let lines_before = rig.sent.len();
+
+        // strm f: C output_flush_streaming drops track 2 (writep = track_start) and reports
+        // STMf because something was flushed, even though stream 2 already ended
+        // (slimproto.c:374-383, output.c:461-470).
+        now += 10;
+        rig.command(&mut p, &simple_strm(b'f'), now);
+        assert_eq!(rig.lines()[lines_before..], ["STAT:STMf"]);
+        assert!(p.track_marker().is_none());
+        assert_eq!(rig.coord.state, PlayerState::Playing, "the current track keeps playing");
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        assert_eq!(p.sink.samples, track_samples(1, 600));
+        assert_eq!(stms_at, [0]);
+
+        // A second strm f has nothing left to flush and no stream: no STMf.
+        let lines_before = rig.sent.len();
+        now += 10;
+        rig.command(&mut p, &simple_strm(b'f'), now);
+        assert!(rig.lines()[lines_before..].is_empty());
+    }
+
+    #[test]
+    fn test_strm_q_clears_everything() {
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 100));
+        let mut rig = gapless_rig(&[t1, t2]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |_, p| p.track_marker().is_some());
+        let (sent_before, sink_len) = (rig.sent.len(), p.sink.samples.len());
+
+        // C slimproto.c:386-391: decode_flush + output_flush, no reply.
+        now += 10;
+        rig.command(&mut p, &simple_strm(b'q'), now);
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+        assert!(p.track_marker().is_none());
+        assert_eq!(p.output_buffer_available(), 0);
+        assert_eq!(p.frames_played, 0);
+        for _ in 0..20 {
+            now += 10;
+            rig.tick(&mut p, now).unwrap();
+        }
+        assert!(rig.lines()[sent_before..].is_empty(), "{:?}", &rig.lines()[sent_before..]);
+        assert_eq!(p.sink.samples.len(), sink_len);
+        assert!(p.active_marker_crossed().is_none());
+    }
+
+    #[test]
+    fn test_second_strm_s_before_boundary_overwrites_it() {
+        let (t1, t2, t3) = (track_bytes(1, 600), track_bytes(2, 50), track_bytes(3, 80));
+        let mut rig = gapless_rig(&[t1, t2, t3]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 2
+        });
+        // Boundary position in sink frames: frames played so far plus the frames ahead of it.
+        let boundary_at =
+            |p: &GaplessPipeline<'_>| p.sink.samples.len() / 2 + p.track_marker().unwrap().bytes_ahead as usize / 8;
+        let first = boundary_at(&p);
+        assert_eq!(first, 600);
+        now += 10;
+        rig.command(&mut p, &strm_start(3, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 3
+        });
+        // One pending boundary (C output.track_start): track 3's start replaced track 2's.
+        assert_eq!(boundary_at(&p), first + 50);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        // strm s never flushes outputbuf, so track 2's audio still plays (C), but only one
+        // track start is reported after track 1's: track 3's.
+        let mut expected = track_samples(1, 600);
+        expected.extend(track_samples(2, 50));
+        expected.extend(track_samples(3, 80));
+        assert_eq!(p.sink.samples, expected);
+        assert_eq!(stms_at, [0, 650]);
+    }
+
+    #[test]
+    fn test_rate_change_at_boundary_with_rate_delay_inserts_split_silence() {
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 100));
+        let mut rig = gapless_rig(&[t1, t2]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        p.boundary.rate_delay_ms = 20; // C `-r ...:20` (main.c:509)
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now); // 44.1 kHz
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'4', true), now); // 48 kHz
+        // The playing track keeps its clock until the boundary.
+        assert_eq!(rig.coord.current_sample_rate, 44_100);
+        assert_eq!(p.sink.rate, 44_100);
+        assert_eq!(rig.backend.rate, 44_100);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        assert_eq!(rig.coord.current_sample_rate, 48_000);
+        assert_eq!(p.sink.rate, 48_000);
+
+        // C output.c:128-148: 441 silent frames at 44.1 kHz before the boundary, 480 at
+        // 48 kHz after it.
+        let (first_half, second_half) = (441, 480);
+        let mut expected = track_samples(1, 600);
+        expected.extend(std::iter::repeat_n(0, (first_half + second_half) * 2));
+        expected.extend(track_samples(2, 100));
+        assert_eq!(p.sink.samples, expected);
+        let at = |rate: u32| p.sink.writes.iter().filter(|w| w.0 == rate).map(|w| w.1).sum::<usize>();
+        assert_eq!((at(44_100), at(48_000)), (600 + first_half, second_half + 100));
+        // STMs comes with the track start, after the first half of the silence.
+        assert_eq!(stms_at.len(), 2);
+    }
+
+    #[test]
+    fn test_connect_failure_of_next_track_lets_the_current_one_finish() {
+        let t1 = track_bytes(1, 600);
+        let mut rig = gapless_rig(&[t1]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        // /t2 has no route: the connect fails (C DISCONNECT/UNREACHABLE, stream.c:684-688), but
+        // the output keeps RUNNING: strm s never touches it.
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'3', true), now);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        assert_eq!(p.sink.samples, track_samples(1, 600));
+        assert_eq!(count(&rig.lines(), "DSCO:3"), 1);
     }
 }

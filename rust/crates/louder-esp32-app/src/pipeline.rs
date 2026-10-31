@@ -410,7 +410,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
         if frames_produced > 0 {
             // The decoder's rate is the next track's rate, applied when playback reaches the
-            // track start (C parity: pcm.c:216-233, mad.c:254-256, flac.c:147-170 set
+            // track start (C parity: pcm.c:216-236, mad.c:254-256, flac.c:147-170 set
             // `output.next_sample_rate` with `track_start`; output.c:154 switches). A rate
             // change inside a track is ignored, as in C (only `new_stream` reads the rate).
             self.mark_track_start();
@@ -467,7 +467,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         if let Some(marker) = self.boundary.marker {
             if marker.bytes_ahead == 0 {
                 // C parity: output.c:127 `track_start == readp`, only with real frames to
-                // play (`frames == 0` is silence there, output.c:112-115).
+                // play (`frames == 0` is silence there, output.c:111-114).
                 self.reach_track_start(marker);
                 if self.boundary.silence_frames > 0 {
                     return self.write_boundary_silence();
@@ -823,7 +823,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Flushes both stream and output ringbuffers, clears pending PCM, and resets the decoder
     /// state (`strm q`: C `decode_flush` + `output_flush`, output.c:440-458). The track
     /// boundary goes too: no pending track start, no rate-change silence, `delay_active`
-    /// cleared (output.c:452), and the next decoded frames start a new track.
+    /// cleared (output.c:455), and the next decoded frames start a new track.
     pub fn flush(&mut self) {
         self.stream_buffer.flush();
         self.output_buffer.flush();
@@ -1205,7 +1205,7 @@ mod tests {
         assert_eq!(consumed, 52);
 
         // Task 12 (C parity): the decoder's rate is the next track's rate (C
-        // `output.next_sample_rate`, pcm.c:233); the clock switches when playback reaches the
+        // `output.next_sample_rate`, pcm.c:231-237); the clock switches when playback reaches the
         // track start (output.c:154), not when the frames are decoded.
         assert_eq!(pipeline.track_marker().map(|m| m.sample_rate), Some(48000));
         assert_eq!(pipeline.sink.sample_rate, 44100);
@@ -1762,6 +1762,23 @@ mod tests {
         expected.extend(track_left(3, 20));
         assert_eq!(left(&p.sink.samples), expected);
         assert_eq!(p.frames_played, 20);
+    }
+
+    #[test]
+    fn test_set_track_marker_is_single_slot_and_clamped_to_written_frames() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.boundary.new_stream = false;
+        feed(&mut p, &track_pcm(1, 10));
+        assert!(p.track_marker().is_none());
+        let m = |bytes_ahead| TrackMarker { bytes_ahead, sample_rate: 48_000, replay_gain: 0, output_threshold_frames: 0 };
+        assert_eq!(p.set_track_marker(m(40)), None);
+        // A second one replaces the first (C overwrites output.track_start).
+        assert_eq!(p.set_track_marker(m(1_000)), Some(m(40)));
+        // Never past the written frames, always on a frame boundary.
+        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(80));
+        p.set_track_marker(m(13));
+        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(8));
     }
 
     #[test]
