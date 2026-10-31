@@ -38,10 +38,6 @@ use squeezelite_decoders::PcmDecoder;
 
 mod tasks;
 
-/// SqueezeESP32 HELO capability string broadcasted to LMS server during SlimProto handshake (`WO-155`).
-pub const HELO_CAPABILITIES: &str =
-    "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,HasDigitalOut=1,MaxSampleRate=96000,flc,pcm,wav,aif,mp3";
-
 /// Executes one integrated firmware tick across the CYD UART bridge, audio pipeline,
 /// and digital amplifier health monitor (`HALNET-409`).
 ///
@@ -95,7 +91,7 @@ where
 
     let frames = if let Some(net) = net {
         let _ = coordinator.tick(net.client, net.stream, net.backend, pipeline, now_ms);
-        if let Some(update) = coordinator.take_cyd_message() {
+        while let Some(update) = coordinator.take_cyd_message() {
             let _ = cyd_bridge.flush_outbound(&update);
         }
         coordinator.last_tick_frames()
@@ -326,7 +322,7 @@ mod xtensa_hw {
         resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigSource, JournalSector,
         FlashTargetPolicy, JournalSlot, RamJournal,
     };
-    use louder_esp32_app::net_device::{HttpStreamState, SlimLinkState};
+    use louder_esp32_app::net_device::{HttpStreamState, SlimLinkState, SlimReconnect};
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{DeadManLeaseWatchdog, HttpControlAction};
     use squeezelite_audio_core::EqPreset;
@@ -1814,7 +1810,9 @@ mod xtensa_hw {
             pending_close_deadline_ms: 0,
             helo_sent: false,
             last_connect_attempt_ms: 0,
-            last_slim_connect_ms: 0,
+            slim_reconnect: SlimReconnect::new(),
+            slim_was_open: false,
+            slim_switch_to: None,
             last_fault_check_ms: 0,
             latest_telemetry,
             last_cyd_progress_ms: 0,
@@ -1991,22 +1989,18 @@ mod tests {
 
     #[test]
     fn test_helo_capabilities_flc_and_sample_rate() {
-        assert!(
-            HELO_CAPABILITIES.contains(",flc,"),
-            "Capabilities must advertise native FLAC (,flc,)"
-        );
-        assert!(
-            HELO_CAPABILITIES.contains("MaxSampleRate=96000"),
-            "Capabilities must advertise MaxSampleRate=96000"
-        );
-        assert!(
-            HELO_CAPABILITIES.contains(",pcm,"),
-            "Capabilities must advertise pcm"
-        );
-        assert!(
-            HELO_CAPABILITIES.contains(",mp3"),
-            "Capabilities must advertise mp3"
-        );
+        // Task 11: built from what the firmware can do (no HasDigitalOut until SPDIF exists,
+        // MaxSampleRate from the verified clock table).
+        let caps = PlayerCoordinator::helo_capabilities(None).unwrap();
+        assert!(caps.contains(",flc,"), "Capabilities must advertise native FLAC (,flc,)");
+        assert!(caps.contains(&format!(
+            "MaxSampleRate={}",
+            louder_esp32_app::clock_table::max_verified_rate()
+        )));
+        assert!(caps.contains(",pcm,"), "Capabilities must advertise pcm");
+        assert!(caps.contains(",mp3"), "Capabilities must advertise mp3");
+        assert!(!caps.contains("HasDigitalOut"));
+        assert!(caps.starts_with("Model=squeezeesp32,"));
     }
 }
 

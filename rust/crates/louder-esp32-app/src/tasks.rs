@@ -235,7 +235,6 @@ mod device {
         Esp32Uart2Port, Esp32VhciTransport, HwStreamPipeline, SmolDevice, CORE1_HEARTBEAT,
         DMA_OUTSTANDING_FRAMES,
     };
-    use crate::HELO_CAPABILITIES;
     use core::cell::RefCell;
     use core::future::Future;
     use core::pin::pin;
@@ -258,8 +257,8 @@ mod device {
     };
     use louder_esp32_app::io_traits::{NetAddr, SlimTransport};
     use louder_esp32_app::net_device::{
-        HttpStreamState, SlimLinkState, SmoltcpSlimTransport, SmoltcpStreamSource, TcpPhase,
-        TcpSocketOps,
+        HttpStreamState, SlimLinkState, SlimReconnect, SmoltcpSlimTransport, SmoltcpStreamSource,
+        TcpPhase, TcpSocketOps,
     };
     use louder_esp32_app::ota_safety::{OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET, SETTINGS_JOURNAL_OFFSET};
     use louder_esp32_app::pipeline::ActiveDecoder;
@@ -340,7 +339,12 @@ mod device {
         /// `HELO` went out on the current control connection.
         pub(crate) helo_sent: bool,
         pub(crate) last_connect_attempt_ms: u64,
-        pub(crate) last_slim_connect_ms: u64,
+        /// LMS control-link reconnect policy (C connect loop + MK5 backoff).
+        pub(crate) slim_reconnect: SlimReconnect,
+        /// The control socket was open at the end of the last `slim_session`.
+        pub(crate) slim_was_open: bool,
+        /// `serv` target taken from the coordinator, applied by the next `slim_session`.
+        pub(crate) slim_switch_to: Option<[u8; 4]>,
         pub(crate) last_fault_check_ms: u64,
         pub(crate) latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         pub(crate) last_cyd_progress_ms: u64,
@@ -1114,55 +1118,71 @@ mod device {
         }
     }
 
-    /// `slimproto_session`: control-link upkeep (half-close reset, 1 s-rate-limited connect to
-    /// LMS), then [`slim_tick`] once the IPv4 lease is active.
+    /// `slimproto_session`: control-link upkeep, then [`slim_tick`] once the IPv4 lease is
+    /// active. Upkeep: a `serv` switch drops the link and targets the new server; a half-closed
+    /// link is reset; a link that went down is reported to [`SlimReconnect`] (backoff, or the
+    /// fall-back to the previous server); a connect starts when the policy allows it.
     #[inline(never)]
     fn slim_session(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
         let Some(local_ip) = s.assigned_ip else {
             return;
         };
-        // Half-closed / closing control link: abort it so it reconnects at once instead of
-        // lingering in CloseWait.
+        let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+        // C parity (slimproto.c:780, 1098-1105): `serv` ends the session and connects to the
+        // new server at once.
+        if let Some(ip) = s.slim_switch_to.take() {
+            slim_sock.abort();
+            s.slim_reconnect.server_switch(now_ms, s.lms_ip);
+            s.slim_was_open = false;
+            s.helo_sent = false;
+            s.lms_ip = ip;
+            s.coordinator.lms_ip = ip;
+        }
+        // Half-closed / closing control link: abort it so it reconnects instead of lingering
+        // in CloseWait.
+        if slim_sock.is_open()
+            && matches!(
+                slim_sock.state(),
+                tcp::State::CloseWait
+                    | tcp::State::TimeWait
+                    | tcp::State::Closing
+                    | tcp::State::LastAck
+                    | tcp::State::FinWait1
+                    | tcp::State::FinWait2
+            )
         {
-            let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-            if slim_sock.is_open()
-                && matches!(
-                    slim_sock.state(),
-                    tcp::State::CloseWait
-                        | tcp::State::TimeWait
-                        | tcp::State::Closing
-                        | tcp::State::LastAck
-                        | tcp::State::FinWait1
-                        | tcp::State::FinWait2
-                )
-            {
-                slim_sock.abort();
-                s.helo_sent = false;
+            slim_sock.abort();
+        }
+        let open = slim_sock.is_open();
+        if s.slim_was_open && !open {
+            s.helo_sent = false;
+            let seed = (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32;
+            if let Some(previous) = s.slim_reconnect.link_down(now_ms, seed) {
+                // The `serv` target was unreachable: back to the previous server.
+                s.lms_ip = previous;
+                s.coordinator.lms_ip = previous;
             }
         }
-        // Connect to LMS if closed (rate-limited to 1 s)
-        {
-            let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-            if !slim_sock.is_open()
-                && (s.last_slim_connect_ms == 0
-                    || now_ms.saturating_sub(s.last_slim_connect_ms) >= 1_000)
-            {
-                s.last_slim_connect_ms = now_ms;
-                s.helo_sent = false;
-                s.slim_link.reset();
-                let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(s.lms_ip)), s.lms_port);
-                let local_ep = (
-                    IpAddress::Ipv4(Ipv4Address::from(local_ip)),
-                    next_local_port(&mut s.local_port_counter),
-                );
-                let _ = slim_sock.connect(s.smol_iface.context(), remote_ep, local_ep);
+        s.slim_was_open = open;
+        if !open && s.slim_reconnect.may_connect(now_ms) {
+            s.helo_sent = false;
+            s.slim_link.reset();
+            let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(s.lms_ip)), s.lms_port);
+            let local_ep = (
+                IpAddress::Ipv4(Ipv4Address::from(local_ip)),
+                next_local_port(&mut s.local_port_counter),
+            );
+            if slim_sock.connect(s.smol_iface.context(), remote_ep, local_ep).is_ok() {
+                s.slim_reconnect.connect_started();
+                s.slim_was_open = true;
             }
         }
         slim_tick(s, local_ip);
     }
 
-    /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`), then one
+    /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`, with the
+    /// [`SlimReconnect`] reconnect flag), then one
     /// `PlayerCoordinator::tick` over the device adapters: at most one server frame, the HTTP
     /// audio fetch, play-state evaluation, deferred `STAT`/`RESP`/`META`/`DSCO` and the
     /// heartbeat. It never decodes or writes to the sink (`external_audio_pump`, set at
@@ -1185,7 +1205,10 @@ mod device {
             ref mut local_port_counter,
             ref mut helo_sent,
             ref mut current_vol_pct,
+            ref mut slim_reconnect,
+            ref mut slim_switch_to,
             config,
+            now_ms: lap_ms,
             ..
         } = *s;
         let Some((slim_sock, audio_sock)) =
@@ -1197,12 +1220,13 @@ mod device {
         let mut transport = SmoltcpSlimTransport::new(SmolTcp::new(slim_sock), &mut *slim_link);
         if transport.connected() && !*helo_sent {
             *helo_sent = coordinator
-                .hello(&mut transport, HELO_DEVICE_ID, HELO_CAPABILITIES, now_ms)
+                .hello(&mut transport, HELO_DEVICE_ID, slim_reconnect.reconnect_flag())
                 .is_ok();
             if !*helo_sent {
                 // Never let a `STAT` reach LMS before the `HELO`: retry next lap.
                 return;
             }
+            slim_reconnect.session_up(lap_ms);
         }
         let mut source = SmoltcpStreamSource::new(
             SmolTcp {
@@ -1215,8 +1239,11 @@ mod device {
         // A dead control link is handled by `slim_session` (reconnect + HELO); the tick's own
         // errors need no action here.
         let _ = coordinator.tick(&mut transport, &mut source, &mut backend, pipeline, now_ms);
+        if let Some(ip) = coordinator.take_server_switch() {
+            *slim_switch_to = Some(ip);
+        }
 
-        if let Some(msg) = coordinator.take_cyd_message() {
+        while let Some(msg) = coordinator.take_cyd_message() {
             if let CydMessage::Volume(pct) = msg {
                 *current_vol_pct = pct;
                 config.update(|c| c.volume = pct);

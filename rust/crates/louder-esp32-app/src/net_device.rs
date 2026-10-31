@@ -647,3 +647,158 @@ fn write_authority(out: &mut Vec<u8>, addr: NetAddr) {
     out.push(b':');
     decimal(out, u32::from(addr.port));
 }
+
+/// Reconnect policy of the LMS control connection: C `slimproto()`'s connect loop
+/// (`slimproto.c:1086-1213`, MK5 backoff), driven by the device's connection upkeep.
+///
+/// * A session (connected, `HELO` sent) that drops waits
+///   [`squeezelite_proto::next_backoff_ms`]: 1, 2, 4, 8, 16, then 30 s plus up to 999 ms of
+///   jitter, with the doubling reset after a session that lasted over 30 s
+///   (`slimproto.c:1176-1197`). Every later `HELO` carries the reconnect flag
+///   (`slimproto.c:1173-1175`).
+/// * A connect that fails waits 5 s (`slimproto.c:1132-1135`), except after a `serv` switch,
+///   where it falls back to the previous server at once (`slimproto.c:1127-1131`).
+/// * A `serv` switch connects to the new server at once, with the reconnect flag and the
+///   backoff cleared (`slimproto.c:1098-1105`).
+///
+/// Not ported: C rediscovers the server after `MAX_SERVER_RETRIES` failed connects
+/// (`slimproto.c:1137-1142`); this firmware has no discovery until Phase 3.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlimReconnect {
+    attempt: u32,
+    retry_at_ms: u64,
+    session_start_ms: Option<u64>,
+    connecting: bool,
+    reconnect: bool,
+    previous_ip: Option<[u8; 4]>,
+}
+
+impl SlimReconnect {
+    /// Delay after a failed connect (C `sleep(5)`).
+    pub const CONNECT_FAILED_DELAY_MS: u64 = 5_000;
+    /// A session longer than this resets the backoff (C `slimproto.c:1179`).
+    pub const LONG_SESSION_MS: u64 = 30_000;
+
+    pub const fn new() -> Self {
+        Self {
+            attempt: 0,
+            retry_at_ms: 0,
+            session_start_ms: None,
+            connecting: false,
+            reconnect: false,
+            previous_ip: None,
+        }
+    }
+
+    /// A connect may be started now.
+    pub fn may_connect(&self, now_ms: u64) -> bool {
+        now_ms >= self.retry_at_ms
+    }
+
+    /// A connect was started.
+    pub fn connect_started(&mut self) {
+        self.connecting = true;
+    }
+
+    /// The connection is up and `HELO` went out.
+    pub fn session_up(&mut self, now_ms: u64) {
+        self.connecting = false;
+        self.session_start_ms = Some(now_ms);
+    }
+
+    /// The `reconnect` flag for the next `HELO`.
+    pub fn reconnect_flag(&self) -> bool {
+        self.reconnect
+    }
+
+    /// The connection is gone (closed, reset, refused or timed out). Returns the server to
+    /// fall back to when the connect to a `serv` target failed.
+    pub fn link_down(&mut self, now_ms: u64, seed: u32) -> Option<[u8; 4]> {
+        if let Some(start) = self.session_start_ms.take() {
+            self.connecting = false;
+            self.reconnect = true;
+            if now_ms.saturating_sub(start) > Self::LONG_SESSION_MS {
+                self.attempt = 0;
+            }
+            let delay = squeezelite_proto::next_backoff_ms(self.attempt, seed);
+            self.retry_at_ms = now_ms + u64::from(delay);
+            self.attempt = self.attempt.saturating_add(1);
+            self.previous_ip = None;
+            return None;
+        }
+        if !core::mem::take(&mut self.connecting) {
+            return None;
+        }
+        match self.previous_ip.take() {
+            Some(previous) => {
+                self.retry_at_ms = now_ms;
+                Some(previous)
+            }
+            None => {
+                self.retry_at_ms = now_ms + Self::CONNECT_FAILED_DELAY_MS;
+                None
+            }
+        }
+    }
+
+    /// `serv`: switch away from `current_ip` now.
+    pub fn server_switch(&mut self, now_ms: u64, current_ip: [u8; 4]) {
+        *self = Self { previous_ip: Some(current_ip), retry_at_ms: now_ms, ..Self::new() };
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::SlimReconnect;
+
+    #[test]
+    fn test_session_drops_back_off_exponentially_and_reset_after_a_long_session() {
+        let mut r = SlimReconnect::new();
+        assert!(r.may_connect(0));
+        assert!(!r.reconnect_flag(), "first HELO is not a reconnect");
+        let mut now = 1_000u64;
+        let mut delays = std::vec::Vec::new();
+        for _ in 0..7 {
+            r.connect_started();
+            r.session_up(now);
+            now += 1_000; // a short session
+            assert_eq!(r.link_down(now, 7), None);
+            let mut wait = 0;
+            while !r.may_connect(now + wait) {
+                wait += 1;
+            }
+            delays.push(wait);
+            now += wait;
+        }
+        assert_eq!(delays, [1_007, 2_007, 4_007, 8_007, 16_007, 30_007, 30_007]);
+        assert!(r.reconnect_flag());
+        // A session over 30 s resets the doubling.
+        r.connect_started();
+        r.session_up(now);
+        now += 30_001;
+        r.link_down(now, 0);
+        assert!(r.may_connect(now + 1_000) && !r.may_connect(now + 999));
+    }
+
+    #[test]
+    fn test_failed_connect_waits_five_seconds_or_falls_back_after_serv() {
+        let mut r = SlimReconnect::new();
+        r.connect_started();
+        assert_eq!(r.link_down(100, 0), None);
+        assert!(!r.may_connect(5_099) && r.may_connect(5_100));
+        // Nothing in flight: a closed socket is no event.
+        assert_eq!(r.link_down(6_000, 0), None);
+        assert!(r.may_connect(6_000));
+
+        // serv: connect at once, reconnect flag cleared, fall back if the target is dead.
+        r.connect_started();
+        r.session_up(7_000);
+        r.link_down(8_000, 0);
+        assert!(r.reconnect_flag());
+        r.server_switch(8_001, [10, 0, 0, 1]);
+        assert!(r.may_connect(8_001) && !r.reconnect_flag());
+        r.connect_started();
+        assert_eq!(r.link_down(9_000, 0), Some([10, 0, 0, 1]));
+        assert!(r.may_connect(9_000));
+    }
+}
