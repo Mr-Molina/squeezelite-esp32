@@ -124,6 +124,11 @@ impl<I: I2c, R: I2sClockRegisters> AudioBackend for Esp32AudioBackend<'_, I, R> 
         }
     }
 
+    /// The TAS5805M digital volume does the attenuation (Rust enhancement, Task 7 ruling).
+    fn has_hw_volume(&self) -> bool {
+        true
+    }
+
     fn set_mute(&mut self, mute: bool) {
         self.muted = mute;
     }

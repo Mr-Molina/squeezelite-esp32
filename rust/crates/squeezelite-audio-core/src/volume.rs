@@ -75,7 +75,7 @@ impl ChannelMode {
 }
 
 /// The composite output gain: volume x replay gain x fade, polarity and channel select, in the
-/// order C composes them in `_output_frames` (`output.c:54-57`, `:222-226`, `:243-244`) and
+/// order C composes them in `_output_frames` (`output.c:54-57`, `:226-228`, `:243-245`) and
 /// applies them in `_apply_gain` (`output_pack.c:383-410`).
 ///
 /// All gains are Q16.16 (`0x1_0000` = unity). The pipeline owns one and refreshes the
@@ -85,7 +85,7 @@ impl ChannelMode {
 ///   `volume_cb`, `output_embedded.c:118-126`).
 /// - `replay_gain_q16`: C `output.current_replay_gain`; 0 means none (`output.c:54-55`). During
 ///   a crossfade it is 0, because the crossfade weights carry each track's own replay gain
-///   (C uses plain `output.gainL` there, `output.c:243-244`).
+///   (C uses plain `output.gainL` there, `output.c:243-245`).
 /// - `fade_q16`: the fade-up/down gain of this chunk (`FadeEngine::gain_q16`), unity otherwise.
 /// - `invert_polarity`: C `output.invert` (`slimproto.c:488`).
 /// - `channel_mode`: C `output.channels` (`slimproto.c:489`).
@@ -137,8 +137,8 @@ impl GainStage {
         if invert {
             g = -g;
         }
-        // C parity: output.c:224-226, the fade gain multiplies the standard gain. Declared
-        // divergence (ruled in Task 13): C negates a second time here (:227), which cancels
+        // C parity: output.c:226-228, the fade gain multiplies the standard gain. Declared
+        // divergence (ruled in Task 13): C negates a second time here (:229), which cancels
         // the inversion for the length of the fade; here it is negated once.
         if self.fade_q16 != FIXED_ONE as u32 {
             g = gain(g, q16(self.fade_q16));
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn test_polarity_inversion_negates_once_with_fade() {
         // Declared divergence (ruled): C negates a second time under a fade (output.c:57 then
-        // :227), which cancels the inversion; here the fade multiplies the inverted gain once.
+        // :229), which cancels the inversion; here the fade multiplies the inverted gain once.
         let g = GainStage { invert_polarity: true, fade_q16: 0x8000, ..GainStage::unity() };
         assert_eq!(g.channel_gains(), (gain(-0x1_0000, 0x8000), gain(-0x1_0000, 0x8000)));
         let mut s = [1000, -1000];

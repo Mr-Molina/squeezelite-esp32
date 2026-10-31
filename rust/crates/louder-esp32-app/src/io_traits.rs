@@ -148,6 +148,9 @@ pub trait StreamSource {
 pub trait AudioBackend {
     fn set_sample_rate(&mut self, hz: u32) -> Result<(), ClockError>;
     fn set_hw_volume(&mut self, left: u8, right: u8);
+    /// Whether [`Self::set_hw_volume`] attenuates the output, so the software volume stays
+    /// unity (C: a `volume_cb` that handles the volume, output_embedded.c:120).
+    fn has_hw_volume(&self) -> bool;
     fn set_mute(&mut self, mute: bool);
     fn set_power(&mut self, on: bool);
     fn dma_outstanding_frames(&self) -> u32;
@@ -263,14 +266,23 @@ impl SlimTransport for LoopbackTransport {
 // ---------------------------------------------------------------------------
 
 /// [`AudioBackend`] that records what it was told. Accepts exactly the sample rates in
-/// [`crate::clock_table::VERIFIED_RATES`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// [`crate::clock_table::VERIFIED_RATES`]. Has hardware volume like the device unless
+/// `hw_volume` is cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockBackend {
     pub rate: u32,
     pub muted: bool,
     pub powered: bool,
     pub hw_vol: (u8, u8),
     pub outstanding: u32,
+    /// [`AudioBackend::has_hw_volume`] (default `true`).
+    pub hw_volume: bool,
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self { rate: 0, muted: false, powered: false, hw_vol: (0, 0), outstanding: 0, hw_volume: true }
+    }
 }
 
 impl MockBackend {
@@ -290,6 +302,10 @@ impl AudioBackend for MockBackend {
 
     fn set_hw_volume(&mut self, left: u8, right: u8) {
         self.hw_vol = (left, right);
+    }
+
+    fn has_hw_volume(&self) -> bool {
+        self.hw_volume
     }
 
     fn set_mute(&mut self, mute: bool) {

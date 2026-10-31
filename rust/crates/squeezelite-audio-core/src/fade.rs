@@ -204,8 +204,9 @@ impl FadeEngine {
     }
 
     /// The fade gain of the current chunk, Q16.16 (unity when no fade up/down runs; a
-    /// crossfade's weights are in [`ChunkGain::Cross`]). Task 14's gain stage composes it with
-    /// volume and replay gain, as C does at `output.c:224-226`.
+    /// crossfade's weights are in [`ChunkGain::Cross`]). The pipeline copies it into its
+    /// [`crate::GainStage`] once per chunk, which composes it with volume and replay gain, as C
+    /// does at `output.c:226-228`.
     pub const fn gain_q16(&self) -> u32 {
         self.gain
     }

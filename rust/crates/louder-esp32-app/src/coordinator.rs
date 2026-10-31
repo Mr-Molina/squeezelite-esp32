@@ -31,7 +31,7 @@ use crate::config_handle::ConfigHandle;
 use crate::io_traits::{
     AudioBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
-use crate::pipeline::{ActiveDecoder, FadeMode, StreamPipeline};
+use crate::pipeline::{ActiveDecoder, ChannelMode, FadeMode, StreamPipeline};
 
 /// Size of the stack buffer [`PlayerCoordinator::tick`] receives one server frame into. A larger
 /// frame is dropped by the transport (reported as [`TransportError::Io`] and skipped).
@@ -39,6 +39,9 @@ pub const SERVER_FRAME_BUF_LEN: usize = 2048;
 
 /// HTTP request sent when a `strm s` carries no request headers (`COORD-503`).
 const DEFAULT_HTTP_REQUEST: &[u8] = b"GET /stream.mp3 HTTP/1.0\r\n\r\n";
+
+/// Q16.16 unity gain (C `FIXED_ONE`).
+const UNITY_GAIN: u32 = 0x1_0000;
 
 /// Free output-ring space [`PlayerCoordinator::pump_decode`] requires before decoding.
 pub const PUMP_DECODE_MIN_OUTPUT_SPACE: usize = 1024;
@@ -168,6 +171,9 @@ pub struct PlayerCoordinator {
     pub state: PlayerState,
     pub mac: [u8; 6],
     pub model_name: &'static str,
+    /// The software volume handed to the gain stage ([`StreamPipeline::set_volume`]): unity
+    /// (or 0 for silence) when the amplifier does the volume, else the `audg` gains. The
+    /// volume LMS asked for is [`StreamPipeline::requested_volume_q16`].
     pub volume: VolumeScale,
     pub frames_played: u64,
     pub last_heartbeat_ms: u32,
@@ -438,6 +444,42 @@ impl PlayerCoordinator {
             CydNote::Volume(pct) => CydMessage::Volume(pct),
             CydNote::Metadata => self.track_metadata_message()?,
         })
+    }
+
+    /// C `set_volume(left, right)` (output_embedded.c:118-126) for an `audg`.
+    ///
+    /// - A backend with hardware volume (the device's TAS5805M) does the attenuation and the
+    ///   software volume stays unity, as C skips `output.gainL/R` when its `volume_cb` handles
+    ///   the volume. Rust enhancement (Task 7 ruling; C has no TAS5805M driver): one register
+    ///   code from the louder channel drives both amplifier channels. The software gain is 0
+    ///   for a 0 gain, as C's I2S volume callback asserts the mute GPIO on `(left | right) ==
+    ///   0` (output_i2s.c:496).
+    /// - Otherwise (host, any backend without hardware volume) the gains go into the software
+    ///   gain stage per channel, as C (output_embedded.c:120-124).
+    ///
+    /// Replay gain, fade, polarity and channel select are applied in software either way.
+    fn set_volume<B: AudioBackend, S: AudioOutputSink>(
+        &mut self,
+        left: u32,
+        right: u32,
+        backend: &mut B,
+        pipeline: &mut StreamPipeline<'_, S>,
+    ) {
+        // C parity: output_embedded.c:126 `equalizer_set_volume(left, right)` always sees the
+        // requested volume; kept for the loudness contour (Task 16).
+        pipeline.set_requested_volume(left, right);
+        let (soft_left, soft_right) = if backend.has_hw_volume() {
+            let louder = left.max(right);
+            let reg = lms_gain_to_tas5805m_vol_reg(louder);
+            backend.set_hw_volume(reg, reg);
+            let soft = if louder > 0 { UNITY_GAIN } else { 0 };
+            (soft, soft)
+        } else {
+            (left, right)
+        };
+        self.volume.gain_left = soft_left;
+        self.volume.gain_right = soft_right;
+        pipeline.set_volume(soft_left, soft_right);
     }
 
     /// Queues a CYD update. A full queue (a caller that stopped draining it) drops the oldest.
@@ -1118,44 +1160,12 @@ impl PlayerCoordinator {
                 digital_atten,
                 ..
             } => {
-                let pct = if digital_atten == 0 {
-                    let (eff_gain_left, eff_gain_right) = if gain_left == 0
-                        && gain_right == 0
-                        && self.volume.gain_left > 0
-                        && self.volume.gain_right > 0
-                    {
-                        (65536, 65536)
-                    } else {
-                        let l = if gain_left > 0 { 65536 } else { 0 };
-                        let r = if gain_right > 0 { 65536 } else { 0 };
-                        (l, r)
-                    };
-                    self.volume.gain_left = eff_gain_left;
-                    self.volume.gain_right = eff_gain_right;
-                    pipeline.set_volume(eff_gain_left, eff_gain_right);
-                    backend.set_hw_volume(
-                        lms_gain_to_tas5805m_vol_reg(gain_left),
-                        lms_gain_to_tas5805m_vol_reg(gain_right),
-                    );
-
-                    // COORD-507: Map 16.16 fixed-point (65536 = 100%) to 0-100 percentage using u64 to prevent u32 overflow
-                    let avg_gain = ((eff_gain_left as u64 + eff_gain_right as u64) / 2) as u32;
-                    core::cmp::min(100, ((avg_gain as u64 * 100) / 65536).min(100) as u8)
-                } else {
-                    // Device policy: the amplifier attenuates (one TAS register code from the
-                    // louder channel, applied to both), software gain stays at unity (or 0 for
-                    // mute), so the volume is never applied twice.
-                    let max_gain = core::cmp::max(gain_left, gain_right);
-                    let vol_reg = lms_gain_to_tas5805m_vol_reg(max_gain);
-                    backend.set_hw_volume(vol_reg, vol_reg);
-                    let eff_gain = if max_gain > 0 { 65536 } else { 0 };
-                    self.volume.gain_left = eff_gain;
-                    self.volume.gain_right = eff_gain;
-                    pipeline.set_volume(eff_gain, eff_gain);
-                    lms_gain_to_hardware_volume_percent(max_gain)
-                };
-
-                self.push_cyd(CydNote::Volume(pct));
+                // C parity: slimproto.c:569 `set_volume(adjust ? gainL : FIXED_ONE, adjust ?
+                // gainR : FIXED_ONE)`. `adjust` (digital_atten) 0 is LMS's fixed-volume mode
+                // (an external amplifier sets the level): unity, the gains are ignored.
+                let (left, right) = if digital_atten != 0 { (gain_left, gain_right) } else { (UNITY_GAIN, UNITY_GAIN) };
+                self.set_volume(left, right, backend, pipeline);
+                self.push_cyd(CydNote::Volume(lms_gain_to_hardware_volume_percent(left.max(right))));
                 Ok(())
             }
             ServerCommand::SetDevice { sample_rate } => {
@@ -1273,9 +1283,15 @@ impl PlayerCoordinator {
             .unwrap_or_else(|| sample_rate_from_index(p.pcm_sample_rate));
         // C slimproto.c:484-485: output.threshold and next_replay_gain for the new track.
         pipeline.begin_stream(rate_hint, p.replay_gain, p.output_threshold);
-        // C slimproto.c:486-488: fade_mode, fade_secs and invert for the new track. They arm
-        // fades at its first decoded frames and at the end of its decoding.
-        pipeline.set_transition(p.fade_mode, u32::from(p.fade_secs), p.flags & 0x03 == 0x03);
+        // C parity: slimproto.c:486-489, fade_mode, fade_secs, invert ((flags & 0x03) ==
+        // 0x03) and channels ((flags & 0x0c) >> 2). The fade settings arm fades at the new
+        // track's first decoded frames and at the end of its decoding.
+        pipeline.set_transition(
+            p.fade_mode,
+            u32::from(p.fade_secs),
+            p.flags & 0x03 == 0x03,
+            ChannelMode::from_strm_flags(p.flags),
+        );
         // Nothing of an earlier track left to play (or another source's audio, which LMS
         // replaces): the clock can switch now, and the frame counters start at 0
         // (COORD-506/509; C resets them at the track start, which then comes first).
@@ -2888,11 +2904,13 @@ mod tests {
         assert_eq!(rig.coord.volume.gain_left, 65536);
         assert_eq!(rig.coord.volume.gain_right, 65536);
 
-        // When digital_atten == 0 and incoming gain is 0,0 while old gain was > 0, set unity gain (65536)
+        // Task 14, re-pinned to C (slimproto.c:569): digital_atten (adjust) 0 is fixed volume,
+        // `set_volume(FIXED_ONE, FIXED_ONE)` whatever the gains: unity in software and 0 dB on
+        // the amplifier, never mute.
         rig.command(&mut pipeline, &audg_frame(0, 0, 0), 100);
         assert_eq!(rig.coord.volume.gain_left, 65536);
         assert_eq!(rig.coord.volume.gain_right, 65536);
-        assert_eq!(rig.backend.hw_vol, (0xFF, 0xFF));
+        assert_eq!(rig.backend.hw_vol, (0x30, 0x30));
 
         // 4-byte player name [0, 'B', 'o', 'b'] updates player_name and replies with SETD without altering current_sample_rate
         rig.command(&mut pipeline, &server_frame(b"setd", &[0x00, b'B', b'o', b'b']), 200);
@@ -2918,6 +2936,54 @@ mod tests {
     }
 
     #[test]
+    fn test_digital_atten_zero_forces_unity_sw_gain() {
+        // C parity: slimproto.c:569 `set_volume(adjust ? gainL : FIXED_ONE, adjust ? gainR :
+        // FIXED_ONE)`; the gains are ignored, mute included.
+        for hw_volume in [true, false] {
+            let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x07], "Test");
+            rig.backend.hw_volume = hw_volume;
+            let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+            let mut pipeline = pcm_pipeline(&mut s, &mut o);
+            // A real volume first, so unity is a change.
+            rig.command(&mut pipeline, &audg_frame(0x4000, 0x2000, 1), 10);
+            for (n, (l, r)) in [(0x4000u32, 0x2000u32), (0, 0), (0x1_0000, 0)].into_iter().enumerate() {
+                let msg = rig.command(&mut pipeline, &audg_frame(l, r, 0), 20 + n as u32);
+                assert_eq!(msg, Some(CydMessage::Volume(100)), "hw {hw_volume} ({l:#x}, {r:#x})");
+                assert_eq!(
+                    (pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16),
+                    (0x1_0000, 0x1_0000)
+                );
+                assert_eq!(pipeline.requested_volume_q16(), (0x1_0000, 0x1_0000));
+                if hw_volume {
+                    // 0 dB on the TAS5805M (DIG_VOL 0x30), never 0xFF (mute).
+                    assert_eq!(rig.backend.hw_vol, (0x30, 0x30));
+                } else {
+                    assert_eq!(rig.backend.hw_vol, (0, 0), "no hardware volume to drive");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_audg_software_volume_without_hardware_volume() {
+        // C parity: output_embedded.c:118-126, no volume_cb: output.gainL/R = the gains, per
+        // channel (balance kept), applied by the gain stage.
+        let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x08], "Test");
+        rig.backend.hw_volume = false;
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut pipeline = pcm_pipeline(&mut s, &mut o);
+        let msg = rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 10);
+        assert_eq!(msg, Some(CydMessage::Volume(55)));
+        assert_eq!((pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16), (1842, 900));
+        assert_eq!((rig.coord.volume.gain_left, rig.coord.volume.gain_right), (1842, 900));
+        assert_eq!(pipeline.requested_volume_q16(), (1842, 900));
+        assert_eq!(rig.backend.hw_vol, (0, 0));
+        // Zero is silence through the software gain (C: output.gainL = 0).
+        rig.command(&mut pipeline, &audg_frame(0, 0, 1), 20);
+        assert_eq!((pipeline.gain_stage.volume_l_q16, pipeline.gain_stage.volume_r_q16), (0, 0));
+    }
+
+    #[test]
     fn test_audg_hardware_volume_policy() {
         let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x04], "Test");
         let mut stream_storage = [0u8; 1024];
@@ -2929,8 +2995,10 @@ mod tests {
         let msg = rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 10);
         assert_eq!(msg, Some(CydMessage::Volume(55)));
         assert_eq!(rig.backend.hw_vol, (0x5D, 0x5D));
-        assert_eq!(pipeline.volume.gain_left, 65536);
-        assert_eq!(pipeline.volume.gain_right, 65536);
+        assert_eq!(pipeline.gain_stage.volume_l_q16, 65536);
+        assert_eq!(pipeline.gain_stage.volume_r_q16, 65536);
+        // The requested volume (C equalizer_set_volume's input, Task 16) is LMS's, per channel.
+        assert_eq!(pipeline.requested_volume_q16(), (1842, 900));
 
         // Zero gain: amplifier muted, software gain 0
         let msg = rig.command(&mut pipeline, &audg_frame(0, 0, 1), 20);
@@ -3170,7 +3238,7 @@ mod tests {
         assert_eq!(
             caps.as_str(),
             concat!(
-                "Model=squeezeesp32,AccuratePlayPoints=1,Depth=32,Firmware=v",
+                "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Depth=32,Firmware=v",
                 env!("CARGO_PKG_VERSION"),
                 ",ModelName=SqueezeESP32,MaxSampleRate=192000,flc,pcm,wav,aif,mp3"
             )
@@ -3504,6 +3572,9 @@ mod tests {
         }
         fn set_hw_volume(&mut self, left: u8, right: u8) {
             self.inner.set_hw_volume(left, right);
+        }
+        fn has_hw_volume(&self) -> bool {
+            self.inner.has_hw_volume()
         }
         fn set_mute(&mut self, mute: bool) {
             self.inner.set_mute(mute);
@@ -4300,7 +4371,8 @@ mod tests {
         frame[8 + 11] = 0x03;
         rig.command(&mut p, &frame, now);
         assert_eq!(p.fade.mode(), FadeMode::Out);
-        assert!(p.boundary.invert);
+        assert!(p.gain_stage.invert_polarity);
+        assert_eq!(p.gain_stage.channel_mode, ChannelMode::Stereo);
         assert_eq!(p.fade.state(), FadeState::Inactive, "fade out arms nothing at the start");
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| count(&r.lines(), "STAT:STMd") == 1);
         // C decode.c:103 `_checkfade(false)`: down over the last min(unread, 1 s) frames.
@@ -4316,6 +4388,29 @@ mod tests {
         // Unfaded before the fade, attenuated at its end.
         assert_eq!(left[600 - dur - 1], -((1000 + 599 - dur as i32) << 16));
         assert!(left[599] > -((1599 << 16) / 2), "{}", left[599]);
+    }
+
+    #[test]
+    fn test_strm_s_flags_set_channel_mode_and_polarity() {
+        // C parity: slimproto.c:488-489, invert = (flags & 0x03) == 0x03, channels = (flags &
+        // 0x0c) >> 2 with MONO_LEFT 0x01, MONO_RIGHT 0x02 (squeezelite.h:663-664).
+        for (flags, invert, mode) in [
+            (0x00, false, ChannelMode::Stereo),
+            (0x01, false, ChannelMode::Stereo),
+            (0x03, true, ChannelMode::Stereo),
+            (0x04, false, ChannelMode::LeftOnly),
+            (0x08, false, ChannelMode::RightOnly),
+            (0x0c, false, ChannelMode::MonoMix),
+            (0x0f, true, ChannelMode::MonoMix),
+        ] {
+            let mut rig = gapless_rig(&[track_bytes(1, 600)]);
+            let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+            let mut p = gapless_pipeline(&mut s, &mut o);
+            let mut frame = strm_start(1, b'3', true);
+            frame[8 + 11] = flags;
+            rig.command(&mut p, &frame, 100);
+            assert_eq!((p.gain_stage.invert_polarity, p.gain_stage.channel_mode), (invert, mode), "flags {flags:#04x}");
+        }
     }
 
     #[test]

@@ -6,15 +6,13 @@
 extern crate alloc;
 use alloc::boxed::Box;
 
-use squeezelite_audio_core::{
-    scale_samples_inplace, AudioOutputSink, AudioRingBuffer, Equalizer, RingBufferError,
-    VolumeScale,
-};
-use squeezelite_audio_core::fade::{apply_gain, cross_sample, gain, ChunkGain, FadeEngine, FadeStep, FIXED_ONE};
+use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, GainStage, RingBufferError};
+use squeezelite_audio_core::fade::{cross_sample, ChunkGain, FadeEngine, FadeStep};
 use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 
 pub use squeezelite_audio_core::EqPreset;
 pub use squeezelite_audio_core::FadeMode;
+pub use squeezelite_audio_core::ChannelMode;
 pub type ActiveCodec = ActiveDecoder;
 
 // Scratch sizing follows the codec set: the `std-codecs` decoders (FLAC 4096-frame blocks, AAC,
@@ -165,6 +163,9 @@ impl ActiveDecoder {
     }
 }
 
+/// Q16.16 unity gain (C `FIXED_ONE`).
+const UNITY_Q16: u32 = 0x1_0000;
+
 /// Output-ring bytes per stereo frame (two native-endian `i32` samples; C `BYTES_PER_FRAME`).
 const OUTPUT_FRAME_BYTES: usize = 8;
 
@@ -211,8 +212,8 @@ pub struct TrackBoundary {
     /// The first half of the rate-change delay was played (C `output.delay_active`).
     delay_active: bool,
     /// Replay gain of the playing track, 16.16 fixed point, 0 = none (C
-    /// `output.current_replay_gain`). Stored with C semantics; so far only a crossfade's weights
-    /// apply it (Task 13). Task 14's gain stage applies it to every sample.
+    /// `output.current_replay_gain`). The gain stage applies it to every output sample
+    /// outside a crossfade (C `output.c:54-55`); inside one, the crossfade weights carry it.
     pub current_replay_gain: u32,
     /// Replay gain from the latest `strm s` (C `output.next_replay_gain`, `slimproto.c:485`).
     pub next_replay_gain: u32,
@@ -220,9 +221,6 @@ pub struct TrackBoundary {
     /// it at the old rate and half after it at the new one (C `output.rate_delay`, the `delay`
     /// of `-r rates:delay`, `main.c:298`, `main.c:509`). Default 0: no silence.
     pub rate_delay_ms: u32,
-    /// Polarity inversion from `strm s` (C `output.invert = (flags & 0x03) == 0x03`,
-    /// `slimproto.c:488`): the standard gain is negated (`output.c:57`).
-    pub invert: bool,
     /// Rate of the newest track start (C `output.next_sample_rate`), which sizes a fade at
     /// the end of its decoding (C `_checkfade(false)`, `output.c:292`).
     next_sample_rate: u32,
@@ -243,7 +241,6 @@ impl TrackBoundary {
             current_replay_gain: 0,
             next_replay_gain: 0,
             rate_delay_ms: 0,
-            invert: false,
             next_sample_rate: rate_hint,
         }
     }
@@ -255,7 +252,12 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub output_buffer: AudioRingBuffer<'a>,
     pub decoder: ActiveDecoder,
     pub equalizer: Equalizer<10>,
-    pub volume: VolumeScale,
+    /// The composite output gain (C `output.gainL/R`, `current_replay_gain`, fade gain,
+    /// `invert`, `channels`), applied to every chunk the output step writes.
+    pub gain_stage: GainStage,
+    /// The volume LMS last asked for, Q16.16 per channel (C `set_volume`'s arguments,
+    /// slimproto.c:569), see [`Self::requested_volume_q16`].
+    pub requested_volume: (u32, u32),
     pub sink: S,
     pub sample_rate: u32,
     pub frames_played: u64,
@@ -292,7 +294,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             output_buffer: AudioRingBuffer::new(output_storage),
             decoder,
             equalizer: Equalizer::new(),
-            volume: VolumeScale::unity(),
+            gain_stage: GainStage::unity(),
+            requested_volume: (UNITY_Q16, UNITY_Q16),
             sink,
             sample_rate,
             frames_played: 0,
@@ -321,7 +324,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.stream_buffer.write(data)
     }
 
-    /// Decodes a chunk from `stream_buffer`, processes volume and EQ, and stores in `output_buffer`.
+    /// Decodes a chunk from `stream_buffer`, processes EQ, and stores it in `output_buffer`.
+    /// Gain (volume, replay gain, fade, polarity, channel select) is applied when the output
+    /// step plays the frames, as C does (output_i2s.c:510 `_apply_gain`).
     ///
     /// # Returns (`PIPE-504`)
     /// - When draining buffered `pcm_pending_samples` from a prior decode step: returns
@@ -372,7 +377,6 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 self.mark_track_start();
                 let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
                 self.equalizer.process_interleaved(active_pcm);
-                scale_samples_inplace(active_pcm, self.volume);
 
                 let frames_to_write = frames_produced.min(avail_frames);
                 let frames_written = if frames_to_write > 0 {
@@ -438,12 +442,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             // `output.next_sample_rate` with `track_start`; output.c:154 switches). A rate
             // change inside a track is ignored, as in C (only `new_stream` reads the rate).
             self.mark_track_start();
-            // Apply DSP across ALL produced samples exactly once before buffering:
-            // 1. Equalizer preset and loudness contour in-place
-            // 2. Volume scaling and attenuation in-place
+            // Equalizer preset and loudness contour, in place, exactly once before buffering.
+            // The gain stage runs at output time (C parity: output.c:54-57, output_i2s.c:510),
+            // so a volume change reaches audio already in the output ring at once, as in C.
             let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
             self.equalizer.process_interleaved(active_pcm);
-            scale_samples_inplace(active_pcm, self.volume);
 
             let avail_frames = self.output_buffer.available_write() / 8;
             let frames_to_write = frames_produced.min(avail_frames);
@@ -572,24 +575,22 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// - Crossfade: each old sample (at the read position) is mixed with the new track's
     ///   sample `dur_f` frames further on (C `cross_ptr = fade_end + cur_f`, output.c:245,
     ///   output_pack.c:366-376), each weighted by its fade weight and its own replay gain.
-    /// - Then the standard gain: negated with `invert` (output.c:57), times the fade-up/down
-    ///   gain (output.c:224-226).
+    /// - Then the gain stage, the one place the output gain is composed: volume x current
+    ///   replay gain x fade-up/down gain, negated with `invert`, then channel select (C parity:
+    ///   output.c:54-57, :226-228; output_pack.c:383-410).
     ///
-    /// Volume is still applied at decode time (pre-existing), and replay gain is applied only
-    /// inside the crossfade weights: Task 14's gain stage composes volume x replay gain x
-    /// [`FadeEngine::gain_q16`] here, as C does.
+    /// Replay gain is applied exactly once per sample: outside a crossfade by the gain stage
+    /// (C output.c:54-55); inside one only by the crossfade weights, because C's standard gain
+    /// there is the plain volume `output.gainL/R` (output.c:243-245). The level is therefore
+    /// continuous across both crossfade edges.
     ///
-    /// TODO(Task 14): with a non-zero replay gain the level steps audibly at BOTH crossfade
-    /// edges (the old track's gain applies only inside the fade, the new track's only until
-    /// it ends), until the composite gain stage applies replay gain outside the crossfade.
-    ///
-    /// Deliberate divergence: during a fade up/down C negates the inverted gain a second time
-    /// (output.c:57 then :227-229), so it plays non-inverted for the fade only, with a
-    /// polarity flip at each fade edge. Here invert negates exactly once, fade or not.
+    /// Deliberate divergence (ruled in Task 13): during a fade up/down C negates the inverted
+    /// gain a second time (output.c:57 then :229), so it plays non-inverted for the fade
+    /// only, with a polarity flip at each fade edge. Here invert negates exactly once.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     fn scale_chunk(&mut self, frames: usize, chunk_gain: ChunkGain) {
         let samples = &mut self.output_i32_scratch[..frames * 2];
-        if let ChunkGain::Cross { gain_in, gain_out, new_ahead } = chunk_gain {
+        let crossfading = if let ChunkGain::Cross { gain_in, gain_out, new_ahead } = chunk_gain {
             let offset = usize::try_from(new_ahead).unwrap_or(usize::MAX).saturating_mul(OUTPUT_FRAME_BYTES);
             // `prepare` checked that the new frames follow (output.c:231): the old samples are
             // already converted, so the byte scratch is free for them.
@@ -601,13 +602,18 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 let new = i32::from_ne_bytes([new[0], new[1], new[2], new[3]]);
                 *sample = cross_sample(*sample, new, gain_out, gain_in);
             }
-        }
-        let standard = if self.boundary.invert { -FIXED_ONE } else { FIXED_ONE };
-        let chunk = match chunk_gain {
-            ChunkGain::Fade(fade_gain) => gain(standard, fade_gain),
-            _ => standard,
+            true
+        } else {
+            false
         };
-        apply_gain(samples, chunk);
+        // C parity: output.c:54-55 (replay gain on all output, 0 = none) and :243-245 (plain
+        // volume while crossfading: the weights above carry both tracks' replay gains).
+        self.gain_stage.replay_gain_q16 = if crossfading { 0 } else { self.boundary.current_replay_gain };
+        // C parity: output.c:226-228, the fade gain of this chunk (unity outside a fade
+        // up/down). Refreshed once per chunk, so a volume change never touches fade progress.
+        self.gain_stage.fade_q16 = self.fade.gain_q16();
+        debug_assert!(!matches!(chunk_gain, ChunkGain::Fade(g) if g as u32 != self.gain_stage.fade_q16));
+        self.gain_stage.apply(samples);
     }
 
     /// Playback reached the pending track start (C parity: output.c:127-162).
@@ -698,12 +704,15 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         (self.output_buffer.capacity() / OUTPUT_FRAME_BYTES) as u64
     }
 
-    /// `strm s` transition and polarity (C `slimproto.c:486-488`: `fade_mode =
-    /// transition_type - '0'`, `fade_secs = transition_period`, `invert`). A fade already armed
-    /// keeps running, as in C.
-    pub fn set_transition(&mut self, mode: FadeMode, secs: u32, invert: bool) {
+    /// `strm s` transition, polarity and channel select (C parity: slimproto.c:486-489:
+    /// `fade_mode = transition_type - '0'`, `fade_secs = transition_period`, `invert`,
+    /// `channels`). A fade already armed keeps running, as in C. Polarity and channel select
+    /// take effect at once, also on the previous track's tail still playing, as C's
+    /// `output.invert` / `output.channels` globals do.
+    pub fn set_transition(&mut self, mode: FadeMode, secs: u32, invert: bool, channels: ChannelMode) {
         self.fade.configure(mode, secs);
-        self.boundary.invert = invert;
+        self.gain_stage.invert_polarity = invert;
+        self.gain_stage.channel_mode = channels;
     }
 
     /// Decoding of the stream ended, completely or with an error (C parity: decode.c:103
@@ -728,6 +737,22 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     pub fn stop_fades(&mut self) {
         self.fade.configure(FadeMode::None, 0);
         self.fade.reset();
+    }
+
+    /// Another audio source (Bluetooth) takes the output: no LMS transition and no LMS replay
+    /// gain apply to it ([`Self::stop_fades`], then replay gain none).
+    ///
+    /// Declared divergence (cleaner): C's Bluetooth start (decode_external.c:147-154) leaves
+    /// `output.current_replay_gain` alone, so the last LMS track's replay gain scales the
+    /// Bluetooth audio (output.c:54-55). Here both the current and the next replay gain are
+    /// cleared. Volume, polarity and channel select are player settings and stay, as in C.
+    pub fn begin_external_audio(&mut self) {
+        self.stop_fades();
+        self.boundary.current_replay_gain = 0;
+        self.boundary.next_replay_gain = 0;
+        if let Some(marker) = self.boundary.marker.as_mut() {
+            marker.replay_gain = 0;
+        }
     }
 
     /// The pending track boundary, if any (C `output.track_start != NULL`).
@@ -853,10 +878,28 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         rewound / OUTPUT_FRAME_BYTES
     }
 
-    /// Sets digital volume level.
+    /// Records the volume LMS asked for (C `set_volume`'s arguments: the `audg` gains, or
+    /// unity when `digital_atten` is 0, slimproto.c:569), whatever attenuates it: the
+    /// amplifier or [`Self::set_volume`].
+    pub fn set_requested_volume(&mut self, left_gain: u32, right_gain: u32) {
+        self.requested_volume = (left_gain, right_gain);
+    }
+
+    /// The volume LMS last asked for, Q16.16 per channel, independent of whether the
+    /// amplifier or the software gain stage attenuates. C hands it to `equalizer_set_volume`
+    /// (output_embedded.c:126) so the loudness contour tracks the volume: Task 16 hooks the
+    /// loudness here.
+    #[must_use]
+    pub const fn requested_volume_q16(&self) -> (u32, u32) {
+        self.requested_volume
+    }
+
+    /// Sets the software volume, Q16.16 per channel (C `output.gainL` / `gainR`, set by
+    /// `set_volume` when no hardware volume handles it, output_embedded.c:118-126). It applies
+    /// from the next output chunk on, also to audio already in the output ring, as in C.
     pub fn set_volume(&mut self, left_gain: u32, right_gain: u32) {
-        self.volume.gain_left = left_gain;
-        self.volume.gain_right = right_gain;
+        self.gain_stage.volume_l_q16 = left_gain;
+        self.gain_stage.volume_r_q16 = right_gain;
     }
 
     /// Sets the active audio decoder. A replaced MP3 decoder is parked in [`Self::mp3_spare`]
@@ -1978,7 +2021,7 @@ mod tests {
     /// `strm s` with a transition. Tests run at a 100 Hz "rate", so one second is 100 frames.
     fn next_stream_with(p: &mut StreamPipeline<'_, RecSink>, rate: u32, rg: u32, mode: FadeMode, secs: u32, invert: bool) {
         next_stream(p, rate, rg);
-        p.set_transition(mode, secs, invert);
+        p.set_transition(mode, secs, invert, ChannelMode::Stereo);
     }
 
     fn write_sizes(p: &StreamPipeline<'_, RecSink>) -> std::vec::Vec<usize> {
@@ -2086,7 +2129,9 @@ mod tests {
             let new = scaled(2, start..start + len, FIXED_ONE);
             expected.extend(old.iter().zip(&new).map(|(&a, &b)| gain(gout, a).saturating_add(gain(gin, b))));
         }
-        expected.extend(scaled(2, 100..400, FIXED_ONE));
+        // Task 14: after the crossfade the new track's replay gain applies to all its output
+        // (C output.c:54-55), continuous with its weight inside the mix.
+        expected.extend(scaled(2, 100..400, 0x8000));
         assert_eq!(p.sink.samples.len(), expected.len(), "300 + 400 - 100 frames: none missing, none twice");
         assert_eq!(p.sink.samples, expected);
         // The first chunk is all old track (in = 0).
@@ -2123,7 +2168,8 @@ mod tests {
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(236 * 8), "boundary unchanged");
         drain_output(&mut p);
         let mut expected = scaled(1, 0..300, FIXED_ONE);
-        expected.extend(scaled(2, 0..400, FIXED_ONE));
+        // Task 14: track 2's replay gain 0x8000 applies from its start (C output.c:54-55, 158).
+        expected.extend(scaled(2, 0..400, 0x8000));
         assert_eq!(p.sink.samples, expected);
         assert_eq!(p.sink.rate_changes, [100, 200]);
         assert_eq!(p.boundary.current_replay_gain, 0x8000);
@@ -2189,5 +2235,238 @@ mod tests {
         assert_eq!(p.fade.state(), FadeState::Due);
         p.flush();
         assert_eq!(p.fade.state(), FadeState::Inactive);
+    }
+
+    // ---- Task 14: composite gain stage ------------------------------------------------------
+
+    /// 16-bit big-endian stereo PCM of a sine: `amp * sin(2 pi i / period)` on both channels.
+    fn sine_pcm(frames: usize, period: usize, amp: f64) -> std::vec::Vec<u8> {
+        let mut out = std::vec::Vec::new();
+        for i in 0..frames {
+            let v = (amp * (2.0 * core::f64::consts::PI * i as f64 / period as f64).sin()).round() as i16;
+            out.extend_from_slice(&v.to_be_bytes());
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn test_volume_applies_at_output_to_buffered_audio() {
+        // C applies output.gainL/R when frames are played (output.c:54, output_i2s.c:510), so
+        // a volume change reaches audio already in the output ring.
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        next_stream(&mut p, 100, 0);
+        feed(&mut p, &track_pcm(1, 200));
+        p.set_volume(0x8000, 0x4000);
+        drain_output(&mut p);
+        let expected: std::vec::Vec<i32> = (0..200)
+            .flat_map(|i| {
+                let v = i32::from(1000 + i as i16) << 16;
+                [gain(0x8000, v), gain(0x4000, -v)]
+            })
+            .collect();
+        assert_eq!(p.sink.samples, expected);
+    }
+
+    #[test]
+    fn test_replay_gain_applies_to_all_output_composed_with_volume() {
+        // C output.c:54-55: gainL = gain(output.gainL, current_replay_gain), one composed
+        // gain per channel; the brief's fixture: volume 0.5 x replay gain 2.0 = unity.
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.set_volume(0x8000, 0x8000);
+        next_stream(&mut p, 100, 0x2_0000);
+        feed(&mut p, &track_pcm(1, 100));
+        drain_output(&mut p);
+        assert_eq!(p.sink.samples, scaled(1, 0..100, FIXED_ONE));
+        // Replay gain 0 means none (output.c:54): the volume alone.
+        next_stream(&mut p, 100, 0);
+        feed(&mut p, &track_pcm(2, 100));
+        p.sink.samples.clear();
+        drain_output(&mut p);
+        assert_eq!(p.sink.samples, scaled(2, 0..100, 0x8000));
+        // An odd composition: gain(gain(vol, rg), s), truncating at each step as C.
+        next_stream(&mut p, 100, 0x1_6A09);
+        feed(&mut p, &track_pcm(3, 100));
+        p.sink.samples.clear();
+        drain_output(&mut p);
+        assert_eq!(p.sink.samples, scaled(3, 0..100, gain(0x8000, 0x1_6A09)));
+    }
+
+    #[test]
+    fn test_gain_change_during_fade_preserves_fade_progress() {
+        // Review Focus #3. Fade in over 128 frames (64 Hz, 2 s); the first 64-frame chunk
+        // leaves the fade at 50 %.
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        next_stream_with(&mut p, 64, 0, FadeMode::In, 2, false);
+        feed(&mut p, &track_pcm(1, 300));
+        assert_eq!(p.process_output_step().unwrap(), 64);
+        assert_eq!((p.fade.state(), p.fade.duration_frames()), (FadeState::Active, 128));
+        let fade_before = p.fade;
+        // Volume change mid-fade: the fade's position, length and gain are untouched.
+        p.set_volume(0x8000, 0x8000);
+        assert_eq!(p.fade, fade_before);
+        assert_eq!(p.process_output_step().unwrap(), 64);
+        // The chunk reflects both: fade 50 % x volume 50 % (output.c:54, :226-228).
+        assert_eq!(p.gain_stage.fade_q16, 0x8000);
+        assert_eq!(&p.sink.samples[128..256], &scaled(1, 64..128, gain(0x8000, 0x8000))[..]);
+        // Another change at the last fade frame changes nothing in the fade either; it ends on
+        // schedule (no restart, no jump to unity).
+        p.set_volume(0x1_0000, 0x1_0000);
+        drain_output(&mut p);
+        assert_eq!(p.fade.state(), FadeState::Inactive);
+        assert_eq!(write_sizes(&p), [64, 64, 64, 64, 44]);
+        let mut expected = scaled(1, 0..64, 0);
+        expected.extend(scaled(1, 64..128, gain(0x8000, 0x8000)));
+        expected.extend(scaled(1, 128..300, FIXED_ONE));
+        assert_eq!(p.sink.samples, expected);
+    }
+
+    #[test]
+    fn test_invert_with_volume_replay_gain_and_fade_negates_once() {
+        // C output.c:54-57 then :224-226; the inversion is applied exactly once under the fade
+        // (declared divergence from C's second negation, ruled in Task 13).
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.set_volume(0x8000, 0x8000);
+        next_stream_with(&mut p, 100, 0x2_0000, FadeMode::In, 1, true);
+        feed(&mut p, &track_pcm(1, 200));
+        drain_output(&mut p);
+        let standard = -gain(0x8000, 0x2_0000);
+        let mut expected = scaled(1, 0..64, gain(standard, 0));
+        expected.extend(scaled(1, 64..100, gain(standard, to_gain(0.64))));
+        expected.extend(scaled(1, 100..200, standard));
+        assert_eq!(p.sink.samples, expected);
+        // Inverted before, during and after the fade: left samples (positive in the source)
+        // are never positive.
+        assert!(left(&p.sink.samples).iter().all(|&v| v <= 0));
+        assert!(left(&p.sink.samples[128..]).iter().all(|&v| v < 0));
+    }
+
+    #[test]
+    fn test_channel_select_applies_to_output() {
+        // C slimproto.c:489 output.channels, output_pack.c:383-410.
+        let expect = |mode: ChannelMode, l: i32, r: i32| -> (i32, i32) {
+            let (l, r) = (gain(0x8000, l), gain(0x4000, r));
+            match mode {
+                ChannelMode::LeftOnly => (l, l),
+                ChannelMode::RightOnly => (r, r),
+                ChannelMode::MonoMix => ((l + r) / 2, (l + r) / 2),
+                ChannelMode::Stereo => (l, r),
+            }
+        };
+        for mode in [ChannelMode::LeftOnly, ChannelMode::RightOnly, ChannelMode::MonoMix, ChannelMode::Stereo] {
+            let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+            let mut p = rec_pipeline(&mut s, &mut o);
+            p.set_volume(0x8000, 0x4000);
+            next_stream(&mut p, 100, 0);
+            p.set_transition(FadeMode::None, 0, false, mode);
+            feed(&mut p, &track_pcm(1, 100));
+            drain_output(&mut p);
+            let expected: std::vec::Vec<i32> = (0..100)
+                .flat_map(|i| {
+                    let v = i32::from(1000 + i as i16) << 16;
+                    let (l, r) = expect(mode, v, -v);
+                    [l, r]
+                })
+                .collect();
+            assert_eq!(p.sink.samples, expected, "{mode:?}");
+        }
+    }
+
+    /// Track 1 (300 frames, replay gain `rg1`) crossed after one 64-frame step, then track 2
+    /// (400 frames, `rg2`) with a 1 s crossfade at 100 Hz: the mix spans track 1's frames
+    /// 200..300 and track 2's 0..100.
+    fn crossfade_rg<'a>(s: &'a mut [u8], o: &'a mut [u8], rg1: u32, rg2: u32, t1: &[u8], t2: &[u8]) -> StreamPipeline<'a, RecSink> {
+        let mut p = rec_pipeline(s, o);
+        next_stream_with(&mut p, 100, rg1, FadeMode::Cross, 1, false);
+        feed(&mut p, t1);
+        assert_eq!(p.process_output_step().unwrap(), 64);
+        assert!(p.active_marker_crossed().is_some());
+        next_stream_with(&mut p, 100, rg2, FadeMode::Cross, 1, false);
+        feed(&mut p, t2);
+        assert_eq!((p.fade.state(), p.fade.dir()), (FadeState::Due, FadeDir::Cross));
+        p
+    }
+
+    #[test]
+    fn test_crossfade_applies_replay_gain_once() {
+        // Inside a crossfade C's standard gain is the plain volume (output.c:243-245) and each
+        // weight carries its track's replay gain (:234-239): replay gain is never doubled.
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = crossfade_rg(&mut s, &mut o, 0x8000, 0xC000, &track_pcm(1, 300), &track_pcm(2, 400));
+        p.set_volume(0x8000, 0x8000);
+        drain_output(&mut p);
+        // Before the fade: volume x track 1's replay gain (the first 64 frames were played at
+        // unity volume, before set_volume).
+        let mut expected = scaled(1, 0..64, gain(FIXED_ONE, 0x8000));
+        expected.extend(scaled(1, 64..200, gain(0x8000, 0x8000)));
+        for (start, len) in [(0usize, 64usize), (64, 36)] {
+            let gin = to_gain(start as f32 / 100.0);
+            let (gout, gin) = (gain(FIXED_ONE - gin, 0x8000), gain(gin, 0xC000));
+            let old = scaled(1, 200 + start..200 + start + len, FIXED_ONE);
+            let new = scaled(2, start..start + len, FIXED_ONE);
+            // Mix with the weights, then the volume alone.
+            expected.extend(old.iter().zip(&new).map(|(&a, &b)| gain(0x8000, gain(gout, a).saturating_add(gain(gin, b)))));
+        }
+        expected.extend(scaled(2, 100..400, gain(0x8000, 0xC000)));
+        assert_eq!(p.sink.samples, expected);
+        assert_eq!(p.boundary.current_replay_gain, 0xC000);
+        // The first mixed chunk (in = 0) equals the old track at volume x replay gain within
+        // the truncation of the two-step product, not volume x replay gain squared.
+        let first_mixed = &p.sink.samples[400..402];
+        let v = i32::from(1200i16) << 16;
+        assert!((first_mixed[0] - gain(gain(0x8000, 0x8000), v)).abs() <= 2, "{first_mixed:?}");
+    }
+
+    #[test]
+    fn test_crossfade_edges_keep_constant_level_with_replay_gain() {
+        // A constant-level sine through a crossfade between two tracks with the same replay
+        // gain (0.5): the level must not step at either edge. The period (20 frames) divides
+        // the fade start (200), so old and new samples are in phase inside the mix.
+        const AMP: f64 = 20_000.0;
+        let (t1, t2) = (sine_pcm(300, 20, AMP), sine_pcm(400, 20, AMP));
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = crossfade_rg(&mut s, &mut o, 0x8000, 0x8000, &t1, &t2);
+        drain_output(&mut p);
+        let out = left(&p.sink.samples);
+        assert_eq!(out.len(), 600);
+        // Every frame: half the source level (2^16 scale), to within the Q16 truncations.
+        let ideal = |i: usize| 0.5 * 65536.0 * (AMP * (2.0 * core::f64::consts::PI * i as f64 / 20.0).sin()).round();
+        let tolerance = 65536.0 * AMP * 4.0 / 65536.0 + 4.0;
+        for (i, &v) in out.iter().enumerate() {
+            assert!((f64::from(v) - ideal(i)).abs() <= tolerance, "frame {i}: {v} vs {}", ideal(i));
+        }
+        // Peak level just before each edge, inside and just after: equal.
+        let peak = |r: core::ops::Range<usize>| out[r].iter().map(|v| v.unsigned_abs()).max().unwrap();
+        let (before, inside, after) = (peak(180..200), peak(240..260), peak(300..320));
+        let full = (AMP * 65536.0 * 0.5) as u32;
+        for (name, level) in [("before", before), ("inside", inside), ("after", after)] {
+            assert!(level.abs_diff(full) <= full / 1000, "{name}: {level} vs {full}");
+        }
+    }
+
+    #[test]
+    fn test_external_audio_clears_replay_gain_keeps_player_settings() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.set_volume(0x8000, 0x8000);
+        next_stream_with(&mut p, 100, 0x2_0000, FadeMode::In, 1, true);
+        feed(&mut p, &track_pcm(1, 100));
+        p.process_output_step().unwrap();
+        assert!(p.active_marker_crossed().is_some());
+        // The next LMS track is queued behind the playing one.
+        next_stream(&mut p, 100, 0x3000);
+        feed(&mut p, &track_pcm(2, 10));
+        assert_eq!(p.boundary.current_replay_gain, 0x2_0000);
+        assert_eq!(p.track_marker().map(|m| m.replay_gain), Some(0x3000));
+        p.begin_external_audio();
+        assert_eq!((p.boundary.current_replay_gain, p.boundary.next_replay_gain), (0, 0));
+        assert_eq!(p.track_marker().map(|m| m.replay_gain), Some(0));
+        assert_eq!((p.fade.mode(), p.fade.state()), (FadeMode::None, FadeState::Inactive));
+        // Volume and polarity are player settings (C keeps output.gainL/R and invert).
+        assert_eq!((p.gain_stage.volume_l_q16, p.gain_stage.invert_polarity), (0x8000, true));
     }
 }

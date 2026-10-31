@@ -757,9 +757,10 @@ mod device {
                     if !s.bt_audio_active {
                         // A replaced MP3 decoder is parked by `set_decoder` for the next track.
                         s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                        // Declared divergence (cleaner): no LMS fade over Bluetooth audio (C's
-                        // `_buf_flush` leaves an armed fade running, decode_external.c:148).
-                        s.pipeline.stop_fades();
+                        // Declared divergences (cleaner): no LMS fade and no LMS replay gain on
+                        // Bluetooth audio (C's `_buf_flush` leaves an armed fade running and
+                        // `current_replay_gain` set, decode_external.c:147-154).
+                        s.pipeline.begin_external_audio();
                         s.pipeline.set_mute(false);
                         s.coordinator.begin_external_playback();
                         if s.amp.mode() != louder_esp32_app::AmpMode::Play {

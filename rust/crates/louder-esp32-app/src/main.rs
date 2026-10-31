@@ -1076,8 +1076,9 @@ mod xtensa_hw {
                 .write(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
             core::ptr::addr_of_mut!((*ptr).equalizer)
                 .write(squeezelite_audio_core::Equalizer::new());
-            core::ptr::addr_of_mut!((*ptr).volume)
-                .write(squeezelite_audio_core::VolumeScale::unity());
+            core::ptr::addr_of_mut!((*ptr).gain_stage)
+                .write(squeezelite_audio_core::GainStage::unity());
+            core::ptr::addr_of_mut!((*ptr).requested_volume).write((0x1_0000, 0x1_0000));
             core::ptr::addr_of_mut!((*ptr).sink).write(sink);
             core::ptr::addr_of_mut!((*ptr).sample_rate).write(44_100);
             core::ptr::addr_of_mut!((*ptr).frames_played).write(0);
