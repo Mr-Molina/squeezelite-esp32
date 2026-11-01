@@ -1,10 +1,13 @@
 //! Wi-Fi Station Manager and Network Provisioning
 //!
-//! Provides network connection management backed by pure-Rust key-value storage:
-//! - Loads persisted credentials from `squeezelite_config::KeyValueStorage` on initialization.
+//! Provides network connection management backed by pure-Rust
+//! key-value storage:
+//! - Loads persisted credentials from `squeezelite_config::KeyValueStorage`
+//!   on initialization.
 //! - Persists credentials across reboots on successful connection.
 //! - Simulated network status on host platforms.
-//! - Active ESP-IDF Wi-Fi STA driver on ESP32 target hardware (`target_os = "espidf"`).
+//! - Active ESP-IDF Wi-Fi STA driver on ESP32 target hardware
+//!   (`target_os = "espidf"`).
 
 use core::fmt;
 use squeezelite_config::{KeyValueStorage, MemConfigStore, StorageError, WifiCredentials};
@@ -125,9 +128,10 @@ impl<S: KeyValueStorage> WifiManager<S> {
         &mut self.store
     }
 
-    /// Initiates a Wi-Fi connection handshake and persists credentials to storage,
-    /// transitioning into [`WifiState::Connecting`] until [`Self::confirm_connected`]
-    /// or [`Self::on_connected`] is invoked upon link/DHCP completion (PERIPH-605).
+    /// Initiates a Wi-Fi connection handshake and persists credentials,
+    /// transitioning into [`WifiState::Connecting`] until
+    /// [`Self::confirm_connected`] or [`Self::on_connected`] is invoked upon
+    /// link/DHCP completion (PERIPH-605).
     pub fn begin_connect(&mut self, ssid: &str, password: &str) -> Result<WifiState, StorageError> {
         if ssid.is_empty() || ssid.len() > 32 {
             return Err(StorageError::InvalidFormat);
@@ -143,7 +147,8 @@ impl<S: KeyValueStorage> WifiManager<S> {
         self.config.password.clear();
         self.config.password.push_str(password).map_err(|_| StorageError::CapacityExceeded)?;
 
-        // Persist to key-value storage, preserving existing static IP / network configuration if present (CODE-CFG-001)
+        // Persist to storage, preserving static IP settings if present
+        // (CODE-CFG-001)
         let existing = WifiCredentials::load_from(&self.store).ok().flatten();
         let mut creds = WifiCredentials::new(ssid, password)?;
         if let Some(prev) = existing {
@@ -166,7 +171,8 @@ impl<S: KeyValueStorage> WifiManager<S> {
         Ok(())
     }
 
-    /// Returns the exponential backoff delay in milliseconds based on consecutive failures (APP-002).
+    /// Returns the exponential backoff delay in milliseconds based on
+    /// consecutive failures (APP-002).
     pub fn current_backoff_ms(&self) -> u32 {
         if self.retry_count == 0 {
             return 0;
@@ -176,14 +182,15 @@ impl<S: KeyValueStorage> WifiManager<S> {
         core::cmp::min(delay, self.max_backoff_ms)
     }
 
-    /// Records a failed connection attempt and increments backoff counter using saturating arithmetic.
+    /// Records a failed connection attempt and increments backoff counter
+    /// using saturating arithmetic.
     pub fn record_failure(&mut self) {
         self.state = WifiState::Failed;
         self.retry_count = self.retry_count.saturating_add(1);
     }
 
-    /// Handles an unexpected link disconnection event, transitioning state and incrementing retry count
-    /// with saturating arithmetic (PERIPH-611).
+    /// Handles an unexpected link disconnection event, transitioning state and
+    /// incrementing retry count with saturating arithmetic (PERIPH-611).
     pub fn on_disconnected(&mut self) {
         self.state = WifiState::Disconnected;
         self.retry_count = self.retry_count.saturating_add(1);
@@ -200,7 +207,7 @@ impl<S: KeyValueStorage> WifiManager<S> {
         self.record_success();
     }
 
-    /// Callback invoked when the station link and IP lease are acquired (PERIPH-605).
+    /// Callback invoked when station link and IP lease are acquired (PERIPH-605).
     pub fn on_connected(&mut self) {
         self.record_success();
     }
@@ -382,7 +389,7 @@ mod tests {
         assert_eq!(wifi.retry_count(), 0);
         assert_eq!(wifi.current_backoff_ms(), 0);
 
-        // Verify that the stored credentials contain the new SSID/password but preserved static IP settings
+        // Verify stored credentials contain new SSID/pass but preserved IP
         let stored = WifiCredentials::load_from(wifi.store()).unwrap().expect("creds present");
         assert_eq!(stored.ssid.as_str(), "NewSSID");
         assert_eq!(stored.passphrase.as_str(), "NewPassword456");

@@ -3,7 +3,8 @@
 //! Provides sinks for audio frame output:
 //! - `NullAudioSink`: Lightweight sink for headless tests and benchmarking.
 //! - `SimulatedSink`: Sink storing written samples for verification.
-//! - `EspI2sSink`: Hardware I2S DMA sink when running on ESP32 (`target_os = "espidf"`).
+//! - `EspI2sSink`: Hardware I2S DMA sink when running on ESP32
+//!   (`target_os = "espidf"`).
 
 use squeezelite_audio_core::output::{AudioOutputSink, OutputError};
 

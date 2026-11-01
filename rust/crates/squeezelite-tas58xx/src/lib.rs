@@ -1,7 +1,8 @@
 //! `squeezelite-tas58xx`
 //!
 //! A zero-cost, type-state `embedded-hal` driver for Texas Instruments TAS5805M
-//! and TAS5825M Class-D digital amplifiers, as used on the Louder-ESP32 / Louder-ESP32-Plus boards.
+//! and TAS5825M Class-D digital amplifiers, as used on
+//! the Louder-ESP32 / Louder-ESP32-Plus boards.
 //!
 //! Enforces hardware state transitions at compile time:
 //! `PowerDown` -> `Standby` -> `Play`.
@@ -15,9 +16,11 @@ use embedded_hal::i2c::I2c;
 
 /// Standard 7-bit I2C address for TAS5825M (Louder-ESP32-Plus).
 pub const DEFAULT_I2C_ADDR: u8 = 0x4C;
-/// Standard 7-bit I2C address for TAS5805M (Louder-ESP32 alternate ADR pin high/float).
+/// Standard 7-bit I2C address for TAS5805M
+/// (Louder-ESP32 alternate ADR pin high/float).
 pub const TAS5805M_I2C_ADDR: u8 = 0x2D;
-/// Standard 7-bit I2C address for TAS5805M (Sonocotta Louder-ESP32 default ADR pin low).
+/// Standard 7-bit I2C address for TAS5805M
+/// (Sonocotta Louder-ESP32 default ADR pin low).
 pub const TAS5805M_I2C_ADDR_DEFAULT: u8 = 0x2C;
 
 /// Volume presets aligned with TI TAS5805M / TAS5825M register map (0x4C).
@@ -36,14 +39,16 @@ pub const CHAN_FAULT_OC_MASK: u8 = 0x03;
 pub const CHAN_FAULT_DC_MASK: u8 = 0x0C;
 pub const FAULT1_DC_FAULT: u8 = 0x03;
 
-/// Global fault 1 bitmasks (`GLOBAL_FAULT1 = 0x71`, TI TAS5805M datasheet section 7.6.1.29).
+/// Global fault 1 bitmasks (`GLOBAL_FAULT1 = 0x71`,
+/// TI TAS5805M datasheet section 7.6.1.29).
 pub const FAULT1_PVDD_UV: u8 = registers::FAULT1_PVDD_UV;
 pub const FAULT1_PVDD_OV: u8 = registers::FAULT1_PVDD_OV;
 pub const FAULT1_CLOCK_FAULT: u8 = registers::FAULT1_CLOCK_FAULT;
 pub const FAULT1_BQ_WR_ERROR: u8 = registers::FAULT1_BQ_WR_ERROR;
 pub const FAULT1_OTP_CRC_ERROR: u8 = registers::FAULT1_OTP_CRC_ERROR;
 
-/// Global fault 2 and over-temperature warning bitmasks (`GLOBAL_FAULT2 = 0x72`, `OTW = 0x73`).
+/// Global fault 2 and over-temperature warning bitmasks
+/// (`GLOBAL_FAULT2 = 0x72`, `OTW = 0x73`).
 pub const FAULT2_OTSD: u8 = registers::FAULT2_OTSD;
 pub const FAULT2_OTW: u8 = registers::FAULT2_OTW;
 
@@ -67,28 +72,35 @@ pub mod registers {
     pub const FS_MON: u8 = 0x37;
     /// `BCK_MON`: Detected BCK-to-FS clock ratio monitor (`0x38`).
     pub const BCK_MON: u8 = 0x38;
-    /// `CLKDET_STATUS`: Clock detector & PLL lock status (`0x39`, bit 3 = PLL locked).
+    /// `CLKDET_STATUS`: Clock detector & PLL lock status
+    /// (`0x39`, bit 3 = PLL locked).
     pub const CLKDET_STATUS: u8 = 0x39;
-    /// `DIG_VOL_LEFT` / `DIG_VOL_CTRL`: Master digital volume (`0x4C`, `0.5 dB`/step, `0x30` = `0.0 dB`).
+    /// `DIG_VOL_LEFT` / `DIG_VOL_CTRL`: Master digital volume
+    /// (`0x4C`, `0.5 dB`/step, `0x30` = `0.0 dB`).
     pub const DIG_VOL_CTRL: u8 = 0x4C; // Master Digital Volume Control
     pub const DIG_VOL_LEFT: u8 = 0x4C;
     /// `DIG_VOL_RIGHT`: Digital volume ramp / fine control (`0x4D`).
     pub const DIG_VOL_RIGHT: u8 = 0x4D;
     /// `DIG_VOL_CTRL2`: Digital volume ramp rate configuration (`0x4E`).
     pub const DIG_VOL_CTRL2: u8 = 0x4E;
-    /// `AUTO_MUTE_CTRL`: Hardware automute enable (`0x50`, `0x07` = L/R independent + grouped automute).
+    /// `AUTO_MUTE_CTRL`: Hardware automute enable
+    /// (`0x50`, `0x07` = L/R independent + grouped automute).
     pub const AUTO_MUTE_CTRL: u8 = 0x50;
     /// `AUTO_MUTE_TIME`: Hardware automute threshold time (`0x51`).
     pub const AUTO_MUTE_TIME: u8 = 0x51;
-    /// `ANA_CTRL`: Class-D analog modulation phase control (`0x53`, `0x01` = L/R out-of-phase PWM to halve PVDD ripple).
+    /// `ANA_CTRL`: Class-D analog modulation phase control
+    /// (`0x53`, `0x01` = L/R out-of-phase PWM to halve PVDD ripple).
     pub const ANA_CTRL: u8 = 0x53;
-    /// `AGAIN`: Analog gain attenuation (`0x54`, bits `4:0`, `0.5 dB`/step from `0x00` = `0.0 dB` / `29.5 V` down to `0x1F` = `-15.5 dB`).
+    /// `AGAIN`: Analog gain attenuation (`0x54`, bits `4:0`,
+    /// `0.5 dB`/step from `0x00` = `0.0 dB` / `29.5 V` to `0x1F` = `-15.5 dB`).
     pub const AGAIN: u8 = 0x54;
     /// `DSP_MISC`: DSP miscellaneous control (`0x66`).
     pub const DSP_MISC: u8 = 0x66;
-    /// `AUTOMUTE_STATE`: Live L/R hardware automute status flags (`0x69`, bit 0 = Left muted, bit 1 = Right muted).
+    /// `AUTOMUTE_STATE`: Live L/R hardware automute status flags
+    /// (`0x69`, bit 0 = Left muted, bit 1 = Right muted).
     pub const AUTOMUTE_STATE: u8 = 0x69;
-    /// `SS_CTRL0`: Spread-spectrum PWM EMI reduction (`0x6B`, `0x01` = Triangle spread spectrum enabled).
+    /// `SS_CTRL0`: Spread-spectrum PWM EMI reduction
+    /// (`0x6B`, `0x01` = Triangle spread spectrum enabled).
     pub const SS_CTRL0: u8 = 0x6B;
     pub const CHAN_FAULT: u8 = 0x70;
     pub const GLOBAL_FAULT1: u8 = 0x71;
@@ -97,10 +109,12 @@ pub mod registers {
     pub const FAULT_CLEAR: u8 = 0x78;
     pub const BOOK_SELECT: u8 = 0x7F;
 
-    /// `DEVICE_CTRL_1` value: 1SPW (Hybrid-Pro) modulation, BTL stereo, 384 kHz FSW (`0x02`).
+    /// `DEVICE_CTRL_1` value: 1SPW (Hybrid-Pro) modulation,
+    /// BTL stereo, 384 kHz FSW (`0x02`).
     pub const CTRL1_1SPW_384KHZ_BTL: u8 = 0x02;
 
-    // GLOBAL_FAULT1 (0x71) bitmasks per TI TAS5805M datasheet (SLASEH5B Section 7.6.1.29):
+    // GLOBAL_FAULT1 (0x71) bitmasks per TI TAS5805M datasheet
+    // (SLASEH5B Section 7.6.1.29):
     /// Bit 0: PVDD Undervoltage fault (`PVDD_UV_FAULT`).
     pub const FAULT1_PVDD_UV: u8 = 0x01;
     /// Bit 1: PVDD Overvoltage fault (`PVDD_OV_FAULT`).
@@ -115,7 +129,8 @@ pub mod registers {
     // GLOBAL_FAULT2 (0x72) and OT_WARNING (0x73) bitmasks:
     /// `GLOBAL_FAULT2` (0x72) Overtemperature shut-down (`OTSD_FAULT`).
     pub const FAULT2_OTSD: u8 = 0x02;
-    /// `GLOBAL_FAULT2` (0x72) / `OT_WARNING` (0x73) Overtemperature warning (`OTW`, 135 C).
+    /// `GLOBAL_FAULT2` (0x72) / `OT_WARNING` (0x73) Overtemperature warning
+    /// (`OTW`, 135 C).
     pub const FAULT2_OTW: u8 = 0x08;
 }
 
@@ -211,11 +226,12 @@ impl Tas5805mTelemetry {
         self.detected_sample_rate_hz_with_hint(0)
     }
 
-    /// Decodes `FS_MON` (`0x37` bits `3:0`) into the detected sample rate in Hz with an optional hint.
+    /// Decodes `FS_MON` (`0x37` bits `3:0`) into detected sample rate in Hz
+    /// with an optional hint.
     ///
-    /// Per TI SLASEH5B Table 7-19, `0x09` indicates 44.1 kHz or 48 kHz. If `hint_hz == 44_100`,
-    /// 44_100 is returned; otherwise 48_000 is returned by default. `0x08` is preserved for
-    /// backwards compatibility.
+    /// Per TI SLASEH5B Table 7-19, `0x09` indicates 44.1 kHz or 48 kHz.
+    /// If `hint_hz == 44_100`, 44_100 is returned; otherwise 48_000 is
+    /// returned by default. `0x08` is preserved for backwards compatibility.
     #[must_use]
     pub const fn detected_sample_rate_hz_with_hint(&self, hint_hz: u32) -> u32 {
         match self.fs_mon & 0x0F {
@@ -238,7 +254,8 @@ impl Tas5805mTelemetry {
         }
     }
 
-    /// Returns the detected BCK-to-FS ratio (`BCK_MON` `0x38` and `FS_MON` `0x37` bits `5:4`).
+    /// Returns the detected BCK-to-FS ratio
+    /// (`BCK_MON` `0x38` and `FS_MON` `0x37` bits `5:4`).
     #[must_use]
     pub const fn bck_ratio(&self) -> u16 {
         let high = ((self.fs_mon >> 4) & 0x03) as u16;
@@ -249,9 +266,10 @@ impl Tas5805mTelemetry {
         }
     }
 
-    /// Returns `true` if `CLKDET_STATUS` (`0x39`) bit 3 indicates internal PLL lock (`1`) or
-    /// when `CLKDET_STATUS` bits `2:0` (`0x07`) report zero clock faults while `FS_MON` (`0x37`)
-    /// reports a valid sample rate (`> 0`) and `BCK_MON` (`0x38`) reports a valid BCK ratio (`>= 32`).
+    /// Returns `true` if `CLKDET_STATUS` (`0x39`) bit 3 indicates internal
+    /// PLL lock (`1`) or when `CLKDET_STATUS` bits `2:0` (`0x07`) report zero
+    /// clock faults while `FS_MON` (`0x37`) reports a valid sample rate
+    /// (`> 0`) and `BCK_MON` (`0x38`) reports a valid BCK ratio (`>= 32`).
     #[must_use]
     pub const fn is_pll_locked(&self) -> bool {
         (self.clkdet_status & 0x08) != 0
@@ -260,7 +278,8 @@ impl Tas5805mTelemetry {
                 && self.bck_mon >= 32)
     }
 
-    /// Returns `true` if both Left and Right channels are currently hardware-automuted (`0x69` bits `1:0` == `0b11`).
+    /// Returns `true` if both Left and Right channels are currently
+    /// hardware-automuted (`0x69` bits `1:0` == `0b11`).
     #[must_use]
     pub const fn is_automuted(&self) -> bool {
         (self.automute_state & 0x03) == 0x03
@@ -321,9 +340,12 @@ where
         }
     }
 
-    /// Resets the TAS58xx and transitions it into `Standby` mode, returning `Self` on I2C error
-    /// so the caller never loses ownership of the I2C peripheral (PERIPH-604).
-    pub fn try_init_into_standby(mut self) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
+    /// Resets the TAS58xx and transitions it into `Standby` mode,
+    /// returning `Self` on I2C error so the caller never loses ownership
+    /// of the I2C peripheral (PERIPH-604).
+    pub fn try_init_into_standby(
+        mut self,
+    ) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
         if let Err(e) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
             return Err((self, DriverError::I2cError(e)));
         }
@@ -449,6 +471,7 @@ where
 
     /// Reads hardware fault status registers (0x70..=0x73) during Standby.
     pub fn check_faults(&mut self) -> Result<FaultStatus, DriverError<E>> {
+        self.select_page0_book0()?;
         let mut status = [0u8; 4];
         self.i2c
             .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
@@ -463,15 +486,17 @@ where
 
     /// Clears any latched hardware faults.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
+        self.select_page0_book0()?;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
             .map_err(DriverError::I2cError)
     }
 
-    /// Sets master digital volume while in Standby mode with automatic upper-bound clamping.
-    /// Clamps values below `0x30` to `VOL_UNITY_0DB` (0.0 dB) to prevent hazardous overdrive
-    /// prior to unmuting into Play.
+    /// Sets master digital volume while in Standby mode with automatic
+    /// upper-bound clamping. Clamps values below `0x30` to `VOL_UNITY_0DB`
+    /// (0.0 dB) to prevent hazardous overdrive prior to unmuting into Play.
     pub fn set_digital_volume(&mut self, volume: u8) -> Result<(), DriverError<E>> {
+        self.select_page0_book0()?;
         let safe_vol = if volume < VOL_UNITY_0DB {
             VOL_UNITY_0DB // Clamp to 0.0dB unity gain
         } else {
@@ -482,7 +507,8 @@ where
             .map_err(DriverError::I2cError)
     }
 
-    /// Re-confirms Book 0 and Page 0 selection and clears hardware faults after reset.
+    /// Re-confirms Book 0 and Page 0 selection and clears hardware faults
+    /// after reset.
     pub fn reconfirm_book_page_and_clear_faults(&mut self) -> Result<(), DriverError<E>> {
         self.i2c
             .write(self.addr, &[registers::PAGE_SELECT, 0x00])
@@ -495,12 +521,13 @@ where
             .map_err(DriverError::I2cError)
     }
 
-    /// Selects a register Book and Page, ensuring Page 0 is selected first (RUST-18).
+    /// Selects a register Book and Page, ensuring Page 0 is selected
+    /// first (RUST-18).
     ///
-    /// Texas Instruments TAS5805M/TAS5825M book selection (`BOOK_SELECT` register 0x7F)
-    /// is only accessible from Page 0. If the device was left on a non-zero page,
-    /// writing to 0x7F would modify that page's register instead of the book register.
-    /// Therefore, this method strictly performs:
+    /// Texas Instruments TAS5805M/TAS5825M book selection (`BOOK_SELECT`
+    /// register 0x7F) is only accessible from Page 0. If the device was left
+    /// on a non-zero page, writing to 0x7F would modify that page's register
+    /// instead of the book register. Therefore, this method strictly performs:
     /// 1. Write `PAGE_SELECT (0x00)` = `0x00`
     /// 2. Write `BOOK_SELECT (0x7F)` = `book`
     /// 3. Write `PAGE_SELECT (0x00)` = `page`
@@ -530,7 +557,8 @@ where
             .map_err(DriverError::I2cError)
     }
 
-    /// Transitions into `Play` mode, staging through Hi-Z and clearing faults first (RUST-17).
+    /// Transitions into `Play` mode, staging through Hi-Z and clearing faults
+    /// first (RUST-17).
     ///
     /// Writes:
     /// 1. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_HIZ (0x02)`
@@ -538,7 +566,8 @@ where
     /// 3. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_PLAY_MUTE (0x0B)`
     /// 4. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_PLAY (0x03)`
     ///
-    /// Returns `(Self, DriverError<E>)` on I2C error so peripheral ownership is retained (PERIPH-604).
+    /// Returns `(Self, DriverError<E>)` on I2C error so peripheral ownership
+    /// is retained (PERIPH-604).
     pub fn try_start_playback_via_hiz(
         mut self,
     ) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
@@ -574,7 +603,8 @@ where
         })
     }
 
-    /// Transitions into `Play` mode staging through Hi-Z and clearing faults first (RUST-17).
+    /// Transitions into `Play` mode staging through Hi-Z and clearing faults
+    /// first (RUST-17).
     pub fn start_playback_via_hiz(self) -> Result<Tas58xx<I2C, Play>, DriverError<E>> {
         self.try_start_playback_via_hiz().map_err(|(_, e)| e)
     }
@@ -613,7 +643,8 @@ where
         self.try_start_playback().map_err(|(_, e)| e)
     }
 
-    /// Places the amplifier into Deep Sleep (`PowerDown`), returning `Self` on I2C error.
+    /// Places the amplifier into Deep Sleep (`PowerDown`), returning `Self`
+    /// on I2C error.
     pub fn try_enter_deep_sleep(
         mut self,
     ) -> Result<Tas58xx<I2C, PowerDown>, (Self, DriverError<E>)> {
@@ -635,10 +666,12 @@ impl<I2C, E> Tas58xx<I2C, Play>
 where
     I2C: I2c<Error = E>,
 {
-    /// Sets master digital volume with automatic upper-bound clamping to prevent hazardous overdrive.
+    /// Sets master digital volume with automatic upper-bound clamping
+    /// to prevent hazardous overdrive.
     /// Values above `0x30` attenuate down to `0xFE` (-103 dB).
     /// `0xFF` is hardware muted.
     pub fn set_digital_volume(&mut self, volume: u8) -> Result<(), DriverError<E>> {
+        self.select_page0_book0()?;
         let safe_vol = if volume < VOL_UNITY_0DB {
             VOL_UNITY_0DB // Clamp to 0.0dB unity gain
         } else {
@@ -651,6 +684,7 @@ where
 
     /// Reads hardware fault status registers (0x70..=0x73) during Play.
     pub fn check_faults(&mut self) -> Result<FaultStatus, DriverError<E>> {
+        self.select_page0_book0()?;
         let mut status = [0u8; 4];
         self.i2c
             .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
@@ -665,6 +699,7 @@ where
 
     /// Clears any latched hardware faults during Play.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
+        self.select_page0_book0()?;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
             .map_err(DriverError::I2cError)
@@ -675,6 +710,7 @@ where
     /// 2. Clear analog/digital fault latches (`FAULT_CLEAR (0x78) = 0x80`).
     /// 3. Return `DEVICE_CTRL_2 (0x03)` to `CTRL2_MODE_PLAY (0x03)`.
     pub fn recover_from_fault(&mut self) -> Result<(), DriverError<E>> {
+        self.select_page0_book0()?;
         self.i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
             .map_err(DriverError::I2cError)?;
@@ -686,12 +722,13 @@ where
             .map_err(DriverError::I2cError)
     }
 
-    /// Selects a register Book and Page during Play mode, ensuring Page 0 is selected first (RUST-18).
+    /// Selects a register Book and Page during Play mode, ensuring
+    /// Page 0 is selected first (RUST-18).
     ///
-    /// Texas Instruments TAS5805M/TAS5825M book selection (`BOOK_SELECT` register 0x7F)
-    /// is only accessible from Page 0. If the device was left on a non-zero page,
-    /// writing to 0x7F would modify that page's register instead of the book register.
-    /// Therefore, this method strictly performs:
+    /// Texas Instruments TAS5805M/TAS5825M book selection (`BOOK_SELECT`
+    /// register 0x7F) is only accessible from Page 0. If the device was left
+    /// on a non-zero page, writing to 0x7F would modify that page's register
+    /// instead of the book register. Therefore, this method strictly performs:
     /// 1. Write `PAGE_SELECT (0x00)` = `0x00`
     /// 2. Write `BOOK_SELECT (0x7F)` = `book`
     /// 3. Write `PAGE_SELECT (0x00)` = `page`
@@ -707,7 +744,8 @@ where
             .map_err(DriverError::I2cError)
     }
 
-    /// Transitions back to `Standby` mode, returning `Self` on I2C error (PERIPH-604).
+    /// Transitions back to `Standby` mode, returning `Self` on I2C
+    /// error (PERIPH-604).
     pub fn try_stop_playback(mut self) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
         if let Err(e) = self
             .i2c
@@ -729,7 +767,8 @@ where
         })
     }
 
-    /// Transitions back to `Standby` mode with soft-mute ramp down to prevent click/pop.
+    /// Transitions back to `Standby` mode with soft-mute ramp down to
+    /// prevent click/pop.
     pub fn stop_playback(self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
         self.try_stop_playback().map_err(|(_, e)| e)
     }
@@ -804,8 +843,16 @@ where
 mod tests {
     extern crate std;
     use std::vec;
+    use std::vec::Vec;
     use super::*;
     use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
+    fn page0_book0(addr: u8) -> [I2cTrans; 3] {
+        [
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+        ]
+    }
 
     #[test]
     fn test_power_up_to_standby_transition() {
@@ -830,13 +877,17 @@ mod tests {
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1, 0x03]), // 32-bit I2S (bits [1:0] = 11)
+            // 32-bit I2S (bits [1:0] = 11)
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1, 0x03]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::FAULT_CLEAR, 0x80]),
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]), // Soft mute asserted
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x03]), // Unmute with soft ramp
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, 0x30]), // Set volume (0dB unity gain)
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]), // Soft mute before Standby
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]), // Stop back to Standby
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x03]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, 0x30]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
         ];
         let mut i2c = I2cMock::new(&expectations);
 
@@ -852,9 +903,11 @@ mod tests {
 
     #[test]
     fn test_volume_clamping_prevents_overdrive() {
-        let expectations = [
+        let mut expectations = Vec::new();
+        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
+        expectations.push(
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
-        ];
+        );
         let mut i2c = I2cMock::new(&expectations);
 
         let mut playing = Tas58xx {
@@ -871,13 +924,15 @@ mod tests {
 
     #[test]
     fn test_multi_byte_fault_status_polling() {
-        let expectations = [
+        let mut expectations = Vec::new();
+        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
+        expectations.push(
             I2cTrans::write_read(
                 DEFAULT_I2C_ADDR,
                 vec![registers::CHAN_FAULT],
                 vec![0x00, 0x00, 0x01, 0x00], // global_fault2 bit 0 = OTSD (overtemperature)
             ),
-        ];
+        );
         let mut i2c = I2cMock::new(&expectations);
 
         let mut standby = Tas58xx {
@@ -895,10 +950,15 @@ mod tests {
 
     #[test]
     fn test_standby_set_digital_volume_with_clamping() {
-        let expectations = [
+        let mut expectations = Vec::new();
+        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
+        expectations.push(
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
+        );
+        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
+        expectations.push(
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, 0x48]),
-        ];
+        );
         let mut i2c = I2cMock::new(&expectations);
 
         let mut standby = Tas58xx {
@@ -1011,7 +1071,9 @@ mod tests {
 
     #[test]
     fn test_recover_from_fault_three_step_sequence() {
-        let expectations = [
+        let mut expectations = Vec::new();
+        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
+        expectations.extend([
             I2cTrans::write(
                 DEFAULT_I2C_ADDR,
                 vec![registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ],
@@ -1024,7 +1086,7 @@ mod tests {
                 DEFAULT_I2C_ADDR,
                 vec![registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY],
             ),
-        ];
+        ]);
         let mut i2c = I2cMock::new(&expectations);
 
         let mut playing = Tas58xx {
@@ -1195,7 +1257,12 @@ mod tests {
             Ok(())
         }
 
-        fn write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
+        fn write_read(
+            &mut self,
+            address: u8,
+            write: &[u8],
+            read: &mut [u8],
+        ) -> Result<(), Self::Error> {
             self.write(address, write)?;
             self.read(address, read)
         }

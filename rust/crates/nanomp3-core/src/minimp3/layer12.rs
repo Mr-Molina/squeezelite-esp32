@@ -26,9 +26,13 @@ const fn alloc(tab_offset: u8, code_tab_width: u8, band_count: u8) -> SubbandAll
 
 static G_ALLOC_L1: [SubbandAlloc; 1] = [alloc(76, 4, 32)];
 static G_ALLOC_L2M2: [SubbandAlloc; 3] = [alloc(60, 4, 4), alloc(44, 3, 7), alloc(44, 2, 19)];
-static G_ALLOC_L2M1: [SubbandAlloc; 4] = [alloc(0, 4, 3), alloc(16, 4, 8), alloc(32, 3, 12), alloc(40, 2, 7)];
+static G_ALLOC_L2M1: [SubbandAlloc; 4] = [
+    alloc(0, 4, 3), alloc(16, 4, 8), alloc(32, 3, 12), alloc(40, 2, 7),
+];
 static G_ALLOC_L2M1_LOWRATE: [SubbandAlloc; 2] = [alloc(44, 4, 2), alloc(44, 3, 10)];
 
+// JUSTIFICATION: Manual table alignment matches MPEG Layer I/II
+// specification bit allocation layout.
 #[rustfmt::skip]
 static G_BITALLOC_CODE_TAB: [u8; 92] = [
     0,17, 3, 4, 5,6,7, 8,9,10,11,12,13,14,15,16,
@@ -123,7 +127,10 @@ fn l12_read_scale_info(hdr: Header, bs: &mut Bs, sci: &mut ScaleInfo) {
 
     for i in 0..sci.total_bands {
         if i == k {
-            let a = subband_alloc.next().unwrap();
+            let a = match subband_alloc.next() {
+                Some(alloc) => alloc,
+                None => break,
+            };
             k += a.band_count as usize;
             ba_bits = u32::from(a.code_tab_width);
             ba_code_tab = &G_BITALLOC_CODE_TAB[a.tab_offset as usize..];
@@ -166,7 +173,8 @@ fn l12_dequantize_granule(
         for i in 0..2 * sci.total_bands {
             // C walks `dst` alternately +576 and -558: left band, right band,
             // next left band, ...
-            let dst = &mut grbuf[base + group_size * j + (i / 2) * 18 + (i % 2) * 576..][..group_size];
+            let idx = base + group_size * j + (i / 2) * 18 + (i % 2) * 576;
+            let dst = &mut grbuf[idx..idx + group_size];
             let ba = u32::from(sci.bitalloc[i]);
             if ba == 0 {
                 continue;
@@ -226,13 +234,26 @@ pub(super) fn decode_frame<S: Sample>(
     let mut i = 0;
     let mut out = 0;
     for igr in 0..3 {
+        // JUSTIFICATION: Flat 1152-element slice view of contiguous scratch.
+        // SAFETY: `scratch.grbuf` is contiguous 2x576 f32 array matching layout
+        // of [f32; 1152].
         #[allow(unsafe_code)]
-        let grbuf: &mut [f32; 1152] = unsafe { &mut *(scratch.grbuf.as_mut_ptr() as *mut [f32; 1152]) };
+        let grbuf: &mut [f32; 1152] = unsafe {
+            &mut *(scratch.grbuf.as_mut_ptr() as *mut [f32; 1152])
+        };
         i += l12_dequantize_granule(grbuf, i, bs, &sci, group_size);
         if i == 12 {
             i = 0;
             l12_apply_scf_384(&sci, igr, grbuf);
-            mp3d_synth_granule(&mut st.qmf_state, &mut scratch.grbuf, 12, nch, &mut pcm[out..], &mut scratch.syn, compat);
+            mp3d_synth_granule(
+                &mut st.qmf_state,
+                &mut scratch.grbuf,
+                12,
+                nch,
+                &mut pcm[out..],
+                &mut scratch.syn,
+                compat,
+            );
             scratch.grbuf = [[0.; 576]; 2];
             out += 384 * nch;
         }

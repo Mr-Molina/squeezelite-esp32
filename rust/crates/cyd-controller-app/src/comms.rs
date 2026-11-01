@@ -5,7 +5,9 @@
 
 use core::fmt::Write;
 use heapless::{Deque, String, Vec};
-use squeezelite_cyd_link::{truncate_utf8, CydCommand, CydLinkProtocol, CydMessage, LinkError, PlayState};
+use squeezelite_cyd_link::{
+    truncate_utf8, CydCommand, CydLinkProtocol, CydMessage, LinkError, PlayState,
+};
 
 pub const CYD_UART_TX_PIN: u8 = 27;
 pub const CYD_UART_RX_PIN: u8 = 22;
@@ -117,7 +119,7 @@ impl CydDisplayLink {
         Ok(buf)
     }
 
-    /// Enqueue an interactive touch command in C-firmware NDJSON format for transmission to host.
+    /// Enqueue touch command in C-firmware NDJSON format for transmission to host.
     pub fn send_json_command(&mut self, cmd: CydCommand) -> Result<Vec<u8, 64>, LinkError> {
         let mut raw = [0u8; 64];
         let len = CydLinkProtocol::encode_json_command(&cmd, &mut raw)?;
@@ -471,7 +473,10 @@ mod tests {
     #[test]
     fn test_protocol_parse_meta_event() {
         let mut state = CydTelemetryState::default();
-        let line = "{\"event\":\"meta\",\"title\":\"Comfortably Numb\",\"artist\":\"Pink Floyd\",\"album\":\"The Wall\"}\n";
+        let line = concat!(
+            "{\"event\":\"meta\",\"title\":\"Comfortably Numb\",",
+            "\"artist\":\"Pink Floyd\",\"album\":\"The Wall\"}\n"
+        );
         let res = parse_json_event(line, &mut state);
 
         assert!(res.is_ok());
@@ -493,7 +498,10 @@ mod tests {
         assert_eq!(state.album.as_str(), "");
 
         // Excessively long string should be safely truncated
-        let long_title = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let long_title = concat!(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
         let mut json_buf = heapless::String::<160>::new();
         let _ = write!(json_buf, "{{\"event\":\"meta\",\"title\":\"{}\"}}", long_title);
 
@@ -505,7 +513,10 @@ mod tests {
     #[test]
     fn test_protocol_parse_status_event() {
         let mut state = CydTelemetryState::default();
-        let line = "{\"event\":\"status\",\"state\":\"play\",\"elapsed\":125,\"duration\":360,\"vol\":85}\n";
+        let line = concat!(
+            "{\"event\":\"status\",\"state\":\"play\",",
+            "\"elapsed\":125,\"duration\":360,\"vol\":85}\n"
+        );
         assert!(parse_json_event(line, &mut state).is_ok());
 
         assert_eq!(state.state, PlayState::Playing);
@@ -515,7 +526,10 @@ mod tests {
         assert!(state.link_active);
 
         // Negative elapsed and duration clamp to 0
-        let line_neg = "{\"event\":\"status\",\"state\":\"play\",\"elapsed\":-1,\"duration\":-10,\"vol\":-5}\n";
+        let line_neg = concat!(
+            "{\"event\":\"status\",\"state\":\"play\",",
+            "\"elapsed\":-1,\"duration\":-10,\"vol\":-5}\n"
+        );
         assert!(parse_json_event(line_neg, &mut state).is_ok());
         assert_eq!(state.elapsed_secs, 0);
         assert_eq!(state.duration_secs, 0);
@@ -525,7 +539,10 @@ mod tests {
     #[test]
     fn test_protocol_parse_sys_event() {
         let mut state = CydTelemetryState::default();
-        let line = "{\"event\":\"sys\",\"mode\":\"Spotify\",\"name\":\"Living Room\",\"ip\":\"192.168.1.150\"}\n";
+        let line = concat!(
+            "{\"event\":\"sys\",\"mode\":\"Spotify\",",
+            "\"name\":\"Living Room\",\"ip\":\"192.168.1.150\"}\n"
+        );
         assert!(parse_json_event(line, &mut state).is_ok());
 
         assert_eq!(state.mode.as_str(), "Spotify");
@@ -565,8 +582,14 @@ mod tests {
         assert!(format_command("vol", 101).is_none());
 
         // Volume step commands
-        assert_eq!(&format_command("vol_step", 5).unwrap()[..], b"{\"cmd\":\"vol_step\",\"dir\":5}\n");
-        assert_eq!(&format_command("vol_step", -5).unwrap()[..], b"{\"cmd\":\"vol_step\",\"dir\":-5}\n");
+        assert_eq!(
+            &format_command("vol_step", 5).unwrap()[..],
+            b"{\"cmd\":\"vol_step\",\"dir\":5}\n"
+        );
+        assert_eq!(
+            &format_command("vol_step", -5).unwrap()[..],
+            b"{\"cmd\":\"vol_step\",\"dir\":-5}\n"
+        );
 
         assert!(format_command("unsupported_cmd", 0).is_none());
     }
@@ -574,7 +597,10 @@ mod tests {
     #[test]
     fn test_uart_feed_rx_bytes_and_callbacks() {
         let mut link = CydDisplayLink::new();
-        let line = b"{\"event\":\"meta\",\"title\":\"Time\",\"artist\":\"Pink Floyd\",\"album\":\"Dark Side\"}\n";
+        let line = concat!(
+            "{\"event\":\"meta\",\"title\":\"Time\",",
+            "\"artist\":\"Pink Floyd\",\"album\":\"Dark Side\"}\n"
+        ).as_bytes();
         let parsed = link.feed_rx_bytes(line, 1000);
 
         assert_eq!(parsed, 1);
@@ -603,7 +629,11 @@ mod tests {
     #[test]
     fn test_uart_feed_multiple_events_in_single_buffer() {
         let mut link = CydDisplayLink::new();
-        let multi = b"{\"event\":\"sys\",\"mode\":\"LMS\",\"ip\":\"10.0.0.5\"}\n{\"event\":\"status\",\"state\":\"play\",\"elapsed\":10,\"duration\":100,\"vol\":50}\n";
+        let multi = concat!(
+            "{\"event\":\"sys\",\"mode\":\"LMS\",\"ip\":\"10.0.0.5\"}\n",
+            "{\"event\":\"status\",\"state\":\"play\",",
+            "\"elapsed\":10,\"duration\":100,\"vol\":50}\n"
+        ).as_bytes();
 
         let parsed = link.feed_rx_bytes(multi, 500);
         assert_eq!(parsed, 2);
@@ -649,7 +679,7 @@ mod tests {
         assert_eq!(link.feed_rx_bytes(meta, 3_500_000), 1);
         assert!(link.state.link_active);
 
-        // 5. Polling at t=7.0s (3.5s elapsed < 5s timeout): stays active, NO sync command sent
+        // 5. Polling at t=7.0s (3.5s elapsed < 5s timeout): stays active
         assert!(link.poll_heartbeat(7_000_000).is_none());
         assert!(link.state.link_active);
 
@@ -702,28 +732,43 @@ mod tests {
     fn test_json_unescaping_and_exact_key_matching() {
         // COMMS-308: unescape \", \\, \/, \n, \t and stop only at unescaped quote
         let mut state = CydTelemetryState::default();
-        let line = "{\"event\":\"meta\",\"title\":\"Rock \\\"Live\\\" \\\\ \\/Pt 1\\n\\tEnd\",\"artist\":\"AC\\\\DC\",\"album\":\"Back \\\"In\\\" Black\"}\n";
+        let line = concat!(
+            "{\"event\":\"meta\",",
+            "\"title\":\"Rock \\\"Live\\\" \\\\ \\/Pt 1\\n\\tEnd\",",
+            "\"artist\":\"AC\\\\DC\",",
+            "\"album\":\"Back \\\"In\\\" Black\"}\n"
+        );
         assert!(parse_json_event(line, &mut state).is_ok());
         assert_eq!(state.title.as_str(), "Rock \"Live\" \\ /Pt 1  End");
         assert_eq!(state.artist.as_str(), "AC\\DC");
         assert_eq!(state.album.as_str(), "Back \"In\" Black");
 
-        // COMMS-309: "vol" must NOT false-match "volume_max" or "voltage", and optional whitespace before ':' works
+        // COMMS-309: "vol" must NOT false-match "volume_max" or "voltage"
         let mut st2 = CydTelemetryState::default();
-        let status_line = "{\"event\" : \"status\", \"state\" : \"play\", \"volume_max\": 100, \"voltage\": 5, \"vol\" : 42, \"wifi\" : true}\n";
+        let status_line = concat!(
+            "{\"event\" : \"status\", \"state\" : \"play\", ",
+            "\"volume_max\": 100, \"voltage\": 5, ",
+            "\"vol\" : 42, \"wifi\" : true}\n"
+        );
         assert!(parse_json_event(status_line, &mut st2).is_ok());
         assert_eq!(st2.vol, 42);
         assert!(st2.wifi_connected);
 
-        assert_eq!(extract_json_int("{\"volume_max\":99,\"voltage\":12}", "vol"), None);
-        assert_eq!(extract_json_bool("{\"wifi_enabled\":true,\"wifi\" : false}", "wifi"), Some(false));
+        assert_eq!(
+            extract_json_int("{\"volume_max\":99,\"voltage\":12}", "vol"),
+            None
+        );
+        assert_eq!(
+            extract_json_bool("{\"wifi_enabled\":true,\"wifi\" : false}", "wifi"),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_negative_timestamps_parse_error_count_and_reset() {
         let mut link = CydDisplayLink::new();
 
-        // COMMS-311: negative timestamp clamped to 0 so last_sync_time_us is not left < 0
+        // COMMS-311: negative timestamp clamped to 0 (last_sync_time_us >= 0)
         let sync = link.poll_heartbeat(-5000);
         assert!(sync.is_some());
         assert_eq!(link.last_sync_time_us, 0);

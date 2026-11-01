@@ -1,0 +1,19 @@
+/target
+.DS_Store
+.vscode/tasks.json
+Cargo.lock
+# Local cargo config (e.g. RUST_MIN_STACK for the huge inline test structs).
+# Each developer keeps their own; not imposed on consumers or fresh clones.
+.cargo
+fuzz/target
+fuzz/artifacts
+fuzz/corpus
+flamegraph.svg
+opus-1.6.1/tests/c_ref_gen
+tests/c_wav_ref
+tests/c_plc_ref
+tests/c_wav_ref
+tests/c_ref_gen
+fixtures/ref_c_*.wav
+tests/*.c
+opus-1.6.1/

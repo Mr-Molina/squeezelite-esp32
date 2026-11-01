@@ -1,41 +1,59 @@
-//! Pure-Rust Port 80 HTTP Control/Recovery Server & Dead-Man Network Lease Watchdog (Gates 3 & 4).
+//! Pure-Rust Port 80 HTTP Control/Recovery Server & Dead-Man Network Lease
+//! Watchdog (Gates 3 & 4).
 //!
 //! Provides:
-//! - Non-blocking HTTP request parser and response formatter for TCP Port 80 on `172.22.1.15`:
-//!   - `GET /status.json` (and `GET /`): Squeezelite-ESP32 compatible status JSON + Rust telemetry
-//!   - `POST /recovery.json`: HTTP 200 JSON + immediate `RebootToRecovery` (`0x10000` factory)
-//!   - `POST /reboot.json`: HTTP 200 JSON + immediate `RebootToRecovery` (`0x10000` factory)
-//!   - `POST /reboot_ota.json`: HTTP 200 JSON + `PersistOta0AndReboot` (`0x160000` `ota_0`)
-//! - `DeadManLeaseWatchdog`: 45-second boot connect/DHCP timeout and 60-second link-drop timeout.
+//! - Non-blocking HTTP request parser and response formatter for TCP Port 80
+//!   on `172.22.1.15`:
+//!   - `GET /status.json` (and `GET /`): Squeezelite-ESP32 compatible status
+//!     JSON + Rust telemetry
+//!   - `POST /recovery.json`: HTTP 200 JSON + immediate `RebootToRecovery`
+//!     (`0x10000` factory)
+//!   - `POST /reboot.json`: HTTP 200 JSON + `PersistOta0AndReboot`
+//!     (`0x160000` `ota_0`)
+//!   - `POST /reboot_ota.json`: HTTP 200 JSON + `PersistOta0AndReboot`
+//!     (`0x160000` `ota_0`)
+//! - `DeadManLeaseWatchdog`: 45-second boot connect/DHCP timeout and 60-second
+//!   link-drop timeout.
 
 use core::fmt::Write;
 use heapless::String;
 
+use squeezelite_cspot::crypto::OakleyGroup1Dh;
+use squeezelite_cspot::zeroconf::ZeroConfServer;
+
 use crate::ota_safety::{REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION};
-use crate::pipeline::{PSRAM_HEAP_BYTES, PSRAM_OUTPUT_RING_BYTES, PSRAM_STREAM_RING_BYTES};
+use crate::pipeline::{
+    PSRAM_HEAP_BYTES, PSRAM_OUTPUT_RING_BYTES, PSRAM_STREAM_RING_BYTES,
+};
 
-/// `psram_used_bytes` reported when no PSRAM heap statistics exist: the firmware's two PSRAM
-/// rings (512 KiB stream + 2000 KiB output = 2,572,288 B).
-pub const DEFAULT_PSRAM_USED_BYTES: u32 = (PSRAM_STREAM_RING_BYTES + PSRAM_OUTPUT_RING_BYTES) as u32;
-/// `psram_free_bytes` to match [`DEFAULT_PSRAM_USED_BYTES`] in the 4 MiB region (1,622,016 B).
-pub const DEFAULT_PSRAM_FREE_BYTES: u32 = PSRAM_HEAP_BYTES as u32 - DEFAULT_PSRAM_USED_BYTES;
+/// `psram_used_bytes` reported when no PSRAM heap statistics exist: the
+/// firmware's two PSRAM rings (512 KiB stream + 2000 KiB output = 2,572,288 B).
+pub const DEFAULT_PSRAM_USED_BYTES: u32 =
+    (PSRAM_STREAM_RING_BYTES + PSRAM_OUTPUT_RING_BYTES) as u32;
+/// `psram_free_bytes` to match [`DEFAULT_PSRAM_USED_BYTES`] in the 4 MiB
+/// region (1,622,016 B).
+pub const DEFAULT_PSRAM_FREE_BYTES: u32 =
+    PSRAM_HEAP_BYTES as u32 - DEFAULT_PSRAM_USED_BYTES;
 
-/// Maximum time allowed from boot to establish Wi-Fi STA link + DHCPv4 lease before rolling back.
+/// Maximum time allowed from boot to establish Wi-Fi STA link + DHCPv4 lease
+/// before rolling back.
 pub const BOOT_LEASE_TIMEOUT_MS: u64 = 45_000;
 
-/// Maximum continuous time Wi-Fi link or DHCPv4 lease may remain down at runtime before rolling back.
+/// Maximum continuous time Wi-Fi link or DHCPv4 lease may remain down at
+/// runtime before rolling back.
 pub const DROP_LEASE_TIMEOUT_MS: u64 = 60_000;
 
-/// Post-response action required after flushing the Port 80 HTTP response socket.
+/// Post-response action required after flushing the Port 80 HTTP response
+/// socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpControlAction {
     /// Keep running normally.
     None,
-    /// Trigger `esp_hal::system::software_reset()` to boot into `recovery` (`0x10000`),
-    /// relying on Gate 1 (`otadata` pre-erased to `0xFF`).
+    /// Trigger `esp_hal::system::software_reset()` to boot into `recovery`
+    /// (`0x10000`), relying on Gate 1 (`otadata` pre-erased to `0xFF`).
     RebootToRecovery,
-    /// Write `OtaSelectEntry::new_ota_0()` to `0xD000` and trigger `software_reset()`
-    /// so the next boot stays in `ota_0` (`0x160000`).
+    /// Write `OtaSelectEntry::new_ota_0()` to `0xD000` and trigger
+    /// `software_reset()` so the next boot stays in `ota_0` (`0x160000`).
     PersistOta0AndReboot,
     /// Transmit SlimProto IR packet to LMS and/or adjust amplifier volume/mute.
     PlayerIrCommand {
@@ -43,15 +61,22 @@ pub enum HttpControlAction {
         vol_pct: Option<u8>,
         mute: Option<bool>,
     },
-    /// Sets the active 10-band equalizer preset (`0 = Flat`, `1 = Bass`, `2 = Loudness`, `3 = Vocal`, `4 = Rock`).
+    /// Sets the active 10-band equalizer preset (`0 = Flat`, `1 = Bass`,
+    /// `2 = Loudness`, `3 = Vocal`, `4 = Rock`).
     SetEqPreset(u8),
-    /// Sets TAS5805M analog gain attenuation (`0x00 = 0 dB`, `0x08 = -4 dB`, `0x0C = -6 dB`, `0x10 = -8 dB`).
+    /// Sets TAS5805M analog gain attenuation (`0x00 = 0 dB`, `0x08 = -4 dB`,
+    /// `0x0C = -6 dB`, `0x10 = -8 dB`).
     SetAnalogGain(u8),
+    /// Starts Spotify playback arbitration and streaming.
+    SpotifyPlay,
+    /// Stops Spotify playback arbitration and returns to suspended source.
+    SpotifyStop,
 }
 
-/// Amp I2C NACK count per operation class (spec §4.8): the bus wrapper still swallows I2C
-/// errors (shadow-register fallback), so these counters keep faults from being fully silent.
-/// A NACKed `write_read` retries as a `write` + `read`, which count in their own classes too.
+/// Amp I2C NACK count per operation class (spec §4.8): the bus wrapper still
+/// swallows I2C errors (shadow-register fallback), so these counters keep
+/// faults from being fully silent. A NACKed `write_read` retries as a `write`
+/// + `read`, which count in their own classes too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct I2cNackByOp {
     /// NACKed plain reads.
@@ -81,11 +106,13 @@ pub struct HttpStatusSnapshot<'a> {
     pub lms_port: u16,
     /// LMS CLI port (`9090`).
     pub lms_cport: u16,
-    /// Whether `otadata` (`0xD000..0xF000`) is pre-armed to `0xFF` (`Factory` recovery on reset).
+    /// Whether `otadata` (`0xD000..0xF000`) is pre-armed to `0xFF` (`Factory`
+    /// recovery on reset).
     pub otadata_prearmed_factory: bool,
     /// Total audio frames rendered via `I2S0` DMA.
     pub frames_played: u64,
-    /// Current TAS5805M amplifier mode label (`"Play"`, `"HiZ"`, `"DeepSleep"`, `"Fault"`).
+    /// Current TAS5805M amplifier mode label (`"Play"`, `"HiZ"`, `"DeepSleep"`,
+    /// `"Fault"`).
     pub amp_mode: &'a str,
     /// Current TAS5805M amplifier volume percentage (`0..=100%`).
     pub vol_pct: u8,
@@ -93,7 +120,8 @@ pub struct HttpStatusSnapshot<'a> {
     pub i2c_acks: u32,
     /// Total hardware `I2C0` NACK errors.
     pub i2c_nacks: u32,
-    /// `I2C0` NACK errors per operation class (`"i2c_nack_by_op":{"read":..,"write":..,"write_read":..}`).
+    /// `I2C0` NACK errors per operation class
+    /// (`"i2c_nack_by_op":{"read":..,"write":..,"write_read":..}`).
     pub i2c_nack_by_op: I2cNackByOp,
     /// Monotonic uptime in milliseconds since boot.
     pub uptime_ms: u64,
@@ -113,7 +141,8 @@ pub struct HttpStatusSnapshot<'a> {
     pub codec_channels: u8,
     /// Active decoder sample bit depth (16, 24, 32).
     pub codec_bit_depth: u8,
-    /// Active 10-band equalizer preset name (`"Flat"`, `"Bass"`, `"Loudness"`, `"Vocal"`, `"Rock"`).
+    /// Active 10-band equalizer preset name (`"Flat"`, `"Bass"`,
+    /// `"Loudness"`, `"Vocal"`, `"Rock"`).
     pub eq_preset: &'a str,
     /// Whether 10-band graphic equalizer is actively filtering samples.
     pub eq_enabled: bool,
@@ -121,11 +150,13 @@ pub struct HttpStatusSnapshot<'a> {
     pub tas_fs_hz: u32,
     /// Detected hardware BCK-to-FS ratio from TAS5805M register 0x38.
     pub tas_bck_ratio: u16,
-    /// Whether TAS5805M internal PLL clock synthesizer is locked (register 0x39 bit 3).
+    /// Whether TAS5805M internal PLL clock synthesizer is locked
+    /// (register 0x39 bit 3).
     pub tas_pll_locked: bool,
     /// Whether TAS5805M clock fault auto-mute is active (register 0x39 bit 0).
     pub tas_automuted: bool,
-    /// Hardware analog gain code (`0x54`, bits 4:0; `0x00` = 0 dB, `0x08` = -4 dB, `0x0C` = -6 dB, `0x10` = -8 dB).
+    /// Hardware analog gain code (`0x54`, bits 4:0; `0x00` = 0 dB,
+    /// `0x08` = -4 dB, `0x0C` = -6 dB, `0x10` = -8 dB).
     pub again_code: u8,
     /// NVS FlashJournal monotonic sequence number.
     pub settings_seq: u32,
@@ -139,6 +170,10 @@ pub struct HttpStatusSnapshot<'a> {
     pub bt_rx_pkts: u32,
     /// Total decoded audio frames from Bluetooth A2DP stream.
     pub bt_frames: u64,
+    /// Maximum execution duration of a single `decode()` step in microseconds.
+    pub decode_us_max: u32,
+    /// Execution duration of the very first `decode()` step in microseconds.
+    pub decode_us_first: u32,
 }
 
 /// Type alias for runtime status snapshot.
@@ -184,6 +219,8 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             bt_streaming: false,
             bt_rx_pkts: 0,
             bt_frames: 0,
+            decode_us_max: 0,
+            decode_us_first: 0,
         }
     }
 }
@@ -216,7 +253,8 @@ impl<'a> core::fmt::Write for BufferWriter<'a> {
     }
 }
 
-/// Writes a string slice escaped for JSON output (escaping `"`, `\`, and ASCII control chars < 0x20).
+/// Writes a string slice escaped for JSON output (escaping `"`, `\`, and
+/// ASCII control chars < 0x20).
 pub fn write_json_escaped_str<W: core::fmt::Write>(mut writer: W, s: &str) -> core::fmt::Result {
     for b in s.bytes() {
         match b {
@@ -239,7 +277,8 @@ pub fn write_json_escaped_str<W: core::fmt::Write>(mut writer: W, s: &str) -> co
     Ok(())
 }
 
-/// Helper wrapper struct implementing Display to format JSON-escaped strings inline.
+/// Helper wrapper struct implementing Display to format JSON-escaped strings
+/// inline.
 pub struct JsonEscaped<'a>(pub &'a str);
 
 impl<'a> core::fmt::Display for JsonEscaped<'a> {
@@ -254,7 +293,21 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
     let mut writer = BufferWriter::new(out_buf);
     write!(
         writer,
-        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\"i2c_nack_by_op\":{{\"read\":{},\"write\":{},\"write_read\":{}}},\"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\"again_code\":{},\"settings_seq\":{},\"bt_enabled\":{},\"bt_connected\":{},\"bt_streaming\":{},\"bt_rx_pkts\":{},\"bt_frames\":{}}}",
+        "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\
+        \"recovery\":0,\"rust_engine\":true,\"otadata_prearmed_factory\":{},\
+        \"if\":\"wifi\",\"ip\":\"{}.{}.{}.{}\",\"netmask\":\"{}.{}.{}.{}\",\
+        \"gw\":\"{}.{}.{}.{}\",\"ssid\":\"{}\",\"rssi\":{},\"lms_cport\":{},\
+        \"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\
+        \"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\
+        \"i2c_nack_by_op\":{{\"read\":{},\"write\":{},\"write_read\":{}}},\
+        \"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\
+        \"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\
+        \"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\
+        \"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\
+        \"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\
+        \"again_code\":{},\"settings_seq\":{},\"bt_enabled\":{},\
+        \"bt_connected\":{},\"bt_streaming\":{},\"bt_rx_pkts\":{},\
+        \"bt_frames\":{},\"decode_us_max\":{},\"decode_us_first\":{}}}",
         JsonEscaped(REQUIRED_OTA_PROJECT_NAME),
         JsonEscaped(RUST_OTA_FIRMWARE_VERSION),
         snapshot.otadata_prearmed_factory,
@@ -308,6 +361,8 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.bt_streaming,
         snapshot.bt_rx_pkts,
         snapshot.bt_frames,
+        snapshot.decode_us_max,
+        snapshot.decode_us_first,
     ).ok()?;
     Some(writer.written_len())
 }
@@ -318,13 +373,16 @@ pub fn format_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8])
     write_status_json(snapshot, out_buf)
 }
 
-/// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full response for JSON) into `out_buf`.
+/// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
+/// response for JSON) into `out_buf`.
 ///
-/// For static HTML responses (`GET /`, `GET /index.html`), writes ONLY the HTTP headers into `out_buf` and
-/// returns `Some((header_len, DASHBOARD_HTML.as_bytes(), action))`, enabling multi-chunk streaming
+/// For static HTML responses (`GET /`, `GET /index.html`), writes ONLY the HTTP
+/// headers into `out_buf` and returns `Some((header_len,
+/// DASHBOARD_HTML.as_bytes(), action))`, enabling multi-chunk streaming
 /// directly from `.rodata` without buffer overflow or truncation.
 ///
-/// Returns `None` if `req_bytes` does not yet contain a complete request line (`\r\n` or `\n`).
+/// Returns `None` if `req_bytes` does not yet contain a complete request line
+/// (`\r\n` or `\n`).
 pub fn handle_http_request_streaming(
     req_bytes: &[u8],
     snapshot: &HttpStatusSnapshot<'_>,
@@ -340,13 +398,65 @@ pub fn handle_http_request_streaming(
     let raw_path = parts.next().unwrap_or("");
     let path = raw_path.split('?').next().unwrap_or(raw_path);
 
+    // Spotify Connect ZeroConf HTTP handling
+    // (GET /?action=getInfo, POST /?action=addUser, /spotify_info)
+    if raw_path.contains("action=getInfo")
+        || raw_path.contains("action=addUser")
+        || raw_path.contains("spotify_info")
+    {
+        let body_slice = req_bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| &req_bytes[p + 4..])
+            .or_else(|| {
+                req_bytes
+                    .windows(2)
+                    .position(|w| w == b"\n\n")
+                    .map(|p| &req_bytes[p + 2..])
+            })
+            .unwrap_or(&[]);
+        let body_str = core::str::from_utf8(body_slice).unwrap_or("");
+        let dh = OakleyGroup1Dh::from_private_key([0x42u8; 96]).ok()?;
+        let device_id = "142137fd329622137a149016c82e18beb834";
+        let remote_name = "BASEMENT";
+
+        if let Ok(resp) = ZeroConfServer::handle_request(
+            raw_path,
+            body_str,
+            &dh,
+            device_id,
+            remote_name,
+        ) {
+            let mut header: String<160> = String::new();
+            let _ = write!(
+                header,
+                "HTTP/1.1 {} OK\r\nContent-Type: {}\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n",
+                resp.status_code,
+                resp.content_type,
+                resp.body.len()
+            );
+            let header_bytes = header.as_bytes();
+            let total_len = header_bytes.len() + resp.body.len();
+            if total_len > out_buf.len() {
+                return None;
+            }
+            out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
+            out_buf[header_bytes.len()..total_len].copy_from_slice(&resp.body);
+            return Some((total_len, &[], HttpControlAction::None));
+        }
+    }
+
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
             let body_bytes = DASHBOARD_HTML.as_bytes();
             let mut header: String<160> = String::new();
             let _ = write!(
                 header,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                Content-Length: {}\r\nConnection: close\r\n\
+                Cache-Control: no-store\r\n\r\n",
                 body_bytes.len()
             );
             let header_bytes = header.as_bytes();
@@ -365,9 +475,9 @@ pub fn handle_http_request_streaming(
             Some((resp.len(), &[], HttpControlAction::None))
         }
         ("GET", "/status.json") => {
-            // The body is formatted straight into `out_buf` behind room for the header, then
-            // moved down once the header (which carries the body length) is known: no body
-            // scratch buffer on the stack.
+            // The body is formatted straight into `out_buf` behind room for the
+            // header, then moved down once the header (which carries the body
+            // length) is known: no body scratch buffer on the stack.
             const HEADER_ROOM: usize = 160;
             if out_buf.len() <= HEADER_ROOM {
                 return None;
@@ -377,7 +487,9 @@ pub fn handle_http_request_streaming(
             let mut header: String<HEADER_ROOM> = String::new();
             write!(
                 header,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n",
                 body_len
             )
             .ok()?;
@@ -455,7 +567,7 @@ pub fn handle_http_request_streaming(
                 "volup" => (
                     HttpControlAction::PlayerIrCommand {
                         ir_code: 0x7689_807F,
-                        vol_pct: Some((snapshot.vol_pct + 5).min(100)),
+                        vol_pct: Some(snapshot.vol_pct.saturating_add(5).min(100)),
                         mute: Some(false),
                     },
                     true,
@@ -510,8 +622,17 @@ pub fn handle_http_request_streaming(
                 "again6" => (HttpControlAction::SetAnalogGain(0x0C), true),
                 "again8" => (HttpControlAction::SetAnalogGain(0x10), true),
                 "again10" => (HttpControlAction::SetAnalogGain(0x14), true),
-                other if other.starts_with("vol") && !other[3..].is_empty() && other[3..].chars().all(|c| c.is_ascii_digit()) => {
-                    let pct: u8 = other[3..].parse().unwrap_or(snapshot.vol_pct).min(100);
+                "spotify_play" => (HttpControlAction::SpotifyPlay, true),
+                "spotify_stop" | "spotify_pause" => (HttpControlAction::SpotifyStop, true),
+                other
+                    if other.starts_with("vol")
+                        && !other[3..].is_empty()
+                        && other[3..].chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    let pct: u8 = other[3..]
+                        .parse::<u32>()
+                        .map(|v| v.min(100) as u8)
+                        .unwrap_or(snapshot.vol_pct);
                     (
                         HttpControlAction::PlayerIrCommand {
                             ir_code: 0,
@@ -534,7 +655,9 @@ pub fn handle_http_request_streaming(
             let mut response: String<256> = String::new();
             let _ = write!(
                 response,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
                 body.len(),
                 body.as_str()
             );
@@ -546,11 +669,14 @@ pub fn handle_http_request_streaming(
             Some((resp_bytes.len(), &[], action))
         }
         ("POST", "/recovery.json") | ("GET", "/recovery.json") => {
-            let body = "{\"status\":\"rebooting_to_recovery\",\"target_partition\":\"factory_0x10000\"}";
+            let body = "{\"status\":\"rebooting_to_recovery\",\
+                \"target_partition\":\"factory_0x10000\"}";
             let mut response: String<256> = String::new();
             let _ = write!(
                 response,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -562,11 +688,14 @@ pub fn handle_http_request_streaming(
             Some((resp_bytes.len(), &[], HttpControlAction::RebootToRecovery))
         }
         ("POST", "/reboot.json") | ("GET", "/reboot.json") => {
-            let body = "{\"status\":\"rebooting_to_ota_0\",\"target_partition\":\"ota_0_0x160000\"}";
+            let body = "{\"status\":\"rebooting_to_ota_0\",\
+                \"target_partition\":\"ota_0_0x160000\"}";
             let mut response: String<256> = String::new();
             let _ = write!(
                 response,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -578,11 +707,14 @@ pub fn handle_http_request_streaming(
             Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
         }
         ("POST", "/reboot_ota.json") => {
-            let body = "{\"status\":\"rebooting_to_ota_0\",\"target_partition\":\"ota_0_0x160000\"}";
+            let body = "{\"status\":\"rebooting_to_ota_0\",\
+                \"target_partition\":\"ota_0_0x160000\"}";
             let mut response: String<256> = String::new();
             let _ = write!(
                 response,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -598,7 +730,9 @@ pub fn handle_http_request_streaming(
             let mut response: String<256> = String::new();
             let _ = write!(
                 response,
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -612,16 +746,18 @@ pub fn handle_http_request_streaming(
     }
 }
 
-/// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1 response into `out_buf`.
+/// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1
+/// response into `out_buf`.
 ///
-/// Returns `None` if `req_bytes` does not yet contain a complete request line (`\r\n` or `\n`),
-/// or if `out_buf` is too small to contain the full response.
+/// Returns `None` if `req_bytes` does not yet contain a complete request line
+/// (`\r\n` or `\n`), or if `out_buf` is too small to contain the full response.
 pub fn handle_http_control_request(
     req_bytes: &[u8],
     snapshot: &HttpStatusSnapshot<'_>,
     out_buf: &mut [u8],
 ) -> Option<(usize, HttpControlAction)> {
-    let (hdr_len, static_body, action) = handle_http_request_streaming(req_bytes, snapshot, out_buf)?;
+    let (hdr_len, static_body, action) =
+        handle_http_request_streaming(req_bytes, snapshot, out_buf)?;
     if !static_body.is_empty() {
         let total_len = hdr_len + static_body.len();
         if total_len > out_buf.len() {
@@ -645,15 +781,17 @@ pub const INDEX_HTML: &str = DASHBOARD_HTML;
 pub enum LeaseHealth {
     /// Network lease is healthy or still within the allowed grace window.
     Healthy,
-    /// Lease timeout exceeded; caller MUST immediately invoke `esp_hal::system::software_reset()`.
+    /// Lease timeout exceeded; caller MUST immediately invoke
+    /// `esp_hal::system::software_reset()`.
     ExpiredResetToRecovery,
 }
 
 /// Gate 3 Dead-Man Network Lease Watchdog.
 ///
-/// Guarantees that if Wi-Fi + DHCPv4 is not established within `BOOT_LEASE_TIMEOUT_MS` (45s) of boot,
-/// or if connectivity drops for more than `DROP_LEASE_TIMEOUT_MS` (60s) at runtime, the device
-/// resets into the untouched `recovery` partition (`0x10000`).
+/// Guarantees that if Wi-Fi + DHCPv4 is not established within
+/// `BOOT_LEASE_TIMEOUT_MS` (45s) of boot, or if connectivity drops for more
+/// than `DROP_LEASE_TIMEOUT_MS` (60s) at runtime, the device resets into the
+/// untouched `recovery` partition (`0x10000`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeadManLeaseWatchdog {
     boot_ms: u64,
@@ -677,7 +815,12 @@ impl DeadManLeaseWatchdog {
     }
 
     /// Evaluates current Wi-Fi link + IPv4 lease state at `now_ms`.
-    pub fn evaluate(&mut self, now_ms: u64, wifi_connected: bool, has_ipv4_lease: bool) -> LeaseHealth {
+    pub fn evaluate(
+        &mut self,
+        now_ms: u64,
+        wifi_connected: bool,
+        has_ipv4_lease: bool,
+    ) -> LeaseHealth {
         if wifi_connected && has_ipv4_lease {
             self.ever_leased = true;
             self.last_healthy_ms = now_ms;
@@ -711,9 +854,9 @@ mod tests {
             ..HttpStatusSnapshot::default()
         };
         let mut buf = [0u8; 2048];
+        let req = b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
         let (len, action) =
-            handle_http_control_request(b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
-                .unwrap();
+            handle_http_control_request(req, &snap, &mut buf).unwrap();
         assert_eq!(action, HttpControlAction::None);
         let resp = core::str::from_utf8(&buf[..len]).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -752,8 +895,9 @@ mod tests {
         let mut buf = [0u8; 512];
 
         // 1. Play
+        let req1 = b"GET /cmd.json?act=play HTTP/1.1\r\n\r\n";
         let (len1, act1) =
-            handle_http_control_request(b"GET /cmd.json?act=play HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req1, &snap, &mut buf).unwrap();
         assert_eq!(
             act1,
             HttpControlAction::PlayerIrCommand {
@@ -768,8 +912,9 @@ mod tests {
         assert!(resp1.contains("{\"ok\":true,\"act\":\"play\"}"));
 
         // 2. Pause
+        let req2 = b"GET /cmd.json?act=pause HTTP/1.1\r\n\r\n";
         let (_len2, act2) =
-            handle_http_control_request(b"GET /cmd.json?act=pause HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req2, &snap, &mut buf).unwrap();
         assert_eq!(
             act2,
             HttpControlAction::PlayerIrCommand {
@@ -780,8 +925,9 @@ mod tests {
         );
 
         // 3. Stop
+        let req3 = b"GET /cmd.json?act=stop HTTP/1.1\r\n\r\n";
         let (_len3, act3) =
-            handle_http_control_request(b"GET /cmd.json?act=stop HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req3, &snap, &mut buf).unwrap();
         assert_eq!(
             act3,
             HttpControlAction::PlayerIrCommand {
@@ -792,8 +938,9 @@ mod tests {
         );
 
         // 4. VolUp (+5% from snapshot.vol_pct=60 -> 65)
+        let req4 = b"GET /cmd.json?act=volup HTTP/1.1\r\n\r\n";
         let (_len4, act4) =
-            handle_http_control_request(b"GET /cmd.json?act=volup HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req4, &snap, &mut buf).unwrap();
         assert_eq!(
             act4,
             HttpControlAction::PlayerIrCommand {
@@ -804,8 +951,9 @@ mod tests {
         );
 
         // 5. VolDown (-5% from snapshot.vol_pct=60 -> 55)
+        let req5 = b"GET /cmd.json?act=voldown HTTP/1.1\r\n\r\n";
         let (_len5, act5) =
-            handle_http_control_request(b"GET /cmd.json?act=voldown HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req5, &snap, &mut buf).unwrap();
         assert_eq!(
             act5,
             HttpControlAction::PlayerIrCommand {
@@ -816,8 +964,9 @@ mod tests {
         );
 
         // 6. Direct volume setting: vol70
+        let req6 = b"GET /cmd.json?act=vol70 HTTP/1.1\r\n\r\n";
         let (_len6, act6) =
-            handle_http_control_request(b"GET /cmd.json?act=vol70 HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req6, &snap, &mut buf).unwrap();
         assert_eq!(
             act6,
             HttpControlAction::PlayerIrCommand {
@@ -828,8 +977,9 @@ mod tests {
         );
 
         // 7. Preset1
+        let req7 = b"GET /cmd.json?act=preset1 HTTP/1.1\r\n\r\n";
         let (_len7, act7) =
-            handle_http_control_request(b"GET /cmd.json?act=preset1 HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req7, &snap, &mut buf).unwrap();
         assert_eq!(
             act7,
             HttpControlAction::PlayerIrCommand {
@@ -840,8 +990,9 @@ mod tests {
         );
 
         // 8. Unknown action -> ok: false
+        let req8 = b"GET /cmd.json?act=unknown HTTP/1.1\r\n\r\n";
         let (len8, act8) =
-            handle_http_control_request(b"GET /cmd.json?act=unknown HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
+            handle_http_control_request(req8, &snap, &mut buf).unwrap();
         assert_eq!(act8, HttpControlAction::None);
         let resp8 = core::str::from_utf8(&buf[..len8]).unwrap();
         assert!(resp8.contains("{\"ok\":false,\"error\":\"unknown_action\"}"));
@@ -887,7 +1038,8 @@ mod tests {
         assert!(json_str.contains("\"amp_mode\":\"Stereo\\\"BTL\\\"\""));
 
         // POST /cmd.json with act= in body
-        let req = b"POST /cmd.json HTTP/1.1\r\nHost: 192.168.1.50\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nact=pause";
+        let req = b"POST /cmd.json HTTP/1.1\r\nHost: 192.168.1.50\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\r\nact=pause";
         let (resp_len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
         assert_eq!(act, HttpControlAction::PlayerIrCommand {
             ir_code: 0x7689_20DF,
@@ -921,9 +1073,9 @@ mod tests {
         let snap = HttpStatusSnapshot::default();
         let mut buf = [0u8; 4096];
 
+        let req1 = b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
         let (len1, act1) =
-            handle_http_control_request(b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
-                .unwrap();
+            handle_http_control_request(req1, &snap, &mut buf).unwrap();
         assert_eq!(act1, HttpControlAction::None);
         let resp1 = core::str::from_utf8(&buf[..len1]).unwrap();
         assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -931,9 +1083,9 @@ mod tests {
         assert!(resp1.contains("<title>Louder-ESP32 Control</title>"));
         assert!(resp1.contains("/status.json"));
 
+        let req2 = b"GET /index.html HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
         let (len2, act2) =
-            handle_http_control_request(b"GET /index.html HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n", &snap, &mut buf)
-                .unwrap();
+            handle_http_control_request(req2, &snap, &mut buf).unwrap();
         assert_eq!(act2, HttpControlAction::None);
         let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
         assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -1006,7 +1158,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(act1, HttpControlAction::SetEqPreset(3));
-        assert!(core::str::from_utf8(&scratch[..len1]).unwrap().contains("{\"ok\":true,\"act\":\"eq_voice\"}"));
+        assert!(core::str::from_utf8(&scratch[..len1])
+            .unwrap()
+            .contains("{\"ok\":true,\"act\":\"eq_voice\"}"));
 
         // eq_treble alias
         let (len2, act2) = handle_http_control_request(
@@ -1016,7 +1170,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(act2, HttpControlAction::SetEqPreset(4));
-        assert!(core::str::from_utf8(&scratch[..len2]).unwrap().contains("{\"ok\":true,\"act\":\"eq_treble\"}"));
+        assert!(core::str::from_utf8(&scratch[..len2])
+            .unwrap()
+            .contains("{\"ok\":true,\"act\":\"eq_treble\"}"));
 
         // again10 alias
         let (len3, act3) = handle_http_control_request(
@@ -1026,7 +1182,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(act3, HttpControlAction::SetAnalogGain(0x14));
-        assert!(core::str::from_utf8(&scratch[..len3]).unwrap().contains("{\"ok\":true,\"act\":\"again10\"}"));
+        assert!(core::str::from_utf8(&scratch[..len3])
+            .unwrap()
+            .contains("{\"ok\":true,\"act\":\"again10\"}"));
     }
 
     #[test]
@@ -1053,15 +1211,20 @@ mod tests {
         assert!(INDEX_HTML.contains("again0"));
     }
 
-    /// Worst case of every field: the response must still fit the device's 1,536-byte
-    /// response buffer (`STATIC_HTTP_RESP_BUF`) and HTTP socket TX buffer.
+    /// Worst case of every field: the response must still fit the device's
+    /// 1,536-byte response buffer (`STATIC_HTTP_RESP_BUF`) and HTTP socket TX
+    /// buffer.
     #[test]
     fn test_status_json_worst_case_fits_the_device_response_buffer() {
+        extern crate alloc;
+        use alloc::format;
+
         let worst = HttpStatusSnapshot {
             ip: [255; 4],
             netmask: [255; 4],
             gw: [255; 4],
-            ssid: "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"", // 32 escaped quotes
+            // 32 escaped quotes
+            ssid: "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
             rssi: -100,
             lms_ip: [255; 4],
             lms_port: u16::MAX,
@@ -1071,7 +1234,11 @@ mod tests {
             vol_pct: 100,
             i2c_acks: u32::MAX,
             i2c_nacks: u32::MAX,
-            i2c_nack_by_op: I2cNackByOp { read: u32::MAX, write: u32::MAX, write_read: u32::MAX },
+            i2c_nack_by_op: I2cNackByOp {
+                read: u32::MAX,
+                write: u32::MAX,
+                write_read: u32::MAX,
+            },
             uptime_ms: u64::MAX,
             psram_free_bytes: u32::MAX,
             psram_used_bytes: u32::MAX,
@@ -1085,18 +1252,31 @@ mod tests {
             settings_seq: u32::MAX,
             bt_rx_pkts: u32::MAX,
             bt_frames: u64::MAX,
+            decode_us_max: u32::MAX,
+            decode_us_first: u32::MAX,
             ..Default::default()
         };
         let mut out_buf = [0u8; 1536];
-        let (len, _, _) = handle_http_request_streaming(b"GET /status.json HTTP/1.1\r\n\r\n", &worst, &mut out_buf)
-            .expect("worst-case status.json fits");
+        let (len, _, _) = handle_http_request_streaming(
+            b"GET /status.json HTTP/1.1\r\n\r\n",
+            &worst,
+            &mut out_buf,
+        )
+        .expect("worst-case status.json fits");
         let resp = core::str::from_utf8(&out_buf[..len]).unwrap();
         let (head, body) = resp.split_once("\r\n\r\n").unwrap();
         assert!(head.contains(&format!("Content-Length: {}", body.len())));
         assert!(body.starts_with('{') && body.ends_with('}'));
         // A buffer too small for the body is refused, never truncated.
         let mut small = [0u8; 600];
-        assert!(handle_http_request_streaming(b"GET /status.json HTTP/1.1\r\n\r\n", &worst, &mut small).is_none());
+        assert!(
+            handle_http_request_streaming(
+                b"GET /status.json HTTP/1.1\r\n\r\n",
+                &worst,
+                &mut small,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1116,7 +1296,11 @@ mod tests {
             vol_pct: 55,
             i2c_acks: 42,
             i2c_nacks: 5,
-            i2c_nack_by_op: I2cNackByOp { read: 1, write: 3, write_read: 1 },
+            i2c_nack_by_op: I2cNackByOp {
+                read: 1,
+                write: 3,
+                write_read: 1,
+            },
             uptime_ms: 98_765,
             psram_free_bytes: DEFAULT_PSRAM_FREE_BYTES,
             psram_used_bytes: DEFAULT_PSRAM_USED_BYTES,
@@ -1139,9 +1323,11 @@ mod tests {
             bt_streaming: false,
             bt_rx_pkts: 0,
             bt_frames: 0,
+            decode_us_max: 0,
+            decode_us_first: 0,
         };
-        // Task 10: `i2c_nack_by_op` pushed a typical response past 1,024 bytes; the device
-        // response buffer and HTTP TX buffer are 1,536 bytes.
+        // Task 10: `i2c_nack_by_op` pushed a typical response past 1,024 bytes;
+        // the device response buffer and HTTP TX buffer are 1,536 bytes.
         let mut out_buf = [0u8; 1536];
         let (len, static_body, action) = handle_http_request_streaming(
             b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n",
@@ -1151,16 +1337,63 @@ mod tests {
         .expect("status.json should fit in the 1,536-byte device buffer");
         assert_eq!(action, HttpControlAction::None);
         assert!(static_body.is_empty());
-        assert!(len > 600 && len <= 1536, "expected 600 < len <= 1536, got {len}");
+        assert!(
+            len > 600 && len <= 1536,
+            "expected 600 < len <= 1536, got {len}"
+        );
         let resp = core::str::from_utf8(&out_buf[..len]).expect("valid utf8");
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.contains("\"eq_preset\":\"Loudness\""));
         assert!(resp.contains("\"settings_seq\":7"));
-        assert!(resp.contains("\"i2c_nacks\":5,\"i2c_nack_by_op\":{\"read\":1,\"write\":3,\"write_read\":1},"));
+        assert!(resp.contains(
+            "\"i2c_nacks\":5,\"i2c_nack_by_op\":{\"read\":1,\"write\":3,\"write_read\":1},"
+        ));
         assert!(resp.contains("\"bt_enabled\":false"));
         assert!(resp.contains("\"bt_connected\":false"));
         assert!(resp.contains("\"bt_streaming\":false"));
         assert!(resp.contains("\"bt_rx_pkts\":0"));
         assert!(resp.contains("\"bt_frames\":0"));
+    }
+
+    #[test]
+    fn handles_spotify_zeroconf_get_info() {
+        let snap = HttpStatusSnapshot::default();
+        let mut out_buf = [0u8; 1024];
+        let (len, static_body, action) = handle_http_request_streaming(
+            b"GET /?action=getInfo HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n",
+            &snap,
+            &mut out_buf,
+        )
+        .expect("getInfo should fit in 1024-byte buffer");
+        assert_eq!(action, HttpControlAction::None);
+        assert!(static_body.is_empty());
+        let resp = core::str::from_utf8(&out_buf[..len]).expect("valid utf8");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("\"status\":101"));
+        assert!(resp.contains("\"statusString\":\"OK\""));
+        assert!(resp.contains("\"deviceID\":\"142137fd329622137a149016c82e18beb834\""));
+        assert!(resp.contains("\"remoteName\":\"BASEMENT\""));
+        assert!(resp.contains("\"publicKey\":"));
+    }
+
+    #[test]
+    fn handles_spotify_cmd_actions() {
+        let snap = HttpStatusSnapshot::default();
+        let mut out_buf = [0u8; 512];
+        let (_len, _body, act_play) = handle_http_request_streaming(
+            b"GET /cmd.json?act=spotify_play HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut out_buf,
+        )
+        .expect("spotify_play");
+        assert_eq!(act_play, HttpControlAction::SpotifyPlay);
+
+        let (_len, _body, act_stop) = handle_http_request_streaming(
+            b"GET /cmd.json?act=spotify_stop HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut out_buf,
+        )
+        .expect("spotify_stop");
+        assert_eq!(act_stop, HttpControlAction::SpotifyStop);
     }
 }

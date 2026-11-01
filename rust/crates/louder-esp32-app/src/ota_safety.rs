@@ -1,67 +1,85 @@
-//! Pure-Rust Anti-Brick OTA Safety, NVS Wi-Fi Credential Decryptor, and `ota_header_check` Verifier.
+//! Pure-Rust Anti-Brick OTA Safety, NVS Wi-Fi Credential Decryptor, and
+//! `ota_header_check` Verifier.
 //!
 //! Enforces the 4MB flash invariants for the deployed target (`172.22.1.15`):
-//! - `0x9000` (`0x4000`): `nvs` partition storing `"config"` -> `"ssid"` / `"password"` (`"enc:"` XOR)
-//! - `0xD000` (`0x2000`): `otadata` partition (`0xFF` = boot `recovery` factory partition at `0x10000`)
-//! - `0x10000` (`0x150000`): `recovery` (`factory` partition — NEVER modified by OTA)
-//! - `0x160000` (`0x290000`): `ota_0` partition (target slot for `louder-esp32-app`)
-//! - `0x3F0000` (`0x10000`): `settings` partition (the C firmware's NVS). Rust reads its last two
-//!   sectors (`0x3FE000`, `0x3FF000`) as the settings FlashJournal at boot and writes ONLY the
-//!   journal: the default build erases + writes sector `0x3FE000` alone, on the reboot paths
-//!   with APP_CPU parked; the `runtime-flash-persist` build may also write `0x3FF000`
-//!   (ping-pong) at runtime. Nothing else in the partition is written from Rust.
+//! - `0x9000` (`0x4000`): `nvs` partition storing `"config"` -> `"ssid"` /
+//!   `"password"` (`"enc:"` XOR)
+//! - `0xD000` (`0x2000`): `otadata` partition (`0xFF` = boot `recovery`
+//!   factory partition at `0x10000`)
+//! - `0x10000` (`0x150000`): `recovery` (`factory` partition — NEVER modified
+//!   by OTA)
+//! - `0x160000` (`0x290000`): `ota_0` partition (target slot for
+//!   `louder-esp32-app`)
+//! - `0x3F0000` (`0x10000`): `settings` partition (the C firmware's NVS). Rust
+//!   reads its last two sectors (`0x3FE000`, `0x3FF000`) as the settings
+//!   FlashJournal at boot and writes ONLY the journal: the default build
+//!   erases + writes sector `0x3FE000` alone, on the reboot paths with APP_CPU
+//!   parked; the `runtime-flash-persist` build may also write `0x3FF000`
+//!   (ping-pong) at runtime. Nothing else in the partition is written from
+//!   Rust.
 
 use heapless::String;
 
 /// Offset of the default `nvs` partition in 4MB flash (`partitions.csv`).
 pub const NVS_PARTITION_OFFSET: u32 = 0x0000_9000;
-/// Size of the default `nvs` partition in bytes (16 KB = 4 pages of 4096 bytes).
+/// Size of the default `nvs` partition in bytes (16 KB = 4 pages of 4096
+/// bytes).
 pub const NVS_PARTITION_SIZE: u32 = 0x0000_4000;
 
 /// Offset of the `otadata` partition in 4MB flash (`partitions.csv`).
 pub const OTADATA_PARTITION_OFFSET: u32 = 0x0000_D000;
 /// Offset of the second 4 KB sector of `otadata`.
 pub const OTADATA_SECTOR_1_OFFSET: u32 = 0x0000_E000;
-/// End offset (exclusive) of the `otadata` partition (`0xD000 + 0x2000 = 0xF000`).
+/// End offset (exclusive) of the `otadata` partition (`0xD000 + 0x2000 =
+/// 0xF000`).
 pub const OTADATA_PARTITION_END: u32 = 0x0000_F000;
 /// Size of the `otadata` partition in bytes (8 KB = 2 sectors of 4096 bytes).
 pub const OTADATA_PARTITION_SIZE: u32 = 0x0000_2000;
 
-/// Offset of the untouched `recovery` (`factory`) app partition (`partitions.csv`).
+/// Offset of the untouched `recovery` (`factory`) app partition
+/// (`partitions.csv`).
 pub const RECOVERY_PARTITION_OFFSET: u32 = 0x0001_0000;
 /// Size of the `recovery` (`factory`) app partition in bytes (1,376 KB).
 pub const RECOVERY_PARTITION_SIZE: u32 = 0x0015_0000;
 
 /// Offset of the `ota_0` app partition (`partitions.csv`).
 pub const OTA_0_PARTITION_OFFSET: u32 = 0x0016_0000;
-/// Maximum size of the `ota_0` app partition in bytes (2,624 KB = 2,686,976 bytes).
+/// Maximum size of the `ota_0` app partition in bytes (2,624 KB = 2,686,976
+/// bytes).
 pub const OTA_0_PARTITION_SIZE: u32 = 0x0029_0000;
 
-/// Offset of the `settings` partition (`partitions.csv`). Rust writes only the journal sectors
-/// at [`SETTINGS_JOURNAL_OFFSET`] (`0x3FE000`; `0x3FF000` too with `runtime-flash-persist`).
+/// Offset of the `settings` partition (`partitions.csv`). Rust writes only the
+/// journal sectors at [`SETTINGS_JOURNAL_OFFSET`] (`0x3FE000`; `0x3FF000` too
+/// with `runtime-flash-persist`).
 pub const SETTINGS_PARTITION_OFFSET: u32 = 0x003F_0000;
-/// Offset of the `settings` journal: sector A at 0x003F_E000 (the only sector the default build
-/// writes); sector B, 0x003F_F000, is the last 4 KB sector of the partition.
+/// Offset of the `settings` journal: sector A at 0x003F_E000 (the only sector
+/// the default build writes); sector B, 0x003F_F000, is the last 4 KB sector
+/// of the partition.
 pub const SETTINGS_JOURNAL_OFFSET: u32 = 0x003F_E000;
 /// Size of the `settings` partition in bytes (64 KB).
 pub const SETTINGS_PARTITION_SIZE: u32 = 0x0001_0000;
 
-/// Fixed 16-byte domain salt from `components/wifi-manager/network_wifi.c:55-58`.
+/// Fixed 16-byte domain salt from
+/// `components/wifi-manager/network_wifi.c:55-58`.
 pub const WIFI_NVS_SALT: [u8; 16] = *b"WiFiNVSKey$Secur";
 
 /// Prefix indicating an encrypted Wi-Fi password in NVS (`network_wifi.c:51`).
 pub const WIFI_ENC_PREFIX: &str = "enc:";
 
-/// Required `esp_image_header_t.magic` byte at offset `0x00` (`ESP_IMAGE_HEADER_MAGIC`).
+/// Required `esp_image_header_t.magic` byte at offset `0x00`
+/// (`ESP_IMAGE_HEADER_MAGIC`).
 pub const ESP_IMAGE_MAGIC_BYTE: u8 = 0xE9;
 
-/// Required `esp_app_desc_t.magic_word` at offset `0x20` (`squeezelite-ota.c:650`).
+/// Required `esp_app_desc_t.magic_word` at offset `0x20`
+/// (`squeezelite-ota.c:650`).
 pub const ESP_APP_DESC_MAGIC_WORD: u32 = 0xABCD_5432;
 
-/// Required `esp_app_desc_t.project_name` at offset `0x50` (`application_name.h:5`).
+/// Required `esp_app_desc_t.project_name` at offset `0x50`
+/// (`application_name.h:5`).
 pub const REQUIRED_OTA_PROJECT_NAME: &str = "Squeezelite-ESP32";
 
-/// Rust OTA firmware version string embedded in `esp_app_desc_t.version` at offset `0x30`.
+/// Rust OTA firmware version string embedded in `esp_app_desc_t.version` at
+/// offset `0x30`.
 pub const RUST_OTA_FIRMWARE_VERSION: &str = "I2S-4MFlash-Rust";
 
 const NVS_PAGE_SIZE: usize = 4096;
@@ -75,7 +93,9 @@ pub const NVS_PAGE_STATE_FREEING: u32 = 0xFFFF_FFF8;
 
 #[inline]
 const fn is_nvs_page_valid_state(state: u32) -> bool {
-    state == NVS_PAGE_STATE_ACTIVE || state == NVS_PAGE_STATE_FULL || state == NVS_PAGE_STATE_FREEING
+    state == NVS_PAGE_STATE_ACTIVE
+        || state == NVS_PAGE_STATE_FULL
+        || state == NVS_PAGE_STATE_FREEING
 }
 
 const NVS_TYPE_U8: u8 = 0x01;
@@ -97,13 +117,16 @@ const SHA256_K: [u32; 64] = [
 /// Errors returned by NVS credential extraction or OTA safety checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OtaSafetyError {
-    /// Ciphertext after `"enc:"` has an odd number of hex digits or exceeds buffer capacity.
+    /// Ciphertext after `"enc:"` has an odd number of hex digits or exceeds
+    /// buffer capacity.
     InvalidHexLength(usize),
     /// Ciphertext contains a non-hexadecimal character.
     InvalidHexCharacter,
-    /// Decrypted or plaintext credential is not valid UTF-8 or exceeds `heapless::String` capacity.
+    /// Decrypted or plaintext credential is not valid UTF-8 or exceeds
+    /// `heapless::String` capacity.
     CredentialStringError,
-    /// NVS partition did not contain a valid `"config"` or `"aplist"` Wi-Fi credential entry.
+    /// NVS partition did not contain a valid `"config"` or `"aplist"` Wi-Fi
+    /// credential entry.
     CredentialsNotFound,
     /// `otadata` sector read-back after erase did not return all `0xFF` bytes.
     OtadataNotErased(usize),
@@ -111,7 +134,8 @@ pub enum OtaSafetyError {
     InvalidBinaryHeader(&'static str),
 }
 
-/// Decrypted Wi-Fi Station credentials loaded from NVS (`0x9000`) or compile-time fallback.
+/// Decrypted Wi-Fi Station credentials loaded from NVS (`0x9000`) or
+/// compile-time fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiStaCredentials {
     /// Wi-Fi SSID (up to 32 bytes).
@@ -120,7 +144,8 @@ pub struct WifiStaCredentials {
     pub password: String<64>,
 }
 
-/// Summary of a validated ESP32 OTA `.bin` image header (`esp_image_header_t` + `esp_app_desc_t`).
+/// Summary of a validated ESP32 OTA `.bin` image header (`esp_image_header_t`
+/// + `esp_app_desc_t`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtaBinarySummary {
     /// Total image length in bytes.
@@ -133,7 +158,8 @@ pub struct OtaBinarySummary {
     pub project_name: String<32>,
 }
 
-/// ESP-IDF `esp_ota_select_entry_t` (`32` bytes) stored at `0xD000` and `0xE000`.
+/// ESP-IDF `esp_ota_select_entry_t` (`32` bytes) stored at `0xD000` and
+/// `0xE000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtaSelectEntry {
     /// Monotonic sequence number (`1` selects `ota_0` when `ota_count == 1`).
@@ -142,7 +168,8 @@ pub struct OtaSelectEntry {
     pub seq_label: [u8; 20],
     /// `esp_ota_img_states_t` (`0x0000_0002` = `ESP_OTA_IMG_VALID`).
     pub ota_state: u32,
-    /// CRC32 of `ota_seq` (4 bytes little-endian) with initial value `0xFFFF_FFFF`.
+    /// CRC32 of `ota_seq` (4 bytes little-endian) with initial value
+    /// `0xFFFF_FFFF`.
     pub crc: u32,
 }
 
@@ -164,7 +191,8 @@ impl OtaSelectEntry {
         }
     }
 
-    /// Serializes the entry into its exact 32-byte little-endian flash representation.
+    /// Serializes the entry into its exact 32-byte little-endian flash
+    /// representation.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut out = [0xFFu8; 32];
@@ -176,7 +204,8 @@ impl OtaSelectEntry {
     }
 }
 
-/// Computes the ESP-IDF ROM `esp_crc32_le(crc, buf)` used by `esp-bootloader-esp-idf` for `otadata`.
+/// Computes the ESP-IDF ROM `esp_crc32_le(crc, buf)` used by
+/// `esp-bootloader-esp-idf` for `otadata`.
 #[must_use]
 pub fn esp_crc32_le(initial_crc: u32, buf: &[u8]) -> u32 {
     let mut crc = !initial_crc;
@@ -193,7 +222,8 @@ pub fn esp_crc32_le(initial_crc: u32, buf: &[u8]) -> u32 {
     !crc
 }
 
-/// Pure-Rust FIPS 180-4 SHA-256 implementation for single-block messages (`len <= 55` bytes).
+/// Pure-Rust FIPS 180-4 SHA-256 implementation for single-block messages
+/// (`len <= 55` bytes).
 #[must_use]
 pub fn sha256_short(data: &[u8]) -> [u8; 32] {
     assert!(data.len() <= 55, "sha256_short only supports messages up to 55 bytes");
@@ -260,8 +290,9 @@ pub fn sha256_short(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Verifies that a read-back slice from `otadata` (`0xD000` and `0xE000`) is completely `0xFF`,
-/// proving the ESP-IDF 2nd-stage bootloader will boot `Factory` (`recovery` at `0x10000`) on reset.
+/// Verifies that a read-back slice from `otadata` (`0xD000` and `0xE000`) is
+/// completely `0xFF`, proving the ESP-IDF 2nd-stage bootloader will boot
+/// `Factory` (`recovery` at `0x10000`) on reset.
 pub fn verify_otadata_erased(bytes: &[u8]) -> Result<(), OtaSafetyError> {
     for (idx, &b) in bytes.iter().enumerate() {
         if b != 0xFF {
@@ -271,8 +302,9 @@ pub fn verify_otadata_erased(bytes: &[u8]) -> Result<(), OtaSafetyError> {
     Ok(())
 }
 
-/// Derives the 16-byte XOR keystream from `WIFI_NVS_SALT` and the 6-byte Wi-Fi STA MAC address,
-/// matching `derive_key_from_mac()` in `components/wifi-manager/network_wifi.c:53-70`.
+/// Derives the 16-byte XOR keystream from `WIFI_NVS_SALT` and the 6-byte Wi-Fi
+/// STA MAC address, matching `derive_key_from_mac()` in
+/// `components/wifi-manager/network_wifi.c:53-70`.
 #[must_use]
 pub fn derive_wifi_nvs_key(sta_mac: &[u8; 6]) -> [u8; 16] {
     let mut combined = [0u8; 22];
@@ -303,8 +335,9 @@ fn heapless_string_from_str<const N: usize>(s: &str) -> Result<String<N>, OtaSaf
 
 /// Decrypts a Wi-Fi password value from NVS (`network_wifi.c:94-122`).
 ///
-/// If `raw_value` starts with `"enc:"`, hex-decodes the payload and XORs each byte with
-/// `derive_wifi_nvs_key(sta_mac)[i % 16]`. Otherwise, returns `raw_value` as plaintext.
+/// If `raw_value` starts with `"enc:"`, hex-decodes the payload and XORs each
+/// byte with `derive_wifi_nvs_key(sta_mac)[i % 16]`. Otherwise, returns
+/// `raw_value` as plaintext.
 pub fn decrypt_nvs_wifi_password(
     raw_value: &str,
     sta_mac: &[u8; 6],
@@ -337,7 +370,8 @@ pub fn decrypt_nvs_wifi_password(
     }
 }
 
-/// Checks whether entry `entry_idx` (`0..126`) in an NVS page is in the `WRITTEN` state (`2b10`).
+/// Checks whether entry `entry_idx` (`0..126`) in an NVS page is in the
+/// `WRITTEN` state (`2b10`).
 fn is_nvs_entry_written(bitmap: &[u8], entry_idx: usize) -> bool {
     let byte_idx = entry_idx / 4;
     let bit_shift = (entry_idx % 4) * 2;
@@ -354,7 +388,8 @@ fn parse_nvs_entry_key(entry: &[u8]) -> &str {
     core::str::from_utf8(&key_raw[..key_len]).unwrap_or("")
 }
 
-/// Extracts a string or blob payload from a written NVS entry starting at `entry_idx`.
+/// Extracts a string or blob payload from a written NVS entry starting at
+/// `entry_idx`.
 fn extract_nvs_entry_value<'a>(
     page: &'a [u8],
     entry_idx: usize,
@@ -379,9 +414,9 @@ fn extract_nvs_entry_value<'a>(
     core::str::from_utf8(&raw[..trimmed_len]).ok()
 }
 
-/// Scans a raw `nvs` partition buffer (`0x9000..0xD000`, multiple of 4096 bytes) for the
-/// `"config"` namespace (`"ssid"` and `"password"` keys) or `"aplist"` fallback, and decrypts
-/// the password using `sta_mac`.
+/// Scans a raw `nvs` partition buffer (`0x9000..0xD000`, multiple of 4096
+/// bytes) for the `"config"` namespace (`"ssid"` and `"password"` keys) or
+/// `"aplist"` fallback, and decrypts the password using `sta_mac`.
 pub fn parse_nvs_wifi_credentials(
     nvs_bytes: &[u8],
     sta_mac: &[u8; 6],
@@ -399,8 +434,13 @@ pub fn parse_nvs_wifi_credentials(
         while idx < NVS_ENTRIES_PER_PAGE {
             let entry_off = NVS_ENTRY_OFFSET + idx * NVS_ENTRY_SIZE;
             let entry = &page[entry_off..entry_off + NVS_ENTRY_SIZE];
-            let span = usize::from(entry[2]).max(1);
-            if is_nvs_entry_written(bitmap, idx) && entry[0] == 0 && entry[1] == NVS_TYPE_U8 {
+            let written = is_nvs_entry_written(bitmap, idx);
+            let span = if written {
+                usize::from(entry[2]).clamp(1, NVS_ENTRIES_PER_PAGE - idx)
+            } else {
+                1
+            };
+            if written && entry[0] == 0 && entry[1] == NVS_TYPE_U8 {
                 let key = parse_nvs_entry_key(entry);
                 let ns_id = entry[24];
                 if key == "config" {
@@ -427,8 +467,13 @@ pub fn parse_nvs_wifi_credentials(
         while idx < NVS_ENTRIES_PER_PAGE {
             let entry_off = NVS_ENTRY_OFFSET + idx * NVS_ENTRY_SIZE;
             let entry = &page[entry_off..entry_off + NVS_ENTRY_SIZE];
-            let span = usize::from(entry[2]).max(1);
-            if is_nvs_entry_written(bitmap, idx) {
+            let written = is_nvs_entry_written(bitmap, idx);
+            let span = if written {
+                usize::from(entry[2]).clamp(1, NVS_ENTRIES_PER_PAGE - idx)
+            } else {
+                1
+            };
+            if written {
                 let ns = entry[0];
                 let dtype = entry[1];
                 let key = parse_nvs_entry_key(entry);
@@ -483,8 +528,8 @@ fn extract_json_string_field<'a>(json: &'a str, marker: &str) -> Option<&'a str>
     Some(&rest[..end])
 }
 
-/// Resolves Wi-Fi STA credentials using NVS partition (`0x9000`) extraction or compile-time
-/// override (`SL_WIFI_PASS` if non-empty).
+/// Resolves Wi-Fi STA credentials using NVS partition (`0x9000`) extraction
+/// or compile-time override (`SL_WIFI_PASS` if non-empty).
 pub fn resolve_wifi_credentials(
     nvs_bytes: &[u8],
     sta_mac: &[u8; 6],
@@ -519,8 +564,13 @@ fn scan_nvs_namespaces(
         while idx < NVS_ENTRIES_PER_PAGE {
             let entry_off = NVS_ENTRY_OFFSET + idx * NVS_ENTRY_SIZE;
             let entry = &page[entry_off..entry_off + NVS_ENTRY_SIZE];
-            let span = usize::from(entry[2]).max(1);
-            if is_nvs_entry_written(bitmap, idx) && entry[0] == 0 && entry[1] == NVS_TYPE_U8 {
+            let written = is_nvs_entry_written(bitmap, idx);
+            let span = if written {
+                usize::from(entry[2]).clamp(1, NVS_ENTRIES_PER_PAGE - idx)
+            } else {
+                1
+            };
+            if written && entry[0] == 0 && entry[1] == NVS_TYPE_U8 {
                 let key = parse_nvs_entry_key(entry);
                 let ns_id = entry[24];
                 if key == "config" {
@@ -553,8 +603,13 @@ fn scan_nvs_credentials(
         while idx < NVS_ENTRIES_PER_PAGE {
             let entry_off = NVS_ENTRY_OFFSET + idx * NVS_ENTRY_SIZE;
             let entry = &page[entry_off..entry_off + NVS_ENTRY_SIZE];
-            let span = usize::from(entry[2]).max(1);
-            if is_nvs_entry_written(bitmap, idx) {
+            let written = is_nvs_entry_written(bitmap, idx);
+            let span = if written {
+                usize::from(entry[2]).clamp(1, NVS_ENTRIES_PER_PAGE - idx)
+            } else {
+                1
+            };
+            if written {
                 let ns = entry[0];
                 let dtype = entry[1];
                 let key = parse_nvs_entry_key(entry);
@@ -592,11 +647,11 @@ fn scan_nvs_credentials(
     Ok(())
 }
 
-/// Resolves Wi-Fi STA credentials across the full 4-page (`16,384`-byte) NVS partition
-/// (`0x9000..0xD000`) using a 3-page (`12,288`-byte) scratch buffer by keeping Page 0
-/// (`0x9000..0xA000`, containing namespace ID definitions `config_ns_id`/`aplist_ns_id`)
-/// pinned in `nvs_buf[0..4096]` while reading Pages 2–3 (`0xB000..0xD000`) into
-/// `nvs_buf[4096..12288]`.
+/// Resolves Wi-Fi STA credentials across the full 4-page (`16,384`-byte) NVS
+/// partition (`0x9000..0xD000`) using a 3-page (`12,288`-byte) scratch buffer
+/// by keeping Page 0 (`0x9000..0xA000`, containing namespace ID definitions
+/// `config_ns_id`/`aplist_ns_id`) pinned in `nvs_buf[0..4096]` while reading
+/// Pages 2–3 (`0xB000..0xD000`) into `nvs_buf[4096..12288]`.
 pub fn load_nvs_wifi_credentials_split_12kb<F>(
     mut read_flash: F,
     sta_mac: &[u8; 6],
@@ -613,7 +668,8 @@ where
     let mut latest_password: Option<String<64>> = None;
     let mut latest_aplist_creds: Option<WifiStaCredentials> = None;
 
-    // Pass 1: Read Pages 0, 1, 2 (0x9000..0xC000, 12,288 bytes) into nvs_buf[0..12_288].
+    // Pass 1: Read Pages 0, 1, 2 (0x9000..0xC000, 12,288 bytes) into
+    // nvs_buf[0..12_288].
     nvs_buf.fill(0xFF);
     read_flash(NVS_PARTITION_OFFSET, nvs_buf);
     scan_nvs_namespaces(nvs_buf, &mut config_ns_id, &mut aplist_ns_id);
@@ -627,16 +683,17 @@ where
         &mut latest_aplist_creds,
     )?;
 
-    // Pass 2: Keep Page 0 (0x9000..0xA000) pinned in nvs_buf[0..4096] and read Pages 2 & 3
-    // (0xB000..0xD000, 8,192 bytes) into nvs_buf[4096..12_288].
+    // Pass 2: Keep Page 0 (0x9000..0xA000) pinned in nvs_buf[0..4096] and read
+    // Pages 2 & 3 (0xB000..0xD000, 8,192 bytes) into nvs_buf[4096..12_288].
     nvs_buf[NVS_PAGE_SIZE..].fill(0xFF);
     read_flash(
         NVS_PARTITION_OFFSET + (2 * NVS_PAGE_SIZE as u32),
         &mut nvs_buf[NVS_PAGE_SIZE..],
     );
     scan_nvs_namespaces(&nvs_buf[NVS_PAGE_SIZE..], &mut config_ns_id, &mut aplist_ns_id);
-    // Scan only Page 3 (nvs_buf[2 * NVS_PAGE_SIZE..]) since Pages 0, 1, 2 were already scanned in Pass 1!
-    // Never re-scan Page 0 (at nvs_buf[0..4096]) after Page 1 to prevent newer credentials from being overwritten.
+    // Scan only Page 3 (nvs_buf[2 * NVS_PAGE_SIZE..]) since Pages 0, 1, 2 were
+    // already scanned in Pass 1! Never re-scan Page 0 (at nvs_buf[0..4096])
+    // after Page 1 to prevent newer credentials from being overwritten.
     scan_nvs_credentials(
         &nvs_buf[2 * NVS_PAGE_SIZE..],
         sta_mac,
@@ -657,8 +714,9 @@ where
     resolve_wifi_credentials(nvs_buf, sta_mac, compile_time_ssid, compile_time_pass)
 }
 
-/// Validates an ESP32 firmware `.bin` image against the exact checks performed by
-/// `ota_header_check()` in `components/squeezelite-ota/squeezelite-ota.c:633-669`.
+/// Validates an ESP32 firmware `.bin` image against the exact checks performed
+/// by `ota_header_check()` in
+/// `components/squeezelite-ota/squeezelite-ota.c:633-669`.
 pub fn verify_ota_binary_header(image: &[u8]) -> Result<OtaBinarySummary, OtaSafetyError> {
     if image.len() < 0x120 {
         return Err(OtaSafetyError::InvalidBinaryHeader(
@@ -813,7 +871,8 @@ mod tests {
         let encrypted = encrypt_for_test(secret, &FIXTURE_STA_MAC);
         assert!(encrypted.as_str().starts_with("enc:"));
 
-        let decrypted = decrypt_nvs_wifi_password(encrypted.as_str(), &FIXTURE_STA_MAC).unwrap();
+        let decrypted =
+            decrypt_nvs_wifi_password(encrypted.as_str(), &FIXTURE_STA_MAC).unwrap();
         assert_eq!(decrypted.as_str(), secret);
 
         let plain = decrypt_nvs_wifi_password("PlainPass123\0", &FIXTURE_STA_MAC).unwrap();
@@ -915,18 +974,21 @@ mod tests {
     #[test]
     fn test_split_12kb_nvs_read_with_page0_namespaces_and_page3_credentials() {
         let mut full_nvs = [0xFFu8; NVS_PAGE_SIZE * 4];
-        // Page 0 (0x9000..0xA000): FULL state, holds namespace definitions for "config" (ns_id=1) and "aplist" (ns_id=2)
+        // Page 0 (0x9000..0xA000): FULL state, holds namespace definitions for
+        // "config" (ns_id=1) and "aplist" (ns_id=2)
         full_nvs[0..4].copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
         write_nvs_namespace_entry(&mut full_nvs[0..NVS_PAGE_SIZE], 0, "config", 1);
         write_nvs_namespace_entry(&mut full_nvs[0..NVS_PAGE_SIZE], 1, "aplist", 2);
 
-        // Page 1 (0xA000..0xB000) and Page 2 (0xB000..0xC000): FULL state, no active Wi-Fi credentials
+        // Page 1 (0xA000..0xB000) and Page 2 (0xB000..0xC000): FULL state, no
+        // active Wi-Fi credentials
         full_nvs[NVS_PAGE_SIZE..NVS_PAGE_SIZE + 4]
             .copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
         full_nvs[2 * NVS_PAGE_SIZE..2 * NVS_PAGE_SIZE + 4]
             .copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
 
-        // Page 3 (0xC000..0xD000): ACTIVE state, holds active Wi-Fi credentials under ns_id=1 ("config")
+        // Page 3 (0xC000..0xD000): ACTIVE state, holds active Wi-Fi
+        // credentials under ns_id=1 ("config")
         let page3_start = 3 * NVS_PAGE_SIZE;
         full_nvs[page3_start..page3_start + 4]
             .copy_from_slice(&NVS_PAGE_STATE_ACTIVE.to_le_bytes());
@@ -968,7 +1030,8 @@ mod tests {
     #[test]
     fn test_split_12kb_nvs_read_preserves_page1_newer_credentials_over_page0() {
         let mut full_nvs = [0xFFu8; NVS_PAGE_SIZE * 4];
-        // Page 0 (0x9000..0xA000): FULL state, holds namespace definitions and OLD credentials
+        // Page 0 (0x9000..0xA000): FULL state, holds namespace definitions and
+        // OLD credentials
         full_nvs[0..4].copy_from_slice(&NVS_PAGE_STATE_FULL.to_le_bytes());
         write_nvs_namespace_entry(&mut full_nvs[0..NVS_PAGE_SIZE], 0, "config", 1);
         let span1 = write_nvs_blob_entry(
@@ -990,7 +1053,8 @@ mod tests {
 
         // Page 1 (0xA000..0xB000): ACTIVE state, holds NEWER credentials
         let page1_start = NVS_PAGE_SIZE;
-        full_nvs[page1_start..page1_start + 4].copy_from_slice(&NVS_PAGE_STATE_ACTIVE.to_le_bytes());
+        full_nvs[page1_start..page1_start + 4]
+            .copy_from_slice(&NVS_PAGE_STATE_ACTIVE.to_le_bytes());
         let span3 = write_nvs_blob_entry(
             &mut full_nvs[page1_start..page1_start + NVS_PAGE_SIZE],
             0,
@@ -1021,7 +1085,8 @@ mod tests {
         )
         .expect("Should resolve Page 1 credentials");
 
-        // Verify newer credentials on Page 1 were NOT overwritten by older credentials on Page 0!
+        // Verify newer credentials on Page 1 were NOT overwritten by older
+        // credentials on Page 0!
         assert_eq!(creds.ssid.as_str(), "new_ssid_page1");
         assert_eq!(creds.password.as_str(), "new_pass_page1");
     }

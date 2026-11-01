@@ -1,12 +1,20 @@
-//! Behavioural conformance suite for [`StreamSource`](super::StreamSource) implementations.
+//! Behavioural conformance suite for [`StreamSource`](super::StreamSource)
+//! implementations.
 //!
-//! The suite only drives the `StreamSource` API. It selects what the "server" returns through
-//! the request path, so the implementation under test must be connected to a server (or scripted
-//! fake) that serves [`ROUTES`]: [`FakeStreamSource`](super::FakeStreamSource) does so directly,
-//! and a socket shim only needs a tiny HTTP server replaying the same segments (one `write` +
-//! flush per segment, so segment boundaries become TCP read boundaries) with the connection
-//! closed after the last one. `Location` values are same-origin paths; a shim may rewrite them
-//! to absolute URLs of its own origin. Everything is `no_std` and allocation free.
+//! The suite only drives the `StreamSource` API. It selects what the "server"
+//! returns through
+//! the request path, so the implementation under test must be connected to a
+//! server (or scripted
+//! fake) that serves [`ROUTES`]: [`FakeStreamSource`](super::FakeStreamSource)
+//! does so directly,
+//! and a socket shim only needs a tiny HTTP server replaying the same segments
+//! (one `write` +
+//! flush per segment, so segment boundaries become TCP read boundaries) with
+//! the connection
+//! closed after the last one. `Location` values are same-origin paths; a shim
+//! may rewrite them
+//! to absolute URLs of its own origin. Everything is `no_std` and allocation
+//! free.
 
 use super::{NetAddr, StreamError, StreamSource, MAX_REDIRECTS};
 use heapless::Vec;
@@ -15,7 +23,8 @@ use heapless::Vec;
 pub const PLAIN_BODY: &[u8] = b"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
 /// Audio payload of `/icy` and `/icy-split` with `icy-metaint` 16 (48 bytes).
 pub const ICY_AUDIO: &[u8] = b"AAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCC";
-/// The single metadata block carried by `/icy` and `/icy-split`, trailing NUL padding removed.
+/// The single metadata block carried by `/icy` and `/icy-split`, trailing NUL
+/// padding removed.
 pub const ICY_META: &[u8] = b"StreamTitle='Song One';";
 /// De-chunked payload of `/chunked` (27 bytes).
 pub const CHUNKED_BODY: &[u8] = b"0123456789ABCDEFabcdefghXYZ";
@@ -24,15 +33,21 @@ pub const ICY_METAINT: usize = 16;
 
 /// Scripted server: `(request path, response segments)`.
 ///
-/// * `/plain`: `200`, `Content-Type: audio/mpeg`; headers split mid-line across reads; body is
+/// * `/plain`: `200`, `Content-Type: audio/mpeg`; headers split mid-line across
+///   reads; body is
 ///   [`PLAIN_BODY`].
-/// * `/icy`: `200`, [`ICY_AUDIO`] with a 32-byte metadata block (`StreamTitle` NUL padded) after
-///   the first 16 audio bytes and an empty block after the next 16, all in one read.
-/// * `/icy-split`: same bytes, split between audio and the length byte, inside the metadata
+/// * `/icy`: `200`, [`ICY_AUDIO`] with a 32-byte metadata block (`StreamTitle`
+///   NUL padded) after
+///   the first 16 audio bytes and an empty block after the next 16, all in one
+///   read.
+/// * `/icy-split`: same bytes, split between audio and the length byte, inside
+///   the metadata
 ///   block, and between the empty block and the last audio run.
-/// * `/chunked`: `Transfer-Encoding: chunked` (framing split across reads, including inside a
+/// * `/chunked`: `Transfer-Encoding: chunked` (framing split across reads,
+///   including inside a
 ///   chunk-size line), de-chunked payload is [`CHUNKED_BODY`].
-/// * `/r1`..`/r4`: `302` to `/plain` (`/r1`) or to the previous route (`/r2` -> `/r1`, ...).
+/// * `/r1`..`/r4`: `302` to `/plain` (`/r1`) or to the previous route (`/r2` ->
+///   `/r1`, ...).
 /// * Any other path: `404`.
 pub const ROUTES: &[(&[u8], &[&[u8]])] = &[
     (
@@ -46,7 +61,9 @@ pub const ROUTES: &[(&[u8], &[&[u8]])] = &[
     ),
     (
         b"/icy",
-        &[b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n\r\nAAAAAAAAAAAAAAAA\x02StreamTitle='Song One';\0\0\0\0\0\0\0\0\0BBBBBBBBBBBBBBBB\0CCCCCCCCCCCCCCCC"],
+        &[b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n\r\n\
+            AAAAAAAAAAAAAAAA\x02StreamTitle='Song One';\
+            \0\0\0\0\0\0\0\0\0BBBBBBBBBBBBBBBB\0CCCCCCCCCCCCCCCC"],
     ),
     (
         b"/icy-split",
@@ -74,13 +91,20 @@ pub const ROUTES: &[(&[u8], &[&[u8]])] = &[
     (b"/r4", &[b"HTTP/1.0 302 Found\r\nLocation: /r3\r\n\r\n"]),
 ];
 
-const ADDR: NetAddr = NetAddr { ip: [10, 0, 0, 1], port: 9000 };
+const ADDR: NetAddr = NetAddr {
+    ip: [10, 0, 0, 1],
+    port: 9000,
+};
 /// Upper bound on poll/connect iterations before a case is declared stuck.
 const MAX_POLLS: usize = 512;
 
 fn request(path: &[u8]) -> Vec<u8, 128> {
     let mut r = Vec::new();
-    for part in [&b"GET "[..], path, b" HTTP/1.0\r\nHost: 10.0.0.1:9000\r\n\r\n"] {
+    for part in [
+        &b"GET "[..],
+        path,
+        b" HTTP/1.0\r\nHost: 10.0.0.1:9000\r\n\r\n",
+    ] {
         r.extend_from_slice(part).expect("request fits");
     }
     r
@@ -106,15 +130,21 @@ struct Drained {
     icy: Vec<Vec<u8, 256>, 4>,
 }
 
-/// Polls until EOF with reads of at most `read_len` bytes, collecting audio and metadata.
+/// Polls until EOF with reads of at most `read_len` bytes, collecting audio and
+/// metadata.
 fn drain<S: StreamSource>(s: &mut S, read_len: usize, metaint: usize) -> Drained {
     if metaint > 0 {
         s.set_icy_metaint(metaint);
     }
-    let mut d = Drained { body: Vec::new(), icy: Vec::new() };
+    let mut d = Drained {
+        body: Vec::new(),
+        icy: Vec::new(),
+    };
     let mut buf = [0u8; 64];
     for _ in 0..MAX_POLLS {
-        let n = s.poll_bytes(&mut buf[..read_len]).expect("poll_bytes failed mid-stream");
+        let n = s
+            .poll_bytes(&mut buf[..read_len])
+            .expect("poll_bytes failed mid-stream");
         assert!(n <= read_len, "poll_bytes overran the output buffer");
         d.body.extend_from_slice(&buf[..n]).expect("body too long");
         if let Some(m) = s.take_icy_metadata() {
@@ -133,18 +163,39 @@ fn drain<S: StreamSource>(s: &mut S, read_len: usize, metaint: usize) -> Drained
 }
 
 fn check_headers<S: StreamSource>(s: &mut S, status_prefix: &[u8], needle: &[u8]) {
-    let h = s.take_response_headers().expect("response headers not captured");
-    assert!(h.starts_with(status_prefix), "unexpected status line: {:?}", &h[..]);
-    assert!(contains(&h, needle), "missing header {:?} in {:?}", needle, &h[..]);
-    assert!(h.ends_with(b"\r\n\r\n"), "headers must include the terminating blank line");
-    assert!(s.take_response_headers().is_none(), "headers must be taken once");
+    let h = s
+        .take_response_headers()
+        .expect("response headers not captured");
+    assert!(
+        h.starts_with(status_prefix),
+        "unexpected status line: {:?}",
+        &h[..]
+    );
+    assert!(
+        contains(&h, needle),
+        "missing header {:?} in {:?}",
+        needle,
+        &h[..]
+    );
+    assert!(
+        h.ends_with(b"\r\n\r\n"),
+        "headers must include the terminating blank line"
+    );
+    assert!(
+        s.take_response_headers().is_none(),
+        "headers must be taken once"
+    );
 }
 
-/// Runs every case against fresh sources from `mk`; panics on the first violation.
+/// Runs every case against fresh sources from `mk`; panics on the first
+/// violation.
 ///
-/// Cases: plain stream, header capture, EOF (not set early, sticky afterwards), ICY metaint
-/// stripping, ICY block split across reads, chunked transfer-encoding, redirects (3 followed,
-/// the 4th fails with [`StreamError::TooManyRedirects`]) and error status. Each streaming case
+/// Cases: plain stream, header capture, EOF (not set early, sticky afterwards),
+/// ICY metaint
+/// stripping, ICY block split across reads, chunked transfer-encoding,
+/// redirects (3 followed,
+/// the 4th fails with [`StreamError::TooManyRedirects`]) and error status. Each
+/// streaming case
 /// is repeated with 64, 7 and 1 byte output buffers.
 pub fn run_stream_source_conformance<S: StreamSource>(mut mk: impl FnMut() -> S) {
     // Plain stream + header capture + EOF.
@@ -164,9 +215,21 @@ pub fn run_stream_source_conformance<S: StreamSource>(mut mk: impl FnMut() -> S)
             let mut s = mk();
             connect(&mut s, path).expect("connect icy route");
             let d = drain(&mut s, read_len, ICY_METAINT);
-            assert_eq!(&d.body[..], ICY_AUDIO, "icy audio ({path:?}, read_len {read_len})");
-            assert_eq!(d.icy.len(), 1, "exactly one complete metadata block ({path:?})");
-            assert_eq!(&d.icy[0][..], ICY_META, "icy metadata ({path:?}, read_len {read_len})");
+            assert_eq!(
+                &d.body[..],
+                ICY_AUDIO,
+                "icy audio ({path:?}, read_len {read_len})"
+            );
+            assert_eq!(
+                d.icy.len(),
+                1,
+                "exactly one complete metadata block ({path:?})"
+            );
+            assert_eq!(
+                &d.icy[0][..],
+                ICY_META,
+                "icy metadata ({path:?}, read_len {read_len})"
+            );
         }
     }
 
@@ -175,7 +238,11 @@ pub fn run_stream_source_conformance<S: StreamSource>(mut mk: impl FnMut() -> S)
         let mut s = mk();
         connect(&mut s, b"/chunked").expect("connect /chunked");
         let d = drain(&mut s, read_len, 0);
-        assert_eq!(&d.body[..], CHUNKED_BODY, "chunked body (read_len {read_len})");
+        assert_eq!(
+            &d.body[..],
+            CHUNKED_BODY,
+            "chunked body (read_len {read_len})"
+        );
     }
 
     // Redirects: up to MAX_REDIRECTS followed, one more is refused.

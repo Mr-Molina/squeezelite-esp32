@@ -115,7 +115,7 @@ impl CydLinkProtocol {
             }
             CydMessage::TrackMetadata { artist, title } => {
                 out.extend_from_slice(b"META=").map_err(|_| LinkError::BufferOverflow)?;
-                // Sanitize delimiters (\r, \n, ;) to prevent protocol delimiter injection (CYD-001)
+                // Sanitize delimiters (\r, \n, ;) to prevent delimiter injection (CYD-001)
                 for &b in artist.as_bytes() {
                     let c = if b == b'\n' || b == b'\r' || b == b';' { b' ' } else { b };
                     out.push(c).map_err(|_| LinkError::BufferOverflow)?;
@@ -141,7 +141,8 @@ impl CydLinkProtocol {
             }
             CydMessage::WifiStatus { connected, rssi } => {
                 out.extend_from_slice(b"WIFI=").map_err(|_| LinkError::BufferOverflow)?;
-                out.push(if *connected { b'1' } else { b'0' }).map_err(|_| LinkError::BufferOverflow)?;
+                let conn_byte = if *connected { b'1' } else { b'0' };
+                out.push(conn_byte).map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b';').map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 5];
                 let s = format_i8(*rssi, &mut num_buf);
@@ -153,7 +154,7 @@ impl CydLinkProtocol {
     }
 
     /// Parses a single line from a buffer (supporting `\n` or `\r\n`).
-    /// Implements symmetric deserialization for all message types (CYD-005, CYD-006).
+    /// Implements symmetric deserialization for all message types.
     pub fn parse_line(line: &[u8]) -> Result<CydMessage, LinkError> {
         let trimmed = Self::trim_crlf(line);
 
@@ -173,8 +174,10 @@ impl CydLinkProtocol {
             let mut parts = rest.splitn(2, |&b| b == b';');
             let artist_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
             let title_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
-            let artist_str = core::str::from_utf8(artist_bytes).map_err(|_| LinkError::InvalidFrame)?;
-            let title_str = core::str::from_utf8(title_bytes).map_err(|_| LinkError::InvalidFrame)?;
+            let artist_str = core::str::from_utf8(artist_bytes)
+                .map_err(|_| LinkError::InvalidFrame)?;
+            let title_str = core::str::from_utf8(title_bytes)
+                .map_err(|_| LinkError::InvalidFrame)?;
             let artist_trunc = truncate_utf8(artist_str, 64);
             let title_trunc = truncate_utf8(title_str, 64);
             let mut artist = String::new();
@@ -186,8 +189,10 @@ impl CydLinkProtocol {
             let mut parts = rest.splitn(2, |&b| b == b'/');
             let elapsed_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
             let duration_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
-            let elapsed_str = core::str::from_utf8(elapsed_bytes).map_err(|_| LinkError::InvalidFrame)?;
-            let duration_str = core::str::from_utf8(duration_bytes).map_err(|_| LinkError::InvalidFrame)?;
+            let elapsed_str = core::str::from_utf8(elapsed_bytes)
+                .map_err(|_| LinkError::InvalidFrame)?;
+            let duration_str = core::str::from_utf8(duration_bytes)
+                .map_err(|_| LinkError::InvalidFrame)?;
             let elapsed: u32 = parse_u32(elapsed_str).ok_or(LinkError::InvalidFrame)?;
             let duration: u32 = parse_u32(duration_str).ok_or(LinkError::InvalidFrame)?;
             Ok(CydMessage::Progress { elapsed_secs: elapsed, duration_secs: duration })
@@ -208,19 +213,37 @@ impl CydLinkProtocol {
         }
     }
 
-    /// Encodes an interactive touch command into a delimited frame (`\n` terminated).
+    /// Encodes an interactive touch command into a delimited frame (`\n`).
     pub fn encode_command(
         cmd: &CydCommand,
         out: &mut Vec<u8, 64>,
     ) -> Result<(), LinkError> {
         out.clear();
         match cmd {
-            CydCommand::Play => out.extend_from_slice(b"CMD=PLAY\n").map_err(|_| LinkError::BufferOverflow)?,
-            CydCommand::Pause => out.extend_from_slice(b"CMD=PAUSE\n").map_err(|_| LinkError::BufferOverflow)?,
-            CydCommand::Toggle => out.extend_from_slice(b"CMD=TOGGLE\n").map_err(|_| LinkError::BufferOverflow)?,
-            CydCommand::Next => out.extend_from_slice(b"CMD=NEXT\n").map_err(|_| LinkError::BufferOverflow)?,
-            CydCommand::Previous => out.extend_from_slice(b"CMD=PREV\n").map_err(|_| LinkError::BufferOverflow)?,
-            CydCommand::QueryStatus => out.extend_from_slice(b"CMD=STATUS\n").map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Play => {
+                out.extend_from_slice(b"CMD=PLAY\n")
+                    .map_err(|_| LinkError::BufferOverflow)?
+            }
+            CydCommand::Pause => {
+                out.extend_from_slice(b"CMD=PAUSE\n")
+                    .map_err(|_| LinkError::BufferOverflow)?
+            }
+            CydCommand::Toggle => {
+                out.extend_from_slice(b"CMD=TOGGLE\n")
+                    .map_err(|_| LinkError::BufferOverflow)?
+            }
+            CydCommand::Next => {
+                out.extend_from_slice(b"CMD=NEXT\n")
+                    .map_err(|_| LinkError::BufferOverflow)?
+            }
+            CydCommand::Previous => {
+                out.extend_from_slice(b"CMD=PREV\n")
+                    .map_err(|_| LinkError::BufferOverflow)?
+            }
+            CydCommand::QueryStatus => {
+                out.extend_from_slice(b"CMD=STATUS\n")
+                    .map_err(|_| LinkError::BufferOverflow)?
+            }
             CydCommand::SetVolume(vol) => {
                 if *vol > 100 {
                     return Err(LinkError::ValueOutOfRange);
@@ -235,7 +258,7 @@ impl CydLinkProtocol {
         Ok(())
     }
 
-    /// Encodes an interactive touch command into C-firmware compatible NDJSON (`\n` terminated).
+    /// Encodes an interactive touch command into NDJSON (`\n` terminated).
     pub fn encode_json_command(
         cmd: &CydCommand,
         buf: &mut [u8],
@@ -267,8 +290,9 @@ impl CydLinkProtocol {
         }
     }
 
-    /// Parses an incoming interactive command from the CYD display (supports `\n` and `\r\n`,
-    /// both `CMD=...` wire format and C-firmware NDJSON `{"cmd":...}` format).
+    /// Parses an incoming interactive command from the CYD display (supports
+    /// `\n` and `\r\n`, both `CMD=...` wire format and C-firmware NDJSON
+    /// `{"cmd":...}` format).
     pub fn parse_command<B: AsRef<[u8]> + ?Sized>(line: &B) -> Result<CydCommand, LinkError> {
         let trimmed = Self::trim_crlf(line.as_ref());
 
@@ -404,7 +428,8 @@ fn parse_json_command(json: &str) -> Result<CydCommand, LinkError> {
     }
 }
 
-/// Truncates a UTF-8 string slice to at most `max_bytes` without splitting code points.
+/// Truncates a UTF-8 string slice to at most `max_bytes` without splitting
+/// code points.
 pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -525,7 +550,8 @@ mod tests {
     #[test]
     fn test_encode_and_parse_state() {
         let mut buf = Vec::new();
-        CydLinkProtocol::encode_message(&CydMessage::PlaybackState(PlayState::Playing), &mut buf).unwrap();
+        let msg = CydMessage::PlaybackState(PlayState::Playing);
+        CydLinkProtocol::encode_message(&msg, &mut buf).unwrap();
         assert_eq!(&buf[..], b"STATE=P\n");
 
         let parsed = CydLinkProtocol::parse_line(&buf).unwrap();
@@ -554,9 +580,18 @@ mod tests {
         assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Play);
         // CRLF tolerance test
         assert_eq!(CydLinkProtocol::parse_command(b"CMD=PLAY\r\n").unwrap(), CydCommand::Play);
-        assert_eq!(CydLinkProtocol::parse_command(b"CMD=VOL:80\r\n").unwrap(), CydCommand::SetVolume(80));
-        assert_eq!(CydLinkProtocol::parse_command(b"CMD=VOL=80\r\n").unwrap(), CydCommand::SetVolume(80));
-        assert_eq!(CydLinkProtocol::parse_command(b"CMD=VOL=50\n").unwrap(), CydCommand::SetVolume(50));
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=VOL:80\r\n").unwrap(),
+            CydCommand::SetVolume(80)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=VOL=80\r\n").unwrap(),
+            CydCommand::SetVolume(80)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=VOL=50\n").unwrap(),
+            CydCommand::SetVolume(50)
+        );
 
         CydLinkProtocol::encode_command(&CydCommand::Pause, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=PAUSE\n");
@@ -612,7 +647,7 @@ mod tests {
         let mut buf = Vec::new();
         CydLinkProtocol::encode_message(&msg, &mut buf).unwrap();
 
-        // Delimiters should be replaced with spaces, but ';' preserved in title (LOGIC-404)
+        // Delimiters should be replaced with spaces, preserving ';' in title
         let s = core::str::from_utf8(&buf).unwrap();
         assert!(!s.contains("AC;DC"));
         assert!(s.contains("AC DC"));
@@ -642,8 +677,12 @@ mod tests {
         assert_eq!(truncate_utf8(euro, 5), "€");
 
         // Overlong metadata in parse_line (>64 bytes)
-        let long_line = b"META=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA;BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n";
-        let parsed = CydLinkProtocol::parse_line(long_line).unwrap();
+        let mut long_line = [b'A'; 160];
+        long_line[..5].copy_from_slice(b"META=");
+        long_line[80] = b';';
+        long_line[81..159].fill(b'B');
+        long_line[159] = b'\n';
+        let parsed = CydLinkProtocol::parse_line(&long_line).unwrap();
         match parsed {
             CydMessage::TrackMetadata { artist, title } => {
                 assert_eq!(artist.len(), 64);
@@ -668,31 +707,86 @@ mod tests {
     #[test]
     fn test_parse_and_encode_json_commands() {
         // Parse C-firmware NDJSON commands (&str and &[u8])
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"toggle\"}\n"), Ok(CydCommand::Toggle));
-        assert_eq!(CydLinkProtocol::parse_command(b"{\"cmd\":\"play\"}\r\n"), Ok(CydCommand::Play));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"pause\"}"), Ok(CydCommand::Pause));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"next\"}"), Ok(CydCommand::Next));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"prev\"}"), Ok(CydCommand::Previous));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"sync\"}"), Ok(CydCommand::QueryStatus));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"status\"}"), Ok(CydCommand::QueryStatus));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":0}"), Ok(CydCommand::SetVolume(0)));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":80}\n"), Ok(CydCommand::SetVolume(80)));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":100}"), Ok(CydCommand::SetVolume(100)));
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"toggle\"}\n"),
+            Ok(CydCommand::Toggle)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"{\"cmd\":\"play\"}\r\n"),
+            Ok(CydCommand::Play)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"pause\"}"),
+            Ok(CydCommand::Pause)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"next\"}"),
+            Ok(CydCommand::Next)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"prev\"}"),
+            Ok(CydCommand::Previous)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"sync\"}"),
+            Ok(CydCommand::QueryStatus)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"status\"}"),
+            Ok(CydCommand::QueryStatus)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":0}"),
+            Ok(CydCommand::SetVolume(0))
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":80}\n"),
+            Ok(CydCommand::SetVolume(80))
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":100}"),
+            Ok(CydCommand::SetVolume(100))
+        );
 
         // Out-of-range volume returns ValueOutOfRange
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":101}"), Err(LinkError::ValueOutOfRange));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":255}"), Err(LinkError::ValueOutOfRange));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":-1}"), Err(LinkError::ValueOutOfRange));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":99999}"), Err(LinkError::ValueOutOfRange));
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":101}"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":255}"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":-1}"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":99999}"),
+            Err(LinkError::ValueOutOfRange)
+        );
 
         // Malformed JSON commands return InvalidFrame
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"vol\"}"), Err(LinkError::InvalidFrame));
-        assert_eq!(CydLinkProtocol::parse_command("{\"cmd\":\"unknown\"}"), Err(LinkError::InvalidFrame));
-        assert_eq!(CydLinkProtocol::parse_command("{\"val\":50}"), Err(LinkError::InvalidFrame));
-
-        // JSON commands with key pattern inside string values must not falsely match
         assert_eq!(
-            CydLinkProtocol::parse_command("{\"title\":\"Song with \\\"cmd\\\": \\\"pause\\\" in title\",\"cmd\":\"play\"}\n"),
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\"}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"unknown\"}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"val\":50}"),
+            Err(LinkError::InvalidFrame)
+        );
+
+        // JSON commands with key pattern inside string values must not match
+        let tricky = concat!(
+            "{\"title\":\"Song with \\\"cmd\\\": \\\"pause\\\" in title\",",
+            "\"cmd\":\"play\"}\n"
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command(tricky),
             Ok(CydCommand::Play)
         );
 

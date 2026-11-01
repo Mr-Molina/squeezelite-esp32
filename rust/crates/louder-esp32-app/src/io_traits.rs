@@ -1,11 +1,17 @@
-//! I/O seams for the player core: Slimproto transport, HTTP audio stream source, and audio
+//! I/O seams for the player core: Slimproto transport, HTTP audio stream
+//! source, and audio
 //! backend traits, plus `no_std` fakes and a reusable conformance suite.
 //!
-//! The module is `no_std`-clean (it uses `core` and `heapless` only) so it builds for both the
-//! host and `xtensa-esp32-none-elf`. Host adapters (`std::net`) and device adapters (smoltcp)
-//! implement the traits; [`LoopbackTransport`], [`FakeStreamSource`] and [`MockBackend`] are the
-//! in-memory implementations used by tests. [`run_stream_source_conformance`] pins the
-//! behavioural contract of [`StreamSource`] so every implementation can be checked against the
+//! The module is `no_std`-clean (it uses `core` and `heapless` only) so it
+//! builds for both the
+//! host and `xtensa-esp32-none-elf`. Host adapters (`std::net`) and device
+//! adapters (smoltcp)
+//! implement the traits; [`LoopbackTransport`], [`FakeStreamSource`] and
+//! [`MockBackend`] are the
+//! in-memory implementations used by tests. [`run_stream_source_conformance`]
+//! pins the
+//! behavioural contract of [`StreamSource`] so every implementation can be
+//! checked against the
 //! same cases.
 
 pub mod conformance;
@@ -26,9 +32,11 @@ pub struct NetAddr {
 pub enum TransportError {
     /// The peer closed the connection (or it was never established).
     Disconnected,
-    /// The operation cannot make progress right now (e.g. send queue full); retry later.
+    /// The operation cannot make progress right now (e.g. send queue full); retry
+    /// later.
     WouldBlock,
-    /// Any other I/O failure, including a frame that does not fit the caller's buffer.
+    /// Any other I/O failure, including a frame that does not fit the caller's
+    /// buffer.
     Io,
 }
 
@@ -41,9 +49,11 @@ pub enum StreamError {
     Disconnected,
     /// More than [`MAX_REDIRECTS`] redirects were followed.
     TooManyRedirects,
-    /// The response was not usable (non-2xx status, malformed headers or chunk framing, ...).
+    /// The response was not usable (non-2xx status, malformed headers or chunk
+    /// framing, ...).
     BadResponse,
-    /// Connect phase only: the connection is not established yet; call `connect` again.
+    /// Connect phase only: the connection is not established yet; call `connect`
+    /// again.
     WouldBlock,
 }
 
@@ -54,29 +64,38 @@ pub enum ClockError {
     UnsupportedRate(u32),
 }
 
-/// Maximum number of HTTP redirects a [`StreamSource`] follows; the next one yields
+/// Maximum number of HTTP redirects a [`StreamSource`] follows; the next one
+/// yields
 /// [`StreamError::TooManyRedirects`].
 pub const MAX_REDIRECTS: usize = 3;
 
-/// Capacity of a captured HTTP response head (C squeezelite `MAX_HEADER` parity).
+/// Capacity of a captured HTTP response head (C squeezelite `MAX_HEADER`
+/// parity).
 pub const MAX_RESPONSE_HEAD: usize = 4096;
-/// Capacity of an ICY metadata block; the largest block ICY can carry is 255 * 16 = 4080 bytes.
+/// Capacity of an ICY metadata block; the largest block ICY can carry is 255 *
+/// 16 = 4080 bytes.
 pub const MAX_ICY_METADATA: usize = 4096;
 
-/// Raw HTTP response head as returned by [`StreamSource::take_response_headers`].
+/// Raw HTTP response head as returned by
+/// [`StreamSource::take_response_headers`].
 pub type HeaderBuf = Vec<u8, MAX_RESPONSE_HEAD>;
 /// ICY metadata block as returned by [`StreamSource::take_icy_metadata`].
 pub type MetaBuf = Vec<u8, MAX_ICY_METADATA>;
 
 /// Message-framed Slimproto control connection (TCP port 3483 to the server).
 ///
-/// Length-prefix framing is the adapter's concern: `poll_frame` yields one complete Slimproto
+/// Length-prefix framing is the adapter's concern: `poll_frame` yields one
+/// complete Slimproto
 /// frame per call.
 pub trait SlimTransport {
-    /// Returns `Ok(Some(n))` when one complete frame of `n` bytes (possibly 0) was copied into
-    /// `buf`, `Ok(None)` when no complete frame is available right now, and an error otherwise.
-    /// A frame larger than `buf` is dropped and reported as [`TransportError::Io`]. Frames that
-    /// were already received remain deliverable after the peer disconnects; once drained,
+    /// Returns `Ok(Some(n))` when one complete frame of `n` bytes (possibly 0) was
+    /// copied into
+    /// `buf`, `Ok(None)` when no complete frame is available right now, and an
+    /// error otherwise.
+    /// A frame larger than `buf` is dropped and reported as [`TransportError::Io`].
+    /// Frames that
+    /// were already received remain deliverable after the peer disconnects; once
+    /// drained,
     /// [`TransportError::Disconnected`] is returned.
     fn poll_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError>;
     /// Queues one frame for sending.
@@ -88,27 +107,46 @@ pub trait SlimTransport {
 /// Non-blocking HTTP audio stream client.
 ///
 /// Conventions (checked by [`run_stream_source_conformance`]):
-/// * `connect` sends `http_request` verbatim to `addr`, reads the response headers, follows up
-///   to [`MAX_REDIRECTS`] redirects (`301/302/303/307/308`, same-origin or absolute `Location`)
-///   and succeeds only on `200`/`206`. It may return [`StreamError::WouldBlock`] while the
-///   connection is still being established; the caller then repeats the same `connect` call.
-/// * `poll_bytes` never blocks and never returns `WouldBlock`. `Ok(0)` means "no audio bytes
-///   available right now", which is *not* end of stream: use [`StreamSource::is_eof`].
-///   `poll_bytes` yields de-chunked audio with any ICY metadata blocks stripped.
-/// * `is_eof` is `true` only once the response ended cleanly and every byte has been delivered.
-///   A connection that drops early is reported as [`StreamError::Disconnected`] instead.
-/// * `take_response_headers` returns the raw headers of the final (non-redirect) response,
-///   including the terminating blank line, once (at most [`MAX_RESPONSE_HEAD`] bytes; a longer
+/// * `connect` sends `http_request` verbatim to `addr`, reads the response
+///   headers, follows up
+///   to [`MAX_REDIRECTS`] redirects (`301/302/303/307/308`, same-origin or
+///   absolute `Location`)
+///   and succeeds only on `200`/`206`. It may return
+///   [`StreamError::WouldBlock`] while the
+///   connection is still being established; the caller then repeats the same
+///   `connect` call.
+/// * `poll_bytes` never blocks and never returns `WouldBlock`. `Ok(0)` means
+///   "no audio bytes
+///   available right now", which is *not* end of stream: use
+///   [`StreamSource::is_eof`].
+///   `poll_bytes` yields de-chunked audio with any ICY metadata blocks
+///   stripped.
+/// * `is_eof` is `true` only once the response ended cleanly and every byte has
+///   been delivered.
+///   A connection that drops early is reported as [`StreamError::Disconnected`]
+///   instead.
+/// * `take_response_headers` returns the raw headers of the final
+///   (non-redirect) response,
+///   including the terminating blank line, once (at most [`MAX_RESPONSE_HEAD`]
+///   bytes; a longer
 ///   head is cut at a line boundary and re-terminated).
-/// * `take_icy_metadata` returns the most recent complete metadata block (trailing NUL padding
-///   removed, at most [`MAX_ICY_METADATA`] bytes, so every ICY block fits), once. Partial blocks are never exposed. An
-///   `icy-metaint` response header configures the interval; `set_icy_metaint` overrides it
+/// * `take_icy_metadata` returns the most recent complete metadata block
+///   (trailing NUL padding
+///   removed, at most [`MAX_ICY_METADATA`] bytes, so every ICY block fits),
+///   once. Partial blocks are never exposed. An
+///   `icy-metaint` response header configures the interval; `set_icy_metaint`
+///   overrides it
 ///   (`0` disables stripping).
-/// * After `abort`, `poll_bytes` returns [`StreamError::Disconnected`] until the next `connect`.
-/// * `take_response_headers_with` / `take_icy_metadata_with` are the same takes, handing the bytes
-///   to a callback instead of returning a [`HeaderBuf`] / [`MetaBuf`] by value (4 KB each).
-///   Implementations that keep the data in their own storage override them so callers on a small
-///   stack (the device) never materialise those values; the defaults go through the by-value
+/// * After `abort`, `poll_bytes` returns [`StreamError::Disconnected`] until
+///   the next `connect`.
+/// * `take_response_headers_with` / `take_icy_metadata_with` are the same
+///   takes, handing the bytes
+///   to a callback instead of returning a [`HeaderBuf`] / [`MetaBuf`] by value
+///   (4 KB each).
+///   Implementations that keep the data in their own storage override them so
+///   callers on a small
+///   stack (the device) never materialise those values; the defaults go through
+///   the by-value
 ///   methods.
 pub trait StreamSource {
     fn connect(&mut self, addr: NetAddr, http_request: &[u8]) -> Result<(), StreamError>;
@@ -119,7 +157,8 @@ pub trait StreamSource {
     fn is_eof(&self) -> bool;
     fn abort(&mut self);
 
-    /// [`StreamSource::take_response_headers`], handing the head to `f`. Returns whether there
+    /// [`StreamSource::take_response_headers`], handing the head to `f`. Returns
+    /// whether there
     /// was one.
     fn take_response_headers_with(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
         match self.take_response_headers() {
@@ -131,7 +170,8 @@ pub trait StreamSource {
         }
     }
 
-    /// [`StreamSource::take_icy_metadata`], handing the block to `f`. Returns whether there was
+    /// [`StreamSource::take_icy_metadata`], handing the block to `f`. Returns
+    /// whether there was
     /// one.
     fn take_icy_metadata_with(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
         match self.take_icy_metadata() {
@@ -148,7 +188,8 @@ pub trait StreamSource {
 pub trait AudioBackend {
     fn set_sample_rate(&mut self, hz: u32) -> Result<(), ClockError>;
     fn set_hw_volume(&mut self, left: u8, right: u8);
-    /// Whether [`Self::set_hw_volume`] attenuates the output, so the software volume stays
+    /// Whether [`Self::set_hw_volume`] attenuates the output, so the software
+    /// volume stays
     /// unity (C: a `volume_cb` that handles the volume, output_embedded.c:120).
     fn has_hw_volume(&self) -> bool;
     fn set_mute(&mut self, mute: bool);
@@ -160,8 +201,10 @@ pub trait AudioBackend {
 // LoopbackTransport
 // ---------------------------------------------------------------------------
 
-/// Largest frame a [`LoopbackTransport`] can hold: a `RESP`/`META` frame carrying a full
-/// [`MAX_RESPONSE_HEAD`] / [`MAX_ICY_METADATA`] payload behind its 8-byte header.
+/// Largest frame a [`LoopbackTransport`] can hold: a `RESP`/`META` frame
+/// carrying a full
+/// [`MAX_RESPONSE_HEAD`] / [`MAX_ICY_METADATA`] payload behind its 8-byte
+/// header.
 pub const LOOPBACK_FRAME_CAP: usize = 8 + MAX_RESPONSE_HEAD;
 /// Number of frames each direction of a [`LoopbackTransport`] can queue.
 pub const LOOPBACK_QUEUE_DEPTH: usize = 8;
@@ -169,9 +212,12 @@ pub const LOOPBACK_QUEUE_DEPTH: usize = 8;
 /// One queued frame.
 pub type Frame = Vec<u8, LOOPBACK_FRAME_CAP>;
 
-/// In-memory [`SlimTransport`]: frames injected by a test come out of `poll_frame`, frames
-/// passed to `send` are recorded for [`LoopbackTransport::pop_sent`]. In echo mode (see
-/// [`LoopbackTransport::echo`]) every sent frame is additionally delivered back to `poll_frame`.
+/// In-memory [`SlimTransport`]: frames injected by a test come out of
+/// `poll_frame`, frames
+/// passed to `send` are recorded for [`LoopbackTransport::pop_sent`]. In echo
+/// mode (see
+/// [`LoopbackTransport::echo`]) every sent frame is additionally delivered back
+/// to `poll_frame`.
 ///
 /// Compiled in all builds; uses fixed heapless queues, no allocation.
 pub struct LoopbackTransport {
@@ -184,15 +230,27 @@ pub struct LoopbackTransport {
 impl LoopbackTransport {
     /// Connected transport with independent receive and send queues.
     pub const fn new() -> Self {
-        Self { rx: Deque::new(), tx: Deque::new(), connected: true, echo: false }
+        Self {
+            rx: Deque::new(),
+            tx: Deque::new(),
+            connected: true,
+            echo: false,
+        }
     }
 
-    /// Connected transport that also feeds every sent frame back into the receive queue.
+    /// Connected transport that also feeds every sent frame back into the receive
+    /// queue.
     pub const fn echo() -> Self {
-        Self { rx: Deque::new(), tx: Deque::new(), connected: true, echo: true }
+        Self {
+            rx: Deque::new(),
+            tx: Deque::new(),
+            connected: true,
+            echo: true,
+        }
     }
 
-    /// Queues a frame to be returned by `poll_frame` (as if received from the server).
+    /// Queues a frame to be returned by `poll_frame` (as if received from the
+    /// server).
     pub fn inject_frame(&mut self, frame: &[u8]) -> Result<(), TransportError> {
         let f = Frame::from_slice(frame).map_err(|_| TransportError::Io)?;
         self.rx.push_back(f).map_err(|_| TransportError::WouldBlock)
@@ -265,8 +323,10 @@ impl SlimTransport for LoopbackTransport {
 // MockBackend
 // ---------------------------------------------------------------------------
 
-/// [`AudioBackend`] that records what it was told. Accepts exactly the sample rates in
-/// [`crate::clock_table::VERIFIED_RATES`]. Has hardware volume like the device unless
+/// [`AudioBackend`] that records what it was told. Accepts exactly the sample
+/// rates in
+/// [`crate::clock_table::VERIFIED_RATES`]. Has hardware volume like the device
+/// unless
 /// `hw_volume` is cleared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockBackend {
@@ -281,7 +341,14 @@ pub struct MockBackend {
 
 impl Default for MockBackend {
     fn default() -> Self {
-        Self { rate: 0, muted: false, powered: false, hw_vol: (0, 0), outstanding: 0, hw_volume: true }
+        Self {
+            rate: 0,
+            muted: false,
+            powered: false,
+            hw_vol: (0, 0),
+            outstanding: 0,
+            hw_volume: true,
+        }
     }
 }
 
@@ -325,7 +392,8 @@ impl AudioBackend for MockBackend {
 // FakeStreamSource
 // ---------------------------------------------------------------------------
 
-/// Scripted server response: each segment models the bytes of one TCP read, so tests can split
+/// Scripted server response: each segment models the bytes of one TCP read, so
+/// tests can split
 /// headers, chunk framing and ICY blocks at arbitrary points.
 pub type Segments = &'static [&'static [u8]];
 
@@ -354,7 +422,11 @@ enum ChunkState {
     End,
 }
 
-const CHUNK_START: ChunkState = ChunkState::Size { acc: 0, digits: false, ext: false };
+const CHUNK_START: ChunkState = ChunkState::Size {
+    acc: 0,
+    digits: false,
+    ext: false,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IcyState {
@@ -363,11 +435,14 @@ enum IcyState {
     Meta { remaining: usize },
 }
 
-/// In-memory [`StreamSource`] that plays back scripted HTTP responses selected by the request
-/// path. It simulates redirect following, header capture, chunked decoding and ICY stripping at
+/// In-memory [`StreamSource`] that plays back scripted HTTP responses selected
+/// by the request
+/// path. It simulates redirect following, header capture, chunked decoding and
+/// ICY stripping at
 /// wire level, delivering at most one scripted segment per `poll_bytes` call.
 ///
-/// Unknown paths behave like a `404` ([`StreamError::BadResponse`]). The connect address is
+/// Unknown paths behave like a `404` ([`StreamError::BadResponse`]). The
+/// connect address is
 /// recorded but otherwise ignored; `Location` values are resolved by path only.
 pub struct FakeStreamSource {
     routes: Vec<Route, MAX_ROUTES>,
@@ -418,7 +493,8 @@ impl FakeStreamSource {
         }
     }
 
-    /// Fake serving [`conformance::ROUTES`], the data [`run_stream_source_conformance`] expects.
+    /// Fake serving [`conformance::ROUTES`], the data
+    /// [`run_stream_source_conformance`] expects.
     pub fn with_conformance_routes() -> Self {
         let mut s = Self::new();
         for &(path, segments) in conformance::ROUTES {
@@ -427,7 +503,8 @@ impl FakeStreamSource {
         s
     }
 
-    /// Scripts the response for requests to `path`. Returns `false` if the route table is full.
+    /// Scripts the response for requests to `path`. Returns `false` if the route
+    /// table is full.
     pub fn add_route(&mut self, path: &'static [u8], segments: Segments) -> bool {
         self.routes.push(Route { path, segments }).is_ok()
     }
@@ -466,7 +543,13 @@ impl FakeStreamSource {
                         ChunkState::Data(acc)
                     };
                 }
-                b';' => self.chunk = ChunkState::Size { acc, digits, ext: true },
+                b';' => {
+                    self.chunk = ChunkState::Size {
+                        acc,
+                        digits,
+                        ext: true,
+                    }
+                }
                 _ if ext => {}
                 _ => {
                     let d = (b as char).to_digit(16).ok_or(StreamError::BadResponse)? as usize;
@@ -474,11 +557,19 @@ impl FakeStreamSource {
                     if acc > MAX_CHUNK_SIZE {
                         return Err(StreamError::BadResponse);
                     }
-                    self.chunk = ChunkState::Size { acc, digits: true, ext };
+                    self.chunk = ChunkState::Size {
+                        acc,
+                        digits: true,
+                        ext,
+                    };
                 }
             },
             ChunkState::Data(rem) => {
-                self.chunk = if rem == 1 { ChunkState::DataCr } else { ChunkState::Data(rem - 1) };
+                self.chunk = if rem == 1 {
+                    ChunkState::DataCr
+                } else {
+                    ChunkState::Data(rem - 1)
+                };
                 return Ok(Some(b));
             }
             ChunkState::DataCr => match b {
@@ -490,7 +581,11 @@ impl FakeStreamSource {
                 b'\r' => {}
                 b'\n' if line_len == 0 => self.chunk = ChunkState::End,
                 b'\n' => self.chunk = ChunkState::Trailer { line_len: 0 },
-                _ => self.chunk = ChunkState::Trailer { line_len: line_len + 1 },
+                _ => {
+                    self.chunk = ChunkState::Trailer {
+                        line_len: line_len + 1,
+                    }
+                }
             },
             ChunkState::End => {}
         }
@@ -525,14 +620,20 @@ impl FakeStreamSource {
                 // Every ICY block (<= 4080 bytes) fits the capacity; push cannot fail.
                 let _ = self.icy_accum.push(b);
                 if remaining == 1 {
-                    let end = self.icy_accum.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+                    let end = self
+                        .icy_accum
+                        .iter()
+                        .rposition(|&c| c != 0)
+                        .map_or(0, |i| i + 1);
                     if end > 0 {
                         self.icy_meta = Vec::from_slice(&self.icy_accum[..end]).ok();
                     }
                     self.icy_remaining = self.icy_metaint;
                     self.icy_state = IcyState::Audio;
                 } else {
-                    self.icy_state = IcyState::Meta { remaining: remaining - 1 };
+                    self.icy_state = IcyState::Meta {
+                        remaining: remaining - 1,
+                    };
                 }
                 None
             }
@@ -541,7 +642,8 @@ impl FakeStreamSource {
 }
 
 impl FakeStreamSource {
-    /// Request/redirect loop of `connect`. The response head is accumulated in `self.headers`
+    /// Request/redirect loop of `connect`. The response head is accumulated in
+    /// `self.headers`
     /// (no head-sized stack buffer); the caller clears it on error.
     fn follow_routes(&mut self, http_request: &[u8]) -> Result<(), StreamError> {
         let mut path: Vec<u8, 128> =
@@ -628,11 +730,14 @@ fn trim(mut s: &[u8]) -> &[u8] {
     s
 }
 
-/// Value of header `name` (case-insensitive) in a raw header block, whitespace-trimmed.
+/// Value of header `name` (case-insensitive) in a raw header block,
+/// whitespace-trimmed.
 fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     headers.split(|&b| b == b'\n').skip(1).find_map(|line| {
         let colon = line.iter().position(|&b| b == b':')?;
-        trim(&line[..colon]).eq_ignore_ascii_case(name).then(|| trim(&line[colon + 1..]))
+        trim(&line[..colon])
+            .eq_ignore_ascii_case(name)
+            .then(|| trim(&line[colon + 1..]))
     })
 }
 
@@ -662,7 +767,9 @@ fn location_path(loc: &[u8]) -> &[u8] {
     match loc.windows(3).position(|w| w == b"://") {
         Some(i) => {
             let rest = &loc[i + 3..];
-            rest.iter().position(|&b| b == b'/').map_or(&b"/"[..], |p| &rest[p..])
+            rest.iter()
+                .position(|&b| b == b'/')
+                .map_or(&b"/"[..], |p| &rest[p..])
         }
         None => loc,
     }
@@ -708,7 +815,11 @@ impl StreamSource for FakeStreamSource {
         while self.seg_off < seg.len() && n < out.len() && self.chunk != ChunkState::End {
             let b = seg[self.seg_off];
             self.seg_off += 1;
-            let payload = if self.chunked { self.chunk_step(b)? } else { Some(b) };
+            let payload = if self.chunked {
+                self.chunk_step(b)?
+            } else {
+                Some(b)
+            };
             if let Some(audio) = payload.and_then(|p| self.icy_step(p)) {
                 out[n] = audio;
                 n += 1;
@@ -756,7 +867,10 @@ impl StreamSource for FakeStreamSource {
 mod tests {
     use super::*;
 
-    const ADDR: NetAddr = NetAddr { ip: [127, 0, 0, 1], port: 80 };
+    const ADDR: NetAddr = NetAddr {
+        ip: [127, 0, 0, 1],
+        port: 80,
+    };
 
     fn read_all(s: &mut FakeStreamSource) -> std::vec::Vec<u8> {
         let mut body = std::vec::Vec::new();
@@ -780,13 +894,19 @@ mod tests {
 
     #[test]
     fn request_path_second_token() {
-        assert_eq!(request_path(b"GET /x?y=1 HTTP/1.0\r\n\r\n"), Some(&b"/x?y=1"[..]));
+        assert_eq!(
+            request_path(b"GET /x?y=1 HTTP/1.0\r\n\r\n"),
+            Some(&b"/x?y=1"[..])
+        );
         assert_eq!(request_path(b"GET"), None);
     }
 
     #[test]
     fn icy_metaint_header_is_honoured_without_set_call() {
-        static SEGS: Segments = &[b"HTTP/1.0 200 OK\r\nIcy-MetaInt: 4\r\n\r\nabcd\x01Hi\0\0\0\0\0\0\0\0\0\0\0\0\0\0wxyz\0"];
+        static SEGS: Segments = &[
+            b"HTTP/1.0 200 OK\r\nIcy-MetaInt: 4\r\n\r\n\
+              abcd\x01Hi\0\0\0\0\0\0\0\0\0\0\0\0\0\0wxyz\0",
+        ];
         let mut s = FakeStreamSource::new();
         assert!(s.add_route(b"/i", SEGS));
         s.connect(ADDR, b"GET /i HTTP/1.0\r\n\r\n").unwrap();
@@ -810,7 +930,8 @@ mod tests {
 
     #[test]
     fn truncated_chunked_stream_is_disconnected_not_eof() {
-        static SEGS: Segments = &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcd"];
+        static SEGS: Segments =
+            &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcd"];
         let mut s = FakeStreamSource::new();
         assert!(s.add_route(b"/t", SEGS));
         s.connect(ADDR, b"GET /t HTTP/1.1\r\n\r\n").unwrap();
@@ -837,8 +958,14 @@ mod tests {
         let mut s = FakeStreamSource::new();
         assert!(s.add_route(b"/n", NOLOC));
         assert!(s.add_route(b"/g", GONE));
-        assert_eq!(s.connect(ADDR, b"GET /n HTTP/1.0\r\n\r\n"), Err(StreamError::BadResponse));
-        assert_eq!(s.connect(ADDR, b"GET /g HTTP/1.0\r\n\r\n"), Err(StreamError::BadResponse));
+        assert_eq!(
+            s.connect(ADDR, b"GET /n HTTP/1.0\r\n\r\n"),
+            Err(StreamError::BadResponse)
+        );
+        assert_eq!(
+            s.connect(ADDR, b"GET /g HTTP/1.0\r\n\r\n"),
+            Err(StreamError::BadResponse)
+        );
     }
 
     #[test]
@@ -858,7 +985,10 @@ mod tests {
         }
         assert_eq!(t.send(b"x"), Err(TransportError::WouldBlock));
         assert_eq!(t.sent_len(), LOOPBACK_QUEUE_DEPTH);
-        assert_eq!(t.send(&[0u8; LOOPBACK_FRAME_CAP + 1]), Err(TransportError::Io));
+        assert_eq!(
+            t.send(&[0u8; LOOPBACK_FRAME_CAP + 1]),
+            Err(TransportError::Io)
+        );
         t.disconnect();
         t.reconnect();
         assert!(t.connected());

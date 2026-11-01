@@ -1,10 +1,14 @@
 //! Louder-ESP32-Plus Application Entrypoint
 //!
 //! Initializes board hardware profiles, starts audio streaming pipeline,
-//! and orchestrates SlimProto network connection with TAS5805M/TAS5825M digital amplifier.
+//! and orchestrates SlimProto network connection with TAS5805M/TAS5825M
+//! digital amplifier.
 #![cfg_attr(target_arch = "xtensa", no_std)]
 #![cfg_attr(target_arch = "xtensa", no_main)]
-#![cfg_attr(all(target_arch = "xtensa", not(feature = "esp-rtos-core1")), feature(asm_experimental_arch))]
+#![cfg_attr(
+    all(target_arch = "xtensa", not(feature = "esp-rtos-core1")),
+    feature(asm_experimental_arch)
+)]
 #![cfg_attr(not(target_arch = "xtensa"), forbid(unsafe_code))]
 #![cfg_attr(target_arch = "xtensa", deny(unsafe_code))]
 #![allow(unknown_lints)]
@@ -12,37 +16,58 @@
 #[cfg(not(target_arch = "xtensa"))]
 use embedded_hal::i2c::I2c;
 #[cfg(not(target_arch = "xtensa"))]
+use louder_esp32_app::board::first_boot_defaults;
+#[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::board::{pins, BoardModel};
 #[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::hal::BitDepth;
-use louder_esp32_app::hal::{EspI2sSink, UartPort};
 #[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::hal::LoopbackI2sDma;
+use louder_esp32_app::hal::{EspI2sSink, UartPort};
+#[cfg(not(target_arch = "xtensa"))]
+use louder_esp32_app::io_traits::MockBackend;
 use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
-use louder_esp32_app::{AmpManager, CydUartBridge, PlayerCoordinator};
 #[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::AudioOutputSink;
+#[cfg(any(target_arch = "xtensa", test))]
+use louder_esp32_app::AudioSource;
+use louder_esp32_app::{AmpManager, CydUartBridge, PlayerCoordinator};
 #[cfg(not(target_arch = "xtensa"))]
 use louder_esp32_app::{
     CydMessage, HttpAudioStream, LoopbackUartPort, MemConfigStore, MemFlashPartition,
     NvsFlashBackend, PlayState, SlimprotoClient, TargetI2cBus,
 };
 #[cfg(not(target_arch = "xtensa"))]
-use louder_esp32_app::io_traits::MockBackend;
-#[cfg(not(target_arch = "xtensa"))]
-use louder_esp32_app::board::first_boot_defaults;
-#[cfg(not(target_arch = "xtensa"))]
 use squeezelite_config::AudioConfig;
 #[cfg(not(target_arch = "xtensa"))]
 use squeezelite_decoders::PcmDecoder;
 
+#[cfg_attr(target_arch = "xtensa", allow(dead_code))]
 mod tasks;
 
-/// Executes one integrated firmware tick across the CYD UART bridge, audio pipeline,
-/// and digital amplifier health monitor (`HALNET-409`).
+/// SqueezeESP32 HELO capability string broadcasted to LMS server during
+/// SlimProto handshake (`WO-155`).
+pub const BASEMENT_HELO_CAPABILITIES: &str = concat!(
+    "Model=SqueezeESP32,ModelName=SqueezeESP32,AccuratePlayPoints=1,",
+    "HasDigitalOut=1,MaxSampleRate=96000,flc,pcm,wav,aif,mp3,aac,ogg,alc,ops"
+);
+
+/// Encodes ESP32 I2S0_CLKM_CONF_REG fractional divider fields
+/// (ESP32 TRM Reg 12.6, CODE-MAIN-001):
+/// - bits [7:0] = div_num (integral divider)
+/// - bits [13:8] = div_b (fractional numerator)
+/// - bits [19:14] = div_a (fractional denominator)
+#[must_use]
+pub const fn encode_i2s0_clkm_conf(orig: u32, div_num: u32, div_b: u32, div_a: u32) -> u32 {
+    (orig & !0x000F_FFFF) | (div_num & 0xFF) | ((div_b & 0x3F) << 8) | ((div_a & 0x3F) << 14)
+}
+
+/// Executes one integrated firmware tick across the CYD UART bridge,
+/// audio pipeline, and digital amplifier health monitor (`HALNET-409`).
 ///
-/// Host only: on the device the same steps now run as embassy phases (`tasks.rs`: `cyd_bridge`
-/// command poll, `i2s_feed` DMA-first top-up, `decode_pump` burst, `i2s_feed` final top-up).
+/// Host only: on the device the same steps now run as embassy phases
+/// (`tasks.rs`: `cyd_bridge` command poll, `i2s_feed` DMA-first top-up,
+/// `decode_pump` burst, `i2s_feed` final top-up).
 #[cfg(not(target_arch = "xtensa"))]
 pub fn run_firmware_tick<S, U, I>(
     coordinator: &mut PlayerCoordinator,
@@ -58,8 +83,9 @@ where
     run_firmware_tick_with_network(coordinator, pipeline, cyd_bridge, amp, None, 0)
 }
 
-/// Host network I/O driven by [`run_firmware_tick_with_network`]: the SlimProto control
-/// connection, the HTTP audio stream and the (simulated) audio backend.
+/// Host network I/O driven by [`run_firmware_tick_with_network`]: the
+/// SlimProto control connection, the HTTP audio stream and the (simulated)
+/// audio backend.
 #[cfg(not(target_arch = "xtensa"))]
 pub struct HostNet<'a> {
     pub client: &'a mut SlimprotoClient,
@@ -68,7 +94,8 @@ pub struct HostNet<'a> {
 }
 
 /// Executes one integrated firmware tick with SlimProto network integration,
-/// dynamic sample rate synchronization, DAC amplifier pause, and hardware fault recovery (`RUST-19`).
+/// dynamic sample rate synchronization, DAC amplifier pause, and hardware
+/// fault recovery (`RUST-19`).
 #[cfg(not(target_arch = "xtensa"))]
 pub fn run_firmware_tick_with_network<S, U, I>(
     coordinator: &mut PlayerCoordinator,
@@ -84,9 +111,12 @@ where
     I: I2c,
 {
     if let Ok(Some(cmd)) = cyd_bridge.poll_command() {
-        // The host backend when there is one, else a stand-in with no hardware volume, so the
-        // level goes into the software gain (C output_embedded.c:120-124).
-        let mut no_hw = MockBackend { hw_volume: false, ..MockBackend::default() };
+        // The host backend when there is one, else a stand-in with no hardware
+        // volume, so the level goes into the software gain (C output_embedded.c).
+        let mut no_hw = MockBackend {
+            hw_volume: false,
+            ..MockBackend::default()
+        };
         let backend: &mut MockBackend = match &mut net {
             Some(net) => net.backend,
             None => &mut no_hw,
@@ -121,20 +151,39 @@ where
     frames
 }
 
-// Moved to the library (`amp`) so the shared coordinator can map `audg` onto the TAS volume
-// registers through `AudioBackend::set_hw_volume` (Task 7); re-exported for existing callers.
-pub use louder_esp32_app::amp::{lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg};
+// Moved to the library (`amp`) so the shared coordinator can map `audg` onto
+// the TAS volume registers through `AudioBackend::set_hw_volume` (Task 7);
+// re-exported for existing callers.
+pub use louder_esp32_app::amp::{
+    lms_gain_to_hardware_volume_percent, lms_gain_to_tas5805m_vol_reg,
+};
 
 #[cfg(not(target_arch = "xtensa"))]
 fn main() {
     let board = BoardModel::active();
     println!("========================================================");
-    println!("  Starting Pure-Rust Squeezelite Engine on {}", board.name());
+    println!(
+        "  Starting Pure-Rust Squeezelite Engine on {}",
+        board.name()
+    );
     println!("========================================================");
     println!("Hardware Pin Configuration:");
-    println!("  - I2S Master Audio: BCLK={}, LRCLK={}, DOUT={}", pins::I2S_BCLK, pins::I2S_LRCLK, pins::I2S_DOUT);
-    println!("  - I2C Amp Control:  SDA={}, SCL={}", pins::I2C_SDA, pins::I2C_SCL);
-    println!("  - TAS58xx Power:    PWDN={}, FAULT={}", pins::TAS58XX_PWDN, pins::TAS58XX_FAULT);
+    println!(
+        "  - I2S Master Audio: BCLK={}, LRCLK={}, DOUT={}",
+        pins::I2S_BCLK,
+        pins::I2S_LRCLK,
+        pins::I2S_DOUT
+    );
+    println!(
+        "  - I2C Amp Control:  SDA={}, SCL={}",
+        pins::I2C_SDA,
+        pins::I2C_SCL
+    );
+    println!(
+        "  - TAS58xx Power:    PWDN={}, FAULT={}",
+        pins::TAS58XX_PWDN,
+        pins::TAS58XX_FAULT
+    );
     println!("--------------------------------------------------------");
 
     // 1. Dual-Sector Flash NVS Backend & Configuration Storage (INFRA-801)
@@ -157,32 +206,42 @@ fn main() {
             audio_cfg.lms_server_ip = Some(ip.octets());
         }
     }
-    audio_cfg.save_to(&mut config_store).expect("Failed to serialize AudioConfig");
+    audio_cfg
+        .save_to(&mut config_store)
+        .expect("Failed to serialize AudioConfig");
 
-    let initial_seq = nvs_backend.commit_store(&config_store).expect("Failed to commit dual-sector NVS");
+    let initial_seq = nvs_backend
+        .commit_store(&config_store)
+        .expect("Failed to commit dual-sector NVS");
     println!("Dual-Sector Flash NVS Backend:");
     println!("  - Active Sector Sequence: {}", initial_seq);
     println!("  - Key-Value Entries:      {}", config_store.len());
 
     // Verify persistence across dual-sector flash journal
     let mut verify_store = MemConfigStore::<16>::new();
-    nvs_backend.load_store(&mut verify_store).expect("Failed to reload from dual-sector flash");
-    let verified_audio = AudioConfig::load_from(&verify_store).expect("Failed to deserialize AudioConfig");
+    nvs_backend
+        .load_store(&mut verify_store)
+        .expect("Failed to reload from dual-sector flash");
+    let verified_audio =
+        AudioConfig::load_from(&verify_store).expect("Failed to deserialize AudioConfig");
     println!("  - Verified Node Name:     {}", verified_audio.player_name);
     println!("--------------------------------------------------------");
 
-    // 2. Hardware/Target I2C Bus Adapter and TAS5805M Amplifier Lifecycle Manager
+    // 2. Hardware/Target I2C Bus Adapter and TAS5805M Amplifier Lifecycle
     let i2c_bus = TargetI2cBus::new();
     let mut amp = AmpManager::for_active_board(i2c_bus);
-    amp.initialize(BitDepth::Bits32.bits()).expect("Failed to initialize TAS5805M amplifier");
-    amp.start_playback_via_hiz().expect("Failed to start playback mode via Hi-Z on TAS5805M");
+    amp.initialize(BitDepth::Bits32.bits())
+        .expect("Failed to initialize TAS5805M amplifier");
+    amp.start_playback_via_hiz()
+        .expect("Failed to start playback mode via Hi-Z on TAS5805M");
     println!("TAS5805M Digital Amplifier Subsystem:");
     println!("  - Mode:         {:?}", amp.mode());
     println!("  - Volume:       -24 dB (0x{:02X})", amp.current_volume());
     println!("  - Fault Status: {:?}", amp.check_faults().unwrap_or(None));
     println!("--------------------------------------------------------");
 
-    // 3. Allocate heap-backed audio stream and output buffers (APP-001: avoid FreeRTOS task stack overflow)
+    // 3. Allocate heap-backed audio stream and output buffers
+    // (APP-001: avoid FreeRTOS task stack overflow).
     let mut stream_storage = vec![0u8; 64 * 1024]; // 64 KB heap stream buffer
     let mut output_storage = vec![0u8; 64 * 1024]; // 64 KB heap output buffer
 
@@ -199,7 +258,8 @@ fn main() {
         44100,
     );
 
-    // 4. Host demo MAC: a deterministic test MAC per board (the device uses its efuse STA MAC).
+    // 4. Host demo MAC: a deterministic test MAC per board (the device uses
+    // its efuse STA MAC).
     let mac = {
         let suffix = match board {
             BoardModel::LouderEsp32Wrover => 0x01,
@@ -209,15 +269,26 @@ fn main() {
     };
     let mut coordinator = PlayerCoordinator::new(mac, board.name());
     coordinator.player_name.clear();
-    let safe_name_len = audio_cfg.player_name.floor_char_boundary(64.min(audio_cfg.player_name.len()));
-    let _ = coordinator.player_name.push_str(&audio_cfg.player_name[..safe_name_len]);
+    let safe_name_len = audio_cfg
+        .player_name
+        .floor_char_boundary(64.min(audio_cfg.player_name.len()));
+    let _ = coordinator
+        .player_name
+        .push_str(&audio_cfg.player_name[..safe_name_len]);
 
     println!("Player Coordinator initialized:");
     println!("  - State:       {:?}", coordinator.state);
     println!("  - Node Name:   {}", audio_cfg.player_name);
-    println!("  - MAC Address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    println!(
+        "  - MAC Address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
     println!("  - Sample Rate: {} Hz", pipeline.sample_rate);
-    println!("  - Buffers:     {} bytes stream, {} bytes output", pipeline.stream_buffer_available(), pipeline.output_buffer_available());
+    println!(
+        "  - Buffers:     {} bytes stream, {} bytes output",
+        pipeline.stream_buffer_available(),
+        pipeline.output_buffer_available()
+    );
     println!("--------------------------------------------------------");
 
     // 5. Initialize Wi-Fi Manager and check persistent configuration
@@ -242,24 +313,46 @@ fn main() {
     println!("--------------------------------------------------------");
     println!("Ready for LMS auto-discovery on UDP 3483...");
 
-    // 7. Optional Live LMS Network Connection & Firmware Tick Execution Loop (HALNET-409, HW-PREP-05)
-    let lms_ip = std::net::Ipv4Addr::from(audio_cfg.lms_server_ip.unwrap_or(first_boot_defaults::LMS_SERVER_IP));
-    let lms_port = audio_cfg.lms_server_port.unwrap_or(first_boot_defaults::LMS_SERVER_PORT);
+    // 7. Optional Live LMS Network Connection & Firmware Tick Execution Loop
+    let lms_ip = std::net::Ipv4Addr::from(
+        audio_cfg
+            .lms_server_ip
+            .unwrap_or(first_boot_defaults::LMS_SERVER_IP),
+    );
+    let lms_port = audio_cfg
+        .lms_server_port
+        .unwrap_or(first_boot_defaults::LMS_SERVER_PORT);
     let lms_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(lms_ip, lms_port));
 
-    let should_connect = std::env::var("SL_LMS_CONNECT").as_deref() == Ok("1") || cfg!(target_arch = "xtensa");
+    let should_connect =
+        std::env::var("SL_LMS_CONNECT").as_deref() == Ok("1") || cfg!(target_arch = "xtensa");
     let mut client = if should_connect {
         println!("Connecting SlimProto client to {}...", lms_addr);
-        match SlimprotoClient::connect_with_options(lms_addr, mac, audio_cfg.player_name.as_str(), false, 0) {
+        match SlimprotoClient::connect_with_options(
+            lms_addr,
+            mac,
+            audio_cfg.player_name.as_str(),
+            false,
+            0,
+        ) {
             Ok(c) => {
-                println!("SlimProto client successfully connected to {} for player '{}'", lms_addr, audio_cfg.player_name);
+                println!(
+                    "SlimProto client successfully connected to {} for player '{}'",
+                    lms_addr, audio_cfg.player_name
+                );
                 Some(c)
             }
             Err(e) => {
                 if std::env::var("SL_LMS_CONNECT").as_deref() == Ok("1") {
-                    panic!("Failed to connect SlimProto client to {}: {:?}", lms_addr, e);
+                    panic!(
+                        "Failed to connect SlimProto client to {}: {:?}",
+                        lms_addr, e
+                    );
                 } else {
-                    eprintln!("Warning: Failed to connect SlimProto client to {}: {:?}", lms_addr, e);
+                    eprintln!(
+                        "Warning: Failed to connect SlimProto client to {}: {:?}",
+                        lms_addr, e
+                    );
                     None
                 }
             }
@@ -288,7 +381,10 @@ fn main() {
             now_ms,
         );
         if client.is_some() {
-            println!("  [Tick {:02}] frames={}, state={:?}", tick, frames, coordinator.state);
+            println!(
+                "  [Tick {:02}] frames={}, state={:?}",
+                tick, frames, coordinator.state
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -299,24 +395,25 @@ mod xtensa_hw {
     extern crate alloc;
 
     use super::*;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Waker};
     use embedded_hal::i2c::{ErrorType, I2c, Operation};
     use esp_backtrace as _;
-    use crate::tasks::{FirmwareState, Shared, UDP_PLACEHOLDER_SOCKETS};
-    use esp_hal::{
-        clock::CpuClock,
-        efuse::{interface_mac_address, InterfaceMacAddress},
-        gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
-        i2c::master::{Config as I2cConfig, I2c as HalI2c},
-        i2s::master::{Channels, DataFormat, I2s, TdmConfig},
-        rng::Rng,
-        system::{CpuControl, Stack},
-        time::{Duration, Instant, Rate},
-        timer::timg::{MwdtStage, TimerGroup},
-        uart::{Config as UartConfig, Uart},
-    };
+    use esp_hal::clock::CpuClock;
+    use esp_hal::efuse::{interface_mac_address, InterfaceMacAddress};
+    use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+    use esp_hal::i2c::master::{Config as I2cConfig, I2c as HalI2c};
+    use esp_hal::i2s::master::{Channels, DataFormat, I2s, TdmConfig};
+    use esp_hal::rng::Rng;
+    use esp_hal::system::{CpuControl, Stack};
+    use esp_hal::time::{Duration, Instant, Rate};
+    use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
+    use esp_hal::uart::{Config as UartConfig, Uart};
     use esp_println::println;
+    use esp_radio::wifi::sta::StationConfig;
     use esp_radio::wifi::{
-        sta::StationConfig, AuthenticationMethodConfig, Config as WifiModeConfig, ControllerConfig,
+        AuthenticationMethodConfig, Config as WifiModeConfig, ControllerConfig,
         Interface as WifiInterface, PowerSaveMode, WifiController, WifiRxToken, WifiTxToken,
     };
     use esp_storage::FlashStorage;
@@ -325,35 +422,55 @@ mod xtensa_hw {
         I2S0_SAMPLE_RATE_CONF_ADDR,
     };
     use louder_esp32_app::board::first_boot_defaults;
+    use louder_esp32_app::bt_a2dp::BtA2dpSink;
     use louder_esp32_app::config_handle::{
-        resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigSource, JournalSector,
-        FlashTargetPolicy, JournalSlot, RamJournal,
+        resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigSource, ConfigWriter,
+        FlashTargetPolicy, JournalSector, JournalSlot, RamJournal,
     };
-    use louder_esp32_app::net_device::{HttpStreamState, SlimLinkState, SlimReconnect};
     use louder_esp32_app::hal::I2sDmaDriver;
-    use louder_esp32_app::http_control::{DeadManLeaseWatchdog, HttpControlAction};
-    use squeezelite_audio_core::EqPreset;
-    use squeezelite_config::{FlashJournal, JournalView};
-    use squeezelite_cyd_link::CydMessage;
+    use louder_esp32_app::http_control::{
+        handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
+        LeaseHealth,
+    };
+    use louder_esp32_app::io_traits::{NetAddr, SlimTransport};
+    use louder_esp32_app::net_device::{
+        HttpStreamState, SlimLinkState, SlimReconnect, SmoltcpSlimTransport, SmoltcpStreamSource,
+        TcpPhase, TcpSocketOps,
+    };
     use louder_esp32_app::ota_safety::{
         load_nvs_wifi_credentials_split_12kb, resolve_wifi_credentials, verify_otadata_erased,
-        OtaSafetyError, WifiStaCredentials, OTADATA_PARTITION_END, OTADATA_PARTITION_OFFSET,
-        OTADATA_SECTOR_1_OFFSET,
+        OtaSafetyError, OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_END,
+        OTADATA_PARTITION_OFFSET, OTADATA_SECTOR_1_OFFSET, SETTINGS_JOURNAL_OFFSET,
     };
+    use louder_esp32_app::PlayerState;
     use smoltcp::iface::{
-        Config as SmolIfaceConfig, Interface as SmolInterface, SocketHandle, SocketSet, SocketStorage,
+        Config as SmolIfaceConfig, Context as SmolContext, Interface as SmolInterface,
+        SocketHandle, SocketSet, SocketStorage,
     };
-    use static_cell::{ConstStaticCell, StaticCell};
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-    use smoltcp::socket::{dhcpv4, tcp, udp};
-    use smoltcp::time::Instant as SmolInstant;
-    use smoltcp::wire::{EthernetAddress, HardwareAddress};
+    use smoltcp::socket::{dhcpv4, tcp, udp, AnySocket};
+    use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
+    use smoltcp::wire::{
+        EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    };
     use squeezelite_audio_core::output::OutputError;
+    use squeezelite_audio_core::EqPreset;
+    use squeezelite_config::{FlashJournal, JournalView};
+    use squeezelite_cspot::spirc::{SpircEvent, SpircFrame, SpircStateMachine};
+    use squeezelite_cspot::zeroconf::{SpotifyMdnsBuilder, SpotifyMdnsConfig};
+    use squeezelite_cyd_link::CydMessage;
     use squeezelite_decoders::PcmDecoder;
+    use squeezelite_proto::SlimprotoBuilder;
+    use squeezelite_raop::crypto::airport_express_key;
+    use squeezelite_raop::mdns::{MdnsBuilder, MdnsConfig};
+    use squeezelite_raop::rtp::RtpAudioReceiver;
+    use squeezelite_raop::rtsp::{RtspMethod, RtspRequest, RtspServer, ServerState};
     use squeezelite_tas58xx::{registers, VOL_UNITY_0DB};
+    use static_cell::{ConstStaticCell, StaticCell};
 
-    // Mandatory Squeezelite-ESP32 OTA binary descriptor (`squeezelite-ota.c:663`).
-    // Sets `project_name = "Squeezelite-ESP32"` and `version = "I2S-4MFlash-Rust"` at offset 0x20.
+    // Mandatory Squeezelite-ESP32 OTA binary descriptor (`squeezelite-ota.c`).
+    // Sets `project_name = "Squeezelite-ESP32"` and
+    // `version = "I2S-4MFlash-Rust"` at offset 0x20.
     esp_bootloader_esp_idf::esp_app_desc!(
         "I2S-4MFlash-Rust",
         "Squeezelite-ESP32",
@@ -366,22 +483,24 @@ mod xtensa_hw {
         0
     );
 
-    // Gate 2: Custom panic halt hook that resets immediately into factory recovery (`0x10000`)
-    // instead of spinning in `loop {}`.
+    // Gate 2: Custom panic halt hook that resets immediately into factory
+    // recovery (`0x10000`) instead of spinning in `loop {}`.
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     pub extern "Rust" fn custom_halt() -> ! {
-        println!("[ANTI-BRICK GATE 2] Panic halted -> executing software_reset() to boot recovery (0x10000)");
+        println!("[ANTI-BRICK GATE 2] Panic halted -> reset to recovery (0x10000)");
         esp_hal::system::software_reset()
     }
 
     static HW_ACK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    /// Per-operation NACK counters (`/status.json` `i2c_nack_by_op`, spec §4.8). Counting only:
-    /// each replaces the single total counter's increment at the same place, so the bus
-    /// behaviour is unchanged and the total (`i2c_nacks`) is their sum.
+    /// Per-operation NACK counters (`/status.json` `i2c_nack_by_op`, spec
+    /// §4.8). Counting only: each replaces the single total counter's
+    /// increment at the same place, so the bus behaviour is unchanged and the
+    /// total (`i2c_nacks`) is their sum.
     static HW_NACK_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     static HW_NACK_WRITE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    static HW_NACK_WRITE_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static HW_NACK_WRITE_READ: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
 
     pub struct SmolDevice<'a> {
         pub driver: &'a mut WifiInterface,
@@ -390,7 +509,8 @@ mod xtensa_hw {
     pub struct SmolRxToken(pub WifiRxToken);
     pub struct SmolTxToken(pub WifiTxToken);
 
-    /// Matches `esp-radio`'s `ESP_RADIO_CONFIG_WIFI_MTU = 1492` (`src/wifi/mod.rs:117`).
+    /// Matches `esp-radio`'s `ESP_RADIO_CONFIG_WIFI_MTU = 1492`
+    /// (`src/wifi/mod.rs:117`).
     const WIFI_MAX_FRAME_LEN: usize = 1492;
 
     impl RxToken for SmolRxToken {
@@ -412,10 +532,19 @@ mod xtensa_hw {
     }
 
     impl Device for SmolDevice<'_> {
-        type RxToken<'b> = SmolRxToken where Self: 'b;
-        type TxToken<'b> = SmolTxToken where Self: 'b;
+        type RxToken<'b>
+            = SmolRxToken
+        where
+            Self: 'b;
+        type TxToken<'b>
+            = SmolTxToken
+        where
+            Self: 'b;
 
-        fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        fn receive(
+            &mut self,
+            _timestamp: SmolInstant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
             let (rx, tx) = self.driver.receive()?;
             Some((SmolRxToken(rx), SmolTxToken(tx)))
         }
@@ -458,7 +587,8 @@ mod xtensa_hw {
         }
 
         pub fn hw_nack_by_op() -> louder_esp32_app::http_control::I2cNackByOp {
-            let load = |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
+            let load =
+                |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
             louder_esp32_app::http_control::I2cNackByOp {
                 read: load(&HW_NACK_READ),
                 write: load(&HW_NACK_WRITE),
@@ -524,7 +654,12 @@ mod xtensa_hw {
             Ok(())
         }
 
-        fn write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
+        fn write_read(
+            &mut self,
+            address: u8,
+            write: &[u8],
+            read: &mut [u8],
+        ) -> Result<(), Self::Error> {
             if !write.is_empty() {
                 self.current_reg = write[0];
             }
@@ -545,7 +680,11 @@ mod xtensa_hw {
             Ok(())
         }
 
-        fn transaction(&mut self, address: u8, operations: &mut [Operation<'_>]) -> Result<(), Self::Error> {
+        fn transaction(
+            &mut self,
+            address: u8,
+            operations: &mut [Operation<'_>],
+        ) -> Result<(), Self::Error> {
             for op in operations {
                 match op {
                     Operation::Read(buf) => self.read(address, buf)?,
@@ -590,34 +729,40 @@ mod xtensa_hw {
         }
     }
 
-    /// I2S0 clock registers (`backend_device` documents the layout), volatile access.
+    /// I2S0 clock registers (`backend_device` documents the layout), volatile
+    /// access.
     pub(crate) struct DeviceClockRegs;
 
     #[allow(unsafe_code)]
     impl I2sClockRegisters for DeviceClockRegs {
         fn read_clkm_conf(&mut self) -> u32 {
-            // SAFETY: fixed, always-mapped I2S0 register; I2S0 is owned by this firmware.
+            // JUSTIFICATION: Direct volatile read of ESP32 I2S0_CLKM_CONF_REG.
+            // SAFETY: Fixed, always-mapped I2S0 register owned by this firmware.
             unsafe { core::ptr::read_volatile(I2S0_CLKM_CONF_ADDR as *const u32) }
         }
         fn write_clkm_conf(&mut self, value: u32) {
-            // SAFETY: as above.
+            // JUSTIFICATION: Direct volatile write of ESP32 I2S0_CLKM_CONF_REG.
+            // SAFETY: Fixed, always-mapped I2S0 register owned by this firmware.
             unsafe { core::ptr::write_volatile(I2S0_CLKM_CONF_ADDR as *mut u32, value) }
         }
         fn read_sample_rate_conf(&mut self) -> u32 {
-            // SAFETY: as above.
+            // JUSTIFICATION: Direct volatile read of I2S0_SAMPLE_RATE_CONF_REG.
+            // SAFETY: Fixed, always-mapped I2S0 register owned by this firmware.
             unsafe { core::ptr::read_volatile(I2S0_SAMPLE_RATE_CONF_ADDR as *const u32) }
         }
         fn write_sample_rate_conf(&mut self, value: u32) {
-            // SAFETY: as above.
+            // JUSTIFICATION: Direct volatile write of I2S0_SAMPLE_RATE_CONF_REG.
+            // SAFETY: Fixed, always-mapped I2S0 register owned by this firmware.
             unsafe { core::ptr::write_volatile(I2S0_SAMPLE_RATE_CONF_ADDR as *mut u32, value) }
         }
     }
 
-    /// Size of the I2S TX DMA stream buffer (`dma_tx_stream_buffer!` in [`init_i2s_pipeline`]).
+    /// Size of the I2S TX DMA stream buffer (`dma_tx_stream_buffer!` in
+    /// [`init_i2s_pipeline`]).
     const I2S_DMA_BUFFER_BYTES: usize = 8192;
 
-    /// Stereo frames queued in the I2S DMA buffer, updated by the driver after every push
-    /// (`AudioBackend::dma_outstanding_frames`).
+    /// Stereo frames queued in the I2S DMA buffer, updated by the driver after
+    /// every push (`AudioBackend::dma_outstanding_frames`).
     pub(crate) static DMA_OUTSTANDING_FRAMES: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
 
@@ -626,7 +771,8 @@ mod xtensa_hw {
         DMA_OUTSTANDING_FRAMES.store(queued as u32, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Hardware I2S0 + DMA_I2S0 audio output driver (`BCK=GPIO26`, `WS=GPIO25`, `DOUT=GPIO22`).
+    /// Hardware I2S0 + DMA_I2S0 audio output driver (`BCK=GPIO26`,
+    /// `WS=GPIO25`, `DOUT=GPIO22`).
     pub struct Esp32HardwareI2sDma<'d> {
         transfer: Option<
             esp_hal::i2s::master::I2sTxDmaTransfer<
@@ -673,7 +819,8 @@ mod xtensa_hw {
                     let (i2s_tx, buf) = transfer.stop();
                     let (descriptors, mut buffer) = buf.split();
                     buffer.fill(0);
-                    if let Ok(mut new_buf) = esp_hal::dma::DmaTxStreamBuf::new(descriptors, buffer) {
+                    if let Ok(mut new_buf) = esp_hal::dma::DmaTxStreamBuf::new(descriptors, buffer)
+                    {
                         Self::prefill_silence(&mut new_buf);
                         if let Ok(new_transfer) = i2s_tx.write(new_buf) {
                             self.transfer = Some(new_transfer);
@@ -798,9 +945,9 @@ mod xtensa_hw {
             Ok(total_written)
         }
 
-        /// Programs the I2S0 dividers AND the bit-clock divider from the verified clock table
-        /// (`backend_device::program_i2s_clock`); a rate missing from the table is rejected
-        /// without touching the hardware (no 44.1 kHz fallback).
+        /// Programs the I2S0 dividers AND the bit-clock divider from the
+        /// verified clock table (`backend_device::program_i2s_clock`); a rate
+        /// missing from the table is rejected without touching the hardware.
         fn set_clock_rate(&mut self, sample_rate_hz: u32) -> Result<(), OutputError> {
             if self.sample_rate_hz != sample_rate_hz {
                 program_i2s_clock(&mut DeviceClockRegs, sample_rate_hz)
@@ -819,8 +966,9 @@ mod xtensa_hw {
         Instant::now().duration_since_epoch().as_millis()
     }
 
-    /// Boot resolution step 2 (Wi-Fi): the C firmware's NVS at 0x9000, read-only. Boot-time,
-    /// single-core read (APP_CPU is parked and esp-radio not started yet).
+    /// Boot resolution step 2 (Wi-Fi): the C firmware's NVS at 0x9000,
+    /// read-only. Boot-time, single-core read (APP_CPU is parked and esp-radio
+    /// not started yet).
     #[inline(never)]
     fn load_nvs_wifi_credentials(
         flash: &mut FlashStorage<'_>,
@@ -838,12 +986,11 @@ mod xtensa_hw {
         )
     }
 
-    /// Boot resolution of the Wi-Fi STA credentials, Phase 0/1: the C firmware's NVS, else the
-    /// compile-time first-boot credentials; none at all resets into recovery, as before. Journal
-    /// `wifi.*` keys are ignored (Wi-Fi provisioning belongs to the C recovery firmware until
-    /// Phase 3, and no Rust path can write or clear them).
-    /// The result lives in `.dram2_uninit` for the life of the image (`/status.json` shows the
-    /// SSID), keeping it off the boot frame and out of `.bss` (which would shrink `.stack`).
+    /// Boot resolution of the Wi-Fi STA credentials, Phase 0/1: the C
+    /// firmware's NVS, else the compile-time first-boot credentials; none at
+    /// all resets into recovery. The result lives in `.dram2_uninit` for the
+    /// life of the image (`/status.json` shows the SSID), keeping it off the
+    /// boot frame and out of `.bss` (which would shrink `.stack`).
     #[allow(unsafe_code)]
     #[inline(never)]
     fn init_wifi_credentials(
@@ -860,9 +1007,7 @@ mod xtensa_hw {
             || default_wifi_credentials(sta_mac),
         );
         let Some((creds, source)) = resolved else {
-            println!(
-                "[ANTI-BRICK] No Wi-Fi credentials in the settings journal, 0x9000 NVS or the build -> resetting to recovery (0x10000)"
-            );
+            println!("[ANTI-BRICK] No Wi-Fi credentials found -> resetting to recovery (0x10000)");
             esp_hal::system::software_reset();
         };
         let source = match source {
@@ -877,35 +1022,38 @@ mod xtensa_hw {
             source,
             sta_mac
         );
-        // SAFETY: bring-up calls this once, before anything else can name the static; it is
-        // fully written before the only (shared) reference is handed out.
+        // JUSTIFICATION: Store resolved Wi-Fi credentials in DRAM2.
+        // SAFETY: Called once at bring-up before any concurrent access.
         unsafe { &*(*core::ptr::addr_of_mut!(WIFI_STA_CREDS)).write(creds) }
     }
 
-    /// Boot resolution step 3 (Wi-Fi): the compile-time first-boot credentials, only when a
-    /// passphrase was compiled in (`SL_WIFI_PASS`, plain or `enc:`), with `SL_WIFI_SSID` or
-    /// [`first_boot_defaults::WIFI_SSID`].
+    /// Boot resolution step 3 (Wi-Fi): the compile-time first-boot
+    /// credentials, only when a passphrase was compiled in (`SL_WIFI_PASS`,
+    /// plain or `enc:`), with `SL_WIFI_SSID` or [`first_boot_defaults::WIFI_SSID`].
     #[inline(never)]
     fn default_wifi_credentials(sta_mac: &[u8; 6]) -> Option<WifiStaCredentials> {
         let ssid = option_env!("SL_WIFI_SSID").unwrap_or(first_boot_defaults::WIFI_SSID);
         resolve_wifi_credentials(&[], sta_mac, Some(ssid), option_env!("SL_WIFI_PASS")).ok()
     }
 
-    static MP3_DEC_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static MP3_DEC_TAKEN: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
-    /// The firmware's only MP3 decoder (no heap MP3 decoder without `std-codecs`). Taken once at
-    /// bring-up and parked in the pipeline's MP3 slot (`StreamPipeline::mp3_spare`), from where
-    /// the coordinator uses and returns it for every MP3 track.
+    /// The firmware's only MP3 decoder (no heap MP3 decoder without
+    /// `std-codecs`). Taken once at bring-up and parked in the pipeline's MP3
+    /// slot (`StreamPipeline::mp3_spare`), from where the coordinator uses and
+    /// returns it for every MP3 track.
     #[allow(unsafe_code)]
     fn take_static_mp3_decoder() -> &'static mut squeezelite_decoders::StaticMp3Decoder {
         assert!(
             !MP3_DEC_TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
             "StaticMp3Decoder already taken"
         );
-        // SAFETY: Exclusive singleton access to the static MP3 decoder is guaranteed by MP3_DEC_TAKEN check.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_MP3_DEC: squeezelite_decoders::StaticMp3Decoder =
             squeezelite_decoders::StaticMp3Decoder::new();
+        // JUSTIFICATION: Access to global static MP3 decoder singleton in DRAM2.
+        // SAFETY: Exclusive singleton access is guaranteed by MP3_DEC_TAKEN.
         unsafe {
             let dec = &mut *core::ptr::addr_of_mut!(STATIC_MP3_DEC);
             dec.reset_in_place();
@@ -944,7 +1092,7 @@ mod xtensa_hw {
         core::mem::MaybeUninit::uninit();
     #[allow(unsafe_code)]
     #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_SINK: core::mem::MaybeUninit<louder_esp32_app::bt_a2dp::BtA2dpSink> =
+    static mut STATIC_BT_SINK: core::mem::MaybeUninit<BtA2dpSink> =
         core::mem::MaybeUninit::uninit();
 
     pub(crate) struct Esp32VhciTransport<'d> {
@@ -960,7 +1108,8 @@ mod xtensa_hw {
             matches!(self.connector.write(data), Ok(n) if n == data.len())
         }
     }
-    pub(crate) static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    pub(crate) static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
 
     #[cfg(not(feature = "esp-rtos-core1"))]
     #[esp_hal::ram]
@@ -969,6 +1118,8 @@ mod xtensa_hw {
             CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             for _ in 0..10_000 {
                 #[allow(unsafe_code)]
+                // JUSTIFICATION: Inline assembly required for nop delay loop.
+                // SAFETY: nop instruction has no memory or register side effects.
                 unsafe {
                     core::arch::asm!("nop");
                 }
@@ -976,30 +1127,393 @@ mod xtensa_hw {
         }
     }
 
-    use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
+    #[esp_hal::ram]
+    #[allow(unsafe_code)]
+    // JUSTIFICATION: Transmit a single 8-bit PSRAM mode command over SPI1 CS1.
+    // SAFETY: Runs in IRAM while SPI0/SPI1 are idle and restores SPI1 state.
+    unsafe fn psram_send_cmd_spi1(cmd_byte: u32, qpi_mode: bool) {
+        const SPI0_EXT2_REG: *const u32 = 0x3FF4_30F8 as *const u32;
+        const SPI1_CMD_REG: *mut u32 = 0x3FF4_2000 as *mut u32;
+        const SPI1_ADDR_REG: *mut u32 = 0x3FF4_2004 as *mut u32;
+        const SPI1_CTRL_REG: *mut u32 = 0x3FF4_2008 as *mut u32;
+        const SPI1_USER_REG: *mut u32 = 0x3FF4_201C as *mut u32;
+        const SPI1_USER1_REG: *mut u32 = 0x3FF4_2020 as *mut u32;
+        const SPI1_USER2_REG: *mut u32 = 0x3FF4_2024 as *mut u32;
+        const SPI1_MOSI_DLEN_REG: *mut u32 = 0x3FF4_2028 as *mut u32;
+        const SPI1_MISO_DLEN_REG: *mut u32 = 0x3FF4_202C as *mut u32;
+        const SPI1_PIN_REG: *mut u32 = 0x3FF4_2034 as *mut u32;
+        const SPI1_EXT2_REG: *const u32 = 0x3FF4_20F8 as *const u32;
+        const DPORT_HOST_INF_SEL_REG: *mut u32 = 0x3FF0_00BC as *mut u32;
+        const FREAD_MASK: u32 = (1 << 14) | (1 << 20) | (1 << 23) | (1 << 24);
+        const FWRITE_MASK: u32 = 0xF << 12;
 
-    /// Settings flash write target. Default build: sector A (0x3FE000) only, byte-identical to
-    /// the certified pre-reboot write. 0x3FF000 is page 15 of the C firmware's live `settings`
-    /// NVS partition, which the certified build never touched, and a failed C NVS init erases the
-    /// whole partition (`components/platform_config/nvs_utilities.c:97-100`). Boot still reads
-    /// and validates both sectors.
+        // JUSTIFICATION: Direct volatile MMIO access to SPI1 and DPORT registers.
+        // SAFETY: All register addresses are verified ESP32 hardware peripherals.
+        unsafe {
+            while (core::ptr::read_volatile(SPI1_CMD_REG) & (1 << 18)) != 0 {}
+
+            let backup_usr = core::ptr::read_volatile(SPI1_USER_REG);
+            let backup_usr1 = core::ptr::read_volatile(SPI1_USER1_REG);
+            let backup_usr2 = core::ptr::read_volatile(SPI1_USER2_REG);
+
+            let mut usr = backup_usr & !((1 << 31) | (1 << 29) | (1 << 28) | (1 << 27));
+            usr |= 1 << 30;
+            let usr1 = (backup_usr1 & !((0x3F << 26) | 0xFF)) | (7 << 26);
+            let usr2 = backup_usr2 & !(0xF << 28);
+
+            core::ptr::write_volatile(SPI1_USER_REG, usr);
+            core::ptr::write_volatile(SPI1_USER1_REG, usr1);
+            core::ptr::write_volatile(SPI1_USER2_REG, usr2);
+            core::ptr::write_volatile(SPI1_ADDR_REG, cmd_byte << 24);
+            core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 0);
+            core::ptr::write_volatile(SPI1_MISO_DLEN_REG, 0);
+
+            let pin_orig = core::ptr::read_volatile(SPI1_PIN_REG);
+            core::ptr::write_volatile(SPI1_PIN_REG, (pin_orig & !(1 << 1)) | (1 << 0));
+
+            let ctrl_orig = core::ptr::read_volatile(SPI1_CTRL_REG);
+            let rd_mode_backup = ctrl_orig & FREAD_MASK;
+
+            let mut usr_mode = core::ptr::read_volatile(SPI1_USER_REG) & !FWRITE_MASK;
+            let mut ctrl_mode = ctrl_orig & !FREAD_MASK;
+            if qpi_mode {
+                usr_mode |= 1 << 15;
+                ctrl_mode |= 1 << 24;
+            }
+            core::ptr::write_volatile(SPI1_USER_REG, usr_mode);
+            core::ptr::write_volatile(SPI1_CTRL_REG, ctrl_mode);
+
+            while (core::ptr::read_volatile(SPI0_EXT2_REG) & 0x7) != 0 {}
+            while (core::ptr::read_volatile(SPI1_EXT2_REG) & 0x7) != 0 {}
+
+            let inf_sel = core::ptr::read_volatile(DPORT_HOST_INF_SEL_REG);
+            core::ptr::write_volatile(DPORT_HOST_INF_SEL_REG, inf_sel | (1 << 14));
+
+            core::ptr::write_volatile(
+                SPI1_CMD_REG,
+                core::ptr::read_volatile(SPI1_CMD_REG) | (1 << 18),
+            );
+            while (core::ptr::read_volatile(SPI1_CMD_REG) & (1 << 18)) != 0 {}
+
+            core::ptr::write_volatile(
+                DPORT_HOST_INF_SEL_REG,
+                core::ptr::read_volatile(DPORT_HOST_INF_SEL_REG) & !(1 << 14),
+            );
+
+            let ctrl_after = core::ptr::read_volatile(SPI1_CTRL_REG) & !FREAD_MASK;
+            core::ptr::write_volatile(SPI1_CTRL_REG, ctrl_after | rd_mode_backup);
+            core::ptr::write_volatile(SPI1_PIN_REG, (pin_orig | (1 << 1)) & !(1 << 0));
+
+            core::ptr::write_volatile(SPI1_USER_REG, backup_usr);
+            core::ptr::write_volatile(SPI1_USER1_REG, backup_usr1);
+            core::ptr::write_volatile(SPI1_USER2_REG, backup_usr2);
+        }
+    }
+
+    #[esp_hal::ram]
+    #[allow(unsafe_code)]
+    // JUSTIFICATION: Initialize and MMU-map 4 MB ESP32 PSRAM 100% from IRAM.
+    // SAFETY: Avoids all XIP flash instruction/rodata fetches during SPI0 init.
+    unsafe fn init_and_map_psram_4mb() -> usize {
+        extern "C" {
+            fn esp_rom_gpio_connect_out_signal(
+                gpio_num: u32,
+                signal_idx: u32,
+                out_inv: bool,
+                oen_inv: bool,
+            );
+            fn esp_rom_gpio_connect_in_signal(gpio_num: u32, signal_idx: u32, inv: bool);
+            fn esp_rom_spiflash_config_clk(freqdiv: u8, spi: u8) -> i32;
+            fn cache_sram_mmu_set_rom(
+                cpu_no: u32,
+                pid: u32,
+                vaddr: u32,
+                paddr: u32,
+                psize: u32,
+                num: u32,
+            ) -> i32;
+            static mut g_rom_spiflash_dummy_len_plus: u8;
+        }
+
+        const SPI0_CTRL_REG: *mut u32 = 0x3FF4_3008 as *mut u32;
+        const SPI0_CTRL2_REG: *mut u32 = 0x3FF4_3014 as *mut u32;
+        const SPI0_USER_REG: *mut u32 = 0x3FF4_301C as *mut u32;
+        const SPI0_USER1_REG: *mut u32 = 0x3FF4_3020 as *mut u32;
+        const SPI0_PIN_REG: *mut u32 = 0x3FF4_3034 as *mut u32;
+        const SPI0_CACHE_SCTRL_REG: *mut u32 = 0x3FF4_3054 as *mut u32;
+        const SPI0_SRAM_DRD_CMD_REG: *mut u32 = 0x3FF4_305C as *mut u32;
+        const SPI0_SRAM_DWR_CMD_REG: *mut u32 = 0x3FF4_3060 as *mut u32;
+        const SPI0_EXT2_REG: *const u32 = 0x3FF4_30F8 as *const u32;
+        const SPI0_EXT3_REG: *mut u32 = 0x3FF4_30FC as *mut u32;
+        const SPI0_DATE_REG: *mut u32 = 0x3FF4_33FC as *mut u32;
+
+        const SPI1_CMD_REG: *mut u32 = 0x3FF4_2000 as *mut u32;
+        const SPI1_CTRL_REG: *mut u32 = 0x3FF4_2008 as *mut u32;
+        const SPI1_CTRL2_REG: *mut u32 = 0x3FF4_2014 as *mut u32;
+        const SPI1_USER_REG: *mut u32 = 0x3FF4_201C as *mut u32;
+        const SPI1_USER1_REG: *mut u32 = 0x3FF4_2020 as *mut u32;
+        const SPI1_PIN_REG: *mut u32 = 0x3FF4_2034 as *mut u32;
+        const SPI1_SLAVE_REG: *mut u32 = 0x3FF4_2038 as *mut u32;
+        const SPI1_W0_REG: *mut u32 = 0x3FF4_2080 as *mut u32;
+        const SPI1_EXT2_REG: *const u32 = 0x3FF4_20F8 as *const u32;
+
+        const DPORT_PRO_CACHE_CTRL_REG: *mut u32 = 0x3FF0_0040 as *mut u32;
+        const DPORT_PRO_CACHE_CTRL1_REG: *mut u32 = 0x3FF0_0044 as *mut u32;
+        const DPORT_APP_CACHE_CTRL_REG: *mut u32 = 0x3FF0_0058 as *mut u32;
+        const DPORT_APP_CACHE_CTRL1_REG: *mut u32 = 0x3FF0_005C as *mut u32;
+
+        const IO_MUX_GPIO16_REG: *mut u32 = 0x3FF4_904C as *mut u32;
+        const IO_MUX_GPIO17_REG: *mut u32 = 0x3FF4_9050 as *mut u32;
+        const IO_MUX_GPIO9_REG: *mut u32 = 0x3FF4_9054 as *mut u32;
+        const IO_MUX_GPIO10_REG: *mut u32 = 0x3FF4_9058 as *mut u32;
+        const IO_MUX_GPIO11_REG: *mut u32 = 0x3FF4_905C as *mut u32;
+        const IO_MUX_GPIO6_REG: *mut u32 = 0x3FF4_9060 as *mut u32;
+        const IO_MUX_GPIO7_REG: *mut u32 = 0x3FF4_9064 as *mut u32;
+        const IO_MUX_GPIO8_REG: *mut u32 = 0x3FF4_9068 as *mut u32;
+
+        const EXTMEM_ORIGIN: usize = 0x3F80_0000;
+        const MAX_MEM_SIZE: usize = 4 * 1024 * 1024;
+
+        // JUSTIFICATION: Configure SPI0/SPI1, GPIO matrix, IO_MUX, and SRAM MMU.
+        // SAFETY: Runs on PRO_CPU in IRAM with APP_CPU parked and SPI buses idle.
+        unsafe {
+            while (core::ptr::read_volatile(SPI0_EXT2_REG) & 0x7) != 0 {}
+            while (core::ptr::read_volatile(SPI1_EXT2_REG) & 0x7) != 0 {}
+            while (core::ptr::read_volatile(SPI1_CMD_REG) & (1 << 18)) != 0 {}
+
+            core::ptr::write_volatile(SPI0_EXT3_REG, 0x1);
+            core::ptr::write_volatile(
+                SPI1_USER_REG,
+                core::ptr::read_volatile(SPI1_USER_REG) & !(1 << 23),
+            );
+
+            let slave = core::ptr::read_volatile(SPI1_SLAVE_REG);
+            core::ptr::write_volatile(SPI1_SLAVE_REG, slave & !((1 << 9) | (1 << 30)));
+            let pin1 = core::ptr::read_volatile(SPI1_PIN_REG);
+            core::ptr::write_volatile(SPI1_PIN_REG, pin1 & !(1 << 29));
+            let usr1_reg = core::ptr::read_volatile(SPI1_USER_REG);
+            core::ptr::write_volatile(
+                SPI1_USER_REG,
+                (usr1_reg & !((1 << 7) | (1 << 0))) | (1 << 4) | (1 << 5),
+            );
+            let ctrl1_reg = core::ptr::read_volatile(SPI1_CTRL_REG);
+            core::ptr::write_volatile(SPI1_CTRL_REG, ctrl1_reg & !((1 << 26) | (1 << 25)));
+            core::ptr::write_volatile(SPI1_USER1_REG, 0);
+
+            let mut w_idx: usize = 0;
+            while w_idx < 16 {
+                SPI1_W0_REG.add(w_idx).write_volatile(0);
+                w_idx += 1;
+            }
+            core::ptr::write_volatile(
+                SPI1_CTRL2_REG,
+                core::ptr::read_volatile(SPI1_CTRL2_REG) & !0xFF,
+            );
+
+            esp_rom_gpio_connect_out_signal(17, 0, false, false);
+
+            let rd_mode_reg = core::ptr::read_volatile(SPI0_CTRL_REG);
+            let spi_cache_dummy: u32 = if (rd_mode_reg & (1 << 24)) != 0 {
+                3
+            } else if (rd_mode_reg & (1 << 23)) != 0 {
+                let u1 = core::ptr::read_volatile(SPI0_USER1_REG);
+                core::ptr::write_volatile(SPI0_USER1_REG, (u1 & !(0x3F << 26)) | (27 << 26));
+                1
+            } else {
+                7
+            };
+
+            let dummy_ptr = core::ptr::addr_of_mut!(g_rom_spiflash_dummy_len_plus);
+            dummy_ptr.add(0).write_volatile(1);
+            dummy_ptr.add(1).write_volatile(1);
+
+            let u1_after = core::ptr::read_volatile(SPI0_USER1_REG);
+            core::ptr::write_volatile(
+                SPI0_USER1_REG,
+                (u1_after & !0xFF) | ((spi_cache_dummy + 1) & 0xFF),
+            );
+            core::ptr::write_volatile(
+                SPI0_USER_REG,
+                core::ptr::read_volatile(SPI0_USER_REG) | (1 << 29),
+            );
+
+            let _ = esp_rom_spiflash_config_clk(2, 0);
+            let _ = esp_rom_spiflash_config_clk(2, 1);
+
+            let io6 = core::ptr::read_volatile(IO_MUX_GPIO6_REG);
+            core::ptr::write_volatile(IO_MUX_GPIO6_REG, (io6 & !(0x3 << 10)) | (2 << 10));
+            let io17 = core::ptr::read_volatile(IO_MUX_GPIO17_REG);
+            core::ptr::write_volatile(IO_MUX_GPIO17_REG, (io17 & !(0x3 << 10)) | (2 << 10));
+
+            esp_rom_gpio_connect_out_signal(11, 5, false, false);
+            esp_rom_gpio_connect_out_signal(16, 6, false, false);
+            esp_rom_gpio_connect_out_signal(7, 1, false, false);
+            esp_rom_gpio_connect_in_signal(7, 1, false);
+            esp_rom_gpio_connect_out_signal(8, 2, false, false);
+            esp_rom_gpio_connect_in_signal(8, 2, false);
+            esp_rom_gpio_connect_out_signal(10, 4, false, false);
+            esp_rom_gpio_connect_in_signal(10, 4, false);
+            esp_rom_gpio_connect_out_signal(9, 3, false, false);
+            esp_rom_gpio_connect_in_signal(9, 3, false);
+
+            let io6_fn = core::ptr::read_volatile(IO_MUX_GPIO6_REG);
+            core::ptr::write_volatile(IO_MUX_GPIO6_REG, (io6_fn & !(0x7 << 12)) | (1 << 12));
+            let io11_fn = core::ptr::read_volatile(IO_MUX_GPIO11_REG);
+            core::ptr::write_volatile(IO_MUX_GPIO11_REG, (io11_fn & !(0x7 << 12)) | (2 << 12));
+            let io16_fn = core::ptr::read_volatile(IO_MUX_GPIO16_REG);
+            core::ptr::write_volatile(IO_MUX_GPIO16_REG, (io16_fn & !(0x7 << 12)) | (2 << 12));
+            let io17_fn = core::ptr::read_volatile(IO_MUX_GPIO17_REG);
+            core::ptr::write_volatile(IO_MUX_GPIO17_REG, (io17_fn & !(0x7 << 12)) | (2 << 12));
+
+            let io7_fn = core::ptr::read_volatile(IO_MUX_GPIO7_REG);
+            core::ptr::write_volatile(
+                IO_MUX_GPIO7_REG,
+                ((io7_fn & !(0x7 << 12)) | (2 << 12)) | (1 << 9),
+            );
+            let io8_fn = core::ptr::read_volatile(IO_MUX_GPIO8_REG);
+            core::ptr::write_volatile(
+                IO_MUX_GPIO8_REG,
+                ((io8_fn & !(0x7 << 12)) | (2 << 12)) | (1 << 9),
+            );
+            let io9_fn = core::ptr::read_volatile(IO_MUX_GPIO9_REG);
+            core::ptr::write_volatile(
+                IO_MUX_GPIO9_REG,
+                ((io9_fn & !(0x7 << 12)) | (2 << 12)) | (1 << 9),
+            );
+            let io10_fn = core::ptr::read_volatile(IO_MUX_GPIO10_REG);
+            core::ptr::write_volatile(
+                IO_MUX_GPIO10_REG,
+                ((io10_fn & !(0x7 << 12)) | (2 << 12)) | (1 << 9),
+            );
+
+            esp_rom_gpio_connect_out_signal(28, 256, false, false);
+            esp_rom_gpio_connect_out_signal(29, 256, false, false);
+            esp_rom_gpio_connect_out_signal(17, 0, false, false);
+
+            core::ptr::write_volatile(
+                SPI1_USER_REG,
+                core::ptr::read_volatile(SPI1_USER_REG) | (1 << 4) | (1 << 5),
+            );
+            core::ptr::write_volatile(
+                SPI1_CTRL2_REG,
+                core::ptr::read_volatile(SPI1_CTRL2_REG) & !0xFF,
+            );
+            core::ptr::write_volatile(
+                SPI0_USER_REG,
+                core::ptr::read_volatile(SPI0_USER_REG) | (1 << 4) | (1 << 5),
+            );
+            core::ptr::write_volatile(
+                SPI0_CTRL2_REG,
+                core::ptr::read_volatile(SPI0_CTRL2_REG) & !0xFF,
+            );
+
+            psram_send_cmd_spi1(0xF5, true);
+            psram_send_cmd_spi1(0x35, false);
+
+            core::ptr::write_volatile(
+                SPI0_DATE_REG,
+                core::ptr::read_volatile(SPI0_DATE_REG) & !((1 << 31) | (1 << 30)),
+            );
+
+            let mut sctrl = core::ptr::read_volatile(SPI0_CACHE_SCTRL_REG);
+            sctrl &= !((1 << 1) | (0xFF << 14) | (0x3F << 22));
+            sctrl |= (1 << 2) | (1 << 4) | (1 << 5) | (6 << 14) | (23 << 22) | (1 << 28);
+            core::ptr::write_volatile(SPI0_CACHE_SCTRL_REG, sctrl);
+
+            core::ptr::write_volatile(SPI0_SRAM_DRD_CMD_REG, (7 << 28) | 0xEB);
+            core::ptr::write_volatile(SPI0_SRAM_DWR_CMD_REG, (7 << 28) | 0x38);
+
+            core::ptr::write_volatile(
+                DPORT_PRO_CACHE_CTRL_REG,
+                core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL_REG) & !((1 << 16) | (1 << 11)),
+            );
+            core::ptr::write_volatile(
+                DPORT_APP_CACHE_CTRL_REG,
+                core::ptr::read_volatile(DPORT_APP_CACHE_CTRL_REG) & !((1 << 16) | (1 << 11)),
+            );
+
+            core::ptr::write_volatile(
+                DPORT_PRO_CACHE_CTRL1_REG,
+                core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL1_REG)
+                    & !((1 << 3) | (1 << 5) | (0x7 << 6)),
+            );
+            core::ptr::write_volatile(
+                DPORT_APP_CACHE_CTRL1_REG,
+                core::ptr::read_volatile(DPORT_APP_CACHE_CTRL1_REG)
+                    & !((1 << 3) | (1 << 5) | (0x7 << 6)),
+            );
+
+            core::ptr::write_volatile(
+                SPI0_PIN_REG,
+                core::ptr::read_volatile(SPI0_PIN_REG) & !(1 << 1),
+            );
+
+            let _ = cache_sram_mmu_set_rom(0, 0, EXTMEM_ORIGIN as u32, 0, 32, 128);
+            core::ptr::write_volatile(
+                DPORT_APP_CACHE_CTRL1_REG,
+                core::ptr::read_volatile(DPORT_APP_CACHE_CTRL1_REG) & !(1 << 3),
+            );
+            let _ = cache_sram_mmu_set_rom(1, 0, EXTMEM_ORIGIN as u32, 0, 32, 128);
+
+            let test_word = EXTMEM_ORIGIN as *mut u32;
+            test_word.write_volatile(0xA55A_5AA5);
+            if test_word.read_volatile() != 0xA55A_5AA5 {
+                psram_send_cmd_spi1(0x35, true);
+                test_word.write_volatile(0xA55A_5AA5);
+            }
+
+            let ptr = EXTMEM_ORIGIN as *mut u8;
+            let mut idx: usize = 1023;
+            while idx < MAX_MEM_SIZE {
+                ptr.add(idx).write_volatile(0x7F);
+                idx += 1024;
+            }
+
+            let mut guessed_size: usize = 0;
+            idx = 1023;
+            while idx < MAX_MEM_SIZE {
+                if ptr.add(idx).read_volatile() == 0x7F {
+                    ptr.add(idx).write_volatile(0);
+                    guessed_size = idx + 1;
+                } else {
+                    break;
+                }
+                idx += 1024;
+            }
+
+            if guessed_size >= 1_048_576 {
+                guessed_size
+            } else {
+                core::ptr::write_volatile(
+                    DPORT_PRO_CACHE_CTRL1_REG,
+                    core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL1_REG) | (1 << 3) | (1 << 5),
+                );
+                core::ptr::write_volatile(
+                    SPI0_PIN_REG,
+                    core::ptr::read_volatile(SPI0_PIN_REG) | (1 << 1),
+                );
+                0
+            }
+        }
+    }
+
+    /// Settings flash write target. Default build: sector A (0x3FE000) only,
+    /// byte-identical to the certified pre-reboot write. 0x3FF000 is page 15
+    /// of the C firmware's live `settings` NVS partition, which the certified
+    /// build never touched. Boot still reads and validates both sectors.
     #[cfg(not(feature = "runtime-flash-persist"))]
     const SETTINGS_FLASH_TARGET: FlashTargetPolicy = FlashTargetPolicy::FixedA;
-    /// Settings flash write target, `runtime-flash-persist`: dual-sector ping-pong at
-    /// 0x3FE000 / 0x3FF000 (power loss mid-write keeps the previous journal).
+    /// Settings flash write target, `runtime-flash-persist`: dual-sector
+    /// ping-pong at 0x3FE000 / 0x3FF000.
     #[cfg(feature = "runtime-flash-persist")]
     const SETTINGS_FLASH_TARGET: FlashTargetPolicy = FlashTargetPolicy::PingPong;
 
-    /// Boot resolution step 1 + runtime configuration statics (spec §3.4–3.5, Task 10).
+    /// Boot resolution step 1 + runtime configuration statics (spec §3.4–3.5).
     ///
-    /// Reads both settings sectors (0x3FE000 / 0x3FF000) into `scratch` -- the only flash read
-    /// of the settings journal, at boot, single-core -- picks the newest valid journal, resolves
-    /// every audio/identity field (journal, else [`first_boot_defaults`]) and builds, in place in
-    /// `.dram2_uninit` (so neither `.stack` nor this frame carries them):
-    /// - the [`ConfigHandle`] holding the resolved [`AudioConfig`](squeezelite_config::AudioConfig);
-    /// - the [`RamJournal`]: DRAM sector image + which sector holds the newest journal and its
-    ///   sequence, so no later flash write ever needs to read flash. Its flash target policy is
-    ///   [`SETTINGS_FLASH_TARGET`].
+    /// Reads both settings sectors (0x3FE000 / 0x3FF000) into `scratch` -- the
+    /// only flash read of the settings journal, at boot, single-core -- picks
+    /// the newest valid journal, resolves every audio/identity field and builds
+    /// in place in `.dram2_uninit` the [`ConfigHandle`] and [`RamJournal`].
     #[allow(unsafe_code)]
     #[inline(never)]
     fn init_config(
@@ -1007,11 +1521,14 @@ mod xtensa_hw {
         scratch: &mut [u8; 12_288],
     ) -> (&'static ConfigHandle, &'static mut RamJournal<'static>) {
         #[unsafe(link_section = ".dram2_uninit")]
-        static mut JOURNAL_IMAGE: core::mem::MaybeUninit<JournalSector> = core::mem::MaybeUninit::uninit();
+        static mut JOURNAL_IMAGE: core::mem::MaybeUninit<JournalSector> =
+            core::mem::MaybeUninit::uninit();
         #[unsafe(link_section = ".dram2_uninit")]
-        static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> = core::mem::MaybeUninit::uninit();
+        static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> =
+            core::mem::MaybeUninit::uninit();
         #[unsafe(link_section = ".dram2_uninit")]
-        static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> = core::mem::MaybeUninit::uninit();
+        static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> =
+            core::mem::MaybeUninit::uninit();
         static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         assert!(
             !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
@@ -1025,19 +1542,28 @@ mod xtensa_hw {
 
         let selected = FlashJournal::select_dual_sector(sector_a, sector_b);
         let view = selected.and_then(|(index, _)| {
-            JournalView::new(if index == 0 { &sector_a[..] } else { &sector_b[..] }).ok()
+            JournalView::new(if index == 0 {
+                &sector_a[..]
+            } else {
+                &sector_b[..]
+            })
+            .ok()
         });
         let audio = resolve_boot_audio(view.as_ref(), &first_boot_defaults::audio_config());
         let boot_slot = selected.map(|(index, seq)| (JournalSlot::from_index(index), seq));
 
-        // SAFETY: called once (TAKEN); each static is fully written before the only reference
-        // to it is handed out, and nothing else names these statics.
+        // JUSTIFICATION: Initialize static settings journal in DRAM2.
+        // SAFETY: Called once (TAKEN); statics written before shared.
         unsafe {
             let image = (*core::ptr::addr_of_mut!(JOURNAL_IMAGE)).as_mut_ptr();
             image.write_bytes(0xFF, 1);
-            let journal = (*core::ptr::addr_of_mut!(RAM_JOURNAL))
-                .write(RamJournal::new(&mut *image, boot_slot, SETTINGS_FLASH_TARGET));
-            let config = (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
+            let journal = (*core::ptr::addr_of_mut!(RAM_JOURNAL)).write(RamJournal::new(
+                &mut *image,
+                boot_slot,
+                SETTINGS_FLASH_TARGET,
+            ));
+            let config =
+                (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
             (&*config, journal)
         }
     }
@@ -1049,13 +1575,15 @@ mod xtensa_hw {
             !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
             "FirmwareBssBuffers already taken"
         );
-        // SAFETY: Only a single caller on PRO_CPU takes ownership of the firmware static BSS buffers.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut BSS_BUFFERS: FirmwareBssBuffers = FirmwareBssBuffers::new();
+        // JUSTIFICATION: Access to global static firmware BSS buffer singleton.
+        // SAFETY: Only a single caller on PRO_CPU takes ownership of the buffers.
         unsafe { &mut *core::ptr::addr_of_mut!(BSS_BUFFERS) }
     }
 
-    pub(crate) type HwStreamPipeline = StreamPipeline<'static, EspI2sSink<Esp32HardwareI2sDma<'static>>>;
+    pub(crate) type HwStreamPipeline =
+        StreamPipeline<'static, EspI2sSink<Esp32HardwareI2sDma<'static>>>;
 
     #[allow(unsafe_code)]
     #[inline(never)]
@@ -1073,6 +1601,11 @@ mod xtensa_hw {
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_HTTP_TX_BUF: core::mem::MaybeUninit<[u8; 1536]> =
             core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Field-by-field initialization of static
+        // MaybeUninit<StreamPipeline> in .dram2_uninit to avoid a 12 KB
+        // stack temporary during boot.
+        // SAFETY: Called once during single-core PRO_CPU bring-up before
+        // returning exclusive &'static mut references.
         unsafe {
             let ptr = (*core::ptr::addr_of_mut!(STATIC_PIPELINE)).as_mut_ptr();
             core::ptr::addr_of_mut!((*ptr).stream_buffer)
@@ -1102,6 +1635,8 @@ mod xtensa_hw {
                 .write(louder_esp32_app::pipeline::TrackBoundary::new(44_100));
             core::ptr::addr_of_mut!((*ptr).fade)
                 .write(squeezelite_audio_core::FadeEngine::new());
+            core::ptr::addr_of_mut!((*ptr).decode_us_max).write(0);
+            core::ptr::addr_of_mut!((*ptr).decode_us_first).write(0);
 
             let http_resp_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_RESP_BUF)).as_mut_ptr();
             http_resp_ptr.write_bytes(0, 1);
@@ -1113,13 +1648,14 @@ mod xtensa_hw {
         }
     }
 
-
-    /// Core-1 (APP_CPU) control kept by the firmware for the life of the image.
+    /// Core-1 (APP_CPU) control kept by the firmware for the life of the
+    /// image.
     ///
-    /// Default build: the manual start path (`CpuControl::start_app_core` + NOP heartbeat). The
-    /// guard is held forever because dropping an `AppCoreGuard` parks APP_CPU. Feature
-    /// `esp-rtos-core1`: core 1 is owned by `esp_rtos::start_second_core` (S1 sequencing note;
-    /// unvalidated on hardware until the S1 owner gate).
+    /// Default build: the manual start path (`CpuControl::start_app_core` +
+    /// NOP heartbeat). The guard is held forever because dropping an
+    /// `AppCoreGuard` parks APP_CPU. Feature `esp-rtos-core1`: core 1 is owned
+    /// by `esp_rtos::start_second_core` (S1 sequencing note; unvalidated on
+    /// hardware until the S1 owner gate).
     pub(crate) struct Core1Ctl {
         #[cfg(not(feature = "esp-rtos-core1"))]
         cpu_ctrl: CpuControl<'static>,
@@ -1134,26 +1670,37 @@ mod xtensa_hw {
             self.active
         }
 
-        /// Parks APP_CPU before the reboot-time settings flash write (Core-1 parking rule).
+        /// Parks APP_CPU before the reboot-time settings flash write (Core-1
+        /// parking rule).
         pub(crate) fn park_for_flash_write(&mut self) {
             #[cfg(not(feature = "esp-rtos-core1"))]
             #[allow(unsafe_code)]
+            // JUSTIFICATION: Parking APP_CPU before SPI flash erase/write to
+            // prevent XIP cache fetch collisions on shared SPI0/SPI1 bus.
+            // SAFETY: APP_CPU executes an IRAM-resident loop (`app_core_loop`)
+            // holding no locks.
             unsafe {
                 self.cpu_ctrl.park_core(esp_hal::system::Cpu::AppCpu);
             }
-            // `CPU_CTRL` was handed to `esp_rtos::start_second_core`; this runs only right before
-            // `software_reset()`, so a stolen handle can not race another owner.
+            // `CPU_CTRL` was handed to `esp_rtos::start_second_core`; this
+            // runs only right before `software_reset()`, so a stolen handle
+            // can not race another owner.
             #[cfg(feature = "esp-rtos-core1")]
             #[allow(unsafe_code)]
+            // JUSTIFICATION: Steal CPU_CTRL right before software_reset() to
+            // park APP_CPU during pre-reboot flash write.
+            // SAFETY: Executed immediately prior to software_reset() on
+            // PRO_CPU with no concurrent CPU_CTRL access.
             unsafe {
                 CpuControl::new(esp_hal::peripherals::CPU_CTRL::steal())
                     .park_core(esp_hal::system::Cpu::AppCpu);
             }
         }
 
-        /// Restarts APP_CPU after a runtime settings flash write (`runtime-flash-persist` only;
-        /// see `tasks::runtime_flash_commit`). Default build: the manual path's core 1 runs the
-        /// IRAM NOP heartbeat, so it resumes where it was parked.
+        /// Restarts APP_CPU after a runtime settings flash write
+        /// (`runtime-flash-persist` only; see `tasks::runtime_flash_commit`).
+        /// Default build: the manual path's core 1 runs the IRAM NOP
+        /// heartbeat, so it resumes where it was parked.
         #[cfg(feature = "runtime-flash-persist")]
         pub(crate) fn unpark_after_flash_write(&mut self) {
             #[cfg(not(feature = "esp-rtos-core1"))]
@@ -1161,67 +1708,80 @@ mod xtensa_hw {
         }
     }
 
-    // `runtime-flash-persist` parks APP_CPU mid-flight at runtime. Under `esp-rtos-core1` core 1
-    // runs an embassy executor that takes critical sections; parked while holding the
-    // multicore critical-section lock, it would deadlock core 0's next flash call. Only the
-    // manual core-1 path (IRAM NOP loop, never locks) is allowed with the runtime commit.
+    // `runtime-flash-persist` parks APP_CPU mid-flight at runtime. Under
+    // `esp-rtos-core1` core 1 runs an embassy executor that takes critical
+    // sections; parked while holding the multicore critical-section lock, it
+    // would deadlock core 0's next flash call. Only the manual core-1 path
+    // (IRAM NOP loop, never locks) is allowed with the runtime commit.
     #[cfg(all(feature = "runtime-flash-persist", feature = "esp-rtos-core1"))]
     compile_error!(
-        "`runtime-flash-persist` requires the manual core-1 path: it can not be combined with `esp-rtos-core1`"
+        "`runtime-flash-persist` requires the manual core-1 path: \
+         it can not be combined with `esp-rtos-core1`"
     );
 
-    /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio + the UDP placeholders (§3.6).
-    const SOCKET_SLOTS: usize = 4 + UDP_PLACEHOLDER_SOCKETS;
+    /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio, mDNS UDP
+    /// (5353), AirPlay RTSP TCP (5000), AirPlay RTP UDP (6000), and Spotify
+    /// Connect HTTP/Spirc TCP (4070).
+    const SOCKET_SLOTS: usize = 8;
 
-    /// Payload/metadata sizing of one UDP placeholder socket (P3 re-sizes them; S2 suggested
-    /// 4 metadata slots + 512 B payload for the LMS discovery socket).
-    const UDP_RX_META: usize = 4;
-    const UDP_TX_META: usize = 2;
-    const UDP_PAYLOAD: usize = 512;
+    /// Metadata/payload sizing for the mDNS responder UDP socket (port 5353).
+    const MDNS_UDP_META: usize = 4;
+    const MDNS_UDP_PAYLOAD: usize = 1024;
 
-    struct UdpPlaceholderBuffers {
-        rx_meta: [udp::PacketMetadata; UDP_RX_META],
-        rx_payload: [u8; UDP_PAYLOAD],
-        tx_meta: [udp::PacketMetadata; UDP_TX_META],
-        tx_payload: [u8; UDP_PAYLOAD],
+    /// Metadata/payload sizing for the AirPlay RTP audio UDP socket (port
+    /// 6000).
+    const RTP_UDP_RX_META: usize = 8;
+    const RTP_UDP_TX_META: usize = 2;
+
+    struct UdpMdnsBuffers {
+        rx_meta: [udp::PacketMetadata; MDNS_UDP_META],
+        rx_payload: [u8; MDNS_UDP_PAYLOAD],
+        tx_meta: [udp::PacketMetadata; MDNS_UDP_META],
+        tx_payload: [u8; MDNS_UDP_PAYLOAD],
     }
 
-    impl UdpPlaceholderBuffers {
+    impl UdpMdnsBuffers {
         const fn new() -> Self {
             Self {
-                rx_meta: [udp::PacketMetadata::EMPTY; UDP_RX_META],
-                rx_payload: [0u8; UDP_PAYLOAD],
-                tx_meta: [udp::PacketMetadata::EMPTY; UDP_TX_META],
-                tx_payload: [0u8; UDP_PAYLOAD],
+                rx_meta: [udp::PacketMetadata::EMPTY; MDNS_UDP_META],
+                rx_payload: [0u8; MDNS_UDP_PAYLOAD],
+                tx_meta: [udp::PacketMetadata::EMPTY; MDNS_UDP_META],
+                tx_payload: [0u8; MDNS_UDP_PAYLOAD],
             }
         }
     }
 
-    // ----------------------------------------------------------------------------------------
-    // Boot-stack budget (Task 8 ruling: headroom-based stack gate). Everything the firmware keeps
-    // for its whole life is built IN PLACE in a static, inside a small `#[inline(never)]`
-    // bring-up stage, instead of as a `bring_up` local that is later moved into the state. That
-    // keeps `bring_up`'s frame (which sits under every boot-time callee) small, and each stage's
-    // temporaries are released when it returns. The bytes show up in `.bss` instead of on the
-    // core-0 stack; the gate is the resulting stack headroom (boot peak and steady state) versus
-    // e5b44cd, recorded in the Task 8 report.
-    // ----------------------------------------------------------------------------------------
+    struct UdpRtpMetaBuffers {
+        rx_meta: [udp::PacketMetadata; RTP_UDP_RX_META],
+        tx_meta: [udp::PacketMetadata; RTP_UDP_TX_META],
+    }
 
-    /// smoltcp socket slots. `ConstStaticCell` hands them out without a stack temporary.
+    impl UdpRtpMetaBuffers {
+        const fn new() -> Self {
+            Self {
+                rx_meta: [udp::PacketMetadata::EMPTY; RTP_UDP_RX_META],
+                tx_meta: [udp::PacketMetadata::EMPTY; RTP_UDP_TX_META],
+            }
+        }
+    }
+
+    /// smoltcp socket slots. `ConstStaticCell` hands them out without a stack
+    /// temporary.
     static SOCKET_STORAGE: ConstStaticCell<[SocketStorage<'static>; SOCKET_SLOTS]> =
         ConstStaticCell::new([SocketStorage::EMPTY; SOCKET_SLOTS]);
-    /// Spec §3.6 UDP placeholder buffers (static, never on the stack).
-    static UDP_BUFFERS: ConstStaticCell<[UdpPlaceholderBuffers; UDP_PLACEHOLDER_SOCKETS]> =
-        ConstStaticCell::new([const { UdpPlaceholderBuffers::new() }; UDP_PLACEHOLDER_SOCKETS]);
+    static MDNS_UDP_BUFFERS: ConstStaticCell<UdpMdnsBuffers> =
+        ConstStaticCell::new(UdpMdnsBuffers::new());
+    static RTP_UDP_META_BUFFERS: ConstStaticCell<UdpRtpMetaBuffers> =
+        ConstStaticCell::new(UdpRtpMetaBuffers::new());
     static AMP: StaticCell<AmpManager<Esp32I2cBus<'static>>> = StaticCell::new();
     static CYD_BRIDGE: StaticCell<CydUartBridge<Esp32Uart2Port<'static>>> = StaticCell::new();
     static COORDINATOR: StaticCell<PlayerCoordinator> = StaticCell::new();
     static SMOL_IFACE: StaticCell<SmolInterface> = StaticCell::new();
-    /// The superloop state shared by the core-0 tasks.
-    static SHARED: StaticCell<Shared> = StaticCell::new();
+    static RUNTIME_STATE: StaticCell<DeviceRuntimeState> = StaticCell::new();
 
-    /// Bring-up stage: I2C0 (SDA=21, SCL=27, 400 kHz) and the TAS58xx manager over it, built in
-    /// [`AMP`]. Construction only; the HIL amp init keeps its legacy place in [`bring_up`].
+    /// Bring-up stage: I2C0 (SDA=21, SCL=27, 400 kHz) and the TAS58xx manager
+    /// over it, built in [`AMP`]. Construction only; the HIL amp init keeps
+    /// its legacy place in [`bring_up`].
     #[inline(never)]
     fn init_amp_i2c(
         i2c0: esp_hal::peripherals::I2C0<'static>,
@@ -1245,10 +1805,11 @@ mod xtensa_hw {
         &'static mut [u8; 1536],
     );
 
-    /// Bring-up stage: I2S0 TDM-Philips TX (BCK=26, WS=25, DOUT=22) with streaming DMA prefilled
-    /// with silence, then the I2S sink and the static audio pipeline around it. Building the
-    /// sink (a ~1 KB value) here keeps it out of [`bring_up`]'s frame; sink/pipeline
-    /// construction is pure memory initialisation that used to run a few statements later.
+    /// Bring-up stage: I2S0 TDM-Philips TX (BCK=26, WS=25, DOUT=22) with
+    /// streaming DMA prefilled with silence, then the I2S sink and the static
+    /// audio pipeline around it. Building the sink (a ~1 KB value) here keeps
+    /// it out of [`bring_up`]'s frame; sink/pipeline construction is pure
+    /// memory initialisation that used to run a few statements later.
     #[inline(never)]
     fn init_i2s_pipeline(
         i2s0: esp_hal::peripherals::I2S0<'static>,
@@ -1266,7 +1827,12 @@ mod xtensa_hw {
         let mut tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
         Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
         let i2s = I2s::new(i2s0, dma, i2s_tdm_cfg).expect("Failed to initialize I2S0");
-        let i2s_tx = i2s.i2s_tx.with_bclk(bclk).with_ws(ws).with_dout(dout).build();
+        let i2s_tx = i2s
+            .i2s_tx
+            .with_bclk(bclk)
+            .with_ws(ws)
+            .with_dout(dout)
+            .build();
         let i2s_transfer = i2s_tx
             .write(tx_buffer)
             .expect("Failed to start I2S0 TX streaming DMA");
@@ -1275,8 +1841,8 @@ mod xtensa_hw {
         init_static_pipeline(stream_storage, output_storage, sink)
     }
 
-    /// Bring-up stage: UART2 @ 460 800 (TX=4, RX=36) and the CYD bridge over it, built in
-    /// [`CYD_BRIDGE`].
+    /// Bring-up stage: UART2 @ 460 800 (TX=4, RX=36) and the CYD bridge over
+    /// it, built in [`CYD_BRIDGE`].
     #[inline(never)]
     fn init_cyd_uart(
         uart2: esp_hal::peripherals::UART2<'static>,
@@ -1293,12 +1859,14 @@ mod xtensa_hw {
         CYD_BRIDGE.init(CydUartBridge::new(uart2_port))
     }
 
-    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`], with this board's
-    /// efuse STA MAC (HELO; smoltcp uses the same MAC), the boot-resolved player name (`SETD`
-    /// after HELO, `setd` id-0 replies) and LMS address (`strm s` with server IP 0.0.0.0 streams
-    /// from it), and the [`ConfigHandle`] a `setd` id-0 name change persists through.
-    /// Server frames are received into a static buffer in `.dram2_uninit` (which does not
-    /// shrink `.stack`) instead of a 2 KB buffer on the `slimproto_session` stack.
+    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`], with
+    /// this board's efuse STA MAC (HELO; smoltcp uses the same MAC), the
+    /// boot-resolved player name (`SETD` after HELO, `setd` id-0 replies) and
+    /// LMS address (`strm s` with server IP 0.0.0.0 streams from it), and the
+    /// [`ConfigHandle`] a `setd` id-0 name change persists through. Server
+    /// frames are received into a static buffer in `.dram2_uninit` (which does
+    /// not shrink `.stack`) instead of a 2 KB buffer on the `slimproto_session`
+    /// stack.
     #[allow(unsafe_code)]
     #[inline(never)]
     fn init_coordinator(
@@ -1310,8 +1878,10 @@ mod xtensa_hw {
         static mut SERVER_FRAME_BUF: core::mem::MaybeUninit<
             [u8; louder_esp32_app::coordinator::SERVER_FRAME_BUF_LEN],
         > = core::mem::MaybeUninit::uninit();
-        // SAFETY: called once at bring-up (`COORDINATOR.init` panics on a second call); the
-        // buffer is zeroed before the only reference to it is handed out.
+        // JUSTIFICATION: Zero-initialize static SERVER_FRAME_BUF in
+        // .dram2_uninit to keep the 2 KB frame buffer off the stack.
+        // SAFETY: Called once at bring-up (`COORDINATOR.init` panics on a
+        // second call); the buffer is zeroed before handing out the reference.
         let frame_buf: &'static mut [u8] = unsafe {
             let ptr = (*core::ptr::addr_of_mut!(SERVER_FRAME_BUF)).as_mut_ptr();
             ptr.write_bytes(0, 1);
@@ -1325,13 +1895,15 @@ mod xtensa_hw {
         coordinator.lms_ip = lms_ip;
         coordinator.config = Some(config);
         coordinator.set_frame_buffer(frame_buf);
-        // Decode/output run only in the DMA-first pump phases (`tasks.rs`), never inside tick.
+        // Decode/output run only in the DMA-first pump phases, never inside
+        // tick.
         coordinator.external_audio_pump = true;
         coordinator
     }
 
-    /// Bring-up stage: `esp-radio` Wi-Fi controller configured as a station for
-    /// `wifi_sta_creds` (any configuration failure resets into recovery, as before).
+    /// Bring-up stage: `esp-radio` Wi-Fi controller configured as a station
+    /// for `wifi_sta_creds` (any configuration failure resets into recovery,
+    /// as before).
     #[inline(never)]
     fn init_wifi(
         wifi: esp_hal::peripherals::WIFI<'static>,
@@ -1375,9 +1947,10 @@ mod xtensa_hw {
         wifi_controller
     }
 
-    // The TAS58xx typestate transitions move ~320 B driver values around; when inlined into
-    // `bring_up` they made up most of its frame. These wrappers keep the legacy call sequences
-    // verbatim but in their own short-lived frames.
+    // The TAS58xx typestate transitions move ~320 B driver values around; when
+    // inlined into `bring_up` they made up most of its frame. These wrappers
+    // keep the legacy call sequences verbatim but in their own short-lived
+    // frames.
 
     /// HIL step: initialise the TAS58xx (32-bit) and set unity volume.
     #[inline(never)]
@@ -1386,9 +1959,10 @@ mod xtensa_hw {
         let _ = amp.set_volume(VOL_UNITY_0DB);
     }
 
-    /// Apply the boot-resolved audio configuration: volume, analog gain, EQ and loudness.
-    /// Returns the volume percent. The volume goes through the coordinator's single volume
-    /// entry (register `percent_to_attenuation(percent)` as before, software gain per the
+    /// Apply the boot-resolved audio configuration: volume, analog gain, EQ
+    /// and loudness. Returns the volume percent. The volume goes through the
+    /// coordinator's single volume entry (register
+    /// `percent_to_attenuation(percent)` as before, software gain per the
     /// device policy, requested volume recorded for the loudness).
     #[inline(never)]
     fn amp_apply_boot_config(
@@ -1398,7 +1972,12 @@ mod xtensa_hw {
         config: &ConfigHandle,
     ) -> u8 {
         let (percent, again_code, eq_preset, loudness) = config.read(|c| {
-            (c.volume, c.analog_gain_code, c.equalizer_preset, c.loudness_enabled)
+            (
+                c.volume,
+                c.analog_gain_code,
+                c.equalizer_preset,
+                c.loudness_enabled,
+            )
         });
         let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
         coordinator.set_volume_percent(percent, &mut backend, pipeline);
@@ -1422,10 +2001,11 @@ mod xtensa_hw {
         latest_telemetry
     }
 
-    /// Adds one socket to the set from its own frame (each smoltcp socket value is ~312 B and
-    /// would otherwise be a separate temporary in [`init_net_stack`]'s frame).
+    /// Adds one socket to the set from its own frame (each smoltcp socket
+    /// value is ~312 B and would otherwise be a separate temporary in
+    /// [`init_net_stack`]'s frame).
     #[inline(never)]
-    fn add_socket<T: smoltcp::socket::AnySocket<'static>>(
+    fn add_socket<T: AnySocket<'static>>(
         sockets: &mut SocketSet<'static>,
         socket: impl FnOnce() -> T,
     ) -> SocketHandle {
@@ -1440,20 +2020,32 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        udp_placeholder_handles: [SocketHandle; UDP_PLACEHOLDER_SOCKETS],
+        mdns_handle: SocketHandle,
+        rtsp_handle: SocketHandle,
+        rtp_handle: SocketHandle,
+        spot_handle: SocketHandle,
         local_port_counter: u16,
     }
 
-    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for HTTP, slimproto, audio.
+    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for HTTP,
+    /// slimproto, audio.
     type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 3];
 
-    /// Bring-up stage: `smoltcp` Ethernet interface (in [`SMOL_IFACE`]) + DHCPv4 + TCP port 80 +
-    /// TCP SlimProto (3483) + audio socket + the spec §3.6 UDP placeholders, all in
-    /// [`SOCKET_STORAGE`].
+    /// Bring-up stage: `smoltcp` Ethernet interface (in [`SMOL_IFACE`]) +
+    /// DHCPv4 + TCP port 80 + TCP SlimProto (3483) + audio socket + mDNS UDP
+    /// (5353) + AirPlay RTSP TCP (5000) + AirPlay RTP UDP (6000) + Spotify
+    /// Connect HTTP/Spirc TCP (4070), all in [`SOCKET_STORAGE`].
     #[inline(never)]
-    fn init_net_stack(sta_iface: &mut WifiInterface, sta_mac: [u8; 6], tcp_bufs: TcpBuffers) -> NetStack {
-        let [(http_rx_buf, http_tx_buf), (slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] =
-            tcp_bufs;
+    fn init_net_stack(
+        sta_iface: &mut WifiInterface,
+        sta_mac: [u8; 6],
+        tcp_bufs: TcpBuffers,
+    ) -> NetStack {
+        let [
+            (http_rx_buf, http_tx_buf),
+            (slim_rx_buf, slim_tx_buf),
+            (audio_rx_buf, audio_tx_buf),
+        ] = tcp_bufs;
         let hw_rng = Rng::new();
         let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
@@ -1469,30 +2061,69 @@ mod xtensa_hw {
 
         let mut sockets = SocketSet::new(&mut SOCKET_STORAGE.take()[..]);
 
-        let dhcp_handle = add_socket(&mut sockets, || dhcpv4::Socket::new());
+        let dhcp_handle = add_socket(&mut sockets, dhcpv4::Socket::new);
 
         let http_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(tcp::SocketBuffer::new(http_rx_buf), tcp::SocketBuffer::new(http_tx_buf))
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(http_rx_buf),
+                tcp::SocketBuffer::new(http_tx_buf),
+            )
         });
 
         let slim_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(tcp::SocketBuffer::new(slim_rx_buf), tcp::SocketBuffer::new(slim_tx_buf))
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(slim_rx_buf),
+                tcp::SocketBuffer::new(slim_tx_buf),
+            )
         });
 
         let audio_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(tcp::SocketBuffer::new(audio_rx_buf), tcp::SocketBuffer::new(audio_tx_buf))
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(audio_rx_buf),
+                tcp::SocketBuffer::new(audio_tx_buf),
+            )
         });
 
-        // Spec §3.6: two UDP placeholder sockets (LMS discovery / mDNS). Allocated now so the RAM
-        // budget measured from Task 8 on is the real one; never bound, so smoltcp ignores them
-        // until P3 binds them.
-        let udp_placeholder_handles = UDP_BUFFERS.take().each_mut().map(|bufs| {
-            add_socket(&mut sockets, || {
-                udp::Socket::new(
-                    udp::PacketBuffer::new(&mut bufs.rx_meta[..], &mut bufs.rx_payload[..]),
-                    udp::PacketBuffer::new(&mut bufs.tx_meta[..], &mut bufs.tx_payload[..]),
-                )
-            })
+        let mdns_bufs = MDNS_UDP_BUFFERS.take();
+        let mdns_handle = add_socket(&mut sockets, || {
+            udp::Socket::new(
+                udp::PacketBuffer::new(&mut mdns_bufs.rx_meta[..], &mut mdns_bufs.rx_payload[..]),
+                udp::PacketBuffer::new(&mut mdns_bufs.tx_meta[..], &mut mdns_bufs.tx_payload[..]),
+            )
+        });
+
+        let rtsp_rx: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 4096].into_boxed_slice());
+        let rtsp_tx: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 2048].into_boxed_slice());
+        let rtsp_handle = add_socket(&mut sockets, || {
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(rtsp_rx),
+                tcp::SocketBuffer::new(rtsp_tx),
+            )
+        });
+
+        let rtp_meta = RTP_UDP_META_BUFFERS.take();
+        let rtp_rx_payload: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 16_384].into_boxed_slice());
+        let rtp_tx_payload: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 512].into_boxed_slice());
+        let rtp_handle = add_socket(&mut sockets, || {
+            udp::Socket::new(
+                udp::PacketBuffer::new(&mut rtp_meta.rx_meta[..], rtp_rx_payload),
+                udp::PacketBuffer::new(&mut rtp_meta.tx_meta[..], rtp_tx_payload),
+            )
+        });
+
+        let spot_rx: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 4096].into_boxed_slice());
+        let spot_tx: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 2048].into_boxed_slice());
+        let spot_handle = add_socket(&mut sockets, || {
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(spot_rx),
+                tcp::SocketBuffer::new(spot_tx),
+            )
         });
 
         NetStack {
@@ -1502,32 +2133,125 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            udp_placeholder_handles,
+            mdns_handle,
+            rtsp_handle,
+            rtp_handle,
+            spot_handle,
             local_port_counter,
         }
     }
 
-    /// Device entry: bring-up, then the embassy executor that replaces the legacy superloop.
-    pub fn run_hardware_firmware() -> ! {
-        crate::tasks::run_core0_executor(bring_up())
+    /// `HELO` device id (12 = SqueezeESP32/squeezelite).
+    const HELO_DEVICE_ID: u8 = 12;
+    /// Audio-socket connect/retransmit timeout: an unreachable stream server
+    /// ends in `STMn` instead of a connect that never resolves.
+    const STREAM_SOCKET_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
+
+    /// Unified device runtime state holding Phase 0+1 `PlayerCoordinator` +
+    /// `net_device` + `backend_device` + `ConfigHandle`/`RamJournal` alongside
+    /// `WO-197` 4 MB PSRAM, `WO-211`/`WO-212`/`WO-214` AirPlay 1 RAOP
+    /// (`squeezelite-raop`), Spotify Connect (`squeezelite-cspot`), mDNS
+    /// (`UDP 5353`), and `SourceArbiter`.
+    struct DeviceRuntimeState {
+        wdt: Wdt<esp_hal::peripherals::TIMG0<'static>>,
+        flash: FlashStorage<'static>,
+        core1: Core1Ctl,
+        _pwdn: Output<'static>,
+        _fault: Input<'static>,
+        wifi_controller: WifiController<'static>,
+        sta_iface: WifiInterface,
+        smol_iface: &'static mut SmolInterface,
+        sockets: SocketSet<'static>,
+        dhcp_handle: SocketHandle,
+        http_handle: SocketHandle,
+        slim_handle: SocketHandle,
+        audio_handle: SocketHandle,
+        mdns_handle: SocketHandle,
+        rtsp_handle: SocketHandle,
+        rtp_handle: SocketHandle,
+        spot_handle: SocketHandle,
+        bt_periph: Option<esp_hal::peripherals::BT<'static>>,
+        bt_transport: Option<Esp32VhciTransport<'static>>,
+        bt_sink: &'static mut BtA2dpSink,
+        amp: &'static mut AmpManager<Esp32I2cBus<'static>>,
+        cyd_bridge: &'static mut CydUartBridge<Esp32Uart2Port<'static>>,
+        pipeline: &'static mut HwStreamPipeline,
+        coordinator: &'static mut PlayerCoordinator,
+        slim_link: SlimLinkState,
+        stream_state: HttpStreamState,
+        http_resp_buf: &'static mut [u8; 1536],
+        config: &'static ConfigHandle,
+        journal: &'static mut RamJournal<'static>,
+        config_writer: ConfigWriter,
+        wifi_sta_creds: &'static WifiStaCredentials,
+        sta_mac: [u8; 6],
+        lms_ip: [u8; 4],
+        lms_port: u16,
+        current_vol_pct: u8,
+        local_port_counter: u16,
+        bt_audio_active: bool,
+        boot_ms: u64,
+        lease_watchdog: DeadManLeaseWatchdog,
+        assigned_ip: Option<[u8; 4]>,
+        assigned_mask: [u8; 4],
+        assigned_gw: [u8; 4],
+        pending_http_action: HttpControlAction,
+        pending_action_deadline_ms: u64,
+        pending_http_body: &'static [u8],
+        pending_http_started_ms: u64,
+        pending_http_closing: bool,
+        pending_close_deadline_ms: u64,
+        helo_sent: bool,
+        last_connect_attempt_ms: u64,
+        slim_reconnect: SlimReconnect,
+        slim_was_open: bool,
+        slim_switch_to: Option<[u8; 4]>,
+        last_fault_check_ms: u64,
+        latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
+        last_cyd_progress_ms: u64,
+        last_config_poll_ms: u64,
+        mdns_bound: bool,
+        last_mdns_announce_ms: u64,
+        raop_rtsp: alloc::boxed::Box<RtspServer>,
+        raop_rtp: alloc::boxed::Box<RtpAudioReceiver>,
+        raop_streaming: bool,
+        spot_spirc: alloc::boxed::Box<SpircStateMachine>,
+        spot_streaming: bool,
+        now_ms: u64,
     }
 
-    /// Hardware bring-up, in the legacy order, ending in the initial superloop state (in
-    /// [`SHARED`]). Heavy steps run in `#[inline(never)]` stages that build their results in
-    /// statics, so this frame stays small (see "Boot-stack budget" above).
+    /// Device entry: bring-up, then the Phase 0+1 + Multi-Protocol runtime
+    /// pump loop.
+    pub fn run_hardware_firmware() -> ! {
+        let state = bring_up();
+        loop {
+            pump_device_phase(state);
+        }
+    }
+
+    /// Hardware bring-up, in the legacy order, ending in the initial runtime
+    /// state (in [`RUNTIME_STATE`]). Heavy steps run in `#[inline(never)]`
+    /// stages that build their results in statics, so this frame stays small.
     #[inline(never)]
-    fn bring_up() -> &'static Shared {
+    fn bring_up() -> &'static mut DeviceRuntimeState {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let peripherals = esp_hal::init(config);
 
-        // Park Core 1 (APP_CPU) immediately on entry in case a warm reboot from
-        // dual-core ESP-IDF (`I2S-4MFlash-1681`) left `APP_CPU` unparked (`appcpu_clkgate_en=1`),
-        // preventing `FlashStorage::multicore_auto_park()` from unparking a rogue `APP_CPU`
-        // and ensuring `cpu_ctrl.start_app_core(...)` sees `is_running(Cpu::AppCpu) == false`.
+        // Park Core 1 (APP_CPU) immediately on entry in case a warm reboot
+        // from dual-core ESP-IDF (`I2S-4MFlash-1681`) left `APP_CPU` unparked
+        // (`appcpu_clkgate_en=1`), preventing
+        // `FlashStorage::multicore_auto_park()` from unparking a rogue
+        // `APP_CPU` and ensuring `cpu_ctrl.start_app_core(...)` sees
+        // `is_running(Cpu::AppCpu) == false`.
         #[cfg(not(feature = "esp-rtos-core1"))]
         let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
         #[cfg(not(feature = "esp-rtos-core1"))]
         #[allow(unsafe_code)]
+        // JUSTIFICATION: Park APP_CPU on entry so warm reboot from dual-core
+        // ESP-IDF cannot execute stale code on APP_CPU during Flash / PSRAM
+        // initialization.
+        // SAFETY: Called at the very start of `bring_up` on PRO_CPU before
+        // APP_CPU is started.
         unsafe {
             cpu_ctrl.park_core(esp_hal::system::Cpu::AppCpu);
         }
@@ -1535,6 +2259,8 @@ mod xtensa_hw {
         let mut cpu_ctrl_periph = peripherals.CPU_CTRL;
         #[cfg(feature = "esp-rtos-core1")]
         #[allow(unsafe_code)]
+        // JUSTIFICATION: Park APP_CPU on entry before Flash / PSRAM bring-up.
+        // SAFETY: Called at the very start of `bring_up` on PRO_CPU.
         unsafe {
             CpuControl::new(cpu_ctrl_periph.reborrow()).park_core(esp_hal::system::Cpu::AppCpu);
         }
@@ -1552,10 +2278,14 @@ mod xtensa_hw {
         // GATE 1: First-Instruction `otadata` (0xD000..0xF000) Pre-Arming
         // Erases `otadata` to 0xFF BEFORE PSRAM, Core 1, or Wi-Fi so ANY
         // subsequent reset (panic, WDT, network timeout, or power cycle) boots
-        // straight back into the untouched factory `recovery` partition (0x10000)!
+        // straight back into the untouched factory `recovery` partition
+        // (0x10000)!
         // ====================================================================
         let mut flash = FlashStorage::new(peripherals.FLASH).multicore_auto_park();
-        if flash.erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END).is_err() {
+        if flash
+            .erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END)
+            .is_err()
+        {
             println!("[ANTI-BRICK GATE 1] Failed to erase otadata -> resetting to recovery");
             esp_hal::system::software_reset();
         }
@@ -1570,9 +2300,13 @@ mod xtensa_hw {
             esp_hal::system::software_reset();
         }
         wdt.feed();
-        println!("[ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)");
+        println!(
+            "[ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified \
+             0xFF (Factory recovery pre-armed)"
+        );
 
-        // Read 16 KB `nvs` partition (0x9000..0xD000) and `settings` (0x3FE000) while single-core
+        // Read 16 KB `nvs` partition (0x9000..0xD000) and `settings`
+        // (0x3FE000) while single-core.
         let sta_mac_addr = interface_mac_address(InterfaceMacAddress::Station);
         let mut sta_mac = [0u8; 6];
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
@@ -1587,15 +2321,20 @@ mod xtensa_hw {
             ref mut audio_tx_buf,
         } = fw_bufs;
 
-        // Boot config resolution (spec §3.4), each field independently: settings FlashJournal,
-        // then (Wi-Fi only) the C firmware's NVS, then the compile-time first-boot defaults.
+        // Boot config resolution (spec §3.4), each field independently:
+        // settings FlashJournal, then (Wi-Fi only) the C firmware's NVS, then
+        // the compile-time first-boot defaults.
         let (config, journal) = {
-            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
+            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288])
+                .try_into()
+                .expect("12 KB slice");
             init_config(&mut flash, boot_scratch)
         };
         wdt.feed();
         let wifi_sta_creds = {
-            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288]).try_into().unwrap();
+            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288])
+                .try_into()
+                .expect("12 KB slice");
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
         };
         let (lms_ip, lms_port) = config.read(|c| {
@@ -1607,15 +2346,16 @@ mod xtensa_hw {
         ring_storage.fill(0);
         wdt.feed();
 
-        // Allocate 64 KB heap in DRAM for `esp-rtos` and `esp-radio` Wi-Fi driver.
-        // External PSRAM (`0x3F80_0000`) is registered only if the hardware MMU
-        // (`DPORT_PRO_CACHE_CTRL1_REG` and `SPI0_CACHE_SCTRL_REG`) has already mapped
-        // external SRAM (`>= 1_048_576` B), avoiding `esp-hal 1.2.2` `psram_gpio_config`
-        // `.text` (`0x4013c190`) XIP instruction fetch corruption on 40 MHz DIO flash
-        // and avoiding `esp-alloc` TLSF panic when `psram_size < 1_048_576`.
+        // Allocate 46 KB + 36 KB internal DRAM heap for `esp-rtos` and
+        // `esp-radio`, plus 4 MB external PSRAM (`0x3F80_0000`) initialized
+        // via 100% IRAM-resident `init_and_map_psram_4mb` (`WO-197`).
         #[allow(unsafe_code)]
         let psram_avail_bytes = {
             esp_alloc::heap_allocator!(size: 46 * 1024);
+            // JUSTIFICATION: Register secondary 36 KB internal `.dram2_uninit`
+            // region with `esp_alloc::HEAP`.
+            // SAFETY: `STATIC_BT_HEAP` is an exclusive static uninitialized
+            // buffer in `.dram2_uninit` registered exactly once at boot.
             unsafe {
                 esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
                     (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr() as *mut u8,
@@ -1623,47 +2363,73 @@ mod xtensa_hw {
                     esp_alloc::MemoryCapability::Internal.into(),
                 ));
             }
-            const DPORT_PRO_CACHE_CTRL1_REG: *const u32 = 0x3FF0_0044 as *const u32;
-            const SPI0_CACHE_SCTRL_REG: *const u32 = 0x3FF4_303C as *const u32;
             const EXTMEM_ORIGIN: usize = 0x3F80_0000;
             const EXTMEM_SIZE: usize = louder_esp32_app::pipeline::PSRAM_HEAP_BYTES;
-            let cache_ctrl1 = unsafe { core::ptr::read_volatile(DPORT_PRO_CACHE_CTRL1_REG) };
-            let spi0_sctrl = unsafe { core::ptr::read_volatile(SPI0_CACHE_SCTRL_REG) };
-            let ext_sram_mapped = (cache_ctrl1 & (1 << 1)) == 0 && (spi0_sctrl & (1 << 2)) != 0;
-            if ext_sram_mapped {
+            // JUSTIFICATION: Execute 100% IRAM-resident PSRAM SPI1 + DPORT MMU
+            // initialization (`WO-197`).
+            // SAFETY: Single-core execution with interrupts masked inside the
+            // IRAM routine and `APP_CPU` parked.
+            let psram_bytes = unsafe { init_and_map_psram_4mb() };
+            if psram_bytes >= 1_048_576 {
+                let reg_size = psram_bytes.min(EXTMEM_SIZE);
+                // JUSTIFICATION: Register verified 4 MB external PSRAM
+                // (`0x3F80_0000..0x3FC0_0000`) with `esp_alloc::HEAP`.
+                // SAFETY: `init_and_map_psram_4mb` verified read/write mapping
+                // at `0x3F80_0000`.
                 unsafe {
                     esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
                         EXTMEM_ORIGIN as *mut u8,
-                        EXTMEM_SIZE,
+                        reg_size,
                         esp_alloc::MemoryCapability::External.into(),
                     ));
                 }
-                EXTMEM_SIZE
+                reg_size
             } else {
                 0
             }
         };
         let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(6144);
-        // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream buffer (512 KiB
-        // here) and a 2000 KiB output buffer. Both land in the PSRAM region (the internal
-        // regions are far smaller); the 4 MiB keeps ~1.2 MiB free for the FLAC decoder
-        // (3 x 64 KiB, twice while a track change swaps decoders) and the allocator.
+        // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream
+        // buffer (512 KiB here) and a 2000 KiB output buffer. Both land in
+        // the PSRAM region (the internal regions are far smaller); the 4 MiB
+        // keeps ~1.2 MiB free for the FLAC/AAC/Vorbis/ALAC/Opus decoders and
+        // the allocator.
         let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) =
             if psram_avail_bytes >= 1_048_576 {
                 (
-                    alloc::boxed::Box::leak(alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES].into_boxed_slice()),
-                    alloc::boxed::Box::leak(alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES].into_boxed_slice()),
+                    alloc::boxed::Box::leak(
+                        alloc::vec![
+                            0u8;
+                            louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES
+                        ]
+                        .into_boxed_slice(),
+                    ),
+                    alloc::boxed::Box::leak(
+                        alloc::vec![
+                            0u8;
+                            louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES
+                        ]
+                        .into_boxed_slice(),
+                    ),
                 )
             } else {
                 (bss_stream_storage, bss_output_storage)
             };
         wdt.feed();
+        squeezelite_decoders::prewarm_opus();
+        wdt.feed();
 
-        // Start Core 1 (APP_CPU @ 240 MHz) executing `app_core_loop` in IRAM (`#[esp_hal::ram]`).
-        // Sync `DPORT_APP_FLASH_MMU_TABLE` (0x3FF1_2000..0x3FF1_2400) and `DPORT_APP_CACHE_CTRL1_REG`
-        // (0x3FF0_005C) from `PRO_CPU` (0x3FF1_0000 and 0x3FF0_0044) while `APP_CPU` cache is disabled
-        // so `APP_CPU` can fetch `start_core1_init` / `start_core1_run` from XIP Flash `.text`.
+        // Start Core 1 (APP_CPU @ 240 MHz) executing `app_core_loop` in IRAM
+        // (`#[esp_hal::ram]`). Sync `DPORT_APP_FLASH_MMU_TABLE`
+        // (0x3FF1_2000..0x3FF1_2400) and `DPORT_APP_CACHE_CTRL1_REG`
+        // (0x3FF0_005C) from `PRO_CPU` (0x3FF1_0000 and 0x3FF0_0044) while
+        // `APP_CPU` cache is disabled so `APP_CPU` can fetch
+        // `start_core1_init` / `start_core1_run` from XIP Flash `.text`.
         #[allow(unsafe_code)]
+        // JUSTIFICATION: Synchronize APP_CPU flash/PSRAM MMU tables and cache
+        // control registers from PRO_CPU before starting APP_CPU.
+        // SAFETY: APP_CPU is parked and its cache is disabled while MMU table
+        // entries are copied.
         unsafe {
             const DPORT_PRO_CACHE_CTRL1_REG: *const u32 = 0x3FF0_0044 as *const u32;
             const DPORT_APP_CACHE_CTRL_REG: *mut u32 = 0x3FF0_0058 as *mut u32;
@@ -1686,22 +2452,32 @@ mod xtensa_hw {
                 core::ptr::write_volatile(DPORT_APP_FLASH_MMU_TABLE.add(i), entry);
             }
         }
-        // Default: start core 1 now (manual path). Feature `esp-rtos-core1`: core 1 is started
-        // after `esp_rtos::start` below, with the MMU/cache copy above already done (S1 gotcha 4).
         #[cfg(not(feature = "esp-rtos-core1"))]
         let core1 = {
             #[allow(unsafe_code)]
             let guard = cpu_ctrl.start_app_core(
+                // JUSTIFICATION: Pass exclusive mutable reference to static
+                // APP_CORE_STACK for Core 1 execution.
+                // SAFETY: APP_CPU is started once at boot and owns
+                // APP_CORE_STACK for the lifetime of the firmware.
                 unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
                 app_core_loop,
             );
             let active = guard.is_ok();
-            Core1Ctl { cpu_ctrl, _guard: guard, active }
+            Core1Ctl {
+                cpu_ctrl,
+                _guard: guard,
+                active,
+            }
         };
 
-        // Initialize GPIO33 PWDN, GPIO34 FAULT, I2C0 (SDA=21, SCL=27), I2S0 (BCK=26, WS=25, DOUT=22), UART2
+        // Initialize GPIO33 PWDN, GPIO34 FAULT, I2C0 (SDA=21, SCL=27), I2S0
+        // (BCK=26, WS=25, DOUT=22), UART2
         let mut pwdn = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
-        let fault = Input::new(peripherals.GPIO34, InputConfig::default().with_pull(Pull::None));
+        let fault = Input::new(
+            peripherals.GPIO34,
+            InputConfig::default().with_pull(Pull::None),
+        );
 
         let amp = init_amp_i2c(peripherals.I2C0, peripherals.GPIO21, peripherals.GPIO27);
         let (pipeline, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
@@ -1722,9 +2498,13 @@ mod xtensa_hw {
         wdt.feed();
 
         let coordinator = init_coordinator(sta_mac, config, lms_ip);
-        println!("[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized");
+        println!(
+            "[HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, \
+             I2S0 26/25/22, UART2) Initialized"
+        );
 
-        // Apply the boot-resolved audio configuration (volume, AGAIN, EQ, loudness).
+        // Apply the boot-resolved audio configuration (volume, AGAIN, EQ,
+        // loudness).
         let current_vol_pct = amp_apply_boot_config(coordinator, amp, pipeline, config);
         let _ = cyd_bridge.send_message(&CydMessage::Volume(current_vol_pct));
 
@@ -1735,10 +2515,16 @@ mod xtensa_hw {
         #[cfg(feature = "esp-rtos-core1")]
         let core1 = {
             #[allow(unsafe_code)]
+            // JUSTIFICATION: Pass exclusive mutable reference to static
+            // APP_CORE_STACK for Core 1 executor.
+            // SAFETY: APP_CPU is started once at boot and owns APP_CORE_STACK.
             let stack = unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) };
-            esp_rtos::start_second_core(cpu_ctrl_periph, peripherals.FROM_CPU_INTR1, stack, || {
-                crate::tasks::run_core1_executor()
-            });
+            esp_rtos::start_second_core(
+                cpu_ctrl_periph,
+                peripherals.FROM_CPU_INTR1,
+                stack,
+                || crate::tasks::run_core1_executor(),
+            );
             Core1Ctl { active: true }
         };
 
@@ -1749,7 +2535,10 @@ mod xtensa_hw {
 
         let bt_periph = Some(peripherals.BT);
         #[allow(unsafe_code)]
-        let bt_sink: &'static mut louder_esp32_app::bt_a2dp::BtA2dpSink = unsafe {
+        // JUSTIFICATION: Initialize static BtA2dpSink in `.dram2_uninit`
+        // without creating a stack temporary.
+        // SAFETY: Called once during single-core bring-up on PRO_CPU.
+        let bt_sink: &'static mut BtA2dpSink = unsafe {
             let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_SINK)).as_mut_ptr();
             ptr.write_bytes(0, 1);
             let sink = &mut *ptr;
@@ -1757,7 +2546,6 @@ mod xtensa_hw {
             sink
         };
 
-        // Initialize `smoltcp` Ethernet Interface + DHCPv4 + TCP Port 80 + TCP SlimProto (3483)
         let NetStack {
             smol_iface,
             sockets,
@@ -1765,7 +2553,10 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            udp_placeholder_handles,
+            mdns_handle,
+            rtsp_handle,
+            rtp_handle,
+            spot_handle,
             local_port_counter,
         } = init_net_stack(
             &mut sta_iface,
@@ -1780,14 +2571,16 @@ mod xtensa_hw {
         let boot_ms = now_millis();
         pipeline.sink.driver.pump_silence_if_needed(false, false);
         let latest_telemetry = amp_start_playback(amp);
+        let config_writer = ConfigWriter::new(config, boot_ms);
+        let raop_rtsp = alloc::boxed::Box::new(RtspServer::new(
+            airport_express_key(),
+            sta_mac,
+            [0, 0, 0, 0],
+        ));
+        let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
+        let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
 
-        // ====================================================================
-        // GATE 3 & GATE 4: Non-Blocking Runtime Loop with 45s/60s Dead-Man
-        // Lease Watchdog, Port 80 HTTP Recovery Server, and SlimProto Client.
-        // The loop body now runs as the embassy phase ring in `tasks.rs`; this is
-        // its initial state (the legacy pre-loop `let mut` initializers).
-        // ====================================================================
-        SHARED.init(Shared::new(FirmwareState {
+        RUNTIME_STATE.init(DeviceRuntimeState {
             wdt,
             flash,
             core1,
@@ -1801,7 +2594,10 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            _udp_placeholder_handles: udp_placeholder_handles,
+            mdns_handle,
+            rtsp_handle,
+            rtp_handle,
+            spot_handle,
             bt_periph,
             bt_transport: None,
             bt_sink,
@@ -1814,7 +2610,9 @@ mod xtensa_hw {
             http_resp_buf,
             config,
             journal,
+            config_writer,
             wifi_sta_creds,
+            sta_mac,
             lms_ip,
             lms_port,
             current_vol_pct,
@@ -1839,11 +2637,1015 @@ mod xtensa_hw {
             last_fault_check_ms: 0,
             latest_telemetry,
             last_cyd_progress_ms: 0,
+            last_config_poll_ms: 0,
+            mdns_bound: false,
+            last_mdns_announce_ms: 0,
+            raop_rtsp,
+            raop_rtp,
+            raop_streaming: false,
+            spot_spirc,
+            spot_streaming: false,
             now_ms: 0,
-        }))
+        })
+    }
+
+    struct DeviceSmolTcp<'a> {
+        sock: &'a mut tcp::Socket<'static>,
+        connect: Option<(&'a mut SmolContext, [u8; 4], &'a mut u16)>,
+    }
+
+    impl<'a> DeviceSmolTcp<'a> {
+        fn new(sock: &'a mut tcp::Socket<'static>) -> Self {
+            Self {
+                sock,
+                connect: None,
+            }
+        }
+    }
+
+    fn next_local_port(counter: &mut u16) -> u16 {
+        *counter = 49152 + ((counter.wrapping_add(1) - 49152) & 0x3FFF);
+        *counter
+    }
+
+    impl TcpSocketOps for DeviceSmolTcp<'_> {
+        fn phase(&self) -> TcpPhase {
+            match self.sock.state() {
+                tcp::State::Closed | tcp::State::Listen => TcpPhase::Closed,
+                tcp::State::SynSent | tcp::State::SynReceived => TcpPhase::Connecting,
+                tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2 => {
+                    TcpPhase::Established
+                }
+                tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait => TcpPhase::PeerClosed,
+            }
+        }
+
+        fn connect(&mut self, remote: NetAddr) -> bool {
+            let Some((cx, local_ip, port)) = self.connect.as_mut() else {
+                return false;
+            };
+            self.sock.abort();
+            self.sock.set_timeout(Some(STREAM_SOCKET_TIMEOUT));
+            let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(remote.ip)), remote.port);
+            let local_ep = (
+                IpAddress::Ipv4(Ipv4Address::from(*local_ip)),
+                next_local_port(port),
+            );
+            self.sock.connect(cx, remote_ep, local_ep).is_ok()
+        }
+
+        fn abort(&mut self) {
+            self.sock.abort();
+        }
+
+        fn send_capacity(&self) -> usize {
+            self.sock.send_capacity()
+        }
+
+        fn send_queue(&self) -> usize {
+            self.sock.send_queue()
+        }
+
+        fn send_slice(&mut self, data: &[u8]) -> usize {
+            self.sock.send_slice(data).unwrap_or(0)
+        }
+
+        fn recv_queue(&self) -> usize {
+            self.sock.recv_queue()
+        }
+
+        fn recv_capacity(&self) -> usize {
+            self.sock.recv_capacity()
+        }
+
+        fn peek_slice(&mut self, buf: &mut [u8]) -> usize {
+            self.sock.peek_slice(buf).unwrap_or(0)
+        }
+
+        fn recv_slice(&mut self, buf: &mut [u8]) -> usize {
+            self.sock.recv_slice(buf).unwrap_or(0)
+        }
+    }
+
+    fn slim_and_audio_sockets<'a>(
+        sockets: &'a mut SocketSet<'static>,
+        slim_handle: SocketHandle,
+        audio_handle: SocketHandle,
+    ) -> Option<(&'a mut tcp::Socket<'static>, &'a mut tcp::Socket<'static>)> {
+        let (mut slim, mut audio) = (None, None);
+        for (handle, socket) in sockets.iter_mut() {
+            if handle == slim_handle {
+                slim = tcp::Socket::downcast_mut(socket);
+            } else if handle == audio_handle {
+                audio = tcp::Socket::downcast_mut(socket);
+            }
+        }
+        Some((slim?, audio?))
+    }
+
+    fn lms_audio_active(coordinator: &PlayerCoordinator) -> bool {
+        coordinator.stream_active() && coordinator.state != PlayerState::Stopped
+    }
+
+    #[inline(never)]
+    fn flush_settings_before_reboot(s: &mut DeviceRuntimeState) {
+        s.config.flush_now(&mut *s.journal);
+        if let Some(image) = s.journal.pending_image() {
+            #[cfg(not(feature = "runtime-flash-persist"))]
+            let offset = SETTINGS_JOURNAL_OFFSET;
+            #[cfg(feature = "runtime-flash-persist")]
+            let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
+            s.core1.park_for_flash_write();
+            let _ = s.flash.erase(offset, offset + 4096);
+            let _ = s.flash.write(offset, image.sector);
+        }
+    }
+
+    fn backoff_seed(now_ms: u64) -> u32 {
+        (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32
+    }
+
+    #[inline(never)]
+    fn bt_poll_phase(s: &mut DeviceRuntimeState) {
+        let now_ms = s.now_ms;
+        if s.assigned_ip.is_some() && s.bt_transport.is_none() {
+            if let Some(bt_p) = s.bt_periph.take() {
+                s.wdt.feed();
+                s.bt_transport =
+                    match esp_radio::ble::controller::BleConnector::new(bt_p, Default::default()) {
+                        Ok(c) => Some(Esp32VhciTransport { connector: c }),
+                        Err(_) => None,
+                    };
+                s.wdt.feed();
+            }
+        }
+
+        if s.bt_audio_active && lms_audio_active(s.coordinator) {
+            s.bt_audio_active = false;
+        }
+
+        if let Some(ref mut transport) = s.bt_transport {
+            s.bt_sink
+                .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
+                    if !lms_audio_active(s.coordinator)
+                        && s.coordinator.request_source(AudioSource::Bluetooth)
+                    {
+                        if s.coordinator.current_sample_rate != sample_rate_hz
+                            || s.pipeline.sample_rate != sample_rate_hz
+                        {
+                            s.coordinator.current_sample_rate = sample_rate_hz;
+                            let _ = s.pipeline.set_sample_rate(sample_rate_hz);
+                        }
+                        if !s.bt_audio_active {
+                            s.pipeline
+                                .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                            s.pipeline.begin_external_audio();
+                            s.pipeline.set_mute(false);
+                            s.coordinator.begin_external_playback();
+                            if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                let _ = s.amp.start_playback_via_hiz();
+                            }
+                            s.bt_audio_active = true;
+                        }
+                        let _ = s.pipeline.ingest_stream_data(pcm_bytes);
+                    }
+                });
+
+            if s.bt_audio_active && !s.bt_sink.is_streaming() && !lms_audio_active(s.coordinator) {
+                if s.pipeline.stream_buffer.available_read() == 0
+                    && s.pipeline.output_buffer.available_read() == 0
+                    && !s.pipeline.has_pending_pcm()
+                {
+                    s.coordinator.release_source(AudioSource::Bluetooth);
+                    s.coordinator.end_external_playback();
+                    s.bt_audio_active = false;
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn wifi_and_lease_phase(s: &mut DeviceRuntimeState) {
+        let now_ms = s.now_ms;
+        if !s.wifi_controller.is_connected()
+            && (s.last_connect_attempt_ms == 0
+                || now_ms.saturating_sub(s.last_connect_attempt_ms) >= 5_000)
+        {
+            s.last_connect_attempt_ms = now_ms.max(1);
+            let mut connect_fut = pin!(s.wifi_controller.connect_async());
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let _ = connect_fut.as_mut().poll(&mut cx);
+        }
+
+        if s.lease_watchdog.evaluate(
+            now_ms,
+            s.wifi_controller.is_connected(),
+            s.assigned_ip.is_some(),
+        ) == LeaseHealth::ExpiredResetToRecovery
+        {
+            println!(
+                "[ANTI-BRICK GATE 3] Network lease timeout expired -> \
+                 resetting to recovery (0x10000)"
+            );
+            esp_hal::system::software_reset();
+        }
+    }
+
+    #[inline(never)]
+    fn net_poll_phase(s: &mut DeviceRuntimeState) {
+        let now_ms = s.now_ms;
+        {
+            let mut dev = SmolDevice {
+                driver: &mut s.sta_iface,
+            };
+            let _ = s.smol_iface.poll(
+                SmolInstant::from_millis(now_ms as i64),
+                &mut dev,
+                &mut s.sockets,
+            );
+        }
+
+        let dhcp_event = s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp_handle).poll();
+        match dhcp_event {
+            Some(dhcpv4::Event::Configured(config)) => {
+                let ip_octets = config.address.address().octets();
+                s.assigned_ip = Some(ip_octets);
+                let prefix_len = config.address.prefix_len();
+                let mask_u32 = if prefix_len == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - prefix_len)
+                };
+                s.assigned_mask = mask_u32.to_be_bytes();
+                if let Some(router) = config.router {
+                    s.assigned_gw = router.octets();
+                    let _ = s.smol_iface.routes_mut().add_default_ipv4_route(router);
+                }
+                s.smol_iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    let _ = addrs.push(IpCidr::Ipv4(config.address));
+                });
+                println!(
+                    "[DHCPv4] Acquired IP {}.{}.{}.{}/{}",
+                    ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3], prefix_len
+                );
+            }
+            Some(dhcpv4::Event::Deconfigured) => {
+                s.assigned_ip = None;
+                s.smol_iface.update_ip_addrs(|addrs| addrs.clear());
+                s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
+                s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
+                s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                s.helo_sent = false;
+                s.pending_http_body = &[];
+                s.pending_http_closing = false;
+            }
+            None => {}
+        }
+    }
+
+    #[inline(never)]
+    fn http_serve_phase(s: &mut DeviceRuntimeState) {
+        let now_ms = s.now_ms;
+        {
+            let http_sock = s.sockets.get_mut::<tcp::Socket>(s.http_handle);
+
+            if !s.pending_http_body.is_empty() {
+                if now_ms.saturating_sub(s.pending_http_started_ms) >= 2_500
+                    || matches!(
+                        http_sock.state(),
+                        tcp::State::CloseWait
+                            | tcp::State::TimeWait
+                            | tcp::State::Closing
+                            | tcp::State::LastAck
+                            | tcp::State::FinWait1
+                            | tcp::State::FinWait2
+                            | tcp::State::Closed
+                    )
+                {
+                    s.pending_http_body = &[];
+                    http_sock.abort();
+                    s.pending_http_closing = false;
+                } else if http_sock.may_send() {
+                    if let Ok(sent) = http_sock.send_slice(s.pending_http_body) {
+                        s.pending_http_body = &s.pending_http_body[sent..];
+                    }
+                    if s.pending_http_body.is_empty() {
+                        http_sock.close();
+                        s.pending_http_closing = true;
+                        s.pending_close_deadline_ms = now_ms + 500;
+                    }
+                } else {
+                    s.pending_http_body = &[];
+                    http_sock.abort();
+                    s.pending_http_closing = false;
+                }
+            }
+
+            if s.pending_http_closing {
+                if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                    || now_ms >= s.pending_close_deadline_ms
+                {
+                    http_sock.abort();
+                    s.pending_http_closing = false;
+                }
+            }
+
+            if s.pending_http_body.is_empty()
+                && !s.pending_http_closing
+                && http_sock.is_open()
+                && matches!(
+                    http_sock.state(),
+                    tcp::State::CloseWait
+                        | tcp::State::TimeWait
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                )
+            {
+                http_sock.abort();
+            }
+
+            if !http_sock.is_open() {
+                s.pending_http_body = &[];
+                s.pending_http_closing = false;
+                let _ = http_sock.listen(80);
+            }
+
+            if s.pending_http_body.is_empty()
+                && !s.pending_http_closing
+                && http_sock.can_recv()
+                && http_sock.may_send()
+            {
+                let mut req_buf = [0u8; 256];
+                let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
+                while http_sock.can_recv() {
+                    let _ = http_sock.recv(|buf| (buf.len(), ()));
+                }
+                if n > 0 {
+                    let amp_mode_str = match s.amp.mode() {
+                        louder_esp32_app::AmpMode::Play => "Play",
+                        louder_esp32_app::AmpMode::Standby => "Standby",
+                        louder_esp32_app::AmpMode::PowerDown => "PowerDown",
+                    };
+                    let codec_name = match s.pipeline.decoder {
+                        ActiveDecoder::Mp3(_) => "MP3",
+                        ActiveDecoder::Flac(_) => "FLAC",
+                        ActiveDecoder::Pcm(_) => "PCM",
+                        ActiveDecoder::Aac(_) => "AAC",
+                        ActiveDecoder::Vorbis(_) => "Vorbis",
+                        ActiveDecoder::Alac(_) => "ALAC",
+                        ActiveDecoder::Opus(_) => "Opus",
+                    };
+                    let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
+                        match s.latest_telemetry {
+                            Some(t) => (
+                                t.detected_sample_rate_hz_with_hint(
+                                    s.coordinator.current_sample_rate,
+                                ),
+                                t.bck_ratio(),
+                                t.is_pll_locked(),
+                                t.is_automuted(),
+                            ),
+                            None => (s.coordinator.current_sample_rate, 64, true, false),
+                        };
+                    let (psram_free_bytes, psram_used_bytes) = {
+                        let used = esp_alloc::HEAP.used() as u32;
+                        let free = esp_alloc::HEAP.free() as u32;
+                        if free.saturating_add(used) > 200_000 {
+                            (free, used)
+                        } else {
+                            (
+                                louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
+                                louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
+                            )
+                        }
+                    };
+                    let snap = HttpStatusSnapshot {
+                        ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
+                        netmask: s.assigned_mask,
+                        gw: s.assigned_gw,
+                        ssid: s.wifi_sta_creds.ssid.as_str(),
+                        rssi: s.wifi_controller.rssi().unwrap_or(-50),
+                        lms_ip: s.lms_ip,
+                        lms_port: 9000,
+                        lms_cport: 9090,
+                        otadata_prearmed_factory: true,
+                        frames_played: s.pipeline.frames_played,
+                        amp_mode: amp_mode_str,
+                        vol_pct: s.current_vol_pct,
+                        i2c_acks: Esp32I2cBus::hw_ack_count(),
+                        i2c_nacks: Esp32I2cBus::hw_nack_count(),
+                        i2c_nack_by_op: Esp32I2cBus::hw_nack_by_op(),
+                        uptime_ms: now_ms.saturating_sub(s.boot_ms),
+                        psram_free_bytes,
+                        psram_used_bytes,
+                        core1_active: s.core1.is_active(),
+                        core1_loops: CORE1_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed),
+                        codec: codec_name,
+                        codec_sample_rate: s.coordinator.current_sample_rate,
+                        codec_channels: 2,
+                        codec_bit_depth: 16,
+                        eq_preset: s.pipeline.current_eq_preset.as_str(),
+                        eq_enabled: s.pipeline.equalizer.enabled,
+                        tas_fs_hz,
+                        tas_bck_ratio,
+                        tas_pll_locked,
+                        tas_automuted,
+                        again_code: s.amp.analog_gain_code(),
+                        settings_seq: s.journal.sequence(),
+                        bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
+                        bt_connected: s.bt_sink.is_connected(),
+                        bt_streaming: s.bt_sink.is_streaming(),
+                        bt_rx_pkts: s.bt_sink.rx_packets,
+                        bt_frames: s.bt_sink.decoded_frames,
+                        decode_us_max: s.pipeline.decode_us_max,
+                        decode_us_first: s.pipeline.decode_us_first,
+                    };
+                    if let Some((hdr_or_resp_len, static_body, action)) =
+                        handle_http_request_streaming(
+                            &req_buf[..n],
+                            &snap,
+                            &mut s.http_resp_buf[..],
+                        )
+                    {
+                        let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
+                        if !static_body.is_empty() {
+                            s.pending_http_body = static_body;
+                            s.pending_http_started_ms = now_ms;
+                            if let Ok(sent) = http_sock.send_slice(s.pending_http_body) {
+                                s.pending_http_body = &s.pending_http_body[sent..];
+                            }
+                            if s.pending_http_body.is_empty() {
+                                http_sock.close();
+                                s.pending_http_closing = true;
+                                s.pending_close_deadline_ms = now_ms + 500;
+                            }
+                        } else {
+                            http_sock.close();
+                            s.pending_http_closing = true;
+                            s.pending_close_deadline_ms = now_ms + 500;
+                        }
+                        match action {
+                            HttpControlAction::SetEqPreset(preset_id) => {
+                                let preset = EqPreset::from_u8(preset_id);
+                                s.pipeline.apply_eq_preset(preset);
+                                s.config.update(|c| c.equalizer_preset = preset_id);
+                            }
+                            HttpControlAction::SetAnalogGain(again_code) => {
+                                let _ = s.amp.set_analog_gain(again_code);
+                                s.config.update(|c| c.analog_gain_code = again_code);
+                            }
+                            HttpControlAction::PlayerIrCommand {
+                                ir_code,
+                                vol_pct,
+                                mute,
+                            } => {
+                                if let Some(pct) = vol_pct {
+                                    s.current_vol_pct = pct;
+                                    let mut backend = Esp32AudioBackend::new(
+                                        s.amp,
+                                        DeviceClockRegs,
+                                        &DMA_OUTSTANDING_FRAMES,
+                                    );
+                                    s.coordinator
+                                        .set_volume_percent(pct, &mut backend, s.pipeline);
+                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
+                                    s.config.update(|c| c.volume = pct);
+                                }
+                                if let Some(m) = mute {
+                                    s.pipeline.set_mute(m);
+                                }
+                                if ir_code != 0 && s.helo_sent {
+                                    let mut ir_buf = [0u8; 32];
+                                    if let Ok(ir_len) = SlimprotoBuilder::build_ir(
+                                        now_ms as u32,
+                                        ir_code,
+                                        &mut ir_buf,
+                                    ) {
+                                        let slim_sock =
+                                            s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+                                        let mut link = SmoltcpSlimTransport::new(
+                                            DeviceSmolTcp::new(slim_sock),
+                                            &mut s.slim_link,
+                                        );
+                                        let _ = link.send(&ir_buf[..ir_len]);
+                                    }
+                                }
+                            }
+                            HttpControlAction::RebootToRecovery
+                            | HttpControlAction::PersistOta0AndReboot => {
+                                s.pending_http_action = action;
+                                s.pending_action_deadline_ms = now_ms + 250;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        http_sock.close();
+                        s.pending_http_closing = true;
+                        s.pending_close_deadline_ms = now_ms + 250;
+                    }
+                }
+            }
+        }
+
+        if s.pending_http_action != HttpControlAction::None
+            && now_ms >= s.pending_action_deadline_ms
+        {
+            flush_settings_before_reboot(s);
+            match s.pending_http_action {
+                HttpControlAction::RebootToRecovery => {
+                    println!(
+                        "[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json \
+                         -> resetting into factory recovery (0x10000)"
+                    );
+                    esp_hal::system::software_reset();
+                }
+                HttpControlAction::PersistOta0AndReboot => {
+                    let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
+                    let _ = s.flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
+                    println!(
+                        "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
+                         wrote ota_0 select entry & resetting"
+                    );
+                    esp_hal::system::software_reset();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn slim_session_phase(s: &mut DeviceRuntimeState) {
+        let now_ms = s.now_ms;
+        let Some(local_ip) = s.assigned_ip else {
+            return;
+        };
+        let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+        if let Some(ip) = s.slim_switch_to.take() {
+            slim_sock.abort();
+            s.slim_reconnect
+                .server_switch(now_ms, s.lms_ip, backoff_seed(now_ms));
+            s.slim_was_open = false;
+            s.helo_sent = false;
+            s.lms_ip = ip;
+            s.coordinator.lms_ip = ip;
+        }
+        if slim_sock.is_open()
+            && matches!(
+                slim_sock.state(),
+                tcp::State::CloseWait
+                    | tcp::State::TimeWait
+                    | tcp::State::Closing
+                    | tcp::State::LastAck
+                    | tcp::State::FinWait1
+                    | tcp::State::FinWait2
+            )
+        {
+            slim_sock.abort();
+        }
+        let open = slim_sock.is_open();
+        if s.slim_was_open && !open {
+            s.helo_sent = false;
+            if let Some(previous) = s.slim_reconnect.link_down(now_ms, backoff_seed(now_ms)) {
+                s.lms_ip = previous;
+                s.coordinator.lms_ip = previous;
+            }
+        }
+        s.slim_was_open = open;
+        if !open && s.slim_reconnect.may_connect(now_ms) {
+            s.helo_sent = false;
+            s.slim_link.reset();
+            let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(s.lms_ip)), s.lms_port);
+            let local_ep = (
+                IpAddress::Ipv4(Ipv4Address::from(local_ip)),
+                next_local_port(&mut s.local_port_counter),
+            );
+            if slim_sock
+                .connect(s.smol_iface.context(), remote_ep, local_ep)
+                .is_ok()
+            {
+                s.slim_reconnect.connect_started();
+                s.slim_was_open = true;
+            }
+        }
+        slim_tick(s, local_ip);
+    }
+
+    #[inline(never)]
+    fn slim_tick(s: &mut DeviceRuntimeState, local_ip: [u8; 4]) {
+        let now_ms = s.now_ms as u32;
+        let DeviceRuntimeState {
+            ref mut sockets,
+            ref mut smol_iface,
+            slim_handle,
+            audio_handle,
+            ref mut coordinator,
+            ref mut pipeline,
+            ref mut amp,
+            ref mut cyd_bridge,
+            ref mut slim_link,
+            ref mut stream_state,
+            ref mut local_port_counter,
+            ref mut helo_sent,
+            ref mut current_vol_pct,
+            ref mut slim_reconnect,
+            ref mut slim_switch_to,
+            config,
+            now_ms: lap_ms,
+            ..
+        } = *s;
+        let Some((slim_sock, audio_sock)) =
+            slim_and_audio_sockets(sockets, slim_handle, audio_handle)
+        else {
+            return;
+        };
+
+        let mut transport =
+            SmoltcpSlimTransport::new(DeviceSmolTcp::new(slim_sock), &mut *slim_link);
+        if transport.connected() && !*helo_sent {
+            *helo_sent = coordinator
+                .hello(
+                    &mut transport,
+                    HELO_DEVICE_ID,
+                    slim_reconnect.reconnect_flag(),
+                )
+                .is_ok();
+            if !*helo_sent {
+                return;
+            }
+            slim_reconnect.session_up(lap_ms);
+        }
+        let mut source = SmoltcpStreamSource::new(
+            DeviceSmolTcp {
+                sock: audio_sock,
+                connect: Some((smol_iface.context(), local_ip, local_port_counter)),
+            },
+            &mut *stream_state,
+        );
+        let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        let _ = coordinator.tick(&mut transport, &mut source, &mut backend, pipeline, now_ms);
+        if let Some(ip) = coordinator.take_server_switch() {
+            *slim_switch_to = Some(ip);
+        }
+
+        while let Some(msg) = coordinator.take_cyd_message() {
+            if let CydMessage::Volume(pct) = msg {
+                *current_vol_pct = pct;
+                config.update(|c| c.volume = pct);
+            }
+            let _ = cyd_bridge.send_message(&msg);
+        }
+    }
+
+    #[inline(never)]
+    fn multi_proto_poll(s: &mut DeviceRuntimeState) {
+        let Some(local_ip) = s.assigned_ip else {
+            return;
+        };
+        let now_ms = s.now_ms;
+
+        // 1. mDNS responder (`UDP 5353`) for AirPlay `_raop._tcp.local` &
+        // Spotify `_spotify-connect._tcp.local`
+        {
+            let mdns_sock = s.sockets.get_mut::<udp::Socket>(s.mdns_handle);
+            if !s.mdns_bound {
+                if mdns_sock.bind(5353).is_ok() {
+                    s.mdns_bound = true;
+                }
+            }
+            if s.mdns_bound {
+                let mut rx_q = [0u8; 512];
+                let mut should_announce = s.last_mdns_announce_ms == 0
+                    || now_ms.saturating_sub(s.last_mdns_announce_ms) >= 30_000;
+                while mdns_sock.can_recv() {
+                    if let Ok((n, _meta)) = mdns_sock.recv_slice(&mut rx_q) {
+                        if n >= 12 && (rx_q[2] & 0x80) == 0 {
+                            should_announce = true;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if should_announce && mdns_sock.can_send() {
+                    let mcast = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+                    let mcfg = MdnsConfig {
+                        player_name: alloc::string::String::from("BASEMENT"),
+                        mac_address: s.sta_mac,
+                        ip_address: local_ip,
+                        port: 5000,
+                    };
+                    let rpkt = MdnsBuilder::build_announcement(&mcfg);
+                    let _ = mdns_sock.send_slice(&rpkt, mcast);
+                    let scfg = SpotifyMdnsConfig {
+                        player_name: alloc::string::String::from("BASEMENT"),
+                        mac_address: s.sta_mac,
+                        ip_address: local_ip,
+                        port: 4070,
+                    };
+                    let spkt = SpotifyMdnsBuilder::build_announcement(&scfg);
+                    let _ = mdns_sock.send_slice(&spkt, mcast);
+                    s.last_mdns_announce_ms = now_ms.max(1);
+                }
+            }
+        }
+
+        // 2. AirPlay 1 RAOP RTSP Control (`TCP 5000`) & RTP Audio (`UDP 6000`)
+        {
+            s.raop_rtsp.set_ip_address(local_ip);
+            let rtsp_sock = s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle);
+            if rtsp_sock.is_open()
+                && matches!(
+                    rtsp_sock.state(),
+                    tcp::State::CloseWait
+                        | tcp::State::TimeWait
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                )
+            {
+                rtsp_sock.abort();
+            }
+            if !rtsp_sock.is_open() {
+                let _ = rtsp_sock.listen(5000);
+            }
+            if rtsp_sock.can_recv() && rtsp_sock.may_send() {
+                let mut req_bytes = alloc::vec![0u8; 2048];
+                if let Ok(n) = rtsp_sock.recv_slice(&mut req_bytes) {
+                    if n > 0 {
+                        if let Ok(req) = RtspRequest::parse(&req_bytes[..n]) {
+                            if let Ok(resp) = s.raop_rtsp.handle_request(&req) {
+                                let resp_bytes = resp.to_bytes();
+                                let _ = rtsp_sock.send_slice(&resp_bytes);
+                            }
+                            match req.method {
+                                RtspMethod::Record => {
+                                    if s.coordinator.request_source(AudioSource::AirPlay) {
+                                        if let (Some(key), Some(iv)) =
+                                            (s.raop_rtsp.session_key(), s.raop_rtsp.aes_iv())
+                                        {
+                                            s.raop_rtp.configure_crypto(key, iv);
+                                        }
+                                        if let Some(sdp) = s.raop_rtsp.sdp_session() {
+                                            if let Some(ref fmtp) = sdp.fmtp {
+                                                let _ = s.raop_rtp.configure_alac(fmtp);
+                                            }
+                                        }
+                                        s.pipeline
+                                            .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
+                                                16, 2, false,
+                                            )));
+                                        s.pipeline.begin_external_audio();
+                                        s.coordinator.begin_external_playback();
+                                        s.raop_streaming = true;
+                                    }
+                                }
+                                RtspMethod::SetParameter => {
+                                    let pct = ((s.raop_rtsp.volume() * 100.0) as u8).min(100);
+                                    s.current_vol_pct = pct;
+                                    let mut backend = Esp32AudioBackend::new(
+                                        s.amp,
+                                        DeviceClockRegs,
+                                        &DMA_OUTSTANDING_FRAMES,
+                                    );
+                                    s.coordinator.set_volume_percent(
+                                        pct,
+                                        &mut backend,
+                                        s.pipeline,
+                                    );
+                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
+                                    s.config.update(|c| c.volume = pct);
+                                }
+                                RtspMethod::Teardown => {
+                                    s.raop_streaming = false;
+                                    s.coordinator.release_source(AudioSource::AirPlay);
+                                    if s.coordinator.active_source() == AudioSource::None {
+                                        s.coordinator.end_external_playback();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let rtp_sock = s.sockets.get_mut::<udp::Socket>(s.rtp_handle);
+            if !rtp_sock.is_open() {
+                let _ = rtp_sock.bind(6000);
+            }
+            if rtp_sock.can_recv() {
+                let mut pkt_buf = alloc::vec![0u8; 1536];
+                let mut bursts = 0u8;
+                while bursts < 4 && rtp_sock.can_recv() {
+                    bursts += 1;
+                    if let Ok((n, _ep)) = rtp_sock.recv_slice(&mut pkt_buf) {
+                        if s.raop_streaming
+                            && s.coordinator.active_source() == AudioSource::AirPlay
+                        {
+                            if let Ok((pcm_i16, _hdr)) = s.raop_rtp.process_packet(&pkt_buf[..n]) {
+                                let pcm_bytes: &[u8] = bytemuck::cast_slice(pcm_i16);
+                                let _ = s.pipeline.ingest_stream_data(pcm_bytes);
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if s.raop_streaming && s.raop_rtsp.state() != ServerState::Streaming {
+                s.raop_streaming = false;
+                s.coordinator.release_source(AudioSource::AirPlay);
+                if s.coordinator.active_source() == AudioSource::None {
+                    s.coordinator.end_external_playback();
+                }
+            }
+        }
+
+        // 3. Spotify Connect ZeroConf HTTP & Spirc (`TCP 4070`)
+        {
+            let spot_sock = s.sockets.get_mut::<tcp::Socket>(s.spot_handle);
+            if spot_sock.is_open()
+                && matches!(
+                    spot_sock.state(),
+                    tcp::State::CloseWait
+                        | tcp::State::TimeWait
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                )
+            {
+                spot_sock.abort();
+            }
+            if !spot_sock.is_open() {
+                let _ = spot_sock.listen(4070);
+            }
+            if spot_sock.can_recv() && spot_sock.may_send() {
+                let mut req_buf = alloc::vec![0u8; 1024];
+                if let Ok(n) = spot_sock.recv_slice(&mut req_buf) {
+                    if n > 0 {
+                        if req_buf[..n].starts_with(b"GET ") || req_buf[..n].starts_with(b"POST ")
+                        {
+                            let body = b"{\"status\":101,\"statusString\":\"OK\",\
+                                \"spotifyError\":0,\"version\":\"2.9.0\",\
+                                \"deviceID\":\"c82e18beb8340000000000000000000000000000\",\
+                                \"remoteName\":\"BASEMENT\",\"activeUser\":\"\",\
+                                \"publicKey\":\"\",\"deviceType\":\"SPEAKER\",\
+                                \"libraryVersion\":\"0.1.0\",\"accountReq\":\"PREMIUM\",\
+                                \"brandDisplayName\":\"Squeezelite\",\
+                                \"modelDisplayName\":\"ESP32\"}";
+                            let hdr = b"HTTP/1.1 200 OK\r\n\
+                                Content-Type: application/json\r\n\
+                                Connection: close\r\n\r\n";
+                            let _ = spot_sock.send_slice(hdr);
+                            let _ = spot_sock.send_slice(body);
+                            spot_sock.close();
+                        } else if let Ok(frame) = SpircFrame::parse(&req_buf[..n]) {
+                            if let Some(evt) = s.spot_spirc.handle_frame(&frame) {
+                                match evt {
+                                    SpircEvent::Play | SpircEvent::LoadTrack { .. } => {
+                                        if s.coordinator.request_source(AudioSource::Spotify) {
+                                            let dec = alloc::boxed::Box::new(
+                                                squeezelite_decoders::VorbisDecoder::new(),
+                                            );
+                                            s.pipeline.set_decoder(ActiveDecoder::Vorbis(dec));
+                                            s.pipeline.begin_external_audio();
+                                            s.coordinator.begin_external_playback();
+                                            s.spot_streaming = true;
+                                        }
+                                    }
+                                    SpircEvent::Pause => {
+                                        s.spot_streaming = false;
+                                        s.coordinator.release_source(AudioSource::Spotify);
+                                        if s.coordinator.active_source() == AudioSource::None {
+                                            s.coordinator.end_external_playback();
+                                        }
+                                    }
+                                    SpircEvent::SetVolume(vol_u32) => {
+                                        let pct = ((vol_u32.min(65_536) * 100) / 65_536) as u8;
+                                        s.current_vol_pct = pct;
+                                        let mut backend = Esp32AudioBackend::new(
+                                            s.amp,
+                                            DeviceClockRegs,
+                                            &DMA_OUTSTANDING_FRAMES,
+                                        );
+                                        s.coordinator
+                                            .set_volume_percent(pct, &mut backend, s.pipeline);
+                                        let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
+                                        s.config.update(|c| c.volume = pct);
+                                    }
+                                    SpircEvent::Next
+                                    | SpircEvent::Prev
+                                    | SpircEvent::Seek(_)
+                                    | SpircEvent::Notify => {}
+                                }
+                            }
+                        } else if s.spot_streaming
+                            && s.coordinator.active_source() == AudioSource::Spotify
+                        {
+                            let _ = s.pipeline.ingest_stream_data(&req_buf[..n]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn cyd_command_phase(s: &mut DeviceRuntimeState) {
+        if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
+            let mut backend =
+                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            if let Some(reply) = s
+                .coordinator
+                .handle_cyd_command(cmd, &mut backend, s.pipeline)
+            {
+                if let CydMessage::Volume(pct) = reply {
+                    s.config.update(|c| c.volume = pct.min(100));
+                }
+                let _ = s.cyd_bridge.flush_outbound(&reply);
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn output_decode_phase(s: &mut DeviceRuntimeState) {
+        s.coordinator.pump_output(s.pipeline, 16);
+        let max_steps = match s.pipeline.decoder {
+            ActiveDecoder::Pcm(_) => 4,
+            _ => 16,
+        };
+        s.coordinator.pump_decode(s.pipeline, max_steps);
+        s.coordinator.pump_output(s.pipeline, 16);
+        s.coordinator.current_sample_rate = s.pipeline.sample_rate;
+
+        if !s.coordinator.dac_enabled {
+            let _ = s.amp.stop_playback();
+        }
+
+        let has_buffered_audio =
+            s.pipeline.output_buffer.available_read() >= 8 || s.pipeline.has_pending_pcm();
+        s.pipeline.sink.driver.pump_silence_if_needed(
+            s.coordinator.state == PlayerState::Playing,
+            has_buffered_audio,
+        );
+    }
+
+    #[inline(never)]
+    fn amp_and_cyd_health_phase(s: &mut DeviceRuntimeState) {
+        let now_ms = s.now_ms;
+        if now_ms.saturating_sub(s.last_fault_check_ms) >= 2_000 {
+            s.last_fault_check_ms = now_ms;
+            if s.coordinator.state == PlayerState::Playing {
+                if let Ok(Some(fault)) = s.amp.check_faults() {
+                    if !fault.is_clean() {
+                        let _ = s.amp.recover_from_fault();
+                    }
+                }
+            }
+            if let Ok(telem) = s.amp.read_telemetry() {
+                s.latest_telemetry = telem;
+            }
+        }
+
+        if now_ms.saturating_sub(s.last_cyd_progress_ms) >= 1_000 {
+            s.last_cyd_progress_ms = now_ms;
+            if s.coordinator.state == PlayerState::Playing && s.coordinator.current_sample_rate > 0
+            {
+                let elapsed_secs =
+                    (s.pipeline.frames_played / s.coordinator.current_sample_rate as u64) as u32;
+                let _ = s.cyd_bridge.send_message(&CydMessage::Progress {
+                    elapsed_secs,
+                    duration_secs: 0,
+                });
+            }
+        }
+
+        if now_ms.saturating_sub(s.last_config_poll_ms) >= 100 {
+            s.last_config_poll_ms = now_ms;
+            s.config_writer.poll(s.config, &mut *s.journal, now_ms);
+        }
+    }
+
+    #[inline(never)]
+    fn pump_device_phase(s: &mut DeviceRuntimeState) {
+        s.wdt.feed();
+        s.now_ms = now_millis();
+        bt_poll_phase(s);
+        wifi_and_lease_phase(s);
+        net_poll_phase(s);
+        http_serve_phase(s);
+        slim_session_phase(s);
+        multi_proto_poll(s);
+        cyd_command_phase(s);
+        output_decode_phase(s);
+        amp_and_cyd_health_phase(s);
     }
 }
-
 
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::main]
@@ -1871,17 +3673,22 @@ mod tests {
             44100,
         );
 
-        let mut coordinator = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
+        let mut coordinator =
+            PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
         let mut cyd_bridge = CydUartBridge::new(LoopbackUartPort::new());
         let mut amp = AmpManager::for_active_board(TargetI2cBus::new());
         amp.initialize(32).unwrap();
         amp.start_playback().unwrap();
 
-        // Push PLAY command via UART RX and 1 stereo frame (4 bytes of 16-bit PCM) into stream buffer
+        // Push PLAY command via UART RX and 1 stereo frame (4 bytes of 16-bit
+        // PCM) into stream buffer.
         cyd_bridge.port.push_rx(b"CMD=PLAY\n");
-        pipeline.ingest_stream_data(&[0x01, 0x00, 0xFF, 0x00]).unwrap();
+        pipeline
+            .ingest_stream_data(&[0x01, 0x00, 0xFF, 0x00])
+            .unwrap();
 
-        let frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+        let frames =
+            run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
         assert_eq!(coordinator.state, PlayerState::Playing);
         assert_eq!(frames, 1);
         assert_eq!(cyd_bridge.port.tx_bytes(), b"STATE=P\n");
@@ -1889,10 +3696,10 @@ mod tests {
 
     #[test]
     fn test_run_firmware_tick_with_network_recovers_amp_fault_and_syncs_rate() {
-        use std::io::Read;
-        use std::net::TcpListener;
         use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
         use squeezelite_tas58xx::registers;
+        use std::io::Read;
+        use std::net::TcpListener;
 
         let addr = louder_esp32_app::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
@@ -1916,13 +3723,26 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback (starts at VOL_DEFAULT_M20DB = 0x58)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // check_faults returns a non-clean fault (overcurrent on channel)
-            I2cTrans::write_read(addr, vec![registers::CHAN_FAULT], vec![0x01, 0x00, 0x00, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write_read(
+                addr,
+                vec![registers::CHAN_FAULT],
+                vec![0x01, 0x00, 0x00, 0x00],
+            ),
             // recover_from_fault: Hi-Z -> clear fault -> Play
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
@@ -2012,18 +3832,51 @@ mod tests {
 
     #[test]
     fn test_helo_capabilities_flc_and_sample_rate() {
-        // Task 11: built from what the firmware can do (no HasDigitalOut until SPDIF exists,
-        // MaxSampleRate from the verified clock table).
         let caps = PlayerCoordinator::helo_capabilities(None).unwrap();
-        assert!(caps.contains(",flc,"), "Capabilities must advertise native FLAC (,flc,)");
+        assert!(
+            caps.contains(",flc,"),
+            "Capabilities must advertise native FLAC (,flc,)"
+        );
         assert!(caps.contains(&format!(
             "MaxSampleRate={}",
             louder_esp32_app::clock_table::max_verified_rate()
         )));
-        assert!(caps.contains(",pcm,"), "Capabilities must advertise pcm");
-        assert!(caps.contains(",mp3"), "Capabilities must advertise mp3");
+        assert!(
+            caps.contains(",pcm,"),
+            "Capabilities must advertise pcm"
+        );
+        assert!(
+            caps.contains(",mp3"),
+            "Capabilities must advertise mp3"
+        );
         assert!(!caps.contains("HasDigitalOut"));
         assert!(caps.starts_with("Model=squeezeesp32,"));
+        assert!(
+            BASEMENT_HELO_CAPABILITIES.contains("flc,pcm,wav,aif,mp3,aac,ogg,alc,ops"),
+            "BASEMENT_HELO_CAPABILITIES must advertise all 9 codecs"
+        );
+    }
+
+    #[test]
+    fn test_firmware_tick_arbiter_source_selection() {
+        let mac = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
+        let mut coordinator = PlayerCoordinator::new(mac, "BASEMENT");
+        assert_eq!(coordinator.active_source(), AudioSource::None);
+        assert!(coordinator.request_source(AudioSource::SlimProto));
+        assert!(coordinator.request_source(AudioSource::Bluetooth));
+        assert_eq!(coordinator.active_source(), AudioSource::Bluetooth);
+        assert!(coordinator.request_source(AudioSource::Spotify));
+        assert_eq!(coordinator.active_source(), AudioSource::Spotify);
+        assert!(coordinator.request_source(AudioSource::AirPlay));
+        assert_eq!(coordinator.active_source(), AudioSource::AirPlay);
+        coordinator.release_source(AudioSource::AirPlay);
+        assert_eq!(coordinator.active_source(), AudioSource::Spotify);
+        coordinator.release_source(AudioSource::Spotify);
+        assert_eq!(coordinator.active_source(), AudioSource::Bluetooth);
+        coordinator.release_source(AudioSource::Bluetooth);
+        assert_eq!(coordinator.active_source(), AudioSource::SlimProto);
+        coordinator.release_source(AudioSource::SlimProto);
+        assert_eq!(coordinator.active_source(), AudioSource::None);
     }
 }
 

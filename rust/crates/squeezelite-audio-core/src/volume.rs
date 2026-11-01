@@ -1,9 +1,10 @@
 //! Audio Volume Attenuation & Gain Scaling
 //!
-//! [`GainStage`] is the LMS output's composite gain (volume x replay gain x fade, polarity,
-//! channel select), a port of C squeezelite's `_output_frames` gain composition and
-//! `_apply_gain`. [`VolumeScale`] is the plain per-channel volume record, kept for the
-//! Bluetooth path and the coordinator's volume bookkeeping.
+//! [`GainStage`] is the LMS output's composite gain (volume x replay gain x
+//! fade, polarity, channel select), a port of C squeezelite's `_output_frames`
+//! gain composition and `_apply_gain`. [`VolumeScale`] is the plain
+//! per-channel volume record, kept for the Bluetooth path and the
+//! coordinator's volume bookkeeping.
 
 use crate::fade::{gain, FIXED_ONE};
 
@@ -45,19 +46,22 @@ impl VolumeScale {
     }
 }
 
-/// Output channel selection from `strm s` (C `output.channels = (flags & 0x0c) >> 2`,
-/// `slimproto.c:489`, with `MONO_LEFT = 0x01` and `MONO_RIGHT = 0x02`, `squeezelite.h:663-664`).
+/// Output channel selection from `strm s` (C `output.channels = (flags & 0x0c)
+/// >> 2`, `slimproto.c:489`, with `MONO_LEFT = 0x01` and `MONO_RIGHT = 0x02`,
+/// `squeezelite.h:663-664`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelMode {
     /// Neither bit: left and right as they are.
     #[default]
     Stereo,
-    /// Both bits (`MONO_LEFT | MONO_RIGHT`): the average of the two scaled channels on both
-    /// (C `output_pack.c:386-392`).
+    /// Both bits (`MONO_LEFT | MONO_RIGHT`): the average of the two scaled
+    /// channels on both (C `output_pack.c:386-392`).
     MonoMix,
-    /// `MONO_LEFT` (0x01): the scaled left sample on both channels (C `output_pack.c:400-405`).
+    /// `MONO_LEFT` (0x01): the scaled left sample on both channels (C
+    /// `output_pack.c:400-405`).
     LeftOnly,
-    /// `MONO_RIGHT` (0x02): the scaled right sample on both channels (C `output_pack.c:394-399`).
+    /// `MONO_RIGHT` (0x02): the scaled right sample on both channels (C
+    /// `output_pack.c:394-399`).
     RightOnly,
 }
 
@@ -74,19 +78,22 @@ impl ChannelMode {
     }
 }
 
-/// The composite output gain: volume x replay gain x fade, polarity and channel select, in the
-/// order C composes them in `_output_frames` (`output.c:54-57`, `:226-228`, `:243-245`) and
-/// applies them in `_apply_gain` (`output_pack.c:383-410`).
+/// The composite output gain: volume x replay gain x fade, polarity and
+/// channel select, in the order C composes them in `_output_frames`
+/// (`output.c:54-57`, `:226-228`, `:243-245`) and applies them in
+/// `_apply_gain` (`output_pack.c:383-410`).
 ///
-/// All gains are Q16.16 (`0x1_0000` = unity). The pipeline owns one and refreshes the
-/// per-chunk fields before every output chunk:
-/// - `volume_l_q16` / `volume_r_q16`: C `output.gainL` / `gainR` (set by `audg`, kept across
-///   chunks). Unity when a hardware amplifier does the volume (C `set_volume` with a
-///   `volume_cb`, `output_embedded.c:118-126`).
-/// - `replay_gain_q16`: C `output.current_replay_gain`; 0 means none (`output.c:54-55`). During
-///   a crossfade it is 0, because the crossfade weights carry each track's own replay gain
-///   (C uses plain `output.gainL` there, `output.c:243-245`).
-/// - `fade_q16`: the fade-up/down gain of this chunk (`FadeEngine::gain_q16`), unity otherwise.
+/// All gains are Q16.16 (`0x1_0000` = unity). The pipeline owns one and
+/// refreshes the per-chunk fields before every output chunk:
+/// - `volume_l_q16` / `volume_r_q16`: C `output.gainL` / `gainR` (set by
+///   `audg`, kept across chunks). Unity when a hardware amplifier does the
+///   volume (C `set_volume` with a `volume_cb`, `output_embedded.c:118-126`).
+/// - `replay_gain_q16`: C `output.current_replay_gain`; 0 means none
+///   (`output.c:54-55`). During a crossfade it is 0, because the crossfade
+///   weights carry each track's own replay gain (C uses plain `output.gainL`
+///   there, `output.c:243-245`).
+/// - `fade_q16`: the fade-up/down gain of this chunk (`FadeEngine::gain_q16`),
+///   unity otherwise.
 /// - `invert_polarity`: C `output.invert` (`slimproto.c:488`).
 /// - `channel_mode`: C `output.channels` (`slimproto.c:489`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +112,10 @@ impl Default for GainStage {
     }
 }
 
-/// A `u32` gain as the `s32_t` C passes to `gain()`. Values above `i32::MAX` saturate.
-/// Declared divergence: C converts `u32_t output.gainL` implicitly, so a gain >= 2^31 would
-/// wrap negative (a polarity flip); LMS never sends one.
+/// A `u32` gain as the `s32_t` C passes to `gain()`. Values above `i32::MAX`
+/// saturate. Declared divergence: C converts `u32_t output.gainL` implicitly,
+/// so a gain >= 2^31 would wrap negative (a polarity flip); LMS never sends
+/// one.
 #[inline]
 fn q16(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
@@ -132,22 +140,28 @@ impl GainStage {
     fn compose(&self, volume: u32, invert: bool) -> i32 {
         let volume = q16(volume);
         // C parity: output.c:54-55, replay gain multiplies the volume; 0 means none.
-        let mut g = if self.replay_gain_q16 != 0 { gain(volume, q16(self.replay_gain_q16)) } else { volume };
+        let mut g = if self.replay_gain_q16 != 0 {
+            gain(volume, q16(self.replay_gain_q16))
+        } else {
+            volume
+        };
         // C parity: output.c:57, inversion negates the standard gain.
         if invert {
             g = -g;
         }
-        // C parity: output.c:226-228, the fade gain multiplies the standard gain. Declared
-        // divergence (ruled in Task 13): C negates a second time here (:229), which cancels
-        // the inversion for the length of the fade; here it is negated once.
+        // C parity: output.c:226-228, the fade gain multiplies the standard
+        // gain. Declared divergence (ruled in Task 13): C negates a second
+        // time here (:229), which cancels the inversion for the length of the
+        // fade; here it is negated once.
         if self.fade_q16 != FIXED_ONE as u32 {
             g = gain(g, q16(self.fade_q16));
         }
         g
     }
 
-    /// Volume x replay gain x fade per channel (left, right), without the polarity: the
-    /// magnitude C's `gainL` / `gainR` have in `_output_frames`. Never negative.
+    /// Volume x replay gain x fade per channel (left, right), without the
+    /// polarity: the magnitude C's `gainL` / `gainR` have in `_output_frames`.
+    /// Never negative.
     #[must_use]
     pub fn effective_q16(&self) -> (u64, u64) {
         let l = self.compose(self.volume_l_q16, false);
@@ -164,8 +178,9 @@ impl GainStage {
         )
     }
 
-    /// Scales interleaved stereo `samples` in place, with polarity and channel select (C
-    /// parity: output_pack.c:383-410 `_apply_gain`). A trailing odd sample is left alone.
+    /// Scales interleaved stereo `samples` in place, with polarity and channel
+    /// select (C parity: output_pack.c:383-410 `_apply_gain`). A trailing odd
+    /// sample is left alone.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn apply(&self, samples: &mut [i32]) {
         let (gl, gr) = self.channel_gains();
@@ -288,10 +303,16 @@ mod tests {
         assert_eq!(samples, [5000, 10000]);
     }
 
-    // ---- GainStage (Task 14) ----------------------------------------------------------------
+    // ---- GainStage (Task 14) ------------------------------------------------
 
     fn stage(vol: u32, rg: u32, fade: u32) -> GainStage {
-        GainStage { volume_l_q16: vol, volume_r_q16: vol, replay_gain_q16: rg, fade_q16: fade, ..GainStage::unity() }
+        GainStage {
+            volume_l_q16: vol,
+            volume_r_q16: vol,
+            replay_gain_q16: rg,
+            fade_q16: fade,
+            ..GainStage::unity()
+        }
     }
 
     #[test]
@@ -306,7 +327,8 @@ mod tests {
 
     #[test]
     fn test_composite_gain_composes_like_c() {
-        // C output.c:54 then :225: gain(gain(vol, rg), fade), each step truncating (>> 16).
+        // C output.c:54 then :225: gain(gain(vol, rg), fade), each step
+        // truncating (>> 16).
         let g = stage(0x9999, 0x1_6A09, 0xC000);
         let expect = gain(gain(0x9999, 0x1_6A09), 0xC000);
         assert_eq!(g.channel_gains(), (expect, expect));
@@ -332,17 +354,24 @@ mod tests {
 
     #[test]
     fn test_gain_saturates_like_c() {
-        // C gain() clamps the 64-bit product to +-0x7fffffffffff before >> 16 (output_pack.c:
-        // 33-38): replay gain 4.0 on a near-full-scale sample lands on the i32 bounds, through
-        // the per-sample loop (gains 4.0, so not the unity fast path).
+        // C gain() clamps the 64-bit product to +-0x7fffffffffff before >> 16
+        // (output_pack.c: 33-38): replay gain 4.0 on a near-full-scale sample
+        // lands on the i32 bounds, through the per-sample loop (gains 4.0, so
+        // not the unity fast path).
         let g = GainStage { replay_gain_q16: 0x4_0000, ..GainStage::unity() };
         assert_eq!(g.channel_gains(), (0x4_0000, 0x4_0000));
         let mut s = [0x7fff_0000, -0x7fff_0000, 0x2000_0000, -0x2000_0001];
         g.apply(&mut s);
         assert_eq!(s, [i32::MAX, i32::MIN, i32::MAX, i32::MIN]);
-        // The composition itself saturates too: gain(vol, rg) = 16384.0 x 4.0 clamps to
-        // i32::MAX (output.c:54), and an out-of-range u32 volume first saturates to i32::MAX.
-        let g = GainStage { volume_l_q16: 0x4000_0000, volume_r_q16: u32::MAX, replay_gain_q16: 0x4_0000, ..GainStage::unity() };
+        // The composition itself saturates too: gain(vol, rg) = 16384.0 x 4.0
+        // clamps to i32::MAX (output.c:54), and an out-of-range u32 volume
+        // first saturates to i32::MAX.
+        let g = GainStage {
+            volume_l_q16: 0x4000_0000,
+            volume_r_q16: u32::MAX,
+            replay_gain_q16: 0x4_0000,
+            ..GainStage::unity()
+        };
         assert_eq!(g.channel_gains(), (i32::MAX, i32::MAX));
         assert_eq!(g.effective_q16(), (i32::MAX as u64, i32::MAX as u64));
         assert_eq!(g.channel_gains().0, gain(0x4000_0000, 0x4_0000));
@@ -370,8 +399,9 @@ mod tests {
 
     #[test]
     fn test_polarity_inversion_negates_once_with_fade() {
-        // Declared divergence (ruled): C negates a second time under a fade (output.c:57 then
-        // :229), which cancels the inversion; here the fade multiplies the inverted gain once.
+        // Declared divergence (ruled): C negates a second time under a fade
+        // (output.c:57 then :229), which cancels the inversion; here the fade
+        // multiplies the inverted gain once.
         let g = GainStage { invert_polarity: true, fade_q16: 0x8000, ..GainStage::unity() };
         assert_eq!(g.channel_gains(), (gain(-0x1_0000, 0x8000), gain(-0x1_0000, 0x8000)));
         let mut s = [1000, -1000];
@@ -395,8 +425,9 @@ mod tests {
 
     #[test]
     fn test_channel_mode_from_strm_flags() {
-        // C slimproto.c:489 `(flags & 0x0c) >> 2`; squeezelite.h:663-664 MONO_RIGHT 0x02,
-        // MONO_LEFT 0x01. The polarity bits (0x03) do not affect it.
+        // C slimproto.c:489 `(flags & 0x0c) >> 2`; squeezelite.h:663-664
+        // MONO_RIGHT 0x02, MONO_LEFT 0x01. The polarity bits (0x03) do not
+        // affect it.
         assert_eq!(ChannelMode::from_strm_flags(0x00), ChannelMode::Stereo);
         assert_eq!(ChannelMode::from_strm_flags(0x04), ChannelMode::LeftOnly);
         assert_eq!(ChannelMode::from_strm_flags(0x08), ChannelMode::RightOnly);
@@ -408,7 +439,12 @@ mod tests {
     #[test]
     fn test_channel_select_left_duplicates_left() {
         // C output_pack.c:400-405: L = R = gain(gainL, L).
-        let g = GainStage { volume_l_q16: 0x8000, volume_r_q16: 0x2000, channel_mode: ChannelMode::LeftOnly, ..GainStage::unity() };
+        let g = GainStage {
+            volume_l_q16: 0x8000,
+            volume_r_q16: 0x2000,
+            channel_mode: ChannelMode::LeftOnly,
+            ..GainStage::unity()
+        };
         let mut s = [1000, 3000, -64, 99];
         g.apply(&mut s);
         assert_eq!(s, [500, 500, -32, -32]);
@@ -422,7 +458,12 @@ mod tests {
     #[test]
     fn test_channel_select_right_duplicates_right() {
         // C output_pack.c:394-399: L = R = gain(gainR, R).
-        let g = GainStage { volume_l_q16: 0x8000, volume_r_q16: 0x4000, channel_mode: ChannelMode::RightOnly, ..GainStage::unity() };
+        let g = GainStage {
+            volume_l_q16: 0x8000,
+            volume_r_q16: 0x4000,
+            channel_mode: ChannelMode::RightOnly,
+            ..GainStage::unity()
+        };
         let mut s = [1000, 3000, -64, 100];
         g.apply(&mut s);
         assert_eq!(s, [750, 750, 25, 25]);
@@ -430,14 +471,19 @@ mod tests {
 
     #[test]
     fn test_channel_select_mono_mix_c_average() {
-        // C output_pack.c:386-392: L = R = (gain(gainL, L) + gain(gainR, R)) / 2, C integer
-        // division (truncates toward zero).
+        // C output_pack.c:386-392: L = R = (gain(gainL, L) + gain(gainR, R)) /
+        // 2, C integer division (truncates toward zero).
         let g = GainStage { channel_mode: ChannelMode::MonoMix, ..GainStage::unity() };
         let mut s = [1000, 3001, -1000, -3001, 3, -4, i32::MAX, i32::MAX];
         g.apply(&mut s);
         assert_eq!(s, [2000, 2000, -2000, -2000, 0, 0, i32::MAX, i32::MAX]);
         // Gains apply per channel before the mix.
-        let g = GainStage { volume_l_q16: 0x8000, volume_r_q16: 0x1_0000, channel_mode: ChannelMode::MonoMix, ..GainStage::unity() };
+        let g = GainStage {
+            volume_l_q16: 0x8000,
+            volume_r_q16: 0x1_0000,
+            channel_mode: ChannelMode::MonoMix,
+            ..GainStage::unity()
+        };
         let mut s = [1001, 7];
         g.apply(&mut s);
         // gain(0x8000, 1001) = 500; (500 + 7) / 2 = 253.
@@ -446,7 +492,11 @@ mod tests {
 
     #[test]
     fn test_channel_select_with_invert() {
-        let g = GainStage { invert_polarity: true, channel_mode: ChannelMode::RightOnly, ..GainStage::unity() };
+        let g = GainStage {
+            invert_polarity: true,
+            channel_mode: ChannelMode::RightOnly,
+            ..GainStage::unity()
+        };
         let mut s = [10, 20];
         g.apply(&mut s);
         assert_eq!(s, [-20, -20]);

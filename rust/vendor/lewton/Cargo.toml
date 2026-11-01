@@ -1,0 +1,34 @@
+# Vendored copy of lewton 0.10.2 (crates.io), patched for `no_std + alloc`.
+# Upstream normalized manifest: Cargo.toml.orig. Patch list: VENDOR.md.
+[package]
+name = "lewton"
+version = "0.10.2"
+edition = "2015"
+authors = ["est31 <MTest31@outlook.com>"]
+description = "Pure Rust vorbis decoder. Vendored no_std + alloc port."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RustAudio/lewton"
+publish = false
+autobenches = false
+autotests = false
+
+[lib]
+name = "lewton"
+path = "src/lib.rs"
+
+[features]
+default = []
+std = ["byteorder/std", "ogg"]
+ogg = ["dep:ogg"]
+async_ogg = ["ogg", "ogg/async", "futures", "tokio-io"]
+
+[dependencies]
+byteorder = { version = "1.0", default-features = false }
+tinyvec = { version = "1.0", default-features = false, features = ["alloc"] }
+libm = "0.2"
+ogg = { version = "0.8", default-features = false, optional = true }
+futures = { version = "0.1", optional = true }
+tokio-io = { version = "0.1", optional = true }
+
+[dev-dependencies]
+ogg = "0.8"

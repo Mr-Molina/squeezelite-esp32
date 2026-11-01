@@ -1,8 +1,10 @@
 //! Cheap Yellow Display (CYD) Hardware & Protocol Controller
 //!
 //! Manages serial communications with the Cheap Yellow Display UI:
-//! - Serializes outbound status updates (`PlaybackState`, `Volume`, `TrackMetadata`, `Progress`).
-//! - Parses inbound touch interaction commands (`Play`, `Pause`, `Toggle`, `Next`, `Previous`, `SetVolume`).
+//! - Serializes outbound status updates (`PlaybackState`, `Volume`,
+//!   `TrackMetadata`, `Progress`).
+//! - Parses inbound touch interaction commands (`Play`, `Pause`, `Toggle`,
+//!   `Next`, `Previous`, `SetVolume`).
 
 use heapless::{Deque, Vec};
 use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, LinkError, PlayState};
@@ -37,7 +39,8 @@ impl CydController {
         }
     }
 
-    /// Returns whether the parser is currently discarding an overlong (>128 byte) UART line.
+    /// Returns whether the parser is currently discarding an overlong
+    /// (>128 byte) UART line.
     pub fn is_discarding_overflow(&self) -> bool {
         self.discarding_overflow
     }
@@ -53,8 +56,13 @@ impl CydController {
         Ok(&self.tx_buffer)
     }
 
-    /// Ingests incoming UART bytes and processes all complete commands via callback (CYD-003).
-    pub fn feed_all<F: FnMut(CydCommand)>(&mut self, bytes: &[u8], mut on_cmd: F) -> Result<(), LinkError> {
+    /// Ingests incoming UART bytes and processes all complete commands
+    /// via callback (CYD-003).
+    pub fn feed_all<F: FnMut(CydCommand)>(
+        &mut self,
+        bytes: &[u8],
+        mut on_cmd: F,
+    ) -> Result<(), LinkError> {
         for &b in bytes {
             if b == b'\r' {
                 continue;
@@ -89,7 +97,8 @@ impl CydController {
         Ok(())
     }
 
-    /// Ingests incoming UART bytes from the display and extracts any complete command.
+    /// Ingests incoming UART bytes from the display and extracts any complete
+    /// command.
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> Result<Option<CydCommand>, LinkError> {
         let mut parsed = Vec::<CydCommand, 8>::new();
         self.feed_all(bytes, |cmd| {
@@ -164,7 +173,8 @@ mod tests {
     fn test_cyd_controller_overflow_discard_recovery() {
         let mut controller = CydController::new();
 
-        // Feed >128 bytes with a valid command suffix ("CMD=PLAY\n") in the tail of the truncated line (PERIPH-606)
+        // Feed >128 bytes with a valid command suffix ("CMD=PLAY\n") in the
+        // tail of the truncated line (PERIPH-606)
         let mut overlong = [b'X'; 150];
         overlong[141..150].copy_from_slice(b"CMD=PLAY\n");
 
@@ -172,7 +182,7 @@ mod tests {
         assert_eq!(controller.feed_bytes(&overlong[..135]).unwrap(), None);
         assert!(controller.is_discarding_overflow());
 
-        // Feed the remainder containing "CMD=PLAY\n" — must be discarded, NOT parsed as Play!
+        // Feed remainder containing "CMD=PLAY\n" — must discard, not parse Play!
         assert_eq!(controller.feed_bytes(&overlong[135..]).unwrap(), None);
         assert!(!controller.is_discarding_overflow());
 

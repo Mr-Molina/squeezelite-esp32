@@ -1,0 +1,20 @@
+[package]
+name = "squeezelite-cspot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure-Rust #![no_std] Spotify Connect (cspot) receiver engine for squeezelite-esp32"
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+squeezelite-decoders = { path = "../squeezelite-decoders", default-features = false, features = ["alloc"] }
+heapless = { workspace = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

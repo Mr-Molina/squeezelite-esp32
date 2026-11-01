@@ -1,17 +1,24 @@
-//! Pure HTTP audio-response parsing shared by every [`StreamSource`](crate::io_traits::StreamSource)
-//! implementation: the host `std::net` adapter (`network::HttpAudioStream`) and the device
+//! Pure HTTP audio-response parsing shared by every
+//! [`StreamSource`](crate::io_traits::StreamSource)
+//! implementation: the host `std::net` adapter (`network::HttpAudioStream`) and
+//! the device
 //! adapter ([`crate::net_device::SmoltcpStreamSource`]).
 //!
 //! Everything here is a byte-in/byte-out state machine with no I/O:
-//! * [`ChunkedDecoder`]: `Transfer-Encoding: chunked` framing, decoded in place;
-//! * [`IcyStripper`]: removes ICY (`icy-metaint`) metadata blocks from the audio, in place, and
+//! * [`ChunkedDecoder`]: `Transfer-Encoding: chunked` framing, decoded in
+//!   place;
+//! * [`IcyStripper`]: removes ICY (`icy-metaint`) metadata blocks from the
+//!   audio, in place, and
 //!   keeps the most recent complete block;
-//! * [`RedirectPolicy`]: the redirect hop limit, `Location` classification and the rewritten
+//! * [`RedirectPolicy`]: the redirect hop limit, `Location` classification and
+//!   the rewritten
 //!   request for the next hop;
-//! * [`ResponseHead`] and [`find_head_end`]: status line and header lookups on a raw response
+//! * [`ResponseHead`] and [`find_head_end`]: status line and header lookups on
+//!   a raw response
 //!   head.
 //!
-//! Each machine accepts its input split at any byte boundary (a TCP read may end anywhere), which
+//! Each machine accepts its input split at any byte boundary (a TCP read may
+//! end anywhere), which
 //! is what lets the device adapter feed it straight from smoltcp socket reads.
 
 extern crate alloc;
@@ -20,7 +27,8 @@ use alloc::vec::Vec;
 
 use crate::io_traits::{NetAddr, StreamError, MAX_REDIRECTS};
 
-/// Largest chunk size accepted by [`ChunkedDecoder`]; a larger size line is a framing error.
+/// Largest chunk size accepted by [`ChunkedDecoder`]; a larger size line is a
+/// framing error.
 pub const MAX_CHUNK_SIZE: usize = 1_048_576;
 
 // ---------------------------------------------------------------------------
@@ -29,12 +37,20 @@ pub const MAX_CHUNK_SIZE: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChunkState {
-    /// Chunk-size line. `invalid` defers a bad digit until the line is complete (a size line
+    /// Chunk-size line. `invalid` defers a bad digit until the line is complete (a
+    /// size line
     /// split across reads is only judged once its newline arrived).
-    Size { acc: usize, digits: bool, gap: bool, ext: bool, invalid: bool },
+    Size {
+        acc: usize,
+        digits: bool,
+        gap: bool,
+        ext: bool,
+        invalid: bool,
+    },
     /// Inside chunk data, this many payload bytes left.
     Data(usize),
-    /// After chunk data: expecting `\r\n` (or a bare `\n`); `cr` once the `\r` was seen.
+    /// After chunk data: expecting `\r\n` (or a bare `\n`); `cr` once the `\r` was
+    /// seen.
     DataEnd { cr: bool },
     /// After the last (zero-size) chunk: trailer lines until an empty line.
     Trailer { line_len: usize },
@@ -42,13 +58,20 @@ enum ChunkState {
     Done,
 }
 
-const CHUNK_START: ChunkState =
-    ChunkState::Size { acc: 0, digits: false, gap: false, ext: false, invalid: false };
+const CHUNK_START: ChunkState = ChunkState::Size {
+    acc: 0,
+    digits: false,
+    gap: false,
+    ext: false,
+    invalid: false,
+};
 
 /// Incremental `Transfer-Encoding: chunked` decoder.
 ///
-/// Size lines are hexadecimal with optional surrounding blanks and `;extension`s, terminated by
-/// `\r\n` or a bare `\n`. Chunk data is followed by `\r\n` (or `\n`). After the zero-size chunk,
+/// Size lines are hexadecimal with optional surrounding blanks and
+/// `;extension`s, terminated by
+/// `\r\n` or a bare `\n`. Chunk data is followed by `\r\n` (or `\n`). After the
+/// zero-size chunk,
 /// trailer lines are skipped up to the terminating empty line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkedDecoder {
@@ -72,9 +95,12 @@ impl ChunkedDecoder {
         self.state = CHUNK_START;
     }
 
-    /// Decodes the raw body bytes in `buf` in place: the chunk payload they carry is moved to
-    /// the front of `buf` and its length returned. Every input byte is consumed (bytes after the
-    /// terminating empty line are ignored). A framing error is [`StreamError::BadResponse`].
+    /// Decodes the raw body bytes in `buf` in place: the chunk payload they carry
+    /// is moved to
+    /// the front of `buf` and its length returned. Every input byte is consumed
+    /// (bytes after the
+    /// terminating empty line are ignored). A framing error is
+    /// [`StreamError::BadResponse`].
     pub fn decode_in_place(&mut self, buf: &mut [u8]) -> Result<usize, StreamError> {
         let (mut r, mut w) = (0usize, 0usize);
         while r < buf.len() {
@@ -84,13 +110,23 @@ impl ChunkedDecoder {
                 buf.copy_within(r..r + take, w);
                 r += take;
                 w += take;
-                self.state = if take == rem { ChunkState::DataEnd { cr: false } } else { ChunkState::Data(rem - take) };
+                self.state = if take == rem {
+                    ChunkState::DataEnd { cr: false }
+                } else {
+                    ChunkState::Data(rem - take)
+                };
                 continue;
             }
             let b = buf[r];
             r += 1;
             self.state = match self.state {
-                ChunkState::Size { acc, digits, gap, ext, invalid } => match b {
+                ChunkState::Size {
+                    acc,
+                    digits,
+                    gap,
+                    ext,
+                    invalid,
+                } => match b {
                     b'\n' => {
                         if invalid || !digits {
                             return Err(StreamError::BadResponse);
@@ -103,18 +139,46 @@ impl ChunkedDecoder {
                     }
                     b'\r' => self.state,
                     _ if ext => self.state,
-                    b';' => ChunkState::Size { acc, digits, gap, ext: true, invalid },
-                    b' ' | b'\t' => ChunkState::Size { acc, digits, gap: digits, ext, invalid },
+                    b';' => ChunkState::Size {
+                        acc,
+                        digits,
+                        gap,
+                        ext: true,
+                        invalid,
+                    },
+                    b' ' | b'\t' => ChunkState::Size {
+                        acc,
+                        digits,
+                        gap: digits,
+                        ext,
+                        invalid,
+                    },
                     _ => match (b as char).to_digit(16) {
                         Some(d) if !gap && !invalid => {
                             match acc.checked_mul(16).map(|a| a + d as usize) {
-                                Some(acc) if acc <= MAX_CHUNK_SIZE => {
-                                    ChunkState::Size { acc, digits: true, gap, ext, invalid }
-                                }
-                                _ => ChunkState::Size { acc, digits, gap, ext, invalid: true },
+                                Some(acc) if acc <= MAX_CHUNK_SIZE => ChunkState::Size {
+                                    acc,
+                                    digits: true,
+                                    gap,
+                                    ext,
+                                    invalid,
+                                },
+                                _ => ChunkState::Size {
+                                    acc,
+                                    digits,
+                                    gap,
+                                    ext,
+                                    invalid: true,
+                                },
                             }
                         }
-                        _ => ChunkState::Size { acc, digits, gap, ext, invalid: true },
+                        _ => ChunkState::Size {
+                            acc,
+                            digits,
+                            gap,
+                            ext,
+                            invalid: true,
+                        },
                     },
                 },
                 ChunkState::DataEnd { cr } => match b {
@@ -126,7 +190,9 @@ impl ChunkedDecoder {
                     b'\r' => self.state,
                     b'\n' if line_len == 0 => ChunkState::Done,
                     b'\n' => ChunkState::Trailer { line_len: 0 },
-                    _ => ChunkState::Trailer { line_len: line_len + 1 },
+                    _ => ChunkState::Trailer {
+                        line_len: line_len + 1,
+                    },
                 },
                 ChunkState::Done => ChunkState::Done,
                 ChunkState::Data(_) => unreachable!("handled above"),
@@ -140,7 +206,8 @@ impl ChunkedDecoder {
         matches!(self.state, ChunkState::Trailer { .. } | ChunkState::Done)
     }
 
-    /// The response body is complete: last chunk and the empty line ending its trailer.
+    /// The response body is complete: last chunk and the empty line ending its
+    /// trailer.
     pub fn is_done(&self) -> bool {
         self.state == ChunkState::Done
     }
@@ -162,9 +229,12 @@ enum IcyState {
 
 /// Removes ICY metadata from an audio byte stream.
 ///
-/// With an interval `n` (`icy-metaint`), the stream is `n` audio bytes, one length byte `L`,
-/// `L * 16` metadata bytes, `n` audio bytes, ... A block with `L = 0` carries no metadata. The
-/// most recent complete, non-empty block (trailing NUL padding removed) is kept until taken;
+/// With an interval `n` (`icy-metaint`), the stream is `n` audio bytes, one
+/// length byte `L`,
+/// `L * 16` metadata bytes, `n` audio bytes, ... A block with `L = 0` carries
+/// no metadata. The
+/// most recent complete, non-empty block (trailing NUL padding removed) is kept
+/// until taken;
 /// partial blocks are never exposed. Interval 0 disables stripping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcyStripper {
@@ -184,11 +254,19 @@ impl Default for IcyStripper {
 impl IcyStripper {
     /// Stripper with stripping disabled (interval 0).
     pub const fn new() -> Self {
-        Self { metaint: 0, remaining: 0, state: IcyState::Audio, accum: Vec::new(), ready: None }
+        Self {
+            metaint: 0,
+            remaining: 0,
+            state: IcyState::Audio,
+            accum: Vec::new(),
+            ready: None,
+        }
     }
 
-    /// Sets the interval and restarts counting at the beginning of an audio run (`0` disables
-    /// stripping). A partial block in progress is dropped; a complete one stays available.
+    /// Sets the interval and restarts counting at the beginning of an audio run
+    /// (`0` disables
+    /// stripping). A partial block in progress is dropped; a complete one stays
+    /// available.
     pub fn set_metaint(&mut self, interval: usize) {
         self.metaint = interval;
         self.remaining = interval;
@@ -201,7 +279,8 @@ impl IcyStripper {
         self.metaint
     }
 
-    /// Strips metadata from `buf` in place: the audio bytes are moved to the front of `buf` and
+    /// Strips metadata from `buf` in place: the audio bytes are moved to the front
+    /// of `buf` and
     /// their count returned.
     pub fn strip_in_place(&mut self, buf: &mut [u8]) -> usize {
         if self.metaint == 0 {
@@ -240,7 +319,9 @@ impl IcyStripper {
                         self.remaining = self.metaint;
                         self.state = IcyState::Audio;
                     } else {
-                        self.state = IcyState::Meta { remaining: remaining - take };
+                        self.state = IcyState::Meta {
+                            remaining: remaining - take,
+                        };
                     }
                 }
             }
@@ -248,9 +329,14 @@ impl IcyStripper {
         w
     }
 
-    /// A metadata block is complete: keep it (NUL padding removed) unless it is empty.
+    /// A metadata block is complete: keep it (NUL padding removed) unless it is
+    /// empty.
     fn finish_block(&mut self) {
-        let end = self.accum.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+        let end = self
+            .accum
+            .iter()
+            .rposition(|&c| c != 0)
+            .map_or(0, |i| i + 1);
         if end > 0 {
             self.accum.truncate(end);
             self.ready = Some(core::mem::take(&mut self.accum));
@@ -269,7 +355,8 @@ impl IcyStripper {
         self.ready.take()
     }
 
-    /// Drops the stored block, any partial block and the interval (connection closed).
+    /// Drops the stored block, any partial block and the interval (connection
+    /// closed).
     pub fn clear(&mut self) {
         *self = Self::new();
     }
@@ -288,7 +375,8 @@ pub enum RedirectTarget<'a> {
     Absolute { authority: &'a [u8], path: &'a [u8] },
 }
 
-/// Redirect handling shared by the stream sources: `301/302/303/307/308` are followed up to
+/// Redirect handling shared by the stream sources: `301/302/303/307/308` are
+/// followed up to
 /// [`MAX_REDIRECTS`] hops; the next one is [`StreamError::TooManyRedirects`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RedirectPolicy {
@@ -311,7 +399,8 @@ impl RedirectPolicy {
         self.followed
     }
 
-    /// Accounts for one more hop: [`StreamError::TooManyRedirects`] when [`MAX_REDIRECTS`]
+    /// Accounts for one more hop: [`StreamError::TooManyRedirects`] when
+    /// [`MAX_REDIRECTS`]
     /// hops were already followed.
     pub fn follow(&mut self) -> Result<(), StreamError> {
         if self.followed >= MAX_REDIRECTS {
@@ -321,7 +410,8 @@ impl RedirectPolicy {
         Ok(())
     }
 
-    /// Classifies a `Location` value (surrounding blanks and quotes ignored): `/path` (not
+    /// Classifies a `Location` value (surrounding blanks and quotes ignored):
+    /// `/path` (not
     /// `//...`) is same-origin, `http://...` (any case) is absolute, anything else is
     /// [`StreamError::BadResponse`].
     pub fn classify(location: &[u8]) -> Result<RedirectTarget<'_>, StreamError> {
@@ -343,9 +433,12 @@ impl RedirectPolicy {
         Err(StreamError::BadResponse)
     }
 
-    /// The request for the next hop: `template`'s request line with `path` as its target, every
-    /// other non-empty line kept (trimmed) except `Host`, which becomes `Host: host` (appended
-    /// when the template had none); lines joined by `\r\n` and ended by a blank line. An empty
+    /// The request for the next hop: `template`'s request line with `path` as its
+    /// target, every
+    /// other non-empty line kept (trimmed) except `Host`, which becomes `Host:
+    /// host` (appended
+    /// when the template had none); lines joined by `\r\n` and ended by a blank
+    /// line. An empty
     /// template yields `GET <path> HTTP/1.0` + `Host`.
     pub fn rewrite_request(template: &[u8], host: &[u8], path: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(template.len() + host.len() + path.len() + 32);
@@ -363,13 +456,19 @@ impl RedirectPolicy {
         }
         let mut first = true;
         let mut host_found = false;
-        for line in template.split(|&b| b == b'\n').map(trim).filter(|l| !l.is_empty()) {
+        for raw_line in template.split(|&b| b == b'\n') {
+            let line = trim(raw_line);
+            if line.is_empty() {
+                continue;
+            }
             if !out.is_empty() {
                 out.extend_from_slice(b"\r\n");
             }
             if first {
                 first = false;
-                let mut parts = line.split(|b| b.is_ascii_whitespace()).filter(|p| !p.is_empty());
+                let mut parts = line
+                    .split(|b| b.is_ascii_whitespace())
+                    .filter(|p| !p.is_empty());
                 let method = parts.next().unwrap_or(b"GET");
                 let _target = parts.next();
                 let proto = parts.next().unwrap_or(b"HTTP/1.0");
@@ -396,11 +495,15 @@ impl RedirectPolicy {
     }
 }
 
-/// Parses an `ipv4[:port]` authority (port 80 when absent). Host names are not resolved here
+/// Parses an `ipv4[:port]` authority (port 80 when absent). Host names are not
+/// resolved here
 /// (`None`).
 pub fn parse_ipv4_authority(authority: &[u8]) -> Option<NetAddr> {
     let (host, port) = match authority.iter().position(|&b| b == b':') {
-        Some(i) => (&authority[..i], u16::try_from(parse_decimal(&authority[i + 1..])?).ok()?),
+        Some(i) => (
+            &authority[..i],
+            u16::try_from(parse_decimal(&authority[i + 1..])?).ok()?,
+        ),
         None => (authority, 80),
     };
     let mut ip = [0u8; 4];
@@ -458,11 +561,14 @@ fn trim_quotes(s: &[u8]) -> &[u8] {
     trim(s)
 }
 
-/// Value of header `name` (case-insensitive) in a raw head or request (first line skipped).
+/// Value of header `name` (case-insensitive) in a raw head or request (first
+/// line skipped).
 fn header_in<'a>(raw: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     raw.split(|&b| b == b'\n').skip(1).find_map(|line| {
         let colon = line.iter().position(|&b| b == b':')?;
-        trim(&line[..colon]).eq_ignore_ascii_case(name).then(|| trim(&line[colon + 1..]))
+        trim(&line[..colon])
+            .eq_ignore_ascii_case(name)
+            .then(|| trim(&line[colon + 1..]))
     })
 }
 
@@ -470,7 +576,8 @@ fn header_in<'a>(raw: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 // Response head
 // ---------------------------------------------------------------------------
 
-/// Length of the response head at the start of `buf` (through the first `\r\n\r\n` or `\n\n`,
+/// Length of the response head at the start of `buf` (through the first
+/// `\r\n\r\n` or `\n\n`,
 /// whichever ends first), or `None` while it is incomplete.
 pub fn find_head_end(buf: &[u8]) -> Option<usize> {
     (1..buf.len()).find_map(|i| {
@@ -493,7 +600,10 @@ impl<'a> ResponseHead<'a> {
         if !(line.starts_with(b"HTTP/1.") || line.starts_with(b"ICY ")) {
             return None;
         }
-        let code = line.split(|b| b.is_ascii_whitespace()).filter(|t| !t.is_empty()).nth(1)?;
+        let code = line
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|t| !t.is_empty())
+            .nth(1)?;
         u16::try_from(parse_decimal(code)?).ok()
     }
 
@@ -519,8 +629,10 @@ impl<'a> ResponseHead<'a> {
     }
 }
 
-/// `head` cut to at most `max_len` bytes without splitting a header line: everything up to
-/// the last complete line that leaves room for the terminating blank line, which is then
+/// `head` cut to at most `max_len` bytes without splitting a header line:
+/// everything up to
+/// the last complete line that leaves room for the terminating blank line,
+/// which is then
 /// appended (`\r\n\r\n`). A head that already fits is returned unchanged.
 pub fn truncate_head(head: &[u8], max_len: usize) -> Vec<u8> {
     if head.len() <= max_len {
@@ -535,7 +647,8 @@ pub fn truncate_head(head: &[u8], max_len: usize) -> Vec<u8> {
     out
 }
 
-/// Value of the `Host` header in a raw request, blanks trimmed (`None` if absent or empty).
+/// Value of the `Host` header in a raw request, blanks trimmed (`None` if
+/// absent or empty).
 pub fn request_host(request: &[u8]) -> Option<&[u8]> {
     header_in(request, b"host").filter(|h| !h.is_empty())
 }
@@ -546,7 +659,8 @@ mod tests {
     use crate::io_traits::MAX_ICY_METADATA;
     use std::vec;
 
-    /// Feeds `input` to a fresh decoder in pieces of `step` bytes, collecting the payload.
+    /// Feeds `input` to a fresh decoder in pieces of `step` bytes, collecting the
+    /// payload.
     fn dechunk(input: &[u8], step: usize) -> (Result<Vec<u8>, StreamError>, ChunkedDecoder) {
         let mut d = ChunkedDecoder::new();
         let mut out = Vec::new();
@@ -562,7 +676,8 @@ mod tests {
 
     #[test]
     fn chunked_decodes_split_at_every_boundary() {
-        let wire = b"10\r\n0123456789ABCDEF\r\n8;name=v\r\nabcdefgh\r\n3\r\nXYZ\r\n0\r\nX-T: 1\r\n\r\n";
+        let wire =
+            b"10\r\n0123456789ABCDEF\r\n8;name=v\r\nabcdefgh\r\n3\r\nXYZ\r\n0\r\nX-T: 1\r\n\r\n";
         for step in 1..=wire.len() {
             let (out, d) = dechunk(wire, step);
             assert_eq!(out.unwrap(), b"0123456789ABCDEFabcdefghXYZ", "step {step}");
@@ -595,11 +710,11 @@ mod tests {
     #[test]
     fn chunked_framing_errors_are_bad_response() {
         for bad in [
-            &b"zz\r\n"[..],          // not hex
-            b"\r\n",                 // empty size line
-            b"1 2\r\n",              // blank inside the size
-            b"2\r\nabX",             // no CRLF after the data
-            b"200001\r\n",           // over MAX_CHUNK_SIZE
+            &b"zz\r\n"[..],            // not hex
+            b"\r\n",                   // empty size line
+            b"1 2\r\n",                // blank inside the size
+            b"2\r\nabX",               // no CRLF after the data
+            b"200001\r\n",             // over MAX_CHUNK_SIZE
             b"ffffffffffffffffff\r\n", // overflow
         ] {
             for step in [1, 64] {
@@ -631,7 +746,8 @@ mod tests {
         (audio, metas)
     }
 
-    const ICY_WIRE: &[u8] = b"AAAAAAAAAAAAAAAA\x02StreamTitle='Song One';\0\0\0\0\0\0\0\0\0BBBBBBBBBBBBBBBB\0CCCCCCCCCCCCCCCC";
+    const ICY_WIRE: &[u8] = b"AAAAAAAAAAAAAAAA\x02StreamTitle='Song One';\
+        \0\0\0\0\0\0\0\0\0BBBBBBBBBBBBBBBB\0CCCCCCCCCCCCCCCC";
 
     #[test]
     fn icy_strips_blocks_split_at_every_boundary() {
@@ -639,8 +755,15 @@ mod tests {
             let mut s = IcyStripper::new();
             s.set_metaint(16);
             let (audio, metas) = strip(&mut s, ICY_WIRE, step);
-            assert_eq!(audio, b"AAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCC", "step {step}");
-            assert_eq!(metas, vec![b"StreamTitle='Song One';".to_vec()], "step {step}");
+            assert_eq!(
+                audio, b"AAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCC",
+                "step {step}"
+            );
+            assert_eq!(
+                metas,
+                vec![b"StreamTitle='Song One';".to_vec()],
+                "step {step}"
+            );
         }
     }
 
@@ -656,7 +779,10 @@ mod tests {
     fn icy_all_nul_block_is_not_metadata_and_latest_block_wins() {
         let mut s = IcyStripper::new();
         s.set_metaint(2);
-        let mut buf = b"ab\x01one\0\0\0\0\0\0\0\0\0\0\0\0\0cd\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0ef\x01two\0\0\0\0\0\0\0\0\0\0\0\0\0gh".to_vec();
+        let mut buf = b"ab\x01one\0\0\0\0\0\0\0\0\0\0\0\0\0\
+            cd\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\
+            ef\x01two\0\0\0\0\0\0\0\0\0\0\0\0\0gh"
+            .to_vec();
         let n = s.strip_in_place(&mut buf);
         assert_eq!(&buf[..n], b"abcdefgh");
         assert_eq!(s.metadata(), Some(&b"two"[..]));
@@ -692,7 +818,10 @@ mod tests {
         assert_eq!(&wire[..n], b"ab");
         let block = s.take_metadata().unwrap();
         assert_eq!(block.len(), 4080);
-        assert!(block.len() <= MAX_ICY_METADATA, "every ICY block fits a MetaBuf");
+        assert!(
+            block.len() <= MAX_ICY_METADATA,
+            "every ICY block fits a MetaBuf"
+        );
     }
 
     #[test]
@@ -719,14 +848,30 @@ mod tests {
         );
         assert_eq!(
             RedirectPolicy::classify(b"\"HTTP://10.0.0.2:9000/s.mp3\""),
-            Ok(RedirectTarget::Absolute { authority: b"10.0.0.2:9000", path: b"/s.mp3" })
+            Ok(RedirectTarget::Absolute {
+                authority: b"10.0.0.2:9000",
+                path: b"/s.mp3"
+            })
         );
         assert_eq!(
             RedirectPolicy::classify(b"http://host"),
-            Ok(RedirectTarget::Absolute { authority: b"host", path: b"/" })
+            Ok(RedirectTarget::Absolute {
+                authority: b"host",
+                path: b"/"
+            })
         );
-        for bad in [&b"//host/x"[..], b"https://h/x", b"ftp://h/x", b"relative/x", b""] {
-            assert_eq!(RedirectPolicy::classify(bad), Err(StreamError::BadResponse), "{bad:?}");
+        for bad in [
+            &b"//host/x"[..],
+            b"https://h/x",
+            b"ftp://h/x",
+            b"relative/x",
+            b"",
+        ] {
+            assert_eq!(
+                RedirectPolicy::classify(bad),
+                Err(StreamError::BadResponse),
+                "{bad:?}"
+            );
         }
     }
 
@@ -753,16 +898,37 @@ mod tests {
 
     #[test]
     fn ipv4_authority_parsing() {
-        assert_eq!(parse_ipv4_authority(b"10.0.0.2:9000"), Some(NetAddr { ip: [10, 0, 0, 2], port: 9000 }));
-        assert_eq!(parse_ipv4_authority(b"192.168.1.20"), Some(NetAddr { ip: [192, 168, 1, 20], port: 80 }));
-        for bad in [&b"host:80"[..], b"1.2.3:80", b"1.2.3.4.5", b"256.1.1.1", b"1.2.3.4:", b"1.2.3.4:x", b"1.2.3.4:70000"] {
+        assert_eq!(
+            parse_ipv4_authority(b"10.0.0.2:9000"),
+            Some(NetAddr {
+                ip: [10, 0, 0, 2],
+                port: 9000
+            })
+        );
+        assert_eq!(
+            parse_ipv4_authority(b"192.168.1.20"),
+            Some(NetAddr {
+                ip: [192, 168, 1, 20],
+                port: 80
+            })
+        );
+        for bad in [
+            &b"host:80"[..],
+            b"1.2.3:80",
+            b"1.2.3.4.5",
+            b"256.1.1.1",
+            b"1.2.3.4:",
+            b"1.2.3.4:x",
+            b"1.2.3.4:70000",
+        ] {
             assert_eq!(parse_ipv4_authority(bad), None, "{bad:?}");
         }
     }
 
     #[test]
     fn head_end_and_header_lookup() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\nicy-metaint:  8192 \r\nContent-Length: 12\r\n\r\nBODY";
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\
+            icy-metaint:  8192 \r\nContent-Length: 12\r\n\r\nBODY";
         let end = find_head_end(raw).unwrap();
         assert_eq!(&raw[end..], b"BODY");
         let head = ResponseHead(&raw[..end]);
@@ -777,7 +943,10 @@ mod tests {
         assert_eq!(ResponseHead(b"ICY 200 OK\n\n").status(), Some(200));
         assert_eq!(find_head_end(b"HTTP/1.0 200 OK\r\nA: b\r\n"), None);
         // Only the status line decides the status.
-        assert_eq!(ResponseHead(b"HTTP/1.0 404 Not Found\r\nX-RateLimit: 200\r\n\r\n").status(), Some(404));
+        assert_eq!(
+            ResponseHead(b"HTTP/1.0 404 Not Found\r\nX-RateLimit: 200\r\n\r\n").status(),
+            Some(404)
+        );
         assert_eq!(ResponseHead(b"FOO 200 OK\r\n\r\n").status(), None);
         assert!(!ResponseHead(b"HTTP/1.0 200 OK\r\n\r\n").is_chunked());
     }
@@ -794,7 +963,10 @@ mod tests {
 
     #[test]
     fn request_host_lookup() {
-        assert_eq!(request_host(b"GET / HTTP/1.0\r\nhost:  10.0.0.1:9000 \r\n\r\n"), Some(&b"10.0.0.1:9000"[..]));
+        assert_eq!(
+            request_host(b"GET / HTTP/1.0\r\nhost:  10.0.0.1:9000 \r\n\r\n"),
+            Some(&b"10.0.0.1:9000"[..])
+        );
         assert_eq!(request_host(b"GET / HTTP/1.0\r\n\r\n"), None);
         assert_eq!(request_host(b"GET / HTTP/1.0\r\nHost:\r\n\r\n"), None);
     }

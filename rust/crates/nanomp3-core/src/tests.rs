@@ -1,4 +1,4 @@
-use super::*;
+use super::{Channels, DecodeError, Decoder, Sample, MAX_SAMPLES_PER_FRAME};
 
 // Available in the public domain as a work of the United States government.
 // https://www.marineband.marines.mil/Audio-Resources/The-Complete-Marches-of-John-Philip-Sousa/
@@ -144,5 +144,8 @@ fn layer_2_frames() {
         Err(DecodeError::UnsupportedLayer(info)) if !cfg!(feature = "layer12") => info,
         other => panic!("unexpected {other:?}"),
     };
-    assert_eq!((info.layer, info.sample_rate, info.bitrate, info.channels), (2, 44100, 128, Channels::Mono));
+    assert_eq!(
+        (info.layer, info.sample_rate, info.bitrate, info.channels),
+        (2, 44100, 128, Channels::Mono)
+    );
 }

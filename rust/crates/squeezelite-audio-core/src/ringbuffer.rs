@@ -1,12 +1,14 @@
 //! Lock-free Single-Producer Single-Consumer (SPSC) Audio Ringbuffer
 //!
-//! Designed for zero dynamic allocations on embedded targets. Backed by any contiguous
-//! byte slice (including external PSRAM buffers).
+//! Designed for zero dynamic allocations on embedded targets. Backed by
+//! any contiguous byte slice (including external PSRAM buffers).
 //!
 //! Features:
-//! - Cache-line aligned atomic pointers (`#[repr(align(64))]`) to eliminate false sharing.
+//! - Cache-line aligned atomic pointers (`#[repr(align(64))]`) to
+//!   eliminate false sharing.
 //! - Single-atomic flush semantics avoiding dual-pointer race conditions.
-//! - Lock-free concurrent SPSC access via interior mutability with raw pointers.
+//! - Lock-free concurrent SPSC access via interior mutability with
+//!   raw pointers.
 //! - Separate `Producer` and `Consumer` split handles.
 
 
@@ -53,9 +55,11 @@ pub struct AudioRingBuffer<'a> {
     _marker: PhantomData<&'a mut [u8]>,
 }
 
-// SAFETY: `AudioRingBuffer` owns raw pointer access to `storage` during its lifetime `'a`.
-// Access to storage is synchronized via atomic load/store with acquire/release semantics
-// across single-producer single-consumer threads, making it safe to send across threads.
+// JUSTIFICATION: Allows passing the ringbuffer handle across threads.
+// SAFETY: `AudioRingBuffer` owns raw pointer access to `storage` during `'a`.
+// Access to storage is synchronized via atomic load/store with acquire/release
+// semantics across single-producer single-consumer threads, making it safe to
+// send across threads.
 unsafe impl<'a> Send for AudioRingBuffer<'a> {}
 
 impl<'a> AudioRingBuffer<'a> {
@@ -111,10 +115,11 @@ impl<'a> AudioRingBuffer<'a> {
         self.peek_at(0, dst)
     }
 
-    /// Peeks unread data starting `offset` bytes past the read position, without advancing
-    /// the read pointer. Returns the bytes copied (0 when `offset` is at or past the unread
-    /// data). The fade engine reads a crossfade's new-track samples this way (C `cross_ptr`,
-    /// `output.c:245`, `output_pack.c:366-376`).
+    /// Peeks unread data starting `offset` bytes past the read position,
+    /// without advancing the read pointer. Returns the bytes copied (0 when
+    /// `offset` is at or past the unread data). The fade engine reads a
+    /// crossfade's new-track samples this way (C `cross_ptr`, `output.c:245`,
+    /// `output_pack.c:366-376`).
     pub fn peek_at(&self, offset: usize, dst: &mut [u8]) -> usize {
         let avail = self.available_read();
         if offset >= avail {
@@ -126,13 +131,17 @@ impl<'a> AudioRingBuffer<'a> {
 
         let data_to_end = self.capacity - r;
         if to_peek <= data_to_end {
-            // SAFETY: `r + to_peek <= self.capacity` because `to_peek <= data_to_end` and `data_to_end = self.capacity - r`.
+            // JUSTIFICATION: Non-overlapping memory copy for contiguous read.
+            // SAFETY: `r + to_peek <= self.capacity` because
+            // `to_peek <= data_to_end` and `data_to_end = self.capacity - r`.
             // Destination pointer is valid for `to_peek` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), to_peek);
             }
         } else {
-            // SAFETY: The peek range wraps around buffer boundary. It is split into two disjoint contiguous slices:
+            // JUSTIFICATION: Non-overlapping memory copy for wrap-around read.
+            // SAFETY: The peek range wraps around buffer boundary. It is split
+            // into two disjoint contiguous slices:
             // 1. `self.storage.add(r)` of size `data_to_end` into `dst[..data_to_end]`.
             // 2. `self.storage` of size `remainder` into `dst[data_to_end..to_peek]`.
             // Both source and destination pointers are valid and non-overlapping.
@@ -149,37 +158,43 @@ impl<'a> AudioRingBuffer<'a> {
         to_peek
     }
 
-    /// Advances the read pointer by `count` bytes (e.g. after peeking and consuming).
+    /// Advances the read pointer by `count` bytes (e.g. after peeking and
+    /// consuming).
     pub fn consume(&mut self, count: usize) {
         self.consume_internal(count);
     }
 
-    /// Rewinds the read pointer by `count` bytes (e.g. when unconsumed bytes remain).
+    /// Rewinds the read pointer by `count` bytes (e.g. when unconsumed
+    /// bytes remain).
     pub fn rewind_read(&mut self, count: usize) {
         self.rewind_read_internal(count);
     }
 
-    /// Flushes all data in the ringbuffer in a single atomic instruction (CONC-002).
-    /// Advances `read_pos` to match `write_pos`, rendering the buffer empty immediately.
+    /// Flushes all data in the ringbuffer in a single atomic instruction
+    /// (CONC-002). Advances `read_pos` to match `write_pos`, rendering the
+    /// buffer empty immediately.
     pub fn flush(&mut self) {
         self.flush_internal();
     }
 
-    /// Discards the newest unread bytes so that only the oldest `keep` unread bytes remain:
-    /// the write position moves back to `keep` bytes past the read position. Returns the
-    /// number of bytes discarded; `keep >= available_read()` is a no-op.
+    /// Discards the newest unread bytes so that only the oldest `keep` unread
+    /// bytes remain: the write position moves back to `keep` bytes past the
+    /// read position. Returns the number of bytes discarded;
+    /// `keep >= available_read()` is a no-op.
     ///
-    /// This is C squeezelite's `outputbuf->writep = output.track_start` (`output.c:466`): drop
-    /// what was written after a track boundary that playback has not reached.
+    /// This is C squeezelite's `outputbuf->writep = output.track_start`
+    /// (`output.c:466`): drop what was written after a track boundary that
+    /// playback has not reached.
     ///
-    /// It takes `&mut self`, so it cannot run while [`Self::split`] handles exist. A concurrent
-    /// consumer may already have loaded the old write position and be copying out of the
-    /// region this frees, which the producer would then overwrite, so the operation is not
-    /// offered on [`Producer`]. With exclusive access it only shortens the unread region:
+    /// It takes `&mut self`, so it cannot run while [`Self::split`] handles
+    /// exist. A concurrent consumer may already have loaded the old write
+    /// position and be copying out of the region this frees, which the
+    /// producer would then overwrite, so the operation is not offered on
+    /// [`Producer`]. With exclusive access it only shortens the unread region:
     /// - the read position, and the already-read bytes behind it that
     ///   [`Self::rewind_read`] may restore, are untouched;
-    /// - the new write position lies inside the old unread region, so every byte still
-    ///   unread was written before and stays readable in order.
+    /// - the new write position lies inside the old unread region, so every
+    ///   byte still unread was written before and stays readable in order.
     pub fn truncate_unread(&mut self, keep: usize) -> usize {
         let avail = self.available_read();
         if keep >= avail {
@@ -191,7 +206,8 @@ impl<'a> AudioRingBuffer<'a> {
         avail - keep
     }
 
-    /// Splits the ringbuffer into disjoint Producer and Consumer handles (CONC-001).
+    /// Splits the ringbuffer into disjoint Producer and Consumer handles
+    /// (CONC-001).
     pub fn split(&mut self) -> (Producer<'_, 'a>, Consumer<'_, 'a>) {
         (
             Producer {
@@ -220,13 +236,17 @@ impl<'a> AudioRingBuffer<'a> {
 
         let space_to_end = self.capacity - w;
         if to_write <= space_to_end {
-            // SAFETY: `w + to_write <= self.capacity` because `to_write <= space_to_end` and `space_to_end = self.capacity - w`.
+            // JUSTIFICATION: Non-overlapping memory copy for contiguous write.
+            // SAFETY: `w + to_write <= self.capacity` because
+            // `to_write <= space_to_end` and `space_to_end = self.capacity - w`.
             // `src` is valid for `to_write` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), self.storage.add(w), to_write);
             }
         } else {
-            // SAFETY: The write range wraps around buffer boundary. It is split into two disjoint contiguous slices:
+            // JUSTIFICATION: Non-overlapping memory copy for wrap-around write.
+            // SAFETY: The write range wraps around buffer boundary. Split into
+            // two disjoint contiguous slices:
             // 1. `src[..space_to_end]` into `self.storage.add(w)`.
             // 2. `src[space_to_end..to_write]` into `self.storage`.
             // Both source and destination pointers are valid and non-overlapping.
@@ -259,13 +279,17 @@ impl<'a> AudioRingBuffer<'a> {
 
         let data_to_end = self.capacity - r;
         if to_read <= data_to_end {
-            // SAFETY: `r + to_read <= self.capacity` because `to_read <= data_to_end` and `data_to_end = self.capacity - r`.
+            // JUSTIFICATION: Non-overlapping memory copy for contiguous read.
+            // SAFETY: `r + to_read <= self.capacity` because
+            // `to_read <= data_to_end` and `data_to_end = self.capacity - r`.
             // `dst` is valid for `to_read` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), to_read);
             }
         } else {
-            // SAFETY: The read range wraps around buffer boundary. It is split into two disjoint contiguous slices:
+            // JUSTIFICATION: Non-overlapping memory copy for wrap-around read.
+            // SAFETY: The read range wraps around buffer boundary. Split into
+            // two disjoint contiguous slices:
             // 1. `self.storage.add(r)` of size `data_to_end` into `dst[..data_to_end]`.
             // 2. `self.storage` of size `remainder` into `dst[data_to_end..to_read]`.
             // Both source and destination pointers are valid and non-overlapping.
@@ -313,10 +337,10 @@ impl<'a> AudioRingBuffer<'a> {
         } else {
             self.capacity - (to_rewind - r)
         };
-        self.read_pos.store(new_r, Ordering::Release);
         let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
             Some(cur.saturating_sub(to_rewind))
         });
+        self.read_pos.store(new_r, Ordering::Release);
     }
 
     pub(crate) fn flush_internal(&self) {
@@ -326,15 +350,17 @@ impl<'a> AudioRingBuffer<'a> {
     }
 }
 
-/// Exclusive SPSC producer handle. Explicitly `!Sync` and `!Clone` so only a single
-/// thread can ever invoke `write` (AUDIO-707).
+/// Exclusive SPSC producer handle. Explicitly `!Sync` and `!Clone` so
+/// only a single thread can ever invoke `write` (AUDIO-707).
 pub struct Producer<'ring, 'buf> {
     ring: &'ring AudioRingBuffer<'buf>,
     _not_sync: PhantomData<core::cell::UnsafeCell<()>>,
 }
 
-// SAFETY: `Producer` holds an immutable reference to the ringbuffer and has exclusive write
-// access via SPSC protocol. It contains `!Sync` PhantomData so it cannot be shared across threads simultaneously.
+// JUSTIFICATION: SPSC producer handle transfer across threads.
+// SAFETY: `Producer` holds an immutable reference to the ringbuffer and has
+// exclusive write access via SPSC protocol. It contains `!Sync` PhantomData
+// so it cannot be shared across threads simultaneously.
 unsafe impl<'ring, 'buf> Send for Producer<'ring, 'buf> {}
 
 impl<'ring, 'buf> Producer<'ring, 'buf> {
@@ -347,15 +373,18 @@ impl<'ring, 'buf> Producer<'ring, 'buf> {
     }
 }
 
-/// Exclusive SPSC consumer handle. Explicitly `!Sync` and `!Clone` so only a single
-/// thread can ever invoke `read`/`consume`/`rewind_read`/`flush` (AUDIO-707).
+/// Exclusive SPSC consumer handle. Explicitly `!Sync` and `!Clone` so
+/// only a single thread can ever invoke `read`/`consume`/`rewind_read`/`flush`
+/// (AUDIO-707).
 pub struct Consumer<'ring, 'buf> {
     ring: &'ring AudioRingBuffer<'buf>,
     _not_sync: PhantomData<core::cell::UnsafeCell<()>>,
 }
 
-// SAFETY: `Consumer` holds an immutable reference to the ringbuffer and has exclusive read/rewind
-// access via SPSC protocol. It contains `!Sync` PhantomData so it cannot be shared across threads simultaneously.
+// JUSTIFICATION: SPSC consumer handle transfer across threads.
+// SAFETY: `Consumer` holds an immutable reference to the ringbuffer and has
+// exclusive read/rewind access via SPSC protocol. It contains `!Sync`
+// PhantomData so it cannot be shared across threads simultaneously.
 unsafe impl<'ring, 'buf> Send for Consumer<'ring, 'buf> {}
 
 impl<'ring, 'buf> Consumer<'ring, 'buf> {
@@ -488,7 +517,8 @@ mod tests {
         let mut storage = [0xAAu8; 16];
         let mut rb = AudioRingBuffer::new(&mut storage);
 
-        // Rewinding before any read must be a no-op (never rewinds into uninitialized storage)
+        // Rewinding before any read must be a no-op (never rewinds into
+        // uninitialized storage)
         rb.rewind_read(10);
         assert_eq!(rb.available_read(), 0);
 
@@ -511,8 +541,9 @@ mod tests {
         assert_eq!(rb.available_read(), 7);
         assert_eq!(rb.available_write(), 8);
 
-        // Rewinding by an excessive number of bytes must clamp to the remaining 3 read bytes,
-        // NOT to available_write (8), preventing exposure of the 5 uninitialized bytes!
+        // Rewinding by an excessive number of bytes must clamp to the
+        // remaining 3 read bytes, NOT to available_write (8), preventing
+        // exposure of the 5 uninitialized bytes!
         rb.rewind_read(usize::MAX);
         assert_eq!(rb.available_read(), 10);
         assert_eq!(rb.available_write(), 5);
@@ -643,7 +674,8 @@ mod tests {
         let mut out = [0u8; 4];
         rb.read(&mut out).unwrap();
         rb.write(b"next").unwrap();
-        // Drop everything unread; the 4 bytes already read are still behind the read position.
+        // Drop everything unread; the 4 bytes already read are still behind
+        // the read position.
         assert_eq!(rb.truncate_unread(0), 4);
         assert_eq!(rb.available_read(), 0);
         rb.rewind_read(4);
@@ -658,8 +690,8 @@ mod tests {
         let mut out = [0u8; 2];
         rb.read(&mut out).unwrap();
         rb.truncate_unread(1);
-        // Write into the freed region, then rewind as far as allowed: only the 2 bytes read
-        // ("ab") come back, never stale or overwritten storage.
+        // Write into the freed region, then rewind as far as allowed: only the
+        // 2 bytes read ("ab") come back, never stale or overwritten storage.
         rb.write(b"XYZ").unwrap();
         rb.rewind_read(usize::MAX);
         assert_eq!(read_all(&mut rb), b"abcXYZ");

@@ -77,7 +77,7 @@ enum HciOutType {
 }
 
 /// The largest HCI packet, including the packet type indicator byte.
-const MAX_HCI_PACKET_LEN: usize = 1024;
+const MAX_HCI_PACKET_LEN: usize = 1048;
 
 /// Reassembles whole HCI packets out of the byte stream that the host writes.
 ///

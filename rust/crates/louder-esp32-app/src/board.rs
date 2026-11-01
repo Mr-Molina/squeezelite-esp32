@@ -4,7 +4,8 @@
 //! - `board-louder-esp32` (ESP32-WROVER-N8R8)
 //! - `board-louder-esp32-s3` (ESP32-S3-WROOM-N8R8)
 
-// When both features are enabled (e.g. during --all-features), board-louder-esp32-s3 takes precedence.
+// When both features are enabled (e.g. during --all-features),
+// board-louder-esp32-s3 takes precedence.
 
 #[cfg(not(any(feature = "board-louder-esp32", feature = "board-louder-esp32-s3")))]
 compile_error!("You must select either 'board-louder-esp32' or 'board-louder-esp32-s3'.");
@@ -43,31 +44,34 @@ pub mod pins {
 
 /// Compile-time first-boot seeds (spec §3.4, resolution step 3).
 ///
-/// Boot resolves each field from the settings FlashJournal first, then (Wi-Fi only) the C
-/// firmware's NVS, and only then falls back to these values. They identify the deployment the
-/// firmware was first flashed for; after the first boot the journal (`setd` name, `/cmd.json`
-/// changes, LMS volume) is the source of truth. The player MAC is never a constant: HELO and
-/// smoltcp both use the efuse STA MAC.
+/// Boot resolves each field from the settings FlashJournal first, then (Wi-Fi
+/// only) the C firmware's NVS, and only then falls back to these values. They
+/// identify the deployment the firmware was first flashed for; after the first
+/// boot the journal (`setd` name, `/cmd.json` changes, LMS volume) is the
+/// source of truth. The player MAC is never a constant: HELO and smoltcp both
+/// use the efuse STA MAC.
 pub mod first_boot_defaults {
     use squeezelite_config::AudioConfig;
 
-    /// Player name announced to LMS (`SETD`) until LMS or a user renames the player.
+    /// Player name announced to LMS (`SETD`) until LMS or a user renames the
+    /// player.
     ///
-    /// Must be exactly 8 bytes: it is also the Bluetooth local name, and the fixed SDP service
-    /// record in `bt_a2dp.rs` holds an 8-byte Text element (compile-time assert where the record
-    /// is built from `BT_LOCAL_NAME`).
+    /// Must be exactly 8 bytes: it is also the Bluetooth local name, and the
+    /// fixed SDP service record in `bt_a2dp.rs` holds an 8-byte Text element
+    /// (compile-time assert where the record is built from `BT_LOCAL_NAME`).
     pub const PLAYER_NAME: &str = "BASEMENT";
     /// Lyrion Music Server (LMS) IPv4 address.
     pub const LMS_SERVER_IP: [u8; 4] = [10, 0, 0, 10];
     /// LMS SlimProto TCP port.
     pub const LMS_SERVER_PORT: u16 = 3483;
-    /// Wi-Fi SSID used with a compile-time `SL_WIFI_PASS` when neither the journal nor the NVS
-    /// holds credentials.
+    /// Wi-Fi SSID used with a compile-time `SL_WIFI_PASS` when neither the
+    /// journal nor the NVS holds credentials.
     pub const WIFI_SSID: &str = "iot";
 
-    /// The audio/identity configuration of a board whose journal holds nothing: the
-    /// [`AudioConfig`] defaults (volume, EQ, analog gain, loudness) with this deployment's
-    /// name and LMS address.
+    /// The audio/identity configuration of a board whose journal holds
+    /// nothing: the [`AudioConfig`] defaults (volume, EQ, analog gain,
+    /// loudness) with this deployment's name and LMS address.
+    #[must_use]
     pub fn audio_config() -> AudioConfig {
         let mut cfg = AudioConfig::default();
         cfg.set_player_name(PLAYER_NAME);
@@ -76,6 +80,26 @@ pub mod first_boot_defaults {
         cfg
     }
 }
+
+/// Default Lyrion Music Server (LMS) IPv4 address from target build
+/// context (`10.0.0.10`).
+pub const DEFAULT_LMS_SERVER_IP: [u8; 4] = first_boot_defaults::LMS_SERVER_IP;
+/// Default Lyrion Music Server (LMS) SlimProto TCP/UDP port (`3483`).
+pub const DEFAULT_LMS_SERVER_PORT: u16 = first_boot_defaults::LMS_SERVER_PORT;
+/// Default deployed player node name (`"BASEMENT"` on `172.22.1.15`).
+pub const DEFAULT_PLAYER_NAME: &str = first_boot_defaults::PLAYER_NAME;
+/// Default deployed Wi-Fi SSID (`"iot"` on `172.22.1.15`).
+pub const DEFAULT_WIFI_SSID: &str = first_boot_defaults::WIFI_SSID;
+/// Hardware MAC address of the `172.22.1.15` `"BASEMENT"` ESP32 unit
+/// (`c8:2e:18:be:b8:34`).
+pub const BASEMENT_PLAYER_MAC: [u8; 6] = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
+/// SlimProto `HELO` capability string for ESP32-WROVER PSRAM target.
+pub const BASEMENT_HELO_CAPABILITIES: &str = concat!(
+    "Model=squeezelite,AccuratePlayPoints=1,",
+    "HasDigitalOut=1,MaxSampleRate=96000,flc,pcm,wav,aif,mp3,aac,ogg,alc,ops"
+);
+/// External PSRAM output ring buffer capacity in bytes (2,000 KiB).
+pub const OUTPUT_RING_BYTES: usize = 2000 * 1024;
 
 /// Board identity descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +172,8 @@ pub struct I2sPinConfig {
     pub bclk_pin: u8,
     pub lrclk_pin: u8,
     pub dout_pin: u8,
-    /// Optional master clock (MCLK) pin (`None` on Louder-ESP32 3-wire BCLK PLL mode).
+    /// Optional master clock (MCLK) pin (`None` on Louder-ESP32
+    /// 3-wire BCLK PLL mode).
     pub mclk_pin: Option<u8>,
 }
 
@@ -173,6 +198,17 @@ mod tests {
         assert_eq!(BoardModel::LouderEsp32Wrover.cyd_uart_pins(), (4, 36));
         assert_eq!(BoardModel::LouderEsp32PlusS3.cyd_uart_pins(), (43, 44));
         assert_eq!(pins::TAS5805M_PRIMARY_I2C_ADDR, 0x2C);
+    }
+
+    #[test]
+    fn test_basement_deployment_constants() {
+        assert_eq!(DEFAULT_LMS_SERVER_IP, [10, 0, 0, 10]);
+        assert_eq!(DEFAULT_LMS_SERVER_PORT, 3483);
+        assert_eq!(DEFAULT_PLAYER_NAME, "BASEMENT");
+        assert_eq!(DEFAULT_WIFI_SSID, "iot");
+        assert_eq!(BASEMENT_PLAYER_MAC, [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34]);
+        assert!(BASEMENT_HELO_CAPABILITIES.contains("MaxSampleRate=96000"));
+        assert_eq!(OUTPUT_RING_BYTES, 2000 * 1024);
     }
 
     #[test]

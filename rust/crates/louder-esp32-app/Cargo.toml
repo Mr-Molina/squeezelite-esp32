@@ -37,6 +37,8 @@ squeezelite-tas58xx = { path = "../squeezelite-tas58xx" }
 squeezelite-decoders = { path = "../squeezelite-decoders", default-features = false, features = ["alloc"] }
 squeezelite-cyd-link = { path = "../squeezelite-cyd-link" }
 squeezelite-config = { path = "../squeezelite-config" }
+squeezelite-raop = { path = "../squeezelite-raop", default-features = false, features = ["alloc"] }
+squeezelite-cspot = { path = "../squeezelite-cspot", default-features = false, features = ["alloc"] }
 embedded-hal = { workspace = true }
 heapless = { workspace = true }
 bytemuck = "1.25"
@@ -67,7 +69,7 @@ embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
 static_cell = "2.1.1"
 esp-storage = { version = "0.10.0", features = ["esp32", "critical-section", "bytewise-read"] }
-smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "socket-dns", "multicast"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "socket-dns", "multicast"] }
 
 [dev-dependencies]
 # Self dev-dependency: enables `std-codecs` for every test/bench build of this package (host only;

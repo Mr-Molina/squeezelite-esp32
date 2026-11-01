@@ -77,15 +77,22 @@ extern "C" fn notify_host_recv(data: *mut u8, len: u16) -> i32 {
 
     let data = unsafe { core::slice::from_raw_parts(data, len as usize) };
 
-    let packet = ReceivedPacket {
-        data: Box::from(data),
-    };
+    let pushed = super::BT_STATE.with(|state| {
+        if state.rx_queue.len() < 32 {
+            let packet = ReceivedPacket {
+                data: Box::from(data),
+            };
+            state.rx_queue.push_back(packet);
+            true
+        } else {
+            false
+        }
+    });
 
-    super::BT_STATE.with(|state| state.rx_queue.push_back(packet));
-
-    super::dump_packet_info(data);
-
-    crate::ble::controller::hci_read_data_available();
+    if pushed {
+        super::dump_packet_info(data);
+        crate::ble::controller::hci_read_data_available();
+    }
 
     0
 }
@@ -178,7 +185,9 @@ unsafe extern "C" fn task_create(
             if core_id < 2 { Some(core_id) } else { None },
             stack_depth as usize,
         );
-        *(handle as *mut usize) = task.as_ptr() as usize;
+        if !handle.is_null() {
+            *(handle as *mut usize) = task.as_ptr() as usize;
+        }
     }
 
     1

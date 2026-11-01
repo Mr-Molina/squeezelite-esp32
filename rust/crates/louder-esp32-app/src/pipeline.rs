@@ -1,22 +1,26 @@
 //! Real-Time Streaming Audio Pipeline Engine
 //!
 //! Connects LMS stream buffers, pure-Rust decoders, DSP equalizer,
-//! volume scaling, and the I2S audio output sink into an integrated processing loop.
+//! volume scaling, and the I2S audio output sink into an integrated processing
+//! loop.
 
 extern crate alloc;
 use alloc::boxed::Box;
 
-use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, GainStage, RingBufferError};
 use squeezelite_audio_core::fade::{cross_sample, ChunkGain, FadeEngine, FadeStep};
+use squeezelite_audio_core::{
+    AudioOutputSink, AudioRingBuffer, Equalizer, GainStage, RingBufferError,
+};
 use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 
+pub use squeezelite_audio_core::ChannelMode;
 pub use squeezelite_audio_core::EqPreset;
 pub use squeezelite_audio_core::FadeMode;
-pub use squeezelite_audio_core::ChannelMode;
 pub type ActiveCodec = ActiveDecoder;
 
-// Scratch sizing follows the codec set: the `std-codecs` decoders (FLAC 4096-frame blocks, AAC,
-// Vorbis) need the large buffers; the firmware codec set fits the smaller ones.
+// Scratch sizing follows the codec set: the `std-codecs` decoders (FLAC
+// 4096-frame blocks, AAC, Vorbis) need the large buffers; the firmware codec
+// set fits the smaller ones.
 #[cfg(feature = "std-codecs")]
 pub const PCM_SCRATCH_SAMPLES: usize = 8192;
 #[cfg(not(feature = "std-codecs"))]
@@ -25,30 +29,33 @@ pub const PCM_SCRATCH_SAMPLES: usize = 2304;
 #[cfg(feature = "std-codecs")]
 pub const READ_SCRATCH_BYTES: usize = 4096;
 #[cfg(not(feature = "std-codecs"))]
-pub const READ_SCRATCH_BYTES: usize = 1536;
+pub const READ_SCRATCH_BYTES: usize = 1728;
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 
-/// Stream ring of the firmware when PSRAM is mapped: 512 KiB (C `-b 500:2000` asks 500 KiB;
-/// C parity: main/Kconfig.projbuild:465).
+/// Stream ring of the firmware when PSRAM is mapped: 512 KiB (C `-b 500:2000`
+/// asks 500 KiB; C parity: main/Kconfig.projbuild:465).
 pub const PSRAM_STREAM_RING_BYTES: usize = 524_288;
-/// Output ring of the firmware when PSRAM is mapped: 2000 KiB, about 5.8 s at 44.1 kHz (C
-/// parity: main/Kconfig.projbuild:465 `-b 500:2000`; main.c:410 `atoi(o) * 1024`). A crossfade
-/// can use up to 90 % of it (C output.c:330), 230,400 frames.
+/// Output ring of the firmware when PSRAM is mapped: 2000 KiB, about 5.8 s at
+/// 44.1 kHz (C parity: main/Kconfig.projbuild:465 `-b 500:2000`; main.c:410
+/// `atoi(o) * 1024`). A crossfade can use up to 90 % of it (C output.c:330),
+/// 230,400 frames.
 pub const PSRAM_OUTPUT_RING_BYTES: usize = 2_000 * 1024;
 /// Size of the external PSRAM heap region (4 MiB, mapped at 0x3F80_0000).
 pub const PSRAM_HEAP_BYTES: usize = 4 * 1024 * 1024;
 
 /// Storage of the MP3 decoder carried by [`ActiveDecoder::Mp3`].
 ///
-/// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it (firmware) the
-/// decoder is a static singleton handed out by bring-up, so no MP3 state lives on the heap.
+/// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it
+/// (firmware) the decoder is a static singleton handed out by bring-up, so no
+/// MP3 state lives on the heap.
 #[cfg(feature = "std-codecs")]
 pub type Mp3Handle = Box<squeezelite_decoders::Mp3Decoder>;
 /// Storage of the MP3 decoder carried by [`ActiveDecoder::Mp3`].
 ///
-/// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it (firmware) the
-/// decoder is a static singleton handed out by bring-up, so no MP3 state lives on the heap.
+/// With `std-codecs` each track gets a fresh heap-boxed decoder. Without it
+/// (firmware) the decoder is a static singleton handed out by bring-up, so no
+/// MP3 state lives on the heap.
 #[cfg(not(feature = "std-codecs"))]
 pub type Mp3Handle = &'static mut squeezelite_decoders::StaticMp3Decoder;
 
@@ -56,10 +63,10 @@ pub enum ActiveDecoder {
     Pcm(PcmDecoder),
     Mp3(Mp3Handle),
     Flac(Box<squeezelite_decoders::FlacDecoder>),
-    #[cfg(feature = "std-codecs")]
     Aac(Box<squeezelite_decoders::AacDecoder>),
-    #[cfg(feature = "std-codecs")]
     Vorbis(Box<squeezelite_decoders::VorbisDecoder>),
+    Alac(Box<squeezelite_decoders::AlacDecoder>),
+    Opus(Box<squeezelite_decoders::OpusDecoder>),
 }
 
 impl AudioDecoder for ActiveDecoder {
@@ -72,10 +79,10 @@ impl AudioDecoder for ActiveDecoder {
             Self::Pcm(d) => d.decode(encoded_in, pcm_out),
             Self::Mp3(d) => d.decode(encoded_in, pcm_out),
             Self::Flac(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(feature = "std-codecs")]
             Self::Aac(d) => d.decode(encoded_in, pcm_out),
-            #[cfg(feature = "std-codecs")]
             Self::Vorbis(d) => d.decode(encoded_in, pcm_out),
+            Self::Alac(d) => d.decode(encoded_in, pcm_out),
+            Self::Opus(d) => d.decode(encoded_in, pcm_out),
         }
     }
 
@@ -84,25 +91,27 @@ impl AudioDecoder for ActiveDecoder {
             Self::Pcm(d) => d.flush(),
             Self::Mp3(d) => d.flush(),
             Self::Flac(d) => d.flush(),
-            #[cfg(feature = "std-codecs")]
             Self::Aac(d) => d.flush(),
-            #[cfg(feature = "std-codecs")]
             Self::Vorbis(d) => d.flush(),
+            Self::Alac(d) => d.flush(),
+            Self::Opus(d) => d.flush(),
         }
     }
 }
 
 impl ActiveDecoder {
-    /// Returns the active stream sample rate in Hz reported by the decoder, if known.
+    /// Returns the active stream sample rate in Hz reported by the decoder, if
+    /// known.
+    #[must_use]
     pub fn sample_rate(&self) -> Option<u32> {
         let rate = match self {
             Self::Pcm(d) => return d.sample_rate,
             Self::Mp3(d) => d.sample_rate,
             Self::Flac(d) => d.sample_rate,
-            #[cfg(feature = "std-codecs")]
             Self::Aac(d) => d.sample_rate,
-            #[cfg(feature = "std-codecs")]
             Self::Vorbis(d) => d.sample_rate,
+            Self::Alac(d) => d.sample_rate,
+            Self::Opus(d) => d.sample_rate,
         };
         if rate > 0 {
             Some(rate)
@@ -111,53 +120,64 @@ impl ActiveDecoder {
         }
     }
 
-    /// A fresh MP3 decoder, or `None` when this build cannot create one (without `std-codecs`
-    /// the static MP3 decoder is owned by bring-up).
+    /// A fresh MP3 decoder, or `None` when this build cannot create one
+    /// (without `std-codecs` the static MP3 decoder is owned by bring-up).
     #[cfg(feature = "std-codecs")]
+    #[must_use]
     pub fn new_mp3() -> Option<Self> {
         Some(Self::Mp3(Box::new(squeezelite_decoders::Mp3Decoder::new())))
     }
 
-    /// A fresh MP3 decoder, or `None` when this build cannot create one (without `std-codecs`
-    /// the static MP3 decoder is owned by bring-up).
+    /// A fresh MP3 decoder, or `None` when this build cannot create one
+    /// (without `std-codecs` the static MP3 decoder is owned by bring-up).
     #[cfg(not(feature = "std-codecs"))]
+    #[must_use]
     pub fn new_mp3() -> Option<Self> {
         None
     }
 
-    /// A fresh AAC decoder, or `None` when the build lacks `std-codecs`.
-    #[cfg(feature = "std-codecs")]
+    /// A fresh AAC decoder (available in every build).
+    #[must_use]
     pub fn new_aac() -> Option<Self> {
         Some(Self::Aac(Box::new(squeezelite_decoders::AacDecoder::new())))
     }
 
-    /// A fresh AAC decoder, or `None` when the build lacks `std-codecs`.
-    #[cfg(not(feature = "std-codecs"))]
-    pub fn new_aac() -> Option<Self> {
-        None
-    }
-
-    /// A fresh Ogg Vorbis decoder, or `None` when the build lacks `std-codecs`.
-    #[cfg(feature = "std-codecs")]
+    /// A fresh Ogg Vorbis decoder (available in every build).
+    #[must_use]
     pub fn new_vorbis() -> Option<Self> {
-        Some(Self::Vorbis(Box::new(squeezelite_decoders::VorbisDecoder::new())))
-    }
-
-    /// A fresh Ogg Vorbis decoder, or `None` when the build lacks `std-codecs`.
-    #[cfg(not(feature = "std-codecs"))]
-    pub fn new_vorbis() -> Option<Self> {
-        None
+        Some(Self::Vorbis(Box::new(
+            squeezelite_decoders::VorbisDecoder::new(),
+        )))
     }
 
     /// A fresh FLAC decoder (available in every build).
+    #[must_use]
     pub fn new_flac() -> Self {
         Self::Flac(Box::new(squeezelite_decoders::FlacDecoder::new()))
     }
 
-    /// Returns whether the active decoder has unconsumed decoded PCM frames waiting in its internal buffer.
+    /// A fresh ALAC decoder (available in every build).
+    #[must_use]
+    pub fn new_alac() -> Self {
+        Self::Alac(Box::new(squeezelite_decoders::AlacDecoder::new()))
+    }
+
+    /// A fresh Ogg Opus decoder (available in every build).
+    #[must_use]
+    pub fn new_opus() -> Self {
+        Self::Opus(Box::new(squeezelite_decoders::OpusDecoder::new()))
+    }
+
+    /// Returns whether the active decoder has unconsumed decoded PCM frames
+    /// waiting in its internal buffer.
+    #[must_use]
     pub fn has_pending_pcm(&self) -> bool {
         match self {
             Self::Flac(d) => d.has_pending_pcm(),
+            Self::Aac(d) => d.has_pending_pcm(),
+            Self::Vorbis(d) => d.has_pending_pcm(),
+            Self::Alac(d) => d.has_pending_pcm(),
+            Self::Opus(d) => d.has_pending_pcm(),
             _ => false,
         }
     }
@@ -166,69 +186,83 @@ impl ActiveDecoder {
 /// Q16.16 unity gain (C `FIXED_ONE`).
 const UNITY_Q16: u32 = 0x1_0000;
 
-/// Output-ring bytes per stereo frame (two native-endian `i32` samples; C `BYTES_PER_FRAME`).
+/// Output-ring bytes per stereo frame (two native-endian `i32` samples; C
+/// `BYTES_PER_FRAME`).
 const OUTPUT_FRAME_BYTES: usize = 8;
 
-/// The pending track boundary in the output ring: C squeezelite's `output.track_start`
-/// pointer, plus the `output.next_*` values that take effect when playback reaches it.
+/// The pending track boundary in the output ring: C squeezelite's
+/// `output.track_start` pointer, plus the `output.next_*` values that take
+/// effect when playback reaches it.
 ///
-/// C keeps exactly one such pointer; a newer track start overwrites one playback has not
-/// reached yet (`flac.c:147`, `mad.c:256`, `pcm.c:216`). The pipeline therefore holds a single
-/// `Option<TrackMarker>` ([`StreamPipeline::track_marker`]), not a queue.
+/// C keeps exactly one such pointer; a newer track start overwrites one
+/// playback has not reached yet (`flac.c:147`, `mad.c:256`, `pcm.c:216`). The
+/// pipeline therefore holds a single `Option<TrackMarker>`
+/// ([`StreamPipeline::track_marker`]), not a queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackMarker {
-    /// Unread output-ring bytes in front of the boundary (C `track_start - readp`). Always a
-    /// whole number of frames and never more than the unread bytes: the boundary never sits
-    /// behind the read position or past the write position.
+    /// Unread output-ring bytes in front of the boundary (C `track_start -
+    /// readp`). Always a whole number of frames and never more than the
+    /// unread bytes: the boundary never sits behind the read position or
+    /// past the write position.
     pub bytes_ahead: u64,
     /// Rate of the track that starts here (C `output.next_sample_rate`).
     pub sample_rate: u32,
-    /// Replay gain of the track that starts here, 16.16 fixed point, 0 = none (C
-    /// `output.next_replay_gain`).
+    /// Replay gain of the track that starts here, 16.16 fixed point, 0 = none
+    /// (C `output.next_replay_gain`).
     pub replay_gain: u32,
-    /// `strm s` output threshold (C `output.threshold`, tenths of a second) in frames at
-    /// [`Self::sample_rate`]. Stored for the output-start gate (Task 15); not applied yet.
+    /// `strm s` output threshold (C `output.threshold`, tenths of a second) in
+    /// frames at [`Self::sample_rate`]. Stored for the output-start gate
+    /// (Task 15); not applied yet.
     pub output_threshold_frames: u32,
 }
 
-/// Track-boundary state of the output side (C `output.track_start`, `next_*`, `current_*`,
-/// `delay_active`, `track_started`; `decode.new_stream`). Built by [`TrackBoundary::new`] so
-/// firmware bring-up can initialise the whole group with one write.
+/// Track-boundary state of the output side (C `output.track_start`, `next_*`,
+/// `current_*`, `delay_active`, `track_started`; `decode.new_stream`). Built by
+/// [`TrackBoundary::new`] so firmware bring-up can initialise the whole group
+/// with one write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackBoundary {
     marker: Option<TrackMarker>,
-    /// The boundary playback crossed and nobody has taken yet (C `output.track_started`).
+    /// The boundary playback crossed and nobody has taken yet (C
+    /// `output.track_started`).
     crossed: Option<TrackMarker>,
     /// The next decoded frames start a new track (C `decode.new_stream`).
     new_stream: bool,
-    /// Rate for a new track whose decoder reports none (raw PCM): the `strm s` rate, or the
-    /// rate last set explicitly with [`StreamPipeline::set_sample_rate`].
+    /// Rate for a new track whose decoder reports none (raw PCM): the `strm s`
+    /// rate, or the rate last set explicitly with
+    /// [`StreamPipeline::set_sample_rate`].
     stream_rate_hint: u32,
     /// `strm s` output threshold, tenths of a second (C `output.threshold`).
     output_threshold: u8,
-    /// Silent frames still to play for the boundary rate-change delay (C `output.pause_frames`
-    /// while `OUTPUT_PAUSE_FRAMES` from `output.c:139-147`).
+    /// Silent frames still to play for the boundary rate-change delay (C
+    /// `output.pause_frames` while `OUTPUT_PAUSE_FRAMES` from
+    /// `output.c:139-147`).
     silence_frames: u32,
-    /// The first half of the rate-change delay was played (C `output.delay_active`).
+    /// The first half of the rate-change delay was played (C
+    /// `output.delay_active`).
     delay_active: bool,
     /// Replay gain of the playing track, 16.16 fixed point, 0 = none (C
-    /// `output.current_replay_gain`). The gain stage applies it to every output sample
-    /// outside a crossfade (C `output.c:54-55`); inside one, the crossfade weights carry it.
+    /// `output.current_replay_gain`). The gain stage applies it to every output
+    /// sample outside a crossfade (C `output.c:54-55`); inside one, the
+    /// crossfade weights carry it.
     pub current_replay_gain: u32,
-    /// Replay gain from the latest `strm s` (C `output.next_replay_gain`, `slimproto.c:485`).
+    /// Replay gain from the latest `strm s` (C `output.next_replay_gain`,
+    /// `slimproto.c:485`).
     pub next_replay_gain: u32,
-    /// Silence in ms played around a track boundary that changes the sample rate, half before
-    /// it at the old rate and half after it at the new one (C `output.rate_delay`, the `delay`
-    /// of `-r rates:delay`, `main.c:298`, `main.c:509`). Default 0: no silence.
+    /// Silence in ms played around a track boundary that changes the sample
+    /// rate, half before it at the old rate and half after it at the new
+    /// one (C `output.rate_delay`, the `delay` of `-r rates:delay`,
+    /// `main.c:298`, `main.c:509`). Default 0: no silence.
     pub rate_delay_ms: u32,
-    /// Rate of the newest track start (C `output.next_sample_rate`), which sizes a fade at
-    /// the end of its decoding (C `_checkfade(false)`, `output.c:292`).
+    /// Rate of the newest track start (C `output.next_sample_rate`), which
+    /// sizes a fade at the end of its decoding (C `_checkfade(false)`,
+    /// `output.c:292`).
     next_sample_rate: u32,
 }
 
 impl TrackBoundary {
-    /// No boundary pending; the first decoded frames start a track (C `decode_init` sets
-    /// `decode.new_stream`, `decode.c:223`).
+    /// No boundary pending; the first decoded frames start a track (C
+    /// `decode_init` sets `decode.new_stream`, `decode.c:223`).
     pub const fn new(rate_hint: u32) -> Self {
         Self {
             marker: None,
@@ -252,11 +286,12 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub output_buffer: AudioRingBuffer<'a>,
     pub decoder: ActiveDecoder,
     pub equalizer: Equalizer<10>,
-    /// The composite output gain (C `output.gainL/R`, `current_replay_gain`, fade gain,
-    /// `invert`, `channels`), applied to every chunk the output step writes.
+    /// The composite output gain (C `output.gainL/R`, `current_replay_gain`,
+    /// fade gain, `invert`, `channels`), applied to every chunk the output
+    /// step writes.
     pub gain_stage: GainStage,
-    /// The volume LMS last asked for, Q16.16 per channel (C `set_volume`'s arguments,
-    /// slimproto.c:569), see [`Self::requested_volume_q16`].
+    /// The volume LMS last asked for, Q16.16 per channel (C `set_volume`'s
+    /// arguments, slimproto.c:569), see [`Self::requested_volume_q16`].
     pub requested_volume: (u32, u32),
     pub sink: S,
     pub sample_rate: u32,
@@ -270,14 +305,22 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub current_eq_preset: EqPreset,
     pub user_muted: bool,
     /// MP3 decoder parked while another decoder is active, reused by
-    /// [`Self::use_mp3_decoder`]. Firmware bring-up hands its static MP3 decoder in here once
-    /// (there is no heap MP3 decoder without `std-codecs`); [`Self::set_decoder`] parks a
-    /// replaced MP3 decoder here, so the static one is never lost or duplicated.
+    /// [`Self::use_mp3_decoder`]. Firmware bring-up hands its static MP3
+    /// decoder in here once (there is no heap MP3 decoder without
+    /// `std-codecs`); [`Self::set_decoder`] parks a replaced MP3 decoder
+    /// here, so the static one is never lost or duplicated.
     pub mp3_spare: Option<Mp3Handle>,
     /// Gapless track-boundary state (C `output.track_start` and friends).
     pub boundary: TrackBoundary,
-    /// Fade-in/out and crossfade state (C `output.fade*`), applied by the output step.
+    /// Fade-in/out and crossfade state (C `output.fade*`), applied by the
+    /// output step.
     pub fade: FadeEngine,
+    /// Maximum single-step decode time in microseconds since the current
+    /// decoder was installed.
+    pub decode_us_max: u32,
+    /// First non-zero decode step time in microseconds since the current
+    /// decoder was installed.
+    pub decode_us_first: u32,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -310,6 +353,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             mp3_spare: None,
             boundary: TrackBoundary::new(sample_rate),
             fade: FadeEngine::new(),
+            decode_us_max: 0,
+            decode_us_first: 0,
         }
     }
 
@@ -319,26 +364,32 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.sink.set_mute(mute);
     }
 
-    /// Pushes incoming encoded stream bytes from LMS into the stream ringbuffer.
+    /// Pushes incoming encoded stream bytes from LMS into the stream
+    /// ringbuffer.
     pub fn ingest_stream_data(&mut self, data: &[u8]) -> Result<usize, RingBufferError> {
         self.stream_buffer.write(data)
     }
 
-    /// Decodes a chunk from `stream_buffer`, processes EQ, and stores it in `output_buffer`.
-    /// Gain (volume, replay gain, fade, polarity, channel select) is applied when the output
-    /// step plays the frames, as C does (output_i2s.c:510 `_apply_gain`).
+    /// Decodes a chunk from `stream_buffer`, processes EQ, and stores it in
+    /// `output_buffer`. Gain (volume, replay gain, fade, polarity, channel
+    /// select) is applied when the output step plays the frames, as C does
+    /// (output_i2s.c:510 `_apply_gain`).
     ///
     /// # Returns (`PIPE-504`)
-    /// - When draining buffered `pcm_pending_samples` from a prior decode step: returns
-    ///   `Ok(frames_to_write)` (the number of pending stereo frames written to `output_buffer`,
-    ///   or `Ok(0)` if `output_buffer` has fewer than 8 bytes of free space).
-    /// - When `output_buffer` is full (`available_write() < 8`): returns `Ok(0)` due to backpressure.
-    /// - When decoding new input from `stream_buffer`: returns `Ok(consumed)` (the number of
-    ///   encoded stream bytes consumed by the active decoder).
-    /// - On `DecoderError::CorruptedFrame` or `DecoderError::InvalidHeader`: consumes 1 byte from
-    ///   `stream_buffer` to advance past the corrupted byte and prevent an infinite decode loop (`PIPE-501`).
+    /// - When draining buffered `pcm_pending_samples` from a prior decode step:
+    ///   returns `Ok(frames_to_write)` (the number of pending stereo frames
+    ///   written to `output_buffer`, or `Ok(0)` if `output_buffer` has fewer
+    ///   than 8 bytes of free space).
+    /// - When `output_buffer` is full (`available_write() < 8`): returns
+    ///   `Ok(0)` due to backpressure.
+    /// - When decoding new input from `stream_buffer`: returns `Ok(consumed)`
+    ///   (the number of encoded stream bytes consumed by the active decoder).
+    /// - On `DecoderError::CorruptedFrame` or `DecoderError::InvalidHeader`:
+    ///   consumes 1 byte from `stream_buffer` to advance past the corrupted
+    ///   byte and prevent an infinite decode loop (`PIPE-501`).
     pub fn process_decode_step(&mut self) -> Result<usize, DecoderError> {
-        // Drain pending PCM frames from previous decode if output buffer was previously constrained (LOGIC-601/602)
+        // Drain pending PCM frames from previous decode if output buffer was previously
+        // constrained (LOGIC-601/602)
         if self.pcm_pending_samples > 0 {
             let avail_frames = self.output_buffer.available_write() / 8;
             if avail_frames == 0 {
@@ -347,7 +398,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             let pending_frames = self.pcm_pending_samples / 2;
             let frames_to_write = pending_frames.min(avail_frames);
             let samples_to_write = frames_to_write * 2;
-            let slice = &self.pcm_scratch[self.pcm_pending_offset..self.pcm_pending_offset + samples_to_write];
+            let slice = &self.pcm_scratch
+                [self.pcm_pending_offset..self.pcm_pending_offset + samples_to_write];
             let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
             let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
             let frames_written = written / 8;
@@ -360,13 +412,15 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Ok(frames_written);
         }
 
-        // Drain pending PCM frames from decoder if available (e.g. FlacDecoder pending frames)
+        // Drain pending PCM frames from decoder if available (e.g. FlacDecoder pending
+        // frames)
         if self.decoder.has_pending_pcm() {
             let avail_frames = self.output_buffer.available_write() / 8;
             if avail_frames == 0 {
                 return Ok(0);
             }
-            let (consumed, frames_produced) = match self.decoder.decode(&[], &mut self.pcm_scratch) {
+            let (consumed, frames_produced) = match self.decoder.decode(&[], &mut self.pcm_scratch)
+            {
                 Ok(res) => res,
                 Err(DecoderError::NeedMoreData) => (0, 0),
                 Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
@@ -380,7 +434,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
                 let frames_to_write = frames_produced.min(avail_frames);
                 let frames_written = if frames_to_write > 0 {
-                    let pcm_bytes: &[u8] = bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
+                    let pcm_bytes: &[u8] =
+                        bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
                     let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
                     written / 8
                 } else {
@@ -417,15 +472,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Err(DecoderError::NeedMoreData);
         }
 
-        let (consumed, frames_produced) = match self.decoder.decode(
-            &self.read_scratch[..peeked],
-            &mut self.pcm_scratch,
-        ) {
+        let (consumed, frames_produced) = match self
+            .decoder
+            .decode(&self.read_scratch[..peeked], &mut self.pcm_scratch)
+        {
             Ok(res) => res,
             Err(DecoderError::NeedMoreData) => return Err(DecoderError::NeedMoreData),
             Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
             Err(e) => {
-                // Consume at least 1 byte on corrupted frame / invalid header to prevent infinite busy loop
+                // Consume at least 1 byte on corrupted frame / invalid header to prevent
+                // infinite busy loop
                 self.stream_buffer.consume(1);
                 return Err(e);
             }
@@ -437,14 +493,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
 
         if frames_produced > 0 {
-            // The decoder's rate is the next track's rate, applied when playback reaches the
-            // track start (C parity: pcm.c:216-236, mad.c:254-256, flac.c:147-170 set
-            // `output.next_sample_rate` with `track_start`; output.c:154 switches). A rate
-            // change inside a track is ignored, as in C (only `new_stream` reads the rate).
+            // The decoder's rate is the next track's rate, applied when playback reaches
+            // the track start (C parity: pcm.c:216-236, mad.c:254-256,
+            // flac.c:147-170 set `output.next_sample_rate` with `track_start`;
+            // output.c:154 switches). A rate change inside a track is ignored,
+            // as in C (only `new_stream` reads the rate).
             self.mark_track_start();
-            // Equalizer preset and loudness contour, in place, exactly once before buffering.
-            // The gain stage runs at output time (C parity: output.c:54-57, output_i2s.c:510),
-            // so a volume change reaches audio already in the output ring at once, as in C.
+            // Equalizer preset and loudness contour, in place, exactly once before
+            // buffering. The gain stage runs at output time (C parity:
+            // output.c:54-57, output_i2s.c:510), so a volume change reaches
+            // audio already in the output ring at once, as in C.
             let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
             self.equalizer.process_interleaved(active_pcm);
 
@@ -452,7 +510,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             let frames_to_write = frames_produced.min(avail_frames);
 
             let frames_written = if frames_to_write > 0 {
-                let pcm_bytes: &[u8] = bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
+                let pcm_bytes: &[u8] =
+                    bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
                 debug_assert_eq!(pcm_bytes.len() % 8, 0);
                 let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
                 written / 8
@@ -475,12 +534,14 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
     /// Flushes output ringbuffer frames to the audio output sink (I2S DMA).
     ///
-    /// Track boundaries follow C `_output_frames` (`output.c:126-166`): a chunk never runs past
-    /// the pending [`TrackMarker`], and a step that starts on it processes the track start
-    /// first ([`Self::active_marker_crossed`] then returns it) and plays on into the new track.
-    /// Fades follow `output.c:174-252` ([`Self::prepare_fade`], [`Self::scale_chunk`]): a
-    /// chunk never runs past a fade start or end either.
-    /// Returns the frames written to the sink, including rate-change silence.
+    /// Track boundaries follow C `_output_frames` (`output.c:126-166`): a chunk
+    /// never runs past the pending [`TrackMarker`], and a step that starts
+    /// on it processes the track start
+    /// first ([`Self::active_marker_crossed`] then returns it) and plays on
+    /// into the new track. Fades follow `output.c:174-252`
+    /// ([`Self::prepare_fade`], [`Self::scale_chunk`]): a chunk never runs
+    /// past a fade start or end either. Returns the frames written to the
+    /// sink, including rate-change silence.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_output_step(&mut self) -> Result<usize, S::Error> {
         if self.boundary.silence_frames > 0 {
@@ -511,8 +572,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             to_read = to_read.min(usize::try_from(marker.bytes_ahead).unwrap_or(usize::MAX));
         }
         if let Some(max_frames) = fade.max_frames {
-            // C parity: output.c:178-180, 212-214, the chunk ends exactly on the fade start/end.
-            let max_bytes = usize::try_from(max_frames).unwrap_or(usize::MAX).saturating_mul(OUTPUT_FRAME_BYTES);
+            // C parity: output.c:178-180, 212-214, the chunk ends exactly on the fade
+            // start/end.
+            let max_bytes = usize::try_from(max_frames)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(OUTPUT_FRAME_BYTES);
             to_read = to_read.min(max_bytes);
         }
         let bytes_to_read = (to_read / OUTPUT_FRAME_BYTES) * OUTPUT_FRAME_BYTES;
@@ -520,8 +584,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Ok(0);
         }
 
-        // Non-destructive peek: frames remain in ringbuffer until sink write succeeds (LOGIC-603)
-        let bytes_read = self.output_buffer.peek(&mut self.write_scratch[..bytes_to_read]);
+        // Non-destructive peek: frames remain in ringbuffer until sink write succeeds
+        // (LOGIC-603)
+        let bytes_read = self
+            .output_buffer
+            .peek(&mut self.write_scratch[..bytes_to_read]);
         if bytes_read < OUTPUT_FRAME_BYTES {
             return Ok(0);
         }
@@ -541,7 +608,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         if !self.user_muted {
             self.sink.set_mute(false);
         }
-        let written_frames = self.sink.write_frames(&self.output_i32_scratch[..frames_to_write * 2])?;
+        let written_frames = self
+            .sink
+            .write_frames(&self.output_i32_scratch[..frames_to_write * 2])?;
         // ONLY consume the exact number of frames successfully committed to the sink
         self.consume_output(written_frames);
         if written_frames > 0 {
@@ -551,15 +620,21 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         Ok(written_frames)
     }
 
-    /// The fade part of one C `_output_frames` iteration (output.c:174-252) for the chunk
-    /// about to be written. A completed crossfade skips the new track's first `dur_f` frames,
-    /// which were already played inside the mix (output.c:196-200: not counted as played),
-    /// and makes the next replay gain current (output.c:203).
+    /// The fade part of one C `_output_frames` iteration (output.c:174-252) for
+    /// the chunk about to be written. A completed crossfade skips the new
+    /// track's first `dur_f` frames, which were already played inside the
+    /// mix (output.c:196-200: not counted as played), and makes the next
+    /// replay gain current (output.c:203).
     fn prepare_fade(&mut self) -> FadeStep {
         let used = (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u64;
         // C `size`: the frames this call wants to write.
         let size = used.min((self.write_scratch.len() / OUTPUT_FRAME_BYTES) as u64);
-        let step = self.fade.prepare(used, size, self.boundary.current_replay_gain, self.boundary.next_replay_gain);
+        let step = self.fade.prepare(
+            used,
+            size,
+            self.boundary.current_replay_gain,
+            self.boundary.next_replay_gain,
+        );
         if step.skip_frames > 0 {
             self.consume_output(usize::try_from(step.skip_frames).unwrap_or(usize::MAX));
         }
@@ -569,42 +644,65 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         step
     }
 
-    /// Scales the chunk in `output_i32_scratch` (C `write_cb`: `_apply_cross` then
-    /// `_apply_gain`, output_i2s.c:504-511).
+    /// Scales the chunk in `output_i32_scratch` (C `write_cb`: `_apply_cross`
+    /// then `_apply_gain`, output_i2s.c:504-511).
     ///
-    /// - Crossfade: each old sample (at the read position) is mixed with the new track's
-    ///   sample `dur_f` frames further on (C `cross_ptr = fade_end + cur_f`, output.c:245,
-    ///   output_pack.c:366-376), each weighted by its fade weight and its own replay gain.
-    /// - Then the gain stage, the one place the output gain is composed: volume x current
-    ///   replay gain x fade-up/down gain, negated with `invert`, then channel select (C parity:
-    ///   output.c:54-57, :226-228; output_pack.c:383-410).
+    /// - Crossfade: each old sample (at the read position) is mixed with the
+    ///   new track's sample `dur_f` frames further on (C `cross_ptr =
+    ///   fade_end + cur_f`, output.c:245, output_pack.c:366-376), each
+    ///   weighted by its fade weight and its own replay gain.
+    /// - Then the gain stage, the one place the output gain is composed: volume
+    ///   x current replay gain x fade-up/down gain, negated with `invert`, then
+    ///   channel select (C parity: output.c:54-57, :226-228;
+    ///   output_pack.c:383-410).
     ///
-    /// Replay gain is applied exactly once per sample: outside a crossfade by the gain stage
-    /// (C output.c:54-55); inside one only by the crossfade weights, because C's standard gain
-    /// there is the plain volume `output.gainL/R` (output.c:243-245). The level is therefore
+    /// Replay gain is applied exactly once per sample: outside a crossfade by
+    /// the gain stage (C output.c:54-55); inside one only by the crossfade
+    /// weights, because C's standard gain there is the plain volume
+    /// `output.gainL/R` (output.c:243-245). The level is therefore
     /// continuous across both crossfade edges.
     ///
-    /// Deliberate divergence (ruled in Task 13): during a fade up/down C negates the inverted
-    /// gain a second time (output.c:57 then :229), so it plays non-inverted for the fade
-    /// only, with a polarity flip at each fade edge. Here invert negates exactly once.
+    /// Deliberate divergence (ruled in Task 13): during a fade up/down C
+    /// negates the inverted gain a second time (output.c:57 then :229), so
+    /// it plays non-inverted for the fade only, with a polarity flip at
+    /// each fade edge. Here invert negates exactly once.
     ///
-    /// C's per-call gain artifacts are not reproduced either: C composes `gainL/R` once per
-    /// `_output_frames` call (output.c:54-57) and multiplies the fade gain into it in place
-    /// (:227-228), so a call whose loop runs more than one chunk compounds the fade gains of
-    /// its chunks; and the replay-gain swap at crossfade completion (:209) reaches the gain
-    /// only on the next call. Rust recomposes the whole gain for every chunk.
+    /// C's per-call gain artifacts are not reproduced either: C composes
+    /// `gainL/R` once per `_output_frames` call (output.c:54-57) and
+    /// multiplies the fade gain into it in place (:227-228), so a call
+    /// whose loop runs more than one chunk compounds the fade gains of
+    /// its chunks; and the replay-gain swap at crossfade completion (:209)
+    /// reaches the gain only on the next call. Rust recomposes the whole
+    /// gain for every chunk.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     fn scale_chunk(&mut self, frames: usize, chunk_gain: ChunkGain) {
         let samples = &mut self.output_i32_scratch[..frames * 2];
-        let crossfading = if let ChunkGain::Cross { gain_in, gain_out, new_ahead } = chunk_gain {
-            let offset = usize::try_from(new_ahead).unwrap_or(usize::MAX).saturating_mul(OUTPUT_FRAME_BYTES);
-            // `prepare` checked that the new frames follow (output.c:231): the old samples are
-            // already converted, so the byte scratch is free for them.
-            let got = self.output_buffer.peek_at(offset, &mut self.write_scratch[..frames * OUTPUT_FRAME_BYTES]);
+        let crossfading = if let ChunkGain::Cross {
+            gain_in,
+            gain_out,
+            new_ahead,
+        } = chunk_gain
+        {
+            let offset = usize::try_from(new_ahead)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(OUTPUT_FRAME_BYTES);
+            // `prepare` checked that the new frames follow (output.c:231): the old samples
+            // are already converted, so the byte scratch is free for them.
+            let got = self.output_buffer.peek_at(
+                offset,
+                &mut self.write_scratch[..frames * OUTPUT_FRAME_BYTES],
+            );
             // `prepare` guarantees used > dur_f + size, so the whole chunk of new frames is
             // there; a short read would mix only part of the chunk.
-            debug_assert_eq!(got, frames * OUTPUT_FRAME_BYTES, "crossfade new-track frames missing");
-            for (sample, new) in samples.iter_mut().zip(self.write_scratch[..got].chunks_exact(4)) {
+            debug_assert_eq!(
+                got,
+                frames * OUTPUT_FRAME_BYTES,
+                "crossfade new-track frames missing"
+            );
+            for (sample, new) in samples
+                .iter_mut()
+                .zip(self.write_scratch[..got].chunks_exact(4))
+            {
                 let new = i32::from_ne_bytes([new[0], new[1], new[2], new[3]]);
                 *sample = cross_sample(*sample, new, gain_out, gain_in);
             }
@@ -612,27 +710,41 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         } else {
             false
         };
-        // C parity: output.c:54-55 (replay gain on all output, 0 = none) and :243-245 (plain
-        // volume while crossfading: the weights above carry both tracks' replay gains).
-        self.gain_stage.replay_gain_q16 = if crossfading { 0 } else { self.boundary.current_replay_gain };
+        // C parity: output.c:54-55 (replay gain on all output, 0 = none) and :243-245
+        // (plain volume while crossfading: the weights above carry both tracks'
+        // replay gains).
+        self.gain_stage.replay_gain_q16 = if crossfading {
+            0
+        } else {
+            self.boundary.current_replay_gain
+        };
         // C parity: output.c:226-228, the fade gain of this chunk (unity outside a fade
-        // up/down). Refreshed once per chunk, so a volume change never touches fade progress.
+        // up/down). Refreshed once per chunk, so a volume change never touches fade
+        // progress.
         self.gain_stage.fade_q16 = self.fade.gain_q16();
-        debug_assert!(!matches!(chunk_gain, ChunkGain::Fade(g) if g as u32 != self.gain_stage.fade_q16));
+        debug_assert!(
+            !matches!(chunk_gain, ChunkGain::Fade(g) if g as u32 != self.gain_stage.fade_q16)
+        );
         self.gain_stage.apply(samples);
     }
 
     /// Playback reached the pending track start (C parity: output.c:127-162).
     ///
-    /// With a rate change and [`TrackBoundary::rate_delay_ms`] > 0 the first arrival only
-    /// queues `current_rate * delay / 2000` silent frames and leaves the boundary pending
-    /// (`delay_active`); the second arrival queues `next_rate * delay / 2000` frames and then
-    /// processes the track start, so the silence is split around the rate switch
-    /// (output.c:128-148). The track start: `frames_played = 0`, `track_started`, the clock
-    /// goes to the next rate, the next replay gain becomes current unless a crossfade holds
-    /// the old one until it completes, and the boundary is cleared (output.c:149-162).
+    /// With a rate change and [`TrackBoundary::rate_delay_ms`] > 0 the first
+    /// arrival only queues `current_rate * delay / 2000` silent frames and
+    /// leaves the boundary pending (`delay_active`); the second arrival
+    /// queues `next_rate * delay / 2000` frames and then processes the
+    /// track start, so the silence is split around the rate switch
+    /// (output.c:128-148). The track start: `frames_played = 0`,
+    /// `track_started`, the clock goes to the next rate, the next replay
+    /// gain becomes current unless a crossfade holds the old one until it
+    /// completes, and the boundary is cleared (output.c:149-162).
     fn reach_track_start(&mut self, marker: TrackMarker) {
-        let delay = if self.sample_rate != marker.sample_rate { self.boundary.rate_delay_ms } else { 0 };
+        let delay = if self.sample_rate != marker.sample_rate {
+            self.boundary.rate_delay_ms
+        } else {
+            0
+        };
         if delay > 0 {
             if !self.boundary.delay_active {
                 self.boundary.silence_frames = delay_frames(self.sample_rate, delay);
@@ -644,56 +756,73 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
         self.frames_played = 0;
         self.boundary.crossed = Some(marker);
-        // The clock switch is requested here, when the sink reaches the boundary. Frames of
-        // the previous track still queued in the sink's DMA then play at the new rate; C has
-        // the same window (output_i2s.c:627-643 switches after `_output_frames` and zeroes
-        // the DMA). Exact DMA-drain sequencing is Task 15. A refused rate keeps the old clock.
-        if marker.sample_rate != self.sample_rate && self.sink.set_sample_rate(marker.sample_rate).is_ok() {
+        // The clock switch is requested here, when the sink reaches the boundary.
+        // Frames of the previous track still queued in the sink's DMA then play
+        // at the new rate; C has the same window (output_i2s.c:627-643 switches
+        // after `_output_frames` and zeroes the DMA). Exact DMA-drain
+        // sequencing is Task 15. A refused rate keeps the old clock.
+        if marker.sample_rate != self.sample_rate
+            && self.sink.set_sample_rate(marker.sample_rate).is_ok()
+        {
             self.sample_rate = marker.sample_rate;
         }
-        // C parity: output.c:157-159, a crossfade keeps the old track's gain for its tail.
+        // C parity: output.c:157-159, a crossfade keeps the old track's gain for its
+        // tail.
         if !self.fade.holds_replay_gain() {
             self.boundary.current_replay_gain = marker.replay_gain;
         }
         self.boundary.marker = None;
     }
 
-    /// Plays queued rate-change silence (C `OUTPUT_PAUSE_FRAMES` silence, output.c:86-96):
-    /// zero frames at the sink's current rate, not counted as played (output.c:277-280).
+    /// Plays queued rate-change silence (C `OUTPUT_PAUSE_FRAMES` silence,
+    /// output.c:86-96): zero frames at the sink's current rate, not counted
+    /// as played (output.c:277-280).
     fn write_boundary_silence(&mut self) -> Result<usize, S::Error> {
         let frames = (self.boundary.silence_frames as usize).min(OUTPUT_I32_SCRATCH_SAMPLES / 2);
         self.output_i32_scratch[..frames * 2].fill(0);
         if !self.user_muted {
             self.sink.set_mute(false);
         }
-        let written = self.sink.write_frames(&self.output_i32_scratch[..frames * 2])?;
+        let written = self
+            .sink
+            .write_frames(&self.output_i32_scratch[..frames * 2])?;
         self.boundary.silence_frames -= written.min(frames) as u32;
         Ok(written)
     }
 
-    /// The decoder produced frames: if they start a new stream, the track start is the
-    /// current write position of the output ring (C parity: pcm.c:214-216, flac.c:145-147,
-    /// mad.c:253-256 `output.track_start = outputbuf->writep` when `decode.new_stream`). The
-    /// rate is the decoder's, or the `strm s` rate when it reports none (raw PCM, C pcm.c
-    /// uses the `strm` rate the codec was opened with). A boundary playback has not reached
-    /// yet is overwritten (one C pointer).
+    /// The decoder produced frames: if they start a new stream, the track start
+    /// is the current write position of the output ring (C parity:
+    /// pcm.c:214-216, flac.c:145-147, mad.c:253-256 `output.track_start =
+    /// outputbuf->writep` when `decode.new_stream`). The rate is the
+    /// decoder's, or the `strm s` rate when it reports none (raw PCM, C pcm.c
+    /// uses the `strm` rate the codec was opened with). A boundary playback has
+    /// not reached yet is overwritten (one C pointer).
     ///
-    /// The same moment arms a fade (C parity: flac.c:167/171, pcm.c:233/237, mad.c:257
-    /// `if (output.fade_mode) _checkfade(true)`); a crossfade moves the track start to the
-    /// fade start (output.c:339).
+    /// The same moment arms a fade (C parity: flac.c:167/171, pcm.c:233/237,
+    /// mad.c:257 `if (output.fade_mode) _checkfade(true)`); a crossfade
+    /// moves the track start to the fade start (output.c:339).
     fn mark_track_start(&mut self) {
         if !self.boundary.new_stream {
             return;
         }
         self.boundary.new_stream = false;
-        let sample_rate = self.decoder.sample_rate().unwrap_or(self.boundary.stream_rate_hint);
+        let sample_rate = self
+            .decoder
+            .sample_rate()
+            .unwrap_or(self.boundary.stream_rate_hint);
         self.boundary.next_sample_rate = sample_rate;
         let output_threshold_frames =
             (u64::from(self.boundary.output_threshold) * u64::from(sample_rate) / 10) as u32;
         let mut bytes_ahead = self.output_buffer.available_read() as u64;
         if self.fade.mode() != FadeMode::None {
             let used = bytes_ahead / OUTPUT_FRAME_BYTES as u64;
-            if let Some(start) = self.fade.check_fade(true, used, self.ring_frames(), sample_rate, self.sample_rate) {
+            if let Some(start) = self.fade.check_fade(
+                true,
+                used,
+                self.ring_frames(),
+                sample_rate,
+                self.sample_rate,
+            ) {
                 bytes_ahead = start * OUTPUT_FRAME_BYTES as u64;
             }
         }
@@ -710,48 +839,67 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         (self.output_buffer.capacity() / OUTPUT_FRAME_BYTES) as u64
     }
 
-    /// `strm s` transition, polarity and channel select (C parity: slimproto.c:486-489:
-    /// `fade_mode = transition_type - '0'`, `fade_secs = transition_period`, `invert`,
-    /// `channels`). A fade already armed keeps running, as in C. Polarity and channel select
-    /// take effect at once, also on the previous track's tail still playing, as C's
+    /// `strm s` transition, polarity and channel select (C parity:
+    /// slimproto.c:486-489: `fade_mode = transition_type - '0'`, `fade_secs
+    /// = transition_period`, `invert`, `channels`). A fade already armed
+    /// keeps running, as in C. Polarity and channel select take effect at
+    /// once, also on the previous track's tail still playing, as C's
     /// `output.invert` / `output.channels` globals do.
-    pub fn set_transition(&mut self, mode: FadeMode, secs: u32, invert: bool, channels: ChannelMode) {
+    pub fn set_transition(
+        &mut self,
+        mode: FadeMode,
+        secs: u32,
+        invert: bool,
+        channels: ChannelMode,
+    ) {
         self.fade.configure(mode, secs);
         self.gain_stage.invert_polarity = invert;
         self.gain_stage.channel_mode = channels;
     }
 
-    /// Decoding of the stream ended, completely or with an error (C parity: decode.c:103
-    /// `if (output.fade_mode) _checkfade(false)`): fade-out and fade-in-out arm a fade down
-    /// over the last decoded frames (output.c:311-321).
+    /// Decoding of the stream ended, completely or with an error (C parity:
+    /// decode.c:103 `if (output.fade_mode) _checkfade(false)`): fade-out
+    /// and fade-in-out arm a fade down over the last decoded frames
+    /// (output.c:311-321).
     pub fn fade_track_end(&mut self) {
         if self.fade.mode() == FadeMode::None {
             return;
         }
         let used = (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u64;
-        let _ = self.fade.check_fade(false, used, self.ring_frames(), self.boundary.next_sample_rate, self.sample_rate);
+        let _ = self.fade.check_fade(
+            false,
+            used,
+            self.ring_frames(),
+            self.boundary.next_sample_rate,
+            self.sample_rate,
+        );
     }
 
-    /// Another audio source (Bluetooth) takes the output: no LMS transition applies to it.
+    /// Another audio source (Bluetooth) takes the output: no LMS transition
+    /// applies to it.
     ///
-    /// Declared divergence (cleaner): C's Bluetooth start (decode_external.c:147-154)
-    /// flushes outputbuf with `_buf_flush`, which leaves `output.fade` and `fade_mode`
-    /// untouched, so a fade the LMS track armed can still run over the Bluetooth audio. Here
-    /// the mode is cleared (the Rust Bluetooth audio goes through a decoder and would reach
-    /// `mark_track_start`), and a fade still due or running is dropped. Polarity inversion is
-    /// a player setting and stays, as in C.
+    /// Declared divergence (cleaner): C's Bluetooth start
+    /// (decode_external.c:147-154) flushes outputbuf with `_buf_flush`,
+    /// which leaves `output.fade` and `fade_mode` untouched, so a fade the
+    /// LMS track armed can still run over the Bluetooth audio. Here
+    /// the mode is cleared (the Rust Bluetooth audio goes through a decoder and
+    /// would reach `mark_track_start`), and a fade still due or running is
+    /// dropped. Polarity inversion is a player setting and stays, as in C.
     pub fn stop_fades(&mut self) {
         self.fade.configure(FadeMode::None, 0);
         self.fade.reset();
     }
 
-    /// Another audio source (Bluetooth) takes the output: no LMS transition and no LMS replay
-    /// gain apply to it ([`Self::stop_fades`], then replay gain none).
+    /// Another audio source (Bluetooth) takes the output: no LMS transition and
+    /// no LMS replay gain apply to it ([`Self::stop_fades`], then replay
+    /// gain none).
     ///
-    /// Declared divergence (cleaner): C's Bluetooth start (decode_external.c:147-154) leaves
-    /// `output.current_replay_gain` alone, so the last LMS track's replay gain scales the
-    /// Bluetooth audio (output.c:54-55). Here both the current and the next replay gain are
-    /// cleared. Volume, polarity and channel select are player settings and stay, as in C.
+    /// Declared divergence (cleaner): C's Bluetooth start
+    /// (decode_external.c:147-154) leaves `output.current_replay_gain`
+    /// alone, so the last LMS track's replay gain scales the
+    /// Bluetooth audio (output.c:54-55). Here both the current and the next
+    /// replay gain are cleared. Volume, polarity and channel select are
+    /// player settings and stay, as in C.
     pub fn begin_external_audio(&mut self) {
         self.stop_fades();
         self.boundary.current_replay_gain = 0;
@@ -766,32 +914,37 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.boundary.marker.as_ref()
     }
 
-    /// Sets the single pending boundary, replacing (and returning) one playback has not
-    /// reached yet, as C overwrites `output.track_start`. `bytes_ahead` is cut to whole
-    /// frames within the unread output, so the boundary cannot point past the written data.
-    /// The decoder sets it by itself on the first frames of a new stream; this is for
+    /// Sets the single pending boundary, replacing (and returning) one playback
+    /// has not reached yet, as C overwrites `output.track_start`.
+    /// `bytes_ahead` is cut to whole frames within the unread output, so
+    /// the boundary cannot point past the written data. The decoder sets it
+    /// by itself on the first frames of a new stream; this is for
     /// callers that write the output ring directly.
     pub fn set_track_marker(&mut self, mut marker: TrackMarker) -> Option<TrackMarker> {
         let unread = self.output_buffer.available_read() as u64;
-        marker.bytes_ahead = marker.bytes_ahead.min(unread) / OUTPUT_FRAME_BYTES as u64 * OUTPUT_FRAME_BYTES as u64;
+        marker.bytes_ahead =
+            marker.bytes_ahead.min(unread) / OUTPUT_FRAME_BYTES as u64 * OUTPUT_FRAME_BYTES as u64;
         self.boundary.marker.replace(marker)
     }
 
-    /// The boundary playback crossed since the last call, once (C `output.track_started`,
-    /// which makes the status loop send `STMs`, `slimproto.c:851-855`).
+    /// The boundary playback crossed since the last call, once (C
+    /// `output.track_started`, which makes the status loop send `STMs`,
+    /// `slimproto.c:851-855`).
     pub fn active_marker_crossed(&mut self) -> Option<TrackMarker> {
         self.boundary.crossed.take()
     }
 
-    /// `strm s` (C `process_strm`, `slimproto.c:436-489`): the new stream's data replaces the
-    /// stream ring (C `stream_sock` flushes `streambuf`, `stream.c:624`, `stream.c:738`), the
-    /// old decoder's undelivered PCM goes with it (C `codec_open` closes the codec), and the
-    /// next track's values are stored: replay gain (C `next_replay_gain`) and output
-    /// threshold (C `output.threshold`), both C globals, so they also update a boundary still
-    /// pending. `rate_hint` is the `strm` rate, used when the decoder reports none.
+    /// `strm s` (C `process_strm`, `slimproto.c:436-489`): the new stream's
+    /// data replaces the stream ring (C `stream_sock` flushes `streambuf`,
+    /// `stream.c:624`, `stream.c:738`), the old decoder's undelivered PCM
+    /// goes with it (C `codec_open` closes the codec), and the next track's
+    /// values are stored: replay gain (C `next_replay_gain`) and output
+    /// threshold (C `output.threshold`), both C globals, so they also update a
+    /// boundary still pending. `rate_hint` is the `strm` rate, used when
+    /// the decoder reports none.
     ///
-    /// The output ring is NOT flushed: the previous track's tail keeps playing, which is how
-    /// C plays gaplessly.
+    /// The output ring is NOT flushed: the previous track's tail keeps playing,
+    /// which is how C plays gaplessly.
     pub fn begin_stream(&mut self, rate_hint: u32, replay_gain: u32, output_threshold: u8) {
         self.stream_buffer.flush();
         self.discard_decoder_backlog();
@@ -805,39 +958,44 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
     }
 
-    /// A codec was opened for a new stream (C `codec_open` sets `decode.new_stream`,
-    /// `decode.c:287`): its first decoded frames mark the next track start.
+    /// A codec was opened for a new stream (C `codec_open` sets
+    /// `decode.new_stream`, `decode.c:287`): its first decoded frames mark
+    /// the next track start.
     pub fn open_stream(&mut self) {
         self.boundary.new_stream = true;
     }
 
-    /// Drops decoded PCM not yet in the output ring and the decoder's own backlog (C has no
-    /// such buffer: its decoders write straight into `outputbuf`, so this is audio C would
-    /// not have decoded yet when the decoder stops).
+    /// Drops decoded PCM not yet in the output ring and the decoder's own
+    /// backlog (C has no such buffer: its decoders write straight into
+    /// `outputbuf`, so this is audio C would not have decoded yet when the
+    /// decoder stops).
     pub fn discard_decoder_backlog(&mut self) {
         self.decoder.flush();
         self.pcm_pending_offset = 0;
         self.pcm_pending_samples = 0;
     }
 
-    /// `strm f` (C `output_flush_streaming`, output.c:461-470): drops everything written
-    /// after the pending track start (C `writep = track_start`) and clears it. Returns
-    /// whether there was one (C "flushed"). A track already playing is never touched. A fade
-    /// due in the dropped audio is dropped too ([`FadeEngine::discard_from`]: declared
-    /// divergence, C leaves it armed).
+    /// `strm f` (C `output_flush_streaming`, output.c:461-470): drops
+    /// everything written after the pending track start (C `writep =
+    /// track_start`) and clears it. Returns whether there was one (C
+    /// "flushed"). A track already playing is never touched. A fade
+    /// due in the dropped audio is dropped too ([`FadeEngine::discard_from`]:
+    /// declared divergence, C leaves it armed).
     pub fn flush_streaming(&mut self) -> bool {
         match self.boundary.marker.take() {
             Some(marker) => {
                 let keep = usize::try_from(marker.bytes_ahead).unwrap_or(usize::MAX);
                 self.output_buffer.truncate_unread(keep);
-                self.fade.discard_from(marker.bytes_ahead / OUTPUT_FRAME_BYTES as u64);
+                self.fade
+                    .discard_from(marker.bytes_ahead / OUTPUT_FRAME_BYTES as u64);
                 true
             }
             None => false,
         }
     }
 
-    /// Consumes `frames` played frames from the output ring, keeping the boundary distance.
+    /// Consumes `frames` played frames from the output ring, keeping the
+    /// boundary distance.
     fn consume_output(&mut self, frames: usize) {
         let bytes = frames * OUTPUT_FRAME_BYTES;
         self.output_buffer.consume(bytes);
@@ -847,12 +1005,14 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.fade.advance(frames as u64);
     }
 
-    /// `strm a` (C `OUTPUT_SKIP_FRAMES`, output.c:68-82): drops up to `frames` output frames
-    /// unplayed and counts them as played. Returns the frames skipped.
+    /// `strm a` (C `OUTPUT_SKIP_FRAMES`, output.c:68-82): drops up to `frames`
+    /// output frames unplayed and counts them as played. Returns the frames
+    /// skipped.
     ///
-    /// Deliberate divergence: the skip stops at a pending track start, so the output still
-    /// processes it (`STMs`, rate, gain). C advances `readp` past `track_start` and then never
-    /// sees `track_start == readp` until the ring wraps around (output.c:72-79, 127).
+    /// Deliberate divergence: the skip stops at a pending track start, so the
+    /// output still processes it (`STMs`, rate, gain). C advances `readp`
+    /// past `track_start` and then never sees `track_start == readp` until
+    /// the ring wraps around (output.c:72-79, 127).
     pub fn skip_output_frames(&mut self, frames: u64) -> u64 {
         let mut held = (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u64;
         if let Some(marker) = self.boundary.marker {
@@ -864,12 +1024,14 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         skip
     }
 
-    /// Moves the output read position back over up to `frames` already played frames (as far
-    /// as the ring still holds them) so they play again; a pending boundary moves away by the
-    /// same amount, so it stays on the track start. Returns the frames rewound.
+    /// Moves the output read position back over up to `frames` already played
+    /// frames (as far as the ring still holds them) so they play again; a
+    /// pending boundary moves away by the same amount, so it stays on the
+    /// track start. Returns the frames rewound.
     pub fn rewind_output_frames(&mut self, frames: usize) -> usize {
         let before = self.output_buffer.available_read();
-        self.output_buffer.rewind_read(frames.saturating_mul(OUTPUT_FRAME_BYTES));
+        self.output_buffer
+            .rewind_read(frames.saturating_mul(OUTPUT_FRAME_BYTES));
         let mut rewound = self.output_buffer.available_read() - before;
         // Whole frames only: the ring may clamp to a byte count that splits a frame.
         let partial = rewound % OUTPUT_FRAME_BYTES;
@@ -884,33 +1046,36 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         rewound / OUTPUT_FRAME_BYTES
     }
 
-    /// Records the volume LMS asked for (C `set_volume`'s arguments: the `audg` gains, or
-    /// unity when `digital_atten` is 0, slimproto.c:569), whatever attenuates it: the
-    /// amplifier or [`Self::set_volume`].
+    /// Records the volume LMS asked for (C `set_volume`'s arguments: the `audg`
+    /// gains, or unity when `digital_atten` is 0, slimproto.c:569),
+    /// whatever attenuates it: the amplifier or [`Self::set_volume`].
     pub fn set_requested_volume(&mut self, left_gain: u32, right_gain: u32) {
         self.requested_volume = (left_gain, right_gain);
     }
 
-    /// The volume LMS last asked for, Q16.16 per channel, independent of whether the
-    /// amplifier or the software gain stage attenuates. C hands it to `equalizer_set_volume`
-    /// (output_embedded.c:126) so the loudness contour tracks the volume: Task 16 hooks the
-    /// loudness here.
+    /// The volume LMS last asked for, Q16.16 per channel, independent of
+    /// whether the amplifier or the software gain stage attenuates. C hands
+    /// it to `equalizer_set_volume` (output_embedded.c:126) so the loudness
+    /// contour tracks the volume: Task 16 hooks the loudness here.
     #[must_use]
     pub const fn requested_volume_q16(&self) -> (u32, u32) {
         self.requested_volume
     }
 
-    /// Sets the software volume, Q16.16 per channel (C `output.gainL` / `gainR`, set by
-    /// `set_volume` when no hardware volume handles it, output_embedded.c:118-126). It applies
-    /// from the next output chunk on, also to audio already in the output ring, as in C.
+    /// Sets the software volume, Q16.16 per channel (C `output.gainL` /
+    /// `gainR`, set by `set_volume` when no hardware volume handles it,
+    /// output_embedded.c:118-126). It applies from the next output chunk
+    /// on, also to audio already in the output ring, as in C.
     pub fn set_volume(&mut self, left_gain: u32, right_gain: u32) {
         self.gain_stage.volume_l_q16 = left_gain;
         self.gain_stage.volume_r_q16 = right_gain;
     }
 
-    /// Sets the active audio decoder. A replaced MP3 decoder is parked in [`Self::mp3_spare`]
-    /// (when the slot is free) for the next MP3 track.
+    /// Sets the active audio decoder. A replaced MP3 decoder is parked in
+    /// [`Self::mp3_spare`] (when the slot is free) for the next MP3 track.
     pub fn set_decoder(&mut self, decoder: ActiveDecoder) {
+        self.decode_us_max = 0;
+        self.decode_us_first = 0;
         if let ActiveDecoder::Mp3(previous) = core::mem::replace(&mut self.decoder, decoder) {
             if self.mp3_spare.is_none() {
                 self.mp3_spare = Some(previous);
@@ -918,9 +1083,42 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
     }
 
-    /// Makes an MP3 decoder active, reset to the start of a stream: the current one if it is
-    /// already MP3, else the parked one, else a fresh one (`std-codecs` builds). Returns `false`
-    /// when this build has no MP3 decoder available (decoder left unchanged).
+    /// Records a decode step duration in microseconds, updating first-step
+    /// and maximum-step telemetry counters.
+    pub fn record_decode_us(&mut self, elapsed_us: u32) {
+        if self.decode_us_first == 0 && elapsed_us > 0 {
+            self.decode_us_first = elapsed_us;
+        }
+        if elapsed_us > self.decode_us_max {
+            self.decode_us_max = elapsed_us;
+        }
+    }
+
+    /// Returns the maximum decode step duration in microseconds since the
+    /// current decoder was installed.
+    #[must_use]
+    pub const fn decode_us_max(&self) -> u32 {
+        self.decode_us_max
+    }
+
+    /// Returns the first non-zero decode step duration in microseconds since
+    /// the current decoder was installed.
+    #[must_use]
+    pub const fn decode_us_first(&self) -> u32 {
+        self.decode_us_first
+    }
+
+    /// Resets the decode timing telemetry counters (`decode_us_max` and
+    /// `decode_us_first`) to zero.
+    pub fn reset_decode_timing(&mut self) {
+        self.decode_us_max = 0;
+        self.decode_us_first = 0;
+    }
+
+    /// Makes an MP3 decoder active, reset to the start of a stream: the current
+    /// one if it is already MP3, else the parked one, else a fresh one
+    /// (`std-codecs` builds). Returns `false` when this build has no MP3
+    /// decoder available (decoder left unchanged).
     pub fn use_mp3_decoder(&mut self) -> bool {
         if let ActiveDecoder::Mp3(current) = &mut self.decoder {
             current.flush();
@@ -969,16 +1167,19 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.equalizer.loudness_enabled()
     }
 
-    /// Dynamically selects and instantiates the audio decoder based on the LMS format character or byte.
+    /// Dynamically selects and instantiates the audio decoder based on the LMS
+    /// format character or byte.
     ///
-    /// - `'m'` / `'M'`: MP3 (nanomp3-core)
-    /// - `'f'` / `'F'`: FLAC (claxon)
-    /// - `'a'` / `'A'`: AAC (syom)
-    /// - `'o'` / `'O'`: Ogg Vorbis (lewton)
+    /// - `'m'` / `'M'`: MP3 (`nanomp3-core`)
+    /// - `'f'` / `'F'`: FLAC (`claxon`)
+    /// - `'a'` / `'A'`: AAC (`syom`)
+    /// - `'o'` / `'O'`: Ogg Vorbis (`lewton`)
+    /// - `'l'` / `'L'`: ALAC (`alac`)
+    /// - `'u'` / `'U'`: Ogg Opus (`opus-rs`)
     /// - `'p'` / `'P'`: PCM passthrough
     ///
-    /// A codec missing from this build (MP3/AAC/Vorbis without `std-codecs`) leaves the current
-    /// decoder unchanged.
+    /// A codec missing from this build (MP3 without `std-codecs` when no static
+    /// MP3 decoder is parked) leaves the current decoder unchanged.
     pub fn select_format(&mut self, format_byte: u8) {
         let decoder = match format_byte {
             b'm' | b'M' => {
@@ -988,6 +1189,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             b'f' | b'F' => Some(ActiveDecoder::new_flac()),
             b'a' | b'A' => ActiveDecoder::new_aac(),
             b'o' | b'O' => ActiveDecoder::new_vorbis(),
+            b'l' | b'L' => Some(ActiveDecoder::new_alac()),
+            b'u' | b'U' => Some(ActiveDecoder::new_opus()),
             _ => Some(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true))),
         };
         if let Some(decoder) = decoder {
@@ -995,16 +1198,21 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
     }
 
-    /// Executes one step of the audio pipeline (alias for `process_decode_step`).
+    /// Executes one step of the audio pipeline (alias for
+    /// `process_decode_step`).
     #[inline]
     pub fn step_audio_pipeline(&mut self) -> Result<usize, DecoderError> {
         self.process_decode_step()
     }
 
-    /// Sets sample rate on pipeline and output sink now. It is also the rate a new track
-    /// whose decoder reports none starts at (external sources such as Bluetooth set it).
+    /// Sets sample rate on pipeline and output sink now. It is also the rate a
+    /// new track whose decoder reports none starts at (external sources
+    /// such as Bluetooth set it).
     pub fn set_sample_rate(&mut self, rate: u32) -> Result<(), S::Error> {
         self.sink.set_sample_rate(rate)?;
+        if self.sample_rate != rate {
+            self.equalizer.reset_history();
+        }
         self.sample_rate = rate;
         self.boundary.stream_rate_hint = rate;
         Ok(())
@@ -1020,14 +1228,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.output_buffer.available_read()
     }
 
-    /// Returns `true` if decoded PCM samples are still waiting to be drained into `output_buffer` (`COORD-504`).
+    /// Returns `true` if decoded PCM samples are still waiting to be drained
+    /// into `output_buffer` (`COORD-504`).
     pub fn has_pending_pcm(&self) -> bool {
         self.pcm_pending_samples > 0 || self.decoder.has_pending_pcm()
     }
 
-    /// Flushes both stream and output ringbuffers, clears pending PCM, and resets the decoder
-    /// state (`strm q`: C `decode_flush` + `output_flush`, output.c:440-458). The track
-    /// boundary goes too: no pending track start, no rate-change silence, `delay_active`
+    /// Flushes both stream and output ringbuffers, clears pending PCM, and
+    /// resets the decoder state (`strm q`: C `decode_flush` +
+    /// `output_flush`, output.c:440-458). The track boundary goes too: no
+    /// pending track start, no rate-change silence, `delay_active`
     /// cleared (output.c:455), and the next decoded frames start a new track.
     pub fn flush(&mut self) {
         self.stream_buffer.flush();
@@ -1047,8 +1257,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     }
 }
 
-
-/// C `rate * delay / 2000`: half of a `delay` ms rate-change silence, in frames.
+/// C `rate * delay / 2000`: half of a `delay` ms rate-change silence, in
+/// frames.
 fn delay_frames(rate: u32, delay_ms: u32) -> u32 {
     u32::try_from(u64::from(rate) * u64::from(delay_ms) / 2000).unwrap_or(u32::MAX)
 }
@@ -1080,8 +1290,7 @@ mod tests {
         let f2_r = (-2000i16).to_be_bytes();
 
         let raw_stream = [
-            f1_l[0], f1_l[1], f1_r[0], f1_r[1],
-            f2_l[0], f2_l[1], f2_r[0], f2_r[1],
+            f1_l[0], f1_l[1], f1_r[0], f1_r[1], f2_l[0], f2_l[1], f2_r[0], f2_r[1],
         ];
 
         let ingested = pipeline.ingest_stream_data(&raw_stream).unwrap();
@@ -1108,7 +1317,8 @@ mod tests {
     fn test_lossless_backpressure_draining() {
         // Stream storage large enough for 8 stereo frames of 16-bit PCM (32 bytes)
         let mut stream_storage = [0u8; 128];
-        // Output storage restricted to 32 bytes (capacity 32 -> available_write = 31 bytes -> max 3 frames = 24 bytes)
+        // Output storage restricted to 32 bytes (capacity 32 -> available_write = 31
+        // bytes -> max 3 frames = 24 bytes)
         let mut output_storage = [0u8; 32];
         let pcm_decoder = PcmDecoder::new(16, 2, true);
         let sink = MockAudioSink::<64>::new();
@@ -1140,7 +1350,7 @@ mod tests {
         let consumed = pipeline.process_decode_step().unwrap();
         assert_eq!(consumed, 32); // All stream bytes ingested by decoder
         assert_eq!(pipeline.pcm_pending_samples, 10); // 5 frames * 2 samples
-        assert_eq!(pipeline.pcm_pending_offset, 6);   // 3 frames * 2 samples
+        assert_eq!(pipeline.pcm_pending_offset, 6); // 3 frames * 2 samples
 
         // If we try to decode again immediately while output buffer is full:
         let drained_zero = pipeline.process_decode_step().unwrap();
@@ -1154,8 +1364,8 @@ mod tests {
         // Second decode step: drains up to 3 more pending frames
         let drained1 = pipeline.process_decode_step().unwrap();
         assert_eq!(drained1, 3);
-        assert_eq!(pipeline.pcm_pending_samples, 4);  // 2 frames * 2 samples remain
-        assert_eq!(pipeline.pcm_pending_offset, 12);  // 6 frames * 2 samples
+        assert_eq!(pipeline.pcm_pending_samples, 4); // 2 frames * 2 samples remain
+        assert_eq!(pipeline.pcm_pending_offset, 12); // 6 frames * 2 samples
 
         // Output step 2: drain these 3 frames to sink
         let out_frames2 = pipeline.process_output_step().unwrap();
@@ -1166,7 +1376,7 @@ mod tests {
         let drained2 = pipeline.process_decode_step().unwrap();
         assert_eq!(drained2, 2);
         assert_eq!(pipeline.pcm_pending_samples, 0); // All pending drained!
-        assert_eq!(pipeline.pcm_pending_offset, 0);  // Offset reset to 0
+        assert_eq!(pipeline.pcm_pending_offset, 0); // Offset reset to 0
 
         // Output step 3: drain final 2 frames to sink
         let out_frames3 = pipeline.process_output_step().unwrap();
@@ -1335,11 +1545,13 @@ mod tests {
 
     #[test]
     fn test_corrupted_frame_consumes_byte_and_prevents_infinite_loop() {
-        // PIPE-501: When decoder returns an error other than NeedMoreData / BufferOverflow,
-        // process_decode_step must consume at least 1 byte so the pipeline progresses.
+        // PIPE-501: When decoder returns an error other than NeedMoreData /
+        // BufferOverflow, process_decode_step must consume at least 1 byte so
+        // the pipeline progresses.
         let mut stream_storage = [0u8; 64];
         let mut output_storage = [0u8; 128];
-        // Invalid bit depth (e.g. 7 bits) causes PcmDecoder::decode to return Err(DecoderError::InvalidHeader)
+        // Invalid bit depth (e.g. 7 bits) causes PcmDecoder::decode to return
+        // Err(DecoderError::InvalidHeader)
         let bad_pcm_decoder = PcmDecoder::new(7, 2, true);
         let sink = MockAudioSink::<64>::new();
 
@@ -1351,7 +1563,9 @@ mod tests {
             44100,
         );
 
-        pipeline.ingest_stream_data(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        pipeline
+            .ingest_stream_data(&[0xAA, 0xBB, 0xCC, 0xDD])
+            .unwrap();
         assert_eq!(pipeline.stream_buffer_available(), 4);
 
         let res = pipeline.process_decode_step();
@@ -1399,8 +1613,7 @@ mod tests {
         let f2_l = (2000i16).to_le_bytes();
         let f2_r = (-2000i16).to_le_bytes();
         let pcm_data = [
-            f1_l[0], f1_l[1], f1_r[0], f1_r[1],
-            f2_l[0], f2_l[1], f2_r[0], f2_r[1],
+            f1_l[0], f1_l[1], f1_r[0], f1_r[1], f2_l[0], f2_l[1], f2_r[0], f2_r[1],
         ];
 
         let mut payload = [0u8; 52];
@@ -1412,8 +1625,9 @@ mod tests {
         assert_eq!(consumed, 52);
 
         // Task 12 (C parity): the decoder's rate is the next track's rate (C
-        // `output.next_sample_rate`, pcm.c:231-237); the clock switches when playback reaches the
-        // track start (output.c:154), not when the frames are decoded.
+        // `output.next_sample_rate`, pcm.c:231-237); the clock switches when playback
+        // reaches the track start (output.c:154), not when the frames are
+        // decoded.
         assert_eq!(pipeline.track_marker().map(|m| m.sample_rate), Some(48000));
         assert_eq!(pipeline.sink.sample_rate, 44100);
         pipeline.process_output_step().unwrap();
@@ -1467,7 +1681,10 @@ mod tests {
         assert_eq!(pipeline.eq_preset(), squeezelite_audio_core::EqPreset::Flat);
 
         pipeline.apply_eq_preset(squeezelite_audio_core::EqPreset::BassBoost);
-        assert_eq!(pipeline.eq_preset(), squeezelite_audio_core::EqPreset::BassBoost);
+        assert_eq!(
+            pipeline.eq_preset(),
+            squeezelite_audio_core::EqPreset::BassBoost
+        );
         assert!(pipeline.equalizer.is_enabled());
 
         pipeline.apply_eq_preset(squeezelite_audio_core::EqPreset::Flat);
@@ -1662,7 +1879,8 @@ mod tests {
 
     #[test]
     fn test_pipeline_flac_playback_flow() {
-        let flac_bytes = include_bytes!("../../squeezelite-decoders/tests/fixtures/stereo_16bit.flac");
+        let flac_bytes =
+            include_bytes!("../../squeezelite-decoders/tests/fixtures/stereo_16bit.flac");
         let mut stream_storage = [0u8; 16384];
         let mut output_storage = [0u8; 16384];
         let flac_decoder = squeezelite_decoders::FlacDecoder::new();
@@ -1678,7 +1896,11 @@ mod tests {
 
         let mut offset = 0;
         let mut safety_counter = 0;
-        while (offset < flac_bytes.len() || pipeline.stream_buffer_available() > 0 || pipeline.has_pending_pcm()) && safety_counter < 100_000 {
+        while (offset < flac_bytes.len()
+            || pipeline.stream_buffer_available() > 0
+            || pipeline.has_pending_pcm())
+            && safety_counter < 100_000
+        {
             safety_counter += 1;
             if offset < flac_bytes.len() {
                 if let Ok(ingested) = pipeline.ingest_stream_data(&flac_bytes[offset..]) {
@@ -1693,13 +1915,17 @@ mod tests {
             let _ = pipeline.process_output_step();
         }
 
-        assert!(pipeline.frames_played > 0, "Frames played should be > 0, got {}", pipeline.frames_played);
+        assert!(
+            pipeline.frames_played > 0,
+            "Frames played should be > 0, got {}",
+            pipeline.frames_played
+        );
         assert_eq!(pipeline.frames_played, 8820);
     }
 
-    // ---------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Task 12: gapless track boundary (C `output.track_start`, output.c:126-166)
-    // ---------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /// Sink recording every sample plus the clock rate each write was made at.
     struct RecSink {
@@ -1739,7 +1965,8 @@ mod tests {
         fn set_mute(&mut self, _muted: bool) {}
     }
 
-    /// 16-bit big-endian stereo PCM: frame `i` of `track` is (track * 1000 + i, -(track * 1000 + i)).
+    /// 16-bit big-endian stereo PCM: frame `i` of `track` is (track * 1000 + i,
+    /// -(track * 1000 + i)).
     fn track_pcm(track: i16, frames: usize) -> std::vec::Vec<u8> {
         let mut out = std::vec::Vec::new();
         for i in 0..frames as i16 {
@@ -1752,7 +1979,9 @@ mod tests {
 
     /// The left samples a track_pcm() stream decodes to.
     fn track_left(track: i16, frames: usize) -> std::vec::Vec<i32> {
-        (0..frames as i16).map(|i| i32::from(track * 1000 + i) << 16).collect()
+        (0..frames as i16)
+            .map(|i| i32::from(track * 1000 + i) << 16)
+            .collect()
     }
 
     fn left(samples: &[i32]) -> std::vec::Vec<i32> {
@@ -1760,7 +1989,13 @@ mod tests {
     }
 
     fn rec_pipeline<'a>(stream: &'a mut [u8], output: &'a mut [u8]) -> StreamPipeline<'a, RecSink> {
-        StreamPipeline::new(stream, output, ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)), RecSink::new(), 44_100)
+        StreamPipeline::new(
+            stream,
+            output,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            RecSink::new(),
+            44_100,
+        )
     }
 
     /// Ingests `bytes` and decodes until the stream ring is empty.
@@ -1778,7 +2013,9 @@ mod tests {
         p.open_stream();
     }
 
-    fn drain_output<S: AudioOutputSink>(p: &mut StreamPipeline<'_, S>) -> std::vec::Vec<Option<TrackMarker>> {
+    fn drain_output<S: AudioOutputSink>(
+        p: &mut StreamPipeline<'_, S>,
+    ) -> std::vec::Vec<Option<TrackMarker>> {
         let mut crossings = std::vec::Vec::new();
         for _ in 0..10_000 {
             let written = p.process_output_step().unwrap_or(0);
@@ -1794,17 +2031,22 @@ mod tests {
     fn test_first_frames_of_new_stream_set_boundary_at_write_position() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
         let mut p = rec_pipeline(&mut s, &mut o);
-        // C decode_init: new_stream = true, so the very first frames mark a track start.
+        // C decode_init: new_stream = true, so the very first frames mark a track
+        // start.
         feed(&mut p, &track_pcm(1, 100));
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
-        // Play 40 frames of track 1 (crossing its boundary), then the next track arrives.
+        // Play 40 frames of track 1 (crossing its boundary), then the next track
+        // arrives.
         p.process_output_step().unwrap();
         assert!(p.active_marker_crossed().is_some());
         let played = p.frames_played as usize;
         next_stream(&mut p, 44_100, 0);
         // strm s keeps the output ring (C slimproto.c:436-489 never flushes outputbuf).
         assert_eq!(p.output_buffer_available(), (100 - played) * 8);
-        assert!(p.track_marker().is_none(), "no boundary until the new decoder writes");
+        assert!(
+            p.track_marker().is_none(),
+            "no boundary until the new decoder writes"
+        );
         feed(&mut p, &track_pcm(2, 50));
         let marker = p.track_marker().copied().unwrap();
         assert_eq!(marker.bytes_ahead, ((100 - played) * 8) as u64);
@@ -1815,7 +2057,8 @@ mod tests {
     fn test_output_is_clipped_at_boundary_and_crossing_resets_frames_played() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
         let mut p = rec_pipeline(&mut s, &mut o);
-        feed(&mut p, &track_pcm(1, 70)); // 70 frames: one 64-frame step, then 6 frames up to the boundary
+        // 70 frames: one 64-frame step, then 6 frames up to the boundary
+        feed(&mut p, &track_pcm(1, 70));
         assert_eq!(p.process_output_step().unwrap(), 64);
         assert!(p.active_marker_crossed().is_some());
         next_stream(&mut p, 44_100, 0);
@@ -1824,7 +2067,8 @@ mod tests {
         assert_eq!(p.process_output_step().unwrap(), 6);
         assert!(p.active_marker_crossed().is_none());
         assert_eq!(p.frames_played, 70);
-        // The next step crosses first (frames_played = 0, C output.c:151), then plays track 2.
+        // The next step crosses first (frames_played = 0, C output.c:151), then plays
+        // track 2.
         assert_eq!(p.process_output_step().unwrap(), 10);
         assert!(p.active_marker_crossed().is_some());
         assert_eq!(p.frames_played, 10);
@@ -1860,8 +2104,9 @@ mod tests {
         assert_eq!(p.track_marker().map(|m| m.sample_rate), Some(48_000));
         let crossings = drain_output(&mut p);
         assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
-        // C output.c:138-148: current_rate * delay / 2000 silent frames at the old rate, the
-        // track start (rate switch), then next_rate * delay / 2000 at the new rate.
+        // C output.c:138-148: current_rate * delay / 2000 silent frames at the old
+        // rate, the track start (rate switch), then next_rate * delay / 2000 at
+        // the new rate.
         let first_half = 44_100 * 20 / 2000;
         let second_half = 48_000 * 20 / 2000;
         let l = left(&p.sink.samples);
@@ -1869,7 +2114,12 @@ mod tests {
         assert!(l[30..30 + first_half + second_half].iter().all(|&v| v == 0));
         assert_eq!(&l[30 + first_half + second_half..], &track_left(2, 30)[..]);
         let frames_at = |rate: u32| -> usize {
-            p.sink.writes.iter().filter(|(r, _)| *r == rate).map(|(_, n)| n).sum()
+            p.sink
+                .writes
+                .iter()
+                .filter(|(r, _)| *r == rate)
+                .map(|(_, n)| n)
+                .sum()
         };
         assert_eq!(frames_at(44_100), 30 + first_half);
         assert_eq!(frames_at(48_000), second_half + 30);
@@ -1887,12 +2137,23 @@ mod tests {
         p.process_output_step().unwrap();
         next_stream(&mut p, 48_000, 0);
         feed(&mut p, &track_pcm(2, 30));
-        assert_eq!(p.sample_rate, 44_100, "decode must not switch the clock early");
+        assert_eq!(
+            p.sample_rate, 44_100,
+            "decode must not switch the clock early"
+        );
         drain_output(&mut p);
         let mut expected = track_left(1, 30);
         expected.extend(track_left(2, 30));
         assert_eq!(left(&p.sink.samples), expected);
-        assert_eq!(p.sink.writes.iter().filter(|(r, _)| *r == 44_100).map(|(_, n)| n).sum::<usize>(), 30);
+        assert_eq!(
+            p.sink
+                .writes
+                .iter()
+                .filter(|(r, _)| *r == 44_100)
+                .map(|(_, n)| n)
+                .sum::<usize>(),
+            30
+        );
         assert_eq!(p.sample_rate, 48_000);
     }
 
@@ -1907,8 +2168,8 @@ mod tests {
         assert_eq!(p.boundary.current_replay_gain, 0x1_0000);
         next_stream(&mut p, 44_100, 0x8000);
         feed(&mut p, &track_pcm(2, 10));
-        // C slimproto.c:485 stores next_replay_gain at strm s; output.c:158-160 applies it at the
-        // boundary. Until then the playing track keeps its gain.
+        // C slimproto.c:485 stores next_replay_gain at strm s; output.c:158-160 applies
+        // it at the boundary. Until then the playing track keeps its gain.
         assert_eq!(p.boundary.next_replay_gain, 0x8000);
         assert_eq!(p.boundary.current_replay_gain, 0x1_0000);
         drain_output(&mut p);
@@ -1958,12 +2219,14 @@ mod tests {
         let first = p.track_marker().copied().unwrap();
         next_stream(&mut p, 44_100, 0);
         feed(&mut p, &track_pcm(3, 20));
-        // One slot (C output.track_start): the newer track start replaces the unreached one.
+        // One slot (C output.track_start): the newer track start replaces the unreached
+        // one.
         let second = p.track_marker().copied().unwrap();
         assert_eq!(second.bytes_ahead, first.bytes_ahead + 20 * 8);
         let crossings = drain_output(&mut p);
         assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
-        // strm s never flushes outputbuf: track 2's decoded part still plays (C), then track 3.
+        // strm s never flushes outputbuf: track 2's decoded part still plays (C), then
+        // track 3.
         let mut expected = track_left(1, 100);
         expected.extend(track_left(2, 20));
         expected.extend(track_left(3, 20));
@@ -1978,7 +2241,12 @@ mod tests {
         p.boundary.new_stream = false;
         feed(&mut p, &track_pcm(1, 10));
         assert!(p.track_marker().is_none());
-        let m = |bytes_ahead| TrackMarker { bytes_ahead, sample_rate: 48_000, replay_gain: 0, output_threshold_frames: 0 };
+        let m = |bytes_ahead| TrackMarker {
+            bytes_ahead,
+            sample_rate: 48_000,
+            replay_gain: 0,
+            output_threshold_frames: 0,
+        };
         assert_eq!(p.set_track_marker(m(40)), None);
         // A second one replaces the first (C overwrites output.track_start).
         assert_eq!(p.set_track_marker(m(1_000)), Some(m(40)));
@@ -1997,10 +2265,12 @@ mod tests {
         assert!(p.active_marker_crossed().is_some());
         next_stream(&mut p, 44_100, 0);
         feed(&mut p, &track_pcm(2, 10));
-        // Rewinding replays 16 already-played frames: the boundary moves 16 frames further away.
+        // Rewinding replays 16 already-played frames: the boundary moves 16 frames
+        // further away.
         assert_eq!(p.rewind_output_frames(16), 16);
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some((36 + 16) * 8));
-        // A skip stops at the boundary, so the track start is still processed by the output.
+        // A skip stops at the boundary, so the track start is still processed by the
+        // output.
         assert_eq!(p.skip_output_frames(1_000), 52);
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
         assert_eq!(p.process_output_step().unwrap(), 10);
@@ -2008,13 +2278,14 @@ mod tests {
         assert_eq!(&left(&p.sink.samples)[64..], &track_left(2, 10)[..]);
     }
 
-    // ---------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Task 13: fades and crossfade (C output.c:174-252, :288-345)
-    // ---------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     use squeezelite_audio_core::fade::{gain, to_gain, FadeDir, FadeState, FIXED_ONE};
 
-    /// Both samples of frames `range` of a `track_pcm(track, ..)` stream, each scaled by `g`.
+    /// Both samples of frames `range` of a `track_pcm(track, ..)` stream, each
+    /// scaled by `g`.
     fn scaled(track: i16, range: core::ops::Range<usize>, g: i32) -> std::vec::Vec<i32> {
         range
             .flat_map(|i| {
@@ -2024,8 +2295,16 @@ mod tests {
             .collect()
     }
 
-    /// `strm s` with a transition. Tests run at a 100 Hz "rate", so one second is 100 frames.
-    fn next_stream_with(p: &mut StreamPipeline<'_, RecSink>, rate: u32, rg: u32, mode: FadeMode, secs: u32, invert: bool) {
+    /// `strm s` with a transition. Tests run at a 100 Hz "rate", so one second
+    /// is 100 frames.
+    fn next_stream_with(
+        p: &mut StreamPipeline<'_, RecSink>,
+        rate: u32,
+        rg: u32,
+        mode: FadeMode,
+        secs: u32,
+        invert: bool,
+    ) {
         next_stream(p, rate, rg);
         p.set_transition(mode, secs, invert, ChannelMode::Stereo);
     }
@@ -2038,11 +2317,15 @@ mod tests {
     fn test_inout_on_empty_buffer_fades_up() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
-        // INOUT, 2 s at 100 Hz: 100 frames each way (output.c:292-296). The buffer is empty,
-        // so the first frames fade up from the write position (output.c:298-309).
+        // INOUT, 2 s at 100 Hz: 100 frames each way (output.c:292-296). The buffer is
+        // empty, so the first frames fade up from the write position
+        // (output.c:298-309).
         next_stream_with(&mut p, 100, 0, FadeMode::InOut, 2, false);
         feed(&mut p, &track_pcm(1, 300));
-        assert_eq!((p.fade.state(), p.fade.dir(), p.fade.duration_frames()), (FadeState::Due, FadeDir::Up, 100));
+        assert_eq!(
+            (p.fade.state(), p.fade.dir(), p.fade.duration_frames()),
+            (FadeState::Due, FadeDir::Up, 100)
+        );
         drain_output(&mut p);
         let mut expected = scaled(1, 0..64, 0);
         expected.extend(scaled(1, 64..100, to_gain(0.64)));
@@ -2064,7 +2347,10 @@ mod tests {
         // Decode complete (C decode.c:103 `_checkfade(false)`): fade down over the last
         // 100 frames before the write position (output.c:311-321).
         p.fade_track_end();
-        assert_eq!((p.fade.state(), p.fade.dir(), p.fade.start_ahead()), (FadeState::Due, FadeDir::Down, 100));
+        assert_eq!(
+            (p.fade.state(), p.fade.dir(), p.fade.start_ahead()),
+            (FadeState::Due, FadeDir::Down, 100)
+        );
         // The next track: INOUT on a non-empty buffer arms nothing at its start.
         next_stream_with(&mut p, 100, 0, FadeMode::InOut, 2, false);
         feed(&mut p, &track_pcm(2, 300));
@@ -2076,16 +2362,21 @@ mod tests {
         expected.extend(scaled(1, 100..200, FIXED_ONE));
         expected.extend(scaled(1, 200..264, FIXED_ONE));
         expected.extend(scaled(1, 264..300, to_gain(0.36)));
-        // Down complete at the track start: up over the same duration (output.c:186-193).
+        // Down complete at the track start: up over the same duration
+        // (output.c:186-193).
         expected.extend(scaled(2, 0..64, 0));
         expected.extend(scaled(2, 64..100, to_gain(0.64)));
         expected.extend(scaled(2, 100..300, FIXED_ONE));
         assert_eq!(p.sink.samples, expected);
-        assert_eq!(write_sizes(&p), [64, 36, 64, 36, 64, 36, 64, 36, 64, 64, 64, 8]);
+        assert_eq!(
+            write_sizes(&p),
+            [64, 36, 64, 36, 64, 36, 64, 36, 64, 64, 64, 8]
+        );
     }
 
-    /// Track 1 (300 frames, crossed after one 64-frame step), then track 2 with `t2_frames`
-    /// and replay gain 0x8000, at `rate1` / `rate2`, both with a 1 s crossfade.
+    /// Track 1 (300 frames, crossed after one 64-frame step), then track 2 with
+    /// `t2_frames` and replay gain 0x8000, at `rate1` / `rate2`, both with
+    /// a 1 s crossfade.
     fn crossfade_setup<'a>(
         s: &'a mut [u8],
         o: &'a mut [u8],
@@ -2096,7 +2387,11 @@ mod tests {
         let mut p = rec_pipeline(s, o);
         next_stream_with(&mut p, rate1, 0, FadeMode::Cross, 1, false);
         feed(&mut p, &track_pcm(1, 300));
-        assert_eq!(p.fade.state(), FadeState::Inactive, "nothing to crossfade from");
+        assert_eq!(
+            p.fade.state(),
+            FadeState::Inactive,
+            "nothing to crossfade from"
+        );
         assert_eq!(p.process_output_step().unwrap(), 64);
         assert!(p.active_marker_crossed().is_some());
         next_stream_with(&mut p, rate2, 0x8000, FadeMode::Cross, 1, false);
@@ -2108,10 +2403,13 @@ mod tests {
     fn test_crossfade_skips_dur_of_new_track_on_completion() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = crossfade_setup(&mut s, &mut o, 100, 100, 400);
-        // C output.c:328-339: 100 frames over the old track's last 236; the track start moves
-        // to the fade start.
+        // C output.c:328-339: 100 frames over the old track's last 236; the track start
+        // moves to the fade start.
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(136 * 8));
-        assert_eq!((p.fade.state(), p.fade.dir(), p.fade.duration_frames()), (FadeState::Due, FadeDir::Cross, 100));
+        assert_eq!(
+            (p.fade.state(), p.fade.dir(), p.fade.duration_frames()),
+            (FadeState::Due, FadeDir::Cross, 100)
+        );
         let mut crossings = std::vec::Vec::new();
         for _ in 0..100 {
             let n = p.process_output_step().unwrap();
@@ -2125,25 +2423,37 @@ mod tests {
             }
         }
         assert_eq!(crossings, [200], "STMs at the fade start");
-        // Old tail plain up to the fade start, then old x (1 - in) + new x in x next replay
-        // gain, per chunk (output.c:231-246), then the new track from dur_f on.
+        // Old tail plain up to the fade start, then old x (1 - in) + new x in x next
+        // replay gain, per chunk (output.c:231-246), then the new track from
+        // dur_f on.
         let mut expected = scaled(1, 0..200, FIXED_ONE);
         for (start, len) in [(0usize, 64usize), (64, 36)] {
             let gin = to_gain(start as f32 / 100.0);
             let (gout, gin) = (FIXED_ONE - gin, gain(gin, 0x8000));
             let old = scaled(1, 200 + start..200 + start + len, FIXED_ONE);
             let new = scaled(2, start..start + len, FIXED_ONE);
-            expected.extend(old.iter().zip(&new).map(|(&a, &b)| gain(gout, a).saturating_add(gain(gin, b))));
+            expected.extend(
+                old.iter()
+                    .zip(&new)
+                    .map(|(&a, &b)| gain(gout, a).saturating_add(gain(gin, b))),
+            );
         }
-        // Task 14: after the crossfade the new track's replay gain applies to all its output
-        // (C output.c:54-55), continuous with its weight inside the mix.
+        // Task 14: after the crossfade the new track's replay gain applies to all its
+        // output (C output.c:54-55), continuous with its weight inside the mix.
         expected.extend(scaled(2, 100..400, 0x8000));
-        assert_eq!(p.sink.samples.len(), expected.len(), "300 + 400 - 100 frames: none missing, none twice");
+        assert_eq!(
+            p.sink.samples.len(),
+            expected.len(),
+            "300 + 400 - 100 frames: none missing, none twice"
+        );
         assert_eq!(p.sink.samples, expected);
         // The first chunk is all old track (in = 0).
-        assert_eq!(&p.sink.samples[400..528], &scaled(1, 200..264, FIXED_ONE)[..]);
-        // Completion: the new replay gain is current (output.c:203); the skipped frames are not
-        // counted as played (output.c:199).
+        assert_eq!(
+            &p.sink.samples[400..528],
+            &scaled(1, 200..264, FIXED_ONE)[..]
+        );
+        // Completion: the new replay gain is current (output.c:203); the skipped frames
+        // are not counted as played (output.c:199).
         assert_eq!(p.boundary.current_replay_gain, 0x8000);
         assert_eq!(p.frames_played, 400);
         assert_eq!(p.output_buffer_available(), 0);
@@ -2171,10 +2481,15 @@ mod tests {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = crossfade_setup(&mut s, &mut o, 100, 200, 400);
         assert_eq!(p.fade.state(), FadeState::Inactive);
-        assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(236 * 8), "boundary unchanged");
+        assert_eq!(
+            p.track_marker().map(|m| m.bytes_ahead),
+            Some(236 * 8),
+            "boundary unchanged"
+        );
         drain_output(&mut p);
         let mut expected = scaled(1, 0..300, FIXED_ONE);
-        // Task 14: track 2's replay gain 0x8000 applies from its start (C output.c:54-55, 158).
+        // Task 14: track 2's replay gain 0x8000 applies from its start (C
+        // output.c:54-55, 158).
         expected.extend(scaled(2, 0..400, 0x8000));
         assert_eq!(p.sink.samples, expected);
         assert_eq!(p.sink.rate_changes, [100, 200]);
@@ -2243,13 +2558,16 @@ mod tests {
         assert_eq!(p.fade.state(), FadeState::Inactive);
     }
 
-    // ---- Task 14: composite gain stage ------------------------------------------------------
+    // ---- Task 14: composite gain stage
+    // ------------------------------------------------------
 
-    /// 16-bit big-endian stereo PCM of a sine: `amp * sin(2 pi i / period)` on both channels.
+    /// 16-bit big-endian stereo PCM of a sine: `amp * sin(2 pi i / period)` on
+    /// both channels.
     fn sine_pcm(frames: usize, period: usize, amp: f64) -> std::vec::Vec<u8> {
         let mut out = std::vec::Vec::new();
         for i in 0..frames {
-            let v = (amp * (2.0 * core::f64::consts::PI * i as f64 / period as f64).sin()).round() as i16;
+            let v = (amp * (2.0 * core::f64::consts::PI * i as f64 / period as f64).sin()).round()
+                as i16;
             out.extend_from_slice(&v.to_be_bytes());
             out.extend_from_slice(&v.to_be_bytes());
         }
@@ -2258,8 +2576,9 @@ mod tests {
 
     #[test]
     fn test_volume_applies_at_output_to_buffered_audio() {
-        // C applies output.gainL/R when frames are played (output.c:54, output_i2s.c:510), so
-        // a volume change reaches audio already in the output ring.
+        // C applies output.gainL/R when frames are played (output.c:54,
+        // output_i2s.c:510), so a volume change reaches audio already in the
+        // output ring.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         next_stream(&mut p, 100, 0);
@@ -2277,8 +2596,9 @@ mod tests {
 
     #[test]
     fn test_replay_gain_applies_to_all_output_composed_with_volume() {
-        // C output.c:54-55: gainL = gain(output.gainL, current_replay_gain), one composed
-        // gain per channel; the brief's fixture: volume 0.5 x replay gain 2.0 = unity.
+        // C output.c:54-55: gainL = gain(output.gainL, current_replay_gain), one
+        // composed gain per channel; the brief's fixture: volume 0.5 x replay
+        // gain 2.0 = unity.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         p.set_volume(0x8000, 0x8000);
@@ -2302,14 +2622,17 @@ mod tests {
 
     #[test]
     fn test_gain_change_during_fade_preserves_fade_progress() {
-        // Review Focus #3. Fade in over 128 frames (64 Hz, 2 s); the first 64-frame chunk
-        // leaves the fade at 50 %.
+        // Review Focus #3. Fade in over 128 frames (64 Hz, 2 s); the first 64-frame
+        // chunk leaves the fade at 50 %.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         next_stream_with(&mut p, 64, 0, FadeMode::In, 2, false);
         feed(&mut p, &track_pcm(1, 300));
         assert_eq!(p.process_output_step().unwrap(), 64);
-        assert_eq!((p.fade.state(), p.fade.duration_frames()), (FadeState::Active, 128));
+        assert_eq!(
+            (p.fade.state(), p.fade.duration_frames()),
+            (FadeState::Active, 128)
+        );
         let fade_before = p.fade;
         // Volume change mid-fade: the fade's position, length and gain are untouched.
         p.set_volume(0x8000, 0x8000);
@@ -2317,9 +2640,12 @@ mod tests {
         assert_eq!(p.process_output_step().unwrap(), 64);
         // The chunk reflects both: fade 50 % x volume 50 % (output.c:54, :226-228).
         assert_eq!(p.gain_stage.fade_q16, 0x8000);
-        assert_eq!(&p.sink.samples[128..256], &scaled(1, 64..128, gain(0x8000, 0x8000))[..]);
-        // Another change at the last fade frame changes nothing in the fade either; it ends on
-        // schedule (no restart, no jump to unity).
+        assert_eq!(
+            &p.sink.samples[128..256],
+            &scaled(1, 64..128, gain(0x8000, 0x8000))[..]
+        );
+        // Another change at the last fade frame changes nothing in the fade either; it
+        // ends on schedule (no restart, no jump to unity).
         p.set_volume(0x1_0000, 0x1_0000);
         drain_output(&mut p);
         assert_eq!(p.fade.state(), FadeState::Inactive);
@@ -2332,8 +2658,9 @@ mod tests {
 
     #[test]
     fn test_invert_with_volume_replay_gain_and_fade_negates_once() {
-        // C output.c:54-57 then :224-226; the inversion is applied exactly once under the fade
-        // (declared divergence from C's second negation, ruled in Task 13).
+        // C output.c:54-57 then :224-226; the inversion is applied exactly once under
+        // the fade (declared divergence from C's second negation, ruled in Task
+        // 13).
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         p.set_volume(0x8000, 0x8000);
@@ -2345,8 +2672,8 @@ mod tests {
         expected.extend(scaled(1, 64..100, gain(standard, to_gain(0.64))));
         expected.extend(scaled(1, 100..200, standard));
         assert_eq!(p.sink.samples, expected);
-        // Inverted before, during and after the fade: left samples (positive in the source)
-        // are never positive.
+        // Inverted before, during and after the fade: left samples (positive in the
+        // source) are never positive.
         assert!(left(&p.sink.samples).iter().all(|&v| v <= 0));
         assert!(left(&p.sink.samples[128..]).iter().all(|&v| v < 0));
     }
@@ -2363,7 +2690,12 @@ mod tests {
                 ChannelMode::Stereo => (l, r),
             }
         };
-        for mode in [ChannelMode::LeftOnly, ChannelMode::RightOnly, ChannelMode::MonoMix, ChannelMode::Stereo] {
+        for mode in [
+            ChannelMode::LeftOnly,
+            ChannelMode::RightOnly,
+            ChannelMode::MonoMix,
+            ChannelMode::Stereo,
+        ] {
             let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
             let mut p = rec_pipeline(&mut s, &mut o);
             p.set_volume(0x8000, 0x4000);
@@ -2382,10 +2714,17 @@ mod tests {
         }
     }
 
-    /// Track 1 (300 frames, replay gain `rg1`) crossed after one 64-frame step, then track 2
-    /// (400 frames, `rg2`) with a 1 s crossfade at 100 Hz: the mix spans track 1's frames
-    /// 200..300 and track 2's 0..100.
-    fn crossfade_rg<'a>(s: &'a mut [u8], o: &'a mut [u8], rg1: u32, rg2: u32, t1: &[u8], t2: &[u8]) -> StreamPipeline<'a, RecSink> {
+    /// Track 1 (300 frames, replay gain `rg1`) crossed after one 64-frame step,
+    /// then track 2 (400 frames, `rg2`) with a 1 s crossfade at 100 Hz: the
+    /// mix spans track 1's frames 200..300 and track 2's 0..100.
+    fn crossfade_rg<'a>(
+        s: &'a mut [u8],
+        o: &'a mut [u8],
+        rg1: u32,
+        rg2: u32,
+        t1: &[u8],
+        t2: &[u8],
+    ) -> StreamPipeline<'a, RecSink> {
         let mut p = rec_pipeline(s, o);
         next_stream_with(&mut p, 100, rg1, FadeMode::Cross, 1, false);
         feed(&mut p, t1);
@@ -2393,20 +2732,31 @@ mod tests {
         assert!(p.active_marker_crossed().is_some());
         next_stream_with(&mut p, 100, rg2, FadeMode::Cross, 1, false);
         feed(&mut p, t2);
-        assert_eq!((p.fade.state(), p.fade.dir()), (FadeState::Due, FadeDir::Cross));
+        assert_eq!(
+            (p.fade.state(), p.fade.dir()),
+            (FadeState::Due, FadeDir::Cross)
+        );
         p
     }
 
     #[test]
     fn test_crossfade_applies_replay_gain_once() {
-        // Inside a crossfade C's standard gain is the plain volume (output.c:243-245) and each
-        // weight carries its track's replay gain (:234-239): replay gain is never doubled.
+        // Inside a crossfade C's standard gain is the plain volume (output.c:243-245)
+        // and each weight carries its track's replay gain (:234-239): replay
+        // gain is never doubled.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
-        let mut p = crossfade_rg(&mut s, &mut o, 0x8000, 0xC000, &track_pcm(1, 300), &track_pcm(2, 400));
+        let mut p = crossfade_rg(
+            &mut s,
+            &mut o,
+            0x8000,
+            0xC000,
+            &track_pcm(1, 300),
+            &track_pcm(2, 400),
+        );
         p.set_volume(0x8000, 0x8000);
         drain_output(&mut p);
-        // Before the fade: volume x track 1's replay gain (the first 64 frames were played at
-        // unity volume, before set_volume).
+        // Before the fade: volume x track 1's replay gain (the first 64 frames were
+        // played at unity volume, before set_volume).
         let mut expected = scaled(1, 0..64, gain(FIXED_ONE, 0x8000));
         expected.extend(scaled(1, 64..200, gain(0x8000, 0x8000)));
         for (start, len) in [(0usize, 64usize), (64, 36)] {
@@ -2415,23 +2765,32 @@ mod tests {
             let old = scaled(1, 200 + start..200 + start + len, FIXED_ONE);
             let new = scaled(2, start..start + len, FIXED_ONE);
             // Mix with the weights, then the volume alone.
-            expected.extend(old.iter().zip(&new).map(|(&a, &b)| gain(0x8000, gain(gout, a).saturating_add(gain(gin, b)))));
+            expected.extend(
+                old.iter()
+                    .zip(&new)
+                    .map(|(&a, &b)| gain(0x8000, gain(gout, a).saturating_add(gain(gin, b)))),
+            );
         }
         expected.extend(scaled(2, 100..400, gain(0x8000, 0xC000)));
         assert_eq!(p.sink.samples, expected);
         assert_eq!(p.boundary.current_replay_gain, 0xC000);
-        // The first mixed chunk (in = 0) equals the old track at volume x replay gain within
-        // the truncation of the two-step product, not volume x replay gain squared.
+        // The first mixed chunk (in = 0) equals the old track at volume x replay gain
+        // within the truncation of the two-step product, not volume x replay
+        // gain squared.
         let first_mixed = &p.sink.samples[400..402];
         let v = i32::from(1200i16) << 16;
-        assert!((first_mixed[0] - gain(gain(0x8000, 0x8000), v)).abs() <= 2, "{first_mixed:?}");
+        assert!(
+            (first_mixed[0] - gain(gain(0x8000, 0x8000), v)).abs() <= 2,
+            "{first_mixed:?}"
+        );
     }
 
     #[test]
     fn test_crossfade_edges_keep_constant_level_with_replay_gain() {
-        // A constant-level sine through a crossfade between two tracks with the same replay
-        // gain (0.5): the level must not step at either edge. The period (20 frames) divides
-        // the fade start (200), so old and new samples are in phase inside the mix.
+        // A constant-level sine through a crossfade between two tracks with the same
+        // replay gain (0.5): the level must not step at either edge. The period
+        // (20 frames) divides the fade start (200), so old and new samples are
+        // in phase inside the mix.
         const AMP: f64 = 20_000.0;
         let (t1, t2) = (sine_pcm(300, 20, AMP), sine_pcm(400, 20, AMP));
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
@@ -2439,18 +2798,29 @@ mod tests {
         drain_output(&mut p);
         let out = left(&p.sink.samples);
         assert_eq!(out.len(), 600);
-        // Every frame: half the source level (2^16 scale), to within the Q16 truncations.
-        let ideal = |i: usize| 0.5 * 65536.0 * (AMP * (2.0 * core::f64::consts::PI * i as f64 / 20.0).sin()).round();
+        // Every frame: half the source level (2^16 scale), to within the Q16
+        // truncations.
+        let ideal = |i: usize| {
+            0.5 * 65536.0 * (AMP * (2.0 * core::f64::consts::PI * i as f64 / 20.0).sin()).round()
+        };
         let tolerance = 65536.0 * AMP * 4.0 / 65536.0 + 4.0;
         for (i, &v) in out.iter().enumerate() {
-            assert!((f64::from(v) - ideal(i)).abs() <= tolerance, "frame {i}: {v} vs {}", ideal(i));
+            assert!(
+                (f64::from(v) - ideal(i)).abs() <= tolerance,
+                "frame {i}: {v} vs {}",
+                ideal(i)
+            );
         }
         // Peak level just before each edge, inside and just after: equal.
-        let peak = |r: core::ops::Range<usize>| out[r].iter().map(|v| v.unsigned_abs()).max().unwrap();
+        let peak =
+            |r: core::ops::Range<usize>| out[r].iter().map(|v| v.unsigned_abs()).max().unwrap();
         let (before, inside, after) = (peak(180..200), peak(240..260), peak(300..320));
         let full = (AMP * 65536.0 * 0.5) as u32;
         for (name, level) in [("before", before), ("inside", inside), ("after", after)] {
-            assert!(level.abs_diff(full) <= full / 1000, "{name}: {level} vs {full}");
+            assert!(
+                level.abs_diff(full) <= full / 1000,
+                "{name}: {level} vs {full}"
+            );
         }
     }
 
@@ -2469,10 +2839,55 @@ mod tests {
         assert_eq!(p.boundary.current_replay_gain, 0x2_0000);
         assert_eq!(p.track_marker().map(|m| m.replay_gain), Some(0x3000));
         p.begin_external_audio();
-        assert_eq!((p.boundary.current_replay_gain, p.boundary.next_replay_gain), (0, 0));
+        assert_eq!(
+            (p.boundary.current_replay_gain, p.boundary.next_replay_gain),
+            (0, 0)
+        );
         assert_eq!(p.track_marker().map(|m| m.replay_gain), Some(0));
-        assert_eq!((p.fade.mode(), p.fade.state()), (FadeMode::None, FadeState::Inactive));
+        assert_eq!(
+            (p.fade.mode(), p.fade.state()),
+            (FadeMode::None, FadeState::Inactive)
+        );
         // Volume and polarity are player settings (C keeps output.gainL/R and invert).
-        assert_eq!((p.gain_stage.volume_l_q16, p.gain_stage.invert_polarity), (0x8000, true));
+        assert_eq!(
+            (p.gain_stage.volume_l_q16, p.gain_stage.invert_polarity),
+            (0x8000, true)
+        );
+    }
+
+    #[test]
+    fn test_decode_timing_telemetry_and_select_format_all_codecs() {
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        assert_eq!(p.decode_us_first(), 0);
+        assert_eq!(p.decode_us_max(), 0);
+
+        p.record_decode_us(0);
+        assert_eq!(p.decode_us_first(), 0);
+        p.record_decode_us(120);
+        assert_eq!(p.decode_us_first(), 120);
+        assert_eq!(p.decode_us_max(), 120);
+        p.record_decode_us(450);
+        assert_eq!(p.decode_us_first(), 120);
+        assert_eq!(p.decode_us_max(), 450);
+        p.record_decode_us(200);
+        assert_eq!(p.decode_us_max(), 450);
+
+        p.reset_decode_timing();
+        assert_eq!(p.decode_us_first(), 0);
+        assert_eq!(p.decode_us_max(), 0);
+
+        p.record_decode_us(300);
+        p.select_format(b'a');
+        assert!(matches!(p.decoder, ActiveDecoder::Aac(_)));
+        assert_eq!(p.decode_us_max(), 0);
+        p.select_format(b'o');
+        assert!(matches!(p.decoder, ActiveDecoder::Vorbis(_)));
+        p.select_format(b'l');
+        assert!(matches!(p.decoder, ActiveDecoder::Alac(_)));
+        p.select_format(b'u');
+        assert!(matches!(p.decoder, ActiveDecoder::Opus(_)));
+        p.select_format(b'f');
+        assert!(matches!(p.decoder, ActiveDecoder::Flac(_)));
     }
 }

@@ -8,6 +8,8 @@ members = [
     "crates/squeezelite-config",
     "crates/louder-esp32-app",
     "crates/cyd-controller-app",
+    "crates/squeezelite-raop",
+    "crates/squeezelite-cspot",
 ]
 resolver = "2"
 
@@ -25,6 +27,13 @@ thiserror = { version = "1.0", default-features = false }
 log = { version = "0.4", default-features = false }
 proptest = "1.5"
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+borrowed_box = "deny"
+ptr_arg = "deny"
+
 [profile.release]
 opt-level = 2
 lto = false
@@ -34,4 +43,8 @@ panic = "abort"
 [patch.crates-io]
 nanomp3-core = { path = "crates/nanomp3-core" }
 esp-radio = { path = "vendor/esp-radio" }
+syom = { path = "vendor/syom" }
+lewton = { path = "vendor/lewton" }
+alac = { path = "vendor/alac" }
+opus-rs = { path = "vendor/opus-rs" }
 

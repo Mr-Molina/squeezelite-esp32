@@ -3,32 +3,53 @@
 //! Verifies zero-panic guarantees and mathematical parsing invariants across
 //! arbitrary adversarial byte sequences and mutated packets.
 
-use proptest::prelude::*;
-use squeezelite_proto::*;
+use proptest::prelude::any;
+use proptest::prelude::prop_assert;
+use proptest::prelude::prop_assert_eq;
+use proptest::prelude::ProptestConfig;
+use proptest::proptest;
+use squeezelite_proto::AudioFormat;
+use squeezelite_proto::DiscoveryParser;
+use squeezelite_proto::ParseError;
+use squeezelite_proto::ServerCommand;
+use squeezelite_proto::SlimprotoBuilder;
+use squeezelite_proto::SlimprotoParser;
+use squeezelite_proto::StatEvent;
+use squeezelite_proto::StreamCommandType;
+use squeezelite_proto::sample_rate_from_index;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    /// Invariant: `SlimprotoParser::parse_frame` must NEVER panic on arbitrary byte sequences.
-    /// If it returns `Ok((_, consumed))`, then `consumed <= buf.len()` and `consumed >= 6`.
+    /// Invariant: `SlimprotoParser::parse_frame` must NEVER panic on
+    /// arbitrary byte sequences. If it returns `Ok((_, consumed))`,
+    /// then `consumed <= buf.len()` and `consumed >= 6`.
     #[test]
     fn fuzz_parse_frame_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..2048)) {
         match SlimprotoParser::parse_frame(&data) {
             Ok((_cmd, consumed)) => {
-                prop_assert!(consumed <= data.len(), "Consumed {} > total {}", consumed, data.len());
+                prop_assert!(
+                    consumed <= data.len(),
+                    "Consumed {} > total {}",
+                    consumed,
+                    data.len()
+                );
                 prop_assert!(consumed >= 6, "Consumed {} < min header size 6", consumed);
             }
             Err(e) => {
                 // Must be one of the bounded parse errors
                 prop_assert!(matches!(
                     e,
-                    ParseError::BufferTooShort | ParseError::PayloadTooLarge | ParseError::InvalidFormat
+                    ParseError::BufferTooShort
+                        | ParseError::PayloadTooLarge
+                        | ParseError::InvalidFormat
                 ));
             }
         }
     }
 
-    /// Invariant: `SlimprotoParser::parse_frame` on mutated `strm` packets must never panic.
+    /// Invariant: `SlimprotoParser::parse_frame` on mutated `strm` packets
+    /// must never panic.
     #[test]
     fn fuzz_parse_mutated_strm_frame(
         cmd_byte in any::<u8>(),
@@ -96,7 +117,13 @@ proptest! {
                 ..
             } => {
                 prop_assert_eq!(command, StreamCommandType::from_byte(cmd_byte));
-                prop_assert_eq!(autostart, autostart_byte == b'1' || autostart_byte == b'3');
+                prop_assert_eq!(
+                    autostart,
+                    autostart_byte == b'1'
+                        || autostart_byte == b'3'
+                        || autostart_byte == 1
+                        || autostart_byte == 3
+                );
                 prop_assert_eq!(format, AudioFormat::from_byte(format_byte));
                 prop_assert_eq!(t_kb, threshold_kb % 256);
                 prop_assert_eq!(port, server_port);
@@ -107,7 +134,8 @@ proptest! {
         }
     }
 
-    /// Invariant: `SlimprotoParser::parse_frame` on mutated `audg` packets must never panic.
+    /// Invariant: `SlimprotoParser::parse_frame` on mutated `audg` packets
+    /// must never panic.
     #[test]
     fn fuzz_parse_mutated_audg_frame(
         gain_l in any::<u32>(),
@@ -148,16 +176,20 @@ proptest! {
         }
     }
 
-    /// Invariant: `DiscoveryParser::parse_response` must never panic on arbitrary byte sequences.
+    /// Invariant: `DiscoveryParser::parse_response` must never panic on
+    /// arbitrary byte sequences.
     #[test]
-    fn fuzz_discovery_parser_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
+    fn fuzz_discovery_parser_arbitrary_bytes(
+        data in proptest::collection::vec(any::<u8>(), 0..1024),
+    ) {
         let res = DiscoveryParser::parse_response(&data);
         if data.is_empty() || data[0] != b'E' {
             prop_assert!(res.is_none());
         }
     }
 
-    /// Invariant: `SlimprotoBuilder::build_stat` must always produce a 61-byte packet starting with STAT.
+    /// Invariant: `SlimprotoBuilder::build_stat` must always produce a
+    /// 61-byte packet starting with STAT.
     #[test]
     fn fuzz_stat_builder_soundness(
         event_code in 0..9u8,
@@ -197,14 +229,23 @@ proptest! {
         prop_assert_eq!(u32::from_be_bytes([out[33], out[34], out[35], out[36]]), ts);
         prop_assert_eq!(u32::from_be_bytes([out[37], out[38], out[39], out[40]]), 65536);
         prop_assert_eq!(u32::from_be_bytes([out[41], out[42], out[43], out[44]]), output_buf);
-        prop_assert_eq!(u32::from_be_bytes([out[45], out[46], out[47], out[48]]), ts / 1000);
+        let expected_seconds = frames / 44_100;
+        let expected_ms = ((frames as u64 * 1000) / 44_100) as u32;
+        prop_assert_eq!(
+            u32::from_be_bytes([out[45], out[46], out[47], out[48]]),
+            expected_seconds
+        );
         prop_assert_eq!(u16::from_be_bytes([out[49], out[50]]), 0);
-        prop_assert_eq!(u32::from_be_bytes([out[51], out[52], out[53], out[54]]), ts);
+        prop_assert_eq!(
+            u32::from_be_bytes([out[51], out[52], out[53], out[54]]),
+            expected_ms
+        );
         prop_assert_eq!(u32::from_be_bytes([out[55], out[56], out[57], out[58]]), 0);
         prop_assert_eq!(u16::from_be_bytes([out[59], out[60]]), 0);
     }
 
-    /// Invariant: `sample_rate_from_index` must return a non-zero, standard audio frequency for all u8 inputs.
+    /// Invariant: `sample_rate_from_index` must return a non-zero, standard
+    /// audio frequency for all u8 inputs.
     #[test]
     fn fuzz_sample_rate_all_indices(index in any::<u8>()) {
         let rate = sample_rate_from_index(index);
@@ -229,7 +270,8 @@ proptest! {
         prop_assert_eq!(cmd, ServerCommand::Body { data: &data });
     }
 
-    /// Invariant: Discovery parser handles both 1-byte TLV and null-terminated strings for valid ports.
+    /// Invariant: Discovery parser handles 1-byte TLV and null-terminated
+    /// strings for valid ports.
     #[test]
     fn fuzz_discovery_parser_tlv_and_null(
         json_port in 1..=65535u16,
@@ -273,7 +315,8 @@ proptest! {
         prop_assert_eq!(server_null.cli_port, cli_port);
     }
 
-    /// Invariant: setd parses correctly for 1-byte setting query and 4-byte sample rate.
+    /// Invariant: setd parses correctly for 1-byte setting query and
+    /// 4-byte sample rate.
     #[test]
     fn fuzz_parse_setd(
         sample_rate in any::<u32>(),

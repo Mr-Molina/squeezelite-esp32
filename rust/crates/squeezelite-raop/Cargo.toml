@@ -1,0 +1,19 @@
+[package]
+name = "squeezelite-raop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure-Rust #![no_std] AirPlay 1 (RAOP) receiver engine for squeezelite-esp32"
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+alac = { version = "0.5.0", default-features = false }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

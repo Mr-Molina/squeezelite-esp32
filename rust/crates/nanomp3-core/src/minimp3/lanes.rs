@@ -69,7 +69,7 @@ mod f32x4 {
         }
         #[inline(always)]
         fn load(s: &[f32]) -> Self {
-            F4::new(s[..4].try_into().unwrap())
+            F4::new([s[0], s[1], s[2], s[3]])
         }
         #[inline(always)]
         fn store(self, s: &mut [f32]) {
@@ -152,7 +152,7 @@ mod f32x4 {
         }
         #[inline(always)]
         fn load(s: &[f32]) -> Self {
-            F4(s[..4].try_into().unwrap())
+            F4([s[0], s[1], s[2], s[3]])
         }
         #[inline(always)]
         fn store(self, s: &mut [f32]) {

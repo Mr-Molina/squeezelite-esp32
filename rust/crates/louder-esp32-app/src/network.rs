@@ -1,6 +1,7 @@
 //! LMS Auto-Discovery and Network Protocol Client
 //!
-//! Works across host environments and ESP32 with `std::net` (esp-idf-svc runtime).
+//! Works across host environments and ESP32 with `std::net` (esp-idf-svc
+//! runtime).
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -10,19 +11,20 @@ use crate::io_traits::{
     HeaderBuf, MetaBuf, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
 };
 use crate::stream_codec::{
-    find_head_end, request_host, truncate_head, ChunkedDecoder, IcyStripper, RedirectPolicy, RedirectTarget,
-    ResponseHead,
+    find_head_end, request_host, truncate_head, ChunkedDecoder, IcyStripper, RedirectPolicy,
+    RedirectTarget, ResponseHead,
 };
 use squeezelite_proto::{
-    DiscoveredServer, DiscoveryBuilder, DiscoveryParser, DisconnectReason, ParseError, ServerCommand,
-    SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
+    DisconnectReason, DiscoveredServer, DiscoveryBuilder, DiscoveryParser, ParseError,
+    ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
 };
 
 /// LMS Auto-Discovery Client over UDP broadcast (Port 3483).
 pub struct LmsDiscovery;
 
 impl LmsDiscovery {
-    /// Broadcasts an LMS discovery query and waits up to `timeout` for a server response.
+    /// Broadcasts an LMS discovery query and waits up to `timeout` for a server
+    /// response.
     pub fn discover_server(timeout: Duration) -> std::io::Result<(SocketAddr, DiscoveredServer)> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_broadcast(true)?;
@@ -36,13 +38,21 @@ impl LmsDiscovery {
         socket.send_to(&query[..qlen], "255.255.255.255:3483")?;
 
         let mut resp_buf = [0u8; 512];
-        loop {
+        let deadline = std::time::Instant::now() + timeout;
+        for _ in 0..8 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             let (bytes_read, src_addr) = socket.recv_from(&mut resp_buf)?;
 
             if let Some(server) = DiscoveryParser::parse_response(&resp_buf[..bytes_read]) {
                 return Ok((src_addr, server));
             }
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "No valid LMS discovery response within timeout",
+        ))
     }
 }
 
@@ -52,20 +62,23 @@ pub struct SlimprotoClient {
     mac: [u8; 6],
     model: String,
     acc_buf: Vec<u8>,
-    /// Cleared once the peer closes the connection or a write leaves a frame half-sent.
+    /// Cleared once the peer closes the connection or a write leaves a frame
+    /// half-sent.
     connected: bool,
 }
 
 impl SlimprotoClient {
     /// Connects to LMS server and completes the initial HELO handshake.
     ///
-    /// Sends `HELO` while the socket is still in blocking mode (with write timeout)
-    /// and transitions to non-blocking mode only after `send_helo` succeeds (`HALNET-403`).
+    /// Sends `HELO` while the socket is still in blocking mode (with write
+    /// timeout) and transitions to non-blocking mode only after `send_helo`
+    /// succeeds (`HALNET-403`).
     pub fn connect(server_addr: SocketAddr, mac: [u8; 6], model: &str) -> std::io::Result<Self> {
         Self::connect_with_options(server_addr, mac, model, false, 0)
     }
 
-    /// Connects to LMS server with extended reconnect and byte offset options (`HALNET-403`).
+    /// Connects to LMS server with extended reconnect and byte offset options
+    /// (`HALNET-403`).
     pub fn connect_with_options(
         server_addr: SocketAddr,
         mac: [u8; 6],
@@ -86,7 +99,8 @@ impl SlimprotoClient {
             connected: true,
         };
 
-        // HALNET-403: Send HELO while socket is still in blocking mode, then enable non-blocking mode
+        // HALNET-403: Send HELO while socket is still in blocking mode, then enable
+        // non-blocking mode
         client.send_helo_with_options(mac, model_name, reconnect, bytes_received)?;
         client.stream.set_nonblocking(true)?;
 
@@ -99,7 +113,8 @@ impl SlimprotoClient {
         self.send_helo_with_options(mac, &model, false, 0)
     }
 
-    /// Builds and sends the `HELO` handshake packet with reconnect flag and received byte offset.
+    /// Builds and sends the `HELO` handshake packet with reconnect flag and
+    /// received byte offset.
     pub fn send_helo_with_options(
         &mut self,
         mac: [u8; 6],
@@ -129,14 +144,16 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &helo_buf[..helo_len])
     }
 
-    /// Writes all bytes in `buf` to `stream`, retrying bounded times on `WouldBlock` (`HALNET-403`).
+    /// Writes all bytes in `buf` to `stream`, retrying bounded times on
+    /// `WouldBlock` (`HALNET-403`).
     fn write_all_bounded(stream: &mut TcpStream, buf: &[u8]) -> std::io::Result<()> {
         let mut written = 0;
         Self::write_all_tracked(stream, buf, &mut written)
     }
 
-    /// Like [`Self::write_all_bounded`], additionally reporting in `offset` how many bytes were
-    /// accepted by the socket, so a caller can tell a clean failure from a half-written frame.
+    /// Like [`Self::write_all_bounded`], additionally reporting in `offset` how
+    /// many bytes were accepted by the socket, so a caller can tell a clean
+    /// failure from a half-written frame.
     fn write_all_tracked(
         stream: &mut TcpStream,
         buf: &[u8],
@@ -213,8 +230,9 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
-    /// Sends a STAT telemetry packet with explicit metrics including custom sample rate,
-    /// 64-bit frames played, server timestamp, and 64-bit byte counter.
+    /// Sends a STAT telemetry packet with explicit metrics including custom
+    /// sample rate, 64-bit frames played, server timestamp, and 64-bit byte
+    /// counter.
     #[allow(clippy::too_many_arguments)]
     pub fn send_stat_with_metrics(
         &mut self,
@@ -244,7 +262,8 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
-    /// Sends an HTTP response packet (`RESP`) transmitting received HTTP headers to LMS.
+    /// Sends an HTTP response packet (`RESP`) transmitting received HTTP
+    /// headers to LMS.
     pub fn send_resp(&mut self, headers: &[u8]) -> std::io::Result<()> {
         let mut buf = vec![0u8; 8 + headers.len()];
         let len = SlimprotoBuilder::build_resp(headers, &mut buf)
@@ -252,7 +271,8 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
-    /// Sends a disconnect notification packet (`DSCO`) transmitting disconnect reason to LMS.
+    /// Sends a disconnect notification packet (`DSCO`) transmitting disconnect
+    /// reason to LMS.
     pub fn send_dsco(&mut self, reason: DisconnectReason) -> std::io::Result<()> {
         let mut buf = [0u8; 16];
         let len = SlimprotoBuilder::build_dsco(reason, &mut buf)
@@ -260,7 +280,8 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
-    /// Sends a stream metadata packet (`META`) forwarding stream metadata (e.g. ICY) to LMS.
+    /// Sends a stream metadata packet (`META`) forwarding stream metadata (e.g.
+    /// ICY) to LMS.
     pub fn send_meta(&mut self, metadata: &[u8]) -> std::io::Result<()> {
         let mut buf = vec![0u8; 8 + metadata.len()];
         let len = SlimprotoBuilder::build_meta(metadata, &mut buf)
@@ -276,8 +297,8 @@ impl SlimprotoClient {
         Self::write_all_bounded(&mut self.stream, &buf[..len])
     }
 
-    /// Inspects the frame header in the buffer to determine expected frame length without
-    /// borrowing scratch (shared with the device transport).
+    /// Inspects the frame header in the buffer to determine expected frame
+    /// length without borrowing scratch (shared with the device transport).
     fn peek_frame_len(buf: &[u8]) -> Result<usize, ParseError> {
         crate::net_device::server_frame_len(buf)
     }
@@ -285,9 +306,13 @@ impl SlimprotoClient {
     /// Polls the network stream, accumulating incoming TCP chunks,
     /// and parses the next available Slimproto frame (PROTO-001, PROTO-002).
     ///
-    /// Copies the active frame into `scratch` so that `ServerCommand<'a>` borrows
-    /// from `scratch` rather than `self`, avoiding borrow-checker contention.
-    pub fn poll_command<'a>(&mut self, scratch: &'a mut [u8]) -> std::io::Result<Option<ServerCommand<'a>>> {
+    /// Copies the active frame into `scratch` so that `ServerCommand<'a>`
+    /// borrows from `scratch` rather than `self`, avoiding borrow-checker
+    /// contention.
+    pub fn poll_command<'a>(
+        &mut self,
+        scratch: &'a mut [u8],
+    ) -> std::io::Result<Option<ServerCommand<'a>>> {
         let Some(consumed) = self.poll_raw_frame(scratch)? else {
             return Ok(None);
         };
@@ -298,14 +323,16 @@ impl SlimprotoClient {
         Ok(Some(cmd))
     }
 
-    /// Accumulates incoming TCP data and copies the next complete frame (length prefix
-    /// included, exactly as received) into `scratch`, returning its length.
+    /// Accumulates incoming TCP data and copies the next complete frame (length
+    /// prefix included, exactly as received) into `scratch`, returning its
+    /// length.
     ///
     /// Shared by [`Self::poll_command`] and the [`SlimTransport`] adapter.
     fn poll_raw_frame(&mut self, scratch: &mut [u8]) -> std::io::Result<Option<usize>> {
         const MAX_ACC_BUF: usize = 8192;
 
-        // 1. If self.acc_buf does not yet have a complete frame, read available bytes from self.stream
+        // 1. If self.acc_buf does not yet have a complete frame, read available bytes
+        //    from self.stream
         let has_complete_frame = match Self::peek_frame_len(&self.acc_buf) {
             Ok(len) => self.acc_buf.len() >= len,
             Err(_) => false,
@@ -316,16 +343,25 @@ impl SlimprotoClient {
             match self.stream.read(&mut temp_buf) {
                 Ok(0) => {
                     self.connected = false;
-                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Server disconnected"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "Server disconnected",
+                    ));
                 }
                 Ok(n) => {
                     if self.acc_buf.len() + n > MAX_ACC_BUF {
                         self.acc_buf.clear();
-                        return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Accumulation buffer overflow"));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::OutOfMemory,
+                            "Accumulation buffer overflow",
+                        ));
                     }
                     self.acc_buf.extend_from_slice(&temp_buf[..n]);
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     // Non-blocking would block or timed out
                 }
                 Err(e) => {
@@ -359,7 +395,10 @@ impl SlimprotoClient {
             Err(ParseError::BufferTooShort) => return Ok(None),
             Err(_) => {
                 self.acc_buf.clear();
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed frame"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Malformed frame",
+                ));
             }
         };
 
@@ -381,9 +420,10 @@ impl SlimprotoClient {
 }
 
 impl SlimTransport for SlimprotoClient {
-    /// Delivers one raw frame per call. Frames already accumulated stay deliverable after the
-    /// peer closes (the socket is only read when no complete frame is buffered); the disconnect
-    /// surfaces once they are drained.
+    /// Delivers one raw frame per call. Frames already accumulated stay
+    /// deliverable after the peer closes (the socket is only read when no
+    /// complete frame is buffered); the disconnect surfaces once they are
+    /// drained.
     fn poll_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
         use std::io::ErrorKind;
         self.poll_raw_frame(buf).map_err(|e| match e.kind() {
@@ -397,9 +437,10 @@ impl SlimTransport for SlimprotoClient {
         })
     }
 
-    /// Sends one frame verbatim. `WouldBlock` is returned only when nothing was written, so the
-    /// caller can retry the whole frame; a failure after a partial write would desynchronise the
-    /// byte stream, so it closes the connection instead and reports `Disconnected`.
+    /// Sends one frame verbatim. `WouldBlock` is returned only when nothing was
+    /// written, so the caller can retry the whole frame; a failure after a
+    /// partial write would desynchronise the byte stream, so it closes the
+    /// connection instead and reports `Disconnected`.
     fn send(&mut self, frame: &[u8]) -> Result<(), TransportError> {
         use std::io::ErrorKind;
         if !self.connected {
@@ -475,9 +516,9 @@ fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, S
     Ok((addr, host_port.to_string(), path.to_string()))
 }
 
-/// Opens a TCP connection to `addr` and writes `request` while the socket is still blocking
-/// (1500ms connect/write timeout, `HALNET-410`); only then switches it to non-blocking mode
-/// (`HALNET-404`).
+/// Opens a TCP connection to `addr` and writes `request` while the socket is
+/// still blocking (1500ms connect/write timeout, `HALNET-410`); only then
+/// switches it to non-blocking mode (`HALNET-404`).
 fn open_stream(addr: SocketAddr, request: &[u8]) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))?;
     stream.set_nodelay(true)?;
@@ -488,7 +529,8 @@ fn open_stream(addr: SocketAddr, request: &[u8]) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// Value of the `Host:` header in `request`, falling back to the socket address.
+/// Value of the `Host:` header in `request`, falling back to the socket
+/// address.
 fn host_of_request(request: &str, addr: SocketAddr) -> String {
     request_host(request.as_bytes())
         .map(|h| String::from_utf8_lossy(h).into_owned())
@@ -498,13 +540,14 @@ fn host_of_request(request: &str, addr: SocketAddr) -> String {
 /// Pure-Rust HTTP Audio Stream Client for fetching streamed audio over TCP.
 ///
 /// Two ways to use it:
-/// * the original API: [`HttpAudioStream::connect`] (blocking connect, returns a connected
-///   stream) and [`HttpAudioStream::poll_audio_bytes`];
-/// * the [`StreamSource`] trait: [`HttpAudioStream::new`] creates an idle stream and the trait's
-///   `connect` (re)connects it. The inherent `is_eof`, `take_response_headers`,
-///   `take_icy_metadata` and `set_icy_metaint` shadow the trait methods on the concrete type
-///   and keep their original `Vec`-based signatures; call them through `StreamSource::` for the
-///   trait semantics (notably, the trait `is_eof` is never true for a connection that dropped
+/// * the original API: [`HttpAudioStream::connect`] (blocking connect, returns
+///   a connected stream) and [`HttpAudioStream::poll_audio_bytes`];
+/// * the [`StreamSource`] trait: [`HttpAudioStream::new`] creates an idle
+///   stream and the trait's `connect` (re)connects it. The inherent `is_eof`,
+///   `take_response_headers`, `take_icy_metadata` and `set_icy_metaint` shadow
+///   the trait methods on the concrete type and keep their original `Vec`-based
+///   signatures; call them through `StreamSource::` for the trait semantics
+///   (notably, the trait `is_eof` is never true for a connection that dropped
 ///   early, while the inherent one reports any socket close).
 pub struct HttpAudioStream {
     /// `None` while idle, after `abort`, and after a failed connect.
@@ -517,8 +560,8 @@ pub struct HttpAudioStream {
     request_template: String,
     redirects: RedirectPolicy,
     response_headers: Option<Vec<u8>>,
-    /// Address and `Host` value of the server currently being read; same-origin (relative)
-    /// `Location` values resolve against these.
+    /// Address and `Host` value of the server currently being read; same-origin
+    /// (relative) `Location` values resolve against these.
     cur_addr: Option<SocketAddr>,
     cur_host: String,
 
@@ -538,8 +581,9 @@ pub struct HttpAudioStream {
     total_audio_bytes: u64,
 
     // `StreamSource` bookkeeping
-    /// The socket closed before the response was complete (truncated chunked/`Content-Length`
-    /// body, or closed during the headers). `eof` is still set for the original API.
+    /// The socket closed before the response was complete (truncated
+    /// chunked/`Content-Length` body, or closed during the headers). `eof`
+    /// is still set for the original API.
     early_drop: bool,
     /// A `StreamSource::connect` is in progress (`WouldBlock` was returned).
     connecting: bool,
@@ -559,7 +603,8 @@ impl HttpAudioStream {
     pub const MAX_BODY_BUF_LEN: usize = 65_536;
     pub const MAX_CHUNK_SIZE: usize = 1_048_576;
 
-    /// Creates an idle, unconnected stream; use [`StreamSource::connect`] to start a request.
+    /// Creates an idle, unconnected stream; use [`StreamSource::connect`] to
+    /// start a request.
     pub fn new() -> Self {
         Self {
             stream: None,
@@ -590,10 +635,12 @@ impl HttpAudioStream {
         }
     }
 
-    /// Connects to the HTTP streaming audio server and issues the initial GET request.
+    /// Connects to the HTTP streaming audio server and issues the initial GET
+    /// request.
     ///
-    /// Uses a 1500ms connect/write timeout (`HALNET-410`) and writes the full HTTP request
-    /// while the socket is still in blocking mode before enabling non-blocking mode (`HALNET-404`).
+    /// Uses a 1500ms connect/write timeout (`HALNET-410`) and writes the full
+    /// HTTP request while the socket is still in blocking mode before
+    /// enabling non-blocking mode (`HALNET-404`).
     pub fn connect(server_addr: SocketAddr, http_headers: &str) -> std::io::Result<Self> {
         let mut request = http_headers.as_bytes().to_vec();
         if !http_headers.is_empty() && !http_headers.ends_with("\r\n\r\n") {
@@ -613,12 +660,14 @@ impl HttpAudioStream {
         Ok(this)
     }
 
-    /// Returns `true` if the server disconnected (EOF) and all pending audio bytes have been drained.
+    /// Returns `true` if the server disconnected (EOF) and all pending audio
+    /// bytes have been drained.
     pub fn is_eof(&self) -> bool {
         self.eof && self.audio_buf.is_empty() && self.unchunked_buf.is_empty()
     }
 
-    /// Returns `true` once the HTTP response headers have been successfully parsed and verified.
+    /// Returns `true` once the HTTP response headers have been successfully
+    /// parsed and verified.
     pub fn headers_parsed(&self) -> bool {
         self.headers_parsed
     }
@@ -648,14 +697,19 @@ impl HttpAudioStream {
         self.total_audio_bytes
     }
 
-    /// De-chunks (when chunked) and ICY-strips everything in `raw_body_buf` into `audio_buf`
-    /// (shared state machines: [`ChunkedDecoder`], [`IcyStripper`]).
+    /// De-chunks (when chunked) and ICY-strips everything in `raw_body_buf`
+    /// into `audio_buf` (shared state machines: [`ChunkedDecoder`],
+    /// [`IcyStripper`]).
     fn process_raw_body(&mut self) -> std::io::Result<()> {
         if self.is_chunked {
-            let n = self.chunk.decode_in_place(&mut self.raw_body_buf).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid chunked framing")
-            })?;
-            self.unchunked_buf.extend_from_slice(&self.raw_body_buf[..n]);
+            let n = self
+                .chunk
+                .decode_in_place(&mut self.raw_body_buf)
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid chunked framing")
+                })?;
+            self.unchunked_buf
+                .extend_from_slice(&self.raw_body_buf[..n]);
             self.raw_body_buf.clear();
             if self.chunk.is_done() {
                 self.eof = true;
@@ -669,10 +723,12 @@ impl HttpAudioStream {
         Ok(())
     }
 
-    /// Header phase: reads and parses the HTTP response head, following redirects. Returns
-    /// `Ok(true)` once the final `200`/`206` response head has been consumed (any body bytes that
-    /// arrived with it stay in `raw_body_buf`, unprocessed), and `Ok(false)` while more data is
-    /// needed or if the socket closed (`eof`/`early_drop` are set in that case).
+    /// Header phase: reads and parses the HTTP response head, following
+    /// redirects. Returns `Ok(true)` once the final `200`/`206` response
+    /// head has been consumed (any body bytes that arrived with it stay in
+    /// `raw_body_buf`, unprocessed), and `Ok(false)` while more data is
+    /// needed or if the socket closed (`eof`/`early_drop` are set in that
+    /// case).
     fn drive_headers(&mut self) -> std::io::Result<bool> {
         while !self.headers_parsed {
             let mut temp = [0u8; 1024];
@@ -782,14 +838,19 @@ impl HttpAudioStream {
                 self.icy.set_metaint(metaint);
             }
             // Declared body length (identity encoding only), to tell truncation from EOF
-            let content_length = if self.is_chunked { None } else { head.content_length() };
+            let content_length = if self.is_chunked {
+                None
+            } else {
+                head.content_length()
+            };
 
             // Capture raw response headers (including delimiter)
             self.response_headers = Some(self.header_buf[..head_len].to_vec());
 
             let leftover = self.header_buf.len() - head_len;
             if leftover > 0 {
-                self.raw_body_buf.extend_from_slice(&self.header_buf[head_len..]);
+                self.raw_body_buf
+                    .extend_from_slice(&self.header_buf[head_len..]);
             }
             self.content_remaining = content_length.map(|l| l.saturating_sub(leftover as u64));
             self.header_buf.clear();
@@ -801,10 +862,12 @@ impl HttpAudioStream {
 
     /// Polls audio stream bytes non-blockingly into `out`.
     ///
-    /// During the initial header phase, incoming chunks are parsed to strip the HTTP response
-    /// header, follow redirects (`301`, `302`, `307`, `308`), and verify HTTP 200 / 206 status (`HALNET-406`).
-    /// Once parsed, raw audio stream bytes are de-chunked and stripped of ICY metadata before
-    /// being written directly to `out`, returning `Ok(0)` with `is_eof() == true` when finished (`HALNET-405`).
+    /// During the initial header phase, incoming chunks are parsed to strip the
+    /// HTTP response header, follow redirects (`301`, `302`, `307`, `308`),
+    /// and verify HTTP 200 / 206 status (`HALNET-406`). Once parsed, raw
+    /// audio stream bytes are de-chunked and stripped of ICY metadata before
+    /// being written directly to `out`, returning `Ok(0)` with `is_eof() ==
+    /// true` when finished (`HALNET-405`).
     pub fn poll_audio_bytes(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -933,17 +996,20 @@ const CONNECT_POLL_BUDGET: Duration = Duration::from_millis(100);
 
 impl StreamSource for HttpAudioStream {
     /// Redirects are followed here; `Location` may be absolute (`http://host[:port]/path`) or
-    /// same-origin (`/path`). Repeating a call that returned [`StreamError::WouldBlock`] resumes
-    /// the same request.
+    /// same-origin (`/path`). Repeating a call that returned
+    /// [`StreamError::WouldBlock`] resumes the same request.
     ///
-    /// **This host implementation blocks.** Opening a connection ([`open_stream`]) takes a
-    /// blocking `connect` (1500 ms timeout) plus a blocking `write_all` of the request (1500 ms
-    /// write timeout), i.e. up to ~3 s. The first call does that once, and every redirect hop
-    /// followed inside a single call repeats it (up to [`HttpAudioStream::MAX_REDIRECTS`] hops),
-    /// so one call can block for ~12 s in the worst case. Only the wait for the response head
-    /// is bounded by [`CONNECT_POLL_BUDGET`] (100 ms between hops), after which `WouldBlock`
-    /// is returned. This blocking profile is specific to the `std::net` host adapter; the
-    /// device (smoltcp) implementation is independent and does not share it.
+    /// **This host implementation blocks.** Opening a connection
+    /// ([`open_stream`]) takes a blocking `connect` (1500 ms timeout) plus
+    /// a blocking `write_all` of the request (1500 ms write timeout), i.e.
+    /// up to ~3 s. The first call does that once, and every redirect hop
+    /// followed inside a single call repeats it (up to
+    /// [`HttpAudioStream::MAX_REDIRECTS`] hops), so one call can block for
+    /// ~12 s in the worst case. Only the wait for the response head
+    /// is bounded by [`CONNECT_POLL_BUDGET`] (100 ms between hops), after which
+    /// `WouldBlock` is returned. This blocking profile is specific to the
+    /// `std::net` host adapter; the device (smoltcp) implementation is
+    /// independent and does not share it.
     fn connect(&mut self, addr: NetAddr, http_request: &[u8]) -> Result<(), StreamError> {
         if !self.connecting {
             let sock = SocketAddr::from((addr.ip, addr.port));
@@ -984,15 +1050,20 @@ impl StreamSource for HttpAudioStream {
         }
     }
 
-    /// Never blocks and never returns `WouldBlock`. Bytes received before a drop are delivered
-    /// first; then a connection that closed early (truncated chunked or `Content-Length` body)
+    /// Never blocks and never returns `WouldBlock`. Bytes received before a
+    /// drop are delivered first; then a connection that closed early
+    /// (truncated chunked or `Content-Length` body)
     /// yields [`StreamError::Disconnected`] instead of EOF.
     fn poll_bytes(&mut self, out: &mut [u8]) -> Result<usize, StreamError> {
         if self.stream.is_none() || self.connecting {
             return Err(StreamError::Disconnected);
         }
         match self.poll_audio_bytes(out) {
-            Ok(0) if self.early_drop && self.audio_buf.is_empty() && self.unchunked_buf.is_empty() => {
+            Ok(0)
+                if self.early_drop
+                    && self.audio_buf.is_empty()
+                    && self.unchunked_buf.is_empty() =>
+            {
                 Err(StreamError::Disconnected)
             }
             Ok(n) => Ok(n),
@@ -1006,11 +1077,13 @@ impl StreamSource for HttpAudioStream {
     }
 
     /// Raw head of the final response. A head longer than
-    /// [`MAX_RESPONSE_HEAD`](crate::io_traits::MAX_RESPONSE_HEAD) bytes is cut at the last line
-    /// boundary that leaves room for the terminating blank line (never inside a header line, so
-    /// no partial value such as `icy-metaint: 1` survives), then the blank line is appended. With
+    /// [`MAX_RESPONSE_HEAD`](crate::io_traits::MAX_RESPONSE_HEAD) bytes is cut
+    /// at the last line boundary that leaves room for the terminating blank
+    /// line (never inside a header line, so no partial value such as
+    /// `icy-metaint: 1` survives), then the blank line is appended. With
     /// the current capacities this cannot trigger through the socket path
-    /// (`MAX_HTTP_HEADER_LEN` rejects longer heads first); it guards the trait contract.
+    /// (`MAX_HTTP_HEADER_LEN` rejects longer heads first); it guards the trait
+    /// contract.
     fn take_response_headers(&mut self) -> Option<HeaderBuf> {
         let raw = HttpAudioStream::take_response_headers(self)?;
         let mut out = HeaderBuf::new();
@@ -1038,6 +1111,235 @@ impl StreamSource for HttpAudioStream {
     }
 }
 
+/// Active AirPlay / RAOP RTSP Control Client over TCP.
+///
+/// Manages CSeq numbering, Session header tracking, and volume commands
+/// (`SET_PARAMETER`) for outbound or loopback RAOP / ShairTunes2W sessions.
+pub struct RaopStreamClient {
+    stream: TcpStream,
+    target_uri: String,
+    cseq: u32,
+    session_id: Option<String>,
+}
+
+impl RaopStreamClient {
+    /// Connects to an AirPlay / RAOP RTSP listener (`addr`) with bounded
+    /// timeouts.
+    pub fn connect(addr: SocketAddr, target_uri: &str) -> std::io::Result<Self> {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+        Ok(Self {
+            stream,
+            target_uri: target_uri.to_string(),
+            cseq: 1,
+            session_id: None,
+        })
+    }
+
+    /// Returns the active RTSP session ID if established by `SETUP`.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Returns the next CSeq counter that will be used.
+    #[must_use]
+    pub const fn next_cseq(&self) -> u32 {
+        self.cseq
+    }
+
+    /// Sends a raw RTSP request and reads back the response status code and
+    /// headers.
+    pub fn send_request(
+        &mut self,
+        method: &str,
+        uri: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> std::io::Result<(u16, String)> {
+        let cseq = self.cseq;
+        self.cseq = self.cseq.wrapping_add(1);
+
+        let mut req = format!("{method} {uri} RTSP/1.0\r\nCSeq: {cseq}\r\n");
+        req.push_str("User-Agent: Squeezelite-ESP32-Rust/1.0\r\n");
+        if let Some(ref sid) = self.session_id {
+            req.push_str(&format!("Session: {sid}\r\n"));
+        }
+        for (k, v) in extra_headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        if let Some(b) = body {
+            req.push_str(&format!("Content-Length: {}\r\n\r\n{b}", b.len()));
+        } else {
+            req.push_str("\r\n");
+        }
+
+        SlimprotoClient::write_all_bounded(&mut self.stream, req.as_bytes())?;
+        self.stream.flush()?;
+
+        let mut resp_buf = Vec::with_capacity(512);
+        let mut temp = [0u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while !resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "RTSP response header timeout",
+                ));
+            }
+            match self.stream.read(&mut temp) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "RTSP peer closed connection",
+                    ));
+                }
+                Ok(n) => {
+                    if resp_buf.len() + n > 4096 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "RTSP response header too large",
+                        ));
+                    }
+                    resp_buf.extend_from_slice(&temp[..n]);
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let resp_str = String::from_utf8_lossy(&resp_buf).into_owned();
+        let status_line = resp_str.lines().next().unwrap_or("");
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Malformed RTSP status line",
+                )
+            })?;
+
+        for line in resp_str.lines().skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("session") {
+                    let sid = v.split(';').next().unwrap_or("").trim();
+                    if !sid.is_empty() {
+                        self.session_id = Some(sid.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok((status_code, resp_str))
+    }
+
+    /// Sends `OPTIONS * RTSP/1.0` and verifies a `200 OK` response.
+    pub fn options(&mut self) -> std::io::Result<String> {
+        let (code, resp) = self.send_request("OPTIONS", "*", &[], None)?;
+        if code != 200 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTSP OPTIONS failed",
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Sends `ANNOUNCE` with an SDP payload describing the audio stream.
+    pub fn announce(&mut self, sdp: &str) -> std::io::Result<String> {
+        let uri = self.target_uri.clone();
+        let (code, resp) = self.send_request(
+            "ANNOUNCE",
+            &uri,
+            &[("Content-Type", "application/sdp")],
+            Some(sdp),
+        )?;
+        if code != 200 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTSP ANNOUNCE failed",
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Sends `SETUP` with the client RTP/RTCP/timing transport header.
+    pub fn setup(&mut self, transport_hdr: &str) -> std::io::Result<String> {
+        let uri = self.target_uri.clone();
+        let (code, resp) =
+            self.send_request("SETUP", &uri, &[("Transport", transport_hdr)], None)?;
+        if code != 200 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTSP SETUP failed",
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Sends `RECORD` to begin RTP audio streaming.
+    pub fn record(&mut self, rtp_info: &str) -> std::io::Result<String> {
+        let uri = self.target_uri.clone();
+        let (code, resp) = self.send_request(
+            "RECORD",
+            &uri,
+            &[("Range", "npt=0-"), ("RTP-Info", rtp_info)],
+            None,
+        )?;
+        if code != 200 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTSP RECORD failed",
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Sends `SET_PARAMETER` with AirPlay dB volume (`-144.0` to `0.0`).
+    pub fn set_volume(&mut self, volume_db: f32) -> std::io::Result<()> {
+        let uri = self.target_uri.clone();
+        let body = format!("volume: {volume_db:.6}\r\n");
+        let (code, _) = self.send_request(
+            "SET_PARAMETER",
+            &uri,
+            &[("Content-Type", "text/parameters")],
+            Some(&body),
+        )?;
+        if code != 200 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTSP SET_PARAMETER failed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sends `TEARDOWN` to close the RTSP session cleanly.
+    pub fn teardown(&mut self) -> std::io::Result<()> {
+        let uri = self.target_uri.clone();
+        let (code, _) = self.send_request("TEARDOWN", &uri, &[], None)?;
+        if code != 200 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTSP TEARDOWN failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,8 +1347,9 @@ mod tests {
 
     #[test]
     fn test_take_response_headers_cuts_long_head_at_line_boundary() {
-        // Every pad line ends in 'E', so a cut inside a line is visible. The head is far over
-        // MAX_RESPONSE_HEAD (unreachable through the socket path, which caps heads first).
+        // Every pad line ends in 'E', so a cut inside a line is visible. The head is
+        // far over MAX_RESPONSE_HEAD (unreachable through the socket path,
+        // which caps heads first).
         let limit = crate::io_traits::MAX_RESPONSE_HEAD;
         let mut head = String::from("HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n");
         let mut i = 0;
@@ -1060,7 +1363,11 @@ mod tests {
         s.response_headers = Some(head.clone().into_bytes());
         let h = StreamSource::take_response_headers(&mut s).expect("headers captured");
         assert!(h.len() <= limit);
-        assert!(h.len() > limit - 100, "should keep as much as fits, got {}", h.len());
+        assert!(
+            h.len() > limit - 100,
+            "should keep as much as fits, got {}",
+            h.len()
+        );
         assert!(h.starts_with(b"HTTP/1.0 200 OK\r\n"), "status line intact");
         assert!(h.ends_with(b"\r\n\r\n"), "terminating blank line present");
         let text = core::str::from_utf8(&h).unwrap();
@@ -1074,12 +1381,21 @@ mod tests {
             if name.starts_with("X-Pad-") {
                 assert!(value.ends_with('E'), "partial header value: {line:?}");
             }
-            assert!(head.contains(&format!("{line}\r\n")), "line not from the response: {line:?}");
+            assert!(
+                head.contains(&format!("{line}\r\n")),
+                "line not from the response: {line:?}"
+            );
             n += 1;
         }
         assert!(n > 50, "kept {n} header lines");
-        assert!(!text.contains("icy-metaint"), "dropped lines are dropped whole");
-        assert!(StreamSource::take_response_headers(&mut s).is_none(), "taken once");
+        assert!(
+            !text.contains("icy-metaint"),
+            "dropped lines are dropped whole"
+        );
+        assert!(
+            StreamSource::take_response_headers(&mut s).is_none(),
+            "taken once"
+        );
     }
 
     #[test]
@@ -1158,7 +1474,7 @@ mod tests {
         // Send second half + another full flsh frame concatenated
         let mut second_chunk = Vec::new();
         second_chunk.extend_from_slice(&flsh_frame[4..]); // Complete first frame
-        second_chunk.extend_from_slice(&flsh_frame);       // Second concatenated frame
+        second_chunk.extend_from_slice(&flsh_frame); // Second concatenated frame
         server_stream.write_all(&second_chunk).unwrap();
 
         handle.join().unwrap();
@@ -1245,11 +1561,9 @@ mod tests {
             let _ = server_stream.shutdown(std::net::Shutdown::Write);
         });
 
-        let mut stream = HttpAudioStream::connect(
-            server_addr,
-            "GET /stream.mp3 HTTP/1.0\r\nHost: 127.0.0.1",
-        )
-        .unwrap();
+        let mut stream =
+            HttpAudioStream::connect(server_addr, "GET /stream.mp3 HTTP/1.0\r\nHost: 127.0.0.1")
+                .unwrap();
 
         assert!(!stream.headers_parsed());
         assert!(!stream.is_eof());
@@ -1283,7 +1597,8 @@ mod tests {
             let mut req_buf = [0u8; 512];
             let _ = server_stream.read(&mut req_buf).unwrap();
 
-            // HALNET-406: Include " 200" in a header line on a 404 response to ensure only the status line is checked!
+            // HALNET-406: Include " 200" in a header line on a 404 response to ensure only
+            // the status line is checked!
             let resp = b"HTTP/1.0 404 Not Found\r\nX-RateLimit: 200\r\nContent-Length: 0\r\n\r\n";
             server_stream.write_all(resp).unwrap();
             server_stream.flush().unwrap();
@@ -1317,7 +1632,8 @@ mod tests {
 
     #[test]
     fn test_http_audio_stream_accepts_206_partial_content() {
-        // HALNET-406 & HALNET-405: 206 Partial Content must be accepted and clean EOF returns Ok(0)
+        // HALNET-406 & HALNET-405: 206 Partial Content must be accepted and clean EOF
+        // returns Ok(0)
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
 
@@ -1326,7 +1642,8 @@ mod tests {
             let mut req_buf = [0u8; 512];
             let _ = server_stream.read(&mut req_buf).unwrap();
 
-            let resp = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\n\r\n\x10\x20\x30\x40";
+            let resp = b"HTTP/1.1 206 Partial Content\r\n\
+                         Content-Range: bytes 0-3/4\r\n\r\n\x10\x20\x30\x40";
             server_stream.write_all(resp).unwrap();
             server_stream.flush().unwrap();
             let _ = server_stream.shutdown(std::net::Shutdown::Write);
@@ -1372,7 +1689,8 @@ mod tests {
             server_stream.write_all(resp_head).unwrap();
             server_stream.flush().unwrap();
 
-            // Part 1: 4 audio bytes "ABCD" + 1 byte 0x01 (len=1 -> 16 bytes) + 8 bytes "StreamTi"
+            // Part 1: 4 audio bytes "ABCD" + 1 byte 0x01 (len=1 -> 16 bytes) + 8 bytes
+            // "StreamTi"
             let mut part1 = Vec::new();
             part1.extend_from_slice(b"ABCD");
             part1.push(0x01); // 1 * 16 = 16 bytes metadata
@@ -1392,7 +1710,8 @@ mod tests {
             let _ = server_stream.shutdown(std::net::Shutdown::Write);
         });
 
-        let mut stream = HttpAudioStream::connect(server_addr, "GET /stream HTTP/1.0\r\n\r\n").unwrap();
+        let mut stream =
+            HttpAudioStream::connect(server_addr, "GET /stream HTTP/1.0\r\n\r\n").unwrap();
         let mut audio = Vec::new();
         let mut buf = [0u8; 16];
         let start = std::time::Instant::now();
@@ -1406,7 +1725,10 @@ mod tests {
 
         assert_eq!(audio, b"ABCDEFGH");
         assert_eq!(stream.total_audio_bytes(), 8);
-        assert_eq!(stream.take_icy_metadata(), Some(b"StreamTitle='X';".to_vec()));
+        assert_eq!(
+            stream.take_icy_metadata(),
+            Some(b"StreamTitle='X';".to_vec())
+        );
         assert_eq!(
             stream.take_response_headers(),
             Some(b"HTTP/1.0 200 OK\r\nicy-metaint: 4\r\n\r\n".to_vec())
@@ -1483,7 +1805,8 @@ mod tests {
             let mut req = [0u8; 512];
             let _ = stream.read(&mut req).unwrap();
 
-            let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n2\r\nEF\r\n0\r\n\r\n";
+            let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                         4\r\nABCD\r\n2\r\nEF\r\n0\r\n\r\n";
             stream.write_all(resp).unwrap();
             stream.flush().unwrap();
             let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -1520,17 +1843,21 @@ mod tests {
         let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
 
         let handle = std::thread::spawn(move || {
-            let mut client = SlimprotoClient::connect_with_options(
-                server_addr,
-                mac,
-                "CustomModel",
-                true,
-                12345,
-            )
-            .unwrap();
+            let mut client =
+                SlimprotoClient::connect_with_options(server_addr, mac, "CustomModel", true, 12345)
+                    .unwrap();
 
             client
-                .send_stat_with_metrics(StatEvent::Connected, 100, 200, 44100, 44100, 12345, 500, 42)
+                .send_stat_with_metrics(
+                    StatEvent::Connected,
+                    100,
+                    200,
+                    44100,
+                    44100,
+                    12345,
+                    500,
+                    42,
+                )
                 .unwrap();
             client.send_resp(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
             client.send_dsco(DisconnectReason::ResetByLocal).unwrap();
@@ -1568,8 +1895,14 @@ mod tests {
         let wlan_flags = u16::from_be_bytes([payload1[24], payload1[25]]);
         assert_eq!(wlan_flags, 0x4000);
         let bytes_rx = u64::from_be_bytes([
-            payload1[26], payload1[27], payload1[28], payload1[29],
-            payload1[30], payload1[31], payload1[32], payload1[33],
+            payload1[26],
+            payload1[27],
+            payload1[28],
+            payload1[29],
+            payload1[30],
+            payload1[31],
+            payload1[32],
+            payload1[33],
         ]);
         assert_eq!(bytes_rx, 12345);
 
@@ -1605,13 +1938,19 @@ mod tests {
     #[test]
     fn test_parse_http_location_bracketed_ipv6() {
         let (addr1, host1, path1) = parse_http_location("http://[::1]/stream.mp3").unwrap();
-        assert_eq!(addr1.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            addr1.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
         assert_eq!(addr1.port(), 80);
         assert_eq!(host1, "[::1]");
         assert_eq!(path1, "/stream.mp3");
 
         let (addr2, host2, path2) = parse_http_location("http://[::1]:8000/stream.mp3").unwrap();
-        assert_eq!(addr2.ip(), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            addr2.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
         assert_eq!(addr2.port(), 8000);
         assert_eq!(host2, "[::1]:8000");
         assert_eq!(path2, "/stream.mp3");
@@ -1627,7 +1966,12 @@ mod tests {
             let mut buf = [0u8; 128];
             let _ = stream.read(&mut buf);
             // Incomplete/malformed chunk header then disconnect
-            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\npartial_chunk_with_no_crlf").unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      partial_chunk_with_no_crlf",
+                )
+                .unwrap();
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
 
@@ -1639,11 +1983,76 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(http.is_eof());
-        // The incomplete chunk-size line is held by the chunk decoder, never delivered as audio
-        // (before Task 9 these bytes sat in `raw_body_buf`).
+        // The incomplete chunk-size line is held by the chunk decoder, never delivered
+        // as audio (before Task 9 these bytes sat in `raw_body_buf`).
         assert!(!http.chunk.last_chunk_seen());
         assert!(http.audio_buf.is_empty());
         handle.join().unwrap();
     }
-}
 
+    #[test]
+    fn test_raop_stream_client_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+
+            // 1. OPTIONS
+            let n = stream.read(&mut buf).unwrap();
+            let req = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(req.starts_with("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n"));
+            stream
+                .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: ANNOUNCE, SETUP, RECORD\r\n\r\n")
+                .unwrap();
+
+            // 2. SETUP
+            let n = stream.read(&mut buf).unwrap();
+            let req = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(req.starts_with("SETUP rtsp://127.0.0.1/1234 RTSP/1.0\r\nCSeq: 2\r\n"));
+            stream
+                .write_all(
+                    b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: DEADBEEF;timeout=60\r\n\
+                      Transport: RTP/AVP/UDP;unicast;server_port=6000\r\n\r\n",
+                )
+                .unwrap();
+
+            // 3. SET_PARAMETER
+            let n = stream.read(&mut buf).unwrap();
+            let req = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(req.contains("Session: DEADBEEF\r\n"));
+            assert!(req.contains("volume: -15.000000\r\n"));
+            stream
+                .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 3\r\n\r\n")
+                .unwrap();
+
+            // 4. TEARDOWN
+            let n = stream.read(&mut buf).unwrap();
+            let req = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(req.starts_with("TEARDOWN rtsp://127.0.0.1/1234 RTSP/1.0\r\nCSeq: 4\r\n"));
+            stream
+                .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 4\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut client = RaopStreamClient::connect(server_addr, "rtsp://127.0.0.1/1234").unwrap();
+        assert_eq!(client.next_cseq(), 1);
+        assert!(client.session_id().is_none());
+
+        let opt_resp = client.options().unwrap();
+        assert!(opt_resp.contains("Public: ANNOUNCE"));
+
+        let setup_resp = client
+            .setup("RTP/AVP/UDP;unicast;client_port=6001-6002")
+            .unwrap();
+        assert!(setup_resp.contains("server_port=6000"));
+        assert_eq!(client.session_id(), Some("DEADBEEF"));
+
+        client.set_volume(-15.0).unwrap();
+        client.teardown().unwrap();
+        assert_eq!(client.next_cseq(), 5);
+
+        handle.join().unwrap();
+    }
+}

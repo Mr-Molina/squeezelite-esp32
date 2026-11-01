@@ -2,7 +2,7 @@
 //!
 //! Provides pure-Rust, zero-allocation hardware abstraction and drivers for:
 //! - ILI9341 320x240 RGB565 TFT SPI display controller
-//! - XPT2046 12-bit resistive touch controller with 5-point median/averaging filter
+//! - XPT2046 12-bit resistive touch controller with 5-point median filter
 
 pub const CYD_TFT_MISO: i8 = 12;
 pub const CYD_TFT_MOSI: i8 = 13;
@@ -207,7 +207,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         self.initialized = true;
     }
 
-    /// Configure hardware display color inversion (`0x21` = INVON, `0x20` = INVOFF).
+    /// Configure hardware display inversion (`0x21` = INVON, `0x20` = INVOFF).
     pub fn set_display_inversion(&mut self, inverted: bool) {
         if inverted {
             self.bus.send_cmd(0x21);
@@ -216,7 +216,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         }
     }
 
-    /// Configure MADCTL RGB/BGR color channel order in landscape mode (`0x28` = BGR, `0x20` = RGB).
+    /// Configure MADCTL RGB/BGR color channel order (`0x28` = BGR, `0x20` = RGB).
     pub fn set_bgr_order(&mut self, bgr: bool) {
         self.bus.send_cmd(0x36);
         if bgr {
@@ -231,7 +231,14 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
     /// Validates and normalizes coordinates, rejects fully out-of-bounds windows,
     /// clamps to screen boundaries and available `color_data.len()`, and transmits
     /// CASET, PASET, and RAMWR chunks.
-    pub fn flush(&mut self, mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, color_data: &[u16]) {
+    pub fn flush(
+        &mut self,
+        mut x1: i32,
+        mut y1: i32,
+        mut x2: i32,
+        mut y2: i32,
+        color_data: &[u16],
+    ) {
         if color_data.is_empty() {
             return;
         }
@@ -326,7 +333,8 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
         }
     }
 
-    /// Fill a rectangular viewport region with a solid RGB565 color using a 512-byte chunk buffer.
+    /// Fill a rectangular viewport region with a solid RGB565 color using
+    /// a 512-byte chunk buffer.
     pub fn fill_rect(&mut self, mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, color: u16) {
         if x1 > x2 {
             core::mem::swap(&mut x1, &mut x2);
@@ -408,7 +416,7 @@ pub struct MockTouchSpiBus {
 }
 
 impl MockTouchSpiBus {
-    /// Create a mock touch bus with configured touch status and raw ADC coordinates.
+    /// Create a mock touch bus with touch status and raw ADC coordinates.
     pub fn new(touched: bool, raw_x: u16, raw_y: u16) -> Self {
         Self { touched, raw_x, raw_y }
     }
@@ -496,10 +504,11 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
         self.invert_y = invert_y;
     }
 
-    /// Configure physical orientation for the ESP32-2432S028R (CYD) 320x240 landscape mount.
+    /// Configure physical orientation for the ESP32-2432S028R (CYD) 320x240
+    /// landscape mount.
     ///
-    /// Matches `cyd-controller/main/drivers/xpt2046.c` where command `0xD0` (`raw_x`) maps
-    /// directly to `x` (`0..319`) and command `0x90` (`raw_y`) maps directly to `y` (`0..239`).
+    /// Matches `cyd-controller/main/drivers/xpt2046.c` where command `0xD0`
+    /// maps to `x` (`0..319`) and command `0x90` maps to `y` (`0..239`).
     pub fn configure_cyd_landscape(&mut self) {
         self.swap_xy = false;
         self.invert_x = false;
@@ -511,14 +520,9 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
         (self.swap_xy, self.invert_x, self.invert_y)
     }
 
-    /// Map raw 12-bit ADC coordinates into calibrated 320x240 landscape screen coordinates.
+    /// Map raw 12-bit ADC coordinates into calibrated 320x240 landscape
+    /// screen coordinates.
     pub fn calibrate_raw(&self, raw_x: i16, raw_y: i16) -> (i16, i16) {
-        let (rx, ry) = if self.swap_xy {
-            (raw_y, raw_x)
-        } else {
-            (raw_x, raw_y)
-        };
-
         let mut x_range = (self.cal_x_max as i32) - (self.cal_x_min as i32);
         let mut y_range = (self.cal_y_max as i32) - (self.cal_y_min as i32);
 
@@ -529,8 +533,15 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
             y_range = 1;
         }
 
-        let mut cal_x = ((rx as i32) - (self.cal_x_min as i32)) * (CYD_TFT_WIDTH - 1) / x_range;
-        let mut cal_y = ((ry as i32) - (self.cal_y_min as i32)) * (CYD_TFT_HEIGHT - 1) / y_range;
+        let (mut cal_x, mut cal_y) = if self.swap_xy {
+            let cx = ((raw_y as i32) - (self.cal_y_min as i32)) * (CYD_TFT_WIDTH - 1) / y_range;
+            let cy = ((raw_x as i32) - (self.cal_x_min as i32)) * (CYD_TFT_HEIGHT - 1) / x_range;
+            (cx, cy)
+        } else {
+            let cx = ((raw_x as i32) - (self.cal_x_min as i32)) * (CYD_TFT_WIDTH - 1) / x_range;
+            let cy = ((raw_y as i32) - (self.cal_y_min as i32)) * (CYD_TFT_HEIGHT - 1) / y_range;
+            (cx, cy)
+        };
 
         // Clamp to screen boundaries
         if cal_x < 0 {
@@ -695,14 +706,14 @@ mod tests {
         let mut touch = Xpt2046Touch::new(bus);
         assert_eq!(touch.orientation(), (false, false, false));
 
-        // C-firmware xpt2046.c parity: direct mapping (swap_xy=false, invert_x=false, invert_y=false)
+        // C-firmware xpt2046.c parity: direct mapping (no swap, no invert)
         touch.configure_cyd_landscape();
         assert_eq!(touch.orientation(), (false, false, false));
         let (out_x, out_y) = touch.calibrate_raw(3800, 3800);
         assert_eq!(out_x, 319);
         assert_eq!(out_y, 239);
 
-        // Verify custom axis swap & inversion (swap_xy=true, invert_x=false, invert_y=true)
+        // Custom axis swap & inversion (swap_xy=true, invert_x=false, invert_y=true)
         touch.set_orientation(true, false, true);
         assert_eq!(touch.orientation(), (true, false, true));
         let (out_x, out_y) = touch.calibrate_raw(300, 3800);
@@ -714,6 +725,23 @@ mod tests {
         let (out_x, out_y) = touch.calibrate_raw(300, 300);
         assert_eq!(out_x, 319);
         assert_eq!(out_y, 0);
+    }
+
+    #[test]
+    fn test_xpt2046_asymmetric_calibration_with_swap_xy() {
+        let bus = MockTouchSpiBus::default();
+        let mut touch = Xpt2046Touch::new(bus);
+        touch.set_calibration(200, 3400, 400, 3600);
+        touch.set_orientation(true, false, false);
+
+        // swap_xy=true: raw_y mapped to screen X (range 3200), raw_x to screen Y
+        let (out_x, out_y) = touch.calibrate_raw(200, 2000);
+        assert_eq!(out_x, 159);
+        assert_eq!(out_y, 0);
+
+        let (out_x, out_y) = touch.calibrate_raw(1800, 3600);
+        assert_eq!(out_x, 319);
+        assert_eq!(out_y, 119);
     }
 
     #[test]

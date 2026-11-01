@@ -33,7 +33,8 @@ pub trait AudioOutputSink {
     /// Returns the number of frames written.
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error>;
 
-    /// Reconfigures the device clock tree for a new sample rate (e.g. 44100, 48000, 96000).
+    /// Reconfigures the device clock tree for a new sample rate
+    /// (e.g. 44100, 48000, 96000).
     fn set_sample_rate(&mut self, rate_hz: u32) -> Result<(), Self::Error>;
 
     /// Mutes or unmutes the audio output.

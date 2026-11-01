@@ -11,11 +11,14 @@ use squeezelite_tas58xx::{
     VOL_DEFAULT_M20DB, VOL_MUTE, VOL_UNITY_0DB,
 };
 
-/// Maps LMS logarithmic mixer gain (`0..=65536`) to perceptual hardware volume percentage (`0..=100%`).
+/// Maps LMS logarithmic mixer gain (`0..=65536`) to perceptual hardware
+/// volume percentage (`0..=100%`).
 ///
-/// LMS sends gain on a 50 dB curve where 51% slider is `gain = 1842` (-31 dB) and 100% is `gain = 65536` (0 dB).
-/// This fixed-point Q8 integer log2 curve maps `gain = 0 -> 0%`, `gain = 1842 -> 55%` (-22.5 dB on TAS5805M `0x4C`),
+/// LMS sends gain on a 50 dB curve where 51% slider is `gain = 1842` (-31 dB)
+/// and 100% is `gain = 65536` (0 dB). This fixed-point Q8 integer log2 curve
+/// maps `gain = 0 -> 0%`, `gain = 1842 -> 55%` (-22.5 dB on TAS5805M `0x4C`),
 /// and `gain = 65536 -> 100%` (0 dB `0x30` on TAS5805M `0x4C`).
+#[must_use]
 pub fn lms_gain_to_hardware_volume_percent(gain: u32) -> u8 {
     if gain == 0 {
         return 0;
@@ -32,11 +35,13 @@ pub fn lms_gain_to_hardware_volume_percent(gain: u32) -> u8 {
     p.clamp(1, 100) as u8
 }
 
-/// The LMS gain whose perceptual percentage ([`lms_gain_to_hardware_volume_percent`]) is
-/// `percent` (clamped to 100): 100 % is unity (LMS full volume, 0x10000), any other percent
-/// the smallest such gain. Either way its TAS register is exactly [`percent_to_attenuation`]'s.
-/// Lets the local percent-based volume paths (CYD, HTTP/IR, boot) go through the same
-/// gain-based volume entry as `audg`.
+/// The LMS gain whose perceptual percentage
+/// ([`lms_gain_to_hardware_volume_percent`]) is `percent` (clamped to 100):
+/// 100 % is unity (LMS full volume, 0x10000), any other percent the smallest
+/// such gain. Either way its TAS register is [`percent_to_attenuation`]'s.
+/// Lets the local percent-based volume paths (CYD, HTTP/IR, boot) go through
+/// the same gain-based volume entry as `audg`.
+#[must_use]
 pub fn percent_to_lms_gain(percent: u8) -> u32 {
     let percent = percent.min(100);
     if percent == 0 {
@@ -45,8 +50,9 @@ pub fn percent_to_lms_gain(percent: u8) -> u32 {
     if percent == 100 {
         return 0x1_0000;
     }
-    // The curve is monotonic in the gain and reaches every percent 1..=100 (1 at gain 1,
-    // 100 at 65536): binary search for the smallest gain at or above `percent`.
+    // The curve is monotonic in the gain and reaches every percent 1..=100
+    // (1 at gain 1, 100 at 65536): binary search for the smallest gain at or
+    // above `percent`.
     let (mut lo, mut hi) = (1u32, 65_536u32);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -59,18 +65,21 @@ pub fn percent_to_lms_gain(percent: u8) -> u32 {
     lo
 }
 
-/// Maps LMS logarithmic mixer gain (`0..=65536`) to exact TAS5805M `0x4C` hardware volume register code.
+/// Maps LMS logarithmic mixer gain (`0..=65536`) to exact TAS5805M `0x4C`
+/// hardware volume register code.
 ///
 /// TAS5805M `DIG_VOL_CTRL` (register `0x4C`) is calibrated at 0.5 dB per step:
 /// - `0x30` = 0.0 dB (100% volume)
 /// - `0x5D` = -22.5 dB (55% perceptual volume)
 /// - `0xFF` = Mute (0% volume)
+#[must_use]
 pub fn lms_gain_to_tas5805m_vol_reg(gain: u32) -> u8 {
     let pct = lms_gain_to_hardware_volume_percent(gain);
     if pct == 0 {
         0xFF // VOL_MUTE
     } else {
-        0x30 + (100 - pct.min(100)) // 0x30 (0.0 dB) at 100%, +1 (+0.5 dB attenuation) per 1% below 100%
+        // 0x30 (0.0 dB) at 100%, +1 (+0.5 dB attenuation) per 1% below 100%
+        0x30 + (100 - pct.min(100))
     }
 }
 
@@ -89,19 +98,21 @@ pub struct AmpConfig {
     pub i2c_addr: u8,
     /// Initial digital volume register value applied before entering Play mode.
     ///
-    /// Defaults to [`VOL_DEFAULT_M20DB`] (`0x58`, `-20.0 dB` safe startup attenuation)
+    /// Defaults to [`VOL_DEFAULT_M20DB`] (`0x58`, `-20.0 dB` startup attenuation)
     /// to prevent unexpected high-SPL output bursts on boot (PERIPH-612).
     pub initial_volume: u8,
     /// I2S audio word length in bits (16, 20, 24, or 32).
     pub word_length_bits: u8,
-    /// Initial analog gain attenuation code (`0x00..=0x1F`, 0.5 dB/step, default `0x08` = `-4.0 dB`).
+    /// Initial analog gain attenuation code (`0x00..=0x1F`, 0.5 dB/step,
+    /// default `0x08` = `-4.0 dB`).
     pub initial_again_code: u8,
 }
 
 impl Default for AmpConfig {
     /// Returns a safe default amplifier configuration:
     /// - `i2c_addr`: Active board TAS58xx I2C address.
-    /// - `initial_volume`: [`VOL_DEFAULT_M20DB`] (`0x58` = `-20.0 dB` safe startup attenuation, PERIPH-612).
+    /// - `initial_volume`: [`VOL_DEFAULT_M20DB`] (`0x58` = `-20.0 dB` startup
+    ///   attenuation, PERIPH-612).
     /// - `word_length_bits`: `32`-bit I2S frames.
     /// - `initial_again_code`: `0x08` (`-4.0 dB` analog gain attenuation).
     fn default() -> Self {
@@ -114,11 +125,11 @@ impl Default for AmpConfig {
     }
 }
 
-/// Maps a logical `0..=100%` volume percentage to a TAS58xx hardware digital volume
-/// attenuation register value (`0x30..=0xFF`) (PERIPH-601, CODE-TAS-001):
+/// Maps a logical `0..=100%` volume percentage to a TAS58xx digital volume
+/// attenuation register (`0x30..=0xFF`) (PERIPH-601, CODE-TAS-001):
 /// - `0%` returns [`VOL_MUTE`] (`0xFF`, hardware mute).
-/// - `1..=100%` (clamped at `100%`) maps linearly with 0.5 dB/step matching `lms_gain_to_tas5805m_vol_reg`:
-///   `100% => 0x30` (0.0 dB), `50% => 0x62` (-25.0 dB), `1% => 0x93` (-49.5 dB).
+/// - `1..=100%` (clamped at `100%`) maps linearly with 0.5 dB/step:
+///   `100% => 0x30` (0 dB), `50% => 0x62` (-25 dB), `1% => 0x93` (-49.5 dB).
 pub const fn percent_to_attenuation(percent: u8) -> u8 {
     if percent == 0 {
         VOL_MUTE
@@ -146,12 +157,13 @@ impl<I2C, E> AmpManager<I2C>
 where
     I2C: I2c<Error = E>,
 {
-    /// Creates a new amplifier manager with the TAS58xx in PowerDown state for the active board.
+    /// Creates a new amplifier manager with TAS58xx in PowerDown state for
+    /// the active board.
     pub fn new(i2c: I2C) -> Self {
         Self::for_active_board(i2c)
     }
 
-    /// Creates a new amplifier manager using the board's default active address (AMP-007).
+    /// Creates a new amplifier manager using active board address (AMP-007).
     pub fn for_active_board(i2c: I2C) -> Self {
         Self::with_address(i2c, crate::board::ACTIVE_BOARD.tas5805m_i2c_addr())
     }
@@ -190,7 +202,8 @@ where
         self.current_again_code
     }
 
-    /// Sets the analog gain attenuation register (`0x54`, bits 4:0, clamped to 0x1F).
+    /// Sets the analog gain attenuation register (`0x54`, bits 4:0, clamped
+    /// to 0x1F).
     pub fn set_analog_gain(&mut self, again_code: u8) -> Result<(), DriverError<E>> {
         let clamped = again_code.min(0x1F);
         match self.inner.as_mut() {
@@ -213,7 +226,8 @@ where
         self.set_analog_gain(code)
     }
 
-    /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69 in Standby or Play mode.
+    /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69 in
+    /// Standby or Play mode.
     pub fn read_telemetry(&mut self) -> Result<Option<Tas5805mTelemetry>, DriverError<E>> {
         match self.inner.as_mut() {
             Some(AmpInner::Play(driver)) => Ok(Some(driver.read_telemetry()?)),
@@ -266,7 +280,9 @@ where
                         self.inner = Some(AmpInner::Standby(standby));
                         return Err(e);
                     }
-                    if let Err(e) = standby.configure_silicon_maximization(self.current_again_code) {
+                    if let Err(e) =
+                        standby.configure_silicon_maximization(self.current_again_code)
+                    {
                         self.inner = Some(AmpInner::Standby(standby));
                         return Err(e);
                     }
@@ -333,7 +349,8 @@ where
         }
     }
 
-    /// Transitions the amplifier from Standby into active Play mode via Hi-Z staging (`HW-PREP-05`).
+    /// Transitions the amplifier from Standby into active Play mode via
+    /// Hi-Z staging (`HW-PREP-05`).
     ///
     /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
     pub fn start_playback_via_hiz(&mut self) -> Result<(), DriverError<E>> {
@@ -365,7 +382,7 @@ where
         }
     }
 
-    /// Transitions the amplifier from Play back to Standby mode (muting power stage).
+    /// Transitions the amplifier from Play to Standby mode (muting stage).
     /// Preserves `self.inner` if a transient I2C error occurs (PERIPH-604).
     pub fn stop_playback(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.take() {
@@ -390,8 +407,9 @@ where
         }
     }
 
-    /// Sets the raw digital volume attenuation (`0x30..=0xFF`, clamped to prevent hazardous overdrive < 0dB).
-    /// Borrows `self.inner` via `as_mut()` so a transient I2C error never drops the driver (PERIPH-604).
+    /// Sets raw digital volume (`0x30..=0xFF`, clamped to prevent overdrive).
+    /// Borrows `self.inner` via `as_mut()` so transient error keeps driver
+    /// (PERIPH-604).
     pub fn set_volume(&mut self, volume: u8) -> Result<(), DriverError<E>> {
         let safe_vol = volume.max(VOL_UNITY_0DB);
         match self.inner.as_mut() {
@@ -409,8 +427,8 @@ where
         }
     }
 
-    /// Sets the amplifier volume from a logical percentage (`0..=100%`) by converting it to
-    /// a TAS58xx register attenuation code before writing to `DIG_VOL_CTRL` (PERIPH-601).
+    /// Sets volume from logical percent (`0..=100%`) by converting to TAS58xx
+    /// attenuation code before writing `DIG_VOL_CTRL` (PERIPH-601).
     pub fn set_volume_percent(&mut self, percent: u8) -> Result<(), DriverError<E>> {
         let attenuation = percent_to_attenuation(percent);
         self.set_volume(attenuation)
@@ -425,7 +443,8 @@ where
         }
     }
 
-    /// Executes the 3-step TI datasheet hardware fault recovery sequence in Play mode (PERIPH-603).
+    /// Executes the 3-step TI datasheet fault recovery sequence in Play mode
+    /// (PERIPH-603).
     pub fn recover_from_fault(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.as_mut() {
             Some(AmpInner::Play(driver)) => driver.recover_from_fault(),
@@ -451,7 +470,7 @@ where
         }
     }
 
-    /// Selects book and page registers on the TAS58xx amplifier in Standby or Play mode (`RUST-18`).
+    /// Selects book and page registers on TAS58xx in Standby/Play (`RUST-18`).
     pub fn select_book_page(&mut self, book: u8, page: u8) -> Result<(), DriverError<E>> {
         match self.inner.as_mut() {
             Some(AmpInner::Play(driver)) => driver.select_book_page(book, page),
@@ -471,12 +490,17 @@ mod tests {
 
     #[test]
     fn test_percent_to_lms_gain_round_trips_to_the_same_register() {
-        // Local volume paths speak percent; the single volume entry takes LMS gains. Every
-        // percent maps to a gain whose TAS register is exactly percent_to_attenuation's.
+        // Local volume paths speak percent; the single volume entry takes LMS
+        // gains. Every percent maps to a gain whose TAS register is exactly
+        // percent_to_attenuation's.
         for p in 0..=100u8 {
             let g = percent_to_lms_gain(p);
             assert_eq!(lms_gain_to_hardware_volume_percent(g), p, "{p}% -> {g}");
-            assert_eq!(lms_gain_to_tas5805m_vol_reg(g), percent_to_attenuation(p), "{p}%");
+            assert_eq!(
+                lms_gain_to_tas5805m_vol_reg(g),
+                percent_to_attenuation(p),
+                "{p}%"
+            );
         }
         assert_eq!(percent_to_lms_gain(0), 0);
         assert_eq!(percent_to_lms_gain(100), 0x1_0000);
@@ -509,11 +533,17 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // set_volume(0x40)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x40]),
             // stop_playback
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -566,8 +596,14 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume(0x50) in Standby
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x50]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x50]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -614,6 +650,9 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume(0x10) clamped to VOL_UNITY_0DB (0x30)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -653,13 +692,22 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // clear_faults in Standby
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // clear_faults in Play
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -712,8 +760,14 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume_percent(0) -> 0xFF
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_MUTE]),
             // set_volume_percent(100) -> 0x30
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -844,6 +898,9 @@ mod tests {
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback_via_hiz:
             // 1) set_digital_volume(0x58)
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             // 2) try_start_playback_via_hiz sequence:
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),

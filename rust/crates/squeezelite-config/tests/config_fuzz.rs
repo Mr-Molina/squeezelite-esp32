@@ -1,15 +1,19 @@
 //! Property-based fuzz tests for `squeezelite-config`
 //!
-//! Verifies zero-panic guarantees, roundtrip fidelity, and corruption resistance
-//! across arbitrary keys, values, and sector bit-flips.
+//! Verifies zero-panic guarantees, roundtrip fidelity, and corruption
+//! resistance across arbitrary keys, values, and sector bit-flips.
 
-use proptest::prelude::*;
-use squeezelite_config::*;
+use proptest::prelude::{any, prop_assert, prop_assert_eq, prop_assume, ProptestConfig};
+use proptest::proptest;
+use squeezelite_config::{
+    crc32_update, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials,
+};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    /// Invariant: In-memory store preserves arbitrary byte payloads under valid keys.
+    /// Invariant: In-memory store preserves arbitrary byte payloads under
+    /// valid keys.
     #[test]
     fn fuzz_mem_store_roundtrip(
         key in "[a-zA-Z0-9_\\.]{1,24}",
@@ -24,7 +28,8 @@ proptest! {
         prop_assert_eq!(&read_buf[..len], &val[..]);
     }
 
-    /// Invariant: Wi-Fi credentials roundtrip preserves arbitrary SSIDs and passphrases.
+    /// Invariant: Wi-Fi credentials roundtrip preserves arbitrary SSIDs
+    /// and passphrases.
     #[test]
     fn fuzz_wifi_credentials_roundtrip(
         ssid in "[a-zA-Z0-9_\\- ]{1,32}",
@@ -51,7 +56,8 @@ proptest! {
         prop_assert_eq!(l.gateway, gw);
     }
 
-    /// Invariant: FlashJournal serializes and deserializes arbitrary store states without data loss.
+    /// Invariant: FlashJournal serializes and deserializes arbitrary store
+    /// states without data loss.
     #[test]
     fn fuzz_flash_journal_roundtrip(
         k1 in "[a-z]{1,8}",
@@ -60,8 +66,9 @@ proptest! {
         v2 in proptest::collection::vec(any::<u8>(), 0..64),
         vol in any::<u8>(),
     ) {
-        // "vol" is the fixed key this property writes last; a generated k1 equal to it would be
-        // overwritten by the volume byte and could never read back as v1.
+        // "vol" is the fixed key this property writes last; a generated k1
+        // equal to it would be overwritten by the volume byte and could never
+        // read back as v1.
         prop_assume!(k1 != "vol");
         let mut store = MemConfigStore::<16>::new();
         let _ = store.set(&k1, &v1);
@@ -85,7 +92,8 @@ proptest! {
         prop_assert_eq!(restored.get_u8("vol").unwrap(), Some(vol));
     }
 
-    /// Invariant: FlashJournal must detect ANY single bit flip in the sector as corrupted.
+    /// Invariant: FlashJournal must detect ANY single bit flip in the
+    /// sector as corrupted.
     #[test]
     fn fuzz_flash_journal_bitflip_detection(
         val in proptest::collection::vec(any::<u8>(), 10..64),
@@ -106,11 +114,12 @@ proptest! {
         let mut restored = MemConfigStore::<16>::new();
         let res = FlashJournal::load_from_sector(&sector[..written], &mut restored);
 
-        // Must either fail with CorruptedData or InvalidFormat, but NEVER succeed or panic
+        // Must fail with CorruptedData or InvalidFormat, but NEVER panic
         prop_assert!(res.is_err(), "Bitflip at offset {} was not detected!", clamped_offset);
     }
 
-    /// Invariant: Dual-sector journal always recovers the older valid sector if the new sector is torn.
+    /// Invariant: Dual-sector journal recovers older valid sector if new
+    /// sector is torn.
     #[test]
     fn fuzz_dual_sector_torn_write_recovery(
         v1 in proptest::collection::vec(any::<u8>(), 1..32),
@@ -124,14 +133,24 @@ proptest! {
         let mut sector_b = [0u8; 512];
 
         // Valid write to A
-        let (wrote_b, _n_a) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        let (wrote_b, _n_a) = FlashJournal::save_to_dual_sectors(
+            &store,
+            &mut sector_a,
+            &mut sector_b,
+        )
+        .unwrap();
         prop_assert!(!wrote_b);
 
         // Update store with v2
         let _ = store.set("data", &v2);
 
         // Write to B
-        let (wrote_b2, n_b) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        let (wrote_b2, n_b) = FlashJournal::save_to_dual_sectors(
+            &store,
+            &mut sector_a,
+            &mut sector_b,
+        )
+        .unwrap();
         prop_assert!(wrote_b2);
 
         // Simulate torn write to B by truncating or zeroing the tail after tear_pct
@@ -140,7 +159,12 @@ proptest! {
 
         // Dual sector load MUST recover v1 from Sector A without error
         let mut recovered = MemConfigStore::<16>::new();
-        let count = FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut recovered).unwrap();
+        let count = FlashJournal::load_from_dual_sectors(
+            &sector_a,
+            &sector_b,
+            &mut recovered,
+        )
+        .unwrap();
         prop_assert_eq!(count, 1);
 
         let mut buf = [0u8; 32];
@@ -161,10 +185,15 @@ fn test_dual_sector_sequence_wraparound() {
     let bytes_a = FlashJournal::save_to_sector_with_seq(&store, &mut sector_a, u32::MAX).unwrap();
     assert!(bytes_a > FlashJournal::HEADER_SIZE);
 
-    // Save to dual sectors: since sector A is u32::MAX and sector B is unwritten (0s),
-    // save_to_dual_sectors writes to sector B with u32::MAX.wrapping_add(1) = 0
+    // Save to dual sectors: since sector A is u32::MAX and sector B is
+    // unwritten (0s), save_to_dual_sectors writes to sector B with seq 0
     store.set_str("k", "v_zero").unwrap();
-    let (wrote_b, bytes_b) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+    let (wrote_b, bytes_b) = FlashJournal::save_to_dual_sectors(
+        &store,
+        &mut sector_a,
+        &mut sector_b,
+    )
+    .unwrap();
     assert!(wrote_b);
     assert!(bytes_b > FlashJournal::HEADER_SIZE);
 
@@ -180,7 +209,12 @@ fn test_dual_sector_sequence_wraparound() {
 
     // Next save writes to sector A with seq 0.wrapping_add(1) = 1
     store.set_str("k", "v_one").unwrap();
-    let (wrote_b2, _) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+    let (wrote_b2, _) = FlashJournal::save_to_dual_sectors(
+        &store,
+        &mut sector_a,
+        &mut sector_b,
+    )
+    .unwrap();
     assert!(!wrote_b2);
     let (seq_a2, _, _) = FlashJournal::read_sector_meta(&sector_a).unwrap();
     assert_eq!(seq_a2, 1);
@@ -207,7 +241,7 @@ fn test_dual_sector_fallback_on_entry_corruption_in_newer_sector() {
 
     // In newer sector B: corrupt the entry CRC (offset 16 + 3)
     sector_b[FlashJournal::HEADER_SIZE + 3] ^= 0xA5;
-    // Recompute the sector CRC over header[0..12] and payload[16..written_b] so sector metadata is Ok
+    // Recompute sector CRC over header and payload so metadata is Ok
     let mut crc = 0xFFFF_FFFF;
     crc = crc32_update(crc, &sector_b[0..12]);
     crc = crc32_update(crc, &sector_b[FlashJournal::HEADER_SIZE..written_b]);
@@ -220,11 +254,19 @@ fn test_dual_sector_fallback_on_entry_corruption_in_newer_sector() {
 
     // Loading from sector B directly fails with CorruptedData
     let mut tmp = MemConfigStore::<16>::new();
-    assert_eq!(FlashJournal::load_from_sector(&sector_b, &mut tmp), Err(StorageError::CorruptedData));
+    assert_eq!(
+        FlashJournal::load_from_sector(&sector_b, &mut tmp),
+        Err(StorageError::CorruptedData)
+    );
 
     // Dual sector load must automatically fall back to intact sector A
     let mut recovered = MemConfigStore::<16>::new();
-    let count = FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut recovered).unwrap();
+    let count = FlashJournal::load_from_dual_sectors(
+        &sector_a,
+        &sector_b,
+        &mut recovered,
+    )
+    .unwrap();
     assert_eq!(count, 1);
     let mut buf = [0u8; 16];
     let len = recovered.get("k", &mut buf).unwrap();

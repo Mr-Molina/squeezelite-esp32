@@ -1,0 +1,32 @@
+# Vendored copy of opus-rs 0.1.40 (crates.io), patched for `no_std + alloc`.
+# Upstream normalized manifest: Cargo.toml.orig. Patch list: VENDOR.md.
+[package]
+name = "opus-rs"
+version = "0.1.40"
+edition = "2024"
+authors = ["jinti<shenjindi@fourz.cn>"]
+description = "pure Rust implementation of Opus codec. Vendored no_std + alloc port."
+license = "BSD-3-Clause"
+repository = "https://github.com/restsend/opus-rs"
+publish = false
+autobenches = false
+autotests = false
+autoexamples = false
+
+[lib]
+name = "opus_rs"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+default = []
+std = ["alloc"]
+alloc = []
+heap = ["alloc"]
+libm = []
+portable-atomic = ["dep:portable-atomic"]
+
+[dependencies]
+libm = { version = "0.2", default-features = false }
+portable-atomic = { version = "1", optional = true, default-features = false }

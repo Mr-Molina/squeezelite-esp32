@@ -2,17 +2,22 @@
 //!
 //! Provides pure-Rust hardware peripheral bridges and drivers:
 //! - I2S DMA Audio Output (`I2sDmaDriver`, `EspI2sSink`, `LoopbackI2sDma`)
-//! - CYD UART Front-Panel Bridge (`UartPort`, `CydUartBridge`, `LoopbackUartPort`)
-//! - Dual-Sector Raw Flash NVS Backend (`FlashPartition`, `NvsFlashBackend`, `MemFlashPartition`)
+//! - CYD UART Front-Panel Bridge (`UartPort`, `CydUartBridge`,
+//!   `LoopbackUartPort`)
+//! - Dual-Sector Flash NVS Backend (`FlashPartition`, `NvsFlashBackend`,
+//!   `MemFlashPartition`)
 //! - Hardware/Target I2C Bus Adapter (`TargetI2cBus`, `TargetI2cError`)
 
-use embedded_hal::i2c::{Error as I2cError, ErrorKind, ErrorType, I2c, NoAcknowledgeSource, Operation};
+use embedded_hal::i2c::{
+    Error as I2cError, ErrorKind, ErrorType, I2c, NoAcknowledgeSource, Operation,
+};
 use squeezelite_audio_core::output::{AudioOutputSink, OutputError};
 use squeezelite_config::{DualSectorFlashStore, FlashJournal, MemConfigStore, StorageError};
 use squeezelite_cyd_link::{CydCommand, CydMessage, LinkError};
 use squeezelite_tas58xx::registers;
 
-/// HAL-level error type covering bus writes, storage bounds, link and storage failures (`CODE-HAL-003`).
+/// HAL-level error type covering bus writes, bounds, link and storage
+/// failures (`CODE-HAL-003`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HalError {
     BusWriteFailed,
@@ -85,7 +90,8 @@ pub trait I2sDmaDriver {
     fn set_tx_enabled(&mut self, enabled: bool);
 }
 
-/// Hardware-register-accurate loopback DMA driver for host simulation and verification.
+/// Hardware-register-accurate loopback DMA driver for host simulation
+/// and verification.
 #[derive(Debug, Clone)]
 pub struct LoopbackI2sDma {
     pub clock_hz: u32,
@@ -228,10 +234,9 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
                 written_bytes = chunk_bytes;
             }
 
-            // HALNET-402: An I2S 32-bit stereo frame is 8 bytes (4 bytes Left + 4 bytes Right).
-            // If the DMA driver returned a partial frame (written_bytes % 8 != 0), loop to write
-            // the remaining 8 - (written_bytes % 8) bytes of that stereo frame so Left/Right
-            // channels never split or swap!
+            // HALNET-402: I2S 32-bit stereo frame is 8 bytes (4B Left + 4B Right).
+            // If the DMA driver returned a partial frame (written_bytes % 8 != 0),
+            // loop to write remaining bytes so channels never split or swap!
             if written_bytes % 8 != 0 {
                 let aligned_end = written_bytes + (8 - (written_bytes % 8));
                 let mut retries = 0u8;
@@ -413,7 +418,8 @@ impl<U: UartPort> CydUartBridge<U> {
         Ok(offset)
     }
 
-    /// Flushes an outbound telemetry message to the UART TX port across partial writes (`HALNET-407`, `CODE-HAL-003`).
+    /// Flushes an outbound telemetry message to the UART TX port across
+    /// partial writes (`HALNET-407`, `CODE-HAL-003`).
     pub fn flush_outbound(&mut self, msg: &CydMessage) -> Result<usize, HalError> {
         self.send_message(msg)
     }
@@ -432,9 +438,13 @@ pub trait FlashPartition {
     fn read_sector(&self, sector_idx: u8) -> Result<&[u8; FLASH_SECTOR_SIZE], StorageError>;
 
     /// Writes a 4096-byte sector (0 for Sector A, 1 for Sector B).
-    fn write_sector(&mut self, sector_idx: u8, data: &[u8; FLASH_SECTOR_SIZE]) -> Result<(), StorageError>;
+    fn write_sector(
+        &mut self,
+        sector_idx: u8,
+        data: &[u8; FLASH_SECTOR_SIZE],
+    ) -> Result<(), StorageError>;
 
-    /// Erases a 4096-byte sector (0 for Sector A, 1 for Sector B), setting all bytes to 0xFF.
+    /// Erases a 4096-byte sector (0 for Sector A, 1 for Sector B) to 0xFF.
     fn erase_sector(&mut self, sector_idx: u8) -> Result<(), StorageError> {
         self.write_sector(sector_idx, &[0xFF; FLASH_SECTOR_SIZE])
     }
@@ -471,7 +481,11 @@ impl FlashPartition for MemFlashPartition {
         }
     }
 
-    fn write_sector(&mut self, sector_idx: u8, data: &[u8; FLASH_SECTOR_SIZE]) -> Result<(), StorageError> {
+    fn write_sector(
+        &mut self,
+        sector_idx: u8,
+        data: &[u8; FLASH_SECTOR_SIZE],
+    ) -> Result<(), StorageError> {
         match sector_idx {
             0 => {
                 self.sector_a.copy_from_slice(data);
@@ -533,7 +547,10 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
     }
 
     /// Loads key-value configuration from dual flash sectors into `store`.
-    pub fn load_store<const N: usize>(&mut self, store: &mut MemConfigStore<N>) -> Result<usize, StorageError> {
+    pub fn load_store<const N: usize>(
+        &mut self,
+        store: &mut MemConfigStore<N>,
+    ) -> Result<usize, StorageError> {
         let a = self.flash.read_sector(0)?;
         let b = self.flash.read_sector(1)?;
 
@@ -557,10 +574,14 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
         Ok(count)
     }
 
-    /// Commits the in-memory store atomically to the alternate flash sector with incremented sequence.
+    /// Commits in-memory store to alternate flash sector with incremented seq.
     ///
-    /// Uses `self.scratch` to avoid allocating 4KB sector buffers on the call stack (`HALNET-408`, `CODE-HAL-001`).
-    pub fn commit_store<const N: usize>(&mut self, store: &MemConfigStore<N>) -> Result<u32, StorageError> {
+    /// Uses `self.scratch` to avoid allocating 4KB buffers on stack
+    /// (`HALNET-408`, `CODE-HAL-001`).
+    pub fn commit_store<const N: usize>(
+        &mut self,
+        store: &MemConfigStore<N>,
+    ) -> Result<u32, StorageError> {
         let s0 = self.flash.read_sector(0)?;
         let s1 = self.flash.read_sector(1)?;
 
@@ -577,12 +598,14 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
         };
 
         FlashJournal::save_to_sector_with_seq(store, &mut self.scratch, next_seq)?;
+        self.flash.erase_sector(target_sector)?;
         self.flash.write_sector(target_sector, &self.scratch)?;
         self.last_seq = next_seq;
         Ok(next_seq)
     }
 
-    /// Erases all sectors (0 and 1) in the flash partition and resets journal state (`HALNET-408`).
+    /// Erases all sectors (0 and 1) in partition and resets journal
+    /// state (`HALNET-408`).
     pub fn erase_all(&mut self) -> Result<(), StorageError> {
         self.flash.erase_sector(0)?;
         self.flash.erase_sector(1)?;
@@ -596,7 +619,8 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
         self.flash.erase_sector(sector_idx)
     }
 
-    /// Erases flash partition sectors spanning byte range `start..end` (`CODE-HAL-003`).
+    /// Erases flash partition sectors spanning byte range `start..end`
+    /// (`CODE-HAL-003`).
     pub fn erase_range(&mut self, range: core::ops::Range<usize>) -> Result<(), HalError> {
         if range.is_empty() || range.start >= range.end || range.end > FLASH_SECTOR_SIZE * 2 {
             return Err(HalError::StorageBoundsError);
@@ -647,7 +671,8 @@ impl I2cError for TargetI2cError {
     }
 }
 
-/// Hardware/target I2C bus adapter for TAS5805M/TAS5825M digital amplifier control.
+/// Hardware/target I2C bus adapter for TAS5805M/TAS5825M digital amplifier
+/// control.
 #[derive(Debug, Clone)]
 pub struct TargetI2cBus {
     pub sda_pin: u8,
@@ -676,7 +701,7 @@ impl TargetI2cBus {
         )
     }
 
-    /// Creates a target I2C bus with explicit pin assignments and default TAS5805M telemetry.
+    /// Creates target I2C bus with explicit pins and default telemetry.
     pub fn with_pins(sda_pin: u8, scl_pin: u8) -> Self {
         let mut registers = [0u8; 256];
         registers[0x37] = 0x08; // 44.1 kHz detected FS_MON
@@ -719,7 +744,8 @@ impl I2c for TargetI2cBus {
             }
         }
 
-        // Special hardware simulation: FAULT_CLEAR register (0x78) bit 7 clears faults (0x70..=0x73)
+        // Hardware simulation: FAULT_CLEAR register (0x78) bit 7 clears
+        // faults (0x70..=0x73)
         if write.len() > 1 && write[0] == registers::FAULT_CLEAR && (write[1] & 0x80) != 0 {
             self.registers[registers::CHAN_FAULT as usize] = 0;
             self.registers[registers::GLOBAL_FAULT1 as usize] = 0;
@@ -730,13 +756,22 @@ impl I2c for TargetI2cBus {
         Ok(())
     }
 
-    fn write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
+    fn write_read(
+        &mut self,
+        address: u8,
+        write: &[u8],
+        read: &mut [u8],
+    ) -> Result<(), Self::Error> {
         self.write(address, write)?;
         self.read(address, read)?;
         Ok(())
     }
 
-    fn transaction(&mut self, address: u8, operations: &mut [Operation<'_>]) -> Result<(), Self::Error> {
+    fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [Operation<'_>],
+    ) -> Result<(), Self::Error> {
         for op in operations {
             match op {
                 Operation::Read(buf) => self.read(address, buf)?,
@@ -756,7 +791,8 @@ pub trait WifiDriver {
     /// Initiates a station connection to the given SSID and passphrase.
     fn start_connect(&mut self, ssid: &str, passphrase: &str) -> Result<(), &'static str>;
 
-    /// Returns `Some(ipv4_octets)` when the Wi-Fi station link is associated and has an IPv4 lease.
+    /// Returns `Some(ipv4_octets)` when the Wi-Fi station link is associated
+    /// and has an IPv4 lease.
     fn is_connected(&self) -> Option<[u8; 4]>;
 
     /// Disconnects the Wi-Fi station interface.
@@ -795,7 +831,8 @@ impl WifiDriver for LoopbackWifiDriver {
     }
 }
 
-/// Bridges `WifiManager` state machine with a hardware `WifiDriver` (`HALNET-411`).
+/// Bridges `WifiManager` state machine with a hardware `WifiDriver`
+/// (`HALNET-411`).
 pub struct EspWifiAdapter<D: WifiDriver, S = MemConfigStore<32>> {
     pub driver: D,
     pub manager: crate::wifi::WifiManager<S>,
@@ -815,7 +852,8 @@ impl<D: WifiDriver, S: squeezelite_config::KeyValueStorage> EspWifiAdapter<D, S>
         self.ip_addr
     }
 
-    /// Polls the hardware Wi-Fi link status and advances the `WifiManager` state machine (`HALNET-411`).
+    /// Polls hardware Wi-Fi link and advances `WifiManager` state machine
+    /// (`HALNET-411`).
     pub fn poll_connection(&mut self) -> crate::wifi::WifiState {
         if self.manager.state() == crate::wifi::WifiState::Connecting {
             if let Some(ip) = self.driver.is_connected() {
@@ -906,9 +944,9 @@ mod tests {
 
     #[test]
     fn test_esp_i2s_sink_partial_dma_frame_completion() {
-        // HALNET-402: Simulate DMA driver returning 3 bytes, then 3 bytes, then 2 bytes
-        // for the first 8-byte stereo frame. Verify EspI2sSink loops to complete the full
-        // 8-byte frame so Left/Right channels are never split or swapped.
+        // HALNET-402: Simulate DMA returning 3 bytes, then 3 bytes, then 2 bytes
+        // for first 8-byte stereo frame. Verify EspI2sSink loops to complete
+        // full 8-byte frame so Left/Right channels are never split or swapped.
         let driver = PartialDmaDriver::new(vec![3, 3, 2]);
         let mut sink = EspI2sSink::for_active_board(driver, 44100);
 
@@ -1046,7 +1084,7 @@ mod tests {
         assert_eq!(seq2, 2);
         assert_eq!(backend.last_seq(), 2);
 
-        // 4. Simulate complete power cycle by transferring flash partition to new backend
+        // 4. Simulate power cycle by transferring flash partition to new backend
         let flash_sim = backend.into_flash();
         let mut new_backend = NvsFlashBackend::new(flash_sim);
         let mut restored_store = MemConfigStore::<16>::new();
@@ -1096,7 +1134,7 @@ mod tests {
 
     #[test]
     fn test_esp_wifi_adapter_connecting_to_connected_transition() {
-        // HALNET-411: Verify EspWifiAdapter::poll_connection transitions from Connecting -> Connected
+        // HALNET-411: Verify poll_connection transitions Connecting -> Connected
         let mut driver = LoopbackWifiDriver::new();
         let mut store = MemConfigStore::<32>::new();
         let creds = WifiCredentials::new("TestNet", "SecretPass123").unwrap();
@@ -1148,7 +1186,8 @@ mod tests {
         // CODE-HAL-003: verify bounds checking on erase_range
         assert_eq!(backend.erase_range(0..0), Err(HalError::StorageBoundsError));
         assert_eq!(backend.erase_range(100..50), Err(HalError::StorageBoundsError));
-        assert_eq!(backend.erase_range(0..FLASH_SECTOR_SIZE * 3), Err(HalError::StorageBoundsError));
+        let bad_range = 0..FLASH_SECTOR_SIZE * 3;
+        assert_eq!(backend.erase_range(bad_range), Err(HalError::StorageBoundsError));
     }
 }
 

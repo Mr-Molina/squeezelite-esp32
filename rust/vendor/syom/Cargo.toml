@@ -1,0 +1,36 @@
+# Vendored copy of syom 0.7.1 (crates.io), patched for `no_std + alloc`.
+# Upstream normalized manifest: Cargo.toml.orig. Patch list: VENDOR.md.
+[package]
+name = "syom"
+version = "0.7.1"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Evgeny Khodzitsky"]
+description = "AAC to planar f32. LC, HE-AAC, AAC-LD. ADTS, M4A, LATM. Vendored no_std + alloc port."
+readme = "README.md"
+repository = "https://github.com/ekhodzitsky/syom"
+publish = false
+autobenches = false
+autotests = false
+
+[lib]
+name = "syom"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+default = ["std"]
+# `std` restores the upstream file/`io::Read` APIs, the encoder, and the
+# host-only profiling hooks. Without it the crate is `no_std + alloc` and
+# exposes the decoder surface only.
+std = []
+
+[dependencies]
+libm = "0.2"
+once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

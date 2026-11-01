@@ -2,7 +2,8 @@
 //!
 //! The code deliberately mirrors the structure of `minimp3.h` (function names
 //! are snake_case versions of the C ones) so the two can be read side by side.
-//! Every floating-point expression is evaluated in the same order as in C, which
+//! Every floating-point expression is evaluated in the same order as in C,
+//! which
 //! keeps the output bit-identical to upstream built with `MINIMP3_ONLY_MP3`,
 //! `MINIMP3_FLOAT_OUTPUT` and `MINIMP3_NO_SIMD`; `parity/` checks this.
 
@@ -17,7 +18,18 @@ mod lanes;
 mod layer12;
 mod tables;
 use lanes::{Lanes, F4};
-use tables::*;
+use tables::{
+    HDR_BITRATE_KBPS_HALFRATE, HDR_SAMPLE_RATE_HZ_G_HZ, G_POW43,
+    L3_ANTIALIAS_G_AA, L3_DECODE_SCALEFACTORS_G_MOD,
+    L3_DECODE_SCALEFACTORS_G_PREAMP, L3_DECODE_SCALEFACTORS_G_SCFC_DECODE,
+    L3_DECODE_SCALEFACTORS_G_SCM_PARTITIONS, L3_HUFFMAN_G_LINBITS,
+    L3_HUFFMAN_TAB32, L3_HUFFMAN_TAB33, L3_HUFFMAN_TABINDEX,
+    L3_HUFFMAN_TABS, L3_IMDCT12_G_TWID3, L3_IMDCT36_G_TWID9,
+    L3_IMDCT_GR_G_MDCT_WINDOW, L3_LDEXP_Q2_G_EXPFRAC,
+    L3_READ_SIDE_INFO_G_SCF_LONG, L3_READ_SIDE_INFO_G_SCF_MIXED,
+    L3_READ_SIDE_INFO_G_SCF_SHORT, L3_STEREO_PROCESS_G_PAN,
+    MP3D_DCT_II_G_SEC, MP3D_SYNTH_G_WIN,
+};
 
 const HDR_SIZE: usize = 4;
 const MAX_FREE_FORMAT_FRAME_SIZE: usize = 2304;
@@ -26,7 +38,8 @@ const MAX_BITRESERVOIR_BYTES: usize = 511;
 const MAX_L3_FRAME_PAYLOAD_BYTES: usize = MAX_FREE_FORMAT_FRAME_SIZE;
 const SHORT_BLOCK_TYPE: u8 = 2;
 const STOP_BLOCK_TYPE: u8 = 3;
-/// `MAX_SCFI` in C: `(255 + BITS_DEQUANTIZER_OUT*4 - 210 + 3) & ~3` with `BITS_DEQUANTIZER_OUT = -1`.
+/// `MAX_SCFI` in C: `(255 + BITS_DEQUANTIZER_OUT*4 - 210 + 3) & ~3` with
+/// `BITS_DEQUANTIZER_OUT = -1`.
 const MAX_SCFI: i32 = (255 - 4 - 210 + 3) & !3;
 
 /// A PCM output sample format: `f32`, `i8`, `u8`, `i16`, `u16`, `i32` or `u32`.
@@ -40,7 +53,7 @@ const MAX_SCFI: i32 = (255 - 4 - 210 + 3) & !3;
 /// | `i16` | rounded half away from zero and clipped |
 /// | `i8` | divided by 256, rounded half away from zero and clipped |
 /// | `i32` | multiplied by 65536, rounded half away from zero and clipped |
-/// | `u8`, `u16`, `u32` | as the signed type, offset by half the range (sign bit flipped) |
+/// | `u8`, `u16`, `u32` | as signed type, offset by half range (sign flipped) |
 ///
 /// Integer formats carry at most about 24 significant bits, since that's the
 /// precision of the synthesis.
@@ -701,7 +714,13 @@ fn l3_huffman_pairs<const LINBITS: bool>(
     }
 }
 
-fn l3_huffman(dst: &mut [f32; 576], bs: &mut Bs, gr_info: &GrInfo, scf: &[f32; 40], layer3gr_limit: i32) {
+fn l3_huffman(
+    dst: &mut [f32; 576],
+    bs: &mut Bs,
+    gr_info: &GrInfo,
+    scf: &[f32; 40],
+    layer3gr_limit: i32,
+) {
     let mut one = 0.0f32;
     let mut ireg = 0;
     let mut big_val_cnt = i32::from(gr_info.big_values);
@@ -754,9 +773,9 @@ fn l3_huffman(dst: &mut [f32; 576], bs: &mut Bs, gr_info: &GrInfo, scf: &[f32; 4
     'count1: loop {
         let mut leaf = i32::from(codebook_count1[br.peek(4) as usize]);
         if leaf & 8 == 0 {
-            leaf = i32::from(
-                codebook_count1[(leaf >> 3) as usize + (br.cache << 4 >> (32 - (leaf & 3))) as usize],
-            );
+            let offset = (leaf >> 3) as usize
+                + (br.cache << 4 >> (32 - (leaf & 3))) as usize;
+            leaf = i32::from(codebook_count1[offset]);
         }
         br.flush(leaf & 7);
         if br.pos() > layer3gr_limit {
@@ -863,7 +882,8 @@ fn l3_intensity_stereo(buf: &mut [f32; 1152], ist_pos: &mut [u8; 39], gr: &[GrIn
         let prev = itop - max_blocks;
         ist_pos[itop] = if max_band[i] >= prev as i32 { default_pos } else { ist_pos[prev] };
     }
-    l3_stereo_process(buf, ist_pos, gr[0].sfbtab, hdr, &max_band, u32::from(gr[1].scalefac_compress & 1));
+    let comp = u32::from(gr[1].scalefac_compress & 1);
+    l3_stereo_process(buf, ist_pos, gr[0].sfbtab, hdr, &max_band, comp);
 }
 
 fn l3_reorder(grbuf: &mut [f32], scratch: &mut [f32], sfb: &[u8]) {
@@ -967,8 +987,10 @@ fn l3_imdct36_bands<T: Lanes>(grbuf: &mut [f32], overlap: &mut [f32], window: &[
 
     for i in 0..9 {
         let ovl = T::gather(&overlap[i..], 9);
-        let sum = co[i] * c(L3_IMDCT36_G_TWID9[9 + i]) + si[i] * c(L3_IMDCT36_G_TWID9[i]);
-        (co[i] * c(L3_IMDCT36_G_TWID9[i]) - si[i] * c(L3_IMDCT36_G_TWID9[9 + i])).scatter(&mut overlap[i..], 9);
+        let twid1 = c(L3_IMDCT36_G_TWID9[i]);
+        let twid2 = c(L3_IMDCT36_G_TWID9[9 + i]);
+        let sum = co[i] * twid2 + si[i] * twid1;
+        (co[i] * twid1 - si[i] * twid2).scatter(&mut overlap[i..], 9);
         (ovl * c(window[i]) - sum * c(window[9 + i])).scatter(&mut grbuf[i..], 18);
         (ovl * c(window[9 + i]) + sum * c(window[i])).scatter(&mut grbuf[17 - i..], 18);
     }
@@ -1011,7 +1033,13 @@ fn l3_imdct12(x: &[f32], dst: &mut [f32], overlap: &mut [f32]) {
 }
 
 fn l3_imdct_short(grbuf: &mut [f32], overlap: &mut [f32], nbands: usize) {
-    for (grbuf, overlap) in grbuf.as_chunks_mut::<18>().0.iter_mut().zip(overlap.as_chunks_mut::<9>().0).take(nbands) {
+    for (grbuf, overlap) in grbuf
+        .as_chunks_mut::<18>()
+        .0
+        .iter_mut()
+        .zip(overlap.as_chunks_mut::<9>().0)
+        .take(nbands)
+    {
         let mut tmp = [0f32; 18];
         tmp.copy_from_slice(grbuf);
         grbuf[..6].copy_from_slice(&overlap[..6]);
@@ -1030,7 +1058,12 @@ fn l3_change_sign(grbuf: &mut [f32; 576]) {
     }
 }
 
-fn l3_imdct_gr(grbuf: &mut [f32; 576], overlap: &mut [f32; 288], block_type: u8, n_long_bands: usize) {
+fn l3_imdct_gr(
+    grbuf: &mut [f32; 576],
+    overlap: &mut [f32; 288],
+    block_type: u8,
+    n_long_bands: usize,
+) {
     let (long_buf, rest_buf) = grbuf.split_at_mut(18 * n_long_bands);
     let (long_ovl, rest_ovl) = overlap.split_at_mut(9 * n_long_bands);
     if n_long_bands != 0 {
@@ -1107,8 +1140,9 @@ fn l3_decode(
     for ch in 0..nch {
         let gr = &gr_info[ch];
         let mut aa_bands = 31;
+        let shift = (hdr.get_my_sample_rate() == 2) as u32;
         let n_long_bands: usize =
-            (if gr.mixed_block_flag != 0 { 2 } else { 0 }) << (hdr.get_my_sample_rate() == 2) as u32;
+            (if gr.mixed_block_flag != 0 { 2 } else { 0 }) << shift;
 
         if gr.n_short_sfb != 0 {
             aa_bands = n_long_bands.saturating_sub(1);
@@ -1244,8 +1278,12 @@ fn mp3d_synth<S: Sample, const NCH: usize>(
     lins: &mut [[f32; 4]; SYNTH_ROWS],
     compat: bool,
 ) {
-    let xl: &[f32; 560] = xl[..560].try_into().unwrap();
-    let xr: &[f32; 560] = xr[..560].try_into().unwrap();
+    let Ok(xl): Result<&[f32; 560], _> = xl[..xl.len().min(560)].try_into() else {
+        return;
+    };
+    let Ok(xr): Result<&[f32; 560], _> = xr[..xr.len().min(560)].try_into() else {
+        return;
+    };
     let dst = &mut dst[..64 * NCH];
     let r = NCH - 1;
 
@@ -1267,13 +1305,24 @@ fn mp3d_synth<S: Sample, const NCH: usize>(
     pair(32 * NCH, 31, 0);
 
     for i in (0..15).rev() {
-        lins[ZLIN + i] = [xl[18 * (31 - i)], xr[18 * (31 - i)], xl[1 + 18 * (31 - i)], xr[1 + 18 * (31 - i)]];
+        lins[ZLIN + i] = [
+            xl[18 * (31 - i)],
+            xr[18 * (31 - i)],
+            xl[1 + 18 * (31 - i)],
+            xr[1 + 18 * (31 - i)],
+        ];
         lins[ZLIN + 16 + i][0] = xl[1 + 18 * (1 + i)];
         lins[ZLIN + 16 + i][1] = xr[1 + 18 * (1 + i)];
         lins[ZLIN - 16 + i][2] = xl[18 * (1 + i)];
         lins[ZLIN - 16 + i][3] = xr[18 * (1 + i)];
 
-        let w: &[f32; 16] = MP3D_SYNTH_G_WIN[(14 - i) * 16..][..16].try_into().unwrap();
+        let w: &[f32; 16] = match MP3D_SYNTH_G_WIN.get((14 - i) * 16..(14 - i) * 16 + 16) {
+            Some(slice) => match slice.try_into() {
+                Ok(arr) => arr,
+                Err(_) => &[0.0; 16],
+            },
+            None => &[0.0; 16],
+        };
         let vz = |k: usize| F4::load(&lins[ZLIN + i - 16 * k]);
         let vy = |k: usize| F4::load(&lins[i + 16 * k]);
         let w0 = |k: usize| F4::splat(w[2 * k]);
@@ -1314,17 +1363,24 @@ fn mp3d_synth_all<S: Sample, const NCH: usize>(
     compat: bool,
 ) {
     for i in (0..nbands).step_by(2) {
+        let Some(lins_slice) = lins.get_mut(16 * i..16 * i + SYNTH_ROWS) else {
+            continue;
+        };
+        let Ok(lins_sub) = lins_slice.try_into() else {
+            continue;
+        };
         mp3d_synth::<S, NCH>(
             &grbuf[i..],
             &grbuf[576 * (NCH - 1) + i..],
             &mut pcm[32 * NCH * i..],
-            (&mut lins[16 * i..16 * i + SYNTH_ROWS]).try_into().unwrap(),
+            lins_sub,
             compat,
         );
     }
 }
 
-/// Rows in the whole synthesis buffer (`syn` in C: `(18 + 15) * 2 * 32` floats).
+/// Rows in the whole synthesis buffer (`syn` in C:
+/// `(18 + 15) * 2 * 32` floats).
 const SYN_ROWS: usize = (18 + 15) * 2 * 32 / 4;
 
 fn mp3d_synth_granule<S: Sample>(
@@ -1390,12 +1446,17 @@ pub fn mp3d_find_frame(mp3: &[u8], free_format_bytes: &mut usize) -> (usize, usi
             let mut frame_and_padding = frame_bytes + h.padding();
 
             let mut k = HDR_SIZE;
-            while frame_bytes == 0 && k < MAX_FREE_FORMAT_FRAME_SIZE && i + 2 * k + HDR_SIZE < mp3_bytes {
+            while frame_bytes == 0
+                && k < MAX_FREE_FORMAT_FRAME_SIZE
+                && i + 2 * k + HDR_SIZE < mp3_bytes
+            {
                 let next = Header::read(&buf[k..]);
                 if h.compare(next) {
                     let fb = k - h.padding();
                     let nextfb = fb + next.padding();
-                    if i + k + nextfb + HDR_SIZE <= mp3_bytes && h.compare(Header::read(&buf[k + nextfb..])) {
+                    if i + k + nextfb + HDR_SIZE <= mp3_bytes
+                        && h.compare(Header::read(&buf[k + nextfb..]))
+                    {
                         frame_and_padding = k;
                         frame_bytes = fb;
                         *free_format_bytes = fb;
@@ -1404,8 +1465,10 @@ pub fn mp3d_find_frame(mp3: &[u8], free_format_bytes: &mut usize) -> (usize, usi
                 k += 1;
             }
 
-            if (frame_bytes != 0 && i + frame_and_padding <= mp3_bytes && mp3d_match_frame(buf, frame_bytes))
-                || (i == 0 && frame_and_padding == mp3_bytes)
+            let matched = frame_bytes != 0
+                && i + frame_and_padding <= mp3_bytes
+                && mp3d_match_frame(buf, frame_bytes);
+            if matched || (i == 0 && frame_and_padding == mp3_bytes)
             {
                 return (i, frame_and_padding);
             }
@@ -1495,7 +1558,9 @@ pub fn mp3dec_decode_frame<S: Sample>(
     if info.layer != 3 {
         #[cfg(feature = "layer12")]
         {
-            let n = layer12::decode_frame(dec, scratch, hdr, &mut bs_frame, pcm, info.channels as usize, compat);
+            let n = layer12::decode_frame(
+                dec, scratch, hdr, &mut bs_frame, pcm, info.channels as usize, compat,
+            );
             info.status = if n == 0 { Status::Corrupt } else { Status::Decoded };
             return n;
         }
@@ -1534,7 +1599,9 @@ pub fn mp3dec_decode_frame<S: Sample>(
                 &gr_info[igr * nch..],
                 nch,
             );
-            mp3d_synth_granule(&mut dec.qmf_state, &mut scratch.grbuf, 18, nch, pcm, &mut scratch.syn, compat);
+            mp3d_synth_granule(
+                &mut dec.qmf_state, &mut scratch.grbuf, 18, nch, pcm, &mut scratch.syn, compat,
+            );
         }
     }
     l3_save_reservoir(dec, &bs);

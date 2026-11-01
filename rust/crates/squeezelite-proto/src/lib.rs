@@ -222,7 +222,8 @@ pub enum StreamCommandType {
     Stop,
     /// Flush audio buffer immediately.
     Flush,
-    /// Undefined or extended stream command (including `'t'` timestamp and `'a'` skip-ahead).
+    /// Undefined or extended stream command (including `'t'` timestamp and
+    /// `'a'` skip-ahead).
     Unknown(u8),
 }
 
@@ -317,7 +318,8 @@ pub enum ServerCommand<'a> {
     Body {
         data: &'a [u8],
     },
-    /// Extended or unrecognized packet opcode (`setd` variable data, `aude`, `cont`, `serv`, `vers`, `dsco`, etc.).
+    /// Extended or unrecognized packet opcode (`setd` variable data, `aude`,
+    /// `cont`, `serv`, `vers`, `dsco`, etc.).
     Unknown {
         opcode: [u8; 4],
         payload: &'a [u8],
@@ -325,7 +327,8 @@ pub enum ServerCommand<'a> {
 }
 
 impl<'a> ServerCommand<'a> {
-    /// Extracts the `setd` device setting `(id, data)` if this command is a `setd` frame.
+    /// Extracts the `setd` device setting `(id, data)` if this command is a
+    /// `setd` frame.
     pub fn device_setting(&self) -> Option<DeviceSetting<'a>> {
         match *self {
             Self::Unknown {
@@ -335,15 +338,18 @@ impl<'a> ServerCommand<'a> {
                 id: payload[0],
                 data: &payload[1..],
             }),
-            Self::SetDevice { sample_rate } if sample_rate <= u8::MAX as u32 => Some(DeviceSetting {
-                id: sample_rate as u8,
-                data: &[],
-            }),
+            Self::SetDevice { sample_rate } if sample_rate <= u8::MAX as u32 => {
+                Some(DeviceSetting {
+                    id: sample_rate as u8,
+                    data: &[],
+                })
+            }
             _ => None,
         }
     }
 
-    /// Extracts `(spdif_enable, dac_enable)` if this command is an `aude` frame.
+    /// Extracts `(spdif_enable, dac_enable)` if this command is an `aude`
+    /// frame.
     pub const fn audio_enable(&self) -> Option<(bool, bool)> {
         match *self {
             Self::Unknown {
@@ -354,7 +360,8 @@ impl<'a> ServerCommand<'a> {
         }
     }
 
-    /// Extracts the `metaint` metadata interval if this command is a `cont` frame.
+    /// Extracts the `metaint` metadata interval if this command is a `cont`
+    /// frame.
     pub fn stream_continue(&self) -> Option<u32> {
         match *self {
             Self::Unknown {
@@ -375,10 +382,11 @@ impl<'a> ServerCommand<'a> {
 
     /// Extracts `(server_ip, syncgroup)` if this command is a `serv` frame.
     ///
-    /// C parity (`slimproto.c:641-656`): the syncgroup is the tail after the IPv4 address only
-    /// when it is exactly [`SYNCGROUP_ID_LEN`] bytes; any other tail means "no syncgroup" (C
-    /// frees `new_server_cap`). `0.0.0.1` is C's SqueezeNetwork marker (`slimproto.c:633-634`); it
-    /// is returned as is for the caller to decide.
+    /// C parity (`slimproto.c:641-656`): the syncgroup is the tail after the
+    /// IPv4 address only when it is exactly [`SYNCGROUP_ID_LEN`] bytes; any
+    /// other tail means "no syncgroup" (C frees `new_server_cap`). `0.0.0.1` is
+    /// C's SqueezeNetwork marker (`slimproto.c:633-634`); it is returned as is
+    /// for the caller to decide.
     pub fn switch_server(&self) -> Option<([u8; 4], Option<&'a [u8]>)> {
         match *self {
             Self::Unknown {
@@ -448,8 +456,8 @@ impl SlimprotoParser {
     /// Parses a single SlimProto frame from a byte slice.
     ///
     /// Supports the official SlimProto server-to-client 6-byte frame header
-    /// (`[2-byte BE length][4-byte ASCII opcode][payload]`) and the 8-byte frame header
-    /// (`[4-byte ASCII opcode][4-byte BE length][payload]`).
+    /// (`[2-byte BE length][4-byte ASCII opcode][payload]`) and the 8-byte
+    /// frame header (`[4-byte ASCII opcode][4-byte BE length][payload]`).
     ///
     /// Returns `Ok((ServerCommand, bytes_consumed))` on success.
     /// Returns `Err(ParseError::BufferTooShort)` if more data is needed.
@@ -522,7 +530,8 @@ impl SlimprotoParser {
         }
 
         let command = StreamCommandType::from_byte(payload[0]);
-        let autostart = payload[1] == b'1' || payload[1] == b'3';
+        let autostart =
+            payload[1] == b'1' || payload[1] == b'3' || payload[1] == 1 || payload[1] == 3;
         let format = AudioFormat::from_byte(payload[2]);
         let pcm_sample_size = payload[3];
         let pcm_sample_rate = payload[4];
@@ -532,11 +541,12 @@ impl SlimprotoParser {
         let spdif_enable = payload[8] != 0;
         let trans_duration = payload[9];
         let trans_type = TransitionType::from_byte(payload[10]);
-        let flags = if payload[1] == b'2' || payload[1] == b'3' || payload[1] == 2 || payload[1] == 3 {
-            payload[11] | STRM_FLAG_CONT_WAIT
-        } else {
-            payload[11]
-        };
+        let flags =
+            if payload[1] == b'2' || payload[1] == b'3' || payload[1] == 2 || payload[1] == 3 {
+                payload[11] | STRM_FLAG_CONT_WAIT
+            } else {
+                payload[11]
+            };
         let output_threshold = payload[12];
         let _slaves = payload[13];
         let replay_gain = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
@@ -576,7 +586,8 @@ impl SlimprotoParser {
         let raw_left = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
         let raw_right = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
 
-        // Legacy negative dB value in old_gain_left/right indicates mute when 16.16 fixed-point gain is zero (CODE-PROTO-001)
+        // Legacy negative dB value in old_gain_left/right indicates mute when
+        // 16.16 fixed-point gain is zero (CODE-PROTO-001)
         let _ = (old_left, old_right);
         let gain_left = raw_left;
         let gain_right = raw_right;
@@ -589,7 +600,8 @@ impl SlimprotoParser {
         })
     }
 
-    /// Parses a raw `setd` payload into `(setting_id, data)` according to the LMS `setd` specification.
+    /// Parses a raw `setd` payload into `(setting_id, data)` according to the
+    /// LMS `setd` specification.
     pub fn parse_setd_setting(payload: &[u8]) -> Result<DeviceSetting<'_>, ParseError> {
         if payload.is_empty() {
             return Err(ParseError::InvalidFormat);
@@ -604,9 +616,9 @@ impl SlimprotoParser {
         if payload.is_empty() {
             return Err(ParseError::InvalidFormat);
         }
-        // Only interpret 4-byte payloads (or 1-byte setting ID queries) via SetDevice;
-        // variable-length device setting frames (e.g. id=0 player name strings) must not
-        // corrupt sample_rate with ASCII name bytes.
+        // Only interpret 4-byte payloads (or 1-byte setting ID queries) via
+        // SetDevice; variable-length device setting frames (e.g. id=0 player
+        // name strings) must not corrupt sample_rate with ASCII name bytes.
         match payload.len() {
             4 => {
                 let sample_rate =
@@ -726,7 +738,8 @@ impl StatEvent {
 /// Standard 53-byte payload size of a SlimProto `STAT` frame.
 pub const STAT_PAYLOAD_SIZE: usize = 53;
 
-/// Total wire size (8-byte header + 53-byte payload) of a SlimProto `STAT` frame.
+/// Total wire size (8-byte header + 53-byte payload) of a SlimProto `STAT`
+/// frame.
 pub const STAT_FRAME_SIZE: usize = 8 + STAT_PAYLOAD_SIZE;
 
 /// Full structured telemetry report for SlimProto `STAT` packets.
@@ -746,7 +759,8 @@ pub struct StatReport {
     pub server_timestamp: u32,
 }
 
-/// Dedicated `STAT` packet builder supporting both full `StatReport` structs and compact telemetry counters.
+/// Dedicated `STAT` packet builder supporting both full `StatReport` structs
+/// and compact telemetry counters.
 pub struct StatBuilder;
 
 impl StatBuilder {
@@ -755,7 +769,8 @@ impl StatBuilder {
         SlimprotoBuilder::build_stat_report(report, out)
     }
 
-    /// Formats a `STAT` telemetry packet estimating `elapsed_seconds` and `elapsed_ms` from `frames_played` at 44.1 kHz.
+    /// Formats a `STAT` telemetry packet estimating `elapsed_seconds` and
+    /// `elapsed_ms` from `frames_played` at 44.1 kHz.
     pub fn build_stat(
         event: StatEvent,
         stream_buffer_fullness: u32,
@@ -783,8 +798,9 @@ impl StatBuilder {
         Self::build_stat_report(&report, out)
     }
 
-    /// Formats a `STAT` telemetry packet with explicit metrics including custom sample rate,
-    /// 64-bit frames played, server timestamp, and 64-bit byte counter.
+    /// Formats a `STAT` telemetry packet with explicit metrics including custom
+    /// sample rate, 64-bit frames played, server timestamp, and 64-bit byte
+    /// counter.
     #[allow(clippy::too_many_arguments)]
     pub fn build_stat_with_metrics(
         event: StatEvent,
@@ -837,7 +853,8 @@ impl SlimprotoBuilder {
         Self::build_helo_with_options(mac, device_id, capabilities, false, 0, out)
     }
 
-    /// Formats a client HELO packet with extended options (reconnect flag and bytes received).
+    /// Formats a client HELO packet with extended options (reconnect flag and
+    /// bytes received).
     pub fn build_helo_with_options(
         mac: &[u8; 6],
         device_id: u8,
@@ -877,7 +894,8 @@ impl SlimprotoBuilder {
         Ok(total_len)
     }
 
-    /// Serializes a complete `StatReport` into a 61-byte `STAT` wire frame, populating all wire offsets.
+    /// Serializes a complete `StatReport` into a 61-byte `STAT` wire frame,
+    /// populating all wire offsets.
     pub fn build_stat_report(report: &StatReport, out: &mut [u8]) -> Result<usize, ParseError> {
         if out.len() < STAT_FRAME_SIZE {
             return Err(ParseError::PayloadTooLarge);
@@ -928,8 +946,9 @@ impl SlimprotoBuilder {
         )
     }
 
-    /// Formats the full official 53-byte payload STAT telemetry packet into a provided byte buffer.
-    /// Total frame length is 61 bytes (8-byte header + 53-byte payload).
+    /// Formats the full official 53-byte payload STAT telemetry packet into a
+    /// provided byte buffer. Total frame length is 61 bytes (8-byte header +
+    /// 53-byte payload).
     pub fn build_stat_full(
         event: StatEvent,
         stream_buffer_fullness: u32,
@@ -938,6 +957,8 @@ impl SlimprotoBuilder {
         timestamp_ms: u32,
         out: &mut [u8],
     ) -> Result<usize, ParseError> {
+        let elapsed_seconds = frames_played / 44_100;
+        let elapsed_ms = ((frames_played as u64 * 1000) / 44_100) as u32;
         let report = StatReport {
             event,
             stream_buffer_size: 65536,
@@ -947,15 +968,16 @@ impl SlimprotoBuilder {
             jiffies: timestamp_ms,
             output_buffer_size: 65536,
             output_buffer_fullness,
-            elapsed_seconds: timestamp_ms / 1000,
+            elapsed_seconds,
             voltage: 0,
-            elapsed_ms: timestamp_ms,
+            elapsed_ms,
             server_timestamp: 0,
         };
         Self::build_stat_report(&report, out)
     }
 
-    /// Formats an HTTP response packet (`RESP`) sending received HTTP headers to LMS.
+    /// Formats an HTTP response packet (`RESP`) sending received HTTP headers
+    /// to LMS.
     pub fn build_resp(headers: &[u8], out: &mut [u8]) -> Result<usize, ParseError> {
         let total_len = 8 + headers.len();
         if out.len() < total_len {
@@ -969,7 +991,8 @@ impl SlimprotoBuilder {
         Ok(total_len)
     }
 
-    /// Formats a disconnect notification packet (`DSCO`) sending disconnect reason to LMS.
+    /// Formats a disconnect notification packet (`DSCO`) sending disconnect
+    /// reason to LMS.
     pub fn build_dsco(reason: DisconnectReason, out: &mut [u8]) -> Result<usize, ParseError> {
         if out.len() < 9 {
             return Err(ParseError::PayloadTooLarge);
@@ -982,7 +1005,8 @@ impl SlimprotoBuilder {
         Ok(9)
     }
 
-    /// Formats a stream metadata packet (`META`) forwarding stream metadata (e.g. ICY) to LMS.
+    /// Formats a stream metadata packet (`META`) forwarding stream metadata
+    /// (e.g. ICY) to LMS.
     pub fn build_meta(metadata: &[u8], out: &mut [u8]) -> Result<usize, ParseError> {
         let total_len = 8 + metadata.len();
         if out.len() < total_len {
@@ -996,7 +1020,8 @@ impl SlimprotoBuilder {
         Ok(total_len)
     }
 
-    /// Formats a player name device setting packet (`SETD` with id 0x00) for LMS.
+    /// Formats a player name device setting packet (`SETD` with id 0x00) for
+    /// LMS.
     pub fn build_setd_name(name: &str, out: &mut [u8]) -> Result<usize, ParseError> {
         let name_bytes = name.as_bytes();
         let payload_len = 1 + name_bytes.len();
@@ -1014,8 +1039,43 @@ impl SlimprotoBuilder {
         Ok(total_len)
     }
 
-    /// Formats an infrared remote control packet (`IR  `) forwarding NEC IR button presses to LMS.
-    /// Wire format: 4-byte opcode (`b"IR  "`), 4-byte length (10), 4-byte timestamp, 1-byte code type (0xFF), 1-byte bits (16), 4-byte IR code.
+    /// Formats a hardware button event packet (`BUTN`) for LMS.
+    ///
+    /// Wire layout (16 bytes total):
+    /// - `out[0..4]`: `b"BUTN"`
+    /// - `out[4..8]`: `8u32.to_be_bytes()` (8-byte payload)
+    /// - `out[8..12]`: `time_ms.to_be_bytes()`
+    /// - `out[12..16]`: `raw_code.to_be_bytes()` (`button_code as u32` when
+    ///   `pressed` is `true`, or `(button_code as u32) | 0x0001_0000` on
+    ///   release)
+    pub fn build_butn(
+        time_ms: u32,
+        button_code: u16,
+        pressed: bool,
+        out: &mut [u8],
+    ) -> Result<usize, ParseError> {
+        if out.len() < 16 {
+            return Err(ParseError::PayloadTooLarge);
+        }
+
+        let raw_code = if pressed {
+            button_code as u32
+        } else {
+            (button_code as u32) | 0x0001_0000
+        };
+
+        out[0..4].copy_from_slice(b"BUTN");
+        out[4..8].copy_from_slice(&8u32.to_be_bytes());
+        out[8..12].copy_from_slice(&time_ms.to_be_bytes());
+        out[12..16].copy_from_slice(&raw_code.to_be_bytes());
+
+        Ok(16)
+    }
+
+    /// Formats an infrared remote control packet (`IR  `) forwarding NEC IR
+    /// button presses to LMS. Wire format: 4-byte opcode (`b"IR  "`), 4-byte
+    /// length (10), 4-byte timestamp, 1-byte code type (0xFF), 1-byte bits
+    /// (16), 4-byte IR code.
     pub fn build_ir(time_ms: u32, ir_code: u32, out: &mut [u8]) -> Result<usize, BuildError> {
         if out.len() < 18 {
             return Err(ParseError::PayloadTooLarge);
@@ -1032,29 +1092,35 @@ impl SlimprotoBuilder {
     }
 }
 
-/// Length of a `serv` SyncgroupID (C `slimproto.c:641`: `len - sizeof(serv_packet) == 10`).
+/// Length of a `serv` SyncgroupID (C `slimproto.c:641`:
+/// `len - sizeof(serv_packet) == 10`).
 pub const SYNCGROUP_ID_LEN: usize = 10;
 
-/// `serv` address that C maps to SqueezeNetwork (`slimproto.c:633-634`, `pkt[4..8] == 0.0.0.1`).
+/// `serv` address that C maps to SqueezeNetwork (`slimproto.c:633-634`,
+/// `pkt[4..8] == 0.0.0.1`).
 pub const SQUEEZENETWORK_MARKER_IP: [u8; 4] = [0, 0, 0, 1];
 
 /// Writes the `HELO` capability string.
 ///
 /// C builds it from three parts (`sendHELO`, `slimproto.c:128-185`):
-/// * `base_cap` (`embedded.h:47-49`): `Model=squeezeesp32,AccuratePlayPoints=1,HasDigitalOut=1,
-///   HasPolarityInversion=1,Balance=1,Depth=<16|32>,Firmware=<VERSION>`;
-/// * `fixed_cap` (`slimproto.c:1068-1082`): `,ModelName=<model>,MaxSampleRate=<rate>` and one
-///   `,<types>` per registered codec;
-/// * `var_cap` (`slimproto.c:1157-1174`): `,loc` for a local player and the `serv`
-///   `,SyncgroupID=<10 chars>`, used for one `HELO` only.
+/// * `base_cap` (`embedded.h:47-49`):
+///   `Model=squeezeesp32,AccuratePlayPoints=1,HasDigitalOut=1,`
+///   `HasPolarityInversion=1,Balance=1,Depth=<16|32>,Firmware=<VERSION>`;
+/// * `fixed_cap` (`slimproto.c:1068-1082`):
+///   `,ModelName=<model>,MaxSampleRate=<rate>` and one `,<types>` per
+///   registered codec;
+/// * `var_cap` (`slimproto.c:1157-1174`): `,loc` for a local player and the
+///   `serv` `,SyncgroupID=<10 chars>`, used for one `HELO` only.
 ///
-/// This writes the same fields in the same order, minus the ones the Rust firmware cannot back
-/// (deliberate divergences): no `HasDigitalOut` (no SPDIF yet), no `,loc` (never a local
-/// player). Since Task 14 (C parity): `HasPolarityInversion=1` (the gain stage honors `strm`
-/// invert, output.c:57) and `Balance=1` (independent L/R `audg` gains, in software, or as a
-/// software ratio over the device's hardware volume). `Depth=32` matches C's
-/// `BYTES_PER_FRAME == 8` branch: the Rust output ring holds 8-byte stereo `i32` frames.
-/// A target that cannot hold the whole string is an error, never a truncation.
+/// This writes the same fields in the same order, minus the ones the Rust
+/// firmware cannot back (deliberate divergences): no `HasDigitalOut` (no SPDIF
+/// yet), no `,loc` (never a local player). Since Task 14 (C parity):
+/// `HasPolarityInversion=1` (the gain stage honors `strm` invert, output.c:57)
+/// and `Balance=1` (independent L/R `audg` gains, in software, or as a software
+/// ratio over the device's hardware volume). `Depth=32` matches C's
+/// `BYTES_PER_FRAME == 8` branch: the Rust output ring holds 8-byte stereo
+/// `i32` frames. A target that cannot hold the whole string is an error, never
+/// a truncation.
 pub fn build_capabilities<W: fmt::Write>(
     model_name: &str,
     firmware: &str,
@@ -1067,7 +1133,8 @@ pub fn build_capabilities<W: fmt::Write>(
         // C parity: embedded.h:47 base_cap, minus HasDigitalOut (see above).
         write!(
             out,
-            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware={firmware}"
+            "Model=squeezeesp32,AccuratePlayPoints=1,\
+             HasPolarityInversion=1,Balance=1,Depth=32,Firmware={firmware}"
         )?;
         write!(out, ",ModelName={model_name},MaxSampleRate={max_rate},{codecs}")?;
         if let Some(id) = syncgroup {
@@ -1078,14 +1145,15 @@ pub fn build_capabilities<W: fmt::Write>(
     write(out).map_err(|_| ParseError::PayloadTooLarge)
 }
 
-/// Delay before reconnecting after the server connection dropped, for the `attempt`-th
-/// consecutive drop (0 = first), with `seed` as the random source.
+/// Delay before reconnecting after the server connection dropped, for the
+/// `attempt`-th consecutive drop (0 = first), with `seed` as the random source.
 ///
-/// C parity (MK5, `slimproto.c:1196-1203`): `reconnect_delay` starts at 1 s and doubles after
-/// every drop, capped at 30 s; the delay is `reconnect_delay * 1000 + rand() % 1000` ms. So the
-/// sequence is 1, 2, 4, 8, 16, 30, 30, ... s plus 0..999 ms of jitter. (The caller resets
-/// `attempt` to 0 after a session that lasted over 30 s, `slimproto.c:1191-1193`, and after a
-/// `serv` switch, `slimproto.c:1103`.)
+/// C parity (MK5, `slimproto.c:1196-1203`): `reconnect_delay` starts at 1 s and
+/// doubles after every drop, capped at 30 s; the delay is
+/// `reconnect_delay * 1000 + rand() % 1000` ms. So the sequence is 1, 2, 4, 8,
+/// 16, 30, 30, ... s plus 0..999 ms of jitter. (The caller resets `attempt` to
+/// 0 after a session that lasted over 30 s, `slimproto.c:1191-1193`, and after
+/// a `serv` switch, `slimproto.c:1103`.)
 pub fn next_backoff_ms(attempt: u32, seed: u32) -> u32 {
     const CAP_S: u32 = 30;
     let base_s = if attempt >= 5 { CAP_S } else { (1u32 << attempt).min(CAP_S) };
@@ -1116,7 +1184,8 @@ impl DiscoveryBuilder {
 pub struct DiscoveryParser;
 
 impl DiscoveryParser {
-    /// Alias for [`Self::parse_response`] that parses an LMS UDP discovery response.
+    /// Alias for [`Self::parse_response`] that parses an LMS UDP discovery
+    /// response.
     pub fn parse_discovery_response(buf: &[u8]) -> Option<DiscoveredServer> {
         Self::parse_response(buf)
     }
@@ -1124,9 +1193,10 @@ impl DiscoveryParser {
     /// Parses an LMS discovery response (must start with uppercase `b'E'`).
     /// Rejects client reflection queries starting with `b'e'`.
     ///
-    /// Supports standard LMS 1-byte TLV length-prefixed tags (`JSON`, `CLIP`, `PORT`,
-    /// skipping informational tags like `NAME`, `VERS`, `UUID`), null-terminated fallback
-    /// (`JSON`/`CLIP` + `port_str\0`), and 2-byte big-endian binary port responses.
+    /// Supports standard LMS 1-byte TLV length-prefixed tags (`JSON`, `CLIP`,
+    /// `PORT`, skipping informational tags like `NAME`, `VERS`, `UUID`),
+    /// null-terminated fallback (`JSON`/`CLIP` + `port_str\0`), and 2-byte
+    /// big-endian binary port responses.
     pub fn parse_response(buf: &[u8]) -> Option<DiscoveredServer> {
         if buf.is_empty() || buf[0] != b'E' {
             return None;
@@ -1216,8 +1286,11 @@ impl DiscoveryParser {
                 let tag_end = i + 4;
                 if tag_end < payload.len() {
                     let tlv_len = payload[tag_end] as usize;
-                    if tag_end + 1 + tlv_len <= payload.len() {
+                    if tlv_len <= 64 && tag_end + 1 + tlv_len <= payload.len() {
                         i = tag_end + 1 + tlv_len;
+                        continue;
+                    } else if let Some(end) = payload[tag_end..].iter().position(|&b| b == 0) {
+                        i = tag_end + end + 1;
                         continue;
                     }
                 }
@@ -1242,7 +1315,11 @@ fn parse_u16(s: &str) -> Result<u16, ()> {
         if !b.is_ascii_digit() {
             return Err(());
         }
-        res = res.checked_mul(10).ok_or(())?.checked_add((b - b'0') as u16).ok_or(())?;
+        res = res
+            .checked_mul(10)
+            .ok_or(())?
+            .checked_add((b - b'0') as u16)
+            .ok_or(())?;
     }
     Ok(res)
 }
@@ -1254,7 +1331,10 @@ mod tests {
     #[test]
     fn test_parse_incomplete_header() {
         let buf = *b"str";
-        assert_eq!(SlimprotoParser::parse_frame(&buf), Err(ParseError::BufferTooShort));
+        assert_eq!(
+            SlimprotoParser::parse_frame(&buf),
+            Err(ParseError::BufferTooShort)
+        );
     }
 
     #[test]
@@ -1262,7 +1342,10 @@ mod tests {
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(b"body");
         buf[4..8].copy_from_slice(&(5000u32).to_be_bytes()); // Exceeds MAX_FRAME_LENGTH 4096
-        assert_eq!(SlimprotoParser::parse_frame(&buf), Err(ParseError::PayloadTooLarge));
+        assert_eq!(
+            SlimprotoParser::parse_frame(&buf),
+            Err(ParseError::PayloadTooLarge)
+        );
     }
 
     #[test]
@@ -1337,7 +1420,8 @@ mod tests {
     fn test_build_helo_packet() {
         let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
         let mut buf = [0u8; 128];
-        let len = SlimprotoBuilder::build_helo(&mac, 12, "Model=LouderESP32Plus", &mut buf).unwrap();
+        let len = SlimprotoBuilder::build_helo(&mac, 12, "Model=LouderESP32Plus", &mut buf)
+            .unwrap();
 
         assert_eq!(&buf[0..4], b"HELO");
         assert_eq!(buf[8], 12);
@@ -1354,7 +1438,7 @@ mod tests {
             128000,
             64000,
             44100,
-            1000,
+            5000,
             &mut buf,
         )
         .unwrap();
@@ -1371,10 +1455,10 @@ mod tests {
         assert_eq!(u32::from_be_bytes([buf[23], buf[24], buf[25], buf[26]]), 0);
         assert_eq!(u32::from_be_bytes([buf[27], buf[28], buf[29], buf[30]]), 44100);
         assert_eq!(u16::from_be_bytes([buf[31], buf[32]]), 0xFFFF);
-        assert_eq!(u32::from_be_bytes([buf[33], buf[34], buf[35], buf[36]]), 1000);
+        assert_eq!(u32::from_be_bytes([buf[33], buf[34], buf[35], buf[36]]), 5000);
         assert_eq!(u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]), 65536);
         assert_eq!(u32::from_be_bytes([buf[41], buf[42], buf[43], buf[44]]), 64000);
-        assert_eq!(u32::from_be_bytes([buf[45], buf[46], buf[47], buf[48]]), 1); // 1000 / 1000
+        assert_eq!(u32::from_be_bytes([buf[45], buf[46], buf[47], buf[48]]), 1);
         assert_eq!(u16::from_be_bytes([buf[49], buf[50]]), 0);
         assert_eq!(u32::from_be_bytes([buf[51], buf[52], buf[53], buf[54]]), 1000);
         assert_eq!(u32::from_be_bytes([buf[55], buf[56], buf[57], buf[58]]), 0);
@@ -1458,23 +1542,35 @@ mod tests {
         let mut frame = [0u8; 31]; // 8 header + 23 payload
         frame[0..4].copy_from_slice(b"strm");
         frame[4..8].copy_from_slice(&23u32.to_be_bytes());
-        assert_eq!(SlimprotoParser::parse_frame(&frame), Err(ParseError::InvalidFormat));
+        assert_eq!(
+            SlimprotoParser::parse_frame(&frame),
+            Err(ParseError::InvalidFormat)
+        );
 
         // Truncated audg payload (< 18 bytes)
         let mut frame = [0u8; 25]; // 8 header + 17 payload
         frame[0..4].copy_from_slice(b"audg");
         frame[4..8].copy_from_slice(&17u32.to_be_bytes());
-        assert_eq!(SlimprotoParser::parse_frame(&frame), Err(ParseError::InvalidFormat));
+        assert_eq!(
+            SlimprotoParser::parse_frame(&frame),
+            Err(ParseError::InvalidFormat)
+        );
 
         // Empty setd payload
         let mut frame = [0u8; 8];
         frame[0..4].copy_from_slice(b"setd");
         frame[4..8].copy_from_slice(&0u32.to_be_bytes());
-        assert_eq!(SlimprotoParser::parse_frame(&frame), Err(ParseError::InvalidFormat));
+        assert_eq!(
+            SlimprotoParser::parse_frame(&frame),
+            Err(ParseError::InvalidFormat)
+        );
 
         // 6-byte frame header with length < 4
         let frame = [0x00, 0x03, b's', b't', b'r', b'm'];
-        assert_eq!(SlimprotoParser::parse_frame(&frame), Err(ParseError::InvalidFormat));
+        assert_eq!(
+            SlimprotoParser::parse_frame(&frame),
+            Err(ParseError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -1498,11 +1594,20 @@ mod tests {
         assert_eq!(server_tlv.json_port, 9000);
         assert_eq!(server_tlv.cli_port, 9090);
 
-        // Discovery response with leading NAME/VERS TLV tags and PORT tag (PROTOCFG-806)
+        // Discovery response with leading NAME/VERS TLV tags and PORT tag
+        // (PROTOCFG-806)
         let response_multi_tlv = b"ENAME\x06MyLMS1VERS\x058.5.0PORT\x043483CLIP\x049091";
         let server_multi = DiscoveryParser::parse_discovery_response(response_multi_tlv).unwrap();
         assert_eq!(server_multi.json_port, 3483);
         assert_eq!(server_multi.cli_port, 9091);
+
+        // Discovery response with null-terminated informational tags (NAME,
+        // VERS)
+        let response_multi_null = b"ENAMEsqueezeserver\0VERS8.5.0\0JSON9002\0CLIP9092\0";
+        let server_multi_null =
+            DiscoveryParser::parse_discovery_response(response_multi_null).unwrap();
+        assert_eq!(server_multi_null.json_port, 9002);
+        assert_eq!(server_multi_null.cli_port, 9092);
 
         // Legacy 2-byte big-endian port response after 'E'
         let response_2byte = [b'E', 0x23, 0x28]; // 0x2328 = 9000
@@ -1514,7 +1619,8 @@ mod tests {
     #[test]
     fn test_setd_device_setting_player_name_and_dac(
     ) {
-        // Player name update (id = 0, data = "StudioPlayer\0") must NOT be parsed as sample_rate (PROTOCFG-801)
+        // Player name update (id = 0, data = "StudioPlayer\0") must NOT be
+        // parsed as sample_rate (PROTOCFG-801)
         let payload = b"\x00StudioPlayer\0";
         let len = (4 + payload.len()) as u16;
         let mut frame = [0u8; 32];
@@ -1542,7 +1648,8 @@ mod tests {
 
     #[test]
     fn test_stat_event_opcodes_and_stat_report_wire_offsets() {
-        // PROTOCFG-802: TrackResumed is STMr; DecodeReady, NotSupported, ConnectEstablished supported
+        // PROTOCFG-802: TrackResumed is STMr; DecodeReady, NotSupported,
+        // ConnectEstablished supported
         assert_eq!(&StatEvent::TrackResumed.opcode_bytes(), b"STMr");
         assert_eq!(&StatEvent::DecodeReady.opcode_bytes(), b"STMd");
         assert_eq!(&StatEvent::NotSupported.opcode_bytes(), b"STMn");
@@ -1568,24 +1675,50 @@ mod tests {
         let written = StatBuilder::build_stat_report(&report, &mut frame).unwrap();
         assert_eq!(written, STAT_FRAME_SIZE);
         assert_eq!(&frame[0..4], b"STAT");
-        assert_eq!(u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]), 53);
+        assert_eq!(
+            u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]),
+            53
+        );
         assert_eq!(&frame[8..12], b"STMr");
 
         // Verify payload offsets relative to payload start (&frame[8..])
         let payload = &frame[8..];
-        assert_eq!(u64::from_be_bytes(payload[15..23].try_into().unwrap()), 0x0000_0001_8000_0000);
-        assert_eq!(u32::from_be_bytes(payload[37..41].try_into().unwrap()), 42);
-        assert_eq!(u16::from_be_bytes(payload[41..43].try_into().unwrap()), 3300);
-        assert_eq!(u32::from_be_bytes(payload[43..47].try_into().unwrap()), 42_500);
-        assert_eq!(u32::from_be_bytes(payload[47..51].try_into().unwrap()), 99_887_766);
+        assert_eq!(
+            u64::from_be_bytes(payload[15..23].try_into().unwrap()),
+            0x0000_0001_8000_0000
+        );
+        assert_eq!(
+            u32::from_be_bytes(payload[37..41].try_into().unwrap()),
+            42
+        );
+        assert_eq!(
+            u16::from_be_bytes(payload[41..43].try_into().unwrap()),
+            3300
+        );
+        assert_eq!(
+            u32::from_be_bytes(payload[43..47].try_into().unwrap()),
+            42_500
+        );
+        assert_eq!(
+            u32::from_be_bytes(payload[47..51].try_into().unwrap()),
+            99_887_766
+        );
 
-        // StatBuilder::build_stat estimates elapsed_seconds and elapsed_ms from frames_played / 44_100
+        // StatBuilder::build_stat estimates elapsed_seconds and elapsed_ms from
+        // frames_played / 44_100
         let mut frame2 = [0u8; STAT_FRAME_SIZE];
-        StatBuilder::build_stat(StatEvent::DecodeReady, 4096, 2048, 88_200, 5000, &mut frame2).unwrap();
+        StatBuilder::build_stat(StatEvent::DecodeReady, 4096, 2048, 88_200, 5000, &mut frame2)
+            .unwrap();
         let payload2 = &frame2[8..];
         assert_eq!(&payload2[0..4], b"STMd");
-        assert_eq!(u32::from_be_bytes(payload2[37..41].try_into().unwrap()), 2); // 88200 / 44100 = 2s
-        assert_eq!(u32::from_be_bytes(payload2[43..47].try_into().unwrap()), 2000); // 2000ms
+        assert_eq!(
+            u32::from_be_bytes(payload2[37..41].try_into().unwrap()),
+            2
+        ); // 88200 / 44100 = 2s
+        assert_eq!(
+            u32::from_be_bytes(payload2[43..47].try_into().unwrap()),
+            2000
+        ); // 2000ms
     }
 
     #[test]
@@ -1623,7 +1756,8 @@ mod tests {
 
     #[test]
     fn test_audg_negative_db_mute_indicator() {
-        // PROTOCFG-805: negative old_gain_left/right mutes channel when raw_gain is zero
+        // PROTOCFG-805: negative old_gain_left/right mutes channel when
+        // raw_gain is zero
         let mut frame = [0u8; 26];
         frame[0..4].copy_from_slice(b"audg");
         frame[4..8].copy_from_slice(&18u32.to_be_bytes());
@@ -1648,7 +1782,8 @@ mod tests {
 
     #[test]
     fn test_audg_negative_db_preserves_nonzero_raw() {
-        // CODE-PROTO-001: non-zero raw_gain is preserved even if old_left/right < 0
+        // CODE-PROTO-001: non-zero raw_gain is preserved even if old_left/right
+        // < 0
         let mut frame = [0u8; 26];
         frame[0..4].copy_from_slice(b"audg");
         frame[4..8].copy_from_slice(&18u32.to_be_bytes());
@@ -1765,7 +1900,8 @@ mod tests {
             u32::from_be_bytes(frame[45..49].try_into().unwrap()),
             2
         );
-        // elapsed_ms at frame[51..55] (payload[43..47]) = 192000 * 1000 / 96000 = 2000
+        // elapsed_ms at frame[51..55] (payload[43..47]) = 192000 * 1000 / 96000
+        // = 2000
         assert_eq!(
             u32::from_be_bytes(frame[51..55].try_into().unwrap()),
             2000
@@ -1845,7 +1981,10 @@ mod tests {
         eqlz_frame[4..8].copy_from_slice(&6u32.to_be_bytes());
         eqlz_frame[8..14].copy_from_slice(&[10, 20, 30, 40, 50, 60]);
         let (cmd_eqlz, _) = SlimprotoParser::parse_frame(&eqlz_frame).unwrap();
-        assert_eq!(cmd_eqlz.equalizer_gains(), Some(&[10, 20, 30, 40, 50, 60][..]));
+        assert_eq!(
+            cmd_eqlz.equalizer_gains(),
+            Some(&[10, 20, 30, 40, 50, 60][..])
+        );
 
         let mut loud_frame = [0u8; 9];
         loud_frame[0..4].copy_from_slice(b"loud");
@@ -1890,6 +2029,33 @@ mod tests {
         .unwrap();
         assert_eq!(&buf_noreconn[32..34], &0u16.to_be_bytes());
         assert_eq!(&buf_noreconn[34..42], &0u64.to_be_bytes());
+    }
+
+    #[test]
+    fn test_build_butn_encodes_slimproto_frame() {
+        let mut buf = [0u8; 32];
+        // Press: pressed = true -> raw_code = button_code as u32
+        let len = SlimprotoBuilder::build_butn(654_321, 0x002A, true, &mut buf).unwrap();
+        assert_eq!(len, 16);
+        assert_eq!(&buf[0..4], b"BUTN");
+        assert_eq!(&buf[4..8], &8u32.to_be_bytes());
+        assert_eq!(&buf[8..12], &654_321u32.to_be_bytes());
+        assert_eq!(&buf[12..16], &0x0000_002Au32.to_be_bytes());
+
+        // Release: pressed = false -> raw_code = (button_code as u32) | 0x0001_0000
+        let len_rel = SlimprotoBuilder::build_butn(654_400, 0x002A, false, &mut buf).unwrap();
+        assert_eq!(len_rel, 16);
+        assert_eq!(&buf[0..4], b"BUTN");
+        assert_eq!(&buf[4..8], &8u32.to_be_bytes());
+        assert_eq!(&buf[8..12], &654_400u32.to_be_bytes());
+        assert_eq!(&buf[12..16], &0x0001_002Au32.to_be_bytes());
+
+        // Buffer too short (< 16 bytes)
+        let mut short_buf = [0u8; 15];
+        assert_eq!(
+            SlimprotoBuilder::build_butn(100, 1, true, &mut short_buf),
+            Err(ParseError::PayloadTooLarge)
+        );
     }
 
     #[test]
@@ -1940,33 +2106,52 @@ mod tests {
 
     #[test]
     fn test_capabilities_string_exact() {
-        // C parity: base_cap (embedded.h:47-49) + fixed_cap (slimproto.c:1068-1082) + var_cap
-        // (slimproto.c:1171-1174), minus what the Rust firmware cannot do yet.
+        // C parity: base_cap (embedded.h:47-49) + fixed_cap
+        // (slimproto.c:1068-1082) + var_cap (slimproto.c:1171-1174), minus
+        // what the Rust firmware cannot do yet.
         let mut caps = CapBuf::new();
-        build_capabilities("SqueezeESP32", "v0.1.0", 96_000, None, "flc,pcm,wav,aif,mp3", &mut caps)
-            .unwrap();
-        // Task 14: HasPolarityInversion=1 now that the gain stage inverts, and Balance=1 (C
-        // embedded.h:47).
+        build_capabilities(
+            "SqueezeESP32",
+            "v0.1.0",
+            96_000,
+            None,
+            "flc,pcm,wav,aif,mp3",
+            &mut caps,
+        )
+        .unwrap();
+        // Task 14: HasPolarityInversion=1 now that the gain stage inverts, and
+        // Balance=1 (C embedded.h:47).
         assert_eq!(
             caps.as_str(),
-            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware=v0.1.0,\
+            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,\
+             Balance=1,Depth=32,Firmware=v0.1.0,\
              ModelName=SqueezeESP32,MaxSampleRate=96000,flc,pcm,wav,aif,mp3"
         );
         assert!(!caps.as_str().contains("HasDigitalOut"));
-        // Task 14 fix round: Balance=1, honored by the per-channel software ratio.
+        // Task 14 fix round: Balance=1, honored by the per-channel software
+        // ratio.
         assert!(caps.as_str().contains(",Balance=1,"));
 
         // A `serv` syncgroup is appended last, exactly as C's var_cap.
         let mut caps = CapBuf::new();
-        build_capabilities("SqueezeESP32", "v0.1.0", 192_000, Some("0123456789"), "flc", &mut caps)
-            .unwrap();
+        build_capabilities(
+            "SqueezeESP32",
+            "v0.1.0",
+            192_000,
+            Some("0123456789"),
+            "flc",
+            &mut caps,
+        )
+        .unwrap();
         assert_eq!(
             caps.as_str(),
-            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,Balance=1,Depth=32,Firmware=v0.1.0,\
+            "Model=squeezeesp32,AccuratePlayPoints=1,HasPolarityInversion=1,\
+             Balance=1,Depth=32,Firmware=v0.1.0,\
              ModelName=SqueezeESP32,MaxSampleRate=192000,flc,SyncgroupID=0123456789"
         );
 
-        // A target too small for the string is an error, never a silent truncation.
+        // A target too small for the string is an error, never a silent
+        // truncation.
         struct Tiny(usize);
         impl fmt::Write for Tiny {
             fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -1982,13 +2167,21 @@ mod tests {
 
     #[test]
     fn test_backoff_sequence_capped_with_jitter() {
-        // C parity (slimproto.c:1196-1203): delay = reconnect_delay s + rand() % 1000 ms,
-        // reconnect_delay 1, 2, 4, 8, 16, then capped at 30 s.
+        // C parity (slimproto.c:1196-1203): delay = reconnect_delay s + rand()
+        // % 1000 ms, reconnect_delay 1, 2, 4, 8, 16, then capped at 30 s.
         let bases = [1_000u32, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
         for (attempt, &base) in bases.iter().enumerate() {
             assert_eq!(next_backoff_ms(attempt as u32, 0), base, "attempt {attempt}");
-            assert_eq!(next_backoff_ms(attempt as u32, 999), base + 999, "attempt {attempt}");
-            assert_eq!(next_backoff_ms(attempt as u32, 1_000), base, "jitter is seed % 1000");
+            assert_eq!(
+                next_backoff_ms(attempt as u32, 999),
+                base + 999,
+                "attempt {attempt}"
+            );
+            assert_eq!(
+                next_backoff_ms(attempt as u32, 1_000),
+                base,
+                "jitter is seed % 1000"
+            );
             assert_eq!(next_backoff_ms(attempt as u32, 12_345), base + 345);
         }
         // Never overflows, however many attempts.
@@ -1997,13 +2190,16 @@ mod tests {
 
     #[test]
     fn test_serv_syncgroup_only_when_exactly_ten_bytes() {
-        // C parity (slimproto.c:641-656): a 10-byte tail is the SyncgroupID, anything else
-        // clears it.
+        // C parity (slimproto.c:641-656): a 10-byte tail is the SyncgroupID,
+        // anything else clears it.
         let mut frame = b"serv\0\0\0\x0e".to_vec();
         frame.extend_from_slice(&[10, 0, 0, 5]);
         frame.extend_from_slice(b"0123456789");
         let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
-        assert_eq!(cmd.switch_server(), Some(([10, 0, 0, 5], Some(&b"0123456789"[..]))));
+        assert_eq!(
+            cmd.switch_server(),
+            Some(([10, 0, 0, 5], Some(&b"0123456789"[..])))
+        );
 
         let mut frame = b"serv\0\0\0\x07".to_vec();
         frame.extend_from_slice(&[10, 0, 0, 5, b'a', b'b', b'c']);

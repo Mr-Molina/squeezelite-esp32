@@ -6,7 +6,8 @@
 //! Provides:
 //! - Strongly typed `KeyValueStorage` trait with type-safe accessors.
 //! - In-memory bounded `MemConfigStore` backed by `heapless`.
-//! - Dual-CRC32 validated `FlashJournal` serialization for power-loss resilient Flash storage.
+//! - Dual-CRC32 validated `FlashJournal` serialization for power-loss
+//!   resilient Flash storage.
 //! - Domain configuration models: `WifiCredentials` and `AudioConfig`.
 
 #![no_std]
@@ -51,7 +52,8 @@ impl fmt::Display for StorageError {
     }
 }
 
-/// Updates a running IEEE 802.3 CRC32 checksum accumulator (polynomial 0xEDB88320).
+/// Updates a running IEEE 802.3 CRC32 checksum accumulator
+/// (polynomial 0xEDB88320).
 pub fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
@@ -251,7 +253,8 @@ pub struct DualSectorFlashStore;
 
 impl DualSectorFlashStore {
     /// Determines the active sector index (`0` for `sector_a`, `1` for `sector_b`)
-    /// using wrapping 32-bit sequence comparison `(seq_b.wrapping_sub(seq_a) as i32) >= 0`.
+    /// using wrapping 32-bit sequence comparison
+    /// `(seq_a.wrapping_sub(seq_b) as i32) >= 0`.
     pub fn active_sector(sector_a: &[u8], sector_b: &[u8]) -> Result<usize, StorageError> {
         let meta_a = FlashJournal::read_sector_meta(sector_a);
         let meta_b = FlashJournal::read_sector_meta(sector_b);
@@ -286,8 +289,8 @@ impl FlashJournal {
         (a.wrapping_sub(b) as i32) >= 0
     }
 
-    /// Serializes all entries from `store` into `sector` with sector and per-entry CRC32 using `sequence`.
-    /// Returns total bytes written.
+    /// Serializes all entries from `store` into `sector` with sector and
+    /// per-entry CRC32 using `sequence`. Returns total bytes written.
     pub fn save_to_sector_with_seq<const MAX_ENTRIES: usize>(
         store: &MemConfigStore<MAX_ENTRIES>,
         sector: &mut [u8],
@@ -344,7 +347,8 @@ impl FlashJournal {
             offset += val_bytes.len();
         }
 
-        // Sector CRC over header (0..12) combined with payload bytes (HEADER_SIZE..offset)
+        // Sector CRC over header (0..12) combined with payload bytes
+        // (HEADER_SIZE..offset)
         let mut crc = 0xFFFF_FFFF;
         crc = crc32_update(crc, &sector[0..12]);
         crc = crc32_update(crc, &sector[Self::HEADER_SIZE..offset]);
@@ -354,7 +358,8 @@ impl FlashJournal {
         Ok(offset)
     }
 
-    /// Serializes all entries from `store` into a single `sector` with default sequence 1.
+    /// Serializes all entries from `store` into a single `sector` with
+    /// default sequence 1.
     pub fn save_to_sector<const MAX_ENTRIES: usize>(
         store: &MemConfigStore<MAX_ENTRIES>,
         sector: &mut [u8],
@@ -362,7 +367,8 @@ impl FlashJournal {
         Self::save_to_sector_with_seq(store, sector, 1)
     }
 
-    /// Reads and validates sector metadata (sequence, entry_count, data_len) without mutating store.
+    /// Reads and validates sector metadata (sequence, entry_count, data_len)
+    /// without mutating store.
     pub fn read_sector_meta(sector: &[u8]) -> Result<(u32, usize, usize), StorageError> {
         if sector.len() < Self::HEADER_SIZE {
             return Err(StorageError::BufferTooSmall);
@@ -374,7 +380,9 @@ impl FlashJournal {
 
         let entry_count = u16::from_be_bytes([sector[5], sector[6]]) as usize;
         let sequence = u32::from_be_bytes([sector[8], sector[9], sector[10], sector[11]]);
-        let expected_sector_crc = u32::from_be_bytes([sector[12], sector[13], sector[14], sector[15]]);
+        let expected_sector_crc = u32::from_be_bytes([
+            sector[12], sector[13], sector[14], sector[15],
+        ]);
 
         // First pass: validate entry structure and find total data length
         let mut offset = Self::HEADER_SIZE;
@@ -407,7 +415,8 @@ impl FlashJournal {
     }
 
     /// Deserializes entries from `sector` into `store` after validating CRCs.
-    /// Uses temporary staging to avoid wiping `store` on partial failure (non-destructive).
+    /// Uses temporary staging to avoid wiping `store` on partial failure
+    /// (non-destructive).
     pub fn load_from_sector<const MAX_ENTRIES: usize>(
         sector: &[u8],
         store: &mut MemConfigStore<MAX_ENTRIES>,
@@ -422,7 +431,9 @@ impl FlashJournal {
         let mut read_offset = Self::HEADER_SIZE;
         for _ in 0..entry_count {
             let key_len = sector[read_offset] as usize;
-            let val_len = u16::from_be_bytes([sector[read_offset + 1], sector[read_offset + 2]]) as usize;
+            let val_len = u16::from_be_bytes([
+                sector[read_offset + 1], sector[read_offset + 2],
+            ]) as usize;
             let expected_entry_crc = u32::from_be_bytes([
                 sector[read_offset + 3],
                 sector[read_offset + 4],
@@ -462,8 +473,9 @@ impl FlashJournal {
         Ok(entry_count)
     }
 
-    /// Loads configuration from dual ping-pong sectors (A/B), selecting the valid sector with
-    /// the newest sequence counter. Provides power-loss resilience.
+    /// Loads configuration from dual ping-pong sectors (A/B), selecting
+    /// the valid sector with the newest sequence counter. Provides
+    /// power-loss resilience.
     pub fn load_from_dual_sectors<const MAX_ENTRIES: usize>(
         sector_a: &[u8],
         sector_b: &[u8],
@@ -490,9 +502,10 @@ impl FlashJournal {
         }
     }
 
-    /// Fully validates `sector` exactly as [`Self::load_from_sector`] does (header, sector CRC,
-    /// every entry CRC, UTF-8 keys, no duplicate keys, exact payload length) WITHOUT staging the
-    /// entries in a store, so it needs no `MemConfigStore` on the caller's stack. Returns
+    /// Fully validates `sector` exactly as [`Self::load_from_sector`] does
+    /// (header, sector CRC, every entry CRC, UTF-8 keys, no duplicate keys,
+    /// exact payload length) WITHOUT staging the entries in a store, so it
+    /// needs no `MemConfigStore` on the caller's stack. Returns
     /// `(sequence, entry_count, data_len)`.
     pub fn validate_sector(sector: &[u8]) -> Result<(u32, usize, usize), StorageError> {
         let (sequence, entry_count, data_len) = Self::read_sector_meta(sector)?;
@@ -519,10 +532,11 @@ impl FlashJournal {
         Ok((sequence, entry_count, data_len))
     }
 
-    /// The sector [`Self::load_from_dual_sectors`] would load, as `(index, sequence)` with index
-    /// `0` for `sector_a` and `1` for `sector_b`: the newest fully valid sector (wrapping sequence
-    /// comparison), falling back to the other one when the newer header hides a corrupt entry.
-    /// `None` when neither sector holds a valid journal.
+    /// The sector [`Self::load_from_dual_sectors`] would load, as `(index,
+    /// sequence)` with index `0` for `sector_a` and `1` for `sector_b`: the
+    /// newest fully valid sector (wrapping sequence comparison), falling back
+    /// to the other one when the newer header hides a corrupt entry. `None`
+    /// when neither sector holds a valid journal.
     pub fn select_dual_sector(sector_a: &[u8], sector_b: &[u8]) -> Option<(usize, u32)> {
         let a = Self::validate_sector(sector_a).ok().map(|(seq, _, _)| seq);
         let b = Self::validate_sector(sector_b).ok().map(|(seq, _, _)| seq);
@@ -540,8 +554,9 @@ impl FlashJournal {
         }
     }
 
-    /// Entry starting at `offset` of a sector whose structure [`Self::read_sector_meta`] has
-    /// already checked: `(key, value, stored_entry_crc, next_offset)`.
+    /// Entry starting at `offset` of a sector whose structure
+    /// [`Self::read_sector_meta`] has already checked:
+    /// `(key, value, stored_entry_crc, next_offset)`.
     fn entry_at(sector: &[u8], offset: usize) -> (&[u8], &[u8], u32, usize) {
         let key_len = sector[offset] as usize;
         let val_len = u16::from_be_bytes([sector[offset + 1], sector[offset + 2]]) as usize;
@@ -557,7 +572,8 @@ impl FlashJournal {
         (&sector[key_start..val_start], &sector[val_start..next], crc, next)
     }
 
-    /// Entry CRC over lengths and payload (the format [`Self::save_to_sector_with_seq`] writes).
+    /// Entry CRC over lengths and payload (the format
+    /// [`Self::save_to_sector_with_seq`] writes).
     fn entry_crc(key: &[u8], val: &[u8]) -> u32 {
         let mut crc = 0xFFFF_FFFF;
         crc = crc32_update(crc, &[key.len() as u8]);
@@ -567,8 +583,8 @@ impl FlashJournal {
         !crc
     }
 
-    /// Saves configuration to the alternate ping-pong sector with an incremented sequence counter.
-    /// Returns a tuple of `(wrote_to_b: bool, bytes_written: usize)`.
+    /// Saves configuration to the alternate ping-pong sector with an
+    /// incremented sequence counter. Returns `(wrote_to_b, bytes_written)`.
     pub fn save_to_dual_sectors<const MAX_ENTRIES: usize>(
         store: &MemConfigStore<MAX_ENTRIES>,
         sector_a: &mut [u8],
@@ -602,9 +618,10 @@ impl FlashJournal {
 
 /// Read-only [`KeyValueStorage`] over one validated journal sector.
 ///
-/// Lookups scan the sector in place, so loading a domain config (`AudioConfig::load_from`,
-/// `WifiCredentials::load_from`) needs no staging `MemConfigStore` (several KB on a small
-/// embedded stack). Writes are refused with [`StorageError::InvalidFormat`].
+/// Lookups scan the sector in place, so loading a domain config
+/// (`AudioConfig::load_from`, `WifiCredentials::load_from`) needs no staging
+/// `MemConfigStore` (several KB on a small embedded stack). Writes are refused
+/// with [`StorageError::InvalidFormat`].
 #[derive(Debug, Clone, Copy)]
 pub struct JournalView<'a> {
     sector: &'a [u8],
@@ -674,12 +691,14 @@ impl KeyValueStorage for JournalView<'_> {
     }
 }
 
-/// Append-only [`KeyValueStorage`] that serializes entries straight into a journal sector.
+/// Append-only [`KeyValueStorage`] that serializes entries straight into a
+/// journal sector.
 ///
-/// Produces the same bytes as [`FlashJournal::save_to_sector_with_seq`] for the same entries in
-/// the same order, without a staging `MemConfigStore`. Each key may be written once; a written
-/// key can be neither rewritten nor removed ([`StorageError::InvalidFormat`]). Call
-/// [`Self::finish`] to seal the header and sector CRC.
+/// Produces the same bytes as [`FlashJournal::save_to_sector_with_seq`] for the
+/// same entries in the same order, without a staging `MemConfigStore`. Each key
+/// may be written once; a written key can be neither rewritten nor removed
+/// ([`StorageError::InvalidFormat`]). Call [`Self::finish`] to seal the header
+/// and sector CRC.
 #[derive(Debug)]
 pub struct SectorWriter<'a> {
     sector: &'a mut [u8],
@@ -700,8 +719,8 @@ impl<'a> SectorWriter<'a> {
         })
     }
 
-    /// Writes the header (magic, version, entry count, `sequence`) and the sector CRC. Returns
-    /// the image length.
+    /// Writes the header (magic, version, entry count, `sequence`) and the
+    /// sector CRC. Returns the image length.
     pub fn finish(self, sequence: u32) -> Result<usize, StorageError> {
         let count = u16::try_from(self.entry_count).map_err(|_| StorageError::CapacityExceeded)?;
         self.sector[0..4].copy_from_slice(&FlashJournal::MAGIC);
@@ -758,7 +777,8 @@ impl KeyValueStorage for SectorWriter<'_> {
         let o = self.offset;
         self.sector[o] = key_bytes.len() as u8;
         self.sector[o + 1..o + 3].copy_from_slice(&(val.len() as u16).to_be_bytes());
-        self.sector[o + 3..o + 7].copy_from_slice(&FlashJournal::entry_crc(key_bytes, val).to_be_bytes());
+        let entry_crc = FlashJournal::entry_crc(key_bytes, val);
+        self.sector[o + 3..o + 7].copy_from_slice(&entry_crc.to_be_bytes());
         self.sector[o + 7..o + 7 + key_bytes.len()].copy_from_slice(key_bytes);
         self.sector[o + 7 + key_bytes.len()..o + entry_len].copy_from_slice(val);
         self.offset += entry_len;
@@ -970,9 +990,10 @@ impl AudioConfig {
     pub const DEFAULT_ANALOG_GAIN_CODE: u8 = 0x08;
     pub const MAX_ANALOG_GAIN_CODE: u8 = 0x1F;
 
-    /// Sets the player name as received from LMS (`setd` id 0) or a user: the name is cut at
-    /// its first NUL and truncated to the journal's 32-byte capacity on a `char` boundary. An
-    /// empty name (or one empty before its NUL) keeps the current name and returns `false`.
+    /// Sets the player name as received from LMS (`setd` id 0) or a user: the
+    /// name is cut at its first NUL and truncated to the journal's 32-byte
+    /// capacity on a `char` boundary. An empty name (or one empty before its
+    /// NUL) keeps the current name and returns `false`.
     pub fn set_player_name(&mut self, name: &str) -> bool {
         let name = name.split('\0').next().unwrap_or("");
         if name.is_empty() {
@@ -1147,11 +1168,21 @@ mod tests {
         assert!(bytes_written > FlashJournal::HEADER_SIZE);
 
         let mut restored_store = MemConfigStore::<16>::new();
-        let entries = FlashJournal::load_from_sector(&sector[..bytes_written], &mut restored_store).unwrap();
+        let entries = FlashJournal::load_from_sector(
+            &sector[..bytes_written],
+            &mut restored_store,
+        )
+        .unwrap();
         assert_eq!(entries, 4);
 
-        assert_eq!(restored_store.get_str::<32>("wifi.ssid").unwrap().unwrap().as_str(), "Main_AP");
-        assert_eq!(restored_store.get_str::<32>("wifi.pass").unwrap().unwrap().as_str(), "Pass1234");
+        assert_eq!(
+            restored_store.get_str::<32>("wifi.ssid").unwrap().unwrap().as_str(),
+            "Main_AP"
+        );
+        assert_eq!(
+            restored_store.get_str::<32>("wifi.pass").unwrap().unwrap().as_str(),
+            "Pass1234"
+        );
         assert_eq!(restored_store.get_u8("audio.vol").unwrap(), Some(85));
         assert_eq!(restored_store.get_u32("audio.baud").unwrap(), Some(115200));
     }
@@ -1189,13 +1220,23 @@ mod tests {
         let mut sector_b = [0u8; 512];
 
         // First write -> goes to sector A (sequence 1)
-        let (wrote_b, n1) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        let (wrote_b, n1) = FlashJournal::save_to_dual_sectors(
+            &store,
+            &mut sector_a,
+            &mut sector_b,
+        )
+        .unwrap();
         assert!(!wrote_b);
         assert!(n1 > FlashJournal::HEADER_SIZE);
 
         // Second write -> goes to sector B (sequence 2)
         store.set_str("setting.k1", "v2").unwrap();
-        let (wrote_b2, n2) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        let (wrote_b2, n2) = FlashJournal::save_to_dual_sectors(
+            &store,
+            &mut sector_a,
+            &mut sector_b,
+        )
+        .unwrap();
         assert!(wrote_b2);
         assert!(n2 > FlashJournal::HEADER_SIZE);
 
@@ -1245,7 +1286,8 @@ mod tests {
     #[test]
     fn test_scalar_accessor_error_mapping() {
         let mut store = MemConfigStore::<16>::new();
-        // Store 5 bytes under u32 key -> get_u32 must return InvalidFormat (BufferTooSmall mapped)
+        // Store 5 bytes under u32 key -> get_u32 must return InvalidFormat
+        // (BufferTooSmall mapped)
         store.set("bad.u32", &[1, 2, 3, 4, 5]).unwrap();
         assert_eq!(store.get_u32("bad.u32"), Err(StorageError::InvalidFormat));
 
@@ -1363,7 +1405,7 @@ mod tests {
         FlashJournal::save_to_sector_with_seq(&store, &mut sector_equal_b, u32::MAX).unwrap();
         assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_equal_b), Ok(0));
 
-        // Validation before writing header: buffer too small for entries does not mutate header
+        // Buffer too small for entries does not mutate header
         let mut small_buf = [0xFFu8; 20]; // fits 16-byte header, but not entry
         let err = FlashJournal::save_to_sector_with_seq(&store, &mut small_buf, 42);
         assert_eq!(err, Err(StorageError::BufferTooSmall));
@@ -1378,7 +1420,8 @@ mod tests {
         let mut sector_b = [0xFFu8; SECTOR_SIZE];
 
         let mut cfg = AudioConfig::default();
-        assert_eq!(cfg.analog_gain_code, AudioConfig::DEFAULT_ANALOG_GAIN_CODE); // Default -4.0 dB (0x08)
+        // Default -4.0 dB (0x08)
+        assert_eq!(cfg.analog_gain_code, AudioConfig::DEFAULT_ANALOG_GAIN_CODE);
         assert!(!cfg.loudness_enabled);
 
         cfg.volume = 55;
@@ -1387,8 +1430,12 @@ mod tests {
         cfg.loudness_enabled = true;
 
         cfg.save_to(&mut store).expect("save_to ok");
-        let (wrote_b, bytes) = FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b)
-            .expect("journal save ok");
+        let (wrote_b, bytes) = FlashJournal::save_to_dual_sectors(
+            &store,
+            &mut sector_a,
+            &mut sector_b,
+        )
+        .expect("journal save ok");
         assert!(!wrote_b);
         assert!(bytes > FlashJournal::HEADER_SIZE);
 
@@ -1429,7 +1476,7 @@ mod tests {
         assert_eq!(cfg.validate(), Err(StorageError::InvalidFormat));
     }
 
-    // --- staging-free journal access (JournalView / SectorWriter) ---------------------------
+    // --- staging-free journal access (JournalView / SectorWriter) -----------
 
     fn sample_store() -> MemConfigStore<16> {
         let mut store = MemConfigStore::<16>::new();
@@ -1464,7 +1511,8 @@ mod tests {
         let mut sector = [0xFFu8; 512];
         let mut writer = SectorWriter::new(&mut sector).unwrap();
         AudioConfig::default().save_to(&mut writer).unwrap();
-        // Optional keys were never written: remove of an absent key is the usual KeyNotFound.
+        // Optional keys were never written: remove of an absent key is the
+        // usual KeyNotFound.
         assert_eq!(writer.remove("absent"), Err(StorageError::KeyNotFound));
         // Append-only: a written key can be neither rewritten nor removed.
         assert_eq!(writer.set(AudioConfig::KEY_VOL, &[1]), Err(StorageError::InvalidFormat));
@@ -1551,7 +1599,10 @@ mod tests {
         crc = crc32_update(crc, &dup[FlashJournal::HEADER_SIZE..dup_len]);
         dup[12..16].copy_from_slice(&(!crc).to_be_bytes());
         let mut sink = MemConfigStore::<16>::new();
-        assert_eq!(FlashJournal::load_from_sector(&dup, &mut sink), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            FlashJournal::load_from_sector(&dup, &mut sink),
+            Err(StorageError::InvalidFormat)
+        );
         assert_eq!(FlashJournal::validate_sector(&dup), Err(StorageError::InvalidFormat));
     }
 
@@ -1594,7 +1645,8 @@ mod tests {
         assert!(!cfg.set_player_name(""));
         assert!(!cfg.set_player_name("\0x"));
         assert_eq!(cfg.player_name.as_str(), "Den");
-        // Longer than the journal capacity: truncated on a char boundary, never split.
+        // Longer than the journal capacity: truncated on a char boundary,
+        // never split.
         let long = "é".repeat(20); // 40 bytes
         assert!(cfg.set_player_name(&long));
         assert_eq!(cfg.player_name.len(), 32);

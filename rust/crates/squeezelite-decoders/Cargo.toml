@@ -4,17 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Pure-Rust audio decoders (PCM, MP3, FLAC, AAC, Vorbis) for squeezelite-esp32"
+description = "Pure-Rust audio decoders (PCM, MP3, FLAC, AAC, Vorbis, ALAC) for squeezelite-esp32"
 
 [features]
 default = ["std"]
-alloc = []
-std = ["alloc", "dep:lewton", "dep:syom", "dep:thiserror"]
+alloc = ["dep:syom", "dep:lewton", "dep:alac", "dep:opus-rs"]
+std = ["alloc", "syom/std", "dep:thiserror", "lewton/std"]
 
 [dependencies]
 squeezelite-audio-core = { path = "../squeezelite-audio-core" }
-lewton = { version = "0.10", default-features = false, features = ["ogg"], optional = true }
-syom = { version = "0.7", optional = true }
+lewton = { version = "0.10", default-features = false, optional = true }
+alac = { version = "0.5.0", default-features = false, optional = true }
+# Vendored no_std + alloc port: rust/vendor/syom (see VENDOR.md, [patch.crates-io]).
+syom = { version = "0.7", default-features = false, optional = true }
+# Vendored no_std + alloc port: rust/vendor/opus-rs (see VENDOR.md, [patch.crates-io]).
+opus-rs = { version = "0.1.40", default-features = false, features = ["libm"], optional = true }
 nanomp3-core = { version = "0.2", default-features = false, features = ["layer12"] }
 thiserror = { workspace = true, optional = true }
 log = { workspace = true, optional = true }

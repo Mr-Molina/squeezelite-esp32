@@ -21,17 +21,25 @@ extern crate alloc;
 use std::boxed::Box;
 #[cfg(feature = "std")]
 use std::vec;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::boxed::Box;
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::vec;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
 use core::fmt;
 
-/// Maximum stream buffer size for compressed audio decoders (FLAC, Vorbis) (PERF-201).
+/// Maximum stream buffer size for compressed audio decoders (FLAC, Vorbis)
+/// (PERF-201).
 pub const MAX_STREAM_BUF: usize = 65536;
+
+/// Maximum block samples supported by FLAC decoder (RFC 9639 standard CD-DA).
+pub const MAX_FLAC_BLOCK_SAMPLES: usize = 4608;
 
 /// Unified Audio Decoder Error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +72,8 @@ impl fmt::Display for DecoderError {
 
 /// Core trait implemented by all audio format decoders.
 pub trait AudioDecoder {
-    /// Decodes encoded audio bytes from `encoded_in` and outputs interleaved 32-bit PCM samples to `pcm_out`.
+    /// Decodes encoded audio bytes from `encoded_in` and outputs
+    /// interleaved 32-bit PCM samples to `pcm_out`.
     ///
     /// Returns `Ok((bytes_consumed, frames_produced))`.
     fn decode(
@@ -91,7 +100,8 @@ const fn parse_aiff_extended_float(bytes: &[u8; 10]) -> u32 {
     }
 }
 
-/// PCM Passthrough Decoder (16-bit / 24-bit / 32-bit, Big or Little Endian, Mono or Stereo).
+/// PCM Passthrough Decoder (16-bit / 24-bit / 32-bit, Big or Little Endian,
+/// Mono or Stereo).
 pub struct PcmDecoder {
     pub bits_per_sample: u8,
     pub channels: u8,
@@ -111,7 +121,8 @@ impl PcmDecoder {
         }
     }
 
-    /// Automatically detects and strips WAV (RIFF...WAVE) and AIFF (FORM...AIFF) container headers.
+    /// Automatically detects and strips WAV (RIFF...WAVE) and AIFF
+    /// (FORM...AIFF) container headers.
     pub fn try_strip_container_header(&mut self, data: &[u8]) -> Result<usize, DecoderError> {
         if data.len() < 4 {
             if b"RIFF".starts_with(data) || b"FORM".starts_with(data) {
@@ -144,11 +155,21 @@ impl PcmDecoder {
                     .ok_or(DecoderError::InvalidHeader)?;
 
                 if chunk_id == b"fmt " {
+                    if chunk_size < 16 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
                     if offset.checked_add(24).is_none_or(|end| end > data.len()) {
                         return Err(DecoderError::NeedMoreData);
                     }
                     let fmt_payload = &data[offset + 8..];
+                    let format_tag = u16::from_le_bytes([fmt_payload[0], fmt_payload[1]]);
+                    if format_tag != 1 {
+                        return Err(DecoderError::UnsupportedSampleFormat);
+                    }
                     let num_channels = u16::from_le_bytes([fmt_payload[2], fmt_payload[3]]);
+                    if num_channels != 1 && num_channels != 2 {
+                        return Err(DecoderError::UnsupportedSampleFormat);
+                    }
                     let sample_rate = u32::from_le_bytes([
                         fmt_payload[4],
                         fmt_payload[5],
@@ -157,9 +178,7 @@ impl PcmDecoder {
                     ]);
                     let bits_per_sample = u16::from_le_bytes([fmt_payload[14], fmt_payload[15]]);
 
-                    if num_channels == 1 || num_channels == 2 {
-                        self.channels = num_channels as u8;
-                    }
+                    self.channels = num_channels as u8;
                     self.sample_rate = Some(sample_rate);
                     self.bits_per_sample = bits_per_sample as u8;
                     self.big_endian = false;
@@ -211,20 +230,24 @@ impl PcmDecoder {
                     .ok_or(DecoderError::InvalidHeader)?;
 
                 if chunk_id == b"COMM" {
+                    if chunk_size < 18 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
                     if offset.checked_add(26).is_none_or(|end| end > data.len()) {
                         return Err(DecoderError::NeedMoreData);
                     }
                     let comm_payload = &data[offset + 8..];
                     let num_channels = i16::from_be_bytes([comm_payload[0], comm_payload[1]]);
+                    if num_channels != 1 && num_channels != 2 {
+                        return Err(DecoderError::UnsupportedSampleFormat);
+                    }
                     let sample_size = i16::from_be_bytes([comm_payload[6], comm_payload[7]]);
 
                     let mut ext = [0u8; 10];
                     ext.copy_from_slice(&comm_payload[8..18]);
                     let sample_rate = parse_aiff_extended_float(&ext);
 
-                    if num_channels == 1 || num_channels == 2 {
-                        self.channels = num_channels as u8;
-                    }
+                    self.channels = num_channels as u8;
                     if sample_size > 0 {
                         self.bits_per_sample = sample_size as u8;
                     }
@@ -617,7 +640,8 @@ impl AudioDecoder for Mp3Decoder {
                 }
             }
             Err(nanomp3_core::DecodeError::ReservoirUnavailable(_)) => {
-                // DEC-005: Differentiate between 0 consumed (need more bytes) and >0 consumed (absorbed into reservoir)
+                // DEC-005: Differentiate between 0 consumed (need more bytes)
+                // and >0 consumed (absorbed into reservoir)
                 if consumed == 0 {
                     Err(DecoderError::NeedMoreData)
                 } else {
@@ -641,10 +665,12 @@ impl AudioDecoder for Mp3Decoder {
     }
 }
 
-/// Zero-heap, `no_std`, `const fn`-initializable MP3 decoder for embedded targets (`xtensa`).
+/// Zero-heap, `no_std`, `const fn`-initializable MP3 decoder for
+/// embedded targets (`xtensa`).
 ///
-/// Decodes directly into `pcm_out` (`>= 2304` `i32` samples) with zero heap allocations
-/// and resets in O(1) via `nanomp3_core::__private::init` without constructing a 23 KB temporary.
+/// Decodes directly into `pcm_out` (`>= 2304` `i32` samples) with zero
+/// heap allocations and resets in O(1) via `nanomp3_core::__private::init`
+/// without constructing a 23 KB temporary.
 pub struct StaticMp3Decoder {
     pub sample_rate: u32,
     decoder: nanomp3_core::Decoder,
@@ -666,7 +692,8 @@ impl StaticMp3Decoder {
         }
     }
 
-    /// Resets the decoder state in-place without constructing a 23 KB temporary on the stack.
+    /// Resets the decoder state in-place without constructing a 23 KB
+    /// temporary on the stack.
     pub fn reset_in_place(&mut self) {
         self.sample_rate = 44100;
         nanomp3_core::__private::init(&mut self.decoder);
@@ -736,10 +763,14 @@ impl AudioDecoder for StaticMp3Decoder {
             }
             Some((0, h)) => {
                 let frame_bytes = h.frame_bytes(0) + h.padding();
-                if frame_bytes == 0 || frame_bytes + 4 > 1728 {
+                if frame_bytes == 0 || frame_bytes > 1728 {
                     return Ok((1, 0));
                 }
-                if encoded_in.len() < frame_bytes + 4 {
+                if encoded_in.len() == frame_bytes {
+                    (frame_bytes, &encoded_in[..frame_bytes])
+                } else if encoded_in.len() < frame_bytes {
+                    return Err(DecoderError::NeedMoreData);
+                } else if encoded_in.len() < frame_bytes + 4 {
                     if encoded_in.len() >= frame_bytes + 2
                         && (encoded_in[frame_bytes] != 0xFF
                             || (encoded_in[frame_bytes + 1] & 0xE0) != 0xE0)
@@ -747,12 +778,13 @@ impl AudioDecoder for StaticMp3Decoder {
                         return Ok((1, 0));
                     }
                     return Err(DecoderError::NeedMoreData);
+                } else {
+                    let next_h = nanomp3_core::__private::Header::read(&encoded_in[frame_bytes..]);
+                    if !h.compare(next_h) {
+                        return Ok((1, 0));
+                    }
+                    (frame_bytes, &encoded_in[..frame_bytes + 4])
                 }
-                let next_h = nanomp3_core::__private::Header::read(&encoded_in[frame_bytes..]);
-                if !h.compare(next_h) {
-                    return Ok((1, 0));
-                }
-                (frame_bytes, &encoded_in[..frame_bytes + 4])
             }
             _ => unreachable!(),
         };
@@ -1013,29 +1045,87 @@ fn read_utf8_number(buf: &[u8], idx: usize) -> Result<(u64, usize), ()> {
     if (u0 & 0xF8) == 0xF0 {
         if idx + 4 > buf.len() { return Err(()); }
         let (u1, u2, u3) = (buf[idx + 1], buf[idx + 2], buf[idx + 3]);
-        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 { return Err(()); }
-        let val = ((u0 as u64 & 0x07) << 18) | ((u1 as u64 & 0x3F) << 12) | ((u2 as u64 & 0x3F) << 6) | (u3 as u64 & 0x3F);
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 {
+            return Err(());
+        }
+        let val = ((u0 as u64 & 0x07) << 18)
+            | ((u1 as u64 & 0x3F) << 12)
+            | ((u2 as u64 & 0x3F) << 6)
+            | (u3 as u64 & 0x3F);
         return Ok((val, idx + 4));
     }
     if (u0 & 0xFC) == 0xF8 {
         if idx + 5 > buf.len() { return Err(()); }
-        let (u1, u2, u3, u4) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4]);
-        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 || (u4 & 0xC0) != 0x80 { return Err(()); }
-        let val = ((u0 as u64 & 0x03) << 24) | ((u1 as u64 & 0x3F) << 18) | ((u2 as u64 & 0x3F) << 12) | ((u3 as u64 & 0x3F) << 6) | (u4 as u64 & 0x3F);
+        let (u1, u2, u3, u4) = (
+            buf[idx + 1],
+            buf[idx + 2],
+            buf[idx + 3],
+            buf[idx + 4],
+        );
+        let valid = (u1 & 0xC0) == 0x80
+            && (u2 & 0xC0) == 0x80
+            && (u3 & 0xC0) == 0x80
+            && (u4 & 0xC0) == 0x80;
+        if !valid {
+            return Err(());
+        }
+        let val = ((u0 as u64 & 0x03) << 24)
+            | ((u1 as u64 & 0x3F) << 18)
+            | ((u2 as u64 & 0x3F) << 12)
+            | ((u3 as u64 & 0x3F) << 6)
+            | (u4 as u64 & 0x3F);
         return Ok((val, idx + 5));
     }
     if (u0 & 0xFE) == 0xFC {
         if idx + 6 > buf.len() { return Err(()); }
-        let (u1, u2, u3, u4, u5) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4], buf[idx + 5]);
-        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 || (u4 & 0xC0) != 0x80 || (u5 & 0xC0) != 0x80 { return Err(()); }
-        let val = ((u0 as u64 & 0x01) << 30) | ((u1 as u64 & 0x3F) << 24) | ((u2 as u64 & 0x3F) << 18) | ((u3 as u64 & 0x3F) << 12) | ((u4 as u64 & 0x3F) << 6) | (u5 as u64 & 0x3F);
+        let (u1, u2, u3, u4, u5) = (
+            buf[idx + 1],
+            buf[idx + 2],
+            buf[idx + 3],
+            buf[idx + 4],
+            buf[idx + 5],
+        );
+        let valid = (u1 & 0xC0) == 0x80
+            && (u2 & 0xC0) == 0x80
+            && (u3 & 0xC0) == 0x80
+            && (u4 & 0xC0) == 0x80
+            && (u5 & 0xC0) == 0x80;
+        if !valid {
+            return Err(());
+        }
+        let val = ((u0 as u64 & 0x01) << 30)
+            | ((u1 as u64 & 0x3F) << 24)
+            | ((u2 as u64 & 0x3F) << 18)
+            | ((u3 as u64 & 0x3F) << 12)
+            | ((u4 as u64 & 0x3F) << 6)
+            | (u5 as u64 & 0x3F);
         return Ok((val, idx + 6));
     }
     if u0 == 0xFE {
         if idx + 7 > buf.len() { return Err(()); }
-        let (u1, u2, u3, u4, u5, u6) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4], buf[idx + 5], buf[idx + 6]);
-        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 || (u4 & 0xC0) != 0x80 || (u5 & 0xC0) != 0x80 || (u6 & 0xC0) != 0x80 { return Err(()); }
-        let val = ((u1 as u64 & 0x3F) << 30) | ((u2 as u64 & 0x3F) << 24) | ((u3 as u64 & 0x3F) << 18) | ((u4 as u64 & 0x3F) << 12) | ((u5 as u64 & 0x3F) << 6) | (u6 as u64 & 0x3F);
+        let (u1, u2, u3, u4, u5, u6) = (
+            buf[idx + 1],
+            buf[idx + 2],
+            buf[idx + 3],
+            buf[idx + 4],
+            buf[idx + 5],
+            buf[idx + 6],
+        );
+        let valid = (u1 & 0xC0) == 0x80
+            && (u2 & 0xC0) == 0x80
+            && (u3 & 0xC0) == 0x80
+            && (u4 & 0xC0) == 0x80
+            && (u5 & 0xC0) == 0x80
+            && (u6 & 0xC0) == 0x80;
+        if !valid {
+            return Err(());
+        }
+        let val = ((u1 as u64 & 0x3F) << 30)
+            | ((u2 as u64 & 0x3F) << 24)
+            | ((u3 as u64 & 0x3F) << 18)
+            | ((u4 as u64 & 0x3F) << 12)
+            | ((u5 as u64 & 0x3F) << 6)
+            | (u6 as u64 & 0x3F);
         return Ok((val, idx + 7));
     }
     Err(())
@@ -1105,7 +1195,7 @@ fn parse_frame_header(
         8..=15 => 256 * (1usize << (block_size_code - 8)),
         _ => return Err(()),
     };
-    if block_size == 0 || block_size > 4096 {
+    if block_size == 0 || block_size > MAX_FLAC_BLOCK_SAMPLES {
         return Err(());
     }
 
@@ -1248,11 +1338,15 @@ fn decode_subframe(
             for sample in out[..order].iter_mut() {
                 *sample = reader.read_signed(eff_bps)?;
             }
-            let qlp_prec = (reader.read_bits(4)? + 1) as usize;
-            if qlp_prec > 15 {
+            let raw_prec = reader.read_bits(4)?;
+            let qlp_prec = (raw_prec + 1) as usize;
+            if qlp_prec == 1 || qlp_prec > 16 {
                 return Err(());
             }
             let qlp_shift = reader.read_signed(5)? as i32;
+            if qlp_shift < 0 {
+                return Err(());
+            }
             let mut coeffs = [0i64; 32];
             for coeff in coeffs[..order].iter_mut() {
                 *coeff = reader.read_signed(qlp_prec)?;
@@ -1264,11 +1358,7 @@ fn decode_subframe(
                 for j in 0..order {
                     sum += coeffs[j] * out[i - 1 - j];
                 }
-                let predicted = if qlp_shift >= 0 {
-                    sum >> qlp_shift
-                } else {
-                    sum << (-qlp_shift)
-                };
+                let predicted = sum >> qlp_shift;
                 out[i] += predicted;
             }
         }
@@ -1332,12 +1422,18 @@ fn decode_residual(
                     return Err(());
                 }
                 let q = reader.read_unary_zeros()? as u64;
+                if q > 65535 {
+                    return Err(());
+                }
                 let rem = if k > 0 {
                     reader.read_bits(k as usize)? as u64
                 } else {
                     0
                 };
-                let u = (q << k) | rem;
+                let u = match q.checked_shl(k) {
+                    Some(shifted) => shifted | rem,
+                    None => return Err(()),
+                };
                 let val = if (u & 1) != 0 {
                     -1 - (u >> 1) as i64
                 } else {
@@ -1370,26 +1466,26 @@ fn decorrelate_samples(
         }
         1 => {
             let l = (scratch[i] as i32) << shift;
-            let r = (scratch[4096 + i] as i32) << shift;
+            let r = (scratch[MAX_FLAC_BLOCK_SAMPLES + i] as i32) << shift;
             (l, r)
         }
         8 => {
             let ch0 = scratch[i];
-            let ch1 = scratch[4096 + i];
+            let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
             let l = (ch0 as i32) << shift;
             let r = ((ch0 - ch1) as i32) << shift;
             (l, r)
         }
         9 => {
             let ch0 = scratch[i];
-            let ch1 = scratch[4096 + i];
+            let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
             let l = ((ch1 + ch0) as i32) << shift;
             let r = (ch1 as i32) << shift;
             (l, r)
         }
         10 => {
             let ch0 = scratch[i];
-            let ch1 = scratch[4096 + i];
+            let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
             let mid = (ch0 << 1) | (ch1 & 1);
             let l = (((mid + ch1) >> 1) as i32) << shift;
             let r = (((mid - ch1) >> 1) as i32) << shift;
@@ -1397,14 +1493,15 @@ fn decorrelate_samples(
         }
         _ => {
             let l = (scratch[i] as i32) << shift;
-            let r = (scratch[4096 + i] as i32) << shift;
+            let r = (scratch[MAX_FLAC_BLOCK_SAMPLES + i] as i32) << shift;
             (l, r)
         }
     }
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
-/// Pure-Rust RFC 9639 Lossless FLAC Decoder with 64KB External PSRAM buffer placement.
+/// Pure-Rust RFC 9639 Lossless FLAC Decoder with 64KB External PSRAM buffer
+/// placement.
 pub struct FlacDecoder {
     pub sample_rate: u32,
     pub bits_per_sample: u32,
@@ -1452,7 +1549,7 @@ impl FlacDecoder {
             stream_buf: vec::Vec::with_capacity(MAX_STREAM_BUF),
             pending_pcm: vec::Vec::with_capacity(16384),
             pending_offset: 0,
-            subframe_scratch: vec![0i64; 8192].into_boxed_slice(),
+            subframe_scratch: vec![0i64; MAX_FLAC_BLOCK_SAMPLES * 2].into_boxed_slice(),
             meta_skip_remaining: 0,
             in_metadata: false,
             min_block_size: 0,
@@ -1552,14 +1649,7 @@ impl AudioDecoder for FlacDecoder {
             }
         }
 
-        if self.header_len > 0 && self.stream_buf.len() > self.header_len {
-            if let Some(pos) = self.stream_buf[self.header_len..].windows(4).position(|w| w == b"fLaC") {
-                let abs_pos = self.header_len + pos;
-                self.stream_buf.drain(..abs_pos);
-                self.header_len = 0;
-                self.in_metadata = false;
-            }
-        }
+
 
         if self.header_len == 0 {
             if let Some(pos) = self.stream_buf.windows(4).position(|w| w == b"fLaC") {
@@ -1706,9 +1796,11 @@ impl AudioDecoder for FlacDecoder {
                     10 if ch == 1 => hdr.bits_per_sample + 1,
                     _ => hdr.bits_per_sample,
                 };
-                let ch_start = ch * 4096;
+                let ch_start = ch * MAX_FLAC_BLOCK_SAMPLES;
                 let ch_slice = &mut self.subframe_scratch[ch_start..ch_start + hdr.block_size];
-                if let Err(()) = decode_subframe(&mut reader, subframe_bps, hdr.block_size, ch_slice) {
+                if let Err(()) =
+                    decode_subframe(&mut reader, subframe_bps, hdr.block_size, ch_slice)
+                {
                     if reader.byte_pos >= reader.bytes.len() {
                         subframe_incomplete = true;
                     } else {
@@ -1735,7 +1827,8 @@ impl AudioDecoder for FlacDecoder {
                 break;
             }
 
-            let expected_crc = u16::from_be_bytes([frame_buf[frame_body_len], frame_buf[frame_body_len + 1]]);
+            let expected_crc =
+                u16::from_be_bytes([frame_buf[frame_body_len], frame_buf[frame_body_len + 1]]);
             let actual_crc = flac_crc16(&frame_buf[0..frame_body_len]);
             if expected_crc != actual_crc {
                 self.stream_buf.drain(self.header_len..self.header_len + 1);
@@ -1797,37 +1890,54 @@ impl AudioDecoder for FlacDecoder {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 /// Pure-Rust AAC (ADTS / LC / HE-AAC) Decoder using syom.
 ///
 /// Propagates exact consumed byte counts returned by syom (DEC-004).
+/// Available with `alloc` (vendored `no_std + alloc` syom port, WO-199).
 pub struct AacDecoder {
     decoder: syom::Decoder,
     pub sample_rate: u32,
     pub channels: u32,
-    pending_pcm: std::vec::Vec<i32>,
+    pending_pcm: vec::Vec<i32>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl Default for AacDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl AacDecoder {
     pub fn new() -> Self {
         Self {
-            decoder: syom::Decoder::new(syom::DecodeOptions::default()),
+            decoder: syom::Decoder::new(syom::DecodeOptions::audio()),
             sample_rate: 44100,
             channels: 2,
-            pending_pcm: std::vec::Vec::new(),
+            pending_pcm: vec::Vec::new(),
         }
+    }
+
+    pub fn has_pending_pcm(&self) -> bool {
+        !self.pending_pcm.is_empty()
+    }
+
+    pub fn flush(&mut self) {
+        self.decoder.reset();
+        self.pending_pcm.clear();
     }
 }
 
-#[cfg(feature = "std")]
+/// Pre-warms codec lazy statics into heap memory at startup to avoid runtime
+/// latency/stack spikes.
+#[cfg(feature = "alloc")]
+pub fn warm_up_decoders() {
+    syom::warm_up();
+}
+
+#[cfg(feature = "alloc")]
 impl AudioDecoder for AacDecoder {
     fn decode(
         &mut self,
@@ -1881,7 +1991,8 @@ impl AudioDecoder for AacDecoder {
             for i in 0..samples {
                 let l_f = left[i].clamp(-1.0, 1.0);
                 let r_f = right[i].clamp(-1.0, 1.0);
-                let l = (l_f * 2147483520.0) as i32; // Clamping boundary to avoid overflow (DSP-003)
+                // Clamping boundary to avoid overflow (DSP-003)
+                let l = (l_f * 2147483520.0) as i32;
                 let r = (r_f * 2147483520.0) as i32;
                 if frames_out < max_frames {
                     pcm_out[frames_out * 2] = l;
@@ -1915,46 +2026,221 @@ impl AudioDecoder for AacDecoder {
     }
 
     fn flush(&mut self) {
-        self.decoder = syom::Decoder::new(syom::DecodeOptions::default());
-        self.pending_pcm.clear();
+        self.flush();
     }
 }
 
-#[cfg(feature = "std")]
-/// Pure-Rust Ogg Vorbis Decoder using lewton with header/audio packet differentiation (DEC-003).
+#[cfg(feature = "alloc")]
+enum VorbisState {
+    WaitingIdent,
+    WaitingComment {
+        ident: Box<lewton::header::IdentHeader>,
+    },
+    WaitingSetup {
+        ident: Box<lewton::header::IdentHeader>,
+        _comment: Box<lewton::header::CommentHeader>,
+    },
+    Ready {
+        ident: Box<lewton::header::IdentHeader>,
+        setup: Box<lewton::header::SetupHeader>,
+        pwr: lewton::audio::PreviousWindowRight,
+    },
+    Poisoned,
+}
+
+#[cfg(feature = "alloc")]
+/// Pure-Rust Ogg Vorbis Decoder using lewton with in-memory Ogg page
+/// demuxing (DEC-003).
+///
+/// Promoted to `alloc` (vendored `no_std + alloc` lewton port, WO-203).
 pub struct VorbisDecoder {
     pub sample_rate: u32,
     pub channels: u32,
     pub packets_decoded: usize,
-    header_len: usize,
-    stream_buf: std::vec::Vec<u8>,
-    pending_samples: std::vec::Vec<i16>,
-    pending_channels: usize,
+    stream_buf: Vec<u8>,
+    partial_packet: Vec<u8>,
+    packet_queue: Vec<Vec<u8>>,
+    pending_pcm: Vec<i32>,
+    state: VorbisState,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl Default for VorbisDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl VorbisDecoder {
     pub fn new() -> Self {
         Self {
             sample_rate: 44100,
             channels: 2,
             packets_decoded: 0,
-            header_len: 0,
-            stream_buf: std::vec::Vec::new(),
-            pending_samples: std::vec::Vec::new(),
-            pending_channels: 2,
+            stream_buf: Vec::new(),
+            partial_packet: Vec::new(),
+            packet_queue: Vec::new(),
+            pending_pcm: Vec::new(),
+            state: VorbisState::WaitingIdent,
+        }
+    }
+
+    pub fn has_pending_pcm(&self) -> bool {
+        !self.pending_pcm.is_empty() || !self.packet_queue.is_empty()
+    }
+
+    pub fn flush(&mut self) {
+        self.pending_pcm.clear();
+        self.packet_queue.clear();
+        self.partial_packet.clear();
+        self.stream_buf.clear();
+        self.packets_decoded = 0;
+        if let VorbisState::Ready { ident, setup, .. } =
+            core::mem::replace(&mut self.state, VorbisState::WaitingIdent)
+        {
+            self.state = VorbisState::Ready {
+                ident,
+                setup,
+                pwr: lewton::audio::PreviousWindowRight::new(),
+            };
+        }
+    }
+
+    fn decode_single_packet(
+        &mut self,
+        packet: &[u8],
+        pcm_out: &mut [i32],
+        frames_out: &mut usize,
+        max_frames: usize,
+    ) -> Result<(), DecoderError> {
+        if packet.is_empty() {
+            return Ok(());
+        }
+
+        // Header packets have LSB 1; audio packets have LSB 0 (Vorbis I spec §1.3.1)
+        let is_header = (packet[0] & 1) != 0;
+
+        if is_header {
+            if packet.starts_with(b"\x01vorbis") {
+                let ident = lewton::header::read_header_ident(packet)
+                    .map_err(|_| DecoderError::InvalidHeader)?;
+                if ident.audio_channels != 1 && ident.audio_channels != 2 {
+                    return Err(DecoderError::UnsupportedSampleFormat);
+                }
+                self.sample_rate = ident.audio_sample_rate;
+                self.channels = ident.audio_channels as u32;
+                self.state = VorbisState::WaitingComment {
+                    ident: Box::new(ident),
+                };
+                return Ok(());
+            } else if packet.starts_with(b"\x03vorbis") {
+                let comment = lewton::header::read_header_comment(packet)
+                    .map_err(|_| DecoderError::InvalidHeader)?;
+                let ident = match core::mem::replace(&mut self.state, VorbisState::Poisoned) {
+                    VorbisState::WaitingComment { ident } => ident,
+                    VorbisState::WaitingSetup { ident, .. } => ident,
+                    VorbisState::Ready { ident, .. } => ident,
+                    _ => return Err(DecoderError::InvalidHeader),
+                };
+                self.state = VorbisState::WaitingSetup {
+                    ident,
+                    _comment: Box::new(comment),
+                };
+                return Ok(());
+            } else if packet.starts_with(b"\x05vorbis") {
+                let ident = match core::mem::replace(&mut self.state, VorbisState::Poisoned) {
+                    VorbisState::WaitingSetup { ident, .. } => ident,
+                    VorbisState::Ready { ident, .. } => ident,
+                    _ => return Err(DecoderError::InvalidHeader),
+                };
+                let setup = lewton::header::read_header_setup(
+                    packet,
+                    ident.audio_channels,
+                    (ident.blocksize_0, ident.blocksize_1),
+                )
+                .map_err(|_| DecoderError::InvalidHeader)?;
+                self.state = VorbisState::Ready {
+                    ident,
+                    setup: Box::new(setup),
+                    pwr: lewton::audio::PreviousWindowRight::new(),
+                };
+                return Ok(());
+            } else {
+                return Err(DecoderError::InvalidHeader);
+            }
+        }
+
+        // Audio packet (LSB 0)
+        let state = core::mem::replace(&mut self.state, VorbisState::Poisoned);
+        match state {
+            VorbisState::Ready { ident, setup, mut pwr } => {
+                let decode_res: Result<lewton::samples::InterleavedSamples<i16>, _> =
+                    lewton::audio::read_audio_packet_generic(&ident, &setup, packet, &mut pwr);
+                self.state = VorbisState::Ready { ident, setup, pwr };
+
+                match decode_res {
+                    Ok(decoded) => {
+                        self.packets_decoded += 1;
+                        let ch = self.channels as usize;
+                        if ch == 0 {
+                            return Err(DecoderError::UnsupportedSampleFormat);
+                        }
+                        let packet_frames = decoded.samples.len() / ch;
+                        if packet_frames == 0 {
+                            return Ok(());
+                        }
+
+                        let available = max_frames.saturating_sub(*frames_out);
+                        let to_copy = core::cmp::min(packet_frames, available);
+
+                        if ch == 2 {
+                            for i in 0..to_copy {
+                                pcm_out[(*frames_out + i) * 2] =
+                                    (decoded.samples[i * 2] as i32) << 16;
+                                pcm_out[(*frames_out + i) * 2 + 1] =
+                                    (decoded.samples[i * 2 + 1] as i32) << 16;
+                            }
+                            if to_copy < packet_frames {
+                                for i in to_copy..packet_frames {
+                                    self.pending_pcm
+                                        .push((decoded.samples[i * 2] as i32) << 16);
+                                    self.pending_pcm
+                                        .push((decoded.samples[i * 2 + 1] as i32) << 16);
+                                }
+                            }
+                        } else {
+                            for i in 0..to_copy {
+                                let s = (decoded.samples[i] as i32) << 16;
+                                pcm_out[(*frames_out + i) * 2] = s;
+                                pcm_out[(*frames_out + i) * 2 + 1] = s;
+                            }
+                            if to_copy < packet_frames {
+                                for i in to_copy..packet_frames {
+                                    let s = (decoded.samples[i] as i32) << 16;
+                                    self.pending_pcm.push(s);
+                                    self.pending_pcm.push(s);
+                                }
+                            }
+                        }
+                        *frames_out += to_copy;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        // Skip corrupt frame in continuous stream
+                        Ok(())
+                    }
+                }
+            }
+            other => {
+                self.state = other;
+                Ok(())
+            }
         }
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "alloc")]
 impl AudioDecoder for VorbisDecoder {
     fn decode(
         &mut self,
@@ -1966,33 +2252,33 @@ impl AudioDecoder for VorbisDecoder {
             return Err(DecoderError::BufferOverflow);
         }
 
-        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
-            self.stream_buf.clear();
-            self.header_len = 0;
-            self.pending_samples.clear();
-            self.packets_decoded = 0;
-            return Err(DecoderError::CorruptedFrame);
+        let mut frames_out = 0;
+
+        // 1. Copy pending PCM from prior decode
+        if !self.pending_pcm.is_empty() {
+            let pending_frames = self.pending_pcm.len() / 2;
+            let to_copy = core::cmp::min(pending_frames, max_frames);
+            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
+            self.pending_pcm.drain(..to_copy * 2);
+            frames_out += to_copy;
+            if frames_out >= max_frames {
+                return Ok((0, frames_out));
+            }
         }
 
-        let mut frames_out = 0;
-        if !self.pending_samples.is_empty() {
-            let ch = if self.pending_channels == 2 { 2 } else { 1 };
-            let pending_frames = self.pending_samples.len() / ch;
-            let to_copy = core::cmp::min(pending_frames, max_frames);
-            if ch == 2 {
-                for i in 0..to_copy {
-                    pcm_out[i * 2] = (self.pending_samples[i * 2] as i32) << 16;
-                    pcm_out[i * 2 + 1] = (self.pending_samples[i * 2 + 1] as i32) << 16;
-                }
-            } else {
-                for i in 0..to_copy {
-                    let s = (self.pending_samples[i] as i32) << 16;
-                    pcm_out[i * 2] = s;
-                    pcm_out[i * 2 + 1] = s;
-                }
+        // 2. Process queued complete packets
+        while frames_out < max_frames && !self.packet_queue.is_empty() {
+            let packet = self.packet_queue.remove(0);
+            self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
+            if frames_out >= max_frames {
+                return Ok((0, frames_out));
             }
-            self.pending_samples.drain(..to_copy * ch);
-            frames_out += to_copy;
+        }
+
+        // 3. Ingest input buffer
+        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.flush();
+            return Err(DecoderError::CorruptedFrame);
         }
 
         if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
@@ -2005,132 +2291,845 @@ impl AudioDecoder for VorbisDecoder {
         let input_taken = encoded_in.len();
         self.stream_buf.extend_from_slice(encoded_in);
 
-        if frames_out >= max_frames {
-            return Ok((input_taken, frames_out));
+        // 4. Demux Ogg pages from stream_buf
+        while let Some(pos) = self.stream_buf.windows(4).position(|w| w == b"OggS") {
+            if pos > 0 {
+                self.stream_buf.drain(..pos);
+            }
+
+            if self.stream_buf.len() < 27 {
+                break;
+            }
+
+            if self.stream_buf[4] != 0 {
+                self.stream_buf.drain(..1);
+                continue;
+            }
+
+            let n_segs = self.stream_buf[26] as usize;
+            let header_len = 27 + n_segs;
+            if self.stream_buf.len() < header_len {
+                break;
+            }
+
+            let mut seg_table_buf = [0u8; 255];
+            seg_table_buf[..n_segs].copy_from_slice(&self.stream_buf[27..header_len]);
+            let seg_table = &seg_table_buf[..n_segs];
+            let mut body_len: usize = 0;
+            for &s in seg_table {
+                body_len += s as usize;
+            }
+            let total_page_len = header_len + body_len;
+            if self.stream_buf.len() < total_page_len {
+                break;
+            }
+
+            let header_type_flag = self.stream_buf[5];
+            let is_continued = (header_type_flag & 0x01) != 0;
+
+            if !is_continued && !self.partial_packet.is_empty() {
+                self.partial_packet.clear();
+            }
+
+            let mut body_offset = header_len;
+            let mut page_packets = Vec::new();
+
+            for &seg_len_u8 in seg_table {
+                let seg_len = seg_len_u8 as usize;
+                self.partial_packet
+                    .extend_from_slice(&self.stream_buf[body_offset..body_offset + seg_len]);
+                body_offset += seg_len;
+
+                if seg_len_u8 < 255 {
+                    let packet = core::mem::take(&mut self.partial_packet);
+                    if !packet.is_empty() {
+                        page_packets.push(packet);
+                    }
+                }
+            }
+
+            self.stream_buf.drain(..total_page_len);
+
+            for packet in page_packets {
+                if frames_out < max_frames && self.packet_queue.is_empty() {
+                    self.decode_single_packet(
+                        &packet,
+                        pcm_out,
+                        &mut frames_out,
+                        max_frames,
+                    )?;
+                } else {
+                    self.packet_queue.push(packet);
+                }
+            }
         }
 
-        let cursor = std::io::Cursor::new(&self.stream_buf[..]);
-        match lewton::inside_ogg::OggStreamReader::new(cursor) {
-            Ok(mut reader) => {
-                if self.header_len == 0 {
-                    if let Ok(pr) = lewton::inside_ogg::OggStreamReader::new(std::io::Cursor::new(&self.stream_buf[..])) {
-                        self.header_len = pr.into_inner().into_inner().position() as usize;
-                    }
-                }
-
-                self.sample_rate = reader.ident_hdr.audio_sample_rate;
-                self.channels = reader.ident_hdr.audio_channels as u32;
-
-                if self.channels != 1 && self.channels != 2 {
-                    return Err(DecoderError::UnsupportedSampleFormat);
-                }
-
-                let ch = self.channels as usize;
-
-                // Advance reader past already-decoded packets to preserve MDCT overlap-add state
-                let mut skipped = 0;
-                while skipped < self.packets_decoded {
-                    match reader.read_dec_packet_itl() {
-                        Ok(Some(_)) => {
-                            skipped += 1;
-                        }
-                        _ => break,
-                    }
-                }
-
-                let mut stream_ended = false;
-                loop {
-                    if frames_out >= max_frames {
-                        break;
-                    }
-                    match reader.read_dec_packet_itl() {
-                        Ok(Some(samples_itl)) => {
-                            self.packets_decoded += 1;
-                            let packet_frames = samples_itl.len() / ch;
-                            let available_space = max_frames.saturating_sub(frames_out);
-                            let frames_to_write = core::cmp::min(packet_frames, available_space);
-
-                            if ch == 2 {
-                                for i in 0..frames_to_write {
-                                    pcm_out[(frames_out + i) * 2] = (samples_itl[i * 2] as i32) << 16;
-                                    pcm_out[(frames_out + i) * 2 + 1] =
-                                        (samples_itl[i * 2 + 1] as i32) << 16;
-                                }
-                            } else {
-                                for i in 0..frames_to_write {
-                                    let s = (samples_itl[i] as i32) << 16;
-                                    pcm_out[(frames_out + i) * 2] = s;
-                                    pcm_out[(frames_out + i) * 2 + 1] = s;
-                                }
-                            }
-
-                            frames_out += frames_to_write;
-                            if frames_to_write < packet_frames {
-                                self.pending_channels = ch;
-                                self.pending_samples
-                                    .extend_from_slice(&samples_itl[frames_to_write * ch..]);
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            stream_ended = true;
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-
-                // Compact stream_buf only when an entire Ogg stream finishes (or flush is called)
-                if stream_ended {
-                    let consumed = reader.into_inner().into_inner().position() as usize;
-                    if consumed > 0 && consumed <= self.stream_buf.len() {
-                        self.stream_buf.drain(..consumed);
-                    } else {
-                        self.stream_buf.clear();
-                    }
-                    self.header_len = 0;
-                    self.packets_decoded = 0;
-                }
-
-                if frames_out == 0 && input_taken == 0 {
-                    Err(DecoderError::NeedMoreData)
-                } else {
-                    Ok((input_taken, frames_out))
-                }
-            }
-            Err(lewton::VorbisError::BadHeader(lewton::header::HeaderReadError::EndOfPacket))
-            | Err(lewton::VorbisError::OggError(_)) => {
-                // Header incomplete: absorbed data into stream buffer, waiting for more data (DEC-003)
-                if frames_out == 0 && input_taken == 0 {
-                    Err(DecoderError::NeedMoreData)
-                } else {
-                    Ok((input_taken, frames_out))
-                }
-            }
-            Err(_) => {
-                if self.stream_buf.len() > MAX_STREAM_BUF {
-                    self.stream_buf.clear();
-                    self.header_len = 0;
-                    self.packets_decoded = 0;
-                    Err(DecoderError::CorruptedFrame)
-                } else if frames_out == 0 && input_taken == 0 {
-                    Err(DecoderError::NeedMoreData)
-                } else {
-                    Ok((input_taken, frames_out))
-                }
-            }
+        if frames_out == 0 && input_taken == 0 {
+            Err(DecoderError::NeedMoreData)
+        } else {
+            Ok((input_taken, frames_out))
         }
     }
 
     fn flush(&mut self) {
-        self.pending_samples.clear();
-        self.packets_decoded = 0;
-        if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
-            self.stream_buf.truncate(self.header_len);
-        } else {
-            self.stream_buf.clear();
-            self.header_len = 0;
+        self.flush();
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AlacState {
+    SearchingAtoms,
+    ReadingMdat,
+    Eof,
+}
+
+#[cfg(feature = "alloc")]
+/// Pure-Rust Apple Lossless Audio Codec (ALAC) Decoder using alac crate
+/// with in-memory streaming MP4 atom demuxer.
+pub struct AlacDecoder {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub bit_depth: u8,
+    pub packets_decoded: usize,
+    stream_buf: Vec<u8>,
+    decoder: Option<alac::Decoder>,
+    sample_sizes: Vec<usize>,
+    sample_idx: usize,
+    packet_out_buf: Vec<i32>,
+    pending_pcm: Vec<i32>,
+    state: AlacState,
+    bytes_to_skip: usize,
+    first_chunk_offset: Option<usize>,
+    file_pos: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl Default for AlacDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AlacDecoder {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 44100,
+            channels: 2,
+            bit_depth: 16,
+            packets_decoded: 0,
+            stream_buf: Vec::new(),
+            decoder: None,
+            sample_sizes: Vec::new(),
+            sample_idx: 0,
+            packet_out_buf: Vec::new(),
+            pending_pcm: Vec::new(),
+            state: AlacState::SearchingAtoms,
+            bytes_to_skip: 0,
+            first_chunk_offset: None,
+            file_pos: 0,
         }
+    }
+
+    pub fn has_pending_pcm(&self) -> bool {
+        !self.pending_pcm.is_empty()
+            || (self.state == AlacState::ReadingMdat
+                && self.sample_idx < self.sample_sizes.len()
+                && self.stream_buf.len() >= self.sample_sizes[self.sample_idx])
+    }
+
+    pub fn flush(&mut self) {
+        self.pending_pcm.clear();
+        self.stream_buf.clear();
+        self.sample_sizes.clear();
+        self.sample_idx = 0;
+        self.bytes_to_skip = 0;
+        self.first_chunk_offset = None;
+        self.file_pos = 0;
+        self.packets_decoded = 0;
+        self.state = AlacState::SearchingAtoms;
+        self.decoder = None;
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AudioDecoder for AlacDecoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        let max_frames = pcm_out.len() / 2;
+        if max_frames == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
+
+        let mut frames_out = 0;
+
+        // 1. Copy pending PCM from prior decode
+        if !self.pending_pcm.is_empty() {
+            let pending_frames = self.pending_pcm.len() / 2;
+            let to_copy = core::cmp::min(pending_frames, max_frames);
+            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
+            self.pending_pcm.drain(..to_copy * 2);
+            frames_out += to_copy;
+            if frames_out >= max_frames {
+                return Ok((0, frames_out));
+            }
+        }
+
+        // 2. Ingest input buffer
+        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.flush();
+            return Err(DecoderError::CorruptedFrame);
+        }
+
+        if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
+            if frames_out > 0 {
+                return Ok((0, frames_out));
+            }
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let input_taken = encoded_in.len();
+        self.stream_buf.extend_from_slice(encoded_in);
+
+        // 3. Skip pending bytes if skipping over a large atom
+        if self.bytes_to_skip > 0 {
+            let to_skip = core::cmp::min(self.bytes_to_skip, self.stream_buf.len());
+            self.stream_buf.drain(..to_skip);
+            self.bytes_to_skip -= to_skip;
+            self.file_pos += to_skip;
+            if self.bytes_to_skip > 0 {
+                if frames_out == 0 && input_taken == 0 {
+                    return Err(DecoderError::NeedMoreData);
+                } else {
+                    return Ok((input_taken, frames_out));
+                }
+            }
+        }
+
+        // 4. Parse MP4 atoms if still searching
+        while self.state == AlacState::SearchingAtoms {
+            if self.bytes_to_skip > 0 {
+                let to_skip = core::cmp::min(self.bytes_to_skip, self.stream_buf.len());
+                self.stream_buf.drain(..to_skip);
+                self.bytes_to_skip -= to_skip;
+                self.file_pos += to_skip;
+                if self.bytes_to_skip > 0 {
+                    break;
+                }
+            }
+
+            if self.stream_buf.len() < 8 {
+                break;
+            }
+
+            let len = u32::from_be_bytes([
+                self.stream_buf[0],
+                self.stream_buf[1],
+                self.stream_buf[2],
+                self.stream_buf[3],
+            ]) as usize;
+
+            let fourcc = [
+                self.stream_buf[4],
+                self.stream_buf[5],
+                self.stream_buf[6],
+                self.stream_buf[7],
+            ];
+
+            match &fourcc {
+                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                    self.stream_buf.drain(..8);
+                    self.file_pos += 8;
+                }
+                b"stsd" => {
+                    if self.stream_buf.len() < 16 {
+                        break;
+                    }
+                    self.stream_buf.drain(..16);
+                    self.file_pos += 16;
+                }
+                b"mp4a" => {
+                    if self.stream_buf.len() < 36 {
+                        break;
+                    }
+                    self.stream_buf.drain(..36);
+                    self.file_pos += 36;
+                }
+                b"alac" => {
+                    if len < 36 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if self.stream_buf.len() < len {
+                        break;
+                    }
+                    let cookie = &self.stream_buf[36..len];
+                    let info = alac::StreamInfo::from_cookie(cookie).or_else(|_| {
+                        if len >= 24 {
+                            alac::StreamInfo::from_cookie(&self.stream_buf[..len])
+                        } else {
+                            alac::StreamInfo::from_cookie(&[])
+                        }
+                    });
+                    match info {
+                        Ok(stream_info) => {
+                            self.sample_rate = stream_info.sample_rate();
+                            self.channels = stream_info.channels() as u32;
+                            self.bit_depth = stream_info.bit_depth();
+                            let max_samples = stream_info.max_samples_per_packet() as usize;
+                            self.packet_out_buf.resize(max_samples, 0);
+                            self.decoder = Some(alac::Decoder::new(stream_info));
+                        }
+                        Err(_) => return Err(DecoderError::InvalidHeader),
+                    }
+                    self.stream_buf.drain(..len);
+                    self.file_pos += len;
+                }
+                b"stsz" => {
+                    if len < 20 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if self.stream_buf.len() < len {
+                        break;
+                    }
+                    let default_sz = u32::from_be_bytes([
+                        self.stream_buf[12],
+                        self.stream_buf[13],
+                        self.stream_buf[14],
+                        self.stream_buf[15],
+                    ]) as usize;
+                    let count = u32::from_be_bytes([
+                        self.stream_buf[16],
+                        self.stream_buf[17],
+                        self.stream_buf[18],
+                        self.stream_buf[19],
+                    ]) as usize;
+
+                    self.sample_sizes.clear();
+                    if default_sz == 0 {
+                        if len < 20 + count * 4 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        self.sample_sizes.reserve(count);
+                        for i in 0..count {
+                            let off = 20 + i * 4;
+                            let sz = u32::from_be_bytes([
+                                self.stream_buf[off],
+                                self.stream_buf[off + 1],
+                                self.stream_buf[off + 2],
+                                self.stream_buf[off + 3],
+                            ]) as usize;
+                            self.sample_sizes.push(sz);
+                        }
+                    } else {
+                        self.sample_sizes = vec![default_sz; count];
+                    }
+                    self.stream_buf.drain(..len);
+                    self.file_pos += len;
+                }
+                b"stco" => {
+                    if len < 16 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if self.stream_buf.len() < len {
+                        break;
+                    }
+                    let count = u32::from_be_bytes([
+                        self.stream_buf[12],
+                        self.stream_buf[13],
+                        self.stream_buf[14],
+                        self.stream_buf[15],
+                    ]) as usize;
+                    if count > 0 && len >= 20 {
+                        let off = u32::from_be_bytes([
+                            self.stream_buf[16],
+                            self.stream_buf[17],
+                            self.stream_buf[18],
+                            self.stream_buf[19],
+                        ]) as usize;
+                        self.first_chunk_offset = Some(off);
+                    }
+                    self.stream_buf.drain(..len);
+                    self.file_pos += len;
+                }
+                b"co64" => {
+                    if len < 16 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if self.stream_buf.len() < len {
+                        break;
+                    }
+                    let count = u32::from_be_bytes([
+                        self.stream_buf[12],
+                        self.stream_buf[13],
+                        self.stream_buf[14],
+                        self.stream_buf[15],
+                    ]) as usize;
+                    if count > 0 && len >= 24 {
+                        let off = u64::from_be_bytes([
+                            self.stream_buf[16],
+                            self.stream_buf[17],
+                            self.stream_buf[18],
+                            self.stream_buf[19],
+                            self.stream_buf[20],
+                            self.stream_buf[21],
+                            self.stream_buf[22],
+                            self.stream_buf[23],
+                        ]) as usize;
+                        self.first_chunk_offset = Some(off);
+                    }
+                    self.stream_buf.drain(..len);
+                    self.file_pos += len;
+                }
+                b"mdat" => {
+                    if self.decoder.is_none() {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    let header_len = if len == 1 { 16 } else { 8 };
+                    if self.stream_buf.len() < header_len {
+                        break;
+                    }
+                    self.stream_buf.drain(..header_len);
+                    self.file_pos += header_len;
+                    if let Some(first_off) = self.first_chunk_offset {
+                        if first_off > self.file_pos {
+                            self.bytes_to_skip = first_off - self.file_pos;
+                            let to_skip = core::cmp::min(self.bytes_to_skip, self.stream_buf.len());
+                            self.stream_buf.drain(..to_skip);
+                            self.bytes_to_skip -= to_skip;
+                            self.file_pos += to_skip;
+                        }
+                    }
+                    self.state = AlacState::ReadingMdat;
+                }
+                _ => {
+                    if len < 8 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if self.stream_buf.len() >= len {
+                        self.stream_buf.drain(..len);
+                        self.file_pos += len;
+                    } else {
+                        let avail = self.stream_buf.len();
+                        self.file_pos += avail;
+                        self.bytes_to_skip = len - avail;
+                        self.stream_buf.clear();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 5. Decode packets from mdat
+        if self.state == AlacState::ReadingMdat {
+            while frames_out < max_frames && self.sample_idx < self.sample_sizes.len() {
+                let pkt_len = self.sample_sizes[self.sample_idx];
+                if self.stream_buf.len() < pkt_len {
+                    break;
+                }
+                let packet_slice = &self.stream_buf[..pkt_len];
+                if let Some(ref mut dec) = self.decoder {
+                    match dec.decode_packet::<i32>(packet_slice, &mut self.packet_out_buf) {
+                        Ok(samples) => {
+                            self.packets_decoded += 1;
+                            let ch = self.channels as usize;
+                            if ch == 0 {
+                                return Err(DecoderError::UnsupportedSampleFormat);
+                            }
+                            let packet_frames = samples.len() / ch;
+                            let available = max_frames.saturating_sub(frames_out);
+                            let to_copy = core::cmp::min(packet_frames, available);
+                            if ch == 2 {
+                                for i in 0..to_copy {
+                                    pcm_out[(frames_out + i) * 2] = samples[i * 2];
+                                    pcm_out[(frames_out + i) * 2 + 1] = samples[i * 2 + 1];
+                                }
+                                if to_copy < packet_frames {
+                                    for i in to_copy..packet_frames {
+                                        self.pending_pcm.push(samples[i * 2]);
+                                        self.pending_pcm.push(samples[i * 2 + 1]);
+                                    }
+                                }
+                            } else {
+                                for (i, &s) in samples[..to_copy].iter().enumerate() {
+                                    pcm_out[(frames_out + i) * 2] = s;
+                                    pcm_out[(frames_out + i) * 2 + 1] = s;
+                                }
+                                if to_copy < packet_frames {
+                                    for &s in &samples[to_copy..packet_frames] {
+                                        self.pending_pcm.push(s);
+                                        self.pending_pcm.push(s);
+                                    }
+                                }
+                            }
+                            frames_out += to_copy;
+                        }
+                        Err(_) => {
+                            // Corrupted packet in stream: skip
+                        }
+                    }
+                }
+                self.stream_buf.drain(..pkt_len);
+                self.file_pos += pkt_len;
+                self.sample_idx += 1;
+            }
+            if self.sample_idx >= self.sample_sizes.len() && !self.sample_sizes.is_empty() {
+                self.state = AlacState::Eof;
+            }
+        }
+
+        if frames_out == 0 && input_taken == 0 {
+            Err(DecoderError::NeedMoreData)
+        } else {
+            Ok((input_taken, frames_out))
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush();
+    }
+}
+
+/// Pre-warms the static Opus CeltMode table in heap memory while the stack
+/// is clear.
+#[cfg(feature = "alloc")]
+pub fn prewarm_opus() {
+    let _ = opus_rs::modes::default_mode();
+}
+
+#[cfg(feature = "alloc")]
+enum OpusState {
+    WaitingHead,
+    WaitingTags {
+        decoder: Box<opus_rs::OpusDecoder>,
+        pre_skip: usize,
+    },
+    Ready {
+        decoder: Box<opus_rs::OpusDecoder>,
+        pre_skip: usize,
+    },
+}
+
+#[cfg(feature = "alloc")]
+/// Pure-Rust Ogg Opus Decoder using opus-rs with in-memory Ogg page
+/// demuxing (DEC-004, RFC 7845).
+pub struct OpusDecoder {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub packets_decoded: usize,
+    stream_buf: Vec<u8>,
+    partial_packet: Vec<u8>,
+    packet_queue: Vec<Vec<u8>>,
+    pending_pcm: Vec<i32>,
+    state: OpusState,
+    float_buf: Vec<f32>,
+}
+
+#[cfg(feature = "alloc")]
+impl Default for OpusDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl OpusDecoder {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48000,
+            channels: 2,
+            packets_decoded: 0,
+            stream_buf: Vec::new(),
+            partial_packet: Vec::new(),
+            packet_queue: Vec::new(),
+            pending_pcm: Vec::new(),
+            state: OpusState::WaitingHead,
+            float_buf: vec![0.0f32; 11520],
+        }
+    }
+
+    pub fn has_pending_pcm(&self) -> bool {
+        !self.pending_pcm.is_empty() || !self.packet_queue.is_empty()
+    }
+
+    pub fn flush(&mut self) {
+        self.pending_pcm.clear();
+        self.packet_queue.clear();
+        self.partial_packet.clear();
+        self.stream_buf.clear();
+        self.packets_decoded = 0;
+        self.state = OpusState::WaitingHead;
+    }
+
+    fn decode_single_packet(
+        &mut self,
+        packet: &[u8],
+        pcm_out: &mut [i32],
+        frames_out: &mut usize,
+        max_frames: usize,
+    ) -> Result<(), DecoderError> {
+        if packet.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Check for OpusHead identification header (RFC 7845 §5.1)
+        if packet.starts_with(b"OpusHead") {
+            if packet.len() < 19 {
+                return Err(DecoderError::InvalidHeader);
+            }
+            let channels = packet[9] as usize;
+            if channels != 1 && channels != 2 {
+                return Err(DecoderError::UnsupportedSampleFormat);
+            }
+            let pre_skip = u16::from_le_bytes([packet[10], packet[11]]) as usize;
+            let decoder = opus_rs::OpusDecoder::boxed_new(48000, channels)
+                .map_err(|_| DecoderError::InvalidHeader)?;
+            self.sample_rate = 48000;
+            self.channels = channels as u32;
+            self.state = OpusState::WaitingTags {
+                decoder,
+                pre_skip,
+            };
+            return Ok(());
+        }
+
+        // 2. Check for OpusTags comment header (RFC 7845 §5.2)
+        if packet.starts_with(b"OpusTags") {
+            if let OpusState::WaitingTags { .. } = self.state {
+                if let OpusState::WaitingTags { decoder, pre_skip } =
+                    core::mem::replace(&mut self.state, OpusState::WaitingHead)
+                {
+                    self.state = OpusState::Ready { decoder, pre_skip };
+                }
+            }
+            return Ok(());
+        }
+
+        // If an audio packet arrives while in WaitingTags, transition to Ready
+        if let OpusState::WaitingTags { .. } = self.state {
+            if let OpusState::WaitingTags { decoder, pre_skip } =
+                core::mem::replace(&mut self.state, OpusState::WaitingHead)
+            {
+                self.state = OpusState::Ready { decoder, pre_skip };
+            }
+        }
+
+        // 3. Audio packet decoding
+        let OpusState::Ready {
+            ref mut decoder,
+            ref mut pre_skip,
+        } = self.state
+        else {
+            return Ok(());
+        };
+
+        if self.float_buf.len() < 11520 {
+            self.float_buf.resize(11520, 0.0f32);
+        }
+
+        let samples_per_ch = match decoder.decode(packet, 5760, &mut self.float_buf) {
+            Ok(n) => n,
+            Err(_) => {
+                // In a continuous stream, skip corrupt packet
+                return Ok(());
+            }
+        };
+
+        self.packets_decoded += 1;
+        if samples_per_ch == 0 {
+            return Ok(());
+        }
+
+        let mut start_frame = 0;
+        if *pre_skip > 0 {
+            if samples_per_ch <= *pre_skip {
+                *pre_skip -= samples_per_ch;
+                return Ok(());
+            } else {
+                start_frame = *pre_skip;
+                *pre_skip = 0;
+            }
+        }
+
+        let packet_frames = samples_per_ch - start_frame;
+        let available = max_frames.saturating_sub(*frames_out);
+        let to_copy = core::cmp::min(packet_frames, available);
+        let ch = self.channels as usize;
+
+        if ch == 2 {
+            for i in 0..to_copy {
+                let idx = (start_frame + i) * 2;
+                let l = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                let r = (self.float_buf[idx + 1].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                pcm_out[(*frames_out + i) * 2] = l;
+                pcm_out[(*frames_out + i) * 2 + 1] = r;
+            }
+            if to_copy < packet_frames {
+                for i in to_copy..packet_frames {
+                    let idx = (start_frame + i) * 2;
+                    let l = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                    let r = (self.float_buf[idx + 1].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                    self.pending_pcm.push(l);
+                    self.pending_pcm.push(r);
+                }
+            }
+        } else {
+            for i in 0..to_copy {
+                let idx = start_frame + i;
+                let s = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                pcm_out[(*frames_out + i) * 2] = s;
+                pcm_out[(*frames_out + i) * 2 + 1] = s;
+            }
+            if to_copy < packet_frames {
+                for i in to_copy..packet_frames {
+                    let idx = start_frame + i;
+                    let s = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                    self.pending_pcm.push(s);
+                    self.pending_pcm.push(s);
+                }
+            }
+        }
+        *frames_out += to_copy;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AudioDecoder for OpusDecoder {
+    fn decode(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+    ) -> Result<(usize, usize), DecoderError> {
+        let max_frames = pcm_out.len() / 2;
+        if max_frames == 0 {
+            return Err(DecoderError::BufferOverflow);
+        }
+
+        let mut frames_out = 0;
+
+        // 1. Copy pending PCM from prior decode
+        if !self.pending_pcm.is_empty() {
+            let pending_frames = self.pending_pcm.len() / 2;
+            let to_copy = core::cmp::min(pending_frames, max_frames);
+            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
+            self.pending_pcm.drain(..to_copy * 2);
+            frames_out += to_copy;
+            if frames_out >= max_frames {
+                return Ok((0, frames_out));
+            }
+        }
+
+        // 2. Process queued complete packets
+        while frames_out < max_frames && !self.packet_queue.is_empty() {
+            let packet = self.packet_queue.remove(0);
+            self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
+            if frames_out >= max_frames {
+                return Ok((0, frames_out));
+            }
+        }
+
+        // 3. Ingest input buffer
+        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.flush();
+            return Err(DecoderError::CorruptedFrame);
+        }
+
+        if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
+            if frames_out > 0 {
+                return Ok((0, frames_out));
+            }
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let input_taken = encoded_in.len();
+        self.stream_buf.extend_from_slice(encoded_in);
+
+        // 4. Demux Ogg pages from stream_buf
+        while let Some(pos) = self.stream_buf.windows(4).position(|w| w == b"OggS") {
+            if pos > 0 {
+                self.stream_buf.drain(..pos);
+            }
+
+            if self.stream_buf.len() < 27 {
+                break;
+            }
+
+            if self.stream_buf[4] != 0 {
+                self.stream_buf.drain(..1);
+                continue;
+            }
+
+            let n_segs = self.stream_buf[26] as usize;
+            let header_len = 27 + n_segs;
+            if self.stream_buf.len() < header_len {
+                break;
+            }
+
+            let mut seg_table_buf = [0u8; 255];
+            seg_table_buf[..n_segs].copy_from_slice(&self.stream_buf[27..header_len]);
+            let seg_table = &seg_table_buf[..n_segs];
+            let mut body_len: usize = 0;
+            for &s in seg_table {
+                body_len += s as usize;
+            }
+            let total_page_len = header_len + body_len;
+            if self.stream_buf.len() < total_page_len {
+                break;
+            }
+
+            let header_type_flag = self.stream_buf[5];
+            let is_continued = (header_type_flag & 0x01) != 0;
+
+            if !is_continued && !self.partial_packet.is_empty() {
+                self.partial_packet.clear();
+            }
+
+            let mut body_offset = header_len;
+            let mut page_packets = Vec::new();
+
+            for &seg_len_u8 in seg_table {
+                let seg_len = seg_len_u8 as usize;
+                self.partial_packet
+                    .extend_from_slice(&self.stream_buf[body_offset..body_offset + seg_len]);
+                body_offset += seg_len;
+
+                if seg_len_u8 < 255 {
+                    let packet = core::mem::take(&mut self.partial_packet);
+                    if !packet.is_empty() {
+                        page_packets.push(packet);
+                    }
+                }
+            }
+
+            self.stream_buf.drain(..total_page_len);
+
+            for packet in page_packets {
+                if frames_out < max_frames && self.packet_queue.is_empty() {
+                    self.decode_single_packet(
+                        &packet,
+                        pcm_out,
+                        &mut frames_out,
+                        max_frames,
+                    )?;
+                } else {
+                    self.packet_queue.push(packet);
+                }
+            }
+        }
+
+        if frames_out == 0 && input_taken == 0 {
+            Err(DecoderError::NeedMoreData)
+        } else {
+            Ok((input_taken, frames_out))
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush();
     }
 }
 
@@ -2222,7 +3221,8 @@ mod tests {
             Err(DecoderError::NeedMoreData)
         );
 
-        // Complete ID3v2 header with synchsafe size = 20 bytes (total = 10 + 20 = 30 bytes)
+        // Complete ID3v2 header with synchsafe size = 20 bytes
+        // (total = 10 + 20 = 30 bytes)
         let mut id3_pkt = [0u8; 34];
         id3_pkt[..3].copy_from_slice(b"ID3");
         id3_pkt[3] = 4; // v2.4
@@ -2231,7 +3231,8 @@ mod tests {
         assert_eq!(consumed, 30);
         assert_eq!(frames, 0);
 
-        // Non-sync padding bytes are skipped with Ok((consumed, 0)) rather than stalling
+        // Non-sync padding bytes are skipped with Ok((consumed, 0)) rather
+        // than stalling
         let junk = [0u8; 8];
         let (consumed_junk, frames_junk) = decoder.decode(&junk, &mut pcm_out).unwrap();
         assert!(consumed_junk > 0);
@@ -2329,16 +3330,24 @@ mod tests {
             assert!(aac.pending_pcm.is_empty());
 
             let mut vorbis = VorbisDecoder::new();
-            vorbis.pending_samples.extend_from_slice(&[10, -10, 20, -20]);
-            vorbis.pending_channels = 2;
-            vorbis.stream_buf.extend_from_slice(b"OggS00001111");
-            vorbis.header_len = 8;
+            vorbis.pending_pcm.extend_from_slice(&[10 << 16, (-10) << 16, 20 << 16, (-20) << 16]);
             let mut v_out = [0i32; 2];
             assert_eq!(vorbis.decode(&[], &mut v_out), Ok((0, 1)));
             assert_eq!(v_out, [10 << 16, (-10) << 16]);
+            assert!(vorbis.has_pending_pcm());
             vorbis.flush();
-            assert!(vorbis.pending_samples.is_empty());
-            assert_eq!(vorbis.stream_buf.len(), 8);
+            assert!(vorbis.pending_pcm.is_empty());
+            assert!(!vorbis.has_pending_pcm());
+
+            let mut alac = AlacDecoder::new();
+            alac.pending_pcm.extend_from_slice(&[10 << 16, (-10) << 16, 20 << 16, (-20) << 16]);
+            let mut a_out = [0i32; 2];
+            assert_eq!(alac.decode(&[], &mut a_out), Ok((0, 1)));
+            assert_eq!(a_out, [10 << 16, (-10) << 16]);
+            assert!(alac.has_pending_pcm());
+            alac.flush();
+            assert!(alac.pending_pcm.is_empty());
+            assert!(!alac.has_pending_pcm());
         }
     }
 
@@ -2471,6 +3480,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
+    fn test_alac_insufficient_data() {
+        let mut decoder = AlacDecoder::new();
+        let encoded = [0u8; 3];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_alac_max_stream_buf_overflow() {
+        let mut decoder = AlacDecoder::new();
+        let oversized = std::vec![0u8; MAX_STREAM_BUF + 1];
+        let mut pcm_out = [0i32; 32];
+        assert_eq!(
+            decoder.decode(&oversized, &mut pcm_out),
+            Err(DecoderError::CorruptedFrame)
+        );
+
+        // Multi-step accumulation
+        let mut dec2 = AlacDecoder::new();
+        let chunk1 = std::vec![0u8; 32768];
+        let _ = dec2.decode(&chunk1, &mut pcm_out);
+        let chunk2 = std::vec![0u8; 32769];
+        assert_eq!(
+            dec2.decode(&chunk2, &mut pcm_out),
+            Err(DecoderError::CorruptedFrame)
+        );
+    }
+
+    #[test]
     fn test_mp3_flush_zeroes_sample_buf() {
         let mut decoder = Mp3Decoder::new();
         decoder.sample_buf[0] = 42;
@@ -2546,7 +3586,9 @@ mod tests {
         header[22..26].copy_from_slice(&1u32.to_be_bytes());
         header[26..28].copy_from_slice(&16i16.to_be_bytes());
         // 44100 Hz in IEEE 754 80-bit extended:
-        header[28..38].copy_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        header[28..38].copy_from_slice(&[
+            0x40, 0x0E, 0xAC, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
         header[38..42].copy_from_slice(b"SSND");
         header[42..46].copy_from_slice(&12u32.to_be_bytes());
         header[46..50].copy_from_slice(&0u32.to_be_bytes());
@@ -2608,6 +3650,13 @@ mod tests {
             assert_eq!(vorbis.packets_decoded, 42);
             vorbis.flush();
             assert_eq!(vorbis.packets_decoded, 0);
+
+            let mut alac = AlacDecoder::new();
+            assert_eq!(alac.packets_decoded, 0);
+            alac.packets_decoded = 42;
+            assert_eq!(alac.packets_decoded, 42);
+            alac.flush();
+            assert_eq!(alac.packets_decoded, 0);
         }
     }
 
@@ -2640,7 +3689,8 @@ mod tests {
         assert_eq!(frames, 0);
 
         // ID3 tag skip test:
-        let id3_header = [b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 20]; // 10 header + 20 payload = 30 total
+        // 10 header + 20 payload = 30 total
+        let id3_header = [b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 20];
         let (consumed_id3, frames_id3) = dec.decode(&id3_header, &mut pcm_out).unwrap();
         assert_eq!(consumed_id3, 10);
         assert_eq!(frames_id3, 0);
@@ -2656,21 +3706,24 @@ mod tests {
         let mut dec = StaticMp3Decoder::new();
         let mut pcm_out = [0i32; 2304];
 
-        // 1. Two matching valid MP3 headers (MPEG-1 Layer III 128 kbps 44.1 kHz = 417 bytes)
-        // but with all-zero/garbage payload that cannot be decoded as valid audio or has no reservoir.
+        // 1. Two matching valid MP3 headers (MPEG-1 Layer III 128 kbps 44.1 kHz
+        // = 417 bytes) but with all-zero/garbage payload that cannot be decoded
+        // as valid audio or has no reservoir.
         let mut corrupted_frame = [0u8; 417 + 4];
         corrupted_frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         corrupted_frame[4..417].fill(0xFF);
         corrupted_frame[417..417 + 4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
 
-        // Decoder must NOT return NeedMoreData; it must return Ok((consumed, 0)) to advance past bad frame!
+        // Decoder must NOT return NeedMoreData; it must return
+        // Ok((consumed, 0)) to advance past bad frame!
         let res = dec.decode(&corrupted_frame, &mut pcm_out);
         assert!(res.is_ok(), "Expected Ok but got {:?}", res);
         let (consumed, frames) = res.unwrap();
         assert!(consumed >= 417, "Expected at least 417 bytes consumed, got {}", consumed);
         assert_eq!(frames, 0);
 
-        // 2. Unmatched second header: first header matches sync, but byte at 417 does not match
+        // 2. Unmatched second header: first header matches sync, but byte at
+        // 417 does not match
         let mut unmatched = [0u8; 417 + 4];
         unmatched[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         unmatched[417] = 0x00; // Not a matching header
@@ -2678,7 +3731,8 @@ mod tests {
         assert_eq!(consumed_unmatched, 1);
         assert_eq!(frames_unmatched, 0);
 
-        // 3. Invalid bitrate nibble (0xF) is rejected by Header::read, skipping non-sync bytes
+        // 3. Invalid bitrate nibble (0xF) is rejected by Header::read,
+        // skipping non-sync bytes
         let mut invalid_bitrate = [0u8; 16];
         invalid_bitrate[0..4].copy_from_slice(&[0xFF, 0xFB, 0xF0, 0x00]);
         let (consumed_inv, frames_inv) = dec.decode(&invalid_bitrate, &mut pcm_out).unwrap();
@@ -2707,13 +3761,17 @@ mod tests {
                 claxon_samples.push(s << shift);
             }
 
-            // 2. Decode with native FlacDecoder in chunks of 512 bytes with 1024-sample pcm_out
+            // 2. Decode with native FlacDecoder in chunks of 512 bytes with
+            // 1024-sample pcm_out
             let mut decoder = FlacDecoder::new();
             let mut native_samples = std::vec::Vec::new();
             let mut pcm_buf = [0i32; 1024];
             let mut offset = 0;
 
-            while offset < data.len() || decoder.has_pending_pcm() || decoder.stream_buf.len() > decoder.header_len {
+            while offset < data.len()
+                || decoder.has_pending_pcm()
+                || decoder.stream_buf.len() > decoder.header_len
+            {
                 let end = (offset + 512).min(data.len());
                 let chunk = &data[offset..end];
                 match decoder.decode(chunk, &mut pcm_buf) {
@@ -2775,7 +3833,10 @@ mod tests {
         let mut pcm_buf = [0i32; 2304];
         let mut offset = 0;
 
-        while offset < data.len() || decoder.has_pending_pcm() || decoder.stream_buf.len() > decoder.header_len {
+        while offset < data.len()
+            || decoder.has_pending_pcm()
+            || decoder.stream_buf.len() > decoder.header_len
+        {
             let end = (offset + 1024).min(data.len());
             let chunk = &data[offset..end];
             match decoder.decode(chunk, &mut pcm_buf) {
@@ -2808,11 +3869,70 @@ mod tests {
         // Feed first 500 bytes (header + partial Frame 1)
         let res = decoder.decode(&data[..500], &mut pcm_buf);
         assert_eq!(res, Ok((500, 0)));
-        assert!(!decoder.has_pending_pcm(), "Decoder must NOT report pending PCM on partial chunk");
+        assert!(
+            !decoder.has_pending_pcm(),
+            "Decoder must NOT report pending PCM on partial chunk"
+        );
 
-        // Feed next 1036 bytes (total 1536 bytes, matching Xtensa READ_SCRATCH_BYTES chunk)
+        // Feed next 1036 bytes (matching Xtensa READ_SCRATCH_BYTES chunk)
         let res2 = decoder.decode(&data[500..1536], &mut pcm_buf);
         assert_eq!(res2, Ok((1036, 0)));
-        assert!(!decoder.has_pending_pcm(), "Decoder must NOT report pending PCM on partial chunk");
+        assert!(
+            !decoder.has_pending_pcm(),
+            "Decoder must NOT report pending PCM on partial chunk"
+        );
+    }
+
+    #[test]
+    fn test_flac_4608_sample_block_decode() {
+        let mut flac_data = std::vec::Vec::new();
+        flac_data.extend_from_slice(b"fLaC");
+
+        // STREAMINFO block (last block = true, type 0, length 34)
+        flac_data.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        let mut streaminfo = [0u8; 34];
+        streaminfo[0..2].copy_from_slice(&4608u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&4608u16.to_be_bytes());
+        // 44100 Hz, 2 channels, 16 bps:
+        streaminfo[10] = 0x0A;
+        streaminfo[11] = 0xC4;
+        streaminfo[12] = 0x42;
+        streaminfo[13] = 0xF0;
+        streaminfo[16] = 0x12;
+        streaminfo[17] = 0x00;
+        flac_data.extend_from_slice(&streaminfo);
+
+        // Frame:
+        let mut frame_bytes = std::vec![0xFF, 0xF8, 0x79, 0x18, 0x00];
+        frame_bytes.extend_from_slice(&4607u16.to_be_bytes()); // 4608 - 1
+        let header_crc = flac_crc8(&frame_bytes);
+        frame_bytes.push(header_crc);
+
+        // Subframe 0 (Left): Constant 1000
+        frame_bytes.push(0x00);
+        frame_bytes.extend_from_slice(&(1000i16).to_be_bytes());
+
+        // Subframe 1 (Right): Constant -1000
+        frame_bytes.push(0x00);
+        frame_bytes.extend_from_slice(&(-1000i16).to_be_bytes());
+
+        let frame_crc = flac_crc16(&frame_bytes);
+        frame_bytes.extend_from_slice(&frame_crc.to_be_bytes());
+        flac_data.extend_from_slice(&frame_bytes);
+
+        let mut decoder = FlacDecoder::new();
+        let mut pcm_out = std::vec![0i32; 9216];
+        let (consumed, frames) = decoder.decode(&flac_data, &mut pcm_out).unwrap();
+
+        assert_eq!(consumed, flac_data.len());
+        assert_eq!(frames, 4608);
+        assert_eq!(decoder.sample_rate, 44100);
+        assert_eq!(decoder.channels, 2);
+        assert_eq!(decoder.bits_per_sample, 16);
+
+        for i in 0..4608 {
+            assert_eq!(pcm_out[i * 2], 1000 << 16);
+            assert_eq!(pcm_out[i * 2 + 1], -1000 << 16);
+        }
     }
 }

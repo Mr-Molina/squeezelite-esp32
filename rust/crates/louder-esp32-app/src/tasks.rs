@@ -1,86 +1,131 @@
-//! Embassy task skeleton for the device firmware (Task 8, spec §3.1), driving the shared
+//! Embassy task skeleton for the device firmware (Task 8, spec §3.1), driving
+//! the shared
 //! [`PlayerCoordinator`](louder_esp32_app::PlayerCoordinator) engine (Task 9).
 //!
 //! # What this module is
 //!
-//! The firmware's work is split into the embassy tasks of spec §3.1. Since Task 9 the player
-//! protocol (SlimProto frames, `STAT` events, HTTP audio fetch, decoder selection, `RESP`/`META`/
+//! The firmware's work is split into the embassy tasks of spec §3.1. Since Task
+//! 9 the player
+//! protocol (SlimProto frames, `STAT` events, HTTP audio fetch, decoder
+//! selection, `RESP`/`META`/
 //! `DSCO`) is NOT implemented here any more: the `slimproto_session` task runs
-//! `PlayerCoordinator::tick` over the device trait implementations ([`net_device`] over the
-//! smoltcp sockets, [`backend_device`] over the amplifier and the I2S0 clock), the very engine
-//! the host tests and the session-replay fixture exercise. The decode and output tasks drive the
-//! pipeline through the coordinator's pump path (`pump_decode` / `pump_output`), so every state
+//! `PlayerCoordinator::tick` over the device trait implementations
+//! ([`net_device`] over the
+//! smoltcp sockets, [`backend_device`] over the amplifier and the I2S0 clock),
+//! the very engine
+//! the host tests and the session-replay fixture exercise. The decode and
+//! output tasks drive the
+//! pipeline through the coordinator's pump path (`pump_decode` /
+//! `pump_output`), so every state
 //! transition is seen by the engine.
 //!
-//! | task                | work                                                                       |
-//! |---------------------|----------------------------------------------------------------------------|
-//! | `watchdog_lease`    | WDT feed + lap timestamp, Gate 3 network lease, 2 s amp fault/telemetry     |
-//! | `bt_a2dp`           | lazy BT controller bring-up, A2DP sink poll (feeds the pipeline when idle)  |
-//! | `net_stack`         | Wi-Fi STA connect drive, smoltcp poll + DHCPv4 events                       |
-//! | `http_control`      | Gate 4 port-80 server + deferred reboot actions (settings flushed first)    |
-//! | `slimproto_session` | LMS control socket: connect, `HELO`/`SETD` (`hello`), `coordinator.tick`    |
-//! |                     | (protocol + play state only; never decodes: `external_audio_pump`)         |
-//! | `cyd_bridge`        | CYD command poll, 1 s progress update                                      |
-//! | `decode_pump`       | `coordinator.pump_decode` (one frame, or a short resync burst)             |
-//! | `i2s_feed`          | `coordinator.pump_output` before/after decoding, DAC gate, silence pump    |
-//! | `config_writer`     | debounced persistence (2 s quiet), RAM journal; flash: see "Settings"      |
+//! | task                | work                                               |
+//! |---------------------|----------------------------------------------------|
+//! | `watchdog_lease`    | WDT feed + lap timestamp, Gate 3 network lease, 2 s
+//! amp fault/telemetry     |
+//! | `bt_a2dp`           | lazy BT controller bring-up, A2DP sink poll (feeds
+//! the pipeline when idle)  |
+//! | `net_stack`         | Wi-Fi STA connect drive, smoltcp poll + DHCPv4
+//! events                       |
+//! | `http_control`      | Gate 4 port-80 server + deferred reboot actions
+//! (settings flushed first)    |
+//! | `slimproto_session` | LMS control socket: connect, `HELO`/`SETD`
+//! (`hello`), `coordinator.tick`    |
+//! |                     | (protocol + play state only; never decodes:
+//! `external_audio_pump`)         |
+//! | `cyd_bridge`        | CYD command poll, 1 s progress update
+//! |
+//! | `decode_pump`       | `coordinator.pump_decode` (one frame, or a short
+//! resync burst)             |
+//! | `i2s_feed`          | `coordinator.pump_output` before/after decoding, DAC
+//! gate, silence pump    |
+//! | `config_writer`     | debounced persistence (2 s quiet), RAM journal;
+//! flash: see "Settings"      |
 //!
-//! The HTTP audio fetch (spec's `audio_fetch` task) is step 3 of `coordinator.tick`, so it runs
-//! inside `slimproto_session`; the separate task is gone until the network/audio split.
+//! The HTTP audio fetch (spec's `audio_fetch` task) is step 3 of
+//! `coordinator.tick`, so it runs
+//! inside `slimproto_session`; the separate task is gone until the
+//! network/audio split.
 //!
 //! [`net_device`]: louder_esp32_app::net_device
 //! [`backend_device`]: louder_esp32_app::backend_device
 //!
 //! # Why a phase ring
 //!
-//! The tasks still hand a baton around in a fixed order ([`PHASE_ORDER`]), one block per hand-off,
-//! one lap == one iteration of the former superloop. That keeps the DMA-first audio order (top
-//! up the I2S DMA BEFORE a ~4.5 ms MP3 frame decode, then again after it) and guarantees that the
-//! shared state is only ever borrowed by one block at a time and never across an `.await`, so no
-//! network/audio concurrency is introduced here (real concurrency, with the `CTRL`/`EVT`
+//! The tasks still hand a baton around in a fixed order ([`PHASE_ORDER`]), one
+//! block per hand-off,
+//! one lap == one iteration of the former superloop. That keeps the DMA-first
+//! audio order (top
+//! up the I2S DMA BEFORE a ~4.5 ms MP3 frame decode, then again after it) and
+//! guarantees that the
+//! shared state is only ever borrowed by one block at a time and never across
+//! an `.await`, so no
+//! network/audio concurrency is introduced here (real concurrency, with the
+//! `CTRL`/`EVT`
 //! channels below, comes with the core-1 audio migration).
 //!
 //! # Core placement
 //!
-//! Spec §3.1 places `decode_pump` and `i2s_feed` on core 1. Core-1 start under esp-rtos is NOT
-//! yet validated on hardware (Spike S1 owner gate pending), so in BOTH build configurations the
-//! audio tasks run on the core-0 executor as ring members. Core 1 is started by:
-//! - default: the battle-tested manual path (park APP_CPU, copy the PRO flash-MMU/cache
-//!   registers, `CpuControl::start_app_core` running the IRAM NOP heartbeat loop);
-//! - feature `esp-rtos-core1`: `esp_rtos::start_second_core` running an embassy executor whose
+//! Spec §3.1 places `decode_pump` and `i2s_feed` on core 1. Core-1 start under
+//! esp-rtos is NOT
+//! yet validated on hardware (Spike S1 owner gate pending), so in BOTH build
+//! configurations the
+//! audio tasks run on the core-0 executor as ring members. Core 1 is started
+//! by:
+//! - default: the battle-tested manual path (park APP_CPU, copy the PRO
+//!   flash-MMU/cache
+//!   registers, `CpuControl::start_app_core` running the IRAM NOP heartbeat
+//!   loop);
+//! - feature `esp-rtos-core1`: `esp_rtos::start_second_core` running an embassy
+//!   executor whose
 //!   only task is `core1_heartbeat`.
 //!
 //! # Settings persistence (Task 10, spec §3.5)
 //!
-//! Every runtime change (`setd` name in the coordinator, `/cmd.json` EQ/AGAIN/volume, LMS
-//! `audg` volume, CYD volume) goes through the [`ConfigHandle`]. `config_writer` polls it every
-//! `CONFIG_WRITER_POLL_MS` (100 ms) and, once a change has been quiet for `DEBOUNCE_MS` (2 s),
-//! serializes the snapshot into the RAM journal (DRAM sector image + next sequence; target
+//! Every runtime change (`setd` name in the coordinator, `/cmd.json`
+//! EQ/AGAIN/volume, LMS
+//! `audg` volume, CYD volume) goes through the [`ConfigHandle`].
+//! `config_writer` polls it every
+//! `CONFIG_WRITER_POLL_MS` (100 ms) and, once a change has been quiet for
+//! `DEBOUNCE_MS` (2 s),
+//! serializes the snapshot into the RAM journal (DRAM sector image + next
+//! sequence; target
 //! sector and sequence tracked in RAM since the boot load). Flash is written:
 //! - default build: ONLY on the reboot paths (`/recovery.json`, `/reboot.json`,
-//!   `/reboot_ota.json`), by `flush_settings_before_reboot` -- `flush_now`, then the certified
-//!   pre-reboot write of sector A (0x3FE000) with APP_CPU parked, byte-identical to the
-//!   certified build (`main.rs` `SETTINGS_FLASH_TARGET`). No flash I/O at runtime (WO-108/WO-109
+//!   `/reboot_ota.json`), by `flush_settings_before_reboot` -- `flush_now`,
+//!   then the certified
+//!   pre-reboot write of sector A (0x3FE000) with APP_CPU parked,
+//!   byte-identical to the
+//!   certified build (`main.rs` `SETTINGS_FLASH_TARGET`). No flash I/O at
+//!   runtime (WO-108/WO-109
 //!   deadlock);
-//! - feature `runtime-flash-persist` (default OFF): additionally at runtime, hazard-gated, in
-//!   `runtime_flash_commit` (rules documented there), with dual-sector ping-pong.
+//! - feature `runtime-flash-persist` (default OFF): additionally at runtime,
+//!   hazard-gated, in
+//!   `runtime_flash_commit` (rules documented there), with dual-sector
+//!   ping-pong.
 //!
 //! [`ConfigHandle`]: louder_esp32_app::config_handle::ConfigHandle
 //!
 //! # Memory
 //!
-//! The stack gate is headroom-based (Task 8 ruling). [`FirmwareState`] and the large values it
-//! points at live in statics built in place during bring-up, and each block runs in its own
-//! `#[inline(never)]` frame. The coordinator keeps its large temporaries (server frame buffer,
-//! stream read chunk) in out-of-line helpers, and the device stream source hands the response
-//! head / ICY block over by callback, so no 4 KB value is ever built on this stack.
+//! The stack gate is headroom-based (Task 8 ruling). [`FirmwareState`] and the
+//! large values it
+//! points at live in statics built in place during bring-up, and each block
+//! runs in its own
+//! `#[inline(never)]` frame. The coordinator keeps its large temporaries
+//! (server frame buffer,
+//! stream read chunk) in out-of-line helpers, and the device stream source
+//! hands the response
+//! head / ICY block over by callback, so no 4 KB value is ever built on this
+//! stack.
 #![cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use squeezelite_proto::AudioFormat;
 
-/// Stream parameters handed from the coordinator to the audio tasks on `strm s` (wired by the
+/// Stream parameters handed from the coordinator to the audio tasks on `strm s`
+/// (wired by the
 /// core-1 audio migration).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +166,8 @@ pub enum AudioEvent {
 #[allow(dead_code)]
 pub const CHANNEL_DEPTH: usize = 8;
 
-/// Coordinator -> audio command channel. Unused while the audio tasks are ring members on core
+/// Coordinator -> audio command channel. Unused while the audio tasks are ring
+/// members on core
 /// 0 (the linker drops it); wired by the core-1 audio migration.
 #[allow(dead_code)]
 pub static CTRL: Channel<CriticalSectionRawMutex, CoordinatorCmd, CHANNEL_DEPTH> = Channel::new();
@@ -130,7 +176,8 @@ pub static CTRL: Channel<CriticalSectionRawMutex, CoordinatorCmd, CHANNEL_DEPTH>
 #[allow(dead_code)]
 pub static EVT: Channel<CriticalSectionRawMutex, AudioEvent, CHANNEL_DEPTH> = Channel::new();
 
-/// Members of the core-0 phase ring (every spec §3.1 task except the timer-driven `config_writer`).
+/// Members of the core-0 phase ring (every spec §3.1 task except the
+/// timer-driven `config_writer`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingTask {
     WatchdogLease,
@@ -166,7 +213,8 @@ pub enum Phase {
     NetPoll,
     /// Gate 4 port-80 server + deferred reboot action.
     HttpServe,
-    /// LMS control socket upkeep, `HELO`, then one `PlayerCoordinator::tick` (server frame,
+    /// LMS control socket upkeep, `HELO`, then one `PlayerCoordinator::tick`
+    /// (server frame,
     /// HTTP audio fetch, audio step, deferred `STAT`s and heartbeat).
     SlimSession,
     /// CYD command poll.
@@ -221,19 +269,19 @@ impl Phase {
     }
 }
 
-#[cfg(target_arch = "xtensa")]
-pub(crate) use device::{run_core0_executor, FirmwareState, Shared, UDP_PLACEHOLDER_SOCKETS};
 #[cfg(all(target_arch = "xtensa", feature = "esp-rtos-core1"))]
 pub(crate) use device::run_core1_executor;
+#[cfg(target_arch = "xtensa")]
+#[allow(unused_imports)]
+pub(crate) use device::{run_core0_executor, FirmwareState, Shared, UDP_PLACEHOLDER_SOCKETS};
 
 /// Device glue: the shared state, the ring tasks, and the blocks they run.
 #[cfg(target_arch = "xtensa")]
 mod device {
     use super::{Phase, RingTask, PHASE_ORDER};
     use crate::xtensa_hw::{
-        now_millis, Core1Ctl, DeviceClockRegs, Esp32I2cBus,
-        Esp32Uart2Port, Esp32VhciTransport, HwStreamPipeline, SmolDevice, CORE1_HEARTBEAT,
-        DMA_OUTSTANDING_FRAMES,
+        now_millis, Core1Ctl, DeviceClockRegs, Esp32I2cBus, Esp32Uart2Port, Esp32VhciTransport,
+        HwStreamPipeline, SmolDevice, CORE1_HEARTBEAT, DMA_OUTSTANDING_FRAMES,
     };
     use core::cell::RefCell;
     use core::future::Future;
@@ -248,8 +296,8 @@ mod device {
     use esp_rtos::embassy::Executor;
     use esp_storage::FlashStorage;
     use louder_esp32_app::backend_device::Esp32AudioBackend;
-    use louder_esp32_app::config_handle::{ConfigHandle, ConfigWriter, RamJournal};
     use louder_esp32_app::bt_a2dp::BtA2dpSink;
+    use louder_esp32_app::config_handle::{ConfigHandle, ConfigWriter, RamJournal};
     use louder_esp32_app::http_control::{
         handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
         LeaseHealth,
@@ -259,10 +307,14 @@ mod device {
         HttpStreamState, SlimLinkState, SlimReconnect, SmoltcpSlimTransport, SmoltcpStreamSource,
         TcpPhase, TcpSocketOps,
     };
-    use louder_esp32_app::ota_safety::{OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET, SETTINGS_JOURNAL_OFFSET};
+    use louder_esp32_app::ota_safety::{
+        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET, SETTINGS_JOURNAL_OFFSET,
+    };
     use louder_esp32_app::pipeline::ActiveDecoder;
     use louder_esp32_app::{AmpManager, CydUartBridge, PlayerCoordinator, PlayerState};
-    use smoltcp::iface::{Context as SmolContext, Interface as SmolInterface, SocketHandle, SocketSet};
+    use smoltcp::iface::{
+        Context as SmolContext, Interface as SmolInterface, SocketHandle, SocketSet,
+    };
     use smoltcp::socket::{dhcpv4, tcp, AnySocket};
     use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
@@ -274,12 +326,15 @@ mod device {
 
     /// `HELO` device id (12 = SqueezeESP32/squeezelite).
     const HELO_DEVICE_ID: u8 = 12;
-    /// Audio-socket connect/retransmit timeout: an unreachable stream server ends in `STMn`
+    /// Audio-socket connect/retransmit timeout: an unreachable stream server ends
+    /// in `STMn`
     /// instead of a connect that never resolves.
     const STREAM_SOCKET_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
 
-    /// Shared firmware state: the hardware, the engine, and the few device-side loop variables
-    /// the non-protocol blocks need. The large members are `&'static mut` into statics built in
+    /// Shared firmware state: the hardware, the engine, and the few device-side
+    /// loop variables
+    /// the non-protocol blocks need. The large members are `&'static mut` into
+    /// statics built in
     /// place during bring-up (see the module docs).
     pub(crate) struct FirmwareState {
         // --- hardware kept alive for the life of the firmware ---
@@ -296,7 +351,8 @@ mod device {
         pub(crate) http_handle: SocketHandle,
         pub(crate) slim_handle: SocketHandle,
         pub(crate) audio_handle: SocketHandle,
-        /// Spec §3.6 UDP placeholders (LMS discovery / mDNS): allocated, unbound, unused until P3.
+        /// Spec §3.6 UDP placeholders (LMS discovery / mDNS): allocated, unbound,
+        /// unused until P3.
         pub(crate) _udp_placeholder_handles: [SocketHandle; UDP_PLACEHOLDER_SOCKETS],
         pub(crate) bt_periph: Option<esp_hal::peripherals::BT<'static>>,
         pub(crate) bt_transport: Option<Esp32VhciTransport<'static>>,
@@ -315,7 +371,8 @@ mod device {
         pub(crate) config: &'static ConfigHandle,
         /// RAM settings journal (DRAM image + target/sequence from the boot load).
         pub(crate) journal: &'static mut RamJournal<'static>,
-        /// Boot-resolved Wi-Fi credentials (journal, else NVS, else first-boot default).
+        /// Boot-resolved Wi-Fi credentials (journal, else NVS, else first-boot
+        /// default).
         pub(crate) wifi_sta_creds: &'static WifiStaCredentials,
         /// Boot-resolved LMS SlimProto target (journal, else first-boot default).
         pub(crate) lms_ip: [u8; 4],
@@ -342,7 +399,8 @@ mod device {
         pub(crate) slim_reconnect: SlimReconnect,
         /// The control socket was open at the end of the last `slim_session`.
         pub(crate) slim_was_open: bool,
-        /// `serv` target taken from the coordinator, applied by the next `slim_session`.
+        /// `serv` target taken from the coordinator, applied by the next
+        /// `slim_session`.
         pub(crate) slim_switch_to: Option<[u8; 4]>,
         pub(crate) last_fault_check_ms: u64,
         pub(crate) latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
@@ -354,7 +412,8 @@ mod device {
     /// Number of UDP placeholder sockets in the smoltcp set (spec §3.6).
     pub(crate) const UDP_PLACEHOLDER_SOCKETS: usize = 2;
 
-    /// The state shared by the ring tasks. Only the baton holder borrows it, and never across
+    /// The state shared by the ring tasks. Only the baton holder borrows it, and
+    /// never across
     /// an `.await`, so the `RefCell` borrow can not fail.
     pub(crate) struct Shared(RefCell<FirmwareState>);
 
@@ -368,7 +427,8 @@ mod device {
     static TURN: [Signal<CriticalSectionRawMutex, Phase>; RingTask::COUNT] =
         [const { Signal::new() }; RingTask::COUNT];
 
-    /// Body shared by every ring task: wait for the baton, run the block, pass the baton on.
+    /// Body shared by every ring task: wait for the baton, run the block, pass the
+    /// baton on.
     async fn run_ring(me: RingTask, shared: &'static Shared) -> ! {
         loop {
             let phase = TURN[me.index()].wait().await;
@@ -378,7 +438,8 @@ mod device {
         }
     }
 
-    /// Runs one block. Routing by [`Phase::owner`] guarantees each block executes inside the
+    /// Runs one block. Routing by [`Phase::owner`] guarantees each block executes
+    /// inside the
     /// task named in the module table.
     fn run_phase(s: &mut FirmwareState, phase: Phase) {
         match phase {
@@ -422,7 +483,8 @@ mod device {
         run_ring(RingTask::HttpControl, shared).await
     }
 
-    /// Core 0: LMS slimproto session (`PlayerCoordinator::tick`, including the HTTP audio fetch).
+    /// Core 0: LMS slimproto session (`PlayerCoordinator::tick`, including the HTTP
+    /// audio fetch).
     #[embassy_executor::task]
     async fn slimproto_session(shared: &'static Shared) -> ! {
         run_ring(RingTask::SlimprotoSession, shared).await
@@ -434,26 +496,31 @@ mod device {
         run_ring(RingTask::CydBridge, shared).await
     }
 
-    /// Stream ring -> decoder -> output ring. Spec §3.1 core 1; runs on core 0 until the S1
+    /// Stream ring -> decoder -> output ring. Spec §3.1 core 1; runs on core 0
+    /// until the S1
     /// owner gate validates core-1 bring-up (see module docs).
     #[embassy_executor::task]
     async fn decode_pump(shared: &'static Shared) -> ! {
         run_ring(RingTask::DecodePump, shared).await
     }
 
-    /// Output ring -> I2S DMA, silence when idle. Spec §3.1 core 1; runs on core 0 until the S1
+    /// Output ring -> I2S DMA, silence when idle. Spec §3.1 core 1; runs on core 0
+    /// until the S1
     /// owner gate validates core-1 bring-up (see module docs).
     #[embassy_executor::task]
     async fn i2s_feed(shared: &'static Shared) -> ! {
         run_ring(RingTask::I2sFeed, shared).await
     }
 
-    /// Poll period of `config_writer`: a change is journaled between `DEBOUNCE_MS` and
+    /// Poll period of `config_writer`: a change is journaled between `DEBOUNCE_MS`
+    /// and
     /// `DEBOUNCE_MS + CONFIG_WRITER_POLL_MS` after the last update.
     pub(crate) const CONFIG_WRITER_POLL_MS: u64 = 100;
 
-    /// Core 0: debounced config persistence (spec §3.5, module docs "Settings persistence").
-    /// Not a ring member: it wakes on its own timer and borrows the shared state only between
+    /// Core 0: debounced config persistence (spec §3.5, module docs "Settings
+    /// persistence").
+    /// Not a ring member: it wakes on its own timer and borrows the shared state
+    /// only between
     /// ring hand-offs (no ring block holds the borrow across an `.await`).
     #[embassy_executor::task]
     async fn config_writer(shared: &'static Shared) -> ! {
@@ -471,39 +538,56 @@ mod device {
         }
     }
 
-    /// `config_writer`: one debounce step; a quiet dirty config is serialized into the RAM
+    /// `config_writer`: one debounce step; a quiet dirty config is serialized into
+    /// the RAM
     /// journal (never flash).
     #[inline(never)]
     fn config_writer_step(s: &mut FirmwareState, writer: &mut ConfigWriter) {
         writer.poll(s.config, &mut *s.journal, now_millis());
     }
 
-    /// Feature `runtime-flash-persist` (default OFF): commit the RAM journal to flash at runtime.
+    /// Feature `runtime-flash-persist` (default OFF): commit the RAM journal to
+    /// flash at runtime.
     ///
-    /// HAZARD (WO-108 / WO-109, hardware-proven deadlock on this board): esp-storage 0.10.0's
+    /// HAZARD (WO-108 / WO-109, hardware-proven deadlock on this board):
+    /// esp-storage 0.10.0's
     /// `FlashStorage::read_nor` calls `spiflash_read` WITHOUT parking APP_CPU, and
-    /// `spiflash_erase_sector` masks interrupts for 45-80 ms and reconfigures SPI1 without
-    /// disabling the SPI0 cache, while 4 MB PSRAM, XIP `.text` and esp-radio Wi-Fi interrupts are
-    /// live. The default build therefore never touches flash at runtime (the RAM journal reaches
-    /// flash only on the certified pre-reboot path). This gate allows a runtime commit only under
+    /// `spiflash_erase_sector` masks interrupts for 45-80 ms and reconfigures SPI1
+    /// without
+    /// disabling the SPI0 cache, while 4 MB PSRAM, XIP `.text` and esp-radio Wi-Fi
+    /// interrupts are
+    /// live. The default build therefore never touches flash at runtime (the RAM
+    /// journal reaches
+    /// flash only on the certified pre-reboot path). This gate allows a runtime
+    /// commit only under
     /// ALL of these rules:
-    /// 1. never while audio plays: the player is neither `Playing` nor `Buffering` and no
+    /// 1. never while audio plays: the player is neither `Playing` nor `Buffering`
+    ///    and no
     ///    Bluetooth stream is active;
-    /// 2. APP_CPU is parked through the certified `Core1Ctl::park_for_flash_write` for the whole
-    ///    erase + write, and unparked after (manual core-1 path only: `main.rs` refuses to build
+    /// 2. APP_CPU is parked through the certified `Core1Ctl::park_for_flash_write`
+    ///    for the whole
+    ///    erase + write, and unparked after (manual core-1 path only: `main.rs`
+    ///    refuses to build
     ///    this feature with `esp-rtos-core1`);
-    /// 3. NO flash read: `erase` + `write_nor` only (no `read_nor`, no read-modify-write
-    ///    `FlashStorage::write`). The target sector and sequence come from the RAM journal, which
+    /// 3. NO flash read: `erase` + `write_nor` only (no `read_nor`, no
+    ///    read-modify-write
+    ///    `FlashStorage::write`). The target sector and sequence come from the RAM
+    ///    journal, which
     ///    carries them from the boot-time load;
-    /// 4. DRAM-only buffers: `write_nor` writes straight from the word-aligned RAM journal image
+    /// 4. DRAM-only buffers: `write_nor` writes straight from the word-aligned RAM
+    ///    journal image
     ///    in `.dram2_uninit` (no bounce buffer, nothing in PSRAM);
-    /// 5. dual-sector ping-pong at 0x3FE000 / 0x3FF000 with the FlashJournal sequence logic
-    ///    (`FlashTargetPolicy::PingPong`, selected in `main.rs` for this feature only): the
-    ///    target is never the sector holding the newest valid journal, so power loss mid-write
+    /// 5. dual-sector ping-pong at 0x3FE000 / 0x3FF000 with the FlashJournal
+    ///    sequence logic
+    ///    (`FlashTargetPolicy::PingPong`, selected in `main.rs` for this feature
+    ///    only): the
+    ///    target is never the sector holding the newest valid journal, so power
+    ///    loss mid-write
     ///    leaves the previous journal intact;
     /// 6. a failed erase/write is retried after 60 s, never in a loop.
     ///
-    /// Not hardware-certified: power-cycle persistence with this feature is an OWNER GATE (enable
+    /// Not hardware-certified: power-cycle persistence with this feature is an
+    /// OWNER GATE (enable
     /// it, then soak with settings changes during idle and during playback).
     #[cfg(feature = "runtime-flash-persist")]
     #[inline(never)]
@@ -511,7 +595,10 @@ mod device {
         const RETRY_MS: u64 = 60_000;
         let now_ms = now_millis();
         if now_ms < *retry_at_ms
-            || matches!(s.coordinator.state, PlayerState::Playing | PlayerState::Buffering)
+            || matches!(
+                s.coordinator.state,
+                PlayerState::Playing | PlayerState::Buffering
+            )
             || s.bt_audio_active
         {
             return;
@@ -529,7 +616,9 @@ mod device {
         let end = offset + louder_esp32_app::config_handle::JOURNAL_SECTOR_SIZE as u32;
         core1.park_for_flash_write();
         let written = flash.erase(offset, end).is_ok()
-            && flash.write_nor(offset, &image.sector[..image.used_len]).is_ok();
+            && flash
+                .write_nor(offset, &image.sector[..image.used_len])
+                .is_ok();
         core1.unpark_after_flash_write();
         if written {
             journal.mark_flash_written();
@@ -538,18 +627,24 @@ mod device {
         }
     }
 
-    /// Before every reboot action: journal any pending change into RAM now (`flush_now`, no
-    /// debounce), then write the RAM journal to its target sector with the certified
-    /// pre-reboot sequence: APP_CPU parked first, DRAM buffer, sector erase + write. In the
-    /// default build this is the ONLY settings flash write (WO-109) and the target is always
+    /// Before every reboot action: journal any pending change into RAM now
+    /// (`flush_now`, no
+    /// debounce), then write the RAM journal to its target sector with the
+    /// certified
+    /// pre-reboot sequence: APP_CPU parked first, DRAM buffer, sector erase +
+    /// write. In the
+    /// default build this is the ONLY settings flash write (WO-109) and the target
+    /// is always
     /// sector A (0x3FE000), byte-identical to the certified build.
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut FirmwareState) {
         s.config.flush_now(&mut *s.journal);
         if let Some(image) = s.journal.pending_image() {
             // Default build: sector A (0x3FE000) as a constant, exactly the certified write
-            // (`FlashTargetPolicy::FixedA` keeps `image.slot` at A too). Any image is valid in
-            // either sector (the newest sequence wins at boot), so the constant is always safe.
+            // (`FlashTargetPolicy::FixedA` keeps `image.slot` at A too). Any image is valid
+            // in
+            // either sector (the newest sequence wins at boot), so the constant is always
+            // safe.
             #[cfg(not(feature = "runtime-flash-persist"))]
             let offset = SETTINGS_JOURNAL_OFFSET;
             #[cfg(feature = "runtime-flash-persist")]
@@ -560,27 +655,30 @@ mod device {
         }
     }
 
-    /// Spawns the core-0 tasks, hands the baton to the first phase and runs the executor.
+    /// Spawns the core-0 tasks, hands the baton to the first phase and runs the
+    /// executor.
     /// Never returns.
     pub(crate) fn run_core0_executor(shared: &'static Shared) -> ! {
         static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
         EXECUTOR0.init(Executor::new()).run(|spawner| {
-            spawner.spawn(watchdog_lease(shared).unwrap());
-            spawner.spawn(bt_a2dp(shared).unwrap());
-            spawner.spawn(net_stack(shared).unwrap());
-            spawner.spawn(http_control(shared).unwrap());
-            spawner.spawn(slimproto_session(shared).unwrap());
-            spawner.spawn(cyd_bridge(shared).unwrap());
-            // Core-0 placement of the audio tasks: see "Core placement" in the module docs.
-            spawner.spawn(decode_pump(shared).unwrap());
-            spawner.spawn(i2s_feed(shared).unwrap());
-            spawner.spawn(config_writer(shared).unwrap());
+            spawner.spawn(watchdog_lease(shared).expect("watchdog_lease task token"));
+            spawner.spawn(bt_a2dp(shared).expect("bt_a2dp task token"));
+            spawner.spawn(net_stack(shared).expect("net_stack task token"));
+            spawner.spawn(http_control(shared).expect("http_control task token"));
+            spawner.spawn(slimproto_session(shared).expect("slimproto_session task token"));
+            spawner.spawn(cyd_bridge(shared).expect("cyd_bridge task token"));
+            // Core-0 placement of the audio tasks: see "Core placement" in the
+            // module docs.
+            spawner.spawn(decode_pump(shared).expect("decode_pump task token"));
+            spawner.spawn(i2s_feed(shared).expect("i2s_feed task token"));
+            spawner.spawn(config_writer(shared).expect("config_writer task token"));
             let first = PHASE_ORDER[0];
             TURN[first.owner().index()].signal(first);
         })
     }
 
-    /// Core 1 (feature `esp-rtos-core1`): replaces the NOP heartbeat loop of the manual start
+    /// Core 1 (feature `esp-rtos-core1`): replaces the NOP heartbeat loop of the
+    /// manual start
     /// path; the audio tasks join this executor once the S1 owner gate passes.
     #[cfg(feature = "esp-rtos-core1")]
     #[embassy_executor::task]
@@ -591,22 +689,25 @@ mod device {
         }
     }
 
-    /// Core-1 entry for `esp_rtos::start_second_core` (feature `esp-rtos-core1`). The executor
+    /// Core-1 entry for `esp_rtos::start_second_core` (feature `esp-rtos-core1`).
+    /// The executor
     /// must be created on core 1 itself (esp-rtos panics otherwise, Spike S1).
     #[cfg(feature = "esp-rtos-core1")]
     pub(crate) fn run_core1_executor() -> ! {
         static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
         EXECUTOR1.init(Executor::new()).run(|spawner| {
-            spawner.spawn(core1_heartbeat().unwrap());
+            spawner.spawn(core1_heartbeat().expect("core1_heartbeat task token"));
         })
     }
 
-    // ------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // smoltcp binding of the device I/O adapters (`net_device`)
-    // ------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
-    /// A smoltcp TCP socket borrowed for one block, as [`TcpSocketOps`]. Only the audio socket
-    /// gets `connect` (interface context, local address and the rotating local port).
+    /// A smoltcp TCP socket borrowed for one block, as [`TcpSocketOps`]. Only the
+    /// audio socket
+    /// gets `connect` (interface context, local address and the rotating local
+    /// port).
     struct SmolTcp<'a> {
         sock: &'a mut tcp::Socket<'static>,
         connect: Option<(&'a mut SmolContext, [u8; 4], &'a mut u16)>,
@@ -614,7 +715,10 @@ mod device {
 
     impl<'a> SmolTcp<'a> {
         fn new(sock: &'a mut tcp::Socket<'static>) -> Self {
-            Self { sock, connect: None }
+            Self {
+                sock,
+                connect: None,
+            }
         }
     }
 
@@ -646,7 +750,10 @@ mod device {
             self.sock.abort();
             self.sock.set_timeout(Some(STREAM_SOCKET_TIMEOUT));
             let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(remote.ip)), remote.port);
-            let local_ep = (IpAddress::Ipv4(Ipv4Address::from(*local_ip)), next_local_port(port));
+            let local_ep = (
+                IpAddress::Ipv4(Ipv4Address::from(*local_ip)),
+                next_local_port(port),
+            );
             self.sock.connect(cx, remote_ep, local_ep).is_ok()
         }
 
@@ -683,7 +790,8 @@ mod device {
         }
     }
 
-    /// The control and audio sockets, borrowed together (disjoint) out of the socket set.
+    /// The control and audio sockets, borrowed together (disjoint) out of the
+    /// socket set.
     fn slim_and_audio_sockets<'a>(
         sockets: &'a mut SocketSet<'static>,
         slim_handle: SocketHandle,
@@ -700,15 +808,17 @@ mod device {
         Some((slim?, audio?))
     }
 
-    /// LMS still owns the output: an LMS stream is connecting/open and its track has not ended.
+    /// LMS still owns the output: an LMS stream is connecting/open and its track
+    /// has not ended.
     fn lms_audio_active(coordinator: &PlayerCoordinator) -> bool {
         coordinator.stream_active() && coordinator.state != PlayerState::Stopped
     }
 
-    // ------------------------------------------------------------------------------------------
-    // Blocks, in PHASE_ORDER. `#[inline(never)]` keeps each block in its own stack frame so only
+    // -------------------------------------------------------------------------
+    // Blocks, in PHASE_ORDER. `#[inline(never)]` keeps each block in its own stack
+    // frame so only
     // one block's temporaries are live at a time.
-    // ------------------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /// `watchdog_lease`: feed the 20 s TIMG0 WDT and take the lap's timestamp.
     #[inline(never)]
@@ -717,8 +827,10 @@ mod device {
         s.now_ms = now_millis();
     }
 
-    /// `bt_a2dp`: lazy BT controller bring-up after the DHCP lease, then A2DP sink poll. A2DP
-    /// audio feeds the pipeline only while LMS does not own the output; the coordinator is told
+    /// `bt_a2dp`: lazy BT controller bring-up after the DHCP lease, then A2DP sink
+    /// poll. A2DP
+    /// audio feeds the pipeline only while LMS does not own the output; the
+    /// coordinator is told
     /// (`begin_external_playback`) so it reports nothing about it to LMS.
     #[inline(never)]
     fn bt_poll(s: &mut FirmwareState) {
@@ -727,13 +839,11 @@ mod device {
         if s.assigned_ip.is_some() && s.bt_transport.is_none() {
             if let Some(bt_p) = s.bt_periph.take() {
                 s.wdt.feed();
-                s.bt_transport = match esp_radio::ble::controller::BleConnector::new(
-                    bt_p,
-                    Default::default(),
-                ) {
-                    Ok(c) => Some(Esp32VhciTransport { connector: c }),
-                    Err(_) => None,
-                };
+                s.bt_transport =
+                    match esp_radio::ble::controller::BleConnector::new(bt_p, Default::default()) {
+                        Ok(c) => Some(Esp32VhciTransport { connector: c }),
+                        Err(_) => None,
+                    };
                 s.wdt.feed();
             }
         }
@@ -745,31 +855,33 @@ mod device {
 
         // Poll Bluetooth Classic A2DP Sink
         if let Some(ref mut transport) = s.bt_transport {
-            s.bt_sink.poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                if !lms_audio_active(s.coordinator) {
-                    if s.coordinator.current_sample_rate != sample_rate_hz
-                        || s.pipeline.sample_rate != sample_rate_hz
-                    {
-                        s.coordinator.current_sample_rate = sample_rate_hz;
-                        let _ = s.pipeline.set_sample_rate(sample_rate_hz);
-                    }
-                    if !s.bt_audio_active {
-                        // A replaced MP3 decoder is parked by `set_decoder` for the next track.
-                        s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                        // Declared divergences (cleaner): no LMS fade and no LMS replay gain on
-                        // Bluetooth audio (C's `_buf_flush` leaves an armed fade running and
-                        // `current_replay_gain` set, decode_external.c:147-154).
-                        s.pipeline.begin_external_audio();
-                        s.pipeline.set_mute(false);
-                        s.coordinator.begin_external_playback();
-                        if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                            let _ = s.amp.start_playback_via_hiz();
+            s.bt_sink
+                .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
+                    if !lms_audio_active(s.coordinator) {
+                        if s.coordinator.current_sample_rate != sample_rate_hz
+                            || s.pipeline.sample_rate != sample_rate_hz
+                        {
+                            s.coordinator.current_sample_rate = sample_rate_hz;
+                            let _ = s.pipeline.set_sample_rate(sample_rate_hz);
                         }
-                        s.bt_audio_active = true;
+                        if !s.bt_audio_active {
+                            // A replaced MP3 decoder is parked by `set_decoder` for the next track.
+                            s.pipeline
+                                .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                            // Declared divergences (cleaner): no LMS fade and no LMS replay gain on
+                            // Bluetooth audio (C's `_buf_flush` leaves an armed fade running and
+                            // `current_replay_gain` set, decode_external.c:147-154).
+                            s.pipeline.begin_external_audio();
+                            s.pipeline.set_mute(false);
+                            s.coordinator.begin_external_playback();
+                            if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                let _ = s.amp.start_playback_via_hiz();
+                            }
+                            s.bt_audio_active = true;
+                        }
+                        let _ = s.pipeline.ingest_stream_data(pcm_bytes);
                     }
-                    let _ = s.pipeline.ingest_stream_data(pcm_bytes);
-                }
-            });
+                });
 
             if s.bt_audio_active && !s.bt_sink.is_streaming() && !lms_audio_active(s.coordinator) {
                 if s.pipeline.stream_buffer.available_read() == 0
@@ -800,15 +912,22 @@ mod device {
         }
     }
 
-    /// `watchdog_lease`: Gate 3 dead-man network lease (45 s boot / 60 s drop -> recovery).
+    /// `watchdog_lease`: Gate 3 dead-man network lease (45 s boot / 60 s drop ->
+    /// recovery).
     #[inline(never)]
     fn lease_check(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
         // Gate 3: Evaluate Dead-Man Network Lease Watchdog (45s boot / 60s drop)
-        if s.lease_watchdog.evaluate(now_ms, s.wifi_controller.is_connected(), s.assigned_ip.is_some())
-            == LeaseHealth::ExpiredResetToRecovery
+        if s.lease_watchdog.evaluate(
+            now_ms,
+            s.wifi_controller.is_connected(),
+            s.assigned_ip.is_some(),
+        ) == LeaseHealth::ExpiredResetToRecovery
         {
-            println!("[ANTI-BRICK GATE 3] Network lease timeout expired -> resetting to recovery (0x10000)");
+            println!(
+                "[ANTI-BRICK GATE 3] Network lease timeout expired -> \
+                 resetting to recovery (0x10000)"
+            );
             esp_hal::system::software_reset();
         }
     }
@@ -870,11 +989,13 @@ mod device {
             None => {}
         }
     }
-    /// `http_control`: Gate 4 port-80 control/recovery server, then its deferred reboot action.
+    /// `http_control`: Gate 4 port-80 control/recovery server, then its deferred
+    /// reboot action.
     #[inline(never)]
     fn http_serve(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
-        // Gate 4: Port 80 HTTP Control & Recovery Server (`/status.json`, `/recovery.json`, `/reboot.json`, `/reboot_ota.json`)
+        // Gate 4: Port 80 HTTP Control & Recovery Server (`/status.json`,
+        // `/recovery.json`, `/reboot.json`, `/reboot_ota.json`)
         {
             let http_sock = s.sockets.get_mut::<tcp::Socket>(s.http_handle);
 
@@ -911,7 +1032,8 @@ mod device {
                 }
             }
 
-            // Immediate recycling of closing sockets once FIN/ACK handshake completes (TimeWait) or on timeout
+            // Immediate recycling of closing sockets once FIN/ACK handshake completes
+            // (TimeWait) or on timeout
             if s.pending_http_closing {
                 if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
                     || now_ms >= s.pending_close_deadline_ms
@@ -963,12 +1085,14 @@ mod device {
                         ActiveDecoder::Mp3(_) => "MP3",
                         ActiveDecoder::Flac(_) => "FLAC",
                         ActiveDecoder::Pcm(_) => "PCM",
-                        #[cfg(not(target_arch = "xtensa"))]
                         ActiveDecoder::Aac(_) => "AAC",
-                        #[cfg(not(target_arch = "xtensa"))]
                         ActiveDecoder::Vorbis(_) => "Vorbis",
+                        ActiveDecoder::Alac(_) => "ALAC",
+                        ActiveDecoder::Opus(_) => "Opus",
                     };
-                    let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) = match s.latest_telemetry {
+                    let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) = match s
+                        .latest_telemetry
+                    {
                         Some(t) => (
                             t.detected_sample_rate_hz_with_hint(s.coordinator.current_sample_rate),
                             t.bck_ratio(),
@@ -1028,9 +1152,15 @@ mod device {
                         bt_streaming: s.bt_sink.is_streaming(),
                         bt_rx_pkts: s.bt_sink.rx_packets,
                         bt_frames: s.bt_sink.decoded_frames,
+                        decode_us_max: s.pipeline.decode_us_max,
+                        decode_us_first: s.pipeline.decode_us_first,
                     };
                     if let Some((hdr_or_resp_len, static_body, action)) =
-                        handle_http_request_streaming(&req_buf[..n], &snap, &mut s.http_resp_buf[..])
+                        handle_http_request_streaming(
+                            &req_buf[..n],
+                            &snap,
+                            &mut s.http_resp_buf[..],
+                        )
                     {
                         let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
                         if !static_body.is_empty() {
@@ -1059,14 +1189,22 @@ mod device {
                                 let _ = s.amp.set_analog_gain(again_code);
                                 s.config.update(|c| c.analog_gain_code = again_code);
                             }
-                            HttpControlAction::PlayerIrCommand { ir_code, vol_pct, mute } => {
+                            HttpControlAction::PlayerIrCommand {
+                                ir_code,
+                                vol_pct,
+                                mute,
+                            } => {
                                 if let Some(pct) = vol_pct {
                                     s.current_vol_pct = pct;
                                     // The single volume entry: the TAS register for `pct`
                                     // (as percent_to_attenuation), LMS's balance kept.
-                                    let mut backend =
-                                        Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
-                                    s.coordinator.set_volume_percent(pct, &mut backend, s.pipeline);
+                                    let mut backend = Esp32AudioBackend::new(
+                                        s.amp,
+                                        DeviceClockRegs,
+                                        &DMA_OUTSTANDING_FRAMES,
+                                    );
+                                    s.coordinator
+                                        .set_volume_percent(pct, &mut backend, s.pipeline);
                                     let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
                                     s.config.update(|c| c.volume = pct);
                                 }
@@ -1076,10 +1214,13 @@ mod device {
                                 }
                                 if ir_code != 0 && s.helo_sent {
                                     let mut ir_buf = [0u8; 32];
-                                    if let Ok(ir_len) =
-                                        SlimprotoBuilder::build_ir(now_ms as u32, ir_code, &mut ir_buf)
-                                    {
-                                        let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+                                    if let Ok(ir_len) = SlimprotoBuilder::build_ir(
+                                        now_ms as u32,
+                                        ir_code,
+                                        &mut ir_buf,
+                                    ) {
+                                        let slim_sock =
+                                            s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
                                         let mut link = SmoltcpSlimTransport::new(
                                             SmolTcp::new(slim_sock),
                                             &mut s.slim_link,
@@ -1088,11 +1229,12 @@ mod device {
                                     }
                                 }
                             }
-                            HttpControlAction::RebootToRecovery | HttpControlAction::PersistOta0AndReboot => {
+                            HttpControlAction::RebootToRecovery
+                            | HttpControlAction::PersistOta0AndReboot => {
                                 s.pending_http_action = action;
                                 s.pending_action_deadline_ms = now_ms + 250;
                             }
-                            HttpControlAction::None => {}
+                            _ => {}
                         }
                     } else {
                         http_sock.close();
@@ -1104,17 +1246,25 @@ mod device {
         }
 
         // Execute deferred HTTP reboot action after flushing TCP response
-        if s.pending_http_action != HttpControlAction::None && now_ms >= s.pending_action_deadline_ms {
+        if s.pending_http_action != HttpControlAction::None
+            && now_ms >= s.pending_action_deadline_ms
+        {
             flush_settings_before_reboot(s);
             match s.pending_http_action {
                 HttpControlAction::RebootToRecovery => {
-                    println!("[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json -> resetting into factory recovery (0x10000)");
+                    println!(
+                        "[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json \
+                         -> resetting into factory recovery (0x10000)"
+                    );
                     esp_hal::system::software_reset();
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
                     let _ = s.flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
-                    println!("[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> wrote ota_0 select entry & resetting");
+                    println!(
+                        "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
+                         wrote ota_0 select entry & resetting"
+                    );
                     esp_hal::system::software_reset();
                 }
                 _ => {}
@@ -1122,10 +1272,14 @@ mod device {
         }
     }
 
-    /// `slimproto_session`: control-link upkeep, then [`slim_tick`] once the IPv4 lease is
-    /// active. Upkeep: a `serv` switch drops the link and targets the new server; a half-closed
-    /// link is reset; a link that went down is reported to [`SlimReconnect`] (backoff, or the
-    /// fall-back to the previous server); a connect starts when the policy allows it.
+    /// `slimproto_session`: control-link upkeep, then [`slim_tick`] once the IPv4
+    /// lease is
+    /// active. Upkeep: a `serv` switch drops the link and targets the new server; a
+    /// half-closed
+    /// link is reset; a link that went down is reported to [`SlimReconnect`]
+    /// (backoff, or the
+    /// fall-back to the previous server); a connect starts when the policy allows
+    /// it.
     #[inline(never)]
     fn slim_session(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
@@ -1134,17 +1288,21 @@ mod device {
         };
         let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
         // C parity: `serv` ends the session (`slimproto_run` exits on `new_server`,
-        // slimproto.c:708), the post-session backoff delay runs (slimproto.c:1187-1210), and
-        // only then the new server is connected (slimproto.c:1096-1103): `SlimReconnect`.
+        // slimproto.c:708), the post-session backoff delay runs
+        // (slimproto.c:1187-1210), and
+        // only then the new server is connected (slimproto.c:1096-1103):
+        // `SlimReconnect`.
         if let Some(ip) = s.slim_switch_to.take() {
             slim_sock.abort();
-            s.slim_reconnect.server_switch(now_ms, s.lms_ip, backoff_seed(now_ms));
+            s.slim_reconnect
+                .server_switch(now_ms, s.lms_ip, backoff_seed(now_ms));
             s.slim_was_open = false;
             s.helo_sent = false;
             s.lms_ip = ip;
             s.coordinator.lms_ip = ip;
         }
-        // Half-closed / closing control link: abort it so it reconnects instead of lingering
+        // Half-closed / closing control link: abort it so it reconnects instead of
+        // lingering
         // in CloseWait.
         if slim_sock.is_open()
             && matches!(
@@ -1177,7 +1335,10 @@ mod device {
                 IpAddress::Ipv4(Ipv4Address::from(local_ip)),
                 next_local_port(&mut s.local_port_counter),
             );
-            if slim_sock.connect(s.smol_iface.context(), remote_ep, local_ep).is_ok() {
+            if slim_sock
+                .connect(s.smol_iface.context(), remote_ep, local_ep)
+                .is_ok()
+            {
                 s.slim_reconnect.connect_started();
                 s.slim_was_open = true;
             }
@@ -1185,19 +1346,27 @@ mod device {
         slim_tick(s, local_ip);
     }
 
-    /// Jitter source for the reconnect backoff (C uses `rand()`, `slimproto.c:1196`): the
+    /// Jitter source for the reconnect backoff (C uses `rand()`,
+    /// `slimproto.c:1196`): the
     /// scrambled lap clock.
     fn backoff_seed(now_ms: u64) -> u32 {
         (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32
     }
 
-    /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`, with the
+    /// `HELO` + `SETD` once per control connection (`PlayerCoordinator::hello`,
+    /// with the
     /// [`SlimReconnect`] reconnect flag), then one
-    /// `PlayerCoordinator::tick` over the device adapters: at most one server frame, the HTTP
-    /// audio fetch, play-state evaluation, deferred `STAT`/`RESP`/`META`/`DSCO` and the
-    /// heartbeat. It never decodes or writes to the sink (`external_audio_pump`, set at
-    /// bring-up): the pump phases own that, DMA first. The tick also runs while the control
-    /// link is down, so the stream keeps being fetched. A server volume change (`audg`) is mirrored to the CYD and the [`ConfigHandle`] (debounced into the journal).
+    /// `PlayerCoordinator::tick` over the device adapters: at most one server
+    /// frame, the HTTP
+    /// audio fetch, play-state evaluation, deferred `STAT`/`RESP`/`META`/`DSCO` and
+    /// the
+    /// heartbeat. It never decodes or writes to the sink (`external_audio_pump`,
+    /// set at
+    /// bring-up): the pump phases own that, DMA first. The tick also runs while the
+    /// control
+    /// link is down, so the stream keeps being fetched. A server volume change
+    /// (`audg`) is mirrored to the CYD and the [`ConfigHandle`] (debounced into the
+    /// journal).
     #[inline(never)]
     fn slim_tick(s: &mut FirmwareState, local_ip: [u8; 4]) {
         let now_ms = s.now_ms as u32;
@@ -1230,7 +1399,11 @@ mod device {
         let mut transport = SmoltcpSlimTransport::new(SmolTcp::new(slim_sock), &mut *slim_link);
         if transport.connected() && !*helo_sent {
             *helo_sent = coordinator
-                .hello(&mut transport, HELO_DEVICE_ID, slim_reconnect.reconnect_flag())
+                .hello(
+                    &mut transport,
+                    HELO_DEVICE_ID,
+                    slim_reconnect.reconnect_flag(),
+                )
                 .is_ok();
             if !*helo_sent {
                 // Never let a `STAT` reach LMS before the `HELO`: retry next lap.
@@ -1246,7 +1419,8 @@ mod device {
             &mut *stream_state,
         );
         let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
-        // A dead control link is handled by `slim_session` (reconnect + HELO); the tick's own
+        // A dead control link is handled by `slim_session` (reconnect + HELO); the
+        // tick's own
         // errors need no action here.
         let _ = coordinator.tick(&mut transport, &mut source, &mut backend, pipeline, now_ms);
         if let Some(ip) = coordinator.take_server_switch() {
@@ -1266,9 +1440,14 @@ mod device {
     #[inline(never)]
     fn cyd_command(s: &mut FirmwareState) {
         if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
-            // CYD SetVolume goes through the single volume entry (device policy, balance kept).
-            let mut backend = Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
-            if let Some(reply) = s.coordinator.handle_cyd_command(cmd, &mut backend, s.pipeline) {
+            // CYD SetVolume goes through the single volume entry (device policy, balance
+            // kept).
+            let mut backend =
+                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            if let Some(reply) = s
+                .coordinator
+                .handle_cyd_command(cmd, &mut backend, s.pipeline)
+            {
                 if let CydMessage::Volume(pct) = reply {
                     // A CYD volume change marks the config dirty (spec §3.5); debounced.
                     s.config.update(|c| c.volume = pct.min(100));
@@ -1278,26 +1457,30 @@ mod device {
         }
     }
 
-    /// `i2s_feed`: drain decoded PCM and top up the I2S0 DMA (up to 16 sink writes) BEFORE
+    /// `i2s_feed`: drain decoded PCM and top up the I2S0 DMA (up to 16 sink writes)
+    /// BEFORE
     /// spending ~4.5 ms decoding a new MP3 frame.
     #[inline(never)]
     fn output_top_up_first(s: &mut FirmwareState) {
         s.coordinator.pump_output(s.pipeline, 16);
     }
 
-    /// `decode_pump`: with the DMA topped up, decode at most one audio frame (or a resync /
+    /// `decode_pump`: with the DMA topped up, decode at most one audio frame (or a
+    /// resync /
     /// tag-skip burst of up to 16 steps for MP3 and FLAC, 4 otherwise).
     #[inline(never)]
     fn decode_burst(s: &mut FirmwareState) {
         let max_steps = match s.pipeline.decoder {
-            ActiveDecoder::Mp3(_) | ActiveDecoder::Flac(_) => 16,
-            _ => 4,
+            ActiveDecoder::Pcm(_) => 4,
+            _ => 16,
         };
         s.coordinator.pump_decode(s.pipeline, max_steps);
     }
 
-    /// `i2s_feed`: top up the DMA with the new frames, sync the coordinator rate, keep the amp
-    /// stopped while the DAC is disabled, then pump silence when there is nothing to play.
+    /// `i2s_feed`: top up the DMA with the new frames, sync the coordinator rate,
+    /// keep the amp
+    /// stopped while the DAC is disabled, then pump silence when there is nothing
+    /// to play.
     #[inline(never)]
     fn output_top_up_final(s: &mut FirmwareState) {
         s.coordinator.pump_output(s.pipeline, 16);
@@ -1340,8 +1523,11 @@ mod device {
         let now_ms = s.now_ms;
         if now_ms.saturating_sub(s.last_cyd_progress_ms) >= 1_000 {
             s.last_cyd_progress_ms = now_ms;
-            if s.coordinator.state == louder_esp32_app::PlayerState::Playing && s.coordinator.current_sample_rate > 0 {
-                let elapsed_secs = (s.pipeline.frames_played / s.coordinator.current_sample_rate as u64) as u32;
+            if s.coordinator.state == louder_esp32_app::PlayerState::Playing
+                && s.coordinator.current_sample_rate > 0
+            {
+                let elapsed_secs =
+                    (s.pipeline.frames_played / s.coordinator.current_sample_rate as u64) as u32;
                 let _ = s.cyd_bridge.send_message(&CydMessage::Progress {
                     elapsed_secs,
                     duration_secs: 0,
@@ -1358,14 +1544,19 @@ mod tests {
     #[test]
     fn test_phase_discriminants_follow_phase_order() {
         for (i, phase) in PHASE_ORDER.iter().enumerate() {
-            assert_eq!(*phase as usize, i, "{phase:?} is out of place in PHASE_ORDER");
+            assert_eq!(
+                *phase as usize, i,
+                "{phase:?} is out of place in PHASE_ORDER"
+            );
         }
     }
 
     #[test]
     fn test_phase_ring_keeps_dma_first_audio_order() {
-        // Owner sequence of one lap. The audio steps keep the pre-Task-9 superloop order: the
-        // I2S DMA is topped up before and after the decode burst, after the slimproto session
+        // Owner sequence of one lap. The audio steps keep the pre-Task-9 superloop
+        // order: the
+        // I2S DMA is topped up before and after the decode burst, after the slimproto
+        // session
         // (whose coordinator tick also fetches the HTTP audio).
         let owners: Vec<RingTask> = PHASE_ORDER.iter().map(|p| p.owner()).collect();
         assert_eq!(
@@ -1397,8 +1588,15 @@ mod tests {
             phase = phase.next();
         }
         assert_eq!(seen, PHASE_ORDER.to_vec());
-        assert_eq!(phase, PHASE_ORDER[0], "the lap must wrap back to the WDT feed");
-        assert_eq!(PHASE_ORDER[0], Phase::WatchdogFeed, "every lap starts by feeding the WDT");
+        assert_eq!(
+            phase, PHASE_ORDER[0],
+            "the lap must wrap back to the WDT feed"
+        );
+        assert_eq!(
+            PHASE_ORDER[0],
+            Phase::WatchdogFeed,
+            "every lap starts by feeding the WDT"
+        );
     }
 
     #[test]
@@ -1438,14 +1636,21 @@ mod tests {
             CoordinatorCmd::Unpause,
             CoordinatorCmd::Flush,
             CoordinatorCmd::SkipAheadMs(1500),
-            CoordinatorCmd::SetGain { l: 65_536, r: 32_768 },
+            CoordinatorCmd::SetGain {
+                l: 65_536,
+                r: 32_768,
+            },
             CoordinatorCmd::SetMute(true),
             CoordinatorCmd::SetMute(false),
         ];
         for cmd in cmds {
-            CTRL.try_send(cmd).expect("CTRL must hold CHANNEL_DEPTH commands");
+            CTRL.try_send(cmd)
+                .expect("CTRL must hold CHANNEL_DEPTH commands");
         }
-        assert!(CTRL.try_send(CoordinatorCmd::Pause).is_err(), "CTRL depth is {CHANNEL_DEPTH}");
+        assert!(
+            CTRL.try_send(CoordinatorCmd::Pause).is_err(),
+            "CTRL depth is {CHANNEL_DEPTH}"
+        );
         for cmd in cmds {
             assert_eq!(CTRL.try_receive(), Ok(cmd));
         }

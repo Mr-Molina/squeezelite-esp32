@@ -29,7 +29,7 @@ pub mod wifi;
 pub use amp::{AmpManager, AmpMode};
 pub use board::{BoardModel, I2sPinConfig, ACTIVE_BOARD};
 pub use bt_a2dp::{AvdtpStreamState, BtA2dpSink, HciTransport, InitStep, SbcDecoder};
-pub use coordinator::{PlayerCoordinator, PlayerState};
+pub use coordinator::{AudioSource, PlayerCoordinator, PlayerState, SourceArbiter};
 pub use cyd::CydController;
 pub use hal::{
     BitDepth, CydUartBridge, EspI2sSink, EspWifiAdapter, FlashPartition, I2sDmaDriver, I2sFormat,
@@ -41,9 +41,11 @@ pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
 
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
-pub use squeezelite_config::{AudioConfig, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials};
+pub use squeezelite_config::{
+    AudioConfig, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials,
+};
 #[cfg(not(target_arch = "xtensa"))]
-pub use network::{HttpAudioStream, LmsDiscovery, SlimprotoClient};
+pub use network::{HttpAudioStream, LmsDiscovery, RaopStreamClient, SlimprotoClient};
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};
 pub use squeezelite_tas58xx::{Play, PowerDown, Standby, Tas58xx};

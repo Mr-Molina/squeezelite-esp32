@@ -3,9 +3,18 @@
 //! Verifies zero-panic guarantees and protocol roundtrip invariants for the
 //! Cheap Yellow Display (CYD) UART communication protocol.
 
-use heapless::{String, Vec};
-use proptest::prelude::*;
-use squeezelite_cyd_link::*;
+use heapless::String;
+use heapless::Vec;
+use proptest::prelude::any;
+use proptest::prelude::prop_assert;
+use proptest::prelude::prop_assert_eq;
+use proptest::prelude::ProptestConfig;
+use proptest::proptest;
+use squeezelite_cyd_link::CydCommand;
+use squeezelite_cyd_link::CydLinkProtocol;
+use squeezelite_cyd_link::CydMessage;
+use squeezelite_cyd_link::LinkError;
+use squeezelite_cyd_link::PlayState;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
@@ -22,7 +31,8 @@ proptest! {
         let _ = CydLinkProtocol::parse_command(&data);
     }
 
-    /// Invariant: `parse_command` must NEVER panic on arbitrary UTF-8 strings including control chars.
+    /// Invariant: `parse_command` must NEVER panic on arbitrary UTF-8 strings
+    /// including control chars.
     #[test]
     fn fuzz_parse_command_arbitrary_strings(s in ".*") {
         let _ = CydLinkProtocol::parse_command(s.as_bytes());
@@ -52,7 +62,8 @@ proptest! {
         prop_assert_eq!(dec_res.unwrap(), CydCommand::SetVolume(vol));
     }
 
-    /// Invariant: Out-of-range volume levels (>100) are rejected with ValueOutOfRange.
+    /// Invariant: Out-of-range volume levels (>100) are rejected with
+    /// ValueOutOfRange.
     #[test]
     fn fuzz_command_set_volume_out_of_range(vol in 101..=255u8) {
         let mut buf = Vec::new();
@@ -100,7 +111,8 @@ proptest! {
         prop_assert_eq!(dec_res.unwrap(), CydMessage::PlaybackState(state));
     }
 
-    /// Invariant: Roundtrip encoding & decoding of touch interaction commands with CRLF tolerance.
+    /// Invariant: Roundtrip encoding & decoding of touch interaction
+    /// commands with CRLF tolerance.
     #[test]
     fn fuzz_touch_commands_roundtrip(cmd_idx in 0..6u8, crlf in any::<bool>()) {
         let cmd = match cmd_idx {
@@ -156,8 +168,8 @@ proptest! {
         prop_assert_eq!(parsed.unwrap(), msg);
     }
 
-    /// Invariant: Track metadata never crashes on arbitrary strings and strips forbidden delimiters.
-    /// Preserves semicolons in title (LOGIC-404).
+    /// Invariant: Track metadata never crashes on arbitrary strings and
+    /// strips forbidden delimiters. Preserves semicolons in title (LOGIC-404).
     #[test]
     fn fuzz_metadata_sanitization(
         artist_str in "[a-zA-Z0-9;\\r\\n ]{0,60}",
@@ -177,7 +189,10 @@ proptest! {
         let parsed = CydLinkProtocol::parse_line(&buf);
         prop_assert!(parsed.is_ok());
 
-        if let Ok(CydMessage::TrackMetadata { artist: parsed_artist, title: parsed_title }) = parsed {
+        if let Ok(CydMessage::TrackMetadata {
+            artist: parsed_artist,
+            title: parsed_title,
+        }) = parsed {
             // Semicolons in title must be preserved
             let expected_semicolons = title_str.chars().filter(|&c| c == ';').count();
             let actual_semicolons = parsed_title.chars().filter(|&c| c == ';').count();

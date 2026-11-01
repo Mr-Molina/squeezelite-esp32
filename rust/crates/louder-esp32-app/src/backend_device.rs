@@ -1,23 +1,35 @@
-//! Device [`AudioBackend`]: I2S0 clock dividers from the verified clock table, the TAS58xx
+//! Device [`AudioBackend`]: I2S0 clock dividers from the verified clock table,
+//! the TAS58xx
 //! amplifier (volume, power) and the I2S DMA fill counter.
 //!
-//! # I2S0 clock registers (ESP32 TRM, chapter "I2S"; cross-checked against the `esp32` PAC and
+//! # I2S0 clock registers (ESP32 TRM, chapter "I2S"; cross-checked against the
+//! `esp32` PAC and
 //! esp-hal's ESP32 `set_clock`)
 //!
 //! | register | address | fields used |
 //! |---|---|---|
-//! | `I2S_CLKM_CONF_REG` | `0x3FF4_F0AC` | `I2S_CLKM_DIV_NUM` [7:0], `I2S_CLKM_DIV_B` [13:8], `I2S_CLKM_DIV_A` [19:14], `I2S_CLK_EN` [20], `I2S_CLKA_ENA` [21] (1 = APLL, 0 = `PLL_D2` 160 MHz) |
-//! | `I2S_SAMPLE_RATE_CONF_REG` | `0x3FF4_F0B0` | `I2S_TX_BCK_DIV_NUM` [5:0] (`RX_BCK_DIV_NUM` [11:6] and the bit modes are left alone) |
+//! | `I2S_CLKM_CONF_REG` | `0x3FF4_F0AC` | `I2S_CLKM_DIV_NUM` [7:0],
+//! `I2S_CLKM_DIV_B` [13:8], `I2S_CLKM_DIV_A` [19:14], `I2S_CLK_EN` [20],
+//! `I2S_CLKA_ENA` [21] (1 = APLL, 0 = `PLL_D2` 160 MHz) |
+//! | `I2S_SAMPLE_RATE_CONF_REG` | `0x3FF4_F0B0` | `I2S_TX_BCK_DIV_NUM` [5:0]
+//! (`RX_BCK_DIV_NUM` [11:6] and the bit modes are left alone) |
 //!
-//! `BCK = 160 MHz / (DIV_NUM + DIV_B / DIV_A) / TX_BCK_DIV_NUM`. Both registers are written for
-//! every rate: the pre-Task-9 firmware only rewrote `CLKM_CONF` and left `TX_BCK_DIV_NUM` at the
-//! value esp-hal chose for 44.1 kHz, which put 88.2 kHz about 12,000 ppm off. The CLKM field
-//! order (`DIV_B` below `DIV_A`) is the one the firmware has used since WO-109. A rate missing
-//! from [`crate::clock_table`] is [`ClockError::UnsupportedRate`] and writes nothing (the old
+//! `BCK = 160 MHz / (DIV_NUM + DIV_B / DIV_A) / TX_BCK_DIV_NUM`. Both registers
+//! are written for
+//! every rate: the pre-Task-9 firmware only rewrote `CLKM_CONF` and left
+//! `TX_BCK_DIV_NUM` at the
+//! value esp-hal chose for 44.1 kHz, which put 88.2 kHz about 12,000 ppm off.
+//! The CLKM field
+//! order (`DIV_B` below `DIV_A`) is the one the firmware has used since WO-109.
+//! A rate missing
+//! from [`crate::clock_table`] is [`ClockError::UnsupportedRate`] and writes
+//! nothing (the old
 //! silent 44.1 kHz fallback is gone).
 //!
-//! Register access is behind [`I2sClockRegisters`] so this module stays `unsafe`-free and
-//! host-testable; the firmware implements it with volatile accesses in `main.rs`.
+//! Register access is behind [`I2sClockRegisters`] so this module stays
+//! `unsafe`-free and
+//! host-testable; the firmware implements it with volatile accesses in
+//! `main.rs`.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -48,14 +60,16 @@ pub trait I2sClockRegisters {
     fn write_sample_rate_conf(&mut self, value: u32);
 }
 
-/// `I2S_CLKM_CONF_REG` value for `cfg`, keeping the bits above `I2S_CLKA_ENA` from `orig`.
+/// `I2S_CLKM_CONF_REG` value for `cfg`, keeping the bits above `I2S_CLKA_ENA`
+/// from `orig`.
 pub const fn encode_clkm_conf(orig: u32, cfg: &I2sClockCfg) -> u32 {
     let source = if cfg.use_apll { CLKM_CLKA_ENA } else { 0 };
-    (orig & !(CLKM_DIV_NUM_MASK
-        | (CLKM_FRAC_MASK << CLKM_DIV_B_SHIFT)
-        | (CLKM_FRAC_MASK << CLKM_DIV_A_SHIFT)
-        | CLKM_CLK_EN
-        | CLKM_CLKA_ENA))
+    (orig
+        & !(CLKM_DIV_NUM_MASK
+            | (CLKM_FRAC_MASK << CLKM_DIV_B_SHIFT)
+            | (CLKM_FRAC_MASK << CLKM_DIV_A_SHIFT)
+            | CLKM_CLK_EN
+            | CLKM_CLKA_ENA))
         | (cfg.clkm_div_num as u32 & CLKM_DIV_NUM_MASK)
         | ((cfg.clkm_div_b as u32 & CLKM_FRAC_MASK) << CLKM_DIV_B_SHIFT)
         | ((cfg.clkm_div_a as u32 & CLKM_FRAC_MASK) << CLKM_DIV_A_SHIFT)
@@ -63,13 +77,15 @@ pub const fn encode_clkm_conf(orig: u32, cfg: &I2sClockCfg) -> u32 {
         | source
 }
 
-/// `I2S_SAMPLE_RATE_CONF_REG` value with `I2S_TX_BCK_DIV_NUM = bck_div`, other fields from
+/// `I2S_SAMPLE_RATE_CONF_REG` value with `I2S_TX_BCK_DIV_NUM = bck_div`, other
+/// fields from
 /// `orig`.
 pub const fn encode_tx_bck_div(orig: u32, bck_div: u8) -> u32 {
     (orig & !TX_BCK_DIV_MASK) | (bck_div as u32 & TX_BCK_DIV_MASK)
 }
 
-/// Programs I2S0 for `rate_hz` (dividers and bit-clock divider) and returns the configuration
+/// Programs I2S0 for `rate_hz` (dividers and bit-clock divider) and returns the
+/// configuration
 /// used. Unsupported rates write nothing.
 pub fn program_i2s_clock<R: I2sClockRegisters>(
     regs: &mut R,
@@ -86,12 +102,17 @@ pub fn program_i2s_clock<R: I2sClockRegisters>(
 /// The device [`AudioBackend`], built for the duration of one coordinator tick.
 ///
 /// * `set_sample_rate`: [`program_i2s_clock`].
-/// * `set_hw_volume`: one TAS58xx digital volume code for both channels (the louder of the
+/// * `set_hw_volume`: one TAS58xx digital volume code for both channels (the
+///   louder of the
 ///   two, i.e. the smaller attenuation code), written only when it changes.
-/// * `set_mute`: no amplifier action (the I2S sink mute already silences the output; the
-///   pre-Task-9 firmware never touched the amplifier on pause), recorded for inspection.
-/// * `set_power(true)`: if the amplifier is not playing, clear faults and start it via Hi-Z
-///   (what the firmware did on `strm s`); `set_power(false)`: stop playback (DAC disabled).
+/// * `set_mute`: no amplifier action (the I2S sink mute already silences the
+///   output; the
+///   pre-Task-9 firmware never touched the amplifier on pause), recorded for
+///   inspection.
+/// * `set_power(true)`: if the amplifier is not playing, clear faults and start
+///   it via Hi-Z
+///   (what the firmware did on `strm s`); `set_power(false)`: stop playback
+///   (DAC disabled).
 /// * `dma_outstanding_frames`: the counter the I2S DMA driver keeps updated.
 pub struct Esp32AudioBackend<'a, I, R> {
     amp: &'a mut AmpManager<I>,
@@ -102,7 +123,12 @@ pub struct Esp32AudioBackend<'a, I, R> {
 
 impl<'a, I: I2c, R: I2sClockRegisters> Esp32AudioBackend<'a, I, R> {
     pub fn new(amp: &'a mut AmpManager<I>, regs: R, dma_outstanding: &'a AtomicU32) -> Self {
-        Self { amp, regs, dma_outstanding, muted: false }
+        Self {
+            amp,
+            regs,
+            dma_outstanding,
+            muted: false,
+        }
     }
 
     /// Last mute request (`set_mute`).
@@ -117,14 +143,16 @@ impl<I: I2c, R: I2sClockRegisters> AudioBackend for Esp32AudioBackend<'_, I, R> 
     }
 
     fn set_hw_volume(&mut self, left: u8, right: u8) {
-        // TAS58xx `DIG_VOL_CTRL`: a larger code attenuates more; one code drives both channels.
+        // TAS58xx `DIG_VOL_CTRL`: a larger code attenuates more; one code drives both
+        // channels.
         let code = left.min(right);
         if self.amp.current_volume() != code {
             let _ = self.amp.set_volume(code);
         }
     }
 
-    /// The TAS5805M digital volume does the attenuation (Rust enhancement, Task 7 ruling).
+    /// The TAS5805M digital volume does the attenuation (Rust enhancement, Task 7
+    /// ruling).
     fn has_hw_volume(&self) -> bool {
         true
     }
@@ -164,8 +192,13 @@ mod tests {
 
     impl FakeRegs {
         fn new() -> Self {
-            // Upper CLKM bits set to check they survive; RX BCK 6, bit modes 16 (reset values).
-            Self { clkm: 0xFFC0_0000 | CLKM_CLKA_ENA, rate_conf: (16 << 18) | (16 << 12) | (6 << 6) | 6, writes: 0 }
+            // Upper CLKM bits set to check they survive; RX BCK 6, bit modes 16 (reset
+            // values).
+            Self {
+                clkm: 0xFFC0_0000 | CLKM_CLKA_ENA,
+                rate_conf: (16 << 18) | (16 << 12) | (6 << 6) | 6,
+                writes: 0,
+            }
         }
     }
 
@@ -192,14 +225,42 @@ mod tests {
             let mut regs = FakeRegs::new();
             let cfg = program_i2s_clock(&mut regs, rate).unwrap();
             assert_eq!(cfg, i2s_clock_config(rate).unwrap());
-            assert_eq!(regs.clkm & 0xFF, u32::from(cfg.clkm_div_num), "{rate}: DIV_NUM [7:0]");
-            assert_eq!((regs.clkm >> 8) & 0x3F, u32::from(cfg.clkm_div_b), "{rate}: DIV_B [13:8]");
-            assert_eq!((regs.clkm >> 14) & 0x3F, u32::from(cfg.clkm_div_a), "{rate}: DIV_A [19:14]");
+            assert_eq!(
+                regs.clkm & 0xFF,
+                u32::from(cfg.clkm_div_num),
+                "{rate}: DIV_NUM [7:0]"
+            );
+            assert_eq!(
+                (regs.clkm >> 8) & 0x3F,
+                u32::from(cfg.clkm_div_b),
+                "{rate}: DIV_B [13:8]"
+            );
+            assert_eq!(
+                (regs.clkm >> 14) & 0x3F,
+                u32::from(cfg.clkm_div_a),
+                "{rate}: DIV_A [19:14]"
+            );
             assert_ne!(regs.clkm & (1 << 20), 0, "{rate}: CLK_EN");
-            assert_eq!(regs.clkm & (1 << 21), 0, "{rate}: PLL_D2 source (CLKA_ENA clear)");
-            assert_eq!(regs.clkm & 0xFFC0_0000, 0xFFC0_0000, "{rate}: upper bits kept");
-            assert_eq!(regs.rate_conf & 0x3F, u32::from(cfg.bck_div), "{rate}: TX_BCK_DIV_NUM [5:0]");
-            assert_eq!(regs.rate_conf >> 6, (16 << 12) | (16 << 6) | 6, "{rate}: other fields kept");
+            assert_eq!(
+                regs.clkm & (1 << 21),
+                0,
+                "{rate}: PLL_D2 source (CLKA_ENA clear)"
+            );
+            assert_eq!(
+                regs.clkm & 0xFFC0_0000,
+                0xFFC0_0000,
+                "{rate}: upper bits kept"
+            );
+            assert_eq!(
+                regs.rate_conf & 0x3F,
+                u32::from(cfg.bck_div),
+                "{rate}: TX_BCK_DIV_NUM [5:0]"
+            );
+            assert_eq!(
+                regs.rate_conf >> 6,
+                (16 << 12) | (16 << 6) | 6,
+                "{rate}: other fields kept"
+            );
             let expected_bck = if rate <= 48_000 { 4 } else { 2 };
             assert_eq!(cfg.bck_div, expected_bck, "{rate}");
         }
@@ -211,7 +272,11 @@ mod tests {
         program_i2s_clock(&mut regs, 44_100).unwrap();
         assert_eq!(regs.rate_conf & 0x3F, 4);
         program_i2s_clock(&mut regs, 88_200).unwrap();
-        assert_eq!(regs.rate_conf & 0x3F, 2, "88.2 kHz needs BCK/2 with the 44.1 kHz CLKM dividers");
+        assert_eq!(
+            regs.rate_conf & 0x3F,
+            2,
+            "88.2 kHz needs BCK/2 with the 44.1 kHz CLKM dividers"
+        );
         assert_eq!(regs.clkm & 0xFF, 14);
     }
 
@@ -220,14 +285,26 @@ mod tests {
         let mut regs = FakeRegs::new();
         let before = (regs.clkm, regs.rate_conf);
         for rate in [0, 7_999, 44_000, 64_000, 384_000] {
-            assert_eq!(program_i2s_clock(&mut regs, rate), Err(ClockError::UnsupportedRate(rate)));
+            assert_eq!(
+                program_i2s_clock(&mut regs, rate),
+                Err(ClockError::UnsupportedRate(rate))
+            );
         }
-        assert_eq!((regs.clkm, regs.rate_conf, regs.writes), (before.0, before.1, 0));
+        assert_eq!(
+            (regs.clkm, regs.rate_conf, regs.writes),
+            (before.0, before.1, 0)
+        );
     }
 
     #[test]
     fn test_encoders_match_the_legacy_clkm_layout() {
-        let cfg = I2sClockCfg { clkm_div_num: 6, clkm_div_a: 2, clkm_div_b: 1, bck_div: 2, use_apll: false };
+        let cfg = I2sClockCfg {
+            clkm_div_num: 6,
+            clkm_div_a: 2,
+            clkm_div_b: 1,
+            bck_div: 2,
+            use_apll: false,
+        };
         let v = encode_clkm_conf(0x1230_0000, &cfg);
         assert_eq!(v & 0xFF, 6);
         assert_eq!((v >> 8) & 0x3F, 1);
@@ -249,7 +326,10 @@ mod tests {
         {
             let mut b = Esp32AudioBackend::new(&mut amp, FakeRegs::new(), &dma);
             assert_eq!(b.set_sample_rate(96_000), Ok(()));
-            assert_eq!(b.set_sample_rate(12_345), Err(ClockError::UnsupportedRate(12_345)));
+            assert_eq!(
+                b.set_sample_rate(12_345),
+                Err(ClockError::UnsupportedRate(12_345))
+            );
             b.set_hw_volume(0x40, 0x39);
             b.set_power(true);
             b.set_mute(true);

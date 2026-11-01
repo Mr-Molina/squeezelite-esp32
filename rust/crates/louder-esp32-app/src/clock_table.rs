@@ -84,7 +84,8 @@ const fn pll(clkm_div_num: u8, clkm_div_b: u8, clkm_div_a: u8, bck_div: u8) -> I
     }
 }
 
-/// Sample rates with a divider entry. Pending hardware BCK measurement at Task 18.
+/// Sample rates with a divider entry. Pending hardware BCK measurement at Task
+/// 18.
 pub const VERIFIED_RATES: &[u32] = &[
     8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
     192_000,

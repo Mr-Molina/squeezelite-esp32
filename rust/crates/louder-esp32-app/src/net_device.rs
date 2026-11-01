@@ -1,16 +1,22 @@
 //! Device implementations of the I/O traits over smoltcp-style TCP sockets.
 //!
-//! [`SmoltcpSlimTransport`] ([`SlimTransport`]) and [`SmoltcpStreamSource`] ([`StreamSource`]) are
-//! written against [`TcpSocketOps`], the small non-blocking subset of `smoltcp::socket::tcp::Socket`
-//! they need. The firmware implements it for a real smoltcp socket in `tasks.rs` (smoltcp is a
-//! device-only dependency); host tests implement it with an in-memory socket shim and run the
+//! [`SmoltcpSlimTransport`] ([`SlimTransport`]) and [`SmoltcpStreamSource`]
+//! ([`StreamSource`]) are
+//! written against [`TcpSocketOps`], the small non-blocking subset of
+//! `smoltcp::socket::tcp::Socket`
+//! they need. The firmware implements it for a real smoltcp socket in
+//! `tasks.rs` (smoltcp is a
+//! device-only dependency); host tests implement it with an in-memory socket
+//! shim and run the
 //! shared conformance suite against the very code the device runs.
 //!
 //! Both adapters keep their persistent state in a separate value (`St`, any
-//! `BorrowMut<State>`): the firmware keeps the state in its static superloop state and wraps the
+//! `BorrowMut<State>`): the firmware keeps the state in its static superloop
+//! state and wraps the
 //! socket borrowed for one coordinator tick, tests own both.
 //!
-//! The HTTP parsing is shared with the host adapter through [`crate::stream_codec`].
+//! The HTTP parsing is shared with the host adapter through
+//! [`crate::stream_codec`].
 
 extern crate alloc;
 
@@ -24,8 +30,8 @@ use crate::io_traits::{
     MAX_RESPONSE_HEAD,
 };
 use crate::stream_codec::{
-    find_head_end, parse_ipv4_authority, request_host, ChunkedDecoder, IcyStripper,
-    RedirectPolicy, RedirectTarget, ResponseHead,
+    find_head_end, parse_ipv4_authority, request_host, ChunkedDecoder, IcyStripper, RedirectPolicy,
+    RedirectTarget, ResponseHead,
 };
 
 /// Connection state of a TCP socket, as the adapters need it.
@@ -37,15 +43,18 @@ pub enum TcpPhase {
     Connecting,
     /// Established; both directions open.
     Established,
-    /// The peer sent FIN: data already received can still be read, nothing more will arrive.
+    /// The peer sent FIN: data already received can still be read, nothing more
+    /// will arrive.
     PeerClosed,
 }
 
-/// Non-blocking TCP socket operations (the subset of `smoltcp::socket::tcp::Socket` used here).
+/// Non-blocking TCP socket operations (the subset of
+/// `smoltcp::socket::tcp::Socket` used here).
 pub trait TcpSocketOps {
     /// Current connection state.
     fn phase(&self) -> TcpPhase;
-    /// Starts connecting to `remote` from a fresh local endpoint. `false` if the attempt could
+    /// Starts connecting to `remote` from a fresh local endpoint. `false` if the
+    /// attempt could
     /// not be started at all (no local address, invalid endpoint, ...).
     fn connect(&mut self, remote: NetAddr) -> bool;
     /// Drops the connection immediately (RST); the socket is `Closed` afterwards.
@@ -87,8 +96,10 @@ fn discard<S: TcpSocketOps>(sock: &mut S, mut n: usize) -> usize {
 
 /// Total length (header included) of the server frame starting at `buf`.
 ///
-/// Server frames carry a 2-byte big-endian length (covering the opcode and payload) before a
-/// 4-letter opcode; the 8-byte form (opcode + 4-byte length) is accepted as well, as by the
+/// Server frames carry a 2-byte big-endian length (covering the opcode and
+/// payload) before a
+/// 4-letter opcode; the 8-byte form (opcode + 4-byte length) is accepted as
+/// well, as by the
 /// host client. [`ParseError::BufferTooShort`] means more bytes are needed.
 pub fn server_frame_len(buf: &[u8]) -> Result<usize, ParseError> {
     if buf.len() < 6 {
@@ -115,7 +126,8 @@ pub fn server_frame_len(buf: &[u8]) -> Result<usize, ParseError> {
     }
 }
 
-/// Persistent state of a [`SmoltcpSlimTransport`]: bytes of a dropped frame still to skip.
+/// Persistent state of a [`SmoltcpSlimTransport`]: bytes of a dropped frame
+/// still to skip.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SlimLinkState {
     discard: usize,
@@ -134,11 +146,16 @@ impl SlimLinkState {
 
 /// [`SlimTransport`] over the LMS control socket.
 ///
-/// Frames are cut directly out of the socket's receive buffer (`peek` the header, `recv` the
-/// frame once it is complete), so no accumulation buffer is needed. A frame larger than the
-/// caller's buffer or the socket's receive buffer is skipped and reported once as
-/// [`TransportError::Io`]; an unparsable header skips one byte (resynchronisation) and is also
-/// `Io`. `send` writes whole frames only: [`TransportError::WouldBlock`] when the transmit
+/// Frames are cut directly out of the socket's receive buffer (`peek` the
+/// header, `recv` the
+/// frame once it is complete), so no accumulation buffer is needed. A frame
+/// larger than the
+/// caller's buffer or the socket's receive buffer is skipped and reported once
+/// as
+/// [`TransportError::Io`]; an unparsable header skips one byte
+/// (resynchronisation) and is also
+/// `Io`. `send` writes whole frames only: [`TransportError::WouldBlock`] when
+/// the transmit
 /// buffer cannot take the frame right now, `Io` when it never could.
 pub struct SmoltcpSlimTransport<S, St = SlimLinkState> {
     sock: S,
@@ -158,7 +175,8 @@ impl<S: TcpSocketOps, St: BorrowMut<SlimLinkState>> SmoltcpSlimTransport<S, St> 
         &mut self.sock
     }
 
-    /// Nothing complete to deliver: `Ok(None)` while the link is up, `Disconnected` once it is
+    /// Nothing complete to deliver: `Ok(None)` while the link is up, `Disconnected`
+    /// once it is
     /// gone (frames already received were delivered first).
     fn nothing_now(&mut self) -> Result<Option<usize>, TransportError> {
         match self.sock.phase() {
@@ -256,10 +274,13 @@ enum StreamPhase {
     Done,
 }
 
-/// Persistent state of a [`SmoltcpStreamSource`] (request, response head, body framing).
+/// Persistent state of a [`SmoltcpStreamSource`] (request, response head, body
+/// framing).
 ///
-/// Buffers are heap `Vec`s sized by what actually arrives (typically a few hundred bytes), so
-/// the firmware does not reserve [`MAX_RESPONSE_HEAD`] / ICY-sized static buffers for them.
+/// Buffers are heap `Vec`s sized by what actually arrives (typically a few
+/// hundred bytes), so
+/// the firmware does not reserve [`MAX_RESPONSE_HEAD`] / ICY-sized static
+/// buffers for them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpStreamState {
     phase: StreamPhase,
@@ -290,7 +311,10 @@ impl HttpStreamState {
     pub const fn new() -> Self {
         Self {
             phase: StreamPhase::Idle,
-            addr: NetAddr { ip: [0; 4], port: 0 },
+            addr: NetAddr {
+                ip: [0; 4],
+                port: 0,
+            },
             host: Vec::new(),
             template: Vec::new(),
             request: Vec::new(),
@@ -325,14 +349,20 @@ enum HeadRead {
     TooLarge,
 }
 
-/// [`StreamSource`] over the audio TCP socket: non-blocking `connect` (TCP handshake, request,
-/// response head, redirects, each resumed by repeating the call while it returns
-/// [`StreamError::WouldBlock`]), chunked decoding, ICY stripping and early-drop detection.
+/// [`StreamSource`] over the audio TCP socket: non-blocking `connect` (TCP
+/// handshake, request,
+/// response head, redirects, each resumed by repeating the call while it
+/// returns
+/// [`StreamError::WouldBlock`]), chunked decoding, ICY stripping and early-drop
+/// detection.
 ///
-/// End of body: chunked framing complete, `Content-Length` reached, or (close-delimited) the
+/// End of body: chunked framing complete, `Content-Length` reached, or
+/// (close-delimited) the
 /// peer's FIN. A FIN before the framing completed, or a reset at any point, is
-/// [`StreamError::Disconnected`] after every byte received so far was delivered. Redirect
-/// `Location`s must be same-origin or carry an IPv4 literal (no resolver on the device; a host
+/// [`StreamError::Disconnected`] after every byte received so far was
+/// delivered. Redirect
+/// `Location`s must be same-origin or carry an IPv4 literal (no resolver on the
+/// device; a host
 /// name is [`StreamError::ConnectFailed`]).
 pub struct SmoltcpStreamSource<S, St = HttpStreamState> {
     sock: S,
@@ -385,7 +415,8 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> SmoltcpStreamSource<S, St>
         }
     }
 
-    /// Acts on a complete head: `Ok(true)` = body ready, `Ok(false)` = redirect hop started.
+    /// Acts on a complete head: `Ok(true)` = body ready, `Ok(false)` = redirect hop
+    /// started.
     fn accept_head(&mut self) -> Result<bool, StreamError> {
         let st = self.state.borrow_mut();
         let head = ResponseHead(&st.head);
@@ -419,7 +450,11 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> SmoltcpStreamSource<S, St>
         }
         st.chunked = head.is_chunked();
         st.chunk.reset();
-        st.remaining = if st.chunked { None } else { head.content_length() };
+        st.remaining = if st.chunked {
+            None
+        } else {
+            head.content_length()
+        };
         if let Some(interval) = head.icy_metaint() {
             st.icy.set_metaint(interval);
         }
@@ -557,7 +592,11 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> StreamSource for SmoltcpSt
                 }
             }
             let audio = st.icy.strip_in_place(&mut out[..audio]);
-            let ended = if st.chunked { st.chunk.is_done() } else { st.remaining == Some(0) };
+            let ended = if st.chunked {
+                st.chunk.is_done()
+            } else {
+                st.remaining == Some(0)
+            };
             if ended {
                 // Complete: release the connection (it is never reused).
                 st.phase = StreamPhase::Done;
@@ -648,22 +687,32 @@ fn write_authority(out: &mut Vec<u8>, addr: NetAddr) {
     decimal(out, u32::from(addr.port));
 }
 
-/// Reconnect policy of the LMS control connection: C `slimproto()`'s connect loop
-/// (`slimproto.c:1094-1213`, MK5 backoff), driven by the device's connection upkeep.
+/// Reconnect policy of the LMS control connection: C `slimproto()`'s connect
+/// loop
+/// (`slimproto.c:1094-1213`, MK5 backoff), driven by the device's connection
+/// upkeep.
 ///
 /// * A session (connected, `HELO` sent) that drops waits
-///   [`squeezelite_proto::next_backoff_ms`]: 1, 2, 4, 8, 16, then 30 s plus up to 999 ms of
+///   [`squeezelite_proto::next_backoff_ms`]: 1, 2, 4, 8, 16, then 30 s plus up
+///   to 999 ms of
 ///   jitter, with the doubling reset after a session that lasted over 30 s
 ///   (`slimproto.c:1187-1203`). Every later `HELO` carries the reconnect flag
 ///   (`slimproto.c:1187-1189`).
-/// * A connect that fails waits 5 s (`slimproto.c:1133-1134`), except after a `serv` switch,
-///   where it falls back to the previous server at once (`slimproto.c:1129-1131`).
-/// * A `serv` ends the session like a drop: C's `slimproto_run` loop exits on `new_server`
-///   (`slimproto.c:708`) and the post-session code still runs (reconnect flag, long-session
-///   reset, backoff delay with jitter, `slimproto.c:1187-1210`). Only then does the loop top
-///   switch servers, clearing the reconnect flag and the backoff (`slimproto.c:1096-1103`).
+/// * A connect that fails waits 5 s (`slimproto.c:1133-1134`), except after a
+///   `serv` switch,
+///   where it falls back to the previous server at once
+///   (`slimproto.c:1129-1131`).
+/// * A `serv` ends the session like a drop: C's `slimproto_run` loop exits on
+///   `new_server`
+///   (`slimproto.c:708`) and the post-session code still runs (reconnect flag,
+///   long-session
+///   reset, backoff delay with jitter, `slimproto.c:1187-1210`). Only then does
+///   the loop top
+///   switch servers, clearing the reconnect flag and the backoff
+///   (`slimproto.c:1096-1103`).
 ///
-/// Not ported: C rediscovers the server after `MAX_SERVER_RETRIES` failed connects
+/// Not ported: C rediscovers the server after `MAX_SERVER_RETRIES` failed
+/// connects
 /// (`slimproto.c:1137-1147`); this firmware has no discovery until Phase 3.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SlimReconnect {
@@ -713,7 +762,8 @@ impl SlimReconnect {
         self.reconnect
     }
 
-    /// The connection is gone (closed, reset, refused or timed out). Returns the server to
+    /// The connection is gone (closed, reset, refused or timed out). Returns the
+    /// server to
     /// fall back to when the connect to a `serv` target failed.
     pub fn link_down(&mut self, now_ms: u64, seed: u32) -> Option<[u8; 4]> {
         if self.end_session(now_ms, seed) {
@@ -735,9 +785,12 @@ impl SlimReconnect {
         }
     }
 
-    /// C's post-session code (`slimproto.c:1187-1210`) for a session that was up: reconnect
-    /// flag set (`:1187-1189`), backoff reset after a session over 30 s (`:1191-1193`), then
-    /// the `reconnect_delay` s + jitter wait and the doubling (`:1196-1203`). Returns `false`
+    /// C's post-session code (`slimproto.c:1187-1210`) for a session that was up:
+    /// reconnect
+    /// flag set (`:1187-1189`), backoff reset after a session over 30 s
+    /// (`:1191-1193`), then
+    /// the `reconnect_delay` s + jitter wait and the doubling (`:1196-1203`).
+    /// Returns `false`
     /// when no session was up.
     fn end_session(&mut self, now_ms: u64, seed: u32) -> bool {
         let Some(start) = self.session_start_ms.take() else {
@@ -754,10 +807,14 @@ impl SlimReconnect {
         true
     }
 
-    /// `serv`: leave the session to `current_ip`. C parity: the session ends like a drop and
-    /// waits the same post-session delay (`slimproto.c:708`, `1187-1210`); the server switch
-    /// at the loop top then clears the reconnect flag and the backoff (`slimproto.c:1096-1103`)
-    /// and remembers `current_ip` to fall back to (`slimproto.c:1097`, `1129-1131`).
+    /// `serv`: leave the session to `current_ip`. C parity: the session ends like a
+    /// drop and
+    /// waits the same post-session delay (`slimproto.c:708`, `1187-1210`); the
+    /// server switch
+    /// at the loop top then clears the reconnect flag and the backoff
+    /// (`slimproto.c:1096-1103`)
+    /// and remembers `current_ip` to fall back to (`slimproto.c:1097`,
+    /// `1129-1131`).
     pub fn server_switch(&mut self, now_ms: u64, current_ip: [u8; 4], seed: u32) {
         self.end_session(now_ms, seed);
         self.attempt = 0;
@@ -810,7 +867,8 @@ mod reconnect_tests {
         assert_eq!(r.link_down(6_000, 0), None);
         assert!(r.may_connect(6_000));
 
-        // A connect to a serv target that fails falls back to the previous server at once.
+        // A connect to a serv target that fails falls back to the previous server at
+        // once.
         r.connect_started();
         r.session_up(7_000);
         r.server_switch(8_000, [10, 0, 0, 1], 0);
@@ -822,9 +880,12 @@ mod reconnect_tests {
 
     #[test]
     fn test_serv_switch_waits_the_post_session_backoff() {
-        // C parity: serv makes slimproto_run exit (slimproto.c:708), the post-session code
-        // waits reconnect_delay s + rand()%1000 ms (slimproto.c:1196-1210), and only then the
-        // loop top switches server, clearing reconnect and the backoff (slimproto.c:1096-1103).
+        // C parity: serv makes slimproto_run exit (slimproto.c:708), the post-session
+        // code
+        // waits reconnect_delay s + rand()%1000 ms (slimproto.c:1196-1210), and only
+        // then the
+        // loop top switches server, clearing reconnect and the backoff
+        // (slimproto.c:1096-1103).
         let mut r = SlimReconnect::new();
         // Two short sessions dropped: the backoff is at 4 s.
         for t in [0u64, 10_000] {
@@ -835,16 +896,23 @@ mod reconnect_tests {
         r.connect_started();
         r.session_up(40_000);
         r.server_switch(41_000, [10, 0, 0, 9], 123);
-        assert!(!r.may_connect(41_000 + 4_122), "4 s + 123 ms jitter, as C's state dictates");
+        assert!(
+            !r.may_connect(41_000 + 4_122),
+            "4 s + 123 ms jitter, as C's state dictates"
+        );
         assert!(r.may_connect(41_000 + 4_123));
-        assert!(!r.reconnect_flag(), "HELO to the new server is not a reconnect");
+        assert!(
+            !r.reconnect_flag(),
+            "HELO to the new server is not a reconnect"
+        );
         // The backoff starts over for the new server.
         r.connect_started();
         r.session_up(50_000);
         r.link_down(51_000, 0);
         assert!(r.may_connect(52_000) && !r.may_connect(51_999));
 
-        // A session over 30 s resets the delay before the switch (slimproto.c:1191-1193).
+        // A session over 30 s resets the delay before the switch
+        // (slimproto.c:1191-1193).
         let mut r = SlimReconnect::new();
         for t in [0u64, 10_000, 20_000] {
             r.connect_started();

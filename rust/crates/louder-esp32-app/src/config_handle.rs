@@ -1,31 +1,47 @@
-//! Runtime configuration: the in-RAM [`AudioConfig`] behind a lock, debounced persistence, the
+//! Runtime configuration: the in-RAM [`AudioConfig`] behind a lock, debounced
+//! persistence, the
 //! RAM journal image, and boot-time resolution (spec §3.4–3.5, Task 10).
 //!
-//! Platform-free by design: no platform or cargo-feature gating here (that lives in
+//! Platform-free by design: no platform or cargo-feature gating here (that
+//! lives in
 //! `main.rs`/`tasks.rs`), so every rule is exercised by host tests.
 //!
 //! # Pieces
 //!
-//! - [`ConfigHandle`]: the in-RAM [`AudioConfig`] + dirty flag, behind an embassy-sync blocking
-//!   mutex. The coordinator (`setd` name), the HTTP server, the CYD bridge and the LMS volume path
+//! - [`ConfigHandle`]: the in-RAM [`AudioConfig`] + dirty flag, behind an
+//!   embassy-sync blocking
+//!   mutex. The coordinator (`setd` name), the HTTP server, the CYD bridge and
+//!   the LMS volume path
 //!   change it through [`ConfigHandle::update`].
-//! - [`ConfigWriter`]: the debounce state machine of the `config_writer` task: a change is
+//! - [`ConfigWriter`]: the debounce state machine of the `config_writer` task:
+//!   a change is
 //!   journaled once no further change has arrived for [`DEBOUNCE_MS`].
-//! - [`RamJournal`]: the serialized journal image (a DRAM sector buffer) plus the flash
-//!   bookkeeping (target sector per [`FlashTargetPolicy`], sequence) carried in RAM from the
-//!   boot-time load, so a later flash write never has to read flash to find where to go.
-//! - [`resolve_boot_audio`] / [`resolve_boot_wifi`]: the per-field boot resolution order
-//!   (audio/identity: FlashJournal, then first-boot defaults; Wi-Fi in Phase 0/1: the C
+//! - [`RamJournal`]: the serialized journal image (a DRAM sector buffer) plus
+//!   the flash
+//!   bookkeeping (target sector per [`FlashTargetPolicy`], sequence) carried in
+//!   RAM from the
+//!   boot-time load, so a later flash write never has to read flash to find
+//!   where to go.
+//! - [`resolve_boot_audio`] / [`resolve_boot_wifi`]: the per-field boot
+//!   resolution order
+//!   (audio/identity: FlashJournal, then first-boot defaults; Wi-Fi in Phase
+//!   0/1: the C
 //!   firmware's NVS, then the first-boot default).
 //!
 //! # Why a snapshot can never be torn
 //!
-//! The whole [`AudioConfig`] lives inside ONE mutex. [`ConfigHandle::update`] runs its closure on
-//! a copy and publishes the result while holding the lock; [`ConfigHandle::snapshot_if_dirty`]
-//! clones the whole struct while holding the same lock. A snapshot is therefore always the state
-//! before or after an update, never a mix. Every published change bumps a generation counter;
-//! a snapshot remembers the generation it saw and [`ConfigHandle::mark_clean`] only clears the
-//! dirty flag if no update was published since, so a change racing a commit is never lost.
+//! The whole [`AudioConfig`] lives inside ONE mutex. [`ConfigHandle::update`]
+//! runs its closure on
+//! a copy and publishes the result while holding the lock;
+//! [`ConfigHandle::snapshot_if_dirty`]
+//! clones the whole struct while holding the same lock. A snapshot is therefore
+//! always the state
+//! before or after an update, never a mix. Every published change bumps a
+//! generation counter;
+//! a snapshot remembers the generation it saw and [`ConfigHandle::mark_clean`]
+//! only clears the
+//! dirty flag if no update was published since, so a change racing a commit is
+//! never lost.
 
 use core::cell::RefCell;
 
@@ -35,13 +51,15 @@ use squeezelite_config::{AudioConfig, KeyValueStorage, SectorWriter};
 
 use crate::ota_safety::WifiStaCredentials;
 
-/// Quiet time after the last change before the `config_writer` journals it (spec §3.5).
+/// Quiet time after the last change before the `config_writer` journals it
+/// (spec §3.5).
 pub const DEBOUNCE_MS: u32 = 2000;
 
 /// Size of one settings journal sector (one flash erase unit).
 pub const JOURNAL_SECTOR_SIZE: usize = 4096;
 
-/// Something that durably records a configuration snapshot (device: [`RamJournal`]).
+/// Something that durably records a configuration snapshot (device:
+/// [`RamJournal`]).
 pub trait ConfigJournal {
     /// Records `cfg`; `false` if it was not recorded (the snapshot stays dirty).
     fn commit(&mut self, cfg: &AudioConfig) -> bool;
@@ -56,7 +74,8 @@ struct HandleState {
     snapshot_generation: u32,
 }
 
-/// The runtime configuration: an [`AudioConfig`] plus a dirty flag behind one mutex.
+/// The runtime configuration: an [`AudioConfig`] plus a dirty flag behind one
+/// mutex.
 pub struct ConfigHandle {
     state: Mutex<CriticalSectionRawMutex, RefCell<HandleState>>,
 }
@@ -74,8 +93,10 @@ impl ConfigHandle {
         }
     }
 
-    /// Applies `f` to the configuration. The result is published only if it is valid
-    /// ([`AudioConfig::validate`]) and differs from the current state; then the handle becomes
+    /// Applies `f` to the configuration. The result is published only if it is
+    /// valid
+    /// ([`AudioConfig::validate`]) and differs from the current state; then the
+    /// handle becomes
     /// dirty. Returns whether a change was published.
     pub fn update(&self, f: impl FnOnce(&mut AudioConfig)) -> bool {
         self.state.lock(|state| {
@@ -92,7 +113,8 @@ impl ConfigHandle {
         })
     }
 
-    /// A copy of the whole configuration if it changed since the last [`Self::mark_clean`].
+    /// A copy of the whole configuration if it changed since the last
+    /// [`Self::mark_clean`].
     pub fn snapshot_if_dirty(&self) -> Option<AudioConfig> {
         self.state.lock(|state| {
             let mut state = state.borrow_mut();
@@ -104,7 +126,8 @@ impl ConfigHandle {
         })
     }
 
-    /// Marks the last [`Self::snapshot_if_dirty`] as durably recorded. A change published after
+    /// Marks the last [`Self::snapshot_if_dirty`] as durably recorded. A change
+    /// published after
     /// that snapshot keeps the handle dirty.
     pub fn mark_clean(&self) {
         self.state.lock(|state| {
@@ -115,11 +138,14 @@ impl ConfigHandle {
         })
     }
 
-    /// Journals any pending change now (called before every reboot action): snapshot, commit,
+    /// Journals any pending change now (called before every reboot action):
+    /// snapshot, commit,
     /// mark clean. Returns whether a snapshot was committed.
     pub fn flush_now<J: ConfigJournal>(&self, journal: &mut J) -> bool {
-        // The commit runs OUTSIDE the lock: it may be slow (serialization; on the device with
-        // `runtime-flash-persist`, a flash write follows), and `update` must never wait on it.
+        // The commit runs OUTSIDE the lock: it may be slow (serialization; on the
+        // device with
+        // `runtime-flash-persist`, a flash write follows), and `update` must never wait
+        // on it.
         let Some(snapshot) = self.snapshot_if_dirty() else {
             return false;
         };
@@ -163,17 +189,25 @@ impl ConfigWriter {
         }
     }
 
-    /// One `config_writer` step at `now_ms`: notes a new change, and once the handle has been
-    /// dirty and quiet for [`DEBOUNCE_MS`], journals the snapshot ([`ConfigHandle::flush_now`]).
+    /// One `config_writer` step at `now_ms`: notes a new change, and once the
+    /// handle has been
+    /// dirty and quiet for [`DEBOUNCE_MS`], journals the snapshot
+    /// ([`ConfigHandle::flush_now`]).
     /// Returns whether it committed.
-    pub fn poll<J: ConfigJournal>(&mut self, handle: &ConfigHandle, journal: &mut J, now_ms: u64) -> bool {
+    pub fn poll<J: ConfigJournal>(
+        &mut self,
+        handle: &ConfigHandle,
+        journal: &mut J,
+        now_ms: u64,
+    ) -> bool {
         let generation = handle.generation();
         if generation != self.seen_generation {
             // A new change restarts the quiet period.
             self.seen_generation = generation;
             self.last_change_ms = now_ms;
         }
-        if !handle.is_dirty() || now_ms.saturating_sub(self.last_change_ms) < u64::from(DEBOUNCE_MS) {
+        if !handle.is_dirty() || now_ms.saturating_sub(self.last_change_ms) < u64::from(DEBOUNCE_MS)
+        {
             return false;
         }
         let committed = handle.flush_now(journal);
@@ -185,7 +219,8 @@ impl ConfigWriter {
     }
 }
 
-/// A word-aligned journal sector buffer (flash writes go straight from it, no bounce copy).
+/// A word-aligned journal sector buffer (flash writes go straight from it, no
+/// bounce copy).
 #[repr(C, align(4))]
 pub struct JournalSector(pub [u8; JOURNAL_SECTOR_SIZE]);
 
@@ -222,7 +257,8 @@ impl JournalSlot {
         }
     }
 
-    /// `0` → [`Self::A`], anything else → [`Self::B`] (`FlashJournal::select_dual_sector` index).
+    /// `0` → [`Self::A`], anything else → [`Self::B`]
+    /// (`FlashJournal::select_dual_sector` index).
     pub const fn from_index(index: usize) -> Self {
         if index == 0 {
             Self::A
@@ -245,27 +281,38 @@ pub struct PendingImage<'a> {
     pub sequence: u32,
 }
 
-/// Which journal sector a flash write targets. Chosen by the firmware build (the cfg lives in
+/// Which journal sector a flash write targets. Chosen by the firmware build
+/// (the cfg lives in
 /// `main.rs`) and passed in at runtime, so this module stays platform-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashTargetPolicy {
-    /// Always sector A (0x3FE000): byte-identical to the certified pre-reboot write. The default
-    /// build: 0x3FF000 is page 15 of the C firmware's live `settings` NVS partition, which the
-    /// certified build never touched (a failed C NVS init erases the whole partition,
+    /// Always sector A (0x3FE000): byte-identical to the certified pre-reboot
+    /// write. The default
+    /// build: 0x3FF000 is page 15 of the C firmware's live `settings` NVS
+    /// partition, which the
+    /// certified build never touched (a failed C NVS init erases the whole
+    /// partition,
     /// `components/platform_config/nvs_utilities.c:97-100`).
     FixedA,
-    /// Dual-sector ping-pong (`runtime-flash-persist` builds only): the target is never the
-    /// sector holding the newest valid journal, so power loss mid-write keeps the previous one.
+    /// Dual-sector ping-pong (`runtime-flash-persist` builds only): the target is
+    /// never the
+    /// sector holding the newest valid journal, so power loss mid-write keeps the
+    /// previous one.
     PingPong,
 }
 
 /// The serialized settings journal kept in RAM, plus the flash bookkeeping.
 ///
-/// Built from the boot-time flash load ([`Self::new`]): the sector holding the newest valid
-/// journal (boot reads and validates BOTH sectors) and its sequence. Every commit serializes the
-/// audio/identity configuration into the RAM image with the next sequence number; the flash
-/// target follows the [`FlashTargetPolicy`]. Journal `wifi.*` keys are never written (Phase 0/1:
-/// Wi-Fi provisioning belongs to the C recovery firmware), so a commit drops any the boot
+/// Built from the boot-time flash load ([`Self::new`]): the sector holding the
+/// newest valid
+/// journal (boot reads and validates BOTH sectors) and its sequence. Every
+/// commit serializes the
+/// audio/identity configuration into the RAM image with the next sequence
+/// number; the flash
+/// target follows the [`FlashTargetPolicy`]. Journal `wifi.*` keys are never
+/// written (Phase 0/1:
+/// Wi-Fi provisioning belongs to the C recovery firmware), so a commit drops
+/// any the boot
 /// journal held. Flash is never read after boot.
 pub struct RamJournal<'a> {
     image: &'a mut JournalSector,
@@ -277,9 +324,14 @@ pub struct RamJournal<'a> {
 }
 
 impl<'a> RamJournal<'a> {
-    /// `boot`: the sector holding the newest valid journal and its sequence (`None` when flash
+    /// `boot`: the sector holding the newest valid journal and its sequence (`None`
+    /// when flash
     /// held none). `policy`: where flash writes go.
-    pub fn new(image: &'a mut JournalSector, boot: Option<(JournalSlot, u32)>, policy: FlashTargetPolicy) -> Self {
+    pub fn new(
+        image: &'a mut JournalSector,
+        boot: Option<(JournalSlot, u32)>,
+        policy: FlashTargetPolicy,
+    ) -> Self {
         let sequence = boot.map_or(0, |(_, sequence)| sequence);
         let target = match (policy, boot) {
             (FlashTargetPolicy::FixedA, _) | (FlashTargetPolicy::PingPong, None) => JournalSlot::A,
@@ -295,7 +347,8 @@ impl<'a> RamJournal<'a> {
         }
     }
 
-    /// Sequence of the newest journal (RAM image, or the boot journal before any commit).
+    /// Sequence of the newest journal (RAM image, or the boot journal before any
+    /// commit).
     pub fn sequence(&self) -> u32 {
         self.sequence
     }
@@ -315,8 +368,10 @@ impl<'a> RamJournal<'a> {
         })
     }
 
-    /// Records that [`Self::pending_image`] reached flash: that sector now holds the newest
-    /// journal. With [`FlashTargetPolicy::PingPong`] the next write targets the other one.
+    /// Records that [`Self::pending_image`] reached flash: that sector now holds
+    /// the newest
+    /// journal. With [`FlashTargetPolicy::PingPong`] the next write targets the
+    /// other one.
     pub fn mark_flash_written(&mut self) {
         if self.flash_pending {
             self.flash_pending = false;
@@ -360,9 +415,13 @@ pub enum ConfigSource {
     Default,
 }
 
-/// Boot resolution of the audio/identity fields, each one independently: the journal's value
+/// Boot resolution of the audio/identity fields, each one independently: the
+/// journal's value
 /// when the journal holds a valid one, else `defaults`'.
-pub fn resolve_boot_audio<S: KeyValueStorage>(journal: Option<&S>, defaults: &AudioConfig) -> AudioConfig {
+pub fn resolve_boot_audio<S: KeyValueStorage>(
+    journal: Option<&S>,
+    defaults: &AudioConfig,
+) -> AudioConfig {
     let mut cfg = defaults.clone();
     let Some(j) = journal else {
         return cfg;
@@ -371,7 +430,10 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(journal: Option<&S>, defaults: &Au
         cfg.set_player_name(name.as_str());
     }
     let mut ip = [0u8; 4];
-    if j.get(AudioConfig::KEY_LMS_IP, &mut ip) == Ok(4) && ip != [0, 0, 0, 0] && ip != [255, 255, 255, 255] {
+    if j.get(AudioConfig::KEY_LMS_IP, &mut ip) == Ok(4)
+        && ip != [0, 0, 0, 0]
+        && ip != [255, 255, 255, 255]
+    {
         cfg.lms_server_ip = Some(ip);
     }
     if let Ok(Some(port)) = j.get_u32(AudioConfig::KEY_LMS_PORT) {
@@ -385,7 +447,8 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(journal: Option<&S>, defaults: &Au
     if let Ok(Some(eq)) = j.get_u8(AudioConfig::KEY_EQ) {
         cfg.equalizer_preset = eq;
     }
-    // Analog gain: u32 since the AGAIN key was widened; legacy journals hold one byte.
+    // Analog gain: u32 since the AGAIN key was widened; legacy journals hold one
+    // byte.
     let again = match j.get_u32(AudioConfig::KEY_AGAIN) {
         Ok(Some(v)) => u8::try_from(v).ok(),
         Ok(None) => None,
@@ -400,9 +463,12 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(journal: Option<&S>, defaults: &Au
     cfg
 }
 
-/// Boot resolution of the Wi-Fi station credentials: the C firmware's NVS ones, else the
-/// first-boot default (`default` is only called when NVS has none). Journal `wifi.*` keys are
-/// deliberately not an input: no Rust path can write or clear them in Phase 0/1, so a stale
+/// Boot resolution of the Wi-Fi station credentials: the C firmware's NVS ones,
+/// else the
+/// first-boot default (`default` is only called when NVS has none). Journal
+/// `wifi.*` keys are
+/// deliberately not an input: no Rust path can write or clear them in Phase
+/// 0/1, so a stale
 /// journal would shadow freshly re-provisioned NVS credentials forever.
 pub fn resolve_boot_wifi(
     nvs: impl FnOnce() -> Option<WifiStaCredentials>,
@@ -415,8 +481,10 @@ pub fn resolve_boot_wifi(
     default().map(|creds| (creds, ConfigSource::Default))
 }
 
-/// Serializes `cfg` (audio/identity keys only, never `wifi.*`) as a complete journal image into
-/// `sector` with `sequence`; returns the image length. `cfg` is validated first, so on `Err`
+/// Serializes `cfg` (audio/identity keys only, never `wifi.*`) as a complete
+/// journal image into
+/// `sector` with `sequence`; returns the image length. `cfg` is validated
+/// first, so on `Err`
 /// `sector` is untouched.
 fn serialize_image(
     sector: &mut [u8; JOURNAL_SECTOR_SIZE],
@@ -468,7 +536,10 @@ mod tests {
     fn test_refused_commit_stays_dirty_and_retries_after_a_quiet_period() {
         let handle = ConfigHandle::new(AudioConfig::default());
         let mut writer = ConfigWriter::new(&handle, 0);
-        let mut journal = FlakyJournal { refuse: 1, commits: 0 };
+        let mut journal = FlakyJournal {
+            refuse: 1,
+            commits: 0,
+        };
         assert!(handle.update(|c| c.volume = 5));
         assert!(!writer.poll(&handle, &mut journal, 0));
         assert!(!writer.poll(&handle, &mut journal, 1_999));
@@ -485,7 +556,10 @@ mod tests {
     #[test]
     fn test_flush_now_commits_immediately_and_only_when_dirty() {
         let handle = ConfigHandle::new(AudioConfig::default());
-        let mut journal = FlakyJournal { refuse: 0, commits: 0 };
+        let mut journal = FlakyJournal {
+            refuse: 0,
+            commits: 0,
+        };
         assert!(!handle.flush_now(&mut journal));
         assert!(handle.update(|c| c.equalizer_preset = 2));
         assert!(handle.flush_now(&mut journal)); // no debounce on the reboot path
@@ -497,7 +571,11 @@ mod tests {
     #[test]
     fn test_ram_journal_refused_commit_keeps_pending_image() {
         let mut image = JournalSector::erased();
-        let mut ram = RamJournal::new(&mut image, Some((JournalSlot::B, 9)), FlashTargetPolicy::PingPong);
+        let mut ram = RamJournal::new(
+            &mut image,
+            Some((JournalSlot::B, 9)),
+            FlashTargetPolicy::PingPong,
+        );
         assert_eq!(ram.target(), JournalSlot::A);
         assert!(ram.commit(&AudioConfig::default()));
         let mut bad = AudioConfig::default();
@@ -510,9 +588,14 @@ mod tests {
         ram.mark_flash_written(); // idempotent without a pending image
         assert_eq!(ram.target(), JournalSlot::B);
 
-        // FixedA never leaves sector A, whatever the boot journal and however many writes.
+        // FixedA never leaves sector A, whatever the boot journal and however many
+        // writes.
         let mut image = JournalSector::erased();
-        let mut ram = RamJournal::new(&mut image, Some((JournalSlot::B, 9)), FlashTargetPolicy::FixedA);
+        let mut ram = RamJournal::new(
+            &mut image,
+            Some((JournalSlot::B, 9)),
+            FlashTargetPolicy::FixedA,
+        );
         for seq in 10..13 {
             assert!(ram.commit(&AudioConfig::default()));
             let p = ram.pending_image().unwrap();

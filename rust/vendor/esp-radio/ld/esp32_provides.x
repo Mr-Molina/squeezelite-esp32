@@ -14,7 +14,6 @@ EXTERN( __esp_radio_misc_nvs_restore );
 EXTERN( __ESP_RADIO_G_LOG_LEVEL );
 EXTERN( __ESP_RADIO_G_MISC_NVS );
 EXTERN( __esp_radio_putchar );
-EXTERN( __esp_radio_putchar );
 EXTERN( __esp_radio_fwrite );
 EXTERN( __esp_radio_fopen );
 EXTERN( __esp_radio_fgets );
@@ -25,8 +24,6 @@ EXTERN( __esp_radio_esp_timer_get_time );
 EXTERN( __esp_radio_esp_event_post );
 EXTERN( __esp_radio_vTaskDelay );
 EXTERN( __esp_radio_puts );
-EXTERN( __esp_radio_sleep );
-EXTERN( __esp_radio_usleep );
 
 PROVIDE( strdup = __esp_radio_strdup );
 PROVIDE( g_wifi_osi_funcs = __ESP_RADIO_G_WIFI_OSI_FUNCS );
@@ -52,8 +49,6 @@ PROVIDE( esp_timer_get_time = __esp_radio_esp_timer_get_time );
 PROVIDE( esp_event_post = __esp_radio_esp_event_post );
 PROVIDE( vTaskDelay = __esp_radio_vTaskDelay );
 PROVIDE( puts = __esp_radio_puts );
-PROVIDE( sleep = __esp_radio_sleep );
-PROVIDE( usleep = __esp_radio_usleep );
 
 /* ESP32 BT controller ROM callbacks for inquiry scan, page, and page scan */
 PROVIDE( ld_iscan_evt_start_cbk = 0x4003b58c );

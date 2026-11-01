@@ -45,7 +45,7 @@ pub const DIRTY_VOLUME: u8 = 1 << 4;
 pub const DIRTY_ALL: u8 =
     DIRTY_STATUS | DIRTY_TRACK | DIRTY_PROGRESS | DIRTY_TRANSPORT | DIRTY_VOLUME;
 
-/// Standard 8x8 printable ASCII bitmap font (`0x20` `' '` through `0x7E` `'~'`).
+/// Standard 8x8 ASCII bitmap font (`0x20` `' '` through `0x7E` `'~'`).
 /// Each `u8` row has bit 7 (`0x80`) as the leftmost pixel (`gx = 0`).
 pub const FONT_8X8: [[u8; 8]; 95] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x20 ' '
@@ -163,7 +163,7 @@ pub const fn glyph_pixel(ch: char, gx: usize, gy: usize) -> bool {
 /// Zero-heap scanline text box rasterizer.
 ///
 /// Renders `text` into the rectangle `(x1..=x2, y1..=y2)` row-by-row using a
-/// 320-pixel stack scanline buffer (`row_buf`) and flushes each scanline to `display`.
+/// 320-pixel stack buffer (`row_buf`) and flushes each row to `display`.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_text_box<B: SpiDisplayBus>(
     display: &mut Ili9341Display<B>,
@@ -366,7 +366,7 @@ impl NowPlayingUi {
         !self.cached_state.link_active
     }
 
-    /// Update link active state directly and mark header, track, and progress regions dirty if changed.
+    /// Update link active state and mark header, track, and progress dirty.
     pub fn set_link_active(&mut self, active: bool) {
         if self.cached_state.link_active != active {
             self.cached_state.link_active = active;
@@ -392,12 +392,12 @@ impl NowPlayingUi {
         s
     }
 
-    /// Check if volume command should be throttled (10 Hz rate limit = 100ms window).
+    /// Check if volume should be throttled (10 Hz rate limit = 100ms window).
     pub fn should_throttle_volume(now_ms: u32, last_sent_ms: u32) -> bool {
         now_ms.wrapping_sub(last_sent_ms) < 100
     }
 
-    /// Update UI widget labels, progress, and controls from received telemetry state,
+    /// Update UI widget labels, progress, and controls from telemetry state,
     /// setting dirty region flags only for sections whose displayed values changed.
     pub fn update(&mut self, state: &CydTelemetryState) {
         let link_changed = self.cached_state.link_active != state.link_active;
@@ -510,7 +510,7 @@ impl NowPlayingUi {
         }
     }
 
-    /// Dispatch a button click to the UART link with immediate optimistic visual feedback.
+    /// Dispatch a button click to UART with optimistic visual feedback.
     pub fn click_button(
         &mut self,
         btn: UiButtonId,
@@ -598,7 +598,7 @@ impl NowPlayingUi {
 
     /// Route a touch screen coordinate against UI hit-boxes.
     ///
-    /// Supports both standard-Y (`182..=230`) and mirrored-Y (`9..=58`, mapped to `239 - y`)
+    /// Supports standard-Y (`182..=230`) and mirrored-Y (`9..=58`)
     /// CYD touch glass panel revisions:
     /// - Prev Button: `x: 12..=56, y: 184..=228`
     /// - Play/Pause Button: `x: 64..=112, y: 182..=230`
@@ -692,7 +692,7 @@ impl NowPlayingUi {
     fn render_track_panel<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
         display.fill_rect(8, 34, 311, 134, UI_COLOR_SURFACE_565);
 
-        // Left Album Art Box (x: 12..88, y: 40..116): accent border + centered 2x "[PCM]" icon
+        // Left Album Art Box: accent border + centered 2x "[PCM]" icon
         display.fill_rect(12, 40, 88, 116, UI_COLOR_ACCENT_565);
         draw_text_box(
             display,
@@ -864,7 +864,7 @@ impl NowPlayingUi {
             true,
         );
 
-        // Slider track (x: 195..310, y: 204..212) with accent fill and white thumb knob (y: 198..218)
+        // Slider track (x: 195..310) with accent fill and white thumb knob
         display.fill_rect(195, 204, 310, 212, UI_COLOR_SURFACE_LIGHT_565);
         let track_w = 310 - 195 + 1; // 116
         let vol_w = ((self.volume_slider.min(100) as i32 * track_w) / 100).clamp(0, track_w);
@@ -881,12 +881,12 @@ impl NowPlayingUi {
         );
     }
 
-    /// Render UI layout frame to ILI9341 display with full bitmap font rasterization.
+    /// Render UI layout frame to ILI9341 display with bitmap font rasterization.
     pub fn render_frame<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
         self.render_hardware_canvas(display);
     }
 
-    /// Render the complete 320x240 Now Playing interface onto physical ILI9341 GRAM.
+    /// Render complete 320x240 Now Playing interface onto physical ILI9341 GRAM.
     pub fn render_hardware_canvas<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
         display.fill_rect(0, 0, 319, 239, UI_COLOR_BG_565);
         self.render_status_bar(display);
@@ -897,7 +897,7 @@ impl NowPlayingUi {
     }
 
     /// Render only dirty UI regions to the display and clear `dirty_flags`.
-    /// Returns `true` if any region was flushed, or `false` if no regions were dirty.
+    /// Returns `true` if any region was flushed, or `false` if none were dirty.
     pub fn render_dirty_regions<B: SpiDisplayBus>(
         &mut self,
         display: &mut Ili9341Display<B>,
@@ -1116,7 +1116,7 @@ mod tests {
         }
         assert_eq!(space_lit, 0);
 
-        // Verify digits '0'..='9', uppercase 'A'..='Z', lowercase 'a'..='z', and UI symbols have non-blank glyphs
+        // Verify ASCII glyphs '0'..='9', 'A'..='Z', 'a'..='z', and UI symbols
         for ch in ('0'..='9')
             .chain('A'..='Z')
             .chain('a'..='z')
@@ -1176,7 +1176,7 @@ mod tests {
         assert_eq!(ui.dirty_flags(), 0);
         let volume_update_bytes = display.bus().total_data_bytes - bytes_before;
 
-        // Volume region partial update should transmit far fewer bytes than a 320x240 full-screen clear (153,600 bytes)
+        // Volume partial update transmits fewer bytes than 320x240 full-screen
         assert!(volume_update_bytes > 0);
         assert!(volume_update_bytes < 30_000);
     }
@@ -1186,12 +1186,15 @@ mod tests {
         let mut ui = NowPlayingUi::new();
         let mut link = CydDisplayLink::new();
 
-        // Bypass 2A: PlayPause toggles state and icon immediately and sets DIRTY_TRANSPORT | DIRTY_TRACK
+        // PlayPause toggles icon immediately and sets DIRTY_TRANSPORT | DIRTY_TRACK
         assert_eq!(ui.play_pause_icon(), "PLAY");
         let _ = ui.click_button(UiButtonId::PlayPause, &mut link).unwrap();
         assert_eq!(link.state().state, PlayState::Playing);
         assert_eq!(ui.play_pause_icon(), "PAUSE");
-        assert_eq!(ui.dirty_flags() & (DIRTY_TRANSPORT | DIRTY_TRACK), DIRTY_TRANSPORT | DIRTY_TRACK);
+        assert_eq!(
+            ui.dirty_flags() & (DIRTY_TRANSPORT | DIRTY_TRACK),
+            DIRTY_TRANSPORT | DIRTY_TRACK
+        );
         ui.clear_dirty();
         assert_eq!(ui.dirty_flags(), 0);
 
@@ -1205,18 +1208,18 @@ mod tests {
         let _ = ui.click_button(UiButtonId::Next, &mut link).unwrap();
         assert_eq!(ui.subtitle_label(), "Next Track (>>)");
 
-        // Bypass 2B: Volume slider updates link.state().vol so subsequent ui.update(link.state()) preserves slider
+        // Volume slider updates link.state().vol so ui.update preserves slider
         let _ = ui.change_volume_slider(77, true, 500, &mut link);
         assert_eq!(link.state().vol, 77);
         ui.clear_dirty();
         ui.update(link.state());
         assert_eq!(ui.volume_slider, 77);
 
-        // Bypass 3: Mirrored-Y touch coordinate (y = 39 -> effective_y = 200) routes to transport buttons & volume
+        // Mirrored-Y touch coordinate (y = 39 -> effective_y = 200)
         let res = ui.handle_touch_point(80, 39, true, 600, &mut link);
         assert_eq!(res.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
 
-        // Mirrored-Y tolerance includes rows 9..=11 (y = 9 -> effective_y = 230, y = 11 -> effective_y = 228)
+        // Mirrored-Y tolerance includes rows 9..=11 (y = 9 -> effective_y = 230)
         let res9 = ui.handle_touch_point(80, 9, true, 650, &mut link);
         assert_eq!(res9.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
         let res11 = ui.handle_touch_point(80, 11, true, 700, &mut link);
@@ -1230,11 +1233,17 @@ mod tests {
         // set_link_active sets DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS when changed
         ui.clear_dirty();
         ui.set_link_active(true);
-        assert_eq!(ui.dirty_flags() & (DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS), DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS);
+        assert_eq!(
+            ui.dirty_flags() & (DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS),
+            DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS
+        );
         assert_eq!(ui.link_badge(), "ONLINE");
         ui.clear_dirty();
         ui.set_link_active(false);
-        assert_eq!(ui.dirty_flags() & (DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS), DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS);
+        assert_eq!(
+            ui.dirty_flags() & (DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS),
+            DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS
+        );
         assert_eq!(ui.link_badge(), "OFFLINE");
     }
 }

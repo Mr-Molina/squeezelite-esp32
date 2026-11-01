@@ -1,8 +1,8 @@
 //! CYD Display Controller Application Entrypoint
 //!
-//! Dual-target entrypoint for the CYD (Cheap Yellow Display ESP32-2432S028R) controller:
-//! - On `xtensa-esp32-none-elf`: Bare-metal `no_std` firmware driving physical ILI9341 SPI2 TFT,
-//!   XPT2046 Touch SPI bus, and executing Hardware-in-the-Loop (HIL) verification & live UI loop.
+//! Dual-target entrypoint for the CYD (Cheap Yellow Display ESP32-2432S028R):
+//! - On `xtensa-esp32-none-elf`: Bare-metal `no_std` firmware driving ILI9341
+//!   SPI2 TFT, XPT2046 Touch SPI, executing HIL verification & live UI loop.
 //! - On host (`x86_64` / `aarch64`): Deterministic verification harness.
 
 #![cfg_attr(target_arch = "xtensa", no_std)]
@@ -27,16 +27,13 @@ mod xtensa_hw {
     use cyd_controller_app::drivers::{SpiDisplayBus, TouchSpiBus};
     use embedded_hal::spi::SpiBus;
     use esp_backtrace as _;
-    use esp_hal::{
-        Blocking,
-        clock::CpuClock,
-        gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
-        spi::{
-            Mode,
-            master::{Config as SpiConfig, Spi},
-        },
-        time::{Duration, Instant, Rate},
-    };
+    use esp_hal::Blocking;
+    use esp_hal::clock::CpuClock;
+    use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+    use esp_hal::spi::Mode;
+    use esp_hal::spi::master::{Config as SpiConfig, Spi};
+    use esp_hal::time::{Duration, Instant, Rate};
+    use esp_hal::timer::timg::{MwdtStage, TimerGroup};
     use esp_println::println;
 
     esp_bootloader_esp_idf::esp_app_desc!();
@@ -46,7 +43,8 @@ mod xtensa_hw {
         while start.elapsed() < Duration::from_millis(ms) {}
     }
 
-    /// Physical ESP32 CYD HSPI (SPI2) display bus driving ILI9341 on GPIO 14/13/12/15/2 and BL on GPIO 21.
+    /// Physical ESP32 CYD HSPI (SPI2) display bus driving ILI9341 on
+    /// GPIO 14/13/12/15/2 and BL on GPIO 21.
     pub struct Esp32SpiDisplayBus<'d> {
         spi: Spi<'d, Blocking>,
         cs: Output<'d>,
@@ -85,7 +83,7 @@ mod xtensa_hw {
             self.cs.set_high();
             self.commands_sent += 1;
 
-            // ILI9341 datasheet requirement: 120ms stabilization delay after SWRESET (0x01) and SLPOUT (0x11)
+            // ILI9341 datasheet: 120ms delay after SWRESET (0x01) and SLPOUT (0x11)
             if cmd == 0x01 || cmd == 0x11 {
                 delay_ms(120);
             }
@@ -110,7 +108,8 @@ mod xtensa_hw {
         }
     }
 
-    /// Physical ESP32 CYD Touch SPI bus driving XPT2046 on SCLK=25, MOSI=32, MISO=39, CS=33, IRQ=36.
+    /// Physical ESP32 CYD Touch SPI bus driving XPT2046 on
+    /// SCLK=25, MOSI=32, MISO=39, CS=33, IRQ=36.
     pub struct Esp32TouchSpiBus<'d> {
         sclk: Output<'d>,
         mosi: Output<'d>,
@@ -143,15 +142,11 @@ mod xtensa_hw {
         }
 
         fn read_raw_12bit(&mut self, cmd: u8) -> u16 {
-            if !self.is_irq_low() {
-                return 0;
-            }
-
             let delay = esp_hal::delay::Delay::new();
             self.cs.set_low();
             delay.delay_micros(2);
 
-            // Transmit 8-bit command MSB-first (~250 kHz effective SPI clock at 240 MHz CPU)
+            // Transmit 8-bit command MSB-first (~250 kHz effective SPI clock)
             for bit in (0..8).rev() {
                 if ((cmd >> bit) & 1) != 0 {
                     self.mosi.set_high();
@@ -190,11 +185,12 @@ mod xtensa_hw {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
         let peripherals = esp_hal::init(config);
 
-        // Disable hardware watchdogs (TIMG0, TIMG1, RTC RWDT)
-        let mut timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-        let mut timg1 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG1);
+        // Disable hardware watchdogs during early peripheral init
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
+        let mut timg1 = TimerGroup::new(peripherals.TIMG1);
         let mut rtc = esp_hal::rtc_cntl::Rtc::new(peripherals.RTC_TIMER);
-        timg0.wdt.disable();
+        let mut wdt0 = timg0.wdt;
+        wdt0.disable();
         timg1.wdt.disable();
         rtc.rwdt.disable();
 
@@ -234,7 +230,7 @@ mod xtensa_hw {
             Esp32TouchSpiBus::new(touch_sclk, touch_mosi, touch_miso, touch_cs, touch_irq);
         let mut touch = Xpt2046Touch::new(touch_bus);
 
-        // Configure physical UART2 (TX=GPIO27, RX=GPIO22 with internal Pull::Up, 460,800 baud)
+        // Configure physical UART2 (TX=GPIO27, RX=GPIO22, 460,800 baud)
         let uart2_rx_pin = Input::new(
             peripherals.GPIO22,
             InputConfig::default().with_pull(Pull::Up),
@@ -285,7 +281,8 @@ mod xtensa_hw {
             && display.flush_count() >= 4
             && display.bus().bytes_sent > 150_000;
         println!(
-            "[HIL 1/5] ILI9341 Display & Backlight Init: {} (cmds={}, spi_bytes={}, flushes={}, bl={}%)",
+            "[HIL 1/5] ILI9341 Display & Backlight Init: {} \
+             (cmds={}, spi_bytes={}, flushes={}, bl={}%)",
             if hil1_pass { "PASS" } else { "FAIL" },
             display.bus().commands_sent,
             display.bus().bytes_sent,
@@ -303,7 +300,8 @@ mod xtensa_hw {
         let (cal_x, cal_y) = touch.calibrate_raw(2050, 2050);
         let hil2_pass = raw_x <= 4095 && raw_y <= 4095 && cal_x == 159 && cal_y == 119;
         println!(
-            "[HIL 2/5] XPT2046 Touch Bus & Calibration:  {} (irq_low={}, raw_adc=({}, {}), center_cal=({}, {}))",
+            "[HIL 2/5] XPT2046 Touch Bus & Calibration:  {} \
+             (irq_low={}, raw_adc=({}, {}), center_cal=({}, {}))",
             if hil2_pass { "PASS" } else { "FAIL" },
             irq_active,
             raw_x,
@@ -317,7 +315,8 @@ mod xtensa_hw {
         // [HIL 3/5] Squeezelite CYD Link Protocol & Active Playback Render
         // ====================================================================
         let mut link = CydDisplayLink::new();
-        let rx_stream = b"STATE=P\r\nVOL=78\r\nMETA=Queen;Bohemian Rhapsody\r\nTIME=142/354\r\nWIFI=1;-52\r\n";
+        let rx_stream = b"STATE=P\r\nVOL=78\r\n\
+            META=Queen;Bohemian Rhapsody\r\nTIME=142/354\r\nWIFI=1;-52\r\n";
         let parsed_events = link.feed_rx_bytes(rx_stream, 1_000_000);
         ui.update(link.state());
         ui.render_hardware_canvas(&mut display);
@@ -333,7 +332,8 @@ mod xtensa_hw {
             && ui.play_pause_icon.as_str() == "PAUSE"
             && ui.link_badge.as_str() == "ONLINE";
         println!(
-            "[HIL 3/5] CYD Link Telemetry & UI Render:   {} (events={}, track=\"{}\", progress={}%, time={}/{}, badge={})",
+            "[HIL 3/5] CYD Link Telemetry & UI Render:   {} \
+             (events={}, track=\"{}\", progress={}%, time={}/{}, badge={})",
             if hil3_pass { "PASS" } else { "FAIL" },
             parsed_events,
             ui.title_label.as_str(),
@@ -360,7 +360,8 @@ mod xtensa_hw {
             && vol_throttled.is_none()
             && vol_released.as_deref() == Some(b"CMD=VOL:100\n".as_slice());
         println!(
-            "[HIL 4/5] Touch Hit-Boxes & 10Hz Throttle:  {} (prev=OK, toggle=OK, next=OK, throttle_50ms=SUPPRESSED, release=CMD=VOL:100)",
+            "[HIL 4/5] Touch Hit-Boxes & 10Hz Throttle:  {} \
+             (prev=OK, toggle=OK, next=OK, throttle=SUPPRESSED, release=VOL:100)",
             if hil4_pass { "PASS" } else { "FAIL" }
         );
         delay_ms(20);
@@ -374,7 +375,8 @@ mod xtensa_hw {
             && !link.state().link_active
             && timeout_resync.as_deref() == Some(b"CMD=STATUS\n".as_slice());
         println!(
-            "[HIL 5/5] Heartbeat Timeout & Resync Poll:  {} (timeout_at=6.5s, link_active={}, resync_frame=\"CMD=STATUS\\n\")",
+            "[HIL 5/5] Heartbeat Timeout & Resync Poll:  {} \
+             (timeout_at=6.5s, link_active={}, resync_frame=\"CMD=STATUS\\n\")",
             if hil5_pass { "PASS" } else { "FAIL" },
             link.state().link_active
         );
@@ -406,7 +408,7 @@ mod xtensa_hw {
         // 1. Configure physical CYD landscape touch orientation
         touch.configure_cyd_landscape();
 
-        // 2. Wipe synthetic "Bohemian Rhapsody" test data and render clean STANDBY/OFFLINE screen
+        // 2. Wipe synthetic test data and render clean STANDBY/OFFLINE screen
         link.reset_state();
         link.state_mut().vol = 50;
         ui = NowPlayingUi::new();
@@ -414,7 +416,7 @@ mod xtensa_hw {
         ui.render_hardware_canvas(&mut display);
         ui.clear_dirty();
 
-        // 3. Queue initial status sync request via poll_heartbeat(0) and flush over UART2 TX
+        // 3. Queue initial status sync via poll_heartbeat(0) and flush UART2 TX
         let _ = link.poll_heartbeat(0);
         while let Some(pkt) = link.pop_tx() {
             let mut written = 0;
@@ -429,7 +431,14 @@ mod xtensa_hw {
         }
         delay_ms(20);
 
-        println!("[READY] CYD Display Reset to STANDBY/OFFLINE — Entering Real-Time UART2 & Touch Loop");
+        // 4. Re-enable TIMG0 Watchdog Timer post-HIL (CODE-CYD-WDT-001)
+        wdt0.set_timeout(MwdtStage::Stage0, Duration::from_millis(10_000));
+        wdt0.enable();
+        wdt0.feed();
+
+        println!(
+            "[READY] CYD Reset to STANDBY/OFFLINE — Entering UART2 & Touch Loop"
+        );
         delay_ms(20);
 
         let delay = esp_hal::delay::Delay::new();
@@ -437,11 +446,12 @@ mod xtensa_hw {
         let mut tick: u32 = 0;
 
         loop {
+            wdt0.feed();
             let elapsed = Instant::now().duration_since_epoch();
             let now_us = elapsed.as_micros() as i64;
             let now_ms = elapsed.as_millis() as u32;
 
-            // 1. Non-blocking UART2 RX Drain (runs on EVERY 1 ms tick so 128-byte FIFO never overflows at 460,800 baud)
+            // 1. Non-blocking UART2 RX Drain (runs on EVERY 1 ms tick)
             let mut rx_buf = [0u8; 64];
             let mut rx_any = false;
             while uart2.read_ready() {
@@ -457,7 +467,7 @@ mod xtensa_hw {
                 }
             }
 
-            // 2. Display rendering, touch polling, and heartbeat every 16 ticks (~60 Hz cadence)
+            // 2. Display rendering, touch polling, and heartbeat (~60 Hz)
             if tick % 16 == 0 {
                 // Heartbeat & Resync Monitor
                 let was_active = link.state().link_active;
@@ -468,7 +478,9 @@ mod xtensa_hw {
 
                 // Touch Press & Release Router with Dirty-Region Redraw
                 if let Some((tx, ty)) = touch.read() {
-                    if let Some(cmd_bytes) = ui.handle_touch_point(tx, ty, false, now_ms, &mut link) {
+                    if let Some(cmd_bytes) =
+                        ui.handle_touch_point(tx, ty, false, now_ms, &mut link)
+                    {
                         if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
                             println!("[TOUCH DRAG] ({}, {}) -> {}", tx, ty, s.trim());
                         }
@@ -477,7 +489,9 @@ mod xtensa_hw {
                     }
                     last_touch = Some((tx, ty));
                 } else if let Some((rx, ry)) = last_touch.take() {
-                    if let Some(cmd_bytes) = ui.handle_touch_point(rx, ry, true, now_ms, &mut link) {
+                    if let Some(cmd_bytes) =
+                        ui.handle_touch_point(rx, ry, true, now_ms, &mut link)
+                    {
                         if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
                             println!("[TOUCH RELEASE] ({}, {}) -> {}", rx, ry, s.trim());
                         }
@@ -489,7 +503,7 @@ mod xtensa_hw {
                 ui.render_dirty_regions(&mut display);
             }
 
-            // 3. Flush tx_queue over Physical UART2 TX (GPIO27) using bounded write loop (up to 64 iterations)
+            // 3. Flush tx_queue over Physical UART2 TX (up to 64 iterations)
             while let Some(pkt) = link.pop_tx() {
                 let mut written = 0;
                 let mut iters = 0;

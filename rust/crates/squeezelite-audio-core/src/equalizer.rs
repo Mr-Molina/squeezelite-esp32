@@ -32,7 +32,8 @@ impl BiquadCoeffs {
     /// 0-delay identity bypass filter coefficients ($H(z) = 1$).
     pub const BYPASS: Self = Self::bypass();
 
-    /// Returns identity bypass filter coefficients ($b_0 = 1, b_1 = 0, b_2 = 0, a_1 = 0, a_2 = 0$).
+    /// Returns identity bypass filter coefficients
+    /// ($b_0 = 1, b_1 = 0, b_2 = 0, a_1 = 0, a_2 = 0$).
     #[must_use]
     pub const fn bypass() -> Self {
         Self {
@@ -46,7 +47,8 @@ impl BiquadCoeffs {
 
     /// Verifies Bounded-Input Bounded-Output (BIBO) stability under the
     /// Schur-Cohn / Jury stability criterion:
-    /// 1. All numerator and denominator coefficients are finite (rejecting NaN and Inf).
+    /// 1. All numerator and denominator coefficients are finite
+    ///    (rejecting NaN and Inf).
     /// 2. $|a_2| < 1.0$
     /// 3. $|a_1| < 1.0 + a_2$
     pub fn is_stable(&self) -> bool {
@@ -62,25 +64,31 @@ impl BiquadCoeffs {
     }
 }
 
-/// Built-in 10-band ISO graphic equalizer presets (`31.25 Hz` .. `16 kHz` @ `44.1 kHz`).
+/// Built-in 10-band ISO graphic equalizer presets
+/// (`31.25 Hz` .. `16 kHz` @ `44.1 kHz`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum EqPreset {
     /// Bit-perfect 0-cycle bypass (`0.0 dB` across all 10 bands).
     #[default]
     Flat = 0,
-    /// Warm low-end shelf (`+5.5 dB` @ 31 Hz, `+4.5 dB` @ 62 Hz, `+3.0 dB` @ 125 Hz, `+1.5 dB` @ 250 Hz).
+    /// Warm low-end shelf (`+5.5 dB` @ 31 Hz, `+4.5 dB` @ 62 Hz,
+    /// `+3.0 dB` @ 125 Hz, `+1.5 dB` @ 250 Hz).
     BassBoost = 1,
-    /// Fletcher-Munson loudness contour (`+4.5 dB` sub-bass, `+3.5 dB` bass, `-1.0 dB` 1 kHz, `+3.0 dB` 8-16 kHz air).
+    /// Fletcher-Munson loudness contour (`+4.5 dB` sub-bass, `+3.5 dB` bass,
+    /// `-1.0 dB` 1 kHz, `+3.0 dB` 8-16 kHz air).
     Loudness = 2,
-    /// Midrange presence boost for spoken word/radio (`-2.0 dB` sub-bass, `+3.5 dB` 1-2 kHz, `+2.5 dB` 4 kHz).
+    /// Midrange presence boost for spoken word/radio (`-2.0 dB` sub-bass,
+    /// `+3.5 dB` 1-2 kHz, `+2.5 dB` 4 kHz).
     Vocal = 3,
-    /// Classic V-curve rock contour (`+4.0 dB` 62-125 Hz, `-1.5 dB` 500 Hz-1 kHz, `+3.5 dB` 4-8 kHz).
+    /// Classic V-curve rock contour (`+4.0 dB` 62-125 Hz,
+    /// `-1.5 dB` 500 Hz-1 kHz, `+3.5 dB` 4-8 kHz).
     Rock = 4,
 }
 
 impl EqPreset {
-    /// Converts a numeric preset index (`0..=4`) into an `EqPreset` (unknown values map to `Flat`).
+    /// Converts a numeric preset index (`0..=4`) into an `EqPreset`
+    /// (unknown values map to `Flat`).
     #[must_use]
     pub const fn from_u8(val: u8) -> Self {
         match val {
@@ -155,7 +163,8 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         Ok(())
     }
 
-    /// Safely sets a band's coefficients, returning true on success or false if out of bounds or unstable.
+    /// Safely sets a band's coefficients, returning true on success
+    /// or false if out of bounds or unstable.
     pub fn set_band(&mut self, index: usize, coeffs: BiquadCoeffs) -> bool {
         self.set_filter(index, coeffs).is_ok()
     }
@@ -199,7 +208,8 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         self.loudness_enabled = enabled;
     }
 
-    /// Process a single stereo frame `(left, right)` in-place and return the filtered frame.
+    /// Process a single stereo frame `(left, right)` in-place and return
+    /// the filtered frame.
     #[inline]
     pub fn process_frame(&mut self, left: i32, right: i32) -> (i32, i32) {
         let mut frame = [left, right];
@@ -270,8 +280,16 @@ impl<const BANDS: usize> Equalizer<BANDS> {
 
             let scaled_l = l * DENORM;
             let scaled_r = r * DENORM;
-            chunk[0] = if scaled_l.is_nan() { 0 } else { scaled_l.clamp(MIN_F32_I32, MAX_F32_I32) as i32 };
-            chunk[1] = if scaled_r.is_nan() { 0 } else { scaled_r.clamp(MIN_F32_I32, MAX_F32_I32) as i32 };
+            chunk[0] = if scaled_l.is_nan() {
+                0
+            } else {
+                scaled_l.clamp(MIN_F32_I32, MAX_F32_I32) as i32
+            };
+            chunk[1] = if scaled_r.is_nan() {
+                0
+            } else {
+                scaled_r.clamp(MIN_F32_I32, MAX_F32_I32) as i32
+            };
         }
     }
 }
@@ -282,7 +300,8 @@ impl<const BANDS: usize> Default for Equalizer<BANDS> {
     }
 }
 
-/// Precomputed RBJ peaking biquad coefficients for `EqPreset::BassBoost` at 44.1 kHz ($Q = 1.414$).
+/// Precomputed RBJ peaking biquad coefficients for `EqPreset::BassBoost`
+/// at 44.1 kHz ($Q = 1.414$).
 #[allow(clippy::excessive_precision)]
 pub const BASS_BOOST_COEFFS: [BiquadCoeffs; 10] = [
     // Band 0: 31.25 Hz, +5.5 dB
@@ -331,7 +350,8 @@ pub const BASS_BOOST_COEFFS: [BiquadCoeffs; 10] = [
     BiquadCoeffs::BYPASS,
 ];
 
-/// Precomputed RBJ peaking biquad coefficients for `EqPreset::Loudness` at 44.1 kHz ($Q = 1.414$).
+/// Precomputed RBJ peaking biquad coefficients for `EqPreset::Loudness`
+/// at 44.1 kHz ($Q = 1.414$).
 #[allow(clippy::excessive_precision)]
 pub const LOUDNESS_COEFFS: [BiquadCoeffs; 10] = [
     // Band 0: 31.25 Hz, +4.5 dB
@@ -404,7 +424,8 @@ pub const LOUDNESS_COEFFS: [BiquadCoeffs; 10] = [
     },
 ];
 
-/// Precomputed RBJ peaking biquad coefficients for `EqPreset::Vocal` at 44.1 kHz ($Q = 1.414$).
+/// Precomputed RBJ peaking biquad coefficients for `EqPreset::Vocal`
+/// at 44.1 kHz ($Q = 1.414$).
 #[allow(clippy::excessive_precision)]
 pub const VOCAL_COEFFS: [BiquadCoeffs; 10] = [
     // Band 0: 31.25 Hz, -2.0 dB
@@ -465,7 +486,8 @@ pub const VOCAL_COEFFS: [BiquadCoeffs; 10] = [
     BiquadCoeffs::BYPASS,
 ];
 
-/// Precomputed RBJ peaking biquad coefficients for `EqPreset::Rock` at 44.1 kHz ($Q = 1.414$).
+/// Precomputed RBJ peaking biquad coefficients for `EqPreset::Rock`
+/// at 44.1 kHz ($Q = 1.414$).
 #[allow(clippy::excessive_precision)]
 pub const ROCK_COEFFS: [BiquadCoeffs; 10] = [
     // Band 0: 31.25 Hz, +4.0 dB
@@ -545,12 +567,14 @@ pub const ROCK_COEFFS: [BiquadCoeffs; 10] = [
 ];
 
 impl Equalizer<10> {
-    /// Applies a pre-tuned 10-band graphic equalizer preset (`Flat`, `BassBoost`, `Loudness`, `Vocal`, `Rock`).
+    /// Applies a pre-tuned 10-band graphic equalizer preset
+    /// (`Flat`, `BassBoost`, `Loudness`, `Vocal`, `Rock`).
     ///
     /// When `EqPreset::Flat`, resets all 10 bands to `BiquadCoeffs::BYPASS`
     /// and sets `enabled = false` for 0-cycle passthrough.
     /// For all other presets, loads the Schur-Cohn verified coefficient tables
-    /// and sets `enabled = true` without clearing biquad history to ensure smooth, click-free transitions.
+    /// and sets `enabled = true` without clearing biquad history to ensure
+    /// smooth, click-free transitions.
     pub fn apply_preset(&mut self, preset: EqPreset) {
         self.current_preset = preset;
         match preset {
@@ -766,7 +790,8 @@ mod tests {
         // First stereo pair should be processed by horner loudness
         assert_ne!(samples[0], 0);
 
-        // When Flat preset is applied and loudness is enabled, loop should not be bypassed
+        // When Flat preset is applied and loudness is enabled, loop should
+        // not be bypassed
         eq.apply_preset(EqPreset::Flat);
         assert!(!eq.is_enabled());
         let mut samples_flat = [500_000, -500_000];
