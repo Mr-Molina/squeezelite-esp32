@@ -270,14 +270,18 @@ patterns:
     claiming feature parity.
   escalation_level: 2
   mitigation_level: 2
-  current_mitigation: mechanical_invariant — Invariant 45 in .agents/INFRASTRUCTURE_INVARIANTS.md
+  current_mitigation: mechanical_invariant — Invariant 45 and Invariant 49 in .agents/INFRASTRUCTURE_INVARIANTS.md
   mitigation_target: .agents/INFRASTRUCTURE_INVARIANTS.md
   postmortem_ids:
   - PM-2026-1025-003
+  - PM-2026-1101-002
   occurrences:
   - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
     date: '2026-10-25'
     postmortem_ref: PM-2026-1025-003
+  - session: conversation://6b63bd01-ad40-4ba9-a8fa-687005ed880f
+    date: '2026-11-01'
+    postmortem_ref: PM-2026-1101-002
 - id: PAT-2026-1025-004
   name: 8-Byte Stereo Frame Circular DMA Alignment & Underrun Zero-Fill Gate
   failure_type: logic
@@ -340,5 +344,42 @@ patterns:
   - session: conversation://31deac42-e161-443d-9205-80c67d7541ab
     date: '2026-10-25'
     postmortem_ref: PM-2026-1025-006
+- id: PAT-2026-1101-001
+  name: Bare-Metal .dram2_uninit Field Parity, PSRAM Region-0 Priority & 65 KB Internal Heap Gate
+  failure_type: logic
+  scope: project
+  root_cause_category: bare_metal_uninitialized_fields_heap_region_order_and_coexistence_starvation
+  description: Omission of field writes in init_static_pipeline() for StreamPipeline fields in .dram2_uninit
+    leaving uninitialized pointer/niche bits, registering Internal DRAM as esp_alloc::HEAP Region 0 ahead
+    of 4 MB PSRAM, or dropping MemoryCapability::Internal heap below 65 KB when Wi-Fi and BTDM coexist.
+  escalation_level: 2
+  mitigation_level: 2
+  current_mitigation: mechanical_invariant — Invariant 48 in .agents/INFRASTRUCTURE_INVARIANTS.md
+  mitigation_target: .agents/INFRASTRUCTURE_INVARIANTS.md
+  postmortem_ids:
+  - PM-2026-1101-001
+  occurrences:
+  - session: conversation://6b63bd01-ad40-4ba9-a8fa-687005ed880f
+    date: '2026-11-01'
+    postmortem_ref: PM-2026-1101-001
+- id: PAT-2026-1101-002
+  name: Twin-Path Implementation Parity & TAS5805M Transient Clock-Fault Filter Gate
+  failure_type: logic
+  scope: project
+  root_cause_category: twin_path_code_divergence_and_spurious_amplifier_fault_cycling
+  description: Asymmetric bug fixes between twin implementations (Mp3Decoder vs StaticMp3Decoder partial frame guard,
+    or tasks.rs vs main.rs 30s amplifier fault cooldown and clock-fault filtering), causing silent audio drops
+    at chunk boundaries or 2-second TAS5805M Hi-Z cycling during playback.
+  escalation_level: 3
+  mitigation_level: 3
+  current_mitigation: automation & mechanical_invariant — test_mp3_decoder_partial_frame_guard, test_fault_status_has_critical_amp_fault, and Invariant 49 in .agents/INFRASTRUCTURE_INVARIANTS.md
+  mitigation_target: .agents/INFRASTRUCTURE_INVARIANTS.md
+  postmortem_ids:
+  - PM-2026-1101-003
+  occurrences:
+  - session: conversation://6b63bd01-ad40-4ba9-a8fa-687005ed880f
+    date: '2026-11-01'
+    postmortem_ref: PM-2026-1101-003
+
 
 
