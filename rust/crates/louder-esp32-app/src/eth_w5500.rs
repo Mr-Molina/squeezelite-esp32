@@ -201,6 +201,11 @@ pub struct W5500Driver<SPI> {
     mac: [u8; 6],
 }
 
+/// Socket 0 TX/RX buffer size (16 KiB for MACRAW mode).
+pub const S0_BUF_SIZE: u16 = 0x4000;
+/// Bitmask for Socket 0 16 KiB ring buffer wrapping (`0x3FFF`).
+pub const S0_BUF_MASK: u16 = 0x3FFF;
+
 impl<SPI: SpiDevice> W5500Driver<SPI> {
     /// Wraps an `embedded_hal::spi::SpiDevice` with the given 6-byte hardware
     /// MAC address.
@@ -341,6 +346,44 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.read_u16_be(S0_RX_RSR, BSB_S0_REG)
     }
 
+    /// Reads `out.len()` bytes from Socket 0 ring buffer, wrapping around
+    /// `S0_BUF_SIZE` (16 KiB) with split SPI transactions if needed.
+    pub fn read_socket0_ring_block(
+        &mut self,
+        ptr: u16,
+        block_select: u8,
+        out: &mut [u8],
+    ) -> Result<(), W5500Error<SPI::Error>> {
+        let offset = ptr & S0_BUF_MASK;
+        let len = out.len() as u16;
+        if offset.saturating_add(len) <= S0_BUF_SIZE {
+            self.read_block(offset, block_select, out)
+        } else {
+            let first_len = (S0_BUF_SIZE - offset) as usize;
+            self.read_block(offset, block_select, &mut out[..first_len])?;
+            self.read_block(0x0000, block_select, &mut out[first_len..])
+        }
+    }
+
+    /// Writes `data.len()` bytes to Socket 0 ring buffer, wrapping around
+    /// `S0_BUF_SIZE` (16 KiB) with split SPI transactions if needed.
+    pub fn write_socket0_ring_block(
+        &mut self,
+        ptr: u16,
+        block_select: u8,
+        data: &[u8],
+    ) -> Result<(), W5500Error<SPI::Error>> {
+        let offset = ptr & S0_BUF_MASK;
+        let len = data.len() as u16;
+        if offset.saturating_add(len) <= S0_BUF_SIZE {
+            self.write_block(offset, block_select, data)
+        } else {
+            let first_len = (S0_BUF_SIZE - offset) as usize;
+            self.write_block(offset, block_select, &data[..first_len])?;
+            self.write_block(0x0000, block_select, &data[first_len..])
+        }
+    }
+
     /// Reads the next complete Ethernet frame from Socket 0's `MACRAW` RX
     /// buffer into `out_frame`, returning the frame length in bytes (`0` if
     /// no frame is waiting).
@@ -354,7 +397,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         }
         let rx_rd = self.read_u16_be(S0_RX_RD, BSB_S0_REG)?;
         let mut len_hdr = [0u8; 2];
-        self.read_block(rx_rd, BSB_S0_RX_BUF, &mut len_hdr)?;
+        self.read_socket0_ring_block(rx_rd, BSB_S0_RX_BUF, &mut len_hdr)?;
         let packet_size = u16::from_be_bytes(len_hdr);
         if packet_size < 2 || packet_size > rsr {
             return Err(W5500Error::InvalidRxHeader(packet_size));
@@ -367,7 +410,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
             });
         }
         let payload_offset = rx_rd.wrapping_add(2);
-        self.read_block(payload_offset, BSB_S0_RX_BUF, &mut out_frame[..frame_len])?;
+        self.read_socket0_ring_block(payload_offset, BSB_S0_RX_BUF, &mut out_frame[..frame_len])?;
         let new_rx_rd = rx_rd.wrapping_add(packet_size);
         self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
         self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
@@ -392,7 +435,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
             });
         }
         let tx_wr = self.read_u16_be(S0_TX_WR, BSB_S0_REG)?;
-        self.write_block(tx_wr, BSB_S0_TX_BUF, frame)?;
+        self.write_socket0_ring_block(tx_wr, BSB_S0_TX_BUF, frame)?;
         let new_tx_wr = tx_wr.wrapping_add(needed);
         self.write_u16_be(S0_TX_WR, BSB_S0_REG, new_tx_wr)?;
         self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_SEND)?;
@@ -539,6 +582,46 @@ mod tests {
         let rcvd = drv.read_frame(&mut rx_buf).expect("read_frame");
         assert_eq!(rcvd, 14);
         assert_eq!(&rx_buf[..14], &sample_frame);
+
+        let mut spi = drv.into_inner();
+        spi.done();
+    }
+
+    #[test]
+    fn test_net_501_w5500_ring_buffer_wrapping() {
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let write_data = [0xAA, 0xBB, 0xCC, 0xDD];
+        let expectations = [
+            // 1. write_socket0_ring_block at 0x3FFE (2 bytes at 0x3FFE, 2 bytes at 0x0000)
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x3F, 0xFE, (BSB_S0_TX_BUF << 3) | 0x04]),
+            SpiTransaction::write_vec(std::vec![0xAA, 0xBB]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x00, (BSB_S0_TX_BUF << 3) | 0x04]),
+            SpiTransaction::write_vec(std::vec![0xCC, 0xDD]),
+            SpiTransaction::transaction_end(),
+            // 2. read_socket0_ring_block at 0x3FFE (2 bytes at 0x3FFE, 2 bytes at 0x0000)
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x3F, 0xFE, BSB_S0_RX_BUF << 3]),
+            SpiTransaction::read_vec(std::vec![0x11, 0x22]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x00, BSB_S0_RX_BUF << 3]),
+            SpiTransaction::read_vec(std::vec![0x33, 0x44]),
+            SpiTransaction::transaction_end(),
+        ];
+
+        let spi = SpiMock::new(&expectations);
+        let mut drv = W5500Driver::new(spi, mac);
+
+        drv.write_socket0_ring_block(0x3FFE, BSB_S0_TX_BUF, &write_data)
+            .expect("split tx ring write");
+
+        let mut read_buf = [0u8; 4];
+        drv.read_socket0_ring_block(0x3FFE, BSB_S0_RX_BUF, &mut read_buf)
+            .expect("split rx ring read");
+        assert_eq!(read_buf, [0x11, 0x22, 0x33, 0x44]);
 
         let mut spi = drv.into_inner();
         spi.done();

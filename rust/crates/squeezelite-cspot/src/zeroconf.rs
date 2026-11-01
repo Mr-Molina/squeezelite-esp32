@@ -139,6 +139,12 @@ impl ReusableCredentials {
                         auth_type = val as u32;
                     }
                 }
+                1 => {
+                    if pos + 8 > payload.len() {
+                        return Err(CryptoError::InvalidCiphertext);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(payload, &mut pos)
                         .map_err(|_| CryptoError::InvalidCiphertext)?
@@ -156,6 +162,12 @@ impl ReusableCredentials {
                     } else if field_num == 0x28 || field_num == 3 {
                         auth_data = slice.to_vec();
                     }
+                }
+                5 => {
+                    if pos + 4 > payload.len() {
+                        return Err(CryptoError::InvalidCiphertext);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(CryptoError::InvalidCiphertext),
             }
@@ -601,23 +613,35 @@ fn read_blob_int(data: &[u8], pos: &mut usize) -> Result<u32, CryptoError> {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '%' {
-            let h1 = chars.next().unwrap_or('0');
-            let h2 = chars.next().unwrap_or('0');
-            let hex_str = format!("{}{}", h1, h2);
-            if let Ok(byte) = u8::from_str_radix(&hex_str, 16) {
-                out.push(byte as char);
+    let mut bytes = Vec::with_capacity(s.len());
+    let s_bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s_bytes.len() {
+        match s_bytes[i] {
+            b'%' => {
+                if i + 2 < s_bytes.len() {
+                    if let Ok(hex_str) = core::str::from_utf8(&s_bytes[i + 1..i + 3]) {
+                        if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
+                            bytes.push(byte);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                }
+                bytes.push(b'%');
+                i += 1;
             }
-        } else if ch == '+' {
-            out.push(' ');
-        } else {
-            out.push(ch);
+            b'+' => {
+                bytes.push(b' ');
+                i += 1;
+            }
+            b => {
+                bytes.push(b);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Extracts a query parameter from URL or form body.
@@ -634,9 +658,29 @@ pub fn get_param(query: &str, key: &str) -> Option<String> {
 }
 
 /// Implements Spotify ZeroConf HTTP endpoint protocol.
-pub struct ZeroConfServer;
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ZeroConfServer {
+    last_user: Option<ZeroConfUser>,
+}
 
 impl ZeroConfServer {
+    /// Creates a new `ZeroConfServer` instance with no authenticated user.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { last_user: None }
+    }
+
+    /// Returns the last authenticated user, if any.
+    #[must_use]
+    pub fn last_user(&self) -> Option<&ZeroConfUser> {
+        self.last_user.as_ref()
+    }
+
+    /// Takes the last authenticated user out of the server, leaving `None`.
+    pub fn take_last_user(&mut self) -> Option<ZeroConfUser> {
+        self.last_user.take()
+    }
+
     /// Builds JSON response for `action=getInfo`.
     pub fn build_get_info_json(
         device_id: &str,
@@ -728,8 +772,10 @@ impl ZeroConfServer {
         Ok((auth_type, auth_data))
     }
 
-    /// Handles an incoming ZeroConf HTTP request (`getInfo` or `addUser`).
+    /// Handles an incoming ZeroConf HTTP request (`getInfo` or `addUser`), storing
+    /// the authenticated user in `self.last_user`.
     pub fn handle_request(
+        &mut self,
         uri: &str,
         body: &str,
         dh: &OakleyGroup1Dh,
@@ -776,12 +822,19 @@ impl ZeroConfServer {
                 let client_key_bytes = base64_decode(&client_key_b64)?;
 
                 let shared_key = dh.calculate_shared(&client_key_bytes)?;
-                let (_auth_type, _auth_data) = Self::decode_blob(
+                let (auth_type, auth_data) = Self::decode_blob(
                     &blob_bytes,
                     &shared_key,
                     device_id,
                     &username,
                 )?;
+
+                self.last_user = Some(ZeroConfUser {
+                    username: username.clone(),
+                    auth_type,
+                    auth_data,
+                    device_name: dev_name.clone(),
+                });
 
                 let resp_json = format!(
                     "{{\"status\":101,\"statusString\":\"OK\",\"spotifyError\":0,\

@@ -465,20 +465,41 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(
 
 /// Boot resolution of the Wi-Fi station credentials: the C firmware's NVS ones,
 /// else the
-/// first-boot default (`default` is only called when NVS has none). Journal
-/// `wifi.*` keys are
-/// deliberately not an input: no Rust path can write or clear them in Phase
-/// 0/1, so a stale
-/// journal would shadow freshly re-provisioned NVS credentials forever.
+/// first-boot default (`default` is only called when NVS has none).
 pub fn resolve_boot_wifi(
     nvs: impl FnOnce() -> Option<WifiStaCredentials>,
     default: impl FnOnce() -> Option<WifiStaCredentials>,
 ) -> Option<(WifiStaCredentials, ConfigSource)> {
-    // Journal precedence for Wi-Fi returns in Phase 3 with Rust provisioning.
     if let Some(creds) = nvs() {
         return Some((creds, ConfigSource::Nvs));
     }
     default().map(|creds| (creds, ConfigSource::Default))
+}
+
+/// Boot resolution of Wi-Fi station credentials with FlashJournal precedence:
+/// 1. Journal (`wifi.ssid`, `wifi.pass`), if present and non-empty ->
+///    `ConfigSource::Journal`.
+/// 2. NVS partition, if present -> `ConfigSource::Nvs`.
+/// 3. Compile-time defaults -> `ConfigSource::Default`.
+pub fn resolve_boot_wifi_with_journal<S: KeyValueStorage>(
+    journal: Option<&S>,
+    nvs: impl FnOnce() -> Option<WifiStaCredentials>,
+    default: impl FnOnce() -> Option<WifiStaCredentials>,
+) -> Option<(WifiStaCredentials, ConfigSource)> {
+    if let Some(j) = journal {
+        if let Ok(Some(ssid)) = j.get_str::<32>("wifi.ssid") {
+            if !ssid.is_empty() {
+                let password = j
+                    .get_str::<64>("wifi.pass")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let creds = WifiStaCredentials { ssid, password };
+                return Some((creds, ConfigSource::Journal));
+            }
+        }
+    }
+    resolve_boot_wifi(nvs, default)
 }
 
 /// Serializes `cfg` (audio/identity keys only, never `wifi.*`) as a complete
@@ -603,5 +624,63 @@ mod tests {
             ram.mark_flash_written();
             assert_eq!(ram.target(), JournalSlot::A);
         }
+    }
+
+    #[test]
+    fn test_logic_505_resolve_boot_wifi_with_journal() {
+        use squeezelite_config::MemConfigStore;
+
+        let mut store = MemConfigStore::<16>::new();
+        store.set_str("wifi.ssid", "JournalAP").expect("set ssid");
+        store.set_str("wifi.pass", "JournalSecret").expect("set pass");
+
+        let nvs_creds = WifiStaCredentials {
+            ssid: "NvsAP".try_into().unwrap(),
+            password: "NvsPass".try_into().unwrap(),
+        };
+        let def_creds = WifiStaCredentials {
+            ssid: "DefAP".try_into().unwrap(),
+            password: "DefPass".try_into().unwrap(),
+        };
+
+        // 1. Journal present with non-empty SSID takes precedence over NVS and default
+        let (res_creds, src) = resolve_boot_wifi_with_journal(
+            Some(&store),
+            || Some(nvs_creds.clone()),
+            || Some(def_creds.clone()),
+        )
+        .expect("resolved with journal");
+        assert_eq!(src, ConfigSource::Journal);
+        assert_eq!(res_creds.ssid.as_str(), "JournalAP");
+        assert_eq!(res_creds.password.as_str(), "JournalSecret");
+
+        // 2. Journal absent falls back to NVS
+        let (res_creds, src) = resolve_boot_wifi_with_journal(
+            None::<&MemConfigStore<16>>,
+            || Some(nvs_creds.clone()),
+            || Some(def_creds.clone()),
+        )
+        .expect("resolved with nvs");
+        assert_eq!(src, ConfigSource::Nvs);
+        assert_eq!(res_creds.ssid.as_str(), "NvsAP");
+
+        // 3. Journal and NVS absent falls back to default
+        let (res_creds, src) = resolve_boot_wifi_with_journal(
+            None::<&MemConfigStore<16>>,
+            || None,
+            || Some(def_creds.clone()),
+        )
+        .expect("resolved with default");
+        assert_eq!(src, ConfigSource::Default);
+        assert_eq!(res_creds.ssid.as_str(), "DefAP");
+
+        // 4. Backward compatibility check for resolve_boot_wifi
+        let (res_creds, src) = resolve_boot_wifi(
+            || Some(nvs_creds.clone()),
+            || Some(def_creds.clone()),
+        )
+        .expect("resolved with resolve_boot_wifi");
+        assert_eq!(src, ConfigSource::Nvs);
+        assert_eq!(res_creds.ssid.as_str(), "NvsAP");
     }
 }

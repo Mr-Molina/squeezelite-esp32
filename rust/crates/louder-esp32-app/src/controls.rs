@@ -812,6 +812,179 @@ impl LedStripVisualizer {
     }
 }
 
+/// Gestures emitted by [`AdcButtonLadder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AdcButtonGesture {
+    /// Button was pressed and released before `long_press_ms`.
+    ShortPress(usize),
+    /// Button was held continuously for at least `long_press_ms`.
+    LongPress(usize),
+    /// Button was released after a `LongPress`.
+    Released(usize),
+}
+
+/// Multi-button resistor ladder connected to an analog-to-digital converter
+/// (ADC) channel.
+///
+/// Decodes up to `N` pushbuttons mapped to distinct nominal millivolt levels,
+/// providing configurable tolerance/hysteresis, debounce filtering, and
+/// short/long/release gesture detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdcButtonLadder<const N: usize> {
+    targets_mv: [u16; N],
+    tolerance_mv: u16,
+    debounce_ms: u32,
+    long_press_ms: u32,
+    raw_button: Option<usize>,
+    stable_button: Option<usize>,
+    last_edge_ms: u32,
+    press_start_ms: u32,
+    long_fired: bool,
+}
+
+impl<const N: usize> AdcButtonLadder<N> {
+    /// Creates a new [`AdcButtonLadder`] with target voltages in millivolts.
+    #[must_use]
+    pub const fn new(
+        targets_mv: [u16; N],
+        tolerance_mv: u16,
+        debounce_ms: u32,
+        long_press_ms: u32,
+    ) -> Self {
+        Self {
+            targets_mv,
+            tolerance_mv,
+            debounce_ms,
+            long_press_ms,
+            raw_button: None,
+            stable_button: None,
+            last_edge_ms: 0,
+            press_start_ms: 0,
+            long_fired: false,
+        }
+    }
+
+    /// Returns the target millivolt thresholds.
+    #[must_use]
+    pub const fn targets_mv(&self) -> &[u16; N] {
+        &self.targets_mv
+    }
+
+    /// Returns the current tolerance window in millivolts.
+    #[must_use]
+    pub const fn tolerance_mv(&self) -> u16 {
+        self.tolerance_mv
+    }
+
+    /// Sets the tolerance window in millivolts.
+    pub fn set_tolerance_mv(&mut self, tolerance_mv: u16) {
+        self.tolerance_mv = tolerance_mv;
+    }
+
+    /// Returns the debounce duration in milliseconds.
+    #[must_use]
+    pub const fn debounce_ms(&self) -> u32 {
+        self.debounce_ms
+    }
+
+    /// Sets the debounce duration in milliseconds.
+    pub fn set_debounce_ms(&mut self, debounce_ms: u32) {
+        self.debounce_ms = debounce_ms;
+    }
+
+    /// Returns the long-press threshold in milliseconds.
+    #[must_use]
+    pub const fn long_press_ms(&self) -> u32 {
+        self.long_press_ms
+    }
+
+    /// Sets the long-press threshold in milliseconds.
+    pub fn set_long_press_ms(&mut self, long_press_ms: u32) {
+        self.long_press_ms = long_press_ms;
+    }
+
+    /// Returns the currently debounced active button, if any.
+    #[must_use]
+    pub const fn stable_button(&self) -> Option<usize> {
+        self.stable_button
+    }
+
+    /// Returns `true` if any button on the ladder is currently debounced
+    /// and held.
+    #[must_use]
+    pub const fn is_pressed(&self) -> bool {
+        self.stable_button.is_some()
+    }
+
+    /// Finds the closest matching button index within `tolerance_mv` for
+    /// `sample_mv`.
+    #[must_use]
+    pub fn match_target(&self, sample_mv: u16) -> Option<usize> {
+        let mut best = None;
+        let mut min_diff = u16::MAX;
+        let mut i = 0usize;
+        while i < N {
+            let diff = sample_mv.abs_diff(self.targets_mv[i]);
+            if diff <= self.tolerance_mv && diff < min_diff {
+                min_diff = diff;
+                best = Some(i);
+            }
+            i += 1;
+        }
+        best
+    }
+
+    /// Updates the button ladder state with a new ADC millivolt sample at `now_ms`.
+    ///
+    /// Emits:
+    /// - [`AdcButtonGesture::LongPress`] once held for `long_press_ms`.
+    /// - [`AdcButtonGesture::Released`] when released following a `LongPress`.
+    /// - [`AdcButtonGesture::ShortPress`] when released before `long_press_ms`.
+    pub fn update(&mut self, sample_mv: u16, now_ms: u32) -> Option<AdcButtonGesture> {
+        let raw = self.match_target(sample_mv);
+        if raw != self.raw_button {
+            self.raw_button = raw;
+            self.last_edge_ms = now_ms;
+        }
+
+        if now_ms.wrapping_sub(self.last_edge_ms) < self.debounce_ms {
+            return None;
+        }
+
+        if self.raw_button != self.stable_button {
+            let prev = self.stable_button;
+            let was_long_fired = self.long_fired;
+            self.stable_button = self.raw_button;
+
+            if self.stable_button.is_some() {
+                self.press_start_ms = now_ms;
+                self.long_fired = false;
+            }
+
+            if let Some(prev_idx) = prev {
+                if was_long_fired {
+                    self.long_fired = false;
+                    return Some(AdcButtonGesture::Released(prev_idx));
+                } else {
+                    return Some(AdcButtonGesture::ShortPress(prev_idx));
+                }
+            }
+            return None;
+        }
+
+        if let Some(btn_idx) = self.stable_button {
+            let held_ms = now_ms.wrapping_sub(self.press_start_ms);
+            if !self.long_fired && held_ms >= self.long_press_ms {
+                self.long_fired = true;
+                return Some(AdcButtonGesture::LongPress(btn_idx));
+            }
+        }
+
+        None
+    }
+}
+
 /// Battery ADC filter, headphone jack detector, and speaker fault monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1030,5 +1203,74 @@ mod tests {
         batt.update_gpio_sensors(true, false);
         assert!(batt.is_jack_inserted());
         assert!(!batt.is_speaker_fault());
+    }
+
+    #[test]
+    fn test_adc_button_ladder_gestures_and_hysteresis() {
+        // Ladder with 3 buttons: 500 mV (btn 0), 1500 mV (btn 1), 2500 mV (btn 2)
+        let mut ladder = AdcButtonLadder::new([500, 1500, 2500], 100, 30, 300);
+        assert_eq!(ladder.targets_mv(), &[500, 1500, 2500]);
+        assert_eq!(ladder.tolerance_mv(), 100);
+        assert_eq!(ladder.debounce_ms(), 30);
+        assert_eq!(ladder.long_press_ms(), 300);
+        assert!(!ladder.is_pressed());
+
+        // 1. Initial idle at 3300 mV (no button)
+        assert_eq!(ladder.update(3300, 0), None);
+        assert!(!ladder.is_pressed());
+
+        // 2. Button 0 ShortPress: press at t=10, debounced at t=50,
+        // release at t=100, debounced release at t=140
+        assert_eq!(ladder.update(520, 10), None);
+        assert_eq!(ladder.update(510, 30), None); // still debouncing (20ms < 30ms)
+        assert_eq!(ladder.update(495, 50), None); // debounced -> stable_button = Some(0)
+        assert!(ladder.is_pressed());
+        assert_eq!(ladder.stable_button(), Some(0));
+
+        assert_eq!(ladder.update(3300, 100), None); // raw release edge
+        assert_eq!(ladder.update(3300, 120), None); // debouncing release
+        assert_eq!(
+            ladder.update(3300, 140),
+            Some(AdcButtonGesture::ShortPress(0))
+        );
+        assert!(!ladder.is_pressed());
+        assert_eq!(ladder.stable_button(), None);
+
+        // 3. Button 1 LongPress & Released: press at t=200, hold past 300ms,
+        // release at t=600
+        assert_eq!(ladder.update(1480, 200), None);
+        assert_eq!(ladder.update(1510, 240), None); // debounced Some(1) at t=240
+        assert!(ladder.is_pressed());
+        assert_eq!(ladder.stable_button(), Some(1));
+
+        // Advance to t=550 (held for 310ms > 300ms)
+        assert_eq!(
+            ladder.update(1500, 550),
+            Some(AdcButtonGesture::LongPress(1))
+        );
+        // Subsequent poll while still held -> None
+        assert_eq!(ladder.update(1500, 560), None);
+
+        // Release at t=600, debounced at t=640 -> Released(1)
+        assert_eq!(ladder.update(3300, 600), None);
+        assert_eq!(
+            ladder.update(3300, 640),
+            Some(AdcButtonGesture::Released(1))
+        );
+        assert!(!ladder.is_pressed());
+
+        // 4. Out-of-tolerance reject: 700 mV is not within 100 mV of 500, 1500, or 2500
+        assert_eq!(ladder.match_target(700), None);
+        assert_eq!(ladder.match_target(580), Some(0));
+        assert_eq!(ladder.match_target(1590), Some(1));
+        assert_eq!(ladder.match_target(2420), Some(2));
+
+        // 5. Mutators
+        ladder.set_tolerance_mv(150);
+        assert_eq!(ladder.tolerance_mv(), 150);
+        ladder.set_debounce_ms(50);
+        assert_eq!(ladder.debounce_ms(), 50);
+        ladder.set_long_press_ms(500);
+        assert_eq!(ladder.long_press_ms(), 500);
     }
 }

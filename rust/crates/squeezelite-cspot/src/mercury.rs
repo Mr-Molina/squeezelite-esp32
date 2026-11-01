@@ -223,6 +223,12 @@ impl MercuryHeader {
                         status_code = Some(val as i32);
                     }
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(MercuryError::TruncatedPacket);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)
                         .map_err(|_| MercuryError::TruncatedPacket)?
@@ -251,6 +257,12 @@ impl MercuryHeader {
                         }
                         _ => {}
                     }
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(MercuryError::TruncatedPacket);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(MercuryError::InvalidFraming),
             }
@@ -368,8 +380,11 @@ impl MercuryPacket {
         if part_count == 0 {
             return Err(MercuryError::InvalidFraming);
         }
+        if pos + part_count.saturating_mul(2) > data.len() {
+            return Err(MercuryError::TruncatedPacket);
+        }
 
-        let mut parts = Vec::with_capacity(part_count);
+        let mut parts = Vec::with_capacity(part_count.min(64));
         for _ in 0..part_count {
             if pos + 2 > data.len() {
                 return Err(MercuryError::TruncatedPacket);

@@ -307,24 +307,61 @@ pub fn montgomery_mod_pow(
     let n_limbs = modulus.limbs.clone();
     let n_prime = inv32(n_limbs[0]);
 
-    // Precompute R^2 mod N where R = 2^(32 * k)
-    let mut r = BigUint::one();
+    // Precompute R^2 mod N where R = 2^(32 * k) using fixed stack buffers
+    const MAX_LIMBS: usize = 128;
+    let mut r_limbs = [0u32; MAX_LIMBS];
+    let mut r_len = 1usize;
+    r_limbs[0] = 1;
+
+    let mod_limbs = &modulus.limbs;
     for _ in 0..(2 * 32 * k) {
-        let mut limbs = Vec::with_capacity(r.limbs.len() + 1);
         let mut carry = 0u32;
-        for &limb in &r.limbs {
-            limbs.push((limb << 1) | carry);
-            carry = limb >> 31;
+        for limb in &mut r_limbs[..r_len] {
+            let val = *limb;
+            *limb = (val << 1) | carry;
+            carry = val >> 31;
         }
-        if carry > 0 {
-            limbs.push(carry);
+        if carry > 0 && r_len < MAX_LIMBS {
+            r_limbs[r_len] = carry;
+            r_len += 1;
         }
-        r = BigUint { limbs };
-        r.normalize();
-        if r >= *modulus {
-            r = r.sub(modulus);
+
+        while r_len > 0 && r_limbs[r_len - 1] == 0 {
+            r_len -= 1;
+        }
+        let is_ge = if r_len > mod_limbs.len() {
+            true
+        } else if r_len < mod_limbs.len() {
+            false
+        } else {
+            let mut ge = true;
+            for i in (0..r_len).rev() {
+                if r_limbs[i] > mod_limbs[i] {
+                    ge = true;
+                    break;
+                } else if r_limbs[i] < mod_limbs[i] {
+                    ge = false;
+                    break;
+                }
+            }
+            ge
+        };
+
+        if is_ge {
+            let mut borrow = 0u64;
+            for i in 0..r_len {
+                let m = if i < mod_limbs.len() { mod_limbs[i] as u64 } else { 0 };
+                let diff = (r_limbs[i] as u64).wrapping_sub(m).wrapping_sub(borrow);
+                r_limbs[i] = diff as u32;
+                borrow = (diff >> 63) & 1;
+            }
+            while r_len > 0 && r_limbs[r_len - 1] == 0 {
+                r_len -= 1;
+            }
         }
     }
+
+    let r = BigUint { limbs: r_limbs[..r_len].to_vec() };
 
     let mut base_padded = base.limbs.clone();
     base_padded.resize(k, 0);
@@ -344,10 +381,12 @@ pub fn montgomery_mod_pow(
     for bit_idx in 0..bit_count {
         let limb_idx = bit_idx / 32;
         let bit_in_limb = bit_idx % 32;
-        let is_bit_set = (exp.limbs[limb_idx] & (1 << bit_in_limb)) != 0;
+        let bit = (exp.limbs[limb_idx] >> bit_in_limb) & 1;
 
-        if is_bit_set {
-            res_bar = mont_mul(&res_bar, &current_base_bar, &n_limbs, n_prime);
+        let next = mont_mul(&res_bar, &current_base_bar, &n_limbs, n_prime);
+        let mask = 0u32.wrapping_sub(bit);
+        for i in 0..res_bar.len() {
+            res_bar[i] = (next[i] & mask) | (res_bar[i] & !mask);
         }
         current_base_bar =
             mont_mul(&current_base_bar, &current_base_bar, &n_limbs, n_prime);

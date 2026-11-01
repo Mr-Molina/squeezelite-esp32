@@ -342,7 +342,7 @@ impl TrackProgress {
     #[must_use]
     pub fn elapsed_ms(&self, sample_rate_hz: u32) -> u32 {
         let rate = u64::from(sample_rate_hz.max(1));
-        let delta = u64::from(self.rtp_current.saturating_sub(self.rtp_start));
+        let delta = u64::from(self.rtp_current.wrapping_sub(self.rtp_start));
         ((delta * 1000) / rate) as u32
     }
 
@@ -350,7 +350,7 @@ impl TrackProgress {
     #[must_use]
     pub fn duration_ms(&self, sample_rate_hz: u32) -> u32 {
         let rate = u64::from(sample_rate_hz.max(1));
-        let delta = u64::from(self.rtp_end.saturating_sub(self.rtp_start));
+        let delta = u64::from(self.rtp_end.wrapping_sub(self.rtp_start));
         ((delta * 1000) / rate) as u32
     }
 }

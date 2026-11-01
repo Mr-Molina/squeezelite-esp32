@@ -488,10 +488,7 @@ impl NowPlayingUi {
             let _ = new_icon.push_str("PLAY");
         }
 
-        if new_title != self.title_label
-            || new_subtitle != self.subtitle_label
-            || new_icon != self.play_pause_icon
-        {
+        if new_title != self.title_label || new_subtitle != self.subtitle_label {
             self.title_label = new_title;
             self.subtitle_label = new_subtitle;
             self.dirty_flags |= DIRTY_TRACK;
@@ -1039,6 +1036,28 @@ mod tests {
         assert!(ui.is_offline());
         assert_eq!(ui.play_pause_icon(), "PLAY");
         assert_eq!(ui.progress_percent(), 0);
+    }
+
+    #[test]
+    fn test_ui_play_pause_transition_does_not_dirty_track_region() {
+        let mut ui = NowPlayingUi::new();
+        let mut state = CydTelemetryState::default();
+        let _ = state.title.push_str("Song Title");
+        let _ = state.artist.push_str("Artist Name");
+        state.state = PlayState::Paused;
+        state.link_active = true;
+
+        ui.update(&state);
+        ui.clear_dirty();
+        assert_eq!(ui.dirty_flags(), 0);
+
+        // State changes to Playing, but track title and artist are unchanged
+        state.state = PlayState::Playing;
+        ui.update(&state);
+
+        // PERF-602: DIRTY_TRANSPORT must be set, but DIRTY_TRACK must not be
+        assert_eq!(ui.dirty_flags() & DIRTY_TRANSPORT, DIRTY_TRANSPORT);
+        assert_eq!(ui.dirty_flags() & DIRTY_TRACK, 0);
     }
 
     #[test]

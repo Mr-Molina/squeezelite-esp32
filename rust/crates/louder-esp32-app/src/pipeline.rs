@@ -436,7 +436,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             if avail_frames == 0 {
                 return Ok(0);
             }
-            let (consumed, frames_produced) = match self.decoder.decode(&[], &mut self.pcm_scratch)
+            let max_scratch_samples = self.max_decode_scratch_samples();
+            let (consumed, frames_produced) = match self
+                .decoder
+                .decode(&[], &mut self.pcm_scratch[..max_scratch_samples])
             {
                 Ok(res) => res,
                 Err(DecoderError::NeedMoreData) => (0, 0),
@@ -445,6 +448,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             };
 
             if frames_produced > 0 {
+                self.check_decoder_sample_rate();
                 self.mark_track_start();
                 let frames_produced = self.resample_decoded_pcm(frames_produced);
                 let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
@@ -490,9 +494,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Err(DecoderError::NeedMoreData);
         }
 
+        let max_scratch_samples = self.max_decode_scratch_samples();
         let (consumed, frames_produced) = match self
             .decoder
-            .decode(&self.read_scratch[..peeked], &mut self.pcm_scratch)
+            .decode(&self.read_scratch[..peeked], &mut self.pcm_scratch[..max_scratch_samples])
         {
             Ok(res) => res,
             Err(DecoderError::NeedMoreData) => return Err(DecoderError::NeedMoreData),
@@ -511,6 +516,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
 
         if frames_produced > 0 {
+            self.check_decoder_sample_rate();
             // The decoder's rate is the next track's rate, applied when playback reaches
             // the track start (C parity: pcm.c:216-236, mad.c:254-256,
             // flac.c:147-170 set `output.next_sample_rate` with `track_start`;
@@ -551,8 +557,58 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         Ok(consumed)
     }
 
+    /// Returns the maximum scratch buffer slice length in `i32` samples to
+    /// pass into the active decoder. When the polyphase FIR resampler is
+    /// upsampling (`to_hz > from_hz`), the decode budget is clamped so the
+    /// resampled output frames never exceed `PCM_SCRATCH_FRAMES`
+    /// (`PCM_SCRATCH_SAMPLES / 2`), guaranteeing that zero resampled audio
+    /// frames are dropped (LOGIC-201 / PERF-201).
+    fn max_decode_scratch_samples(&self) -> usize {
+        if let Some(ref resampler) = self.resampler {
+            let to_hz = u64::from(resampler.to_hz());
+            let from_hz = u64::from(resampler.from_hz().max(1));
+            if to_hz > from_hz {
+                let pcm_scratch_frames = (PCM_SCRATCH_SAMPLES / 2) as u64;
+                let max_frames = (pcm_scratch_frames.saturating_sub(4) * from_hz) / to_hz;
+                let mut max_samples = (max_frames as usize * 2).clamp(2, PCM_SCRATCH_SAMPLES);
+                if matches!(self.decoder, ActiveDecoder::Mp3(_)) {
+                    max_samples = max_samples.clamp(2304, PCM_SCRATCH_SAMPLES);
+                }
+                return max_samples;
+            }
+        }
+        PCM_SCRATCH_SAMPLES
+    }
+
+    /// Inspects the active decoder's detected sample rate and updates the
+    /// pipeline, retuning the 10-band equalizer and reconfiguring or disengaging
+    /// the resampler if the stream's sample rate changed dynamically (LOGIC-202).
+    fn check_decoder_sample_rate(&mut self) {
+        if let Some(sr) = self.decoder.sample_rate() {
+            if sr > 0 && sr != self.active_sample_rate_hz {
+                self.active_sample_rate_hz = sr;
+                self.retune_equalizer();
+                if let Some(r) = self.resampler.as_ref() {
+                    let to_hz = r.to_hz();
+                    let quality = r.quality();
+                    if r.from_hz() != sr {
+                        if sr == to_hz {
+                            self.clear_resampler();
+                        } else {
+                            self.configure_resampler(sr, to_hz, quality);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Passes `frames_produced` stereo frames in `self.pcm_scratch` through the
     /// optional polyphase [`Resampler`] stage before EQ and output buffering.
+    ///
+    /// Processes chunks in bounded 64-frame (`[0i32; 256]`) windows with zero
+    /// heap allocations and moves input samples to the end of `pcm_scratch` so
+    /// output samples never overwrite pending input (LOGIC-201 / PERF-201).
     fn resample_decoded_pcm(&mut self, frames_produced: usize) -> usize {
         let Some(resampler) = self.resampler.as_mut() else {
             return frames_produced;
@@ -561,25 +617,35 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         if in_samples == 0 {
             return 0;
         }
-        let to_hz = u64::from(resampler.to_hz());
-        let from_hz = u64::from(resampler.from_hz().max(1));
-        let est_frames = ((frames_produced as u64) * to_hz).div_ceil(from_hz) as usize + 8;
-        let max_out_samples = (est_frames * 2).min(PCM_SCRATCH_SAMPLES);
-        if max_out_samples <= 512 {
-            let mut stack_out = [0i32; 512];
-            let (_consumed, produced) = resampler.process(
-                &self.pcm_scratch[..in_samples],
-                &mut stack_out[..max_out_samples],
+
+        // Relocate input samples to the end of pcm_scratch so in-place writing at
+        // pcm_scratch[0..out_pos] never collides with pending input.
+        let in_start = PCM_SCRATCH_SAMPLES.saturating_sub(in_samples);
+        self.pcm_scratch.copy_within(0..in_samples, in_start);
+
+        let mut in_pos = in_start;
+        let in_end = in_start + in_samples;
+        let mut out_pos = 0;
+        let mut chunk_out = [0i32; 256];
+
+        while in_pos < in_end && out_pos < PCM_SCRATCH_SAMPLES {
+            let max_chunk = chunk_out.len().min(PCM_SCRATCH_SAMPLES - out_pos);
+            let (consumed, produced) = resampler.process(
+                &self.pcm_scratch[in_pos..in_end],
+                &mut chunk_out[..max_chunk],
             );
-            self.pcm_scratch[..produced].copy_from_slice(&stack_out[..produced]);
-            produced / 2
-        } else {
-            let mut heap_out = alloc::vec![0i32; max_out_samples];
-            let (_consumed, produced) =
-                resampler.process(&self.pcm_scratch[..in_samples], &mut heap_out);
-            self.pcm_scratch[..produced].copy_from_slice(&heap_out[..produced]);
-            produced / 2
+            if produced > 0 {
+                self.pcm_scratch[out_pos..out_pos + produced]
+                    .copy_from_slice(&chunk_out[..produced]);
+                out_pos += produced;
+            }
+            in_pos += consumed;
+            if consumed == 0 && produced == 0 {
+                break;
+            }
         }
+
+        out_pos / 2
     }
 
     /// Flushes output ringbuffer frames to the audio output sink (I2S DMA).
@@ -1274,8 +1340,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
     /// Returns the effective sample rate (in Hz) used for RBJ equalizer synthesis.
     #[must_use]
-    const fn effective_sample_rate_hz(&self) -> u32 {
-        if self.active_sample_rate_hz > 0 {
+    pub fn effective_sample_rate_hz(&self) -> u32 {
+        if let Some(ref r) = self.resampler {
+            r.to_hz()
+        } else if self.active_sample_rate_hz > 0 {
             self.active_sample_rate_hz
         } else if self.sample_rate > 0 {
             self.sample_rate
@@ -1321,8 +1389,32 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         true
     }
 
-    /// Disengages and drops any active polyphase FIR resampler.
+    /// Drains the FIR group-delay tail of the active polyphase resampler into
+    /// the output buffer so the final audio frames are not abruptly truncated
+    /// on EOF (LOGIC-207).
+    pub fn flush_resampler_tail(&mut self) {
+        let Some(resampler) = self.resampler.as_mut() else {
+            return;
+        };
+        let mut tail_buf = [0i32; 256];
+        loop {
+            let produced = resampler.flush(&mut tail_buf);
+            if produced == 0 {
+                break;
+            }
+            self.equalizer.process_interleaved(&mut tail_buf[..produced]);
+            let pcm_bytes: &[u8] = bytemuck::cast_slice(&tail_buf[..produced]);
+            let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+            if written < pcm_bytes.len() {
+                break;
+            }
+        }
+    }
+
+    /// Disengages and drops any active polyphase FIR resampler after draining
+    /// any remaining group-delay tail frames into the output buffer (LOGIC-207).
     pub fn clear_resampler(&mut self) {
+        self.flush_resampler_tail();
         self.resampler = None;
     }
 
@@ -3119,6 +3211,74 @@ mod tests {
         );
 
         p.clear_resampler();
+        assert!(!p.is_resampler_engaged());
+    }
+
+    #[test]
+    fn test_pipeline_resampler_upsample_clamp_and_flush_tail() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 32768]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.set_sample_rate(96_000).unwrap();
+
+        // 44.1 kHz -> 96 kHz upsampling
+        assert!(p.configure_resampler(44_100, 96_000, ResampleQuality::Low));
+        assert!(p.is_resampler_engaged());
+
+        // max_decode_scratch_samples must be clamped below PCM_SCRATCH_SAMPLES
+        let max_samples = p.max_decode_scratch_samples();
+        assert!(max_samples < PCM_SCRATCH_SAMPLES);
+        assert!(max_samples > 0);
+
+        p.begin_stream(44_100, 0, 0);
+        p.open_stream();
+        feed(&mut p, &track_pcm(1, 100));
+
+        let out_frames_before = p.output_buffer_available() / OUTPUT_FRAME_BYTES;
+        assert!(out_frames_before > 0);
+
+        // Flushing resampler tail on stream end
+        p.flush_resampler_tail();
+        let out_frames_after = p.output_buffer_available() / OUTPUT_FRAME_BYTES;
+        assert!(out_frames_after >= out_frames_before);
+
+        p.clear_resampler();
+        assert!(!p.is_resampler_engaged());
+    }
+
+    #[test]
+    fn test_pipeline_dynamic_sample_rate_retunes_and_reconfigures_resampler() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 32768]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        // Initially 44.1 kHz -> 48 kHz resampler
+        p.configure_resampler(44_100, 48_000, ResampleQuality::Low);
+        assert!(p.is_resampler_engaged());
+        assert_eq!(p.active_sample_rate_hz, 44_100);
+
+        // Simulate decoder reporting 48 kHz (now matching resampler to_hz)
+        // With PcmDecoder, feed a WAV header with 48000 Hz
+        let mut header = [0u8; 44];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&(44u32 + 8 - 8).to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&16u32.to_le_bytes());
+        header[20..22].copy_from_slice(&1u16.to_le_bytes());
+        header[22..24].copy_from_slice(&2u16.to_le_bytes());
+        header[24..28].copy_from_slice(&48000u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(48000u32 * 4).to_le_bytes());
+        header[32..34].copy_from_slice(&4u16.to_le_bytes());
+        header[34..36].copy_from_slice(&16u16.to_le_bytes());
+        header[36..40].copy_from_slice(b"data");
+        header[40..44].copy_from_slice(&16u32.to_le_bytes());
+
+        p.ingest_stream_data(&header).unwrap();
+        p.ingest_stream_data(&[0u8; 16]).unwrap();
+        let _ = p.process_decode_step();
+
+        // Active sample rate updated to 48000, and resampler cleared because
+        // in_rate == out_rate == 48000.
+        assert_eq!(p.active_sample_rate_hz, 48_000);
         assert!(!p.is_resampler_engaged());
     }
 }

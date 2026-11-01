@@ -638,6 +638,8 @@ mod device {
     /// sector A (0x3FE000), byte-identical to the certified build.
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut FirmwareState) {
+        s.core1.park_for_flash_write();
+        let _ = s.amp.set_mute(true);
         s.config.flush_now(&mut *s.journal);
         if let Some(image) = s.journal.pending_image() {
             // Default build: sector A (0x3FE000) as a constant, exactly the certified write
@@ -649,7 +651,6 @@ mod device {
             let offset = SETTINGS_JOURNAL_OFFSET;
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-            s.core1.park_for_flash_write();
             let _ = s.flash.erase(offset, offset + 4096);
             let _ = s.flash.write(offset, image.sector);
         }
@@ -848,16 +849,11 @@ mod device {
             }
         }
 
-        // An LMS track took over the output: A2DP has to start over when LMS is done.
-        if s.bt_audio_active && lms_audio_active(s.coordinator) {
-            s.bt_audio_active = false;
-        }
-
         // Poll Bluetooth Classic A2DP Sink
         if let Some(ref mut transport) = s.bt_transport {
             s.bt_sink
                 .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                    if !lms_audio_active(s.coordinator) {
+                    if s.coordinator.request_source(louder_esp32_app::AudioSource::Bluetooth) {
                         if s.coordinator.current_sample_rate != sample_rate_hz
                             || s.pipeline.sample_rate != sample_rate_hz
                         {
@@ -873,7 +869,7 @@ mod device {
                             // `current_replay_gain` set, decode_external.c:147-154).
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback();
+                            s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -883,12 +879,13 @@ mod device {
                     }
                 });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() && !lms_audio_active(s.coordinator) {
+            if s.bt_audio_active && !s.bt_sink.is_streaming() {
                 if s.pipeline.stream_buffer.available_read() == 0
                     && s.pipeline.output_buffer.available_read() == 0
                     && !s.pipeline.has_pending_pcm()
                 {
-                    s.coordinator.end_external_playback();
+                    s.coordinator.release_source(louder_esp32_app::AudioSource::Bluetooth);
+                    s.coordinator.end_external_playback_and_restore(s.pipeline);
                     s.bt_audio_active = false;
                 }
             }
@@ -1234,6 +1231,13 @@ mod device {
                                 s.pending_http_action = action;
                                 s.pending_action_deadline_ms = now_ms + 250;
                             }
+                            HttpControlAction::UpdateConfig => {
+                                s.config.flush_now(&mut *s.journal);
+                            }
+                            HttpControlAction::ExecuteCliCommand
+                            | HttpControlAction::TriggerWifiScan
+                            | HttpControlAction::ConnectWifi
+                            | HttpControlAction::StartOtaFlash => {}
                             _ => {}
                         }
                     } else {
@@ -1508,21 +1512,42 @@ mod device {
         );
     }
 
+    pub(crate) static CONSECUTIVE_FAULTS: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(0);
+    pub(crate) static LAST_RECOVERY_MS: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+
     /// `watchdog_lease`: TAS58xx fault recovery + telemetry refresh every 2 s.
+    ///
+    /// Throttles consecutive automatic `recover_from_fault()` calls with a 30s
+    /// cooldown after 3 consecutive failures to avoid hammering the TAS58xx
+    /// registers during hard overcurrent (OC) or overtemperature (OTSD) faults
+    /// (LOGIC-603 / PERF-601).
     #[inline(never)]
     fn amp_health(s: &mut FirmwareState) {
         let now_ms = s.now_ms;
         if now_ms.saturating_sub(s.last_fault_check_ms) >= 2_000 {
             s.last_fault_check_ms = now_ms;
-            if s.coordinator.state == louder_esp32_app::PlayerState::Playing {
-                if let Ok(Some(fault)) = s.amp.check_faults() {
+            if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
+                s.latest_telemetry = Some(telem);
+                if s.coordinator.state == louder_esp32_app::PlayerState::Playing {
                     if !fault.is_clean() {
-                        let _ = s.amp.recover_from_fault();
+                        let faults = CONSECUTIVE_FAULTS.load(core::sync::atomic::Ordering::Relaxed);
+                        let last_rec = LAST_RECOVERY_MS.load(core::sync::atomic::Ordering::Relaxed);
+                        let now_u32 = now_ms as u32;
+                        let in_cooldown = faults >= 3 && now_u32.wrapping_sub(last_rec) < 30_000;
+                        if !in_cooldown {
+                            let _ = s.amp.recover_from_fault();
+                            LAST_RECOVERY_MS.store(now_u32, core::sync::atomic::Ordering::Relaxed);
+                            CONSECUTIVE_FAULTS.store(
+                                faults.saturating_add(1),
+                                core::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                    } else {
+                        CONSECUTIVE_FAULTS.store(0, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
-            }
-            if let Ok(telem) = s.amp.read_telemetry() {
-                s.latest_telemetry = telem;
             }
         }
     }
@@ -1681,5 +1706,60 @@ mod tests {
             assert_eq!(EVT.try_receive(), Ok(evt));
         }
         assert!(EVT.try_receive().is_err());
+    }
+
+    #[test]
+    fn test_wo255_amp_health_consecutive_fault_throttling() {
+        let mut consecutive_faults = 3u8;
+        let last_recovery_ms = 100_000u32;
+
+        // Within 30s cooldown (e.g. at 110_000 ms), in_cooldown is true
+        let now_u32 = 110_000u32;
+        let in_cooldown =
+            consecutive_faults >= 3 && now_u32.wrapping_sub(last_recovery_ms) < 30_000;
+        assert!(in_cooldown);
+
+        // After 30s cooldown (e.g. at 135_000 ms), in_cooldown is false
+        let now_after = 135_000u32;
+        let in_cooldown_after =
+            consecutive_faults >= 3 && now_after.wrapping_sub(last_recovery_ms) < 30_000;
+        assert!(!in_cooldown_after);
+
+        // Clean fault resets consecutive counter
+        consecutive_faults = 0;
+        assert_eq!(consecutive_faults, 0);
+    }
+
+    #[test]
+    fn test_wo255_bt_source_arbiter_priority_transitions() {
+        use louder_esp32_app::{AudioSource, SourceArbiter};
+        let mut arb = SourceArbiter::new();
+
+        // SlimProto plays (priority 1)
+        assert!(arb.request_source(AudioSource::SlimProto));
+        assert_eq!(arb.active_source(), AudioSource::SlimProto);
+
+        // Bluetooth starts (priority 2): preempts SlimProto (priority 1)
+        assert!(arb.request_source(AudioSource::Bluetooth));
+        assert_eq!(arb.active_source(), AudioSource::Bluetooth);
+        assert!(arb.is_suspended(AudioSource::SlimProto));
+
+        // Spotify starts (priority 3): preempts Bluetooth
+        assert!(arb.request_source(AudioSource::Spotify));
+        assert_eq!(arb.active_source(), AudioSource::Spotify);
+        assert!(arb.is_suspended(AudioSource::Bluetooth));
+        assert!(arb.is_suspended(AudioSource::SlimProto));
+
+        // Bluetooth tries to request while Spotify plays: rejected (yields to Spotify)
+        assert!(!arb.request_source(AudioSource::Bluetooth));
+        assert_eq!(arb.active_source(), AudioSource::Spotify);
+
+        // Spotify ends: releases and promotes Bluetooth
+        arb.release_source(AudioSource::Spotify);
+        assert_eq!(arb.active_source(), AudioSource::Bluetooth);
+
+        // Bluetooth ends: releases and promotes SlimProto
+        arb.release_source(AudioSource::Bluetooth);
+        assert_eq!(arb.active_source(), AudioSource::SlimProto);
     }
 }

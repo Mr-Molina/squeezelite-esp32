@@ -88,6 +88,7 @@ pub const OPCODE_LINK_KEY_REQUEST_REPLY: u16 = 0x040B;
 pub const OPCODE_LINK_KEY_REQUEST_NEGATIVE_REPLY: u16 = 0x040C;
 pub const OPCODE_IO_CAPABILITY_REQUEST_REPLY: u16 = 0x042B;
 pub const OPCODE_USER_CONFIRMATION_REQUEST_REPLY: u16 = 0x042C;
+pub const OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY: u16 = 0x042D;
 
 // HCI Event Codes
 pub const EVT_INQUIRY_COMPLETE: u8 = 0x01;
@@ -3281,6 +3282,11 @@ impl BtA2dpSink {
                     if self.security_policy.pairing_policy == BtPairingPolicy::BondedOnly
                         && self.find_bond_key(&bd_addr).is_none()
                     {
+                        Self::send_cmd(
+                            transport,
+                            OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY,
+                            &params[..6],
+                        );
                         return;
                     }
                     Self::send_cmd(transport, OPCODE_USER_CONFIRMATION_REQUEST_REPLY, &params[..6]);
@@ -4397,11 +4403,7 @@ impl BtA2dpSink {
             let len = payload.len().min(64);
             rsp[..len].copy_from_slice(&payload[..len]);
             rsp[0] = (payload[0] & 0xF0) | 0x02;
-            rsp[3] = if ctype_or_rsp == AVRCP_CTYPE_STATUS {
-                AVRCP_RSP_STABLE
-            } else {
-                AVRCP_RSP_ACCEPTED
-            };
+            rsp[3] = AVRCP_RSP_NOT_IMPLEMENTED;
             Self::send_l2cap(transport, handle, cid, &rsp[..len]);
         } else {
             // Response from peer (Target -> Controller)
@@ -4730,6 +4732,72 @@ mod tests {
         let last_cmd = transport.tx_packets.last().unwrap();
         assert_eq!(u16::from_le_bytes([last_cmd[1], last_cmd[2]]), OPCODE_LINK_KEY_REQUEST_REPLY);
         assert_eq!(&last_cmd[10..26], &dummy_key);
+    }
+
+    #[test]
+    fn test_ssp_bonded_only_negative_reply() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.security_policy.pairing_policy = BtPairingPolicy::BondedOnly;
+        let peer_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+        let user_confirm_req = [
+            HCI_PKT_EVENT,
+            EVT_USER_CONFIRMATION_REQUEST,
+            10,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x12, 0x34, 0x56, 0x78,
+        ];
+        sink.process_packet(&mut transport, &user_confirm_req, |_, _| {});
+        let last_cmd = transport.tx_packets.last().unwrap();
+        assert_eq!(
+            u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
+            OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+        );
+        assert_eq!(&last_cmd[4..10], &peer_addr);
+    }
+
+    #[test]
+    fn test_avrcp_fallback_not_implemented() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        let avrcp_cid = 0x0048;
+        sink.active_handle = Some(0x0040);
+        sink.channels[1] = L2capChannel {
+            local_cid: avrcp_cid,
+            remote_cid: 0x0044,
+            psm: PSM_AVRCP,
+            state: ChannelState::Configured,
+            channel_type: ChannelType::Avrcp,
+            handle: 0x0040,
+            outbound_config_sent: true,
+        };
+
+        // Unknown vendor-dependent PDU (e.g. PDU ID 0xFE with Company ID 0x001958)
+        let unknown_vendor_cmd = [
+            0x00, // AVCTP: tx_label 0, cr 0 (command)
+            (AVRCP_PID >> 8) as u8,
+            AVRCP_PID as u8,
+            AVRCP_CTYPE_CONTROL,
+            0x48, // Subunit: Panel
+            AVRCP_OPCODE_VENDOR_DEPENDENT,
+            0x00, 0x19, 0x58, // BT_SIG_COMPANY_ID
+            0xFE, // Unknown PDU
+            0x00, // Packet type: Single
+            0x00, 0x00, // Parameter length: 0
+        ];
+        let mut acl = Vec::new();
+        acl.push(HCI_PKT_ACL);
+        acl.extend_from_slice(&0x2040u16.to_le_bytes());
+        let l2cap_len = unknown_vendor_cmd.len() as u16;
+        acl.extend_from_slice(&(4 + l2cap_len).to_le_bytes());
+        acl.extend_from_slice(&l2cap_len.to_le_bytes());
+        acl.extend_from_slice(&avrcp_cid.to_le_bytes());
+        acl.extend_from_slice(&unknown_vendor_cmd);
+
+        sink.process_packet(&mut transport, &acl, |_, _| {});
+        let last_tx = transport.tx_packets.last().expect("fallback rsp");
+        assert_eq!(last_tx[9 + 3], AVRCP_RSP_NOT_IMPLEMENTED);
     }
 
     #[test]

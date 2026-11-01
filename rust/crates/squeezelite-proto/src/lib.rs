@@ -579,18 +579,38 @@ impl SlimprotoParser {
         if payload.len() < 18 {
             return Err(ParseError::InvalidFormat);
         }
-        let old_left = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        let old_right = i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let old_left = i32::from_be_bytes([
+            payload[0], payload[1], payload[2], payload[3],
+        ]);
+        let old_right = i32::from_be_bytes([
+            payload[4], payload[5], payload[6], payload[7],
+        ]);
         let digital_atten = payload[8];
         let preamp = payload[9];
-        let raw_left = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
-        let raw_right = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
+        let raw_left = u32::from_be_bytes([
+            payload[10], payload[11], payload[12], payload[13],
+        ]);
+        let raw_right = u32::from_be_bytes([
+            payload[14], payload[15], payload[16], payload[17],
+        ]);
 
-        // Legacy negative dB value in old_gain_left/right indicates mute when
-        // 16.16 fixed-point gain is zero (CODE-PROTO-001)
-        let _ = (old_left, old_right);
-        let gain_left = raw_left;
-        let gain_right = raw_right;
+        // Legacy negative dB value in old_left/old_right indicates mute when
+        // 16.16 fixed-point gain is zero (LOGIC-503).
+        let (gain_left, gain_right) = if raw_left == 0 && raw_right == 0 {
+            let gl = if old_left <= 0 {
+                0
+            } else {
+                (old_left as u32) << 8
+            };
+            let gr = if old_right <= 0 {
+                0
+            } else {
+                (old_right as u32) << 8
+            };
+            (gl, gr)
+        } else {
+            (raw_left, raw_right)
+        };
 
         Ok(ServerCommand::AudioGain {
             gain_left,
@@ -1802,6 +1822,31 @@ mod tests {
                 gain_right: 0x00010000,
                 digital_atten: 1,
                 preamp: 255,
+            }
+        );
+    }
+
+    #[test]
+    fn test_audg_legacy_positive_old_gain_scaled() {
+        // LOGIC-503: when raw gains are 0, positive old gains scale by << 8
+        let mut frame = [0u8; 26];
+        frame[0..4].copy_from_slice(b"audg");
+        frame[4..8].copy_from_slice(&18u32.to_be_bytes());
+        frame[8..12].copy_from_slice(&100i32.to_be_bytes());
+        frame[12..16].copy_from_slice(&50i32.to_be_bytes());
+        frame[16] = 0;
+        frame[17] = 128;
+        frame[18..22].copy_from_slice(&0u32.to_be_bytes());
+        frame[22..26].copy_from_slice(&0u32.to_be_bytes());
+
+        let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
+        assert_eq!(
+            cmd,
+            ServerCommand::AudioGain {
+                gain_left: 100 << 8,
+                gain_right: 50 << 8,
+                digital_atten: 0,
+                preamp: 128,
             }
         );
     }

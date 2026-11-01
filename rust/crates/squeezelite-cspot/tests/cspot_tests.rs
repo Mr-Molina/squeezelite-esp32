@@ -229,7 +229,8 @@ fn test_zeroconf_get_info() {
     let device_id = "142137fd329622137a149016c82e18beb834";
     let remote_name = "BASEMENT";
 
-    let resp = ZeroConfServer::handle_request(
+    let mut server = ZeroConfServer::new();
+    let resp = server.handle_request(
         "/?action=getInfo",
         "",
         &dh,
@@ -738,4 +739,50 @@ fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
     assert_eq!(sm.current_track(), Some("spotify:track:track_2"));
     assert_eq!(sm.position_ms(), 0);
 }
+
+#[test]
+fn test_wo253_spirc_empty_queue_clears_current_track() {
+    let mut sm = SpircStateMachine::new();
+    sm.set_track_queue(vec!["spotify:track:abc".to_string()], 0);
+    assert_eq!(sm.current_track(), Some("spotify:track:abc"));
+    sm.set_track_queue(Vec::new(), 0);
+    assert_eq!(sm.current_track(), None);
+}
+
+#[test]
+fn test_wo253_zeroconf_url_decode_utf8() {
+    use squeezelite_cspot::zeroconf::get_param;
+    let query = "userName=Caf%C3%A9+User&device=ESP32";
+    let user = get_param(query, "userName").expect("username");
+    assert_eq!(user, "Café User");
+}
+
+#[test]
+fn test_wo253_mercury_truncated_part_allocation() {
+    // seq_len = 2, seq_id = 0x0102, flags = 0x01, part_count = 1000
+    // but data ends right after part_count
+    let corrupt = vec![0x00, 0x02, 0x01, 0x02, 0x01, 0x03, 0xE8];
+    let err = MercuryPacket::decode(0xB2, &corrupt);
+    assert_eq!(err, Err(MercuryError::TruncatedPacket));
+}
+
+#[test]
+fn test_wo253_spirc_protobuf_wire_types_1_and_5() {
+    // Construct a protobuf Track submessage with unknown wire type 1 and 5 fields
+    let mut data = Vec::new();
+    // Field 99 (wire type 1 = 64-bit fixed)
+    data.push((99 << 3) | 1);
+    data.extend_from_slice(&0x1122334455667788u64.to_le_bytes());
+    // Field 98 (wire type 5 = 32-bit fixed)
+    data.push((98 << 3) | 5);
+    data.extend_from_slice(&0xAABBCCDDu32.to_le_bytes());
+    // Field 2 (string, wire type 2): title = "Test Song"
+    data.push((2 << 3) | 2);
+    data.push(9);
+    data.extend_from_slice(b"Test Song");
+
+    let meta = TrackMetadata::decode_protobuf(&data).expect("decode with fixed32/fixed64");
+    assert_eq!(meta.title, "Test Song");
+}
+
 

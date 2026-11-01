@@ -427,6 +427,34 @@ where
         }
     }
 
+    /// Sets hardware mute state on the amplifier (`0xFF` mute).
+    pub fn set_mute(&mut self, mute: bool) -> Result<(), DriverError<E>> {
+        if mute {
+            self.set_volume(VOL_MUTE)
+        } else {
+            self.set_volume(self.current_volume)
+        }
+    }
+
+    /// Checks fault status registers and silicon telemetry in a single
+    /// coalesced operation (PERF-601).
+    pub fn check_faults_and_telemetry(
+        &mut self,
+    ) -> Result<Option<(FaultStatus, Tas5805mTelemetry)>, DriverError<E>> {
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => {
+                let (faults, telem) = driver.check_faults_and_telemetry()?;
+                Ok(Some((faults, telem)))
+            }
+            Some(AmpInner::Standby(driver)) => {
+                let faults = driver.check_faults()?;
+                let telem = driver.read_telemetry()?;
+                Ok(Some((faults, telem)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Sets volume from logical percent (`0..=100%`) by converting to TAS58xx
     /// attenuation code before writing `DIG_VOL_CTRL` (PERIPH-601).
     pub fn set_volume_percent(&mut self, percent: u8) -> Result<(), DriverError<E>> {

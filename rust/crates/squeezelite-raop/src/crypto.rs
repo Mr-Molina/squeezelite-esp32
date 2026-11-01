@@ -25,6 +25,8 @@ pub enum CryptoError {
     InvalidModulus,
     /// BigUint parsing error.
     InvalidNumber,
+    /// Base64 decoding failed or invalid input length.
+    InvalidBase64,
 }
 
 impl fmt::Display for CryptoError {
@@ -36,6 +38,7 @@ impl fmt::Display for CryptoError {
             Self::InvalidKeyLength => write!(f, "Expected 16-byte AES-128 key"),
             Self::InvalidModulus => write!(f, "Modulus must be odd and non-zero"),
             Self::InvalidNumber => write!(f, "Failed to parse big number"),
+            Self::InvalidBase64 => write!(f, "Invalid base64 encoding"),
         }
     }
 }
@@ -332,25 +335,61 @@ pub fn montgomery_mod_pow(
     let n_limbs = modulus.limbs.clone();
     let n_prime = inv32(n_limbs[0]);
 
-    // Precompute R^2 mod N where R = 2^(32 * k)
-    let mut r = BigUint::one();
+    // Precompute R^2 mod N where R = 2^(32 * k) using fixed stack buffers
+    const MAX_LIMBS: usize = 128;
+    let mut r_limbs = [0u32; MAX_LIMBS];
+    let mut r_len = 1usize;
+    r_limbs[0] = 1;
+
+    let mod_limbs = &modulus.limbs;
     for _ in 0..(2 * 32 * k) {
-        // r = r << 1
-        let mut limbs = Vec::with_capacity(r.limbs.len() + 1);
         let mut carry = 0u32;
-        for &limb in &r.limbs {
-            limbs.push((limb << 1) | carry);
-            carry = limb >> 31;
+        for limb in &mut r_limbs[..r_len] {
+            let val = *limb;
+            *limb = (val << 1) | carry;
+            carry = val >> 31;
         }
-        if carry > 0 {
-            limbs.push(carry);
+        if carry > 0 && r_len < MAX_LIMBS {
+            r_limbs[r_len] = carry;
+            r_len += 1;
         }
-        r = BigUint { limbs };
-        r.normalize();
-        if r >= *modulus {
-            r = r.sub(modulus);
+
+        while r_len > 0 && r_limbs[r_len - 1] == 0 {
+            r_len -= 1;
+        }
+        let is_ge = if r_len > mod_limbs.len() {
+            true
+        } else if r_len < mod_limbs.len() {
+            false
+        } else {
+            let mut ge = true;
+            for i in (0..r_len).rev() {
+                if r_limbs[i] > mod_limbs[i] {
+                    ge = true;
+                    break;
+                } else if r_limbs[i] < mod_limbs[i] {
+                    ge = false;
+                    break;
+                }
+            }
+            ge
+        };
+
+        if is_ge {
+            let mut borrow = 0u64;
+            for i in 0..r_len {
+                let m = if i < mod_limbs.len() { mod_limbs[i] as u64 } else { 0 };
+                let diff = (r_limbs[i] as u64).wrapping_sub(m).wrapping_sub(borrow);
+                r_limbs[i] = diff as u32;
+                borrow = (diff >> 63) & 1;
+            }
+            while r_len > 0 && r_limbs[r_len - 1] == 0 {
+                r_len -= 1;
+            }
         }
     }
+
+    let r = BigUint { limbs: r_limbs[..r_len].to_vec() };
 
     let mut r2_limbs = r.limbs;
     r2_limbs.resize(k, 0);
@@ -378,9 +417,12 @@ pub fn montgomery_mod_pow(
         let mut sq = mul_limbs(&x_bar, &x_bar);
         x_bar = mont_reduce(&mut sq, &n_limbs, n_prime);
 
-        if bit == 1 {
-            let mut mul = mul_limbs(&x_bar, &c_bar);
-            x_bar = mont_reduce(&mut mul, &n_limbs, n_prime);
+        let mut mul = mul_limbs(&x_bar, &c_bar);
+        let next = mont_reduce(&mut mul, &n_limbs, n_prime);
+
+        let mask = 0u32.wrapping_sub(bit);
+        for i in 0..x_bar.len() {
+            x_bar[i] = (next[i] & mask) | (x_bar[i] & !mask);
         }
     }
 
@@ -1008,6 +1050,10 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, CryptoError> {
         .filter(|&b| !b.is_ascii_whitespace())
         .collect();
 
+    if clean.len() % 4 == 1 {
+        return Err(CryptoError::InvalidBase64);
+    }
+
     fn b64_val(b: u8) -> Result<u32, CryptoError> {
         match b {
             b'A'..=b'Z' => Ok((b - b'A') as u32),
@@ -1015,7 +1061,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, CryptoError> {
             b'0'..=b'9' => Ok((b - b'0' + 52) as u32),
             b'+' => Ok(62),
             b'/' => Ok(63),
-            _ => Err(CryptoError::InvalidInputLength),
+            _ => Err(CryptoError::InvalidBase64),
         }
     }
 

@@ -18,6 +18,7 @@
 use core::fmt::Write;
 use heapless::String;
 
+use squeezelite_cspot::crypto::hmac_sha1;
 use squeezelite_cspot::crypto::OakleyGroup1Dh;
 use squeezelite_cspot::zeroconf::ZeroConfServer;
 
@@ -458,22 +459,93 @@ pub fn write_config_json(
     Some(writer.written_len())
 }
 
+/// Decodes a percent-encoded (`%XX` and `+`) URL string into `dst`, returning
+/// the number of bytes written.
+pub fn percent_decode_into(src: &str, dst: &mut [u8]) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut w = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if w >= dst.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'+' => {
+                dst[w] = b' ';
+                w += 1;
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h1 = match bytes[i + 1] {
+                    b'0'..=b'9' => bytes[i + 1] - b'0',
+                    b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+                    b'A'..=b'F' => bytes[i + 1] - b'A' + 10,
+                    _ => return None,
+                };
+                let h2 = match bytes[i + 2] {
+                    b'0'..=b'9' => bytes[i + 2] - b'0',
+                    b'a'..=b'f' => bytes[i + 2] - b'a' + 10,
+                    b'A'..=b'F' => bytes[i + 2] - b'A' + 10,
+                    _ => return None,
+                };
+                dst[w] = (h1 << 4) | h2;
+                w += 1;
+                i += 3;
+            }
+            b'%' => return None,
+            b => {
+                dst[w] = b;
+                w += 1;
+                i += 1;
+            }
+        }
+    }
+    Some(w)
+}
+
+/// Decodes a percent-encoded URL string into a fixed-capacity heapless
+/// `String<N>`.
+pub fn percent_decode_str<const N: usize>(src: &str) -> Option<String<N>> {
+    let mut buf = [0u8; N];
+    let len = percent_decode_into(src, &mut buf)?;
+    let s = core::str::from_utf8(&buf[..len]).ok()?;
+    let mut out = String::new();
+    out.push_str(s).ok()?;
+    Some(out)
+}
+
 fn extract_param_or_json_field<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     for part in input.split('&') {
         let trimmed = part.trim();
         if let Some(rest) = trimmed.strip_prefix(name) {
+            let rest = rest.trim_start();
             if let Some(val) = rest.strip_prefix('=') {
-                return Some(val);
+                return Some(val.trim());
             }
         }
     }
-    // Minimal JSON string field fallback: `"<name>":"<val>"`
-    let mut marker: String<40> = String::new();
-    write!(marker, "\"{}\":\"", name).ok()?;
-    let start = input.find(marker.as_str())? + marker.len();
-    let rest = &input[start..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
+    // Minimal JSON string field fallback with optional whitespace around `:`
+    // e.g. `"name":"value"`, `"name": "value"`, `"name" : "value"`
+    let mut search_from = 0;
+    while let Some(idx) = input[search_from..].find('"') {
+        let key_start = search_from + idx + 1;
+        if input[key_start..].starts_with(name) {
+            let after_name = key_start + name.len();
+            if input[after_name..].starts_with('"') {
+                let rest = &input[after_name + 1..];
+                let rest_trimmed = rest.trim_start();
+                if let Some(after_colon) = rest_trimmed.strip_prefix(':') {
+                    let after_colon_trimmed = after_colon.trim_start();
+                    if let Some(after_quote) = after_colon_trimmed.strip_prefix('"') {
+                        let end = after_quote.find('"')?;
+                        return Some(&after_quote[..end]);
+                    }
+                }
+            }
+        }
+        search_from = key_start;
+    }
+    None
 }
 
 /// Parses a `key=...&value=...` query/form or `{"key":"...","value":"..."}`
@@ -548,6 +620,39 @@ pub fn write_scan_json(aps: &[ScanApView<'_>], out_buf: &mut [u8]) -> Option<usi
             ap.rssi,
             ap.channel,
             JsonEscaped(ap.auth),
+        )
+        .ok()?;
+    }
+    writer.write_str("]}").ok()?;
+    Some(writer.written_len())
+}
+
+/// Formats a [`crate::wifi::WifiScanTable`] as a `/scan.json` JSON array into
+/// `out_buf`.
+pub fn write_scan_table_json(
+    table: &crate::wifi::WifiScanTable,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    writer.write_str("{\"aps\":[").ok()?;
+    for (idx, ap) in table.entries().iter().enumerate() {
+        if idx > 0 {
+            writer.write_str(",").ok()?;
+        }
+        write!(
+            writer,
+            "{{\"ssid\":\"{}\",\"bssid\":\"{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\",\
+             \"rssi\":{},\"chan\":{},\"auth\":\"{}\"}}",
+            JsonEscaped(ap.ssid.as_str()),
+            ap.bssid[0],
+            ap.bssid[1],
+            ap.bssid[2],
+            ap.bssid[3],
+            ap.bssid[4],
+            ap.bssid[5],
+            ap.rssi,
+            ap.channel,
+            JsonEscaped(ap.auth.as_str()),
         )
         .ok()?;
     }
@@ -658,6 +763,35 @@ pub fn write_messages_json(
             msg.uptime_ms,
             JsonEscaped(msg.level),
             JsonEscaped(msg.message),
+        )
+        .ok()?;
+    }
+    writer.write_str("]}").ok()?;
+    Some(writer.written_len())
+}
+
+/// Formats a [`crate::console::SyslogRingBuffer`] into `out_buf` for
+/// `GET /messages.json`.
+pub fn write_syslog_ring_json<const N: usize>(
+    ring: &crate::console::SyslogRingBuffer<N>,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    writer.write_str("{\"messages\":[").ok()?;
+    for idx in 0..ring.len() {
+        let Some(msg) = ring.entry(idx) else {
+            continue;
+        };
+        if idx > 0 {
+            writer.write_str(",").ok()?;
+        }
+        write!(
+            writer,
+            "{{\"seq\":{},\"uptime_ms\":{},\"level\":\"{}\",\"msg\":\"{}\"}}",
+            msg.seq,
+            msg.uptime_ms,
+            JsonEscaped(msg.level.as_str()),
+            JsonEscaped(msg.text.as_str()),
         )
         .ok()?;
     }
@@ -783,6 +917,9 @@ fn extract_query_or_body<'a>(raw_path: &'a str, req_bytes: &'a [u8]) -> &'a str 
 
 fn write_json_http_response(body_len: usize, out_buf: &mut [u8]) -> Option<usize> {
     const HEADER_ROOM: usize = 160;
+    if HEADER_ROOM.saturating_add(body_len) > out_buf.len() {
+        return None;
+    }
     let mut header: String<HEADER_ROOM> = String::new();
     write!(
         header,
@@ -796,6 +933,32 @@ fn write_json_http_response(body_len: usize, out_buf: &mut [u8]) -> Option<usize
     out_buf.copy_within(HEADER_ROOM..HEADER_ROOM + body_len, header_len);
     out_buf[..header_len].copy_from_slice(header.as_bytes());
     Some(header_len + body_len)
+}
+
+/// Derives a deterministic non-constant 96-byte Diffie-Hellman private key
+/// from the live system snapshot (IP, uptime, device identity) via HMAC-SHA1.
+#[must_use]
+pub fn derive_zeroconf_dh_private_key(status: &HttpStatusSnapshot<'_>) -> [u8; 96] {
+    const SEED_PREFIX: &[u8] = b"louder-esp32-zeroconf-dh-v1";
+    let mut key = [0u8; 96];
+    let uptime_bytes = status.uptime_ms.to_le_bytes();
+    let mut material = [0u8; 17];
+    material[0..4].copy_from_slice(&status.ip);
+    material[4..12].copy_from_slice(&uptime_bytes);
+    material[12] = status.vol_pct;
+    material[13..17].copy_from_slice(&status.i2c_acks.to_le_bytes());
+
+    for (counter, chunk) in key.chunks_mut(20).enumerate() {
+        let mut msg = [0u8; 18];
+        msg[0..17].copy_from_slice(&material);
+        msg[17] = counter as u8;
+        let digest = hmac_sha1(SEED_PREFIX, &msg);
+        let len = chunk.len().min(digest.len());
+        chunk[..len].copy_from_slice(&digest[..len]);
+    }
+
+    key[95] |= 0x01;
+    key
 }
 
 /// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
@@ -841,11 +1004,13 @@ pub fn handle_http_request_streaming(
             })
             .unwrap_or(&[]);
         let body_str = core::str::from_utf8(body_slice).unwrap_or("");
-        let dh = OakleyGroup1Dh::from_private_key([0x42u8; 96]).ok()?;
+        let priv_key = derive_zeroconf_dh_private_key(snapshot);
+        let dh = OakleyGroup1Dh::from_private_key(priv_key).ok()?;
         let device_id = "142137fd329622137a149016c82e18beb834";
         let remote_name = "BASEMENT";
 
-        if let Ok(resp) = ZeroConfServer::handle_request(
+        let mut zc = ZeroConfServer::new();
+        if let Ok(resp) = zc.handle_request(
             raw_path,
             body_str,
             &dh,
@@ -1167,11 +1332,15 @@ pub fn handle_http_request_streaming(
             let payload = extract_query_or_body(raw_path, req_bytes);
             let (body_len, action) = if let Some(upd) = parse_config_update_query(payload) {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                let mut decoded_val_buf = [0u8; 128];
+                let decoded_val = percent_decode_into(upd.value, &mut decoded_val_buf)
+                    .and_then(|len| core::str::from_utf8(&decoded_val_buf[..len]).ok())
+                    .unwrap_or(upd.value);
                 write!(
                     writer,
                     "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\"}}",
                     JsonEscaped(upd.key),
-                    JsonEscaped(upd.value),
+                    JsonEscaped(decoded_val),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::UpdateConfig)
@@ -1230,10 +1399,14 @@ pub fn handle_http_request_streaming(
             let payload = extract_query_or_body(raw_path, req_bytes);
             let (body_len, action) = if let Some(req) = parse_connect_request(payload) {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                let mut decoded_buf = [0u8; 64];
+                let decoded_ssid = percent_decode_into(req.ssid, &mut decoded_buf)
+                    .and_then(|len| core::str::from_utf8(&decoded_buf[..len]).ok())
+                    .unwrap_or(req.ssid);
                 write!(
                     writer,
                     "{{\"ok\":true,\"status\":\"connecting\",\"ssid\":\"{}\"}}",
-                    JsonEscaped(req.ssid),
+                    JsonEscaped(decoded_ssid),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::ConnectWifi)
@@ -2075,5 +2248,81 @@ mod tests {
         assert_eq!(fact, HttpControlAction::StartOtaFlash);
         let fstr = core::str::from_utf8(&buf[..flen]).expect("utf8");
         assert!(fstr.contains("\"ota_state\":\"starting_ota\""));
+    }
+
+    #[test]
+    fn test_sec_502_percent_decode_and_json_whitespace() {
+        let mut dst = [0u8; 64];
+        let len = percent_decode_into("My%20Home+Network%21%2B", &mut dst).expect("decode");
+        let decoded = core::str::from_utf8(&dst[..len]).expect("utf8");
+        assert_eq!(decoded, "My Home Network!+");
+
+        let p1 = extract_param_or_json_field("{\"key\" : \"val1\"}", "key");
+        assert_eq!(p1, Some("val1"));
+        let p2 = extract_param_or_json_field("{\"key\": \"val2\"}", "key");
+        assert_eq!(p2, Some("val2"));
+        let p3 = extract_param_or_json_field("{\"key\":\"val3\"}", "key");
+        assert_eq!(p3, Some("val3"));
+        let p4 = extract_param_or_json_field("key=val4&other=1", "key");
+        assert_eq!(p4, Some("val4"));
+    }
+
+    #[test]
+    fn test_sec_503_deterministic_dh_private_key_derivation() {
+        let snap1 = HttpStatusSnapshot {
+            ip: [192, 168, 1, 100],
+            uptime_ms: 42000,
+            ..HttpStatusSnapshot::default()
+        };
+        let key1 = derive_zeroconf_dh_private_key(&snap1);
+        assert_ne!(key1, [0x42u8; 96]);
+        assert_ne!(key1, [0u8; 96]);
+        assert!(OakleyGroup1Dh::from_private_key(key1).is_ok());
+
+        let mut snap2 = snap1.clone();
+        snap2.uptime_ms = 43000;
+        let key2 = derive_zeroconf_dh_private_key(&snap2);
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_logic_502_scan_table_and_syslog_ring_json_helpers() {
+        use crate::console::{LogLevel, SyslogRingBuffer};
+        use crate::wifi::{ScannedAp, WifiAuthMode, WifiScanTable};
+
+        let mut table = WifiScanTable::new();
+        let ap = ScannedAp::new(
+            "TestNet",
+            [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+            -60,
+            11,
+            WifiAuthMode::Wpa2Psk,
+        )
+        .expect("scanned ap");
+        table.upsert(ap);
+
+        let mut out = [0u8; 512];
+        let len = write_scan_table_json(&table, &mut out).expect("write scan table");
+        let s = core::str::from_utf8(&out[..len]).expect("utf8");
+        assert!(s.contains("\"aps\":[{\"ssid\":\"TestNet\""));
+        assert!(s.contains("\"bssid\":\"12:34:56:78:9A:BC\""));
+        assert!(s.contains("\"auth\":\"WPA2_PSK\""));
+
+        let mut ring = SyslogRingBuffer::<4>::new();
+        ring.push(1234, LogLevel::Warn, "TAS5805M clip warning");
+        let mlen = write_syslog_ring_json(&ring, &mut out).expect("write syslog ring");
+        let ms = core::str::from_utf8(&out[..mlen]).expect("utf8");
+        assert!(ms.contains("\"messages\":[{\"seq\":1"));
+        assert!(ms.contains("\"level\":\"WARN\""));
+        assert!(ms.contains("\"msg\":\"TAS5805M clip warning\""));
+    }
+
+    #[test]
+    fn test_sec_504_write_json_http_response_bounds_check() {
+        let mut small_buf = [0u8; 100];
+        assert_eq!(write_json_http_response(10, &mut small_buf), None);
+
+        let mut ok_buf = [0u8; 256];
+        assert!(write_json_http_response(20, &mut ok_buf).is_some());
     }
 }

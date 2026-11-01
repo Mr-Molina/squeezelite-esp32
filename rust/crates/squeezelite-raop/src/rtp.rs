@@ -753,7 +753,8 @@ impl RtpJitterBuffer {
             let idx = self.slot_index(seq);
             self.slots[idx] = Some(entry);
             self.write_seq = Some(seq);
-            if seq_diff(seq, cur_r) as usize >= self.capacity {
+            let d = seq_diff(seq, cur_r);
+            if d > 0 && (d as usize) >= self.capacity {
                 let new_r =
                     seq.wrapping_sub((self.capacity.saturating_sub(1)) as u16);
                 self.read_seq = Some(new_r);
@@ -785,7 +786,8 @@ impl RtpJitterBuffer {
             self.slots[idx] = Some(entry);
             self.write_seq = Some(seq);
 
-            if seq_diff(seq, cur_r) as usize >= self.capacity {
+            let d = seq_diff(seq, cur_r);
+            if d > 0 && (d as usize) >= self.capacity {
                 let new_r =
                     seq.wrapping_sub((self.capacity.saturating_sub(1)) as u16);
                 self.read_seq = Some(new_r);
@@ -1032,8 +1034,12 @@ impl SyncDriftTracker {
         let local_anchor = if let (Some(loc_ms), Some(rem_ntp)) =
             (self.ntp_local_anchor_ms, self.ntp_remote_anchor)
         {
-            let remote_gap_ms =
-                ntp_to_ms(sync.remote_ntp().wrapping_sub(rem_ntp));
+            let ntp_timestamp = sync.remote_ntp();
+            let dt_ntp = (ntp_timestamp as i64).wrapping_sub(rem_ntp as i64);
+            if dt_ntp <= 0 {
+                return false;
+            }
+            let remote_gap_ms = ntp_to_ms(dt_ntp as u64);
             if remote_gap_ms > 10_000 {
                 return false;
             }
@@ -1041,6 +1047,12 @@ impl SyncDriftTracker {
         } else {
             fallback_local_ms
         };
+
+        if let Some(prev_rtp) = self.sync_rtp_anchor {
+            let rtp_timestamp = sync.rtp_timestamp_now;
+            let drtp = i64::from(rtp_timestamp.wrapping_sub(prev_rtp) as i32);
+            let _ = drtp;
+        }
 
         let lat = sync.effective_latency_frames();
         self.latency_frames = lat;

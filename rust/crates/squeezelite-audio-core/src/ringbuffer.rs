@@ -305,11 +305,10 @@ impl<'a> AudioRingBuffer<'a> {
         }
 
         let new_r = (r + to_read) % self.capacity;
-        self.read_pos.store(new_r, Ordering::Release);
-
-        let _ = self.rewindable.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
             Some(cur.saturating_add(to_read).min(self.capacity()))
         });
+        self.read_pos.store(new_r, Ordering::Release);
 
         Ok(to_read)
     }
@@ -320,15 +319,14 @@ impl<'a> AudioRingBuffer<'a> {
         let to_consume = core::cmp::min(count, avail);
         let r = self.read_pos.load(Ordering::Relaxed);
         let new_r = (r + to_consume) % self.capacity;
-        self.read_pos.store(new_r, Ordering::Release);
-
-        let _ = self.rewindable.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
             Some(cur.saturating_add(to_consume).min(self.capacity()))
         });
+        self.read_pos.store(new_r, Ordering::Release);
     }
 
     #[allow(deprecated)]
-    pub(crate) fn rewind_read_internal(&self, count: usize) {
+    pub(crate) fn rewind_read_internal(&mut self, count: usize) {
         let rew = self.rewindable.load(Ordering::Acquire);
         let to_rewind = count.min(rew).min(self.available_write());
         let r = self.read_pos.load(Ordering::Relaxed);
@@ -374,7 +372,7 @@ impl<'ring, 'buf> Producer<'ring, 'buf> {
 }
 
 /// Exclusive SPSC consumer handle. Explicitly `!Sync` and `!Clone` so
-/// only a single thread can ever invoke `read`/`consume`/`rewind_read`/`flush`
+/// only a single thread can ever invoke `read`/`consume`/`flush`
 /// (AUDIO-707).
 pub struct Consumer<'ring, 'buf> {
     ring: &'ring AudioRingBuffer<'buf>,
@@ -383,7 +381,7 @@ pub struct Consumer<'ring, 'buf> {
 
 // JUSTIFICATION: SPSC consumer handle transfer across threads.
 // SAFETY: `Consumer` holds an immutable reference to the ringbuffer and has
-// exclusive read/rewind access via SPSC protocol. It contains `!Sync`
+// exclusive read access via SPSC protocol. It contains `!Sync`
 // PhantomData so it cannot be shared across threads simultaneously.
 unsafe impl<'ring, 'buf> Send for Consumer<'ring, 'buf> {}
 
@@ -402,10 +400,6 @@ impl<'ring, 'buf> Consumer<'ring, 'buf> {
 
     pub fn consume(&self, count: usize) {
         self.ring.consume_internal(count);
-    }
-
-    pub fn rewind_read(&self, count: usize) {
-        self.ring.rewind_read_internal(count);
     }
 
     pub fn flush(&self) {

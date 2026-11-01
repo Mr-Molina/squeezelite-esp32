@@ -343,6 +343,12 @@ fn test_rtsp_errors() {
         RtspRequest::parse(malformed.as_bytes()),
         Err(RtspError::MalformedRequestLine)
     );
+
+    let invalid_cl = "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 1\r\nContent-Length: not-a-number\r\n\r\n";
+    assert_eq!(
+        RtspRequest::parse(invalid_cl.as_bytes()),
+        Err(RtspError::InvalidContentLength)
+    );
 }
 
 #[test]
@@ -814,4 +820,56 @@ fn test_sync_drift_tracker_and_stereo_frame_stuff_drop() {
     SyncDriftTracker::apply_stereo_adjustment(1, &input_stereo, &mut out);
     assert_eq!(out, vec![10, 20, 30, 40, 50, 60, 50, 60]);
 }
+
+#[test]
+fn test_wo253_dacp_crlf_rejection() {
+    let client = DacpClient::new("1234", "9876");
+    // Action with newline / CRLF injection attempt
+    let injected = "playpause\r\nEvil-Header: injected";
+    assert_eq!(client.build_raw_action_request(injected), None);
+
+    // Empty action
+    assert_eq!(client.build_raw_action_request(""), None);
+
+    // Valid action
+    assert!(client.build_raw_action_request("playpause").is_some());
+}
+
+#[test]
+fn test_wo253_dmap_rtp_wrapping() {
+    // 32-bit timestamp wrapping: start is near u32::MAX, current wrapped around
+    let progress = TrackProgress::new(u32::MAX - 44_100, 44_100, 88_200);
+    // delta = 44_100.wrapping_sub(u32::MAX - 44_100) = 88_201 frames
+    // at 44_100 Hz, elapsed = (88_201 * 1000) / 44_100 = 2000 ms
+    assert_eq!(progress.elapsed_ms(44_100), 2000);
+}
+
+#[test]
+fn test_wo253_base64_invalid_length_mod_4() {
+    use squeezelite_raop::crypto::CryptoError;
+    // Length % 4 == 1 cannot be valid Base64
+    let invalid_len_1 = "A";
+    assert_eq!(base64_decode(invalid_len_1), Err(CryptoError::InvalidBase64));
+    let invalid_len_5 = "ABCDE";
+    assert_eq!(base64_decode(invalid_len_5), Err(CryptoError::InvalidBase64));
+}
+
+#[test]
+fn test_wo253_sync_drift_negative_ntp_rejected() {
+    let mut tracker = SyncDriftTracker::default();
+    let ntp = NtpTimingPacket::new_response(1_000, ms_to_ntp(50_000), ms_to_ntp(50_000));
+    assert!(tracker.record_ntp_timing(&ntp, 1_010));
+
+    // Sync packet with remote NTP timestamp earlier than anchor (40_000 < 50_000): must be rejected
+    let stale_sync = RtpSyncPacket::new(
+        true,
+        0,
+        44_100,
+        (ms_to_ntp(40_000) >> 32) as u32,
+        ms_to_ntp(40_000) as u32,
+        88_200,
+    );
+    assert!(!tracker.record_rtp_sync(&stale_sync, 1_500));
+}
+
 

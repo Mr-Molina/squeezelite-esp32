@@ -184,6 +184,10 @@ impl CaptivePortalDns {
         if (flags & 0x8000) != 0 {
             return None;
         }
+        // Verify standard query opcode (bits 11-14: (flags & 0x7800) == 0).
+        if (flags & 0x7800) != 0 {
+            return None;
+        }
         let qdcount = u16::from_be_bytes([query[4], query[5]]);
         if qdcount == 0 {
             return None;
@@ -197,7 +201,15 @@ impl CaptivePortalDns {
                 pos += 1;
                 break;
             }
-            // Reject DNS compression pointers or invalid label lengths (> 63).
+            // Allow 2-byte DNS compression pointer (top two bits 11 == 0xC0)
+            if (query[pos] & 0xC0) == 0xC0 {
+                if pos + 2 > query.len() {
+                    return None;
+                }
+                pos += 2;
+                break;
+            }
+            // Reject invalid label lengths (> 63).
             if label_len > 63 || pos + 1 + label_len >= query.len() {
                 return None;
             }
@@ -1188,6 +1200,40 @@ mod tests {
         let rstr = core::str::from_utf8(&redir_buf[..rlen]).expect("utf8");
         assert!(rstr.starts_with("HTTP/1.1 302 Found\r\n"));
         assert!(rstr.contains("Location: http://192.168.4.1/\r\n"));
+    }
+
+    #[test]
+    fn test_net_502_dns_opcode_and_compression_pointer() {
+        let dns = CaptivePortalDns::new([10, 0, 0, 1]);
+        // 1. Non-standard opcode (opcode = 1 (IQUERY) -> flags = 0x0800) must
+        // be rejected.
+        let invalid_opcode_query: [u8; 17] = [
+            0xAB, 0xCD, // ID
+            0x08, 0x00, // Flags: Opcode = 1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR
+            0x00,       // root label
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        let mut resp = [0u8; 128];
+        assert_eq!(dns.build_response(&invalid_opcode_query, &mut resp), None);
+
+        // 2. Query with 2-byte DNS compression pointer (0xC00C) in QNAME
+        let compressed_query: [u8; 18] = [
+            0x11, 0x22, // ID
+            0x01, 0x00, // Flags: standard query, RD=1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR
+            0xC0, 0x0C, // 2-byte compression pointer
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        let len = dns
+            .build_response(&compressed_query, &mut resp)
+            .expect("compression pointer must be accepted");
+        assert_eq!(len, compressed_query.len() + 16);
+        assert_eq!(&resp[len - 4..len], &[10, 0, 0, 1]);
     }
 
     #[test]

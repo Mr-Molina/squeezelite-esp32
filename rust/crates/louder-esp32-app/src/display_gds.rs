@@ -868,8 +868,14 @@ impl TextScroller {
     /// Returns the visible character slice `[start..end]` from `text`.
     #[must_use]
     pub fn visible_slice<'a>(&self, text: &'a [u8]) -> &'a [u8] {
-        let start = self.offset.min(text.len());
-        let end = start.saturating_add(self.viewport_chars).min(text.len());
+        let mut start = self.offset.min(text.len());
+        while start < text.len() && (text[start] & 0xC0) == 0x80 {
+            start += 1;
+        }
+        let mut end = start.saturating_add(self.viewport_chars).min(text.len());
+        while end > start && end < text.len() && (text[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
         &text[start..end]
     }
 
@@ -1124,5 +1130,17 @@ mod tests {
         assert!(!arb.release(2));
         assert!(arb.release(1));
         assert_eq!(arb.transactions_completed(), 1);
+    }
+
+    #[test]
+    fn test_scroller_utf8_continuation_boundary() {
+        let text = "Café ♫ 𝄞 Music";
+        let text_bytes = text.as_bytes();
+        let mut scroller = TextScroller::new(text_bytes.len(), 5, 0);
+        for _ in 0..text_bytes.len() {
+            let slice = scroller.visible_slice(text_bytes);
+            assert!(core::str::from_utf8(slice).is_ok());
+            scroller.tick();
+        }
     }
 }

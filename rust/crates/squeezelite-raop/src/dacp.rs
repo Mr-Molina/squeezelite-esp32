@@ -135,14 +135,14 @@ impl DacpClient {
     /// Builds an HTTP/1.0 `GET /ctrl-int/1/<command>` request packet with the
     /// required `Active-Remote` header.
     #[must_use]
-    pub fn build_command_request(&self, command: DacpCommand) -> Vec<u8> {
+    pub fn build_command_request(&self, command: DacpCommand) -> Option<Vec<u8>> {
         self.build_raw_action_request(command.as_str())
     }
 
     /// Builds an HTTP/1.0 `GET /ctrl-int/1/setproperty?dmcp.device-volume=...`
     /// request from a linear volume (`0.0..=1.0`).
     #[must_use]
-    pub fn build_volume_request(&self, volume_linear: f32) -> Vec<u8> {
+    pub fn build_volume_request(&self, volume_linear: f32) -> Option<Vec<u8>> {
         let clamped = volume_linear.clamp(0.0, 1.0);
         let db = if clamped <= 0.0001 {
             -144.0_f32
@@ -154,10 +154,19 @@ impl DacpClient {
     }
 
     /// Builds an HTTP/1.0 `GET /ctrl-int/1/<action>` request for an arbitrary
-    /// action string.
+    /// action string. Returns `None` if `action` or `active_remote` is empty,
+    /// or if `action`, `dacp_id`, or `active_remote` contains control characters.
     #[must_use]
-    pub fn build_raw_action_request(&self, action: &str) -> Vec<u8> {
+    pub fn build_raw_action_request(&self, action: &str) -> Option<Vec<u8>> {
         let trimmed = action.trim_start_matches('/');
+        if trimmed.is_empty() || self.active_remote.is_empty() {
+            return None;
+        }
+        let has_ctrl = |s: &str| s.bytes().any(|b| b < 0x20 || b == 0x7F);
+        if has_ctrl(trimmed) || has_ctrl(&self.active_remote) || has_ctrl(&self.dacp_id) {
+            return None;
+        }
+
         let mut req = format!(
             "GET /ctrl-int/1/{} HTTP/1.0\r\nActive-Remote: {}\r\n",
             trimmed, self.active_remote
@@ -167,6 +176,6 @@ impl DacpClient {
             req.push_str(&dacp_hdr);
         }
         req.push_str("Connection: close\r\n\r\n");
-        req.into_bytes()
+        Some(req.into_bytes())
     }
 }

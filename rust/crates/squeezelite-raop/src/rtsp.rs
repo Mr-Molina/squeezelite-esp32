@@ -202,9 +202,10 @@ impl<'a> RtspRequest<'a> {
             } else if key.eq_ignore_ascii_case("Content-Type") {
                 content_type = Some(value);
             } else if key.eq_ignore_ascii_case("Content-Length") {
-                if let Ok(len) = value.parse::<usize>() {
-                    content_length = len;
-                }
+                let len = value
+                    .parse::<usize>()
+                    .map_err(|_| RtspError::InvalidContentLength)?;
+                content_length = len;
             } else if key.eq_ignore_ascii_case("Transport") {
                 transport = Some(value);
             } else if key.eq_ignore_ascii_case("Apple-Challenge") {
@@ -583,7 +584,7 @@ impl RtspServer {
     #[must_use]
     pub fn build_dacp_command(&self, cmd: DacpCommand) -> Option<Vec<u8>> {
         self.dacp_client()
-            .map(|client| client.build_command_request(cmd))
+            .and_then(|client| client.build_command_request(cmd))
     }
 
     /// Sequence number from the most recent `FLUSH` (or `RECORD`) `RTP-Info`.

@@ -474,7 +474,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
     /// NaN state isolation, and accurate 32-bit boundary saturation.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_interleaved(&mut self, samples: &mut [i32]) {
-        if !self.enabled && !self.loudness_enabled {
+        if !self.enabled {
             return;
         }
 
@@ -488,46 +488,39 @@ impl<const BANDS: usize> Equalizer<BANDS> {
             let mut l = chunk[0] as f32 * NORM;
             let mut r = chunk[1] as f32 * NORM;
 
-            if self.enabled {
-                for i in 0..BANDS {
-                    let f = &self.filters[i];
+            for i in 0..BANDS {
+                let f = &self.filters[i];
 
-                    // Left channel biquad (Direct Form II Transposed)
-                    let (z1_l, z2_l) = &mut self.hist_left[i];
-                    let mut out_l = f.b0 * l + *z1_l;
-                    if !out_l.is_finite() {
-                        *z1_l = 0.0;
-                        *z2_l = 0.0;
-                        out_l = 0.0;
-                    } else {
-                        *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
-                        *z2_l = f.b2 * l - f.a2 * out_l;
-                        // Flush subnormal floats to prevent CPU traps (DSP-006)
-                        if z1_l.abs() < 1e-15 { *z1_l = 0.0; }
-                        if z2_l.abs() < 1e-15 { *z2_l = 0.0; }
-                    }
-                    l = out_l;
-
-                    // Right channel biquad (Direct Form II Transposed)
-                    let (z1_r, z2_r) = &mut self.hist_right[i];
-                    let mut out_r = f.b0 * r + *z1_r;
-                    if !out_r.is_finite() {
-                        *z1_r = 0.0;
-                        *z2_r = 0.0;
-                        out_r = 0.0;
-                    } else {
-                        *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
-                        *z2_r = f.b2 * r - f.a2 * out_r;
-                        if z1_r.abs() < 1e-15 { *z1_r = 0.0; }
-                        if z2_r.abs() < 1e-15 { *z2_r = 0.0; }
-                    }
-                    r = out_r;
+                // Left channel biquad (Direct Form II Transposed)
+                let (z1_l, z2_l) = &mut self.hist_left[i];
+                let mut out_l = f.b0 * l + *z1_l;
+                if !out_l.is_finite() {
+                    *z1_l = 0.0;
+                    *z2_l = 0.0;
+                    out_l = 0.0;
+                } else {
+                    *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
+                    *z2_l = f.b2 * l - f.a2 * out_l;
+                    // Flush subnormal floats to prevent CPU traps (DSP-006)
+                    if z1_l.abs() < 1e-15 { *z1_l = 0.0; }
+                    if z2_l.abs() < 1e-15 { *z2_l = 0.0; }
                 }
-            }
+                l = out_l;
 
-            if self.loudness_enabled {
-                l *= horner_loudness(l.abs());
-                r *= horner_loudness(r.abs());
+                // Right channel biquad (Direct Form II Transposed)
+                let (z1_r, z2_r) = &mut self.hist_right[i];
+                let mut out_r = f.b0 * r + *z1_r;
+                if !out_r.is_finite() {
+                    *z1_r = 0.0;
+                    *z2_r = 0.0;
+                    out_r = 0.0;
+                } else {
+                    *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
+                    *z2_r = f.b2 * r - f.a2 * out_r;
+                    if z1_r.abs() < 1e-15 { *z1_r = 0.0; }
+                    if z2_r.abs() < 1e-15 { *z2_r = 0.0; }
+                }
+                r = out_r;
             }
 
             let scaled_l = l * DENORM;
@@ -821,7 +814,8 @@ pub const ROCK_COEFFS: [BiquadCoeffs; 10] = [
 impl Equalizer<10> {
     /// Retunes all 10 equalizer bands for `gains_db` at sample rate `fs_hz`
     /// using the RBJ peaking EQ designer, verifies Schur-Cohn BIBO stability
-    /// for each band, and resets internal filter delay history.
+    /// for each band, and conditionally resets internal filter delay history
+    /// only if transitioning to disabled or if history contains non-finite values.
     pub fn retune(&mut self, gains_db: &[f32; 10], fs_hz: f32) {
         self.gains_db = *gains_db;
         let bands = design_bands(gains_db, fs_hz);
@@ -837,7 +831,14 @@ impl Equalizer<10> {
             }
         }
         self.enabled = any_active && fs_hz.is_finite() && fs_hz > 0.0;
-        self.reset();
+        let has_non_finite_history = self
+            .hist_left
+            .iter()
+            .chain(self.hist_right.iter())
+            .any(|&(z1, z2)| !z1.is_finite() || !z2.is_finite());
+        if !self.enabled || has_non_finite_history {
+            self.reset();
+        }
     }
 
     /// Applies a pre-tuned 10-band graphic equalizer preset
@@ -1056,21 +1057,68 @@ mod tests {
     fn test_loudness_contour_processing_and_odd_remainder() {
         let mut eq: Equalizer<10> = Equalizer::new();
         eq.set_loudness_contour(true);
-        // EQ disabled but loudness enabled -> processes loudness
+        assert!(eq.loudness_enabled());
+
+        // Enable EQ with BassBoost
+        eq.apply_preset(EqPreset::BassBoost);
+        assert!(eq.is_enabled());
+
         let mut samples = [100_000, -100_000, 999_999];
         eq.process_interleaved(&mut samples);
         // Odd remainder trailing sample (999_999) must remain unmodified
         assert_eq!(samples[2], 999_999);
-        // First stereo pair should be processed by horner loudness
+        // First stereo pair should be processed by biquad filter
         assert_ne!(samples[0], 0);
 
-        // When Flat preset is applied and loudness is enabled, loop should
-        // not be bypassed
+        // When Flat preset is applied, EQ is disabled and samples pass
+        // through unmodified.
         eq.apply_preset(EqPreset::Flat);
         assert!(!eq.is_enabled());
         let mut samples_flat = [500_000, -500_000];
         eq.process_interleaved(&mut samples_flat);
-        assert_ne!(samples_flat[0], 500_000);
+        assert_eq!(samples_flat[0], 500_000);
+        assert_eq!(samples_flat[1], -500_000);
+    }
+
+    #[test]
+    fn test_retune_preserves_biquad_delay_history_during_playback() {
+        let mut eq = Equalizer::<10>::new();
+        let gains1 = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        eq.retune(&gains1, 48_000.0);
+        assert!(eq.is_enabled());
+
+        // Process a frame to populate delay history
+        let _ = eq.process_frame(500_000, -500_000);
+        let has_active_history = eq
+            .hist_left
+            .iter()
+            .chain(eq.hist_right.iter())
+            .any(|&(z1, z2)| z1 != 0.0 || z2 != 0.0);
+        assert!(has_active_history, "history should be populated after frame");
+
+        // Retune with new volume/loudness gains at the same sample rate
+        let gains2 = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        eq.retune(&gains2, 48_000.0);
+        assert!(eq.is_enabled());
+
+        // History must be preserved to prevent audible clicks/pops (LOGIC-204)
+        let history_preserved = eq
+            .hist_left
+            .iter()
+            .chain(eq.hist_right.iter())
+            .any(|&(z1, z2)| z1 != 0.0 || z2 != 0.0);
+        assert!(history_preserved, "history must NOT be zeroed when retuning active EQ");
+
+        // Transitioning to disabled (all zeros) must reset history
+        let gains_zero = [0.0; 10];
+        eq.retune(&gains_zero, 48_000.0);
+        assert!(!eq.is_enabled());
+        let history_zeroed = eq
+            .hist_left
+            .iter()
+            .chain(eq.hist_right.iter())
+            .all(|&(z1, z2)| z1 == 0.0 && z2 == 0.0);
+        assert!(history_zeroed, "history must be zeroed when transitioning to disabled");
     }
 
     #[test]

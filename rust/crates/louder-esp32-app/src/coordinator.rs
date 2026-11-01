@@ -669,6 +669,17 @@ impl PlayerCoordinator {
         self.state = PlayerState::Playing;
     }
 
+    /// Starts external audio playback while clearing any pending compressed
+    /// frames from `pipeline.stream_buffer` before raw external PCM is
+    /// ingested (LOGIC-206).
+    pub fn begin_external_playback_with_pipeline<S: AudioOutputSink>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+    ) {
+        pipeline.stream_buffer.flush();
+        self.begin_external_playback();
+    }
+
     /// The external source stopped and its audio drained:
     /// [`PlayerState::Stopped`] (or [`PlayerState::Playing`] if a suspended LMS
     /// stream is resumed).
@@ -680,6 +691,30 @@ impl PlayerCoordinator {
         } else {
             self.state = PlayerState::Stopped;
         }
+    }
+
+    /// Restores the active LMS audio decoder based on `self.current_format`
+    /// (e.g. FLAC, MP3, AAC, Vorbis, ALAC, Opus, PCM) and flushes any residual
+    /// PCM from `pipeline.stream_buffer` (LOGIC-206).
+    pub fn reinstall_lms_decoder<S: AudioOutputSink>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+    ) {
+        pipeline.stream_buffer.flush();
+        let format = self.current_format.unwrap_or(AudioFormat::Mp3);
+        Self::select_decoder(pipeline, format, 16, 2, false);
+    }
+
+    /// The external source stopped and its audio drained:
+    /// [`PlayerState::Stopped`] (or [`PlayerState::Playing`] if a suspended LMS
+    /// stream is resumed), restoring the LMS decoder and flushing residual
+    /// external PCM (LOGIC-206).
+    pub fn end_external_playback_and_restore<S: AudioOutputSink>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+    ) {
+        self.end_external_playback();
+        self.reinstall_lms_decoder(pipeline);
     }
 
     /// Returns the currently active audio source owning the output pipeline.
@@ -1634,7 +1669,7 @@ impl PlayerCoordinator {
                         send_setd_name(transport, &self.player_name)?;
                     }
                 } else if opcode == *b"eqlz" {
-                    if payload.len() >= 10 {
+                    if !payload.is_empty() {
                         let mut gains = [0.0_f32; 10];
                         for (dst, &byte) in gains.iter_mut().zip(payload.iter().take(10)) {
                             *dst = f32::from(byte as i8).clamp(-12.0, 12.0);
@@ -6432,5 +6467,53 @@ mod tests {
         assert!(pipeline.is_resampler_engaged());
         assert_eq!(rig.backend.rate, 48_000);
         assert_eq!(rig.coord.current_sample_rate, 48_000);
+    }
+
+    #[test]
+    fn test_wo255_short_eqlz_payload_applies_partial_band_gains() {
+        let mut rig = gapless_rig(&[track_bytes(1, 32)]);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Short 3-byte eqlz payload (LOGIC-205)
+        let short_payload: [u8; 3] = [6i8 as u8, -4i8 as u8, 2i8 as u8];
+        rig.command(&mut pipeline, &server_frame(b"eqlz", &short_payload), 10);
+        assert!(pipeline.equalizer.is_enabled());
+        assert_eq!(pipeline.eq_gains_db()[0], 6.0);
+        assert_eq!(pipeline.eq_gains_db()[1], -4.0);
+        assert_eq!(pipeline.eq_gains_db()[2], 2.0);
+        assert_eq!(pipeline.eq_gains_db()[3], 0.0);
+    }
+
+    #[test]
+    fn test_wo255_external_playback_restore_lms_decoder_and_flush() {
+        let mut rig = gapless_rig(&[track_bytes(1, 32)]);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Configure LMS track with FLAC format
+        rig.coord.current_format = Some(AudioFormat::Flac);
+        rig.coord.stream = StreamLink::Open;
+
+        // Ingest some dummy compressed stream bytes
+        pipeline.ingest_stream_data(&[0xFF; 64]).unwrap();
+        assert_eq!(pipeline.stream_buffer.available_read(), 64);
+
+        // Begin external playback flushes stream buffer (LOGIC-206)
+        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        assert_eq!(pipeline.stream_buffer.available_read(), 0);
+        assert!(rig.coord.external_playback);
+
+        // Feed external PCM bytes into stream buffer
+        pipeline.ingest_stream_data(&[0x12; 32]).unwrap();
+        assert_eq!(pipeline.stream_buffer.available_read(), 32);
+
+        // End external playback and restore decoder
+        rig.coord.end_external_playback_and_restore(&mut pipeline);
+        assert!(!rig.coord.external_playback);
+        assert_eq!(pipeline.stream_buffer.available_read(), 0);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
     }
 }

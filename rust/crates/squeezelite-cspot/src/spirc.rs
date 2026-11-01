@@ -200,6 +200,12 @@ impl TrackMetadata {
                         duration_ms = val as u32;
                     }
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)? as usize;
                     if pos + len > data.len() {
@@ -227,6 +233,12 @@ impl TrackMetadata {
                         _ => {}
                     }
                 }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 4;
+                }
                 _ => return Err(SpircError::InvalidWireType),
             }
         }
@@ -253,6 +265,12 @@ impl TrackMetadata {
                 0 => {
                     let _ = decode_varint(data, &mut pos)?;
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)? as usize;
                     if pos + len > data.len() {
@@ -264,6 +282,12 @@ impl TrackMetadata {
                         *artist_out = s.to_string();
                     }
                     pos += len;
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(SpircError::InvalidWireType),
             }
@@ -285,6 +309,12 @@ impl TrackMetadata {
                 0 => {
                     let _ = decode_varint(data, &mut pos)?;
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)? as usize;
                     if pos + len > data.len() {
@@ -300,6 +330,12 @@ impl TrackMetadata {
                     } else if field_num == 0x11 {
                         Self::parse_cover_group(sub, artwork_out)?;
                     }
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(SpircError::InvalidWireType),
             }
@@ -320,6 +356,12 @@ impl TrackMetadata {
                 0 => {
                     let _ = decode_varint(data, &mut pos)?;
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)? as usize;
                     if pos + len > data.len() {
@@ -330,6 +372,12 @@ impl TrackMetadata {
                     if field_num == 1 && artwork_out.is_none() {
                         Self::parse_image_submessage(img_sub, artwork_out)?;
                     }
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(SpircError::InvalidWireType),
             }
@@ -350,6 +398,12 @@ impl TrackMetadata {
                 0 => {
                     let _ = decode_varint(data, &mut pos)?;
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)? as usize;
                     if pos + len > data.len() {
@@ -368,6 +422,12 @@ impl TrackMetadata {
                             *artwork_out = Some(Self::bytes_to_hex(raw));
                         }
                     }
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(SpircError::InvalidWireType),
             }
@@ -562,6 +622,43 @@ pub fn encode_varint(buf: &mut Vec<u8>, mut val: u64) {
     }
 }
 
+/// Skips an unknown protobuf field according to its wire type.
+pub fn skip_unknown_field(
+    wire_type: u8,
+    data: &[u8],
+    pos: &mut usize,
+) -> Result<(), SpircError> {
+    match wire_type {
+        0 => {
+            let _ = decode_varint(data, pos)?;
+            Ok(())
+        }
+        1 => {
+            if *pos + 8 > data.len() {
+                return Err(SpircError::TruncatedMessage);
+            }
+            *pos += 8;
+            Ok(())
+        }
+        2 => {
+            let len = decode_varint(data, pos)? as usize;
+            if *pos + len > data.len() {
+                return Err(SpircError::TruncatedMessage);
+            }
+            *pos += len;
+            Ok(())
+        }
+        5 => {
+            if *pos + 4 > data.len() {
+                return Err(SpircError::TruncatedMessage);
+            }
+            *pos += 4;
+            Ok(())
+        }
+        _ => Err(SpircError::InvalidWireType),
+    }
+}
+
 /// Parsed Spirc wire frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpircFrame {
@@ -704,6 +801,12 @@ impl SpircFrame {
                         _ => {}
                     }
                 }
+                1 => {
+                    if pos + 8 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 8;
+                }
                 2 => {
                     let len = decode_varint(data, &mut pos)? as usize;
                     if pos + len > data.len() {
@@ -724,10 +827,23 @@ impl SpircFrame {
                                 if fn_sub == 12 {
                                     volume = Some(v as u32);
                                 }
+                            } else if wt_sub == 1 {
+                                if sub_pos + 8 > sub_data.len() {
+                                    break;
+                                }
+                                sub_pos += 8;
                             } else if wt_sub == 2 {
                                 let l =
                                     decode_varint(sub_data, &mut sub_pos)? as usize;
+                                if sub_pos + l > sub_data.len() {
+                                    break;
+                                }
                                 sub_pos += l;
+                            } else if wt_sub == 5 {
+                                if sub_pos + 4 > sub_data.len() {
+                                    break;
+                                }
+                                sub_pos += 4;
                             }
                         }
                     } else if field_num == 12 {
@@ -741,9 +857,17 @@ impl SpircFrame {
                                 if fn_sub == 4 {
                                     position_ms = Some(v as u32);
                                 }
+                            } else if wt_sub == 1 {
+                                if sub_pos + 8 > sub_data.len() {
+                                    break;
+                                }
+                                sub_pos += 8;
                             } else if wt_sub == 2 {
                                 let l =
                                     decode_varint(sub_data, &mut sub_pos)? as usize;
+                                if sub_pos + l > sub_data.len() {
+                                    break;
+                                }
                                 if fn_sub == 27 {
                                     // TrackRef submessage
                                     let track_slice =
@@ -762,6 +886,9 @@ impl SpircFrame {
                                                 &mut t_pos,
                                             )?
                                                 as usize;
+                                            if t_pos + tl > track_slice.len() {
+                                                break;
+                                            }
                                             if t_fn == 2 {
                                                 let str_bytes = &track_slice
                                                     [t_pos..t_pos + tl];
@@ -780,13 +907,34 @@ impl SpircFrame {
                                                 track_slice,
                                                 &mut t_pos,
                                             )?;
+                                        } else if t_wt == 1 {
+                                            if t_pos + 8 > track_slice.len() {
+                                                break;
+                                            }
+                                            t_pos += 8;
+                                        } else if t_wt == 5 {
+                                            if t_pos + 4 > track_slice.len() {
+                                                break;
+                                            }
+                                            t_pos += 4;
                                         }
                                     }
                                 }
                                 sub_pos += l;
+                            } else if wt_sub == 5 {
+                                if sub_pos + 4 > sub_data.len() {
+                                    break;
+                                }
+                                sub_pos += 4;
                             }
                         }
                     }
+                }
+                5 => {
+                    if pos + 4 > data.len() {
+                        return Err(SpircError::TruncatedMessage);
+                    }
+                    pos += 4;
                 }
                 _ => return Err(SpircError::InvalidWireType),
             }
@@ -886,6 +1034,7 @@ impl SpircStateMachine {
         self.track_queue = queue;
         if self.track_queue.is_empty() {
             self.playing_track_index = 0;
+            self.current_track = None;
         } else {
             self.playing_track_index =
                 core::cmp::min(start_index, self.track_queue.len() - 1);

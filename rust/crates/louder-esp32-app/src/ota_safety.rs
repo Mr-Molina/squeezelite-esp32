@@ -942,6 +942,20 @@ pub struct OtaFlashWriteOp {
     pub new_sectors_to_erase: u32,
 }
 
+impl OtaFlashWriteOp {
+    /// Returns an empty flash write operation (no bytes written, no sectors
+    /// erased).
+    #[must_use]
+    pub const fn empty(flash_offset: u32) -> Self {
+        Self {
+            flash_offset,
+            bytes_written: 0,
+            first_new_sector_offset: None,
+            new_sectors_to_erase: 0,
+        }
+    }
+}
+
 /// Streaming HTTP/HTTPS OTA assembler that validates the `esp_app_desc_t`
 /// header on the first 288 bytes, tracks 4 KB sector erase boundaries within
 /// `ota_0` (`0x160000`), and computes an incremental SHA-256 digest.
@@ -1020,12 +1034,9 @@ impl OtaStreamAssembler {
             ));
         }
         if chunk.is_empty() {
-            return Ok(OtaFlashWriteOp {
-                flash_offset: OTA_0_PARTITION_OFFSET + self.bytes_received as u32,
-                bytes_written: 0,
-                first_new_sector_offset: None,
-                new_sectors_to_erase: 0,
-            });
+            return Ok(OtaFlashWriteOp::empty(
+                OTA_0_PARTITION_OFFSET + self.bytes_received as u32,
+            ));
         }
 
         let new_total = self.bytes_received.saturating_add(chunk.len());
@@ -1046,24 +1057,58 @@ impl OtaStreamAssembler {
             }
         }
 
-        if self.header_filled < OTA_MIN_HEADER_BYTES {
+        if matches!(self.state, OtaStreamState::AwaitingHeader) {
             let need = OTA_MIN_HEADER_BYTES - self.header_filled;
             let copy_len = chunk.len().min(need);
             self.header_buf[self.header_filled..self.header_filled + copy_len]
                 .copy_from_slice(&chunk[..copy_len]);
             self.header_filled += copy_len;
 
-            if self.header_filled == OTA_MIN_HEADER_BYTES {
-                match verify_ota_binary_header(&self.header_buf) {
-                    Ok(summary) => {
-                        self.state = OtaStreamState::Streaming { summary };
-                    }
-                    Err(err) => {
-                        self.state = OtaStreamState::Aborted(err.clone());
-                        return Err(err);
-                    }
+            if self.header_filled < OTA_MIN_HEADER_BYTES {
+                self.hasher.update(chunk);
+                self.bytes_received = new_total;
+                return Ok(OtaFlashWriteOp::empty(
+                    OTA_0_PARTITION_OFFSET + self.bytes_received as u32,
+                ));
+            }
+
+            // Exactly reached 288 bytes. Validate the complete header before
+            // emitting ANY flash operations.
+            match verify_ota_binary_header(&self.header_buf) {
+                Ok(summary) => {
+                    self.state = OtaStreamState::Streaming { summary };
+                }
+                Err(err) => {
+                    self.state = OtaStreamState::Aborted(err.clone());
+                    return Err(err);
                 }
             }
+
+            // Header is verified. Commit chunk to hasher, update total received bytes,
+            // and emit initial sector 0 erase and write operation covering all buffered
+            // bytes plus the remainder of this chunk.
+            self.hasher.update(chunk);
+            self.bytes_received = new_total;
+
+            let end_offset = self.bytes_received as u32;
+            let required_sectors = end_offset.div_ceil(OTA_FLASH_SECTOR_BYTES);
+            let (first_new_sector_offset, new_sectors_to_erase) =
+                if required_sectors > self.next_unerased_sector_index {
+                    let first = OTA_0_PARTITION_OFFSET
+                        + self.next_unerased_sector_index * OTA_FLASH_SECTOR_BYTES;
+                    let count = required_sectors - self.next_unerased_sector_index;
+                    self.next_unerased_sector_index = required_sectors;
+                    (Some(first), count)
+                } else {
+                    (None, 0)
+                };
+
+            return Ok(OtaFlashWriteOp {
+                flash_offset: OTA_0_PARTITION_OFFSET,
+                bytes_written: new_total,
+                first_new_sector_offset,
+                new_sectors_to_erase,
+            });
         }
 
         let start_offset = self.bytes_received as u32;
@@ -1748,22 +1793,27 @@ mod tests {
         let mut asm = OtaStreamAssembler::new(Some(image.len())).expect("valid assembler");
         assert_eq!(asm.state(), &OtaStreamState::AwaitingHeader);
 
-        // First 100 bytes: awaiting full 288-byte header, erases sector 0
+        // First 100 bytes: awaiting full 288-byte header, no sector erase
+        // or flash write emitted yet
         let op1 = asm.ingest_chunk(&image[..100]).expect("chunk 1");
-        assert_eq!(op1.flash_offset, OTA_0_PARTITION_OFFSET);
-        assert_eq!(op1.first_new_sector_offset, Some(OTA_0_PARTITION_OFFSET));
-        assert_eq!(op1.new_sectors_to_erase, 1);
+        assert_eq!(op1.bytes_written, 0);
+        assert_eq!(op1.first_new_sector_offset, None);
+        assert_eq!(op1.new_sectors_to_erase, 0);
         assert_eq!(asm.state(), &OtaStreamState::AwaitingHeader);
 
-        // Next 200 bytes (300 >= 288): validates header -> Streaming
+        // Next 200 bytes (300 >= 288): validates header -> Streaming,
+        // erases sector 0 and writes all 300 bytes
         let op2 = asm.ingest_chunk(&image[100..300]).expect("chunk 2");
-        assert_eq!(op2.flash_offset, OTA_0_PARTITION_OFFSET + 100);
-        assert_eq!(op2.first_new_sector_offset, None);
+        assert_eq!(op2.flash_offset, OTA_0_PARTITION_OFFSET);
+        assert_eq!(op2.bytes_written, 300);
+        assert_eq!(op2.first_new_sector_offset, Some(OTA_0_PARTITION_OFFSET));
+        assert_eq!(op2.new_sectors_to_erase, 1);
         assert!(matches!(asm.state(), OtaStreamState::Streaming { .. }));
 
         // Remaining 4200 bytes (total 4500 > 4096): crosses into sector 1 (0x161000)
         let op3 = asm.ingest_chunk(&image[300..]).expect("chunk 3");
         assert_eq!(op3.flash_offset, OTA_0_PARTITION_OFFSET + 300);
+        assert_eq!(op3.bytes_written, 4200);
         assert_eq!(
             op3.first_new_sector_offset,
             Some(OTA_0_PARTITION_OFFSET + OTA_FLASH_SECTOR_BYTES)
@@ -1777,6 +1827,24 @@ mod tests {
         let mut expected_hasher = Sha256Incremental::new();
         expected_hasher.update(&image);
         assert_eq!(digest, expected_hasher.finalize());
+    }
+
+    #[test]
+    fn test_sec_501_invalid_header_buffered_rejects_without_flash_ops() {
+        let mut asm = OtaStreamAssembler::new(Some(1024)).expect("valid assembler");
+        // Feed partial garbage chunk (< 288 bytes)
+        let garbage1 = [0x55u8; 120];
+        let op1 = asm.ingest_chunk(&garbage1).expect("buffered awaiting header");
+        assert_eq!(op1.bytes_written, 0);
+        assert_eq!(op1.first_new_sector_offset, None);
+        assert_eq!(op1.new_sectors_to_erase, 0);
+        assert_eq!(asm.state(), &OtaStreamState::AwaitingHeader);
+
+        // Feed second chunk completing 288 bytes with invalid magic byte/app desc
+        let garbage2 = [0xAAu8; 200];
+        let err = asm.ingest_chunk(&garbage2).expect_err("must reject invalid header");
+        assert!(matches!(err, OtaSafetyError::InvalidBinaryHeader(_)));
+        assert!(matches!(asm.state(), OtaStreamState::Aborted(_)));
     }
 
     #[test]

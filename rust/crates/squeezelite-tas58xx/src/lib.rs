@@ -59,6 +59,7 @@ pub const CTRL2_MODE_HIZ: u8 = 0x02;
 pub const CTRL2_MODE_PLAY: u8 = 0x03;
 pub const CTRL2_MODE_PLAY_MUTE: u8 = 0x0B;
 pub const FAULT_CLEAR_ANALOG: u8 = 0x80;
+pub const FAULT_CLEAR_ALL: u8 = 0x81;
 
 /// Register addresses from the TI TAS5805M / TAS5825M datasheets (SLASEH5B).
 pub mod registers {
@@ -430,17 +431,9 @@ where
     /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69.
     pub fn read_telemetry(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
         self.select_page0_book0()?;
-        let mut fs_mon = [0u8; 1];
+        let mut clk_regs = [0u8; 3];
         self.i2c
-            .write_read(self.addr, &[registers::FS_MON], &mut fs_mon)
-            .map_err(DriverError::I2cError)?;
-        let mut bck_mon = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::BCK_MON], &mut bck_mon)
-            .map_err(DriverError::I2cError)?;
-        let mut clkdet = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::CLKDET_STATUS], &mut clkdet)
+            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
             .map_err(DriverError::I2cError)?;
         let mut automute = [0u8; 1];
         self.i2c
@@ -448,9 +441,9 @@ where
             .map_err(DriverError::I2cError)?;
 
         Ok(Tas5805mTelemetry {
-            fs_mon: fs_mon[0],
-            bck_mon: bck_mon[0],
-            clkdet_status: clkdet[0],
+            fs_mon: clk_regs[0],
+            bck_mon: clk_regs[1],
+            clkdet_status: clk_regs[2],
             automute_state: automute[0],
         })
     }
@@ -707,7 +700,7 @@ where
 
     /// Executes the 3-step TI datasheet recovery sequence (PERIPH-603):
     /// 1. Transition `DEVICE_CTRL_2 (0x03)` to `CTRL2_MODE_HIZ (0x02)`.
-    /// 2. Clear analog/digital fault latches (`FAULT_CLEAR (0x78) = 0x80`).
+    /// 2. Clear analog/digital fault latches (`FAULT_CLEAR (0x78) = 0x81`).
     /// 3. Return `DEVICE_CTRL_2 (0x03)` to `CTRL2_MODE_PLAY (0x03)`.
     pub fn recover_from_fault(&mut self) -> Result<(), DriverError<E>> {
         self.select_page0_book0()?;
@@ -715,7 +708,7 @@ where
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
             .map_err(DriverError::I2cError)?;
         self.i2c
-            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
+            .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ALL])
             .map_err(DriverError::I2cError)?;
         self.i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY])
@@ -813,17 +806,9 @@ where
     /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69.
     pub fn read_telemetry(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
         self.select_page0_book0()?;
-        let mut fs_mon = [0u8; 1];
+        let mut clk_regs = [0u8; 3];
         self.i2c
-            .write_read(self.addr, &[registers::FS_MON], &mut fs_mon)
-            .map_err(DriverError::I2cError)?;
-        let mut bck_mon = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::BCK_MON], &mut bck_mon)
-            .map_err(DriverError::I2cError)?;
-        let mut clkdet = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::CLKDET_STATUS], &mut clkdet)
+            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
             .map_err(DriverError::I2cError)?;
         let mut automute = [0u8; 1];
         self.i2c
@@ -831,11 +816,51 @@ where
             .map_err(DriverError::I2cError)?;
 
         Ok(Tas5805mTelemetry {
-            fs_mon: fs_mon[0],
-            bck_mon: bck_mon[0],
-            clkdet_status: clkdet[0],
+            fs_mon: clk_regs[0],
+            bck_mon: clk_regs[1],
+            clkdet_status: clk_regs[2],
             automute_state: automute[0],
         })
+    }
+
+    /// Checks fault status registers (0x70..=0x73) and reads silicon telemetry
+    /// (0x37..=0x39 and 0x69) in a single coalesced operation, reducing I2C
+    /// transactions during periodic health polling (PERF-601).
+    pub fn check_faults_and_telemetry(
+        &mut self,
+    ) -> Result<(FaultStatus, Tas5805mTelemetry), DriverError<E>> {
+        self.select_page0_book0()?;
+
+        let mut status = [0u8; 4];
+        self.i2c
+            .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
+            .map_err(DriverError::I2cError)?;
+
+        let mut clk_regs = [0u8; 3];
+        self.i2c
+            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
+            .map_err(DriverError::I2cError)?;
+
+        let mut automute = [0u8; 1];
+        self.i2c
+            .write_read(self.addr, &[registers::AUTOMUTE_STATE], &mut automute)
+            .map_err(DriverError::I2cError)?;
+
+        let faults = FaultStatus {
+            chan_fault: status[0],
+            global_fault1: status[1],
+            global_fault2: status[2],
+            otw: status[3],
+        };
+
+        let telemetry = Tas5805mTelemetry {
+            fs_mon: clk_regs[0],
+            bck_mon: clk_regs[1],
+            clkdet_status: clk_regs[2],
+            automute_state: automute[0],
+        };
+
+        Ok((faults, telemetry))
     }
 }
 
@@ -1080,7 +1105,7 @@ mod tests {
             ),
             I2cTrans::write(
                 DEFAULT_I2C_ADDR,
-                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG],
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ALL],
             ),
             I2cTrans::write(
                 DEFAULT_I2C_ADDR,
@@ -1323,6 +1348,33 @@ mod tests {
         play.set_analog_gain(0x0C).expect("set_analog_gain ok");
 
         let telem = play.read_telemetry().expect("read_telemetry ok");
+        assert_eq!(telem.detected_sample_rate_hz(), 48_000);
+        assert_eq!(telem.bck_ratio(), 64);
+        assert!(telem.is_pll_locked());
+        assert!(!telem.is_automuted());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_check_faults_and_telemetry_coalesced_reads() {
+        let mut i2c = MockI2c::default();
+        i2c.registers[registers::CHAN_FAULT as usize] = 0x01;
+        i2c.registers[registers::FS_MON as usize] = 0x09;
+        i2c.registers[registers::BCK_MON as usize] = 64;
+        i2c.registers[registers::CLKDET_STATUS as usize] = 0x08;
+        i2c.registers[registers::AUTOMUTE_STATE as usize] = 0x00;
+
+        let mut playing = Tas58xx {
+            i2c: &mut i2c,
+            addr: DEFAULT_I2C_ADDR,
+            _state: PhantomData::<Play>,
+        };
+
+        let (faults, telem) = playing
+            .check_faults_and_telemetry()
+            .expect("check_faults_and_telemetry ok");
+
+        assert!(faults.has_overcurrent());
         assert_eq!(telem.detected_sample_rate_hz(), 48_000);
         assert_eq!(telem.bck_ratio(), 64);
         assert!(telem.is_pll_locked());

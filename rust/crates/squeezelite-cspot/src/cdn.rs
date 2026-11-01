@@ -254,16 +254,19 @@ impl CdnStreamFeeder {
         let mut decrypted = chunk.to_vec();
         self.decryptor.decrypt_chunk(&mut decrypted, offset);
 
-        let slice_to_feed = if !self.header_stripped && offset == 0 {
-            if decrypted.len() > SPOTIFY_HEADER_SIZE {
+        let slice_to_feed = if !self.header_stripped && offset < SPOTIFY_HEADER_SIZE {
+            let strip = (SPOTIFY_HEADER_SIZE - offset).min(decrypted.len());
+            if offset + decrypted.len() >= SPOTIFY_HEADER_SIZE {
                 self.header_stripped = true;
-                &decrypted[SPOTIFY_HEADER_SIZE..]
-            } else {
-                return Ok((chunk.len(), 0));
             }
+            &decrypted[strip..]
         } else {
             &decrypted[..]
         };
+
+        if slice_to_feed.is_empty() {
+            return Ok((chunk.len(), 0));
+        }
 
         self.total_bytes_fed += slice_to_feed.len();
         let (consumed, samples) = self.decoder.decode(slice_to_feed, pcm_out)?;

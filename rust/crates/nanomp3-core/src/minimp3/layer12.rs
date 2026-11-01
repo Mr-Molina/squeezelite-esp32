@@ -234,12 +234,10 @@ pub(super) fn decode_frame<S: Sample>(
     let mut i = 0;
     let mut out = 0;
     for igr in 0..3 {
-        // JUSTIFICATION: Flat 1152-element slice view of contiguous scratch.
-        // SAFETY: `scratch.grbuf` is contiguous 2x576 f32 array matching layout
-        // of [f32; 1152].
-        #[allow(unsafe_code)]
-        let grbuf: &mut [f32; 1152] = unsafe {
-            &mut *(scratch.grbuf.as_mut_ptr() as *mut [f32; 1152])
+        let Ok(grbuf): Result<&mut [f32; 1152], _> =
+            scratch.grbuf.as_flattened_mut().try_into()
+        else {
+            return 0;
         };
         i += l12_dequantize_granule(grbuf, i, bs, &sci, group_size);
         if i == 12 {

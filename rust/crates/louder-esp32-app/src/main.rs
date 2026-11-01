@@ -71,7 +71,14 @@ pub const BASEMENT_HELO_CAPABILITIES: &str = concat!(
 /// - bits [19:14] = div_a (fractional denominator)
 #[must_use]
 pub const fn encode_i2s0_clkm_conf(orig: u32, div_num: u32, div_b: u32, div_a: u32) -> u32 {
-    (orig & !0x000F_FFFF) | (div_num & 0xFF) | ((div_b & 0x3F) << 8) | ((div_a & 0x3F) << 14)
+    let cfg = louder_esp32_app::clock_table::I2sClockCfg {
+        clkm_div_num: div_num as u8,
+        clkm_div_a: div_a as u8,
+        clkm_div_b: div_b as u8,
+        bck_div: 2,
+        use_apll: false,
+    };
+    louder_esp32_app::backend_device::encode_clkm_conf(orig, &cfg)
 }
 
 /// Executes one integrated firmware tick across the CYD UART bridge,
@@ -497,6 +504,9 @@ mod xtensa_hw {
     // Gate 2: Custom panic halt hook that resets immediately into factory
     // recovery (`0x10000`) instead of spinning in `loop {}`.
     #[allow(unsafe_code)]
+    // JUSTIFICATION: Override standard panic halt hook with factory reset
+    // into recovery.
+    // SAFETY: Symbol exported with exact C/Rust ABI for runtime linkage.
     #[unsafe(no_mangle)]
     pub extern "Rust" fn custom_halt() -> ! {
         println!("[ANTI-BRICK GATE 2] Panic halted -> reset to recovery (0x10000)");
@@ -1009,6 +1019,8 @@ mod xtensa_hw {
         nvs_scratch: &mut [u8; 12_288],
         sta_mac: &[u8; 6],
     ) -> &'static WifiStaCredentials {
+        // JUSTIFICATION: Place static Wi-Fi credentials in DRAM2 uninitialized section.
+        // SAFETY: Accessed only during single-core initialization before task spawning.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut WIFI_STA_CREDS: core::mem::MaybeUninit<WifiStaCredentials> =
             core::mem::MaybeUninit::uninit();
@@ -1060,6 +1072,8 @@ mod xtensa_hw {
             !MP3_DEC_TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
             "StaticMp3Decoder already taken"
         );
+        // JUSTIFICATION: Place static MP3 decoder in DRAM2 uninitialized section.
+        // SAFETY: Guarded by atomic MP3_DEC_TAKEN ensuring exclusive access.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_MP3_DEC: squeezelite_decoders::StaticMp3Decoder =
             squeezelite_decoders::StaticMp3Decoder::new();
@@ -1095,13 +1109,23 @@ mod xtensa_hw {
     }
 
     #[allow(unsafe_code)]
-    #[link_section = ".dram2_uninit"]
+    // JUSTIFICATION: Dedicated execution stack for Core 1 (APP_CPU) in DRAM2.
+    // SAFETY: Accessed exclusively by Core 1 runner; stack bounds enforced by
+    // hardware and linker.
+    #[unsafe(link_section = ".dram2_uninit")]
     static mut APP_CORE_STACK: Stack<4096> = Stack::new();
     #[allow(unsafe_code)]
+    // JUSTIFICATION: Dedicated static buffer pool for Bluetooth controller heap
+    // in DRAM2.
+    // SAFETY: Managed as singleton heap storage by single Bluetooth task context.
     #[unsafe(link_section = ".dram2_uninit")]
     static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 22 * 1024]> =
         core::mem::MaybeUninit::uninit();
     #[allow(unsafe_code)]
+    // JUSTIFICATION: Static allocation for Bluetooth A2DP sink state machine in
+    // DRAM2.
+    // SAFETY: Exclusive singleton access initialized once before starting
+    // Bluetooth runner.
     #[unsafe(link_section = ".dram2_uninit")]
     static mut STATIC_BT_SINK: core::mem::MaybeUninit<BtA2dpSink> =
         core::mem::MaybeUninit::uninit();
@@ -1531,12 +1555,21 @@ mod xtensa_hw {
         flash: &mut FlashStorage<'_>,
         scratch: &mut [u8; 12_288],
     ) -> (&'static ConfigHandle, &'static mut RamJournal<'static>) {
+        // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
+        // and config handle.
+        // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut JOURNAL_IMAGE: core::mem::MaybeUninit<JournalSector> =
             core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
+        // and config handle.
+        // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> =
             core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
+        // and config handle.
+        // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> =
             core::mem::MaybeUninit::uninit();
@@ -1586,6 +1619,8 @@ mod xtensa_hw {
             !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
             "FirmwareBssBuffers already taken"
         );
+        // JUSTIFICATION: Static BSS buffers in DRAM2 to avoid stack exhaustion.
+        // SAFETY: Single caller on PRO_CPU guarded by atomic TAKEN.
         #[unsafe(link_section = ".dram2_uninit")]
         static mut BSS_BUFFERS: FirmwareBssBuffers = FirmwareBssBuffers::new();
         // JUSTIFICATION: Access to global static firmware BSS buffer singleton.
@@ -1603,9 +1638,12 @@ mod xtensa_hw {
         output_storage: &'static mut [u8],
         sink: EspI2sSink<Esp32HardwareI2sDma<'static>>,
     ) -> PipelineStatics {
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut STATIC_PIPELINE: core::mem::MaybeUninit<HwStreamPipeline> =
-            core::mem::MaybeUninit::uninit();
+        static PIPELINE_TAKEN: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        assert!(
+            !PIPELINE_TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
+            "STATIC_PIPELINE already initialized"
+        );
         // JUSTIFICATION: Field-by-field initialization of static
         // MaybeUninit<StreamPipeline> in .dram2_uninit to avoid a 12 KB
         // stack temporary during boot.
@@ -1613,6 +1651,12 @@ mod xtensa_hw {
         // returning exclusive &'static mut references; `ptr.write_bytes(0, 1)`
         // zeroes the entire uninitialized `.dram2_uninit` region prior to
         // writing every struct field.
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut STATIC_PIPELINE: core::mem::MaybeUninit<HwStreamPipeline> =
+            core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Write fields of uninitialized static pipeline in DRAM2.
+        // SAFETY: Exclusive access guaranteed by atomic PIPELINE_TAKEN;
+        // pointer is valid.
         unsafe {
             let ptr = (*core::ptr::addr_of_mut!(STATIC_PIPELINE)).as_mut_ptr();
             ptr.write_bytes(0, 1);
@@ -2474,15 +2518,23 @@ mod xtensa_hw {
             }
         };
 
-        // Initialize GPIO33 PWDN, GPIO34 FAULT, I2C0 (SDA=21, SCL=27), I2S0
-        // (BCK=26, WS=25, DOUT=22), UART2
+        // ESP32-WROVER (Louder-ESP32 Basement Target) pin mapping:
+        // - GPIO33: TAS5805M PWDN
+        // - GPIO34: TAS5805M FAULT (input only, external pull-up)
+        // - I2C0: SDA=GPIO21, SCL=GPIO27
+        // - I2S0: BCK=GPIO26, WS=GPIO25, DOUT=GPIO22
+        // - UART2: TX=GPIO4, RX=GPIO36 (CYD Bridge)
+        #[cfg(not(feature = "board-louder-esp32-s3"))]
         let mut pwdn = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
+        #[cfg(not(feature = "board-louder-esp32-s3"))]
         let fault = Input::new(
             peripherals.GPIO34,
             InputConfig::default().with_pull(Pull::None),
         );
 
+        #[cfg(not(feature = "board-louder-esp32-s3"))]
         let amp = init_amp_i2c(peripherals.I2C0, peripherals.GPIO21, peripherals.GPIO27);
+        #[cfg(not(feature = "board-louder-esp32-s3"))]
         let (pipeline, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
             peripherals.I2S0,
             peripherals.DMA_I2S0,
@@ -2492,7 +2544,11 @@ mod xtensa_hw {
             stream_storage,
             output_storage,
         );
+        #[cfg(not(feature = "board-louder-esp32-s3"))]
         let cyd_bridge = init_cyd_uart(peripherals.UART2, peripherals.GPIO4, peripherals.GPIO36);
+
+        #[cfg(feature = "board-louder-esp32-s3")]
+        compile_error!("ESP32-S3 board pin mapping pending hardware bring-up");
 
         // Execute 5-stage HIL self-verification
         pwdn.set_high();
@@ -2753,13 +2809,14 @@ mod xtensa_hw {
 
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut DeviceRuntimeState) {
+        s.core1.park_for_flash_write();
+        let _ = s.amp.set_mute(true);
         s.config.flush_now(&mut *s.journal);
         if let Some(image) = s.journal.pending_image() {
             #[cfg(not(feature = "runtime-flash-persist"))]
             let offset = SETTINGS_JOURNAL_OFFSET;
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-            s.core1.park_for_flash_write();
             let _ = s.flash.erase(offset, offset + 4096);
             let _ = s.flash.write(offset, image.sector);
         }
@@ -2770,37 +2827,9 @@ mod xtensa_hw {
     }
 
     fn restore_suspended_or_stop(s: &mut DeviceRuntimeState) {
-        s.pipeline.stream_buffer.flush();
         match s.coordinator.active_source() {
             AudioSource::SlimProto => {
-                match s.coordinator.current_format {
-                    Some(squeezelite_proto::AudioFormat::Mp3) => {
-                        s.pipeline.use_mp3_decoder();
-                    }
-                    Some(squeezelite_proto::AudioFormat::Flac) => {
-                        s.pipeline.set_decoder(ActiveDecoder::new_flac());
-                    }
-                    Some(squeezelite_proto::AudioFormat::Aac) => {
-                        if let Some(d) = ActiveDecoder::new_aac() {
-                            s.pipeline.set_decoder(d);
-                        }
-                    }
-                    Some(squeezelite_proto::AudioFormat::Ogg) => {
-                        if let Some(d) = ActiveDecoder::new_vorbis() {
-                            s.pipeline.set_decoder(d);
-                        }
-                    }
-                    Some(squeezelite_proto::AudioFormat::Alac) => {
-                        s.pipeline.set_decoder(ActiveDecoder::new_alac());
-                    }
-                    Some(squeezelite_proto::AudioFormat::Opus) => {
-                        s.pipeline.set_decoder(ActiveDecoder::new_opus());
-                    }
-                    _ => {
-                        s.pipeline.use_mp3_decoder();
-                    }
-                }
-                s.coordinator.end_external_playback();
+                s.coordinator.end_external_playback_and_restore(s.pipeline);
                 s.pipeline.set_mute(false);
             }
             AudioSource::None => {
@@ -2808,9 +2837,7 @@ mod xtensa_hw {
                 s.coordinator.end_external_playback();
             }
             AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth => {
-                s.pipeline
-                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                s.pipeline.set_mute(false);
+                s.pipeline.stream_buffer.flush();
             }
         }
     }
@@ -3247,6 +3274,13 @@ mod xtensa_hw {
                                 s.pending_http_action = action;
                                 s.pending_action_deadline_ms = now_ms + 250;
                             }
+                            HttpControlAction::UpdateConfig => {
+                                s.config.flush_now(&mut *s.journal);
+                            }
+                            HttpControlAction::ExecuteCliCommand
+                            | HttpControlAction::TriggerWifiScan
+                            | HttpControlAction::ConnectWifi
+                            | HttpControlAction::StartOtaFlash => {}
                             _ => {}
                         }
                     } else {
@@ -3844,15 +3878,11 @@ mod xtensa_hw {
         let now_ms = s.now_ms;
         if now_ms.saturating_sub(s.last_fault_check_ms) >= 2_000 {
             s.last_fault_check_ms = now_ms;
-            if s.coordinator.state == PlayerState::Playing {
-                if let Ok(Some(fault)) = s.amp.check_faults() {
-                    if !fault.is_clean() {
-                        let _ = s.amp.recover_from_fault();
-                    }
+            if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
+                s.latest_telemetry = Some(telem);
+                if s.coordinator.state == PlayerState::Playing && !fault.is_clean() {
+                    let _ = s.amp.recover_from_fault();
                 }
-            }
-            if let Ok(telem) = s.amp.read_telemetry() {
-                s.latest_telemetry = telem;
             }
         }
 
@@ -3988,7 +4018,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
-            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
         ];
         let mut i2c = I2cMock::new(&expectations);

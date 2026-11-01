@@ -992,6 +992,7 @@ impl TelnetSession {
                         self.iac_state = IacState::InSubnegotiation;
                     }
                     TELNET_IAC => {
+                        let _ = self.line_buf.push(TELNET_IAC as char);
                         self.iac_state = IacState::Normal;
                     }
                     _ => {
@@ -1010,7 +1011,7 @@ impl TelnetSession {
                 IacState::SawSubIac => {
                     if byte == TELNET_SE {
                         self.iac_state = IacState::Normal;
-                    } else if byte != TELNET_IAC {
+                    } else {
                         self.iac_state = IacState::InSubnegotiation;
                     }
                 }
@@ -1199,5 +1200,34 @@ mod tests {
         let reply = core::str::from_utf8(&tx[..tx_len]).expect("utf8");
         assert!(reply.contains("OK: player play"));
         assert!(reply.ends_with(TELNET_PROMPT));
+    }
+
+    #[test]
+    fn test_net_503_telnet_iac_escape_and_subnegotiation() {
+        let reg = CliRegistry::new();
+        let mut session = TelnetSession::new();
+        let mut tx = [0u8; 512];
+
+        // 1. Escaped IAC (0xFF 0xFF) inside regular stream appends literal 0xFF
+        let stream1: &[u8] = &[b'a', TELNET_IAC, TELNET_IAC, b'b'];
+        session.ingest_bytes(stream1, &reg, &mut tx);
+        assert_eq!(session.pending_line(), "a\u{ff}b");
+
+        // 2. Subnegotiation containing escaped IAC (0xFF 0xFF) resumes InSubnegotiation
+        // and terminates cleanly on IAC SE
+        let mut session2 = TelnetSession::new();
+        let stream2: &[u8] = &[
+            TELNET_IAC,
+            TELNET_SB,
+            0x24,
+            TELNET_IAC,
+            TELNET_IAC, // escaped IAC inside subnegotiation
+            0x01,
+            TELNET_IAC,
+            TELNET_SE, // end subnegotiation
+            b'c',
+        ];
+        session2.ingest_bytes(stream2, &reg, &mut tx);
+        assert_eq!(session2.pending_line(), "c");
     }
 }

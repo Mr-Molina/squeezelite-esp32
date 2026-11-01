@@ -252,14 +252,18 @@ impl<const MAX_ENTRIES: usize> KeyValueStorage for MemConfigStore<MAX_ENTRIES> {
 pub struct DualSectorFlashStore;
 
 impl DualSectorFlashStore {
-    /// Determines the active sector index (`0` for `sector_a`, `1` for `sector_b`)
-    /// using wrapping 32-bit sequence comparison
+    /// Determines the active sector index (`0` for `sector_a`, `1` for
+    /// `sector_b`) using wrapping 32-bit sequence comparison
     /// `(seq_a.wrapping_sub(seq_b) as i32) >= 0`.
+    ///
+    /// Validates both sector headers and per-entry CRCs (via
+    /// [`FlashJournal::validate_sector`]) so that a sector with corrupted
+    /// entries falls back cleanly to the valid peer sector.
     pub fn active_sector(sector_a: &[u8], sector_b: &[u8]) -> Result<usize, StorageError> {
-        let meta_a = FlashJournal::read_sector_meta(sector_a);
-        let meta_b = FlashJournal::read_sector_meta(sector_b);
+        let val_a = FlashJournal::validate_sector(sector_a);
+        let val_b = FlashJournal::validate_sector(sector_b);
 
-        match (meta_a, meta_b) {
+        match (val_a, val_b) {
             (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
                 if FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
                     Ok(0)
@@ -1442,6 +1446,44 @@ mod tests {
         let err = FlashJournal::save_to_sector_with_seq(&store, &mut small_buf, 42);
         assert_eq!(err, Err(StorageError::BufferTooSmall));
         assert_eq!(small_buf, [0xFFu8; 20]); // unmodified!
+    }
+
+    #[test]
+    fn test_dual_sector_active_sector_corrupted_entry_fallback() {
+        let mut store = MemConfigStore::<16>::new();
+        store.set_str("vol", "50").unwrap();
+
+        let mut sector_a = [0xFFu8; 256];
+        let mut sector_b = [0xFFu8; 256];
+
+        // Sector A has seq 10 (older)
+        let _ = FlashJournal::save_to_sector_with_seq(
+            &store, &mut sector_a, 10,
+        ).unwrap();
+        // Sector B has seq 11 (newer)
+        let _ = FlashJournal::save_to_sector_with_seq(
+            &store, &mut sector_b, 11,
+        ).unwrap();
+
+        // Sector B is newer, so it is active (index 1)
+        assert_eq!(
+            DualSectorFlashStore::active_sector(&sector_a, &sector_b),
+            Ok(1)
+        );
+
+        // Corrupt an entry byte in Sector B (past header)
+        sector_b[FlashJournal::HEADER_SIZE + 4] ^= 0x55;
+
+        // Sector B entry CRC is now invalid. active_sector must fall back
+        // to valid Sector A (index 0).
+        assert_eq!(
+            DualSectorFlashStore::active_sector(&sector_a, &sector_b),
+            Ok(0)
+        );
+        assert_eq!(
+            DualSectorFlashStore::active_sector(&sector_b, &sector_a),
+            Ok(1)
+        );
     }
 
     #[test]

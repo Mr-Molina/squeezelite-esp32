@@ -44,6 +44,10 @@ pub const MAX_FLAC_BLOCK_SAMPLES: usize = 4608;
 /// Maximum MP4/M4A sample table entries permitted in memory.
 pub const MAX_MP4_SAMPLES: usize = 65536;
 
+/// Maximum stream buffer size for MP4/M4A metadata atoms prior to
+/// entering mdat (PERF-301).
+pub const MAX_MP4_META_BUF: usize = 270_336;
+
 /// Minimum supported audio sample rate in Hz.
 pub const MIN_SAMPLE_RATE: u32 = 8000;
 
@@ -679,18 +683,22 @@ pub fn parse_xing_lame_header(frame: &[u8]) -> Option<XingLameInfo> {
     let mut enc_delay = 0u16;
     let mut enc_padding = 0u16;
 
-    let lame_start = if pos + 24 <= frame.len()
-        && (&frame[pos..pos + 4] == b"LAME"
-            || &frame[pos..pos + 4] == b"Lavc"
-            || &frame[pos..pos + 4] == b"Lavf"
-            || &frame[pos..pos + 4] == b"GOGO"
-            || frame[pos..pos + 4].iter().all(|&b| (0x20..=0x7E).contains(&b)))
-    {
+    let is_known_encoder_tag = |tag: &[u8]| -> bool {
+        tag == b"LAME"
+            || tag == b"Lavc"
+            || tag == b"Lavf"
+            || tag == b"GOGO"
+            || tag == b"L3.9"
+            || tag == b"XING"
+            || tag == b"Info"
+    };
+
+    let lame_start = if pos + 24 <= frame.len() && is_known_encoder_tag(&frame[pos..pos + 4]) {
         Some(pos)
     } else if pos < frame.len() {
         frame[pos..]
             .windows(4)
-            .position(|w| w == b"LAME" || w == b"Lavc" || w == b"Lavf" || w == b"GOGO")
+            .position(is_known_encoder_tag)
             .map(|rel| pos + rel)
     } else {
         None
@@ -943,7 +951,8 @@ impl AudioDecoder for Mp3Decoder {
                     };
                     let lead_trim = (xing.enc_delay as u64) + extra;
                     let max_raw = xing.total_frames.map(|tf| {
-                        let total_raw = (tf as u64) * (xing.samples_per_frame as u64);
+                        let audio_frames = (tf as u64).saturating_sub(1);
+                        let total_raw = audio_frames * (xing.samples_per_frame as u64);
                         total_raw.saturating_sub(xing.enc_padding as u64)
                     });
                     apply_mp3_gapless_trim(
@@ -1225,7 +1234,8 @@ impl AudioDecoder for StaticMp3Decoder {
                     };
                     let lead_trim = (xing.enc_delay as u64) + extra;
                     let max_raw = xing.total_frames.map(|tf| {
-                        let total_raw = (tf as u64) * (xing.samples_per_frame as u64);
+                        let audio_frames = (tf as u64).saturating_sub(1);
+                        let total_raw = audio_frames * (xing.samples_per_frame as u64);
                         total_raw.saturating_sub(xing.enc_padding as u64)
                     });
                     apply_mp3_gapless_trim(
@@ -2112,19 +2122,28 @@ impl FlacDecoder {
             let mut body_off = page_hdr_len;
             for &seg_u8 in &seg_table_buf[..n_segs] {
                 let seg_len = seg_u8 as usize;
+                if self.ogg_partial_pkt.len().saturating_add(seg_len) > MAX_STREAM_BUF {
+                    self.ogg_partial_pkt.clear();
+                    self.ogg_raw_buf.drain(..total_page_len);
+                    return Err(DecoderError::CorruptedFrame);
+                }
                 self.ogg_partial_pkt
                     .extend_from_slice(&self.ogg_raw_buf[body_off..body_off + seg_len]);
                 body_off += seg_len;
 
                 if seg_u8 < 255 {
                     if self.ogg_partial_pkt.starts_with(b"\x7fFLAC") {
-                        if self.ogg_partial_pkt.len() < 13
+                        if self.ogg_partial_pkt.len() < 51
                             || self.ogg_partial_pkt[5] != 1
                             || self.ogg_partial_pkt[6] != 0
                         {
                             self.ogg_partial_pkt.clear();
                             self.ogg_raw_buf.drain(..total_page_len);
                             return Err(DecoderError::InvalidHeader);
+                        }
+                        if self.header_len > 0 {
+                            self.stream_buf.clear();
+                            self.header_len = 0;
                         }
                         if self.stream_buf.len() + (self.ogg_partial_pkt.len() - 9)
                             > MAX_STREAM_BUF
@@ -2178,6 +2197,16 @@ impl AudioDecoder for FlacDecoder {
                 self.pending_offset = 0;
             }
             return Ok((0, to_copy));
+        }
+
+        if self.header_len > 0
+            && (encoded_in.starts_with(b"fLaC")
+                || encoded_in.starts_with(b"\x7fFLAC")
+                || encoded_in.starts_with(b"OggS"))
+        {
+            self.stream_buf.clear();
+            self.header_len = 0;
+            self.is_ogg_flac = None;
         }
 
         if self.is_ogg_flac.is_none() {
@@ -2529,38 +2558,78 @@ fn read_mp4_descr_len(buf: &[u8], mut idx: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> {
-    if asc.len() < 2 {
-        return Err(DecoderError::InvalidHeader);
+struct AscBitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> AscBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
     }
-    let b0 = asc[0];
-    let b1 = asc[1];
-    let audio_object_type = (b0 >> 3) & 0x1F;
+
+    fn read_bits(&mut self, n: usize) -> Option<u32> {
+        if n == 0 || n > 32 {
+            return None;
+        }
+        if self.bit_pos.saturating_add(n) > self.data.len() * 8 {
+            return None;
+        }
+        let mut val = 0u32;
+        for _ in 0..n {
+            let byte_idx = self.bit_pos / 8;
+            let bit_idx = 7 - (self.bit_pos % 8);
+            let bit = ((self.data[byte_idx] >> bit_idx) & 1) as u32;
+            val = (val << 1) | bit;
+            self.bit_pos += 1;
+        }
+        Some(val)
+    }
+}
+
+fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> {
+    let mut reader = AscBitReader::new(asc);
+    let mut audio_object_type = reader.read_bits(5).ok_or(DecoderError::InvalidHeader)?;
+    if audio_object_type == 31 {
+        let ext = reader.read_bits(6).ok_or(DecoderError::InvalidHeader)?;
+        audio_object_type = 32 + ext;
+    }
     if audio_object_type == 0 {
         return Err(DecoderError::InvalidHeader);
     }
     if audio_object_type > 5 {
         return Err(DecoderError::UnsupportedFeature);
     }
-    let sampling_frequency_index = ((b0 & 0x07) << 1) | ((b1 >> 7) & 0x01);
-    if sampling_frequency_index as usize >= AAC_SAMPLE_RATES.len() {
+    let freq_idx = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)?;
+    let (sample_rate, sampling_frequency_index) = if freq_idx == 0x0F {
+        let sr = reader.read_bits(24).ok_or(DecoderError::InvalidHeader)?;
+        let idx = AAC_SAMPLE_RATES
+            .iter()
+            .position(|&r| r == sr)
+            .map(|i| i as u8)
+            .unwrap_or(0x0F);
+        (sr, idx)
+    } else if (freq_idx as usize) < AAC_SAMPLE_RATES.len() {
+        (AAC_SAMPLE_RATES[freq_idx as usize], freq_idx as u8)
+    } else {
         return Err(DecoderError::UnsupportedFeature);
-    }
-    let sample_rate = AAC_SAMPLE_RATES[sampling_frequency_index as usize];
+    };
     if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
         return Err(DecoderError::UnsupportedFeature);
     }
-    let channel_configuration = (b1 >> 3) & 0x0F;
+    let channel_configuration = reader
+        .read_bits(4)
+        .ok_or(DecoderError::InvalidHeader)? as u8;
     if channel_configuration != 1 && channel_configuration != 2 {
         return Err(DecoderError::UnsupportedFeature);
     }
     let adts_profile = if audio_object_type == 5 {
         1
     } else {
-        (audio_object_type - 1) & 0x03
+        ((audio_object_type.saturating_sub(1)) & 0x03) as u8
     };
     Ok(AacAudioSpecificConfig {
-        audio_object_type,
+        audio_object_type: audio_object_type as u8,
         adts_profile,
         sampling_frequency_index,
         channel_configuration,
@@ -2815,7 +2884,13 @@ impl AacDecoder {
             return Err(DecoderError::InvalidHeader);
         };
 
-        if demux.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+        let max_buf = if demux.state == Mp4DemuxState::ReadingMdat {
+            MAX_STREAM_BUF
+        } else {
+            MAX_MP4_META_BUF
+        };
+
+        if demux.stream_buf.len().saturating_add(encoded_in.len()) > max_buf {
             self.flush();
             return Err(DecoderError::CorruptedFrame);
         }
@@ -3260,7 +3335,7 @@ impl AudioDecoder for AacDecoder {
                     || fourcc == b"wide"
                     || fourcc == b"mdat";
                 self.is_mp4 = Some(is_box);
-            } else if encoded_in.len() < 7 {
+            } else if encoded_in.len() < 8 {
                 if frames_out > 0 {
                     return Ok((0, frames_out));
                 }
@@ -3414,7 +3489,9 @@ impl VorbisDecoder {
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        !self.pending_pcm.is_empty() || !self.packet_queue.is_empty()
+        !self.pending_pcm.is_empty()
+            || !self.packet_queue.is_empty()
+            || self.stream_buf.windows(4).any(|w| w == b"OggS")
     }
 
     pub fn flush(&mut self) {
@@ -3654,6 +3731,18 @@ impl AudioDecoder for VorbisDecoder {
                 break;
             }
 
+            let expected_crc = u32::from_le_bytes([
+                self.stream_buf[22],
+                self.stream_buf[23],
+                self.stream_buf[24],
+                self.stream_buf[25],
+            ]);
+            let actual_crc = ogg_crc32(&self.stream_buf[..total_page_len]);
+            if expected_crc != actual_crc {
+                self.stream_buf.drain(..total_page_len);
+                return Err(DecoderError::CorruptedFrame);
+            }
+
             let header_type_flag = self.stream_buf[5];
             let is_continued = (header_type_flag & 0x01) != 0;
 
@@ -3666,6 +3755,11 @@ impl AudioDecoder for VorbisDecoder {
 
             for &seg_len_u8 in seg_table {
                 let seg_len = seg_len_u8 as usize;
+                if self.partial_packet.len().saturating_add(seg_len) > MAX_STREAM_BUF {
+                    self.partial_packet.clear();
+                    self.stream_buf.drain(..total_page_len);
+                    return Err(DecoderError::CorruptedFrame);
+                }
                 self.partial_packet
                     .extend_from_slice(&self.stream_buf[body_offset..body_offset + seg_len]);
                 body_offset += seg_len;
@@ -3691,6 +3785,10 @@ impl AudioDecoder for VorbisDecoder {
                 } else {
                     self.packet_queue.push(packet);
                 }
+            }
+
+            if frames_out >= max_frames {
+                break;
             }
         }
 
@@ -3810,7 +3908,13 @@ impl AudioDecoder for AlacDecoder {
         }
 
         // 2. Ingest input buffer
-        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+        let max_buf = if self.state == AlacState::ReadingMdat {
+            MAX_STREAM_BUF
+        } else {
+            MAX_MP4_META_BUF
+        };
+
+        if self.stream_buf.len().saturating_add(encoded_in.len()) > max_buf {
             self.flush();
             return Err(DecoderError::CorruptedFrame);
         }
@@ -4196,7 +4300,9 @@ impl OpusDecoder {
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        !self.pending_pcm.is_empty() || !self.packet_queue.is_empty()
+        !self.pending_pcm.is_empty()
+            || !self.packet_queue.is_empty()
+            || self.stream_buf.windows(4).any(|w| w == b"OggS")
     }
 
     pub fn flush(&mut self) {
@@ -4425,6 +4531,18 @@ impl AudioDecoder for OpusDecoder {
                 break;
             }
 
+            let expected_crc = u32::from_le_bytes([
+                self.stream_buf[22],
+                self.stream_buf[23],
+                self.stream_buf[24],
+                self.stream_buf[25],
+            ]);
+            let actual_crc = ogg_crc32(&self.stream_buf[..total_page_len]);
+            if expected_crc != actual_crc {
+                self.stream_buf.drain(..total_page_len);
+                return Err(DecoderError::CorruptedFrame);
+            }
+
             let header_type_flag = self.stream_buf[5];
             let is_continued = (header_type_flag & 0x01) != 0;
 
@@ -4437,6 +4555,11 @@ impl AudioDecoder for OpusDecoder {
 
             for &seg_len_u8 in seg_table {
                 let seg_len = seg_len_u8 as usize;
+                if self.partial_packet.len().saturating_add(seg_len) > MAX_STREAM_BUF {
+                    self.partial_packet.clear();
+                    self.stream_buf.drain(..total_page_len);
+                    return Err(DecoderError::CorruptedFrame);
+                }
                 self.partial_packet
                     .extend_from_slice(&self.stream_buf[body_offset..body_offset + seg_len]);
                 body_offset += seg_len;
@@ -4462,6 +4585,10 @@ impl AudioDecoder for OpusDecoder {
                 } else {
                     self.packet_queue.push(packet);
                 }
+            }
+
+            if frames_out >= max_frames {
+                break;
             }
         }
 
@@ -4599,6 +4726,42 @@ mod tests {
         let encoded = [0u8; 5];
         let mut pcm_out = [0i32; 32];
         assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(decoder.is_mp4, None);
+
+        // 7 non-ADTS bytes (e.g. initial MP4 box fragment) must return
+        // NeedMoreData without locking is_mp4
+        let encoded7 = [0u8; 7];
+        assert_eq!(decoder.decode(&encoded7, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(decoder.is_mp4, None);
+
+        // 7-byte valid ADTS header locks is_mp4 to Some(false)
+        let mut adts7 = [0u8; 7];
+        adts7[0] = 0xFF;
+        adts7[1] = 0xF1;
+        let mut dec2 = AacDecoder::new();
+        let _ = dec2.decode(&adts7, &mut pcm_out);
+        assert_eq!(dec2.is_mp4, Some(false));
+    }
+
+    #[test]
+    fn test_decode_asc_bytes_explicit_frequency_and_sbr() {
+        // 1. Explicit 24-bit frequency: AOT=2, freq_idx=15, freq=44100 (0x00AC44), ch=2
+        let asc_24bit = [0x17, 0x80, 0x56, 0x22, 0x10];
+        let cfg = decode_asc_bytes(&asc_24bit).unwrap();
+        assert_eq!(cfg.audio_object_type, 2);
+        assert_eq!(cfg.sample_rate, 44100);
+        assert_eq!(cfg.sampling_frequency_index, 4);
+        assert_eq!(cfg.channel_configuration, 2);
+        assert_eq!(cfg.adts_profile, 1);
+
+        // 2. Explicit SBR (AOT 5): AOT=5, freq_idx=4 (44100 Hz), ch=2
+        let asc_sbr = [0x2A, 0x10];
+        let cfg_sbr = decode_asc_bytes(&asc_sbr).unwrap();
+        assert_eq!(cfg_sbr.audio_object_type, 5);
+        assert_eq!(cfg_sbr.sample_rate, 44100);
+        assert_eq!(cfg_sbr.sampling_frequency_index, 4);
+        assert_eq!(cfg_sbr.channel_configuration, 2);
+        assert_eq!(cfg_sbr.adts_profile, 1);
     }
 
     #[test]
@@ -4836,7 +4999,7 @@ mod tests {
     #[cfg(feature = "std")]
     fn test_alac_max_stream_buf_overflow() {
         let mut decoder = AlacDecoder::new();
-        let oversized = std::vec![0u8; MAX_STREAM_BUF + 1];
+        let oversized = std::vec![0u8; MAX_MP4_META_BUF + 1];
         let mut pcm_out = [0i32; 32];
         assert_eq!(
             decoder.decode(&oversized, &mut pcm_out),
@@ -4845,9 +5008,9 @@ mod tests {
 
         // Multi-step accumulation
         let mut dec2 = AlacDecoder::new();
-        let chunk1 = std::vec![0u8; 32768];
+        let chunk1 = std::vec![0u8; 135_168];
         let _ = dec2.decode(&chunk1, &mut pcm_out);
-        let chunk2 = std::vec![0u8; 32769];
+        let chunk2 = std::vec![0u8; 135_169];
         assert_eq!(
             dec2.decode(&chunk2, &mut pcm_out),
             Err(DecoderError::CorruptedFrame)
@@ -5281,13 +5444,56 @@ mod tests {
     }
 
     #[test]
+    fn test_flac_stream_switch_across_flush() {
+        let flac_44k = include_bytes!("../tests/fixtures/stereo_16bit.flac");
+        let flac_48k = include_bytes!("../tests/fixtures/stereo_24bit.flac");
+
+        let mut decoder = FlacDecoder::new();
+        let mut pcm_out = [0i32; 1024];
+
+        // 1. Decode stream 1 (44.1 kHz, 16-bit)
+        let (consumed1, frames1) = decoder.decode(flac_44k, &mut pcm_out).unwrap();
+        assert!(consumed1 > 0);
+        assert!(frames1 > 0);
+        assert_eq!(decoder.sample_rate, 44100);
+        assert_eq!(decoder.bits_per_sample, 16);
+
+        // 2. Flush between tracks
+        decoder.flush();
+
+        // 3. Decode stream 2 (48 kHz, 24-bit) starting with b"fLaC"
+        let (consumed2, frames2) = decoder.decode(flac_48k, &mut pcm_out).unwrap();
+        assert!(consumed2 > 0);
+        assert!(frames2 > 0);
+        assert_eq!(decoder.sample_rate, 48000);
+        assert_eq!(decoder.bits_per_sample, 24);
+
+        // 4. Mid-stream flush: test that flushing followed by raw audio frames
+        // (without b"fLaC" header) reuses existing STREAMINFO
+        let chunk1_end = 1024.min(flac_48k.len());
+        decoder.flush();
+        // First feed up to chunk1_end
+        let (_c_part1, _f_part1) = decoder.decode(&flac_48k[..chunk1_end], &mut pcm_out).unwrap();
+        assert_eq!(decoder.sample_rate, 48000);
+
+        // Now flush mid-stream and feed next chunk without fLaC header
+        decoder.flush();
+        let chunk2_end = (chunk1_end + 2048).min(flac_48k.len());
+        let (c_part2, _f_part2) = decoder
+            .decode(&flac_48k[chunk1_end..chunk2_end], &mut pcm_out)
+            .unwrap();
+        assert!(c_part2 > 0);
+        assert_eq!(decoder.sample_rate, 48000);
+    }
+
+    #[test]
     fn test_mp3_xing_lame_header_parse_and_gapless_trim() {
         let mut xing_frame = [0u8; 417];
         xing_frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         xing_frame[36..40].copy_from_slice(b"Xing");
         xing_frame[40..44].copy_from_slice(&0x0000_0003u32.to_be_bytes());
-        xing_frame[44..48].copy_from_slice(&3u32.to_be_bytes());
-        xing_frame[48..52].copy_from_slice(&(3u32 * 417).to_be_bytes());
+        xing_frame[44..48].copy_from_slice(&4u32.to_be_bytes());
+        xing_frame[48..52].copy_from_slice(&(4u32 * 417).to_be_bytes());
         xing_frame[52..61].copy_from_slice(b"LAME3.100");
         // enc_delay = 576 (0x240), enc_padding = 1152 (0x480) at LAME + 21
         // (offset 73..76)
@@ -5296,8 +5502,8 @@ mod tests {
         xing_frame[75] = 0x80;
 
         let parsed = parse_xing_lame_header(&xing_frame).unwrap();
-        assert_eq!(parsed.total_frames, Some(3));
-        assert_eq!(parsed.total_bytes, Some(3 * 417));
+        assert_eq!(parsed.total_frames, Some(4));
+        assert_eq!(parsed.total_bytes, Some(4 * 417));
         assert_eq!(parsed.enc_delay, 576);
         assert_eq!(parsed.enc_padding, 1152);
         assert_eq!(parsed.samples_per_frame, 1152);
@@ -5324,7 +5530,7 @@ mod tests {
         }
         assert_eq!(dec.enc_delay_frames(), 576);
         assert_eq!(dec.enc_padding_frames(), 1152);
-        assert_eq!(dec.total_frames(), Some(3));
+        assert_eq!(dec.total_frames(), Some(4));
         // Frame 0 (Xing): 0; Frame 1: 1152 - 576 = 576; Frame 2: 1152;
         // Frame 3: 0 (trimmed)
         assert_eq!(frame_counts, std::vec![0, 576, 1152, 0]);
@@ -5486,6 +5692,40 @@ mod tests {
             bad_dec.decode(&bad_ogg, &mut pcm_buf),
             Err(DecoderError::CorruptedFrame)
         );
+    }
+
+    #[test]
+    fn test_ogg_vorbis_and_opus_crc_and_overflow_protection() {
+        let vorbis_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1.ogg");
+        let opus_fixture = include_bytes!("../tests/fixtures/test_stereo_05s_48k.opus");
+        let mut pcm_buf = [0i32; 1024];
+
+        // 1. SEC-301: Vorbis CRC validation
+        let mut bad_vorbis = vorbis_fixture.to_vec();
+        bad_vorbis[22] ^= 0xFF;
+        let mut vorbis_dec = VorbisDecoder::new();
+        assert_eq!(
+            vorbis_dec.decode(&bad_vorbis, &mut pcm_buf),
+            Err(DecoderError::CorruptedFrame)
+        );
+
+        // 2. SEC-301: Opus CRC validation
+        let mut bad_opus = opus_fixture.to_vec();
+        bad_opus[22] ^= 0xFF;
+        let mut opus_dec = OpusDecoder::new();
+        assert_eq!(
+            opus_dec.decode(&bad_opus, &mut pcm_buf),
+            Err(DecoderError::CorruptedFrame)
+        );
+
+        // 3. PERF-303: Vorbis constrained decode breaks loop early and keeps
+        // remaining pages
+        let mut v_dec = VorbisDecoder::new();
+        let mut small_pcm = [0i32; 128]; // max_frames = 64
+        let (consumed, frames) = v_dec.decode(vorbis_fixture, &mut small_pcm).unwrap();
+        assert!(consumed > 0);
+        assert_eq!(frames, 64);
+        assert!(v_dec.has_pending_pcm());
     }
 
     fn make_mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> std::vec::Vec<u8> {
