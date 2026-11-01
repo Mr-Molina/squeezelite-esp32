@@ -801,14 +801,24 @@ impl StatBuilder {
     ) -> Result<usize, ParseError> {
         let elapsed_ms = ((frames_played as u64) * 1000 / 44_100) as u32;
         let elapsed_seconds = frames_played / 44_100;
+        let stream_buffer_size = if stream_buffer_fullness > 65536 {
+            stream_buffer_fullness.max(262_144)
+        } else {
+            65536
+        };
+        let output_buffer_size = if output_buffer_fullness > 65536 {
+            output_buffer_fullness.max(2_048_000)
+        } else {
+            65536
+        };
         let report = StatReport {
             event,
-            stream_buffer_size: 65536,
+            stream_buffer_size,
             stream_buffer_fullness,
             bytes_received: frames_played as u64,
             signal_strength: 0xFFFF,
             jiffies: timestamp_ms,
-            output_buffer_size: 65536,
+            output_buffer_size,
             output_buffer_fullness,
             elapsed_seconds,
             voltage: 0,
@@ -840,14 +850,24 @@ impl StatBuilder {
         };
         let elapsed_ms = (frames_played.saturating_mul(1000) / rate) as u32;
         let elapsed_seconds = (frames_played / rate) as u32;
+        let stream_buffer_size = if stream_buffer_fullness > 65536 {
+            stream_buffer_fullness.max(262_144)
+        } else {
+            65536
+        };
+        let output_buffer_size = if output_buffer_fullness > 65536 {
+            output_buffer_fullness.max(2_048_000)
+        } else {
+            65536
+        };
         let report = StatReport {
             event,
-            stream_buffer_size: 65536,
+            stream_buffer_size,
             stream_buffer_fullness,
             bytes_received,
             signal_strength: 0xFFFF,
             jiffies: jiffies_ms,
-            output_buffer_size: 65536,
+            output_buffer_size,
             output_buffer_fullness,
             elapsed_seconds,
             voltage: 0,

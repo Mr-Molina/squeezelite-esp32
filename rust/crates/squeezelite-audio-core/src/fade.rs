@@ -54,6 +54,7 @@ fn ratio_gain(num: u64, den: u64) -> i32 {
 /// Scales `samples` in place by a Q16.16 gain (C `_apply_gain`,
 /// `output_pack.c:383-410`, both channels at the same gain). Unity is a no-op,
 /// as in C.
+#[inline]
 pub fn apply_gain(samples: &mut [i32], g: i32) {
     if g == FIXED_ONE {
         return;
@@ -79,6 +80,7 @@ pub fn cross_sample(old: i32, new: i32, gain_out: i32, gain_in: i32) -> i32 {
 /// Crossfades `new_head` into `old_tail` in place (C `_apply_cross`,
 /// `output_pack.c:366-376`). Mixes `min(old_tail.len(), new_head.len())`
 /// samples.
+#[inline]
 pub fn mix_crossfade(old_tail: &mut [i32], new_head: &[i32], gain_out: i32, gain_in: i32) {
     for (old, &new) in old_tail.iter_mut().zip(new_head) {
         *old = cross_sample(*old, new, gain_out, gain_in);
@@ -225,6 +227,12 @@ impl FadeEngine {
     /// it with volume and replay gain, as C does at `output.c:226-228`.
     pub const fn gain_q16(&self) -> u32 {
         self.gain
+    }
+
+    /// Applies the current fade gain to interleaved stereo samples in place.
+    #[inline]
+    pub fn process_samples(&self, samples: &mut [i32]) {
+        apply_gain(samples, self.gain as i32);
     }
 
     /// A crossfade is armed or running: the playing track keeps its replay

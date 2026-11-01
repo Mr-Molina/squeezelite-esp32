@@ -620,6 +620,7 @@ fn l3_decode_scalefactors(
     }
 }
 
+#[inline(always)]
 fn l3_pow_43(mut x: i32) -> f32 {
     let mut mult = 256;
     if x < 129 {
@@ -996,6 +997,7 @@ fn l3_imdct36_bands<T: Lanes>(grbuf: &mut [f32], overlap: &mut [f32], window: &[
     }
 }
 
+#[inline(always)]
 fn l3_imdct36(grbuf: &mut [f32], overlap: &mut [f32], window: &[f32; 18], nbands: usize) {
     let mut j = 0;
     while j + 4 <= nbands {
@@ -1224,6 +1226,11 @@ fn mp3d_dct_ii_cols<T: Lanes>(grbuf: &mut [f32; 576], k: usize) {
     t[3][7].store(&mut grbuf[y + 3 * 18..]);
 }
 
+#[allow(unsafe_code)]
+// JUSTIFICATION: Hot MP3 synthesis DCT kernel placed in IRAM (.iram1) on
+// xtensa.
+// SAFETY: Static placement in valid IRAM text section.
+#[cfg_attr(target_arch = "xtensa", unsafe(link_section = ".iram1"))]
 fn mp3d_dct_ii(grbuf: &mut [f32; 576], n: usize) {
     let mut k = 0;
     while k + 4 <= n {
@@ -1271,6 +1278,7 @@ const ZLIN: usize = 15 * 16;
 /// Rows of `lins` touched by one call to `mp3d_synth`.
 const SYNTH_ROWS: usize = ZLIN + 2 * 16;
 
+#[inline(always)]
 fn mp3d_synth<S: Sample, const NCH: usize>(
     xl: &[f32],
     xr: &[f32],
@@ -1383,6 +1391,11 @@ fn mp3d_synth_all<S: Sample, const NCH: usize>(
 /// `(18 + 15) * 2 * 32` floats).
 const SYN_ROWS: usize = (18 + 15) * 2 * 32 / 4;
 
+#[allow(unsafe_code)]
+// JUSTIFICATION: Hot MP3 synthesis DCT kernel placed in IRAM (.iram1) on
+// xtensa.
+// SAFETY: Static placement in valid IRAM text section.
+#[cfg_attr(target_arch = "xtensa", unsafe(link_section = ".iram1"))]
 fn mp3d_synth_granule<S: Sample>(
     qmf_state: &mut [f32; 960],
     grbuf: &mut [[f32; 576]; 2],

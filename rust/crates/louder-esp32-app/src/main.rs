@@ -778,9 +778,9 @@ mod xtensa_hw {
         }
     }
 
-    /// Size of the I2S TX DMA stream buffer (`dma_tx_stream_buffer!` in
+    /// Size of the I2S TX DMA stream buffer (`DMA_TX_BUF` in
     /// [`init_i2s_pipeline`]).
-    const I2S_DMA_BUFFER_BYTES: usize = 8192;
+    const I2S_DMA_BUFFER_BYTES: usize = 16384;
 
     /// Stereo frames queued in the I2S DMA buffer, updated by the driver after
     /// every push (`AudioBackend::dma_outstanding_frames`).
@@ -898,6 +898,11 @@ mod xtensa_hw {
     }
 
     impl I2sDmaDriver for Esp32HardwareI2sDma<'_> {
+        #[allow(unsafe_code)]
+        // JUSTIFICATION: Hot I2S DMA write loop placed in IRAM (.iram1) to
+        // eliminate SPI flash wait states.
+        // SAFETY: Placed in executable IRAM section with no side effects.
+        #[unsafe(link_section = ".iram1")]
         fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
             let valid_len = data.len() & !7;
             if valid_len == 0 {
@@ -1087,7 +1092,7 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        ring_storage: [u8; 12288],
+        ring_storage: [u8; 4096],
         http_rx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
         slim_tx_buf: [u8; 2048],
@@ -1098,7 +1103,7 @@ mod xtensa_hw {
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                ring_storage: [0u8; 12288],
+                ring_storage: [0u8; 4096],
                 http_rx_buf: [0u8; 1024],
                 slim_rx_buf: [0u8; 2048],
                 slim_tx_buf: [0u8; 2048],
@@ -1119,7 +1124,7 @@ mod xtensa_hw {
     // in DRAM2.
     // SAFETY: Managed as singleton heap storage by single Bluetooth task context.
     #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 22 * 1024]> =
+    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 14 * 1024]> =
         core::mem::MaybeUninit::uninit();
     #[allow(unsafe_code)]
     // JUSTIFICATION: Static allocation for Bluetooth A2DP sink state machine in
@@ -1135,6 +1140,10 @@ mod xtensa_hw {
     }
 
     impl<'d> louder_esp32_app::bt_a2dp::HciTransport for Esp32VhciTransport<'d> {
+        fn can_read(&self) -> bool {
+            esp_radio::ble::have_hci_read_data()
+        }
+
         fn read_packet(&mut self, buf: &mut [u8]) -> usize {
             self.connector.next(buf).unwrap_or(0)
         }
@@ -1693,6 +1702,8 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).loudness_level).write(0);
             core::ptr::addr_of_mut!((*ptr).active_sample_rate_hz).write(44_100);
             core::ptr::addr_of_mut!((*ptr).resampler).write(None);
+            core::ptr::addr_of_mut!((*ptr).output_threshold_frames).write(4_096);
+            core::ptr::addr_of_mut!((*ptr).threshold_satisfied).write(false);
 
             let http_resp_buf: &'static mut [u8; 1536] =
                 alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 1536]));
@@ -1867,7 +1878,42 @@ mod xtensa_hw {
             .with_sample_rate(Rate::from_hz(44_100))
             .with_data_format(DataFormat::Data32Channel32)
             .with_channels(Channels::STEREO);
-        let mut tx_buffer = esp_hal::dma_tx_stream_buffer!(8192, 1024);
+        #[allow(unsafe_code)]
+        // JUSTIFICATION: Static DMA TX buffer in `.dram2_uninit` internal SRAM
+        // (0x3FFE_0000..0x4000_0000) expands DMA depth to 46.44 ms while
+        // freeing 8 KiB from `.bss` to expand `.stack` headroom.
+        // SAFETY: Accessed once on PRO_CPU during single-core initialization.
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut DMA_TX_BUF: esp_hal::dma::aligned::InternalMemory<[u8; 16384]> =
+            esp_hal::dma::aligned::InternalMemory::new([0u8; 16384]);
+
+        #[allow(unsafe_code)]
+        // JUSTIFICATION: Static DMA descriptors in `.dram2_uninit` internal
+        // SRAM for 16 chunks of 1024 B.
+        // SAFETY: Accessed once on PRO_CPU during single-core initialization.
+        #[unsafe(link_section = ".dram2_uninit")]
+        static mut DMA_TX_DESCRIPTORS: esp_hal::dma::aligned::InternalMemory<
+            [esp_hal::dma::DmaDescriptor; 16],
+        > = esp_hal::dma::aligned::InternalMemory::new([esp_hal::dma::DmaDescriptor::EMPTY; 16]);
+
+        #[allow(unsafe_code)]
+        // JUSTIFICATION: Borrow singleton DMA TX buffer in `.dram2_uninit`.
+        // SAFETY: Accessed exclusively once during PRO_CPU initialization.
+        let dma_tx_slice = unsafe {
+            (&mut *core::ptr::addr_of_mut!(DMA_TX_BUF))
+                .get_mut()
+                .unsize()
+        };
+        #[allow(unsafe_code)]
+        // JUSTIFICATION: Borrow singleton DMA descriptors in `.dram2_uninit`.
+        // SAFETY: Accessed exclusively once during PRO_CPU initialization.
+        let tx_descriptors = unsafe {
+            (&mut *core::ptr::addr_of_mut!(DMA_TX_DESCRIPTORS))
+                .get_mut()
+                .unsize()
+        };
+        let mut tx_buffer = esp_hal::dma::DmaTxStreamBuf::new(tx_descriptors, dma_tx_slice)
+            .expect("Failed to create I2S DMA tx stream buffer");
         Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
         let i2s = I2s::new(i2s0, dma, i2s_tdm_cfg).expect("Failed to initialize I2S0");
         let i2s_tx = i2s
@@ -2261,6 +2307,9 @@ mod xtensa_hw {
         spot_spirc: alloc::boxed::Box<SpircStateMachine>,
         spot_streaming: bool,
         now_ms: u64,
+        wifi_connected_logged: bool,
+        last_fault_recovery_ms: u64,
+        last_bt_idle_poll_ms: u64,
     }
 
     /// Device entry: bring-up, then the Phase 0+1 + Multi-Protocol runtime
@@ -2368,16 +2417,28 @@ mod xtensa_hw {
         // settings FlashJournal, then (Wi-Fi only) the C firmware's NVS, then
         // the compile-time first-boot defaults.
         let (config, journal) = {
-            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288])
-                .try_into()
-                .expect("12 KB slice");
+            #[allow(unsafe_code)]
+            // JUSTIFICATION: Use uninitialized DRAM2 memory of STATIC_BT_HEAP
+            // as temporary 12 KB scratch during early single-core boot.
+            // SAFETY: Accessed exclusively during early boot before heap init.
+            let boot_scratch: &mut [u8; 12_288] = unsafe {
+                let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr()
+                    as *mut [u8; 12_288];
+                &mut *ptr
+            };
             init_config(&mut flash, boot_scratch)
         };
         wdt.feed();
         let wifi_sta_creds = {
-            let boot_scratch: &mut [u8; 12_288] = (&mut ring_storage[..12_288])
-                .try_into()
-                .expect("12 KB slice");
+            #[allow(unsafe_code)]
+            // JUSTIFICATION: Use uninitialized DRAM2 memory of STATIC_BT_HEAP
+            // as temporary 12 KB scratch during early single-core boot.
+            // SAFETY: Accessed exclusively during early boot before heap init.
+            let boot_scratch: &mut [u8; 12_288] = unsafe {
+                let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr()
+                    as *mut [u8; 12_288];
+                &mut *ptr
+            };
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
         };
         let (lms_ip, lms_port) = config.read(|c| {
@@ -2421,8 +2482,8 @@ mod xtensa_hw {
             } else {
                 0
             };
-            esp_alloc::heap_allocator!(size: 43 * 1024);
-            // JUSTIFICATION: Register secondary 22 KB internal `.dram2_uninit`
+            esp_alloc::heap_allocator!(size: 51 * 1024);
+            // JUSTIFICATION: Register secondary 14 KB internal `.dram2_uninit`
             // region as Region 2 of `esp_alloc::HEAP`.
             // SAFETY: `STATIC_BT_HEAP` is an exclusive static uninitialized
             // buffer in `.dram2_uninit` registered exactly once at boot.
@@ -2435,7 +2496,7 @@ mod xtensa_hw {
             }
             reg_size
         };
-        let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(6144);
+        let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(2048);
         // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream
         // buffer (512 KiB here) and a 2000 KiB output buffer. Both land in
         // the PSRAM region (the internal regions are far smaller); the 4 MiB
@@ -2605,6 +2666,19 @@ mod xtensa_hw {
             sink
         };
 
+        let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) =
+            if psram_avail_bytes >= 655_360 {
+                (
+                    alloc::boxed::Box::leak(alloc::vec![0u8; 8_192].into_boxed_slice()),
+                    alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
+                )
+            } else {
+                (
+                    &mut slim_rx_buf[..],
+                    &mut audio_rx_buf[..],
+                )
+            };
+
         let NetStack {
             smol_iface,
             sockets,
@@ -2622,8 +2696,8 @@ mod xtensa_hw {
             sta_mac,
             [
                 (&mut http_rx_buf[..], &mut http_tx_buf[..]),
-                (&mut slim_rx_buf[..], &mut slim_tx_buf[..]),
-                (&mut audio_rx_buf[..], &mut audio_tx_buf[..]),
+                (slim_rx_slice, &mut slim_tx_buf[..]),
+                (audio_rx_slice, &mut audio_tx_buf[..]),
             ],
         );
 
@@ -2707,6 +2781,9 @@ mod xtensa_hw {
             spot_spirc,
             spot_streaming: false,
             now_ms: 0,
+            wifi_connected_logged: false,
+            last_fault_recovery_ms: 0,
+            last_bt_idle_poll_ms: 0,
         }))
     }
 
@@ -2858,6 +2935,13 @@ mod xtensa_hw {
         }
 
         if let Some(ref mut transport) = s.bt_transport {
+            if !s.bt_sink.is_connected() && !s.bt_sink.is_streaming() {
+                if now_ms.saturating_sub(s.last_bt_idle_poll_ms) < 2 {
+                    return;
+                }
+                s.last_bt_idle_poll_ms = now_ms;
+            }
+
             s.bt_sink
                 .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
                     if s.coordinator.request_source(AudioSource::Bluetooth) {
@@ -2898,7 +2982,17 @@ mod xtensa_hw {
     #[inline(never)]
     fn wifi_and_lease_phase(s: &mut DeviceRuntimeState) {
         let now_ms = s.now_ms;
-        if !s.wifi_controller.is_connected()
+        let wifi_connected = s.wifi_controller.is_connected();
+        if wifi_connected {
+            if !s.wifi_connected_logged {
+                let _ = s.wifi_controller.set_power_saving(PowerSaveMode::None);
+                s.wifi_connected_logged = true;
+            }
+        } else {
+            s.wifi_connected_logged = false;
+        }
+
+        if !wifi_connected
             && (s.last_connect_attempt_ms == 0
                 || now_ms.saturating_sub(s.last_connect_attempt_ms) >= 5_000)
         {
@@ -2911,7 +3005,7 @@ mod xtensa_hw {
 
         if s.lease_watchdog.evaluate(
             now_ms,
-            s.wifi_controller.is_connected(),
+            wifi_connected,
             s.assigned_ip.is_some(),
         ) == LeaseHealth::ExpiredResetToRecovery
         {
@@ -3065,7 +3159,7 @@ mod xtensa_hw {
                 && http_sock.can_recv()
                 && http_sock.may_send()
             {
-                let mut req_buf = [0u8; 256];
+                let mut req_buf = [0u8; 1024];
                 let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
                 while http_sock.can_recv() {
                     let _ = http_sock.recv(|buf| (buf.len(), ()));
@@ -3487,9 +3581,6 @@ mod xtensa_hw {
                             if meta.endpoint.port != 5353 {
                                 spot_ep = meta.endpoint;
                             }
-                        } else if payload.len() >= 12 && (payload[2] & 0x80) == 0 {
-                            should_announce_raop = true;
-                            should_announce_spotify = true;
                         }
                     } else {
                         break;
@@ -3651,7 +3742,7 @@ mod xtensa_hw {
                 let _ = rtp_sock.bind(6000);
             }
             if rtp_sock.can_recv() {
-                let mut pkt_buf = alloc::vec![0u8; 1536];
+                let mut pkt_buf = [0u8; 1536];
                 let mut bursts = 0u8;
                 while bursts < 4 && rtp_sock.can_recv() {
                     bursts += 1;
@@ -3723,7 +3814,7 @@ mod xtensa_hw {
                 let _ = spot_sock.listen(4070);
             }
             if spot_sock.can_recv() && spot_sock.may_send() {
-                let mut req_buf = alloc::vec![0u8; 1024];
+                let mut req_buf = [0u8; 1024];
                 if let Ok(n) = spot_sock.recv_slice(&mut req_buf) {
                     if n > 0 {
                         if req_buf[..n].starts_with(b"GET ") || req_buf[..n].starts_with(b"POST ")
@@ -3850,7 +3941,7 @@ mod xtensa_hw {
         }
     }
 
-    #[inline(never)]
+    #[esp_hal::ram]
     fn output_decode_phase(s: &mut DeviceRuntimeState) {
         s.coordinator.pump_output(s.pipeline, 16);
         let max_steps = match s.pipeline.decoder {
@@ -3880,7 +3971,11 @@ mod xtensa_hw {
             s.last_fault_check_ms = now_ms;
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
-                if s.coordinator.state == PlayerState::Playing && !fault.is_clean() {
+                if s.coordinator.state == PlayerState::Playing
+                    && fault.has_critical_amp_fault()
+                    && now_ms.saturating_sub(s.last_fault_recovery_ms) >= 30_000
+                {
+                    s.last_fault_recovery_ms = now_ms;
                     let _ = s.amp.recover_from_fault();
                 }
             }
@@ -3914,6 +4009,16 @@ mod xtensa_hw {
         net_poll_phase(s);
         http_serve_phase(s);
         slim_session_phase(s);
+        {
+            let mut dev = SmolDevice {
+                driver: &mut s.sta_iface,
+            };
+            let _ = s.smol_iface.poll(
+                SmolInstant::from_millis(i64::try_from(s.now_ms).unwrap_or(0)),
+                &mut dev,
+                &mut s.sockets,
+            );
+        }
         multi_proto_poll(s);
         cyd_command_phase(s);
         output_decode_phase(s);

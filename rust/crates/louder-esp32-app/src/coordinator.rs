@@ -1320,9 +1320,9 @@ impl PlayerCoordinator {
     /// Decode half of the audio step (see [`Self::pump_output`]): while
     /// [`PlayerState::Playing`], with no decoded PCM pending and at least
     /// [`PUMP_DECODE_MIN_OUTPUT_SPACE`] bytes free in the output ring, decodes
-    /// until one step produced audio, or for at most `max_steps` steps that
-    /// only consumed input (resync, tag skip). After the stream ended an
-    /// undecodable tail is dropped.
+    /// in bursts of at most `max_steps` steps while progress is made and
+    /// output space remains (`CPU-101` / `PIPE-203`). After the stream ended
+    /// an undecodable tail is dropped.
     pub fn pump_decode<S: AudioOutputSink>(
         &mut self,
         pipeline: &mut StreamPipeline<'_, S>,
@@ -1345,10 +1345,12 @@ impl PlayerCoordinator {
                 break;
             }
             self.drop_undecodable_tail(pipeline, &decoded);
-            if pipeline.has_pending_pcm() || pipeline.output_buffer.available_read() > before {
+            if pipeline.has_pending_pcm() {
                 break;
             }
-            if !matches!(decoded, Ok(consumed) if consumed > 0) {
+            let progressed = matches!(decoded, Ok(consumed) if consumed > 0)
+                || pipeline.output_buffer.available_read() > before;
+            if !progressed {
                 break;
             }
         }
@@ -2237,6 +2239,7 @@ impl PlayerCoordinator {
         {
             self.output_underrun_reported = true;
             self.pending_output_underrun = true;
+            pipeline.threshold_satisfied = pipeline.output_threshold_frames == 0;
         }
     }
 

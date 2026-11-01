@@ -165,9 +165,28 @@ pub struct FaultStatus {
     pub otw: u8,
 }
 
+/// Backward-compatible type alias for `FaultStatus`.
+pub type TasFaultStatus = FaultStatus;
+
 impl FaultStatus {
-    pub fn is_clean(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
         self.chan_fault == 0 && self.global_fault1 == 0 && self.global_fault2 == 0
+    }
+
+    /// Returns `true` if a non-clock amplifier fault (over-current, DC fault,
+    /// over-temp, PVDD/BQ/OTP/CBC fault) requires a `Hi-Z -> Clear -> Play`
+    /// recovery cycle.
+    /// Transient `FAULT1_CLOCK_FAULT` (`0x04`) events self-recover via the
+    /// TAS5805M auto-mute state machine and must NOT force the power stage
+    /// into `Hi-Z` every 2 seconds.
+    #[inline]
+    #[must_use]
+    pub const fn has_critical_amp_fault(&self) -> bool {
+        self.chan_fault != 0
+            || (self.global_fault1 & !FAULT1_CLOCK_FAULT) != 0
+            || self.global_fault2 != 0
     }
 
     pub fn has_overtemp_shutdown(&self) -> bool {
@@ -1092,6 +1111,42 @@ mod tests {
         };
         assert!(otw.has_ot_warning());
         assert!(otw.has_overtemperature());
+    }
+
+    #[test]
+    fn test_fault_status_has_critical_amp_fault() {
+        let clk_only = TasFaultStatus {
+            chan_fault: 0,
+            global_fault1: FAULT1_CLOCK_FAULT,
+            global_fault2: 0,
+            otw: 0,
+        };
+        assert!(!clk_only.has_critical_amp_fault());
+        assert!(!clk_only.is_clean());
+
+        let chan_fault = TasFaultStatus {
+            chan_fault: 0x01,
+            global_fault1: 0,
+            global_fault2: 0,
+            otw: 0,
+        };
+        assert!(chan_fault.has_critical_amp_fault());
+
+        let pvdd_uv = TasFaultStatus {
+            chan_fault: 0,
+            global_fault1: FAULT1_PVDD_UV,
+            global_fault2: 0,
+            otw: 0,
+        };
+        assert!(pvdd_uv.has_critical_amp_fault());
+
+        let fault2 = TasFaultStatus {
+            chan_fault: 0,
+            global_fault1: 0,
+            global_fault2: 0x01,
+            otw: 0,
+        };
+        assert!(fault2.has_critical_amp_fault());
     }
 
     #[test]

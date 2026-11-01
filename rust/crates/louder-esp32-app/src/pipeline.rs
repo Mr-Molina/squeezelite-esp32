@@ -34,8 +34,15 @@ pub const PCM_SCRATCH_SAMPLES: usize = 2304;
 pub const READ_SCRATCH_BYTES: usize = 4096;
 #[cfg(not(feature = "std-codecs"))]
 pub const READ_SCRATCH_BYTES: usize = 1728;
+#[cfg(feature = "std-codecs")]
 pub const WRITE_SCRATCH_BYTES: usize = 512;
+#[cfg(not(feature = "std-codecs"))]
+pub const WRITE_SCRATCH_BYTES: usize = 1024;
+
+#[cfg(feature = "std-codecs")]
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
+#[cfg(not(feature = "std-codecs"))]
+pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 256;
 
 /// Stream ring of the firmware when PSRAM is mapped: 512 KiB (C `-b 500:2000`
 /// asks 500 KiB; C parity: main/Kconfig.projbuild:465).
@@ -334,6 +341,12 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub active_sample_rate_hz: u32,
     /// Optional polyphase FIR resampler stage between decoder output and EQ.
     pub resampler: Option<Box<Resampler>>,
+    /// Pre-buffer cushion threshold in frames required before output starts
+    /// (`PROT-504`).
+    pub output_threshold_frames: u32,
+    /// Whether pre-buffer cushion threshold has been satisfied for the current
+    /// stream.
+    pub threshold_satisfied: bool,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -372,6 +385,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             loudness_level: 0,
             active_sample_rate_hz: sample_rate,
             resampler: None,
+            output_threshold_frames: 0,
+            threshold_satisfied: true,
         }
     }
 
@@ -379,6 +394,27 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     pub fn set_mute(&mut self, mute: bool) {
         self.user_muted = mute;
         self.sink.set_mute(mute);
+    }
+
+    /// Sets the output pre-buffer cushion threshold in frames (`PROT-504`).
+    #[inline]
+    pub fn set_output_threshold_frames(&mut self, frames: u32) {
+        self.output_threshold_frames = frames;
+        self.threshold_satisfied = frames == 0;
+    }
+
+    /// Resets the pre-buffer threshold satisfaction flag for a new stream
+    /// (`PROT-504`).
+    #[inline]
+    pub fn reset_for_new_stream(&mut self) {
+        self.threshold_satisfied = self.output_threshold_frames == 0;
+    }
+
+    /// Flushes output ringbuffer frames to the audio output sink (`CPU-103c`).
+    /// Convenience alias for [`Self::process_output_step`].
+    #[inline(always)]
+    pub fn pump_output(&mut self) -> Result<usize, S::Error> {
+        self.process_output_step()
     }
 
     /// Pushes incoming encoded stream bytes from LMS into the stream
@@ -450,28 +486,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             if frames_produced > 0 {
                 self.check_decoder_sample_rate();
                 self.mark_track_start();
-                let frames_produced = self.resample_decoded_pcm(frames_produced);
-                let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
-                self.equalizer.process_interleaved(active_pcm);
-
-                let frames_to_write = frames_produced.min(avail_frames);
-                let frames_written = if frames_to_write > 0 {
-                    let pcm_bytes: &[u8] =
-                        bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
-                    let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
-                    written / 8
-                } else {
-                    0
-                };
-
-                let samples_written = frames_written * 2;
-                if samples_written < frames_produced * 2 {
-                    self.pcm_pending_offset = samples_written;
-                    self.pcm_pending_samples = frames_produced * 2 - samples_written;
-                } else {
-                    self.pcm_pending_offset = 0;
-                    self.pcm_pending_samples = 0;
-                }
+                let frames_written = self.commit_decoded_pcm(frames_produced);
                 return Ok(frames_written);
             }
 
@@ -523,35 +538,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             // output.c:154 switches). A rate change inside a track is ignored,
             // as in C (only `new_stream` reads the rate).
             self.mark_track_start();
-            let frames_produced = self.resample_decoded_pcm(frames_produced);
-            // Equalizer preset and loudness contour, in place, exactly once before
-            // buffering. The gain stage runs at output time (C parity:
-            // output.c:54-57, output_i2s.c:510), so a volume change reaches
-            // audio already in the output ring at once, as in C.
-            let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
-            self.equalizer.process_interleaved(active_pcm);
-
-            let avail_frames = self.output_buffer.available_write() / 8;
-            let frames_to_write = frames_produced.min(avail_frames);
-
-            let frames_written = if frames_to_write > 0 {
-                let pcm_bytes: &[u8] =
-                    bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
-                debug_assert_eq!(pcm_bytes.len() % 8, 0);
-                let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
-                written / 8
-            } else {
-                0
-            };
-
-            let samples_written = frames_written * 2;
-            if samples_written < frames_produced * 2 {
-                self.pcm_pending_offset = samples_written;
-                self.pcm_pending_samples = frames_produced * 2 - samples_written;
-            } else {
-                self.pcm_pending_offset = 0;
-                self.pcm_pending_samples = 0;
-            }
+            let _ = self.commit_decoded_pcm(frames_produced);
         }
 
         Ok(consumed)
@@ -603,49 +590,79 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
     }
 
-    /// Passes `frames_produced` stereo frames in `self.pcm_scratch` through the
-    /// optional polyphase [`Resampler`] stage before EQ and output buffering.
-    ///
-    /// Processes chunks in bounded 64-frame (`[0i32; 256]`) windows with zero
-    /// heap allocations and moves input samples to the end of `pcm_scratch` so
-    /// output samples never overwrite pending input (LOGIC-201 / PERF-201).
-    fn resample_decoded_pcm(&mut self, frames_produced: usize) -> usize {
-        let Some(resampler) = self.resampler.as_mut() else {
-            return frames_produced;
-        };
-        let in_samples = frames_produced * 2;
-        if in_samples == 0 {
-            return 0;
-        }
+    /// Commits decoded PCM frames through the resampler and equalizer stages
+    /// into `output_buffer`. Bounded chunk processing guarantees zero frame
+    /// drops during polyphase upsampling without in-place collision (`PIPE-201`).
+    fn commit_decoded_pcm(&mut self, frames_produced: usize) -> usize {
+        if let Some(resampler) = self.resampler.as_mut() {
+            let in_samples = frames_produced * 2;
+            let mut in_pos = 0;
+            let in_end = in_samples;
+            let mut chunk_out = [0i32; 256];
+            let mut total_frames_written = 0;
 
-        // Relocate input samples to the end of pcm_scratch so in-place writing at
-        // pcm_scratch[0..out_pos] never collides with pending input.
-        let in_start = PCM_SCRATCH_SAMPLES.saturating_sub(in_samples);
-        self.pcm_scratch.copy_within(0..in_samples, in_start);
-
-        let mut in_pos = in_start;
-        let in_end = in_start + in_samples;
-        let mut out_pos = 0;
-        let mut chunk_out = [0i32; 256];
-
-        while in_pos < in_end && out_pos < PCM_SCRATCH_SAMPLES {
-            let max_chunk = chunk_out.len().min(PCM_SCRATCH_SAMPLES - out_pos);
-            let (consumed, produced) = resampler.process(
-                &self.pcm_scratch[in_pos..in_end],
-                &mut chunk_out[..max_chunk],
-            );
-            if produced > 0 {
-                self.pcm_scratch[out_pos..out_pos + produced]
-                    .copy_from_slice(&chunk_out[..produced]);
-                out_pos += produced;
+            while in_pos < in_end {
+                let (consumed, produced) = resampler.process(
+                    &self.pcm_scratch[in_pos..in_end],
+                    &mut chunk_out,
+                );
+                in_pos += consumed;
+                if produced > 0 {
+                    self.equalizer.process_interleaved(&mut chunk_out[..produced]);
+                    let avail_frames = self.output_buffer.available_write() / 8;
+                    let frames_to_write = (produced / 2).min(avail_frames);
+                    let samples_to_write = frames_to_write * 2;
+                    let frames_written = if frames_to_write > 0 {
+                        let pcm_bytes: &[u8] =
+                            bytemuck::cast_slice(&chunk_out[..samples_to_write]);
+                        debug_assert_eq!(pcm_bytes.len() % 8, 0);
+                        let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                        written / 8
+                    } else {
+                        0
+                    };
+                    total_frames_written += frames_written;
+                    if samples_to_write < produced {
+                        let rem = produced - samples_to_write;
+                        self.pcm_scratch[..rem]
+                            .copy_from_slice(&chunk_out[samples_to_write..produced]);
+                        self.pcm_pending_offset = 0;
+                        self.pcm_pending_samples = rem;
+                        break;
+                    }
+                }
+                if consumed == 0 && produced == 0 {
+                    break;
+                }
             }
-            in_pos += consumed;
-            if consumed == 0 && produced == 0 {
-                break;
-            }
-        }
+            total_frames_written
+        } else {
+            let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
+            self.equalizer.process_interleaved(active_pcm);
 
-        out_pos / 2
+            let avail_frames = self.output_buffer.available_write() / 8;
+            let frames_to_write = frames_produced.min(avail_frames);
+
+            let frames_written = if frames_to_write > 0 {
+                let pcm_bytes: &[u8] =
+                    bytemuck::cast_slice(&self.pcm_scratch[..frames_to_write * 2]);
+                debug_assert_eq!(pcm_bytes.len() % 8, 0);
+                let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                written / 8
+            } else {
+                0
+            };
+
+            let samples_written = frames_written * 2;
+            if samples_written < frames_produced * 2 {
+                self.pcm_pending_offset = samples_written;
+                self.pcm_pending_samples = frames_produced * 2 - samples_written;
+            } else {
+                self.pcm_pending_offset = 0;
+                self.pcm_pending_samples = 0;
+            }
+            frames_written
+        }
     }
 
     /// Flushes output ringbuffer frames to the audio output sink (I2S DMA).
@@ -666,6 +683,21 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
         if self.output_buffer.available_read() < OUTPUT_FRAME_BYTES {
             return Ok(0); // Minimum 1 stereo frame (8 bytes)
+        }
+
+        // Pre-buffer cushion gating (PROT-504)
+        if self.output_threshold_frames > 0 && !self.threshold_satisfied {
+            let avail_frames =
+                (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u32;
+            let max_possible = (self.output_buffer.capacity() / OUTPUT_FRAME_BYTES) as u32;
+            let target_frames = self.output_threshold_frames.min(max_possible);
+            let eof = !self.decoder.has_pending_pcm()
+                && self.stream_buffer.available_read() == 0;
+            if avail_frames >= target_frames || eof {
+                self.threshold_satisfied = true;
+            } else {
+                return Ok(0);
+            }
         }
 
         if let Some(marker) = self.boundary.marker {
@@ -1072,10 +1104,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.boundary.stream_rate_hint = rate_hint;
         self.boundary.next_replay_gain = replay_gain;
         self.boundary.output_threshold = output_threshold;
+        let thresh_frames =
+            (u64::from(output_threshold) * u64::from(rate_hint) / 10) as u32;
+        self.output_threshold_frames = thresh_frames;
+        self.threshold_satisfied = thresh_frames == 0;
         if let Some(marker) = self.boundary.marker.as_mut() {
             marker.replay_gain = replay_gain;
-            marker.output_threshold_frames =
-                (u64::from(output_threshold) * u64::from(marker.sample_rate) / 10) as u32;
+            marker.output_threshold_frames = thresh_frames;
         }
     }
 
@@ -1516,6 +1551,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.boundary.new_stream = true;
         // C parity: output.c:448 `output.fade = FADE_INACTIVE`.
         self.fade.reset();
+        self.threshold_satisfied = self.output_threshold_frames == 0;
     }
 }
 

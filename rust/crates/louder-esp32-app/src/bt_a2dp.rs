@@ -49,6 +49,10 @@ pub trait HciTransport {
     /// Write an outgoing HCI packet to the controller. Returns true if
     /// written successfully.
     fn write_packet(&mut self, data: &[u8]) -> bool;
+    /// Returns true if an incoming packet is ready to be read.
+    fn can_read(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
@@ -4451,16 +4455,22 @@ impl BtA2dpSink {
         mut on_pcm: F,
     ) -> bool {
         let mut had_activity = false;
-        let mut rx = [0u8; 1024];
 
-        for _ in 0..16 {
-            let n = transport.read_packet(&mut rx);
-            if n == 0 {
-                break;
+        if transport.can_read() {
+            let mut rx = [0u8; 1024];
+
+            for _ in 0..16 {
+                let n = transport.read_packet(&mut rx);
+                if n == 0 {
+                    break;
+                }
+                self.rx_packets = self.rx_packets.wrapping_add(1);
+                self.process_packet(transport, &rx[..n], &mut on_pcm);
+                had_activity = true;
+                if !transport.can_read() {
+                    break;
+                }
             }
-            self.rx_packets = self.rx_packets.wrapping_add(1);
-            self.process_packet(transport, &rx[..n], &mut on_pcm);
-            had_activity = true;
         }
 
         if self.init_step != InitStep::Completed
@@ -4507,6 +4517,10 @@ mod tests {
     }
 
     impl HciTransport for MockHciTransport {
+        fn can_read(&self) -> bool {
+            !self.rx_queue.is_empty()
+        }
+
         fn read_packet(&mut self, buf: &mut [u8]) -> usize {
             if self.rx_queue.is_empty() {
                 0

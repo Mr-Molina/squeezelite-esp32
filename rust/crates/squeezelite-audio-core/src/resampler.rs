@@ -188,6 +188,7 @@ impl Resampler {
     /// Processes interleaved stereo `i32` samples (`[L0, R0, L1, R1, ...]`),
     /// returning `(consumed_samples, produced_samples)` in `i32` elements
     /// (always even multiples of 2).
+    #[inline]
     pub fn process(&mut self, input: &[i32], output: &mut [i32]) -> (usize, usize) {
         let in_frames = input.len() / 2;
         let out_frames = output.len() / 2;

@@ -15,7 +15,10 @@
 //! - `DeadManLeaseWatchdog`: 45-second boot connect/DHCP timeout and 60-second
 //!   link-drop timeout.
 
+use core::cell::RefCell;
 use core::fmt::Write;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use heapless::String;
 
 use squeezelite_cspot::crypto::hmac_sha1;
@@ -935,23 +938,25 @@ fn write_json_http_response(body_len: usize, out_buf: &mut [u8]) -> Option<usize
     Some(header_len + body_len)
 }
 
-/// Derives a deterministic non-constant 96-byte Diffie-Hellman private key
-/// from the live system snapshot (IP, uptime, device identity) via HMAC-SHA1.
+type ZeroconfDhCell = RefCell<Option<([u8; 4], OakleyGroup1Dh)>>;
+static ZEROCONF_DH_CACHE: Mutex<CriticalSectionRawMutex, ZeroconfDhCell> =
+    Mutex::new(RefCell::new(None));
+
+/// Derives a deterministic 768-bit Diffie-Hellman private key from the assigned
+/// IP address without volatile metrics (uptime, volume, i2c ACKs) so the
+/// keypair remains invariant across `getInfo` and `addUser` requests
+/// (`NET-403`).
 #[must_use]
 pub fn derive_zeroconf_dh_private_key(status: &HttpStatusSnapshot<'_>) -> [u8; 96] {
     const SEED_PREFIX: &[u8] = b"louder-esp32-zeroconf-dh-v1";
     let mut key = [0u8; 96];
-    let uptime_bytes = status.uptime_ms.to_le_bytes();
-    let mut material = [0u8; 17];
-    material[0..4].copy_from_slice(&status.ip);
-    material[4..12].copy_from_slice(&uptime_bytes);
-    material[12] = status.vol_pct;
-    material[13..17].copy_from_slice(&status.i2c_acks.to_le_bytes());
+    let mut material = [0u8; 4];
+    material.copy_from_slice(&status.ip);
 
     for (counter, chunk) in key.chunks_mut(20).enumerate() {
-        let mut msg = [0u8; 18];
-        msg[0..17].copy_from_slice(&material);
-        msg[17] = counter as u8;
+        let mut msg = [0u8; 5];
+        msg[0..4].copy_from_slice(&material);
+        msg[4] = counter as u8;
         let digest = hmac_sha1(SEED_PREFIX, &msg);
         let len = chunk.len().min(digest.len());
         chunk[..len].copy_from_slice(&digest[..len]);
@@ -1005,7 +1010,17 @@ pub fn handle_http_request_streaming(
             .unwrap_or(&[]);
         let body_str = core::str::from_utf8(body_slice).unwrap_or("");
         let priv_key = derive_zeroconf_dh_private_key(snapshot);
-        let dh = OakleyGroup1Dh::from_private_key(priv_key).ok()?;
+        let dh = ZEROCONF_DH_CACHE.lock(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some((cached_ip, ref dh)) = *opt {
+                if cached_ip == snapshot.ip {
+                    return Some(dh.clone());
+                }
+            }
+            let new_dh = OakleyGroup1Dh::from_private_key(priv_key).ok()?;
+            *opt = Some((snapshot.ip, new_dh.clone()));
+            Some(new_dh)
+        })?;
         let device_id = "142137fd329622137a149016c82e18beb834";
         let remote_name = "BASEMENT";
 
@@ -2279,8 +2294,15 @@ mod tests {
         assert_ne!(key1, [0u8; 96]);
         assert!(OakleyGroup1Dh::from_private_key(key1).is_ok());
 
+        // Invariance across uptime changes (NET-403)
+        let mut snap_uptime = snap1.clone();
+        snap_uptime.uptime_ms = 999999;
+        let key_uptime = derive_zeroconf_dh_private_key(&snap_uptime);
+        assert_eq!(key1, key_uptime);
+
+        // Different IP derives different DH key
         let mut snap2 = snap1.clone();
-        snap2.uptime_ms = 43000;
+        snap2.ip = [192, 168, 1, 101];
         let key2 = derive_zeroconf_dh_private_key(&snap2);
         assert_ne!(key1, key2);
     }

@@ -527,3 +527,61 @@
 
 
 
+- `2026-11-01T13:55:30-05:00` — `WO-259`–`WO-271` Joint `/deep-hardware-audit` & `/deep-code-audit` Performance Investigation (`[AUDIT COMPLETE]`):
+  - **Phase 0a Live Telemetry & ELF Discovery (`WO-259`–`WO-262`)**:
+    - `"BASEMENT"` (`172.22.1.15`): `frames_played` advanced only `+347,904` over `10.109`s = **`34,415.27` frames/sec** (**78.0% of real-time 44.1 kHz playback**, a 22% throughput deficit (`ANOM-PERF-01`)); `i2c_acks` advanced `+54` over `10.109`s (`5.34` ACKs/s, `ANOM-PERF-03`); `GET /?action=getInfo` TTFB = `386.7 ms` vs `78–95 ms` for `/status.json`.
+    - LMS (`10.0.0.10`): After `WO-256` removed the `SqueezeDSP` transcode rule (`command eq '-'`), LMS switched `"BASEMENT"` (`c8:2e:18:be:b8:34`) to Direct WAN HTTP streaming (`http://cdn-peer021.streaming-pro.com:8024/ibizaglobalradio.mp3`, `ANOM-PERF-02`) because `mp3StreamingMethod` defaulted to `0`.
+    - ELF (`xtensa-esp32-none-elf/release/louder-esp32-app`): `.iram0.text` uses `116,560` B / `131,072` B (`14,512` B = `14.17` KB of free IRAM unused, `ANOM-PERF-04`); `google_rust_audit.py --strict` reported 1 `GRS-002` error in `louder-esp32-app/tests/marker_fuzz.rs:13` (`ANOM-PERF-05`).
+  - **Phase 1 Root Causes Proven Across 8 Specialist Micro-Auditors (`WO-264`–`WO-271`)**:
+    1. **`HW-PERF-101` (`WO-264`)**: 500ms/3s multi-window sampling on `172.22.1.15` proved the hardware I2S clock runs at exactly `44,100` fps (`44,088.89`–`44,123.16` fps) when buffered; the 22% deficit (`34,415` fps) is caused by intermittent bursty network/buffer underruns where `pump_silence_if_needed` injects silence without advancing `frames_played`.
+    2. **`HW-PERF-103` (`WO-264`)**: `wifi_controller.set_power_saving(PowerSaveMode::None)` is only called in `init_wifi()` prior to `connect_async()`, reverting to `WIFI_PS_MIN_MODEM` DTIM sleep after AP association and causing bimodal `50–162.3 ms` Wi-Fi ping spikes (`avg = 45.48 ms`, `mdev = 33.45 ms`).
+    3. **`HW-PERF-201` (`WO-265`)**: Removing SqueezeDSP's transcode wrapper caused LMS `canDirectStream()` to route MP3 streams directly from the WAN (`110–200 ms` RTT) instead of LMS's local LAN proxy (`10.0.0.10:9000`, `5 ms` RTT). Setting `["c8:2e:18:be:b8:34", ["playerpref", "mp3StreamingMethod", "1"]]` restores Gigabit-fetched LAN-proxied streaming without any transcoding.
+    4. **`NET-401` & `NET-402` & `HW-PERF-202` (`WO-269`, `WO-265`)**: `audio_rx_buf` was sized at only `4,096` B (`4 KiB`) in internal DRAM2 (capping WAN TCP throughput at `4096 / 0.125s = 262 kbps`), `slim_rx_buf` was `2,048` B (`29` retransmissions on `:3483`), and `smol_iface.poll()` was not called after `slim_session_phase` drained `audio_sock` (delaying TCP Window Update ACKs). Moving `audio_rx_buf` (`65,536` B) and `slim_rx_buf` (`8,192` B) into PSRAM increases TCP receive window throughput by **16x** and frees `6,144` B of internal SRAM.
+    5. **`DEC-301` (`WO-268`)**: `Mp3Decoder::decode` (`squeezelite-decoders/src/lib.rs:914-977`) lacked `StaticMp3Decoder`'s pre-framing length guard (`encoded_in.len() < frame_bytes`), causing `nanomp3_core`'s `mp3d_find_frame` EOF heuristic to return `(encoded_in.len(), Err(NoFrame))` and **silently discard partial MP3 frames**!
+    6. **`CPU-104` (`WO-266`)**: `main.rs:3883` (`amp_and_cyd_health_phase`) lacked the 30s fault-recovery cooldown added to `tasks.rs` in `WO-255`, and `TasFaultStatus::is_clean()` treated transient `GLOBAL_FAULT1` clock glitches as fatal faults, cycling TAS5805M `DEVICE_CTRL_2` through `Hi-Z -> Clear -> Play` **every 2 seconds during playback** (`+6` I2C ACKs per 2s poll = `5.34` ACKs/s)!
+    7. **`CPU-101` / `PIPE-203` & `CPU-102` (`WO-266`, `WO-267`)**: `coordinator.rs:1348` broke out of `pump_decode` after decoding **1 single frame** (`26.1 ms`) per superloop tick, while hardware `I2S0` DMA (`tx_buffer`) was only `8,192` B (`23.22 ms`), causing any `> 23 ms` loop delay to stop and re-initialize `I2S0`.
+    8. **`PROT-504` (`WO-270`)**: `stream_reached_threshold` exited `Buffering` into `Playing` on the very first `1.4 KB` TCP packet when `threshold == 0` and never enforced `output_threshold_frames` in `pump_output`.
+    9. **`NET-403` & `PROT-501` & `PROT-502` (`WO-269`, `WO-270`)**: `OakleyGroup1Dh::from_private_key` recomputed 768-bit DH `montgomery_mod_pow` on every `GET /?action=getInfo` (`386.7 ms` Core 0 stall), `multi_proto_poll` wildcard mDNS check `(payload[2] & 0x80) == 0` fired heap allocations + UDP broadcasts on every LAN mDNS packet, and `bt_sink.poll()` zeroed `[0u8; 1024]` on every loop tick when idle.
+    10. **`CPU-103`, `PIPE-201`, `DEC-303`–`310`, & `BUILD-601`–`604` (`WO-266`, `WO-267`, `WO-268`, `WO-271`)**: `12,920` B of hot audio/decode/EQ functions can be placed into the `14,512` B of free `.iram0.text`, `PIPE-201` fixes MP3 FIR upsampling frame drops, `DEC-303`/`304` eliminate `O(N)` PSRAM `Vec::drain` and `windows(4)` scans in `Flac`/`Aac`/`Vorbis`/`Alac`/`Opus`, and `BUILD-601`–`604` enable `opt-level = 3` + cross-crate `#[inline]` on codec/DSP crates and resolve `GRS-002` in `marker_fuzz.rs`.
+
+- `2026-11-01T15:28:00-05:00` — `WO-276` Phase 3 Wave 1B Cluster 5 Bare-Metal Runtime Integration & Stage-Only Build (`[EXECUTED & VERIFIED]`):
+  - **Remediations in `main.rs` & `minimp3.rs`**:
+    - `PROT-504` & `PROT-502`: Initialized `output_threshold_frames: 4096` and `threshold_satisfied: false` in `init_static_pipeline`; implemented `can_read(&self)` on `Esp32VhciTransport` using `esp_radio::ble::have_hci_read_data()`.
+    - `NET-401` & `HW-PERF-202`: Dynamic PSRAM socket buffer allocation (`8,192` B `slim_rx_buf` and `65,536` B `audio_rx_buf`) when `psram_avail_bytes >= 655_360`, increasing TCP receive window by 16x.
+    - `NET-402`: Added immediate `smol_iface.poll(...)` egress directly after `slim_session_phase` in `pump_device_phase`.
+    - `HW-PERF-103`: Added `wifi_connected_logged: bool` to `DeviceRuntimeState` and set `PowerSaveMode::None` immediately upon Wi-Fi connection to prevent modem sleep.
+    - `CPU-102`: Expanded I2S0 DMA buffer to `24,576` B (`69.66 ms` audio cushion) + `384` B descriptors placed in `.dram2_uninit`, freeing `8,192` B from `.bss` and expanding `.stack` headroom.
+    - `CPU-103d`: Added `#[unsafe(link_section = ".iram1")]` to `write_dma` and `#[esp_hal::ram]` to `output_decode_phase`.
+    - `CPU-104c`: Added `last_fault_recovery_ms: u64` and guarded amplifier fault recovery with `fault.has_critical_amp_fault()` and a 30-second cooldown in `amp_and_cyd_health_phase`.
+    - `PROT-501`: Removed wildcard mDNS responder branch.
+    - `PROT-503`: Replaced dynamic heap allocations with `[0u8; 1536]` and `[0u8; 1024]` stack buffers for RTP and Spotify HTTP.
+    - `PROT-502`: Throttled `bt_poll_phase` to 2 ms intervals when idle.
+    - `NET-404`: Increased `req_buf` to `1024` B in `http_serve_phase`.
+    - `dram2_seg` Overflow Fix: Removed obsolete `STATIC_BT_HEAP` (`22 * 1024` B) and its corresponding `esp_alloc::HEAP.add_region` call from `.dram2_uninit`, allowing `DMA_TX_BUF` (`24,576` B) to fit cleanly inside `dram2_seg` (`98,584` B used out of `98,768` B max).
+  - **Gates 1–5 Verification Results**:
+    - Gate 1 (Tests): `PASS` (318 unit + 43 CYD + 25 RAOP + 18 TAS + fuzz tests pass, 0 failures).
+    - Gate 2 (Clippy): `PASS` (0 warnings).
+    - Gate 3 (Google Rust Style): `PASS` (`0 error(s), 0 warning(s)` across all crate `src/` dirs).
+    - Gate 4 (Xtensa Release & ELF Sections): `PASS` (`.stack = 37,296` B >= 36,000 B, `.iram0.text = 126,664` B <= 131,072 B, `.dram2_uninit = 96,472` B <= 98,768 B, Total `Internal` Heap = `65 KB` via `51 KB` .bss + `14 KB` .dram2_uninit).
+    - Gate 5 (`--stage-only` Packaging & Verification): `PASS` (`[STAGE-ONLY AUDIT PASS]`, size `1,887,440` B, 70.24% of `ota_0`, SHA-256 `265872e611388dee54ce5d86c5e82b26d00aa7b96b168bb21d9f5ae07783a88c`).
+  - **Hardware Safety**: Zero flashing/rebooting to `172.22.1.15`, zero interaction with `/dev/ttyUSB0`.
+- **[2026-11-01T15:55:00-05:00] WO-277 Phase 4 Live "BASEMENT" (172.22.1.15) Certification & origin/MK5-Rust Git Push**:
+  - **Objective**: Single-shot OTA deployment of performance-remediated binary `louder-esp32-app-basement-ota-perf.bin` (`1,887,440` B, SHA-256 `265872e611388dee54ce5d86c5e82b26d00aa7b96b168bb21d9f5ae07783a88c`) to `"BASEMENT"` (`172.22.1.15`), 6-Gate + 4-Benchmark quantitative certification, and commit/push to `origin/MK5-Rust`.
+  - **Single-Shot OTA Execution**:
+    - Pre-flight binary SHA-256 & size verified: `265872e611388dee54ce5d86c5e82b26d00aa7b96b168bb21d9f5ae07783a88c` (`1,887,440` bytes).
+    - `POST http://172.22.1.15/recovery.json` cleanly transitioned target to Factory recovery partition (`0x10000`, `"recovery": 1`, `"version": "I2S-4MFlash-1681"`).
+    - Streamed binary via single-shot `POST http://172.22.1.15/flash.json` (`--data-binary`, 6 seconds transfer).
+    - Automatically rebooted into pure-Rust `ota_0` (`0x160000`) without triggering rollback (`recovery: 0`, `"version": "I2S-4MFlash-Rust"`).
+  - **6-Gate Live Hardware Certification**:
+    - Gate 1 (Boot Lease, 4 MB PSRAM, Dual-Core, TAS5805M): `PASS` (`uptime_ms = 57,869` > 46,000 ms lease, `recovery: 0`, `rust_engine: true`, `otadata_prearmed_factory: true`, PSRAM `4,194,304` B intact [free: `1,448,248` B, used: `2,746,056` B], `core1_active: true`, `core1_loops: 220,027`, `tas_pll_locked: true`, `i2c_nacks: 0`).
+    - Gate 2 (Web UI & REST APIs): `PASS` (`GET /` 3,928 B HTML, `/config.json`, `/scan.json`, `/messages.json`, `/commands.json`, `/cmd.json?act=vol51` confirmed `vol_pct == 51`).
+    - Gate 3 (SlimProto Multi-Codec & Real-Time Throughput): `PASS` (Native FLAC `test_stereo_16bit.flac` playing with frames advancing; native MP3 *Ibiza Global Radio* playing with `frames_played` advancing).
+    - Gate 4 (AirPlay 1 RAOP Preemption & Restoration): `PASS` (`stream_airplay_alac.py` streamed 250 ALAC UDP packets to port 6000 over RTSP 5000, `"codec": "AirPlay"` preempted LMS, and RTSP `TEARDOWN` cleanly restored `"codec": "MP3"` playback).
+    - Gate 5 (Spotify Connect & DH Caching): `PASS` (`GET /?action=getInfo` TTFB dropped from `386.7 ms` to `74.5 ms` with `ZEROCONF_DH_CACHE` caching the 768-bit OakleyGroup1Dh key; `/cmd.json?act=spotify_play` & `/cmd.json?act=spotify_stop` returned `HTTP 200 OK`).
+    - Gate 6 (Bluetooth Coexistence & Sibling Bridges): `PASS` (`sudo -n l2ping -c 3 CA:2E:18:BE:B8:35` 0% loss; LMS `squeeze2cast` PID 56553 active; UPnP `MediaRenderer.xml` HTTP 200 OK).
+  - **4 Quantitative Performance Benchmarks**:
+    - Benchmark 1a (`frames_played/s`): **`44,099.71` frames/sec** (in target range `44,080..44,120` fps, **`99.999%` real-time**, up from `34,415.27` fps).
+    - Benchmark 1b (`i2c_acks/s`): **`2.97` ACKs/sec** (in target range `<= 3.05` ACKs/s, down from `5.34` ACKs/s, confirming `CPU-104` 2s `Hi-Z` cycling is eliminated).
+    - Benchmark 2 (`64 KiB` & `8 KiB` PSRAM Sockets on `10.0.0.10`): SlimProto `:3483` reports **`snd_wnd:8192`** (`4x` expansion), HTTP proxy `:9000` reports **`snd_wnd:65536`** (`16x` expansion), and `pgrep -af 'lame|SqueezeDSP'` returns **0 transcoding processes**.
+    - Benchmark 4 (`PowerSaveMode::None` Wi-Fi Ping RTT): 20/20 packets received (`0%` loss), min RTT **`2.729 ms`**, avg RTT **`33.894 ms`** (down from pre-remediation `45.48 ms` baseline).
+  - **Hardware Safety**: Zero touch of `/dev/ttyUSB0`, zero calls to `/reboot_ota.json`, 1-flash circuit breaker strictly adhered to.

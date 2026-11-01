@@ -79,11 +79,13 @@ impl<'a> AudioRingBuffer<'a> {
     }
 
     /// Returns the total capacity of the ringbuffer.
+    #[inline]
     pub const fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Returns the number of bytes currently stored and available for reading.
+    #[inline]
     pub fn available_read(&self) -> usize {
         let r = self.read_pos.load(Ordering::Acquire);
         let w = self.write_pos.load(Ordering::Acquire);
@@ -95,22 +97,26 @@ impl<'a> AudioRingBuffer<'a> {
     }
 
     /// Returns the number of bytes free and available for writing.
+    #[inline]
     pub fn available_write(&self) -> usize {
         // Reserve 1 slot to distinguish between empty and full states (CONC-007)
         self.capacity.saturating_sub(self.available_read() + 1)
     }
 
     /// Writes data from `src` into the ringbuffer.
+    #[inline]
     pub fn write(&mut self, src: &[u8]) -> Result<usize, RingBufferError> {
         self.write_internal(src)
     }
 
     /// Reads data from the ringbuffer into `dst`.
+    #[inline]
     pub fn read(&mut self, dst: &mut [u8]) -> Result<usize, RingBufferError> {
         self.read_internal(dst)
     }
 
     /// Peeks data from the ringbuffer without advancing the read pointer.
+    #[inline]
     pub fn peek(&self, dst: &mut [u8]) -> usize {
         self.peek_at(0, dst)
     }
@@ -120,6 +126,7 @@ impl<'a> AudioRingBuffer<'a> {
     /// `offset` is at or past the unread data). The fade engine reads a
     /// crossfade's new-track samples this way (C `cross_ptr`, `output.c:245`,
     /// `output_pack.c:366-376`).
+    #[inline]
     pub fn peek_at(&self, offset: usize, dst: &mut [u8]) -> usize {
         let avail = self.available_read();
         if offset >= avail {
@@ -160,12 +167,14 @@ impl<'a> AudioRingBuffer<'a> {
 
     /// Advances the read pointer by `count` bytes (e.g. after peeking and
     /// consuming).
+    #[inline]
     pub fn consume(&mut self, count: usize) {
         self.consume_internal(count);
     }
 
     /// Rewinds the read pointer by `count` bytes (e.g. when unconsumed
     /// bytes remain).
+    #[inline]
     pub fn rewind_read(&mut self, count: usize) {
         self.rewind_read_internal(count);
     }
@@ -173,8 +182,15 @@ impl<'a> AudioRingBuffer<'a> {
     /// Flushes all data in the ringbuffer in a single atomic instruction
     /// (CONC-002). Advances `read_pos` to match `write_pos`, rendering the
     /// buffer empty immediately.
+    #[inline]
     pub fn flush(&mut self) {
         self.flush_internal();
+    }
+
+    /// Clears all data in the ringbuffer, rendering it empty immediately.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.flush();
     }
 
     /// Discards the newest unread bytes so that only the oldest `keep` unread
@@ -221,6 +237,7 @@ impl<'a> AudioRingBuffer<'a> {
         )
     }
 
+    #[inline]
     pub(crate) fn write_internal(&self, src: &[u8]) -> Result<usize, RingBufferError> {
         let avail_read = self.available_read();
         let free = self.capacity.saturating_sub(avail_read + 1);
@@ -267,6 +284,7 @@ impl<'a> AudioRingBuffer<'a> {
         Ok(to_write)
     }
 
+    #[inline]
     #[allow(deprecated)]
     pub(crate) fn read_internal(&self, dst: &mut [u8]) -> Result<usize, RingBufferError> {
         let avail = self.available_read();
@@ -313,6 +331,7 @@ impl<'a> AudioRingBuffer<'a> {
         Ok(to_read)
     }
 
+    #[inline]
     #[allow(deprecated)]
     pub(crate) fn consume_internal(&self, count: usize) {
         let avail = self.available_read();
@@ -341,6 +360,7 @@ impl<'a> AudioRingBuffer<'a> {
         self.read_pos.store(new_r, Ordering::Release);
     }
 
+    #[inline]
     pub(crate) fn flush_internal(&self) {
         let w = self.write_pos.load(Ordering::Acquire);
         self.read_pos.store(w, Ordering::Release);
@@ -362,10 +382,12 @@ pub struct Producer<'ring, 'buf> {
 unsafe impl<'ring, 'buf> Send for Producer<'ring, 'buf> {}
 
 impl<'ring, 'buf> Producer<'ring, 'buf> {
+    #[inline]
     pub fn write(&self, src: &[u8]) -> Result<usize, RingBufferError> {
         self.ring.write_internal(src)
     }
 
+    #[inline]
     pub fn available_write(&self) -> usize {
         self.ring.available_write()
     }
@@ -386,22 +408,27 @@ pub struct Consumer<'ring, 'buf> {
 unsafe impl<'ring, 'buf> Send for Consumer<'ring, 'buf> {}
 
 impl<'ring, 'buf> Consumer<'ring, 'buf> {
+    #[inline]
     pub fn read(&self, dst: &mut [u8]) -> Result<usize, RingBufferError> {
         self.ring.read_internal(dst)
     }
 
+    #[inline]
     pub fn available_read(&self) -> usize {
         self.ring.available_read()
     }
 
+    #[inline]
     pub fn peek(&self, dst: &mut [u8]) -> usize {
         self.ring.peek(dst)
     }
 
+    #[inline]
     pub fn consume(&self, count: usize) {
         self.ring.consume_internal(count);
     }
 
+    #[inline]
     pub fn flush(&self) {
         self.ring.flush_internal();
     }

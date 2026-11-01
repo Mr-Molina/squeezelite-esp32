@@ -1531,7 +1531,7 @@ mod device {
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
                 if s.coordinator.state == louder_esp32_app::PlayerState::Playing {
-                    if !fault.is_clean() {
+                    if fault.has_critical_amp_fault() {
                         let faults = CONSECUTIVE_FAULTS.load(core::sync::atomic::Ordering::Relaxed);
                         let last_rec = LAST_RECOVERY_MS.load(core::sync::atomic::Ordering::Relaxed);
                         let now_u32 = now_ms as u32;

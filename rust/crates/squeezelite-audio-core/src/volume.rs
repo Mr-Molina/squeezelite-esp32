@@ -170,6 +170,7 @@ impl GainStage {
     }
 
     /// The signed channel gains handed to `_apply_gain` (C `gainL`, `gainR`).
+    #[inline]
     #[must_use]
     pub fn channel_gains(&self) -> (i32, i32) {
         (
@@ -178,9 +179,18 @@ impl GainStage {
         )
     }
 
+    /// Sets the volume gains for left and right channels in 16.16
+    /// fixed-point format.
+    #[inline]
+    pub fn set_gains(&mut self, left_q16: u32, right_q16: u32) {
+        self.volume_l_q16 = left_q16;
+        self.volume_r_q16 = right_q16;
+    }
+
     /// Scales interleaved stereo `samples` in place, with polarity and channel
     /// select (C parity: output_pack.c:383-410 `_apply_gain`). A trailing odd
     /// sample is left alone.
+    #[inline]
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn apply(&self, samples: &mut [i32]) {
         let (gl, gr) = self.channel_gains();

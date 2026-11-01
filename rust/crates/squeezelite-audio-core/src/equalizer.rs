@@ -472,6 +472,8 @@ impl<const BANDS: usize> Equalizer<BANDS> {
     /// Process interleaved stereo 32-bit audio samples in-place.
     /// Operates in normalized $[-1.0, 1.0]$ float domain with denormal flushing,
     /// NaN state isolation, and accurate 32-bit boundary saturation.
+    #[inline]
+    #[cfg_attr(target_arch = "xtensa", link_section = ".iram1")]
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_interleaved(&mut self, samples: &mut [i32]) {
         if !self.enabled {

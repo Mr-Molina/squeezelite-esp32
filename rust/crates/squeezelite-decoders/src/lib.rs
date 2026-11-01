@@ -882,32 +882,42 @@ impl AudioDecoder for Mp3Decoder {
             return Err(DecoderError::NeedMoreData);
         }
 
-        if !self.xing_checked {
-            let mut idx = 0;
-            while idx + 4 <= encoded_in.len() {
-                let h = nanomp3_core::__private::Header::read(&encoded_in[idx..]);
-                if h.valid() {
-                    let frame_bytes = h.frame_bytes(0) + h.padding();
-                    if frame_bytes > 0 && frame_bytes <= 1728 {
-                        if idx > 0 {
-                            return Ok((idx, 0));
-                        }
-                        if encoded_in.len() < frame_bytes {
-                            return Err(DecoderError::NeedMoreData);
-                        }
-                        if let Some(xing) = parse_xing_lame_header(&encoded_in[..frame_bytes]) {
-                            self.xing_checked = true;
-                            self.xing_info = Some(xing);
-                            let sr = h.sample_rate_hz();
-                            if sr > 0 {
-                                self.sample_rate = sr;
-                            }
-                            return Ok((frame_bytes, 0));
-                        }
+        let mut sync_offset = None;
+        let mut idx = 0;
+        while idx + 4 <= encoded_in.len() {
+            let h = nanomp3_core::__private::Header::read(&encoded_in[idx..]);
+            if h.valid() {
+                sync_offset = Some((idx, h));
+                break;
+            }
+            idx += 1;
+        }
+
+        if let Some((sync_idx, h)) = sync_offset {
+            let frame_bytes = h.frame_bytes(0) + h.padding();
+            if frame_bytes > 0 && frame_bytes <= 1728 {
+                let remaining = encoded_in.len().saturating_sub(sync_idx);
+                if remaining < frame_bytes {
+                    if sync_idx > 0 {
+                        return Ok((sync_idx, 0));
                     }
-                    break;
+                    return Err(DecoderError::NeedMoreData);
                 }
-                idx += 1;
+                if sync_idx > 0 {
+                    return Ok((sync_idx, 0));
+                }
+                if !self.xing_checked {
+                    if let Some(xing) = parse_xing_lame_header(&encoded_in[..frame_bytes]) {
+                        self.xing_checked = true;
+                        self.xing_info = Some(xing);
+                        let sr = h.sample_rate_hz();
+                        if sr > 0 {
+                            self.sample_rate = sr;
+                        }
+                        return Ok((frame_bytes, 0));
+                    }
+                    self.xing_checked = true;
+                }
             }
         }
 
@@ -1177,6 +1187,7 @@ impl AudioDecoder for StaticMp3Decoder {
                         }
                         return Ok((frame_bytes, 0));
                     }
+                    self.xing_checked = true;
                 }
                 if encoded_in.len() == frame_bytes {
                     (frame_bytes, &encoded_in[..frame_bytes])
@@ -3311,8 +3322,13 @@ impl AudioDecoder for AacDecoder {
         if !self.pending_pcm.is_empty() {
             let pending_frames = self.pending_pcm.len() / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
-            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
-            self.pending_pcm.drain(..to_copy * 2);
+            let samples = to_copy * 2;
+            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
+            if samples == self.pending_pcm.len() {
+                self.pending_pcm.clear();
+            } else {
+                self.pending_pcm.drain(..samples);
+            }
             frames_out += to_copy;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -3491,7 +3507,7 @@ impl VorbisDecoder {
     pub fn has_pending_pcm(&self) -> bool {
         !self.pending_pcm.is_empty()
             || !self.packet_queue.is_empty()
-            || self.stream_buf.windows(4).any(|w| w == b"OggS")
+            || self.stream_buf.len() >= 27
     }
 
     pub fn flush(&mut self) {
@@ -3665,8 +3681,13 @@ impl AudioDecoder for VorbisDecoder {
         if !self.pending_pcm.is_empty() {
             let pending_frames = self.pending_pcm.len() / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
-            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
-            self.pending_pcm.drain(..to_copy * 2);
+            let samples = to_copy * 2;
+            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
+            if samples == self.pending_pcm.len() {
+                self.pending_pcm.clear();
+            } else {
+                self.pending_pcm.drain(..samples);
+            }
             frames_out += to_copy;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -3739,7 +3760,11 @@ impl AudioDecoder for VorbisDecoder {
             ]);
             let actual_crc = ogg_crc32(&self.stream_buf[..total_page_len]);
             if expected_crc != actual_crc {
-                self.stream_buf.drain(..total_page_len);
+                if total_page_len == self.stream_buf.len() {
+                    self.stream_buf.clear();
+                } else {
+                    self.stream_buf.drain(..total_page_len);
+                }
                 return Err(DecoderError::CorruptedFrame);
             }
 
@@ -3757,7 +3782,11 @@ impl AudioDecoder for VorbisDecoder {
                 let seg_len = seg_len_u8 as usize;
                 if self.partial_packet.len().saturating_add(seg_len) > MAX_STREAM_BUF {
                     self.partial_packet.clear();
-                    self.stream_buf.drain(..total_page_len);
+                    if total_page_len == self.stream_buf.len() {
+                        self.stream_buf.clear();
+                    } else {
+                        self.stream_buf.drain(..total_page_len);
+                    }
                     return Err(DecoderError::CorruptedFrame);
                 }
                 self.partial_packet
@@ -3772,7 +3801,11 @@ impl AudioDecoder for VorbisDecoder {
                 }
             }
 
-            self.stream_buf.drain(..total_page_len);
+            if total_page_len == self.stream_buf.len() {
+                self.stream_buf.clear();
+            } else {
+                self.stream_buf.drain(..total_page_len);
+            }
 
             for packet in page_packets {
                 if frames_out < max_frames && self.packet_queue.is_empty() {
@@ -3899,8 +3932,13 @@ impl AudioDecoder for AlacDecoder {
         if !self.pending_pcm.is_empty() {
             let pending_frames = self.pending_pcm.len() / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
-            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
-            self.pending_pcm.drain(..to_copy * 2);
+            let samples = to_copy * 2;
+            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
+            if samples == self.pending_pcm.len() {
+                self.pending_pcm.clear();
+            } else {
+                self.pending_pcm.drain(..samples);
+            }
             frames_out += to_copy;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -4302,7 +4340,7 @@ impl OpusDecoder {
     pub fn has_pending_pcm(&self) -> bool {
         !self.pending_pcm.is_empty()
             || !self.packet_queue.is_empty()
-            || self.stream_buf.windows(4).any(|w| w == b"OggS")
+            || self.stream_buf.len() >= 27
     }
 
     pub fn flush(&mut self) {
@@ -4465,8 +4503,13 @@ impl AudioDecoder for OpusDecoder {
         if !self.pending_pcm.is_empty() {
             let pending_frames = self.pending_pcm.len() / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
-            pcm_out[..to_copy * 2].copy_from_slice(&self.pending_pcm[..to_copy * 2]);
-            self.pending_pcm.drain(..to_copy * 2);
+            let samples = to_copy * 2;
+            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
+            if samples == self.pending_pcm.len() {
+                self.pending_pcm.clear();
+            } else {
+                self.pending_pcm.drain(..samples);
+            }
             frames_out += to_copy;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -4539,7 +4582,11 @@ impl AudioDecoder for OpusDecoder {
             ]);
             let actual_crc = ogg_crc32(&self.stream_buf[..total_page_len]);
             if expected_crc != actual_crc {
-                self.stream_buf.drain(..total_page_len);
+                if total_page_len == self.stream_buf.len() {
+                    self.stream_buf.clear();
+                } else {
+                    self.stream_buf.drain(..total_page_len);
+                }
                 return Err(DecoderError::CorruptedFrame);
             }
 
@@ -4557,7 +4604,11 @@ impl AudioDecoder for OpusDecoder {
                 let seg_len = seg_len_u8 as usize;
                 if self.partial_packet.len().saturating_add(seg_len) > MAX_STREAM_BUF {
                     self.partial_packet.clear();
-                    self.stream_buf.drain(..total_page_len);
+                    if total_page_len == self.stream_buf.len() {
+                        self.stream_buf.clear();
+                    } else {
+                        self.stream_buf.drain(..total_page_len);
+                    }
                     return Err(DecoderError::CorruptedFrame);
                 }
                 self.partial_packet
@@ -4572,7 +4623,11 @@ impl AudioDecoder for OpusDecoder {
                 }
             }
 
-            self.stream_buf.drain(..total_page_len);
+            if total_page_len == self.stream_buf.len() {
+                self.stream_buf.clear();
+            } else {
+                self.stream_buf.drain(..total_page_len);
+            }
 
             for packet in page_packets {
                 if frames_out < max_frames && self.packet_queue.is_empty() {
@@ -4708,6 +4763,25 @@ mod tests {
         let (consumed_junk, frames_junk) = decoder.decode(&junk, &mut pcm_out).unwrap();
         assert!(consumed_junk > 0);
         assert_eq!(frames_junk, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_mp3_decoder_partial_frame_guard() {
+        let mut dec = Mp3Decoder::new();
+        let mut audio_frame = [0u8; 417];
+        audio_frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let mut pcm_out = vec![0i32; 2304];
+
+        // Truncated 200-byte slice returns Err(DecoderError::NeedMoreData)
+        // without consuming the partial frame.
+        let res = dec.decode(&audio_frame[..200], &mut pcm_out);
+        assert_eq!(res, Err(DecoderError::NeedMoreData));
+
+        // Full 417-byte frame decodes 1152 samples
+        let (consumed, frames) = dec.decode(&audio_frame, &mut pcm_out).unwrap();
+        assert_eq!(consumed, 417);
+        assert_eq!(frames, 1152);
     }
 
     #[test]

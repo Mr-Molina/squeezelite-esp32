@@ -8,9 +8,19 @@
 //! the written data, never off a frame boundary.
 #![cfg(not(target_arch = "xtensa"))]
 
-use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline, TrackMarker};
+use louder_esp32_app::pipeline::ActiveDecoder;
+use louder_esp32_app::pipeline::StreamPipeline;
+use louder_esp32_app::pipeline::TrackMarker;
 use louder_esp32_app::AudioOutputSink;
-use proptest::prelude::*;
+use proptest::collection;
+use proptest::prelude::prop_assert;
+use proptest::prelude::prop_assert_eq;
+use proptest::prelude::prop_oneof;
+use proptest::prelude::Just;
+use proptest::prelude::ProptestConfig;
+use proptest::prelude::Strategy;
+use proptest::prelude::TestCaseError;
+use proptest::proptest;
 use squeezelite_audio_core::OutputError;
 use squeezelite_decoders::PcmDecoder;
 
@@ -110,7 +120,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
     #[test]
-    fn marker_distances_never_negative_after_rewind(ops in prop::collection::vec(op(), 1..120)) {
+    fn marker_distances_never_negative_after_rewind(ops in collection::vec(op(), 1..120)) {
         let mut stream_storage = [0u8; 1024];
         // Small odd-sized output ring: positions wrap and rewinds can be clamped mid-frame.
         let mut output_storage = [0u8; 517];

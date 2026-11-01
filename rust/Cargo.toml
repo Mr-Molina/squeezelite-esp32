@@ -40,6 +40,33 @@ lto = false
 codegen-units = 1
 panic = "abort"
 
+[profile.release.package.nanomp3-core]
+opt-level = 3
+
+[profile.release.package.squeezelite-audio-core]
+opt-level = 3
+
+[profile.release.package.squeezelite-decoders]
+opt-level = 3
+
+[profile.release.package.alac]
+opt-level = 3
+
+[profile.release.package.lewton]
+opt-level = 3
+
+[profile.release.package.opus-rs]
+opt-level = 3
+
+[profile.release.package.syom]
+opt-level = 3
+
+[profile.release.package.squeezelite-raop]
+opt-level = 3
+
+[profile.release.package.squeezelite-cspot]
+opt-level = 3
+
 [patch.crates-io]
 nanomp3-core = { path = "crates/nanomp3-core" }
 esp-radio = { path = "vendor/esp-radio" }
