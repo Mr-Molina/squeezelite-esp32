@@ -11,11 +11,16 @@
 pub mod equalizer;
 pub mod fade;
 pub mod output;
+pub mod resampler;
 pub mod ringbuffer;
 pub mod volume;
 
-pub use equalizer::{BiquadCoeffs, EqPreset, Equalizer};
+pub use equalizer::{
+    design_bands, design_peaking, loudness_gains_db, preset_gains_db, BiquadCoeffs, EqPreset,
+    Equalizer, EqualizerError, DEFAULT_EQ_Q, EQ_BANDS_HZ,
+};
 pub use fade::{FadeEngine, FadeMode};
 pub use output::{AudioOutputSink, MockAudioSink, OutputError};
+pub use resampler::{InterpolationMode, ResampleQuality, Resampler};
 pub use ringbuffer::{AudioRingBuffer, RingBufferError};
 pub use volume::{scale_samples_inplace, ChannelMode, GainStage, VolumeScale};

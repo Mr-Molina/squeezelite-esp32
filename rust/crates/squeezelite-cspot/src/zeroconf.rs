@@ -14,11 +14,348 @@ use crate::crypto::Aes192Ecb;
 use crate::crypto::CryptoError;
 use crate::crypto::OakleyGroup1Dh;
 use crate::crypto::Sha1;
+use crate::spirc::decode_varint;
+use crate::spirc::encode_varint;
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::fmt;
+
+/// AP packet command for client authentication login request (`0xAB`).
+pub const AP_LOGIN_REQUEST_CMD: u8 = 0xAB;
+
+/// AP packet command for `APWelcome` authentication success (`0xAC`).
+pub const AP_WELCOME_CMD: u8 = 0xAC;
+
+/// AP packet command for `APLError` authentication failure (`0xAD`).
+pub const AP_AUTH_DECLINED_CMD: u8 = 0xAD;
+
+/// Spotify authentication type for stored reusable credentials (`0x01`).
+pub const AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS: u32 = 0x01;
+
+const REUSABLE_CRED_MAGIC: [u8; 4] = *b"CSRC";
+const REUSABLE_CRED_VERSION: u8 = 1;
+
+/// Spotify authentication credential type (`authentication.proto`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AuthenticationType {
+    /// Standard username and password (`0x00`).
+    UserPass = 0x00,
+    /// Stored reusable Spotify credentials (`0x01`).
+    StoredSpotifyCredentials = 0x01,
+    /// Stored Facebook credentials (`0x02`).
+    StoredFacebookCredentials = 0x02,
+    /// Ephemeral Spotify OAuth token (`0x03`).
+    SpotifyToken = 0x03,
+    /// Facebook token (`0x04`).
+    FacebookToken = 0x04,
+}
+
+impl From<u32> for AuthenticationType {
+    fn from(val: u32) -> Self {
+        match val {
+            0x00 => Self::UserPass,
+            0x01 => Self::StoredSpotifyCredentials,
+            0x02 => Self::StoredFacebookCredentials,
+            0x03 => Self::SpotifyToken,
+            0x04 => Self::FacebookToken,
+            _ => Self::StoredSpotifyCredentials,
+        }
+    }
+}
+
+/// Reusable Spotify credentials extracted from `APWelcome` (`0xAC`) and
+/// persisted to `FlashJournal` with AES-128-CTR + HMAC-SHA1 authentication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReusableCredentials {
+    /// Canonical Spotify username (`APWelcome.canonical_username`).
+    pub canonical_username: String,
+    /// Authentication type (`AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS = 1`).
+    pub auth_type: u32,
+    /// Reusable authentication blob (`APWelcome.reusable_auth_credentials`).
+    pub auth_data: Vec<u8>,
+}
+
+impl ReusableCredentials {
+    /// Creates reusable credentials from explicit fields.
+    #[must_use]
+    pub fn new(
+        canonical_username: impl Into<String>,
+        auth_type: u32,
+        auth_data: Vec<u8>,
+    ) -> Self {
+        Self {
+            canonical_username: canonical_username.into(),
+            auth_type,
+            auth_data,
+        }
+    }
+
+    /// Creates reusable credentials with
+    /// `AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS`.
+    #[must_use]
+    pub fn stored_spotify(
+        canonical_username: impl Into<String>,
+        auth_data: Vec<u8>,
+    ) -> Self {
+        Self::new(
+            canonical_username,
+            AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+            auth_data,
+        )
+    }
+
+    /// Extracts reusable credentials from an AP packet (`cmd` must be `0xAC`).
+    pub fn from_ap_welcome_packet(
+        cmd: u8,
+        payload: &[u8],
+    ) -> Result<Self, CryptoError> {
+        if cmd != AP_WELCOME_CMD {
+            return Err(CryptoError::DecryptionFailed);
+        }
+        Self::from_ap_welcome(payload)
+    }
+
+    /// Parses an `APWelcome` (`0xAC`) protobuf payload (`authentication.proto`).
+    pub fn from_ap_welcome(payload: &[u8]) -> Result<Self, CryptoError> {
+        let mut pos = 0usize;
+        let mut canonical_username = String::new();
+        let mut auth_type = AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS;
+        let mut auth_data = Vec::new();
+
+        while pos < payload.len() {
+            let key = decode_varint(payload, &mut pos)
+                .map_err(|_| CryptoError::InvalidCiphertext)?;
+            let field_num = (key >> 3) as u32;
+            let wire_type = (key & 0x07) as u8;
+
+            match wire_type {
+                0 => {
+                    let val = decode_varint(payload, &mut pos)
+                        .map_err(|_| CryptoError::InvalidCiphertext)?;
+                    if field_num == 0x1E || field_num == 2 {
+                        auth_type = val as u32;
+                    }
+                }
+                2 => {
+                    let len = decode_varint(payload, &mut pos)
+                        .map_err(|_| CryptoError::InvalidCiphertext)?
+                        as usize;
+                    if pos + len > payload.len() {
+                        return Err(CryptoError::InvalidCiphertext);
+                    }
+                    let slice = &payload[pos..pos + len];
+                    pos += len;
+
+                    if field_num == 0x0A || field_num == 1 {
+                        let s = core::str::from_utf8(slice)
+                            .map_err(|_| CryptoError::InvalidCiphertext)?;
+                        canonical_username = s.to_string();
+                    } else if field_num == 0x28 || field_num == 3 {
+                        auth_data = slice.to_vec();
+                    }
+                }
+                _ => return Err(CryptoError::InvalidCiphertext),
+            }
+        }
+
+        if canonical_username.is_empty() || auth_data.is_empty() {
+            return Err(CryptoError::InvalidCiphertext);
+        }
+
+        Ok(Self {
+            canonical_username,
+            auth_type,
+            auth_data,
+        })
+    }
+
+    /// Encodes `APWelcome` (`0xAC`) protobuf bytes matching `authentication.proto`.
+    #[must_use]
+    pub fn encode_ap_welcome(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            self.canonical_username.len() + self.auth_data.len() + 24,
+        );
+
+        // Field 10 (0x0A): canonical_username (string, wire type 2)
+        encode_varint(&mut buf, (0x0A << 3) | 2);
+        let user_bytes = self.canonical_username.as_bytes();
+        encode_varint(&mut buf, user_bytes.len() as u64);
+        buf.extend_from_slice(user_bytes);
+
+        // Field 20 (0x14): account_type_logged_in = 0 (Spotify)
+        encode_varint(&mut buf, 0x14 << 3);
+        encode_varint(&mut buf, 0);
+
+        // Field 25 (0x19): credentials_type_logged_in = 0 (Spotify)
+        encode_varint(&mut buf, 0x19 << 3);
+        encode_varint(&mut buf, 0);
+
+        // Field 30 (0x1E): reusable_auth_credentials_type (varint)
+        encode_varint(&mut buf, 0x1E << 3);
+        encode_varint(&mut buf, self.auth_type as u64);
+
+        // Field 40 (0x28): reusable_auth_credentials (bytes, wire type 2)
+        encode_varint(&mut buf, (0x28 << 3) | 2);
+        encode_varint(&mut buf, self.auth_data.len() as u64);
+        buf.extend_from_slice(&self.auth_data);
+
+        buf
+    }
+
+    /// Encodes `LoginCredentials` protobuf bytes (`authentication.proto`)
+    /// for reconnect.
+    #[must_use]
+    pub fn encode_login_credentials(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            self.canonical_username.len() + self.auth_data.len() + 16,
+        );
+
+        // Field 10 (0x0A): username
+        encode_varint(&mut buf, (0x0A << 3) | 2);
+        let user_bytes = self.canonical_username.as_bytes();
+        encode_varint(&mut buf, user_bytes.len() as u64);
+        buf.extend_from_slice(user_bytes);
+
+        // Field 20 (0x14): typ
+        encode_varint(&mut buf, 0x14 << 3);
+        encode_varint(&mut buf, self.auth_type as u64);
+
+        // Field 30 (0x1E): auth_data
+        encode_varint(&mut buf, (0x1E << 3) | 2);
+        encode_varint(&mut buf, self.auth_data.len() as u64);
+        buf.extend_from_slice(&self.auth_data);
+
+        buf
+    }
+
+    /// Serializes credentials into deterministic binary frame before encryption.
+    #[must_use]
+    pub fn serialize_plain(&self) -> Vec<u8> {
+        let user_bytes = self.canonical_username.as_bytes();
+        let user_len = core::cmp::min(user_bytes.len(), u16::MAX as usize);
+        let auth_len = core::cmp::min(self.auth_data.len(), u16::MAX as usize);
+
+        let mut out = Vec::with_capacity(13 + user_len + auth_len);
+        out.extend_from_slice(&REUSABLE_CRED_MAGIC);
+        out.push(REUSABLE_CRED_VERSION);
+        out.extend_from_slice(&self.auth_type.to_be_bytes());
+        out.extend_from_slice(&(user_len as u16).to_be_bytes());
+        out.extend_from_slice(&user_bytes[..user_len]);
+        out.extend_from_slice(&(auth_len as u16).to_be_bytes());
+        out.extend_from_slice(&self.auth_data[..auth_len]);
+        out
+    }
+
+    /// Deserializes credentials from deterministic plaintext binary frame.
+    pub fn deserialize_plain(data: &[u8]) -> Result<Self, CryptoError> {
+        if data.len() < 13 {
+            return Err(CryptoError::DecryptionFailed);
+        }
+        if data[0..4] != REUSABLE_CRED_MAGIC || data[4] != REUSABLE_CRED_VERSION {
+            return Err(CryptoError::DecryptionFailed);
+        }
+        let auth_type = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+        let user_len = u16::from_be_bytes([data[9], data[10]]) as usize;
+        if 11 + user_len + 2 > data.len() {
+            return Err(CryptoError::DecryptionFailed);
+        }
+        let username_str = core::str::from_utf8(&data[11..11 + user_len])
+            .map_err(|_| CryptoError::DecryptionFailed)?;
+        let auth_pos = 11 + user_len;
+        let auth_len =
+            u16::from_be_bytes([data[auth_pos], data[auth_pos + 1]]) as usize;
+        if auth_pos + 2 + auth_len != data.len() {
+            return Err(CryptoError::DecryptionFailed);
+        }
+        let auth_data = data[auth_pos + 2..auth_pos + 2 + auth_len].to_vec();
+        if username_str.is_empty() || auth_data.is_empty() {
+            return Err(CryptoError::DecryptionFailed);
+        }
+
+        Ok(Self {
+            canonical_username: username_str.to_string(),
+            auth_type,
+            auth_data,
+        })
+    }
+
+    fn derive_keys(secret: &[u8]) -> ([u8; 16], [u8; 20]) {
+        let base_hash = Sha1::digest(secret);
+        let base_key = &base_hash[0..16];
+        let enc_full = hmac_sha1(base_key, b"encryption");
+        let mac_key = hmac_sha1(base_key, b"checksum");
+        let mut enc_key = [0u8; 16];
+        enc_key.copy_from_slice(&enc_full[0..16]);
+        (enc_key, mac_key)
+    }
+
+    /// Encrypts and authenticates credentials with AES-128-CTR + HMAC-SHA1
+    /// for `FlashJournal` persistence (`[16B IV || ciphertext || 20B HMAC]`).
+    #[must_use]
+    pub fn encrypt(&self, secret: &[u8], iv: [u8; 16]) -> Vec<u8> {
+        let (enc_key, mac_key) = Self::derive_keys(secret);
+        let mut ciphertext = self.serialize_plain();
+        let mut ctr = Aes128Ctr::new(&enc_key, iv);
+        ctr.process(&mut ciphertext);
+
+        let mut payload = Vec::with_capacity(16 + ciphertext.len() + 20);
+        payload.extend_from_slice(&iv);
+        payload.extend_from_slice(&ciphertext);
+
+        let mac = hmac_sha1(&mac_key, &payload);
+        payload.extend_from_slice(&mac);
+        payload
+    }
+
+    /// Verifies HMAC-SHA1 and decrypts AES-128-CTR credentials from `FlashJournal`.
+    pub fn decrypt(blob: &[u8], secret: &[u8]) -> Result<Self, CryptoError> {
+        if blob.len() < 16 + 13 + 20 {
+            return Err(CryptoError::InvalidCiphertext);
+        }
+
+        let (enc_key, mac_key) = Self::derive_keys(secret);
+        let mac_offset = blob.len() - 20;
+        let authenticated_part = &blob[..mac_offset];
+        let expected_mac = &blob[mac_offset..];
+        let computed_mac = hmac_sha1(&mac_key, authenticated_part);
+
+        let mut diff = 0u8;
+        for (&a, &b) in computed_mac.iter().zip(expected_mac.iter()) {
+            diff |= a ^ b;
+        }
+        if diff != 0 {
+            return Err(CryptoError::DecryptionFailed);
+        }
+
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&blob[0..16]);
+        let mut decrypted = blob[16..mac_offset].to_vec();
+
+        let mut ctr = Aes128Ctr::new(&enc_key, iv);
+        ctr.process(&mut decrypted);
+
+        Self::deserialize_plain(&decrypted)
+    }
+
+    /// Encodes encrypted credentials as Base64 for string-valued
+    /// `FlashJournal` storage.
+    #[must_use]
+    pub fn encrypt_base64(&self, secret: &[u8], iv: [u8; 16]) -> String {
+        base64_encode(&self.encrypt(secret, iv))
+    }
+
+    /// Decodes and decrypts Base64-encoded credentials from `FlashJournal`.
+    pub fn decrypt_base64(
+        encoded: &str,
+        secret: &[u8],
+    ) -> Result<Self, CryptoError> {
+        let raw = base64_decode(encoded)?;
+        Self::decrypt(&raw, secret)
+    }
+}
 
 /// Configuration for Spotify Connect ZeroConf mDNS announcement.
 #[derive(Clone, Debug, Eq, PartialEq)]

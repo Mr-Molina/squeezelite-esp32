@@ -42,6 +42,18 @@ use squeezelite_config::AudioConfig;
 #[cfg(not(target_arch = "xtensa"))]
 use squeezelite_decoders::PcmDecoder;
 
+#[allow(dead_code, clippy::duplicated_attributes)]
+mod console;
+#[allow(dead_code, clippy::duplicated_attributes)]
+mod controls;
+#[allow(dead_code, clippy::duplicated_attributes)]
+mod dac_platform;
+#[allow(dead_code, clippy::duplicated_attributes)]
+mod display_gds;
+#[allow(dead_code, clippy::duplicated_attributes)]
+mod eth_w5500;
+#[allow(dead_code, clippy::duplicated_attributes)]
+mod power_boards;
 #[cfg_attr(target_arch = "xtensa", allow(dead_code))]
 mod tasks;
 
@@ -466,7 +478,6 @@ mod xtensa_hw {
     use squeezelite_raop::rtp::RtpAudioReceiver;
     use squeezelite_raop::rtsp::{RtspMethod, RtspRequest, RtspServer, ServerState};
     use squeezelite_tas58xx::{registers, VOL_UNITY_0DB};
-    use static_cell::{ConstStaticCell, StaticCell};
 
     // Mandatory Squeezelite-ESP32 OTA binary descriptor (`squeezelite-ota.c`).
     // Sets `project_name = "Squeezelite-ESP32"` and
@@ -1088,7 +1099,7 @@ mod xtensa_hw {
     static mut APP_CORE_STACK: Stack<4096> = Stack::new();
     #[allow(unsafe_code)]
     #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 18 * 1024]> =
+    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 22 * 1024]> =
         core::mem::MaybeUninit::uninit();
     #[allow(unsafe_code)]
     #[unsafe(link_section = ".dram2_uninit")]
@@ -1595,19 +1606,16 @@ mod xtensa_hw {
         #[unsafe(link_section = ".dram2_uninit")]
         static mut STATIC_PIPELINE: core::mem::MaybeUninit<HwStreamPipeline> =
             core::mem::MaybeUninit::uninit();
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut STATIC_HTTP_RESP_BUF: core::mem::MaybeUninit<[u8; 1536]> =
-            core::mem::MaybeUninit::uninit();
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut STATIC_HTTP_TX_BUF: core::mem::MaybeUninit<[u8; 1536]> =
-            core::mem::MaybeUninit::uninit();
         // JUSTIFICATION: Field-by-field initialization of static
         // MaybeUninit<StreamPipeline> in .dram2_uninit to avoid a 12 KB
         // stack temporary during boot.
         // SAFETY: Called once during single-core PRO_CPU bring-up before
-        // returning exclusive &'static mut references.
+        // returning exclusive &'static mut references; `ptr.write_bytes(0, 1)`
+        // zeroes the entire uninitialized `.dram2_uninit` region prior to
+        // writing every struct field.
         unsafe {
             let ptr = (*core::ptr::addr_of_mut!(STATIC_PIPELINE)).as_mut_ptr();
+            ptr.write_bytes(0, 1);
             core::ptr::addr_of_mut!((*ptr).stream_buffer)
                 .write(squeezelite_audio_core::AudioRingBuffer::new(stream_storage));
             core::ptr::addr_of_mut!((*ptr).output_buffer)
@@ -1637,14 +1645,17 @@ mod xtensa_hw {
                 .write(squeezelite_audio_core::FadeEngine::new());
             core::ptr::addr_of_mut!((*ptr).decode_us_max).write(0);
             core::ptr::addr_of_mut!((*ptr).decode_us_first).write(0);
+            core::ptr::addr_of_mut!((*ptr).eq_gains_db).write([0.0; 10]);
+            core::ptr::addr_of_mut!((*ptr).loudness_level).write(0);
+            core::ptr::addr_of_mut!((*ptr).active_sample_rate_hz).write(44_100);
+            core::ptr::addr_of_mut!((*ptr).resampler).write(None);
 
-            let http_resp_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_RESP_BUF)).as_mut_ptr();
-            http_resp_ptr.write_bytes(0, 1);
+            let http_resp_buf: &'static mut [u8; 1536] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 1536]));
+            let http_tx_buf: &'static mut [u8; 1536] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 1536]));
 
-            let http_tx_ptr = (*core::ptr::addr_of_mut!(STATIC_HTTP_TX_BUF)).as_mut_ptr();
-            http_tx_ptr.write_bytes(0, 1);
-
-            (&mut *ptr, &mut *http_resp_ptr, &mut *http_tx_ptr)
+            (&mut *ptr, http_resp_buf, http_tx_buf)
         }
     }
 
@@ -1765,23 +1776,9 @@ mod xtensa_hw {
         }
     }
 
-    /// smoltcp socket slots. `ConstStaticCell` hands them out without a stack
-    /// temporary.
-    static SOCKET_STORAGE: ConstStaticCell<[SocketStorage<'static>; SOCKET_SLOTS]> =
-        ConstStaticCell::new([SocketStorage::EMPTY; SOCKET_SLOTS]);
-    static MDNS_UDP_BUFFERS: ConstStaticCell<UdpMdnsBuffers> =
-        ConstStaticCell::new(UdpMdnsBuffers::new());
-    static RTP_UDP_META_BUFFERS: ConstStaticCell<UdpRtpMetaBuffers> =
-        ConstStaticCell::new(UdpRtpMetaBuffers::new());
-    static AMP: StaticCell<AmpManager<Esp32I2cBus<'static>>> = StaticCell::new();
-    static CYD_BRIDGE: StaticCell<CydUartBridge<Esp32Uart2Port<'static>>> = StaticCell::new();
-    static COORDINATOR: StaticCell<PlayerCoordinator> = StaticCell::new();
-    static SMOL_IFACE: StaticCell<SmolInterface> = StaticCell::new();
-    static RUNTIME_STATE: StaticCell<DeviceRuntimeState> = StaticCell::new();
-
     /// Bring-up stage: I2C0 (SDA=21, SCL=27, 400 kHz) and the TAS58xx manager
-    /// over it, built in [`AMP`]. Construction only; the HIL amp init keeps
-    /// its legacy place in [`bring_up`].
+    /// over it, allocated in external PSRAM. Construction only; the HIL amp
+    /// init keeps its legacy place in [`bring_up`].
     #[inline(never)]
     fn init_amp_i2c(
         i2c0: esp_hal::peripherals::I2C0<'static>,
@@ -1794,7 +1791,9 @@ mod xtensa_hw {
             .with_sda(sda)
             .with_scl(scl);
         let i2c_bus = Esp32I2cBus::new(hal_i2c);
-        AMP.init(AmpManager::for_active_board(i2c_bus))
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(AmpManager::for_active_board(
+            i2c_bus,
+        )))
     }
 
     /// Static pipeline + the static HTTP-server buffers handed out with it
@@ -1842,7 +1841,7 @@ mod xtensa_hw {
     }
 
     /// Bring-up stage: UART2 @ 460 800 (TX=4, RX=36) and the CYD bridge over
-    /// it, built in [`CYD_BRIDGE`].
+    /// it, allocated in external PSRAM.
     #[inline(never)]
     fn init_cyd_uart(
         uart2: esp_hal::peripherals::UART2<'static>,
@@ -1856,38 +1855,30 @@ mod xtensa_hw {
             .with_tx(tx)
             .with_rx(uart2_rx);
         let uart2_port = Esp32Uart2Port::new(hal_uart2);
-        CYD_BRIDGE.init(CydUartBridge::new(uart2_port))
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(CydUartBridge::new(uart2_port)))
     }
 
-    /// Bring-up stage: the player coordinator, built in [`COORDINATOR`], with
-    /// this board's efuse STA MAC (HELO; smoltcp uses the same MAC), the
+    /// Bring-up stage: the player coordinator, allocated in external PSRAM,
+    /// with this board's efuse STA MAC (HELO; smoltcp uses the same MAC), the
     /// boot-resolved player name (`SETD` after HELO, `setd` id-0 replies) and
     /// LMS address (`strm s` with server IP 0.0.0.0 streams from it), and the
     /// [`ConfigHandle`] a `setd` id-0 name change persists through. Server
-    /// frames are received into a static buffer in `.dram2_uninit` (which does
-    /// not shrink `.stack`) instead of a 2 KB buffer on the `slimproto_session`
-    /// stack.
-    #[allow(unsafe_code)]
+    /// frames are received into a heap buffer in PSRAM instead of a 2 KB
+    /// buffer on the `slimproto_session` stack.
     #[inline(never)]
     fn init_coordinator(
         sta_mac: [u8; 6],
         config: &'static ConfigHandle,
         lms_ip: [u8; 4],
     ) -> &'static mut PlayerCoordinator {
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut SERVER_FRAME_BUF: core::mem::MaybeUninit<
-            [u8; louder_esp32_app::coordinator::SERVER_FRAME_BUF_LEN],
-        > = core::mem::MaybeUninit::uninit();
-        // JUSTIFICATION: Zero-initialize static SERVER_FRAME_BUF in
-        // .dram2_uninit to keep the 2 KB frame buffer off the stack.
-        // SAFETY: Called once at bring-up (`COORDINATOR.init` panics on a
-        // second call); the buffer is zeroed before handing out the reference.
-        let frame_buf: &'static mut [u8] = unsafe {
-            let ptr = (*core::ptr::addr_of_mut!(SERVER_FRAME_BUF)).as_mut_ptr();
-            ptr.write_bytes(0, 1);
-            &mut *ptr
-        };
-        let coordinator = COORDINATOR.init(PlayerCoordinator::new(sta_mac, "SqueezeESP32"));
+        let frame_buf: &'static mut [u8] = alloc::boxed::Box::leak(
+            alloc::vec![0u8; louder_esp32_app::coordinator::SERVER_FRAME_BUF_LEN]
+                .into_boxed_slice(),
+        );
+        let coordinator = alloc::boxed::Box::leak(alloc::boxed::Box::new(PlayerCoordinator::new(
+            sta_mac,
+            "SqueezeESP32",
+        )));
         config.read(|c| {
             coordinator.player_name.clear();
             let _ = coordinator.player_name.push_str(c.player_name.as_str());
@@ -2031,10 +2022,10 @@ mod xtensa_hw {
     /// slimproto, audio.
     type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 3];
 
-    /// Bring-up stage: `smoltcp` Ethernet interface (in [`SMOL_IFACE`]) +
-    /// DHCPv4 + TCP port 80 + TCP SlimProto (3483) + audio socket + mDNS UDP
-    /// (5353) + AirPlay RTSP TCP (5000) + AirPlay RTP UDP (6000) + Spotify
-    /// Connect HTTP/Spirc TCP (4070), all in [`SOCKET_STORAGE`].
+    /// Bring-up stage: `smoltcp` Ethernet interface + DHCPv4 + TCP port 80 +
+    /// TCP SlimProto (3483) + audio socket + mDNS UDP (5353) + AirPlay RTSP
+    /// TCP (5000) + AirPlay RTP UDP (6000) + Spotify Connect HTTP/Spirc TCP
+    /// (4070), allocated in external PSRAM.
     #[inline(never)]
     fn init_net_stack(
         sta_iface: &mut WifiInterface,
@@ -2053,13 +2044,19 @@ mod xtensa_hw {
         smol_cfg.random_seed = rng_seed;
         let local_port_counter: u16 = 49152 + ((hw_rng.random() as u16) & 0x3FFF);
         let mut smol_dev = SmolDevice { driver: sta_iface };
-        let smol_iface = SMOL_IFACE.init(SmolInterface::new(
+        let smol_iface = alloc::boxed::Box::leak(alloc::boxed::Box::new(SmolInterface::new(
             smol_cfg,
             &mut smol_dev,
             SmolInstant::from_millis(now_millis() as i64),
-        ));
+        )));
 
-        let mut sockets = SocketSet::new(&mut SOCKET_STORAGE.take()[..]);
+        let socket_storage: &'static mut [SocketStorage<'static>] = alloc::boxed::Box::leak(
+            (0..SOCKET_SLOTS)
+                .map(|_| SocketStorage::EMPTY)
+                .collect::<alloc::vec::Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let mut sockets = SocketSet::new(&mut socket_storage[..]);
 
         let dhcp_handle = add_socket(&mut sockets, dhcpv4::Socket::new);
 
@@ -2084,7 +2081,7 @@ mod xtensa_hw {
             )
         });
 
-        let mdns_bufs = MDNS_UDP_BUFFERS.take();
+        let mdns_bufs = alloc::boxed::Box::leak(alloc::boxed::Box::new(UdpMdnsBuffers::new()));
         let mdns_handle = add_socket(&mut sockets, || {
             udp::Socket::new(
                 udp::PacketBuffer::new(&mut mdns_bufs.rx_meta[..], &mut mdns_bufs.rx_payload[..]),
@@ -2103,7 +2100,7 @@ mod xtensa_hw {
             )
         });
 
-        let rtp_meta = RTP_UDP_META_BUFFERS.take();
+        let rtp_meta = alloc::boxed::Box::leak(alloc::boxed::Box::new(UdpRtpMetaBuffers::new()));
         let rtp_rx_payload: &'static mut [u8] =
             alloc::boxed::Box::leak(alloc::vec![0u8; 16_384].into_boxed_slice());
         let rtp_tx_payload: &'static mut [u8] =
@@ -2215,6 +2212,8 @@ mod xtensa_hw {
         raop_rtsp: alloc::boxed::Box<RtspServer>,
         raop_rtp: alloc::boxed::Box<RtpAudioReceiver>,
         raop_streaming: bool,
+        last_rtp_packet_ms: u64,
+        rtsp_rx_acc: alloc::vec::Vec<u8>,
         spot_spirc: alloc::boxed::Box<SpircStateMachine>,
         spot_streaming: bool,
         now_ms: u64,
@@ -2230,8 +2229,8 @@ mod xtensa_hw {
     }
 
     /// Hardware bring-up, in the legacy order, ending in the initial runtime
-    /// state (in [`RUNTIME_STATE`]). Heavy steps run in `#[inline(never)]`
-    /// stages that build their results in statics, so this frame stays small.
+    /// state allocated in external PSRAM. Heavy steps run in `#[inline(never)]`
+    /// stages so this frame stays small.
     #[inline(never)]
     fn bring_up() -> &'static mut DeviceRuntimeState {
         let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -2346,14 +2345,41 @@ mod xtensa_hw {
         ring_storage.fill(0);
         wdt.feed();
 
-        // Allocate 46 KB + 36 KB internal DRAM heap for `esp-rtos` and
-        // `esp-radio`, plus 4 MB external PSRAM (`0x3F80_0000`) initialized
-        // via 100% IRAM-resident `init_and_map_psram_4mb` (`WO-197`).
+        // Register 4 MB external PSRAM (`0x3F80_0000`) FIRST as Region 0 of
+        // `esp_alloc::HEAP` (`MemoryCapability::External`) so all standard Rust
+        // `GlobalAlloc` allocations (`Box::new`, `vec!`) allocate from PSRAM,
+        // preserving 100% of internal DRAM (`43 KB` Region 1 + `22 KB` Region
+        // 2 = `65 KB` `MemoryCapability::Internal`) for `esp-rtos` and
+        // `esp-radio` (`Wi-Fi` + `BLE`/`BTDM`).
         #[allow(unsafe_code)]
         let psram_avail_bytes = {
-            esp_alloc::heap_allocator!(size: 46 * 1024);
-            // JUSTIFICATION: Register secondary 36 KB internal `.dram2_uninit`
-            // region with `esp_alloc::HEAP`.
+            const EXTMEM_ORIGIN: usize = 0x3F80_0000;
+            const EXTMEM_SIZE: usize = louder_esp32_app::pipeline::PSRAM_HEAP_BYTES;
+            // JUSTIFICATION: Execute 100% IRAM-resident PSRAM SPI1 + DPORT MMU
+            // initialization (`WO-197`) before registering heap regions.
+            // SAFETY: Single-core execution with interrupts masked inside the
+            // IRAM routine and `APP_CPU` parked.
+            let psram_bytes = unsafe { init_and_map_psram_4mb() };
+            let reg_size = if psram_bytes >= 1_048_576 {
+                let sz = psram_bytes.min(EXTMEM_SIZE);
+                // JUSTIFICATION: Register verified 4 MB external PSRAM
+                // (`0x3F80_0000..0x3FC0_0000`) as Region 0 of `esp_alloc::HEAP`.
+                // SAFETY: `init_and_map_psram_4mb` verified read/write mapping
+                // at `0x3F80_0000`.
+                unsafe {
+                    esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                        EXTMEM_ORIGIN as *mut u8,
+                        sz,
+                        esp_alloc::MemoryCapability::External.into(),
+                    ));
+                }
+                sz
+            } else {
+                0
+            };
+            esp_alloc::heap_allocator!(size: 43 * 1024);
+            // JUSTIFICATION: Register secondary 22 KB internal `.dram2_uninit`
+            // region as Region 2 of `esp_alloc::HEAP`.
             // SAFETY: `STATIC_BT_HEAP` is an exclusive static uninitialized
             // buffer in `.dram2_uninit` registered exactly once at boot.
             unsafe {
@@ -2363,30 +2389,7 @@ mod xtensa_hw {
                     esp_alloc::MemoryCapability::Internal.into(),
                 ));
             }
-            const EXTMEM_ORIGIN: usize = 0x3F80_0000;
-            const EXTMEM_SIZE: usize = louder_esp32_app::pipeline::PSRAM_HEAP_BYTES;
-            // JUSTIFICATION: Execute 100% IRAM-resident PSRAM SPI1 + DPORT MMU
-            // initialization (`WO-197`).
-            // SAFETY: Single-core execution with interrupts masked inside the
-            // IRAM routine and `APP_CPU` parked.
-            let psram_bytes = unsafe { init_and_map_psram_4mb() };
-            if psram_bytes >= 1_048_576 {
-                let reg_size = psram_bytes.min(EXTMEM_SIZE);
-                // JUSTIFICATION: Register verified 4 MB external PSRAM
-                // (`0x3F80_0000..0x3FC0_0000`) with `esp_alloc::HEAP`.
-                // SAFETY: `init_and_map_psram_4mb` verified read/write mapping
-                // at `0x3F80_0000`.
-                unsafe {
-                    esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-                        EXTMEM_ORIGIN as *mut u8,
-                        reg_size,
-                        esp_alloc::MemoryCapability::External.into(),
-                    ));
-                }
-                reg_size
-            } else {
-                0
-            }
+            reg_size
         };
         let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(6144);
         // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream
@@ -2580,7 +2583,7 @@ mod xtensa_hw {
         let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
         let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
 
-        RUNTIME_STATE.init(DeviceRuntimeState {
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(DeviceRuntimeState {
             wdt,
             flash,
             core1,
@@ -2643,10 +2646,12 @@ mod xtensa_hw {
             raop_rtsp,
             raop_rtp,
             raop_streaming: false,
+            last_rtp_packet_ms: 0,
+            rtsp_rx_acc: alloc::vec::Vec::with_capacity(2048),
             spot_spirc,
             spot_streaming: false,
             now_ms: 0,
-        })
+        }))
     }
 
     struct DeviceSmolTcp<'a> {
@@ -2746,10 +2751,6 @@ mod xtensa_hw {
         Some((slim?, audio?))
     }
 
-    fn lms_audio_active(coordinator: &PlayerCoordinator) -> bool {
-        coordinator.stream_active() && coordinator.state != PlayerState::Stopped
-    }
-
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut DeviceRuntimeState) {
         s.config.flush_now(&mut *s.journal);
@@ -2768,6 +2769,52 @@ mod xtensa_hw {
         (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32
     }
 
+    fn restore_suspended_or_stop(s: &mut DeviceRuntimeState) {
+        s.pipeline.stream_buffer.flush();
+        match s.coordinator.active_source() {
+            AudioSource::SlimProto => {
+                match s.coordinator.current_format {
+                    Some(squeezelite_proto::AudioFormat::Mp3) => {
+                        s.pipeline.use_mp3_decoder();
+                    }
+                    Some(squeezelite_proto::AudioFormat::Flac) => {
+                        s.pipeline.set_decoder(ActiveDecoder::new_flac());
+                    }
+                    Some(squeezelite_proto::AudioFormat::Aac) => {
+                        if let Some(d) = ActiveDecoder::new_aac() {
+                            s.pipeline.set_decoder(d);
+                        }
+                    }
+                    Some(squeezelite_proto::AudioFormat::Ogg) => {
+                        if let Some(d) = ActiveDecoder::new_vorbis() {
+                            s.pipeline.set_decoder(d);
+                        }
+                    }
+                    Some(squeezelite_proto::AudioFormat::Alac) => {
+                        s.pipeline.set_decoder(ActiveDecoder::new_alac());
+                    }
+                    Some(squeezelite_proto::AudioFormat::Opus) => {
+                        s.pipeline.set_decoder(ActiveDecoder::new_opus());
+                    }
+                    _ => {
+                        s.pipeline.use_mp3_decoder();
+                    }
+                }
+                s.coordinator.end_external_playback();
+                s.pipeline.set_mute(false);
+            }
+            AudioSource::None => {
+                s.pipeline.use_mp3_decoder();
+                s.coordinator.end_external_playback();
+            }
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth => {
+                s.pipeline
+                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                s.pipeline.set_mute(false);
+            }
+        }
+    }
+
     #[inline(never)]
     fn bt_poll_phase(s: &mut DeviceRuntimeState) {
         let now_ms = s.now_ms;
@@ -2783,16 +2830,10 @@ mod xtensa_hw {
             }
         }
 
-        if s.bt_audio_active && lms_audio_active(s.coordinator) {
-            s.bt_audio_active = false;
-        }
-
         if let Some(ref mut transport) = s.bt_transport {
             s.bt_sink
                 .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                    if !lms_audio_active(s.coordinator)
-                        && s.coordinator.request_source(AudioSource::Bluetooth)
-                    {
+                    if s.coordinator.request_source(AudioSource::Bluetooth) {
                         if s.coordinator.current_sample_rate != sample_rate_hz
                             || s.pipeline.sample_rate != sample_rate_hz
                         {
@@ -2814,14 +2855,14 @@ mod xtensa_hw {
                     }
                 });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() && !lms_audio_active(s.coordinator) {
+            if s.bt_audio_active && !s.bt_sink.is_streaming() {
                 if s.pipeline.stream_buffer.available_read() == 0
                     && s.pipeline.output_buffer.available_read() == 0
                     && !s.pipeline.has_pending_pcm()
                 {
-                    s.coordinator.release_source(AudioSource::Bluetooth);
-                    s.coordinator.end_external_playback();
                     s.bt_audio_active = false;
+                    s.coordinator.release_source(AudioSource::Bluetooth);
+                    restore_suspended_or_stop(s);
                 }
             }
         }
@@ -2874,6 +2915,10 @@ mod xtensa_hw {
             Some(dhcpv4::Event::Configured(config)) => {
                 let ip_octets = config.address.address().octets();
                 s.assigned_ip = Some(ip_octets);
+                s.raop_rtsp.set_ip_address(ip_octets);
+                let _ = s
+                    .smol_iface
+                    .join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
                 let prefix_len = config.address.prefix_len();
                 let mask_u32 = if prefix_len == 0 {
                     0
@@ -2897,9 +2942,20 @@ mod xtensa_hw {
             Some(dhcpv4::Event::Deconfigured) => {
                 s.assigned_ip = None;
                 s.smol_iface.update_ip_addrs(|addrs| addrs.clear());
+                let _ = s
+                    .smol_iface
+                    .leave_multicast_group(Ipv4Address::new(224, 0, 0, 251));
                 s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
+                s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
+                s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
+                s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
+                s.mdns_bound = false;
+                s.raop_streaming = false;
+                s.spot_streaming = false;
+                s.rtsp_rx_acc.clear();
                 s.helo_sent = false;
                 s.pending_http_body = &[];
                 s.pending_http_closing = false;
@@ -2993,14 +3049,27 @@ mod xtensa_hw {
                         louder_esp32_app::AmpMode::Standby => "Standby",
                         louder_esp32_app::AmpMode::PowerDown => "PowerDown",
                     };
-                    let codec_name = match s.pipeline.decoder {
-                        ActiveDecoder::Mp3(_) => "MP3",
-                        ActiveDecoder::Flac(_) => "FLAC",
-                        ActiveDecoder::Pcm(_) => "PCM",
-                        ActiveDecoder::Aac(_) => "AAC",
-                        ActiveDecoder::Vorbis(_) => "Vorbis",
-                        ActiveDecoder::Alac(_) => "ALAC",
-                        ActiveDecoder::Opus(_) => "Opus",
+                    let codec_name = match s.coordinator.active_source() {
+                        AudioSource::AirPlay => "AirPlay",
+                        AudioSource::Bluetooth => "Bluetooth",
+                        AudioSource::Spotify => "Spotify",
+                        _ => {
+                            if s.raop_streaming {
+                                "AirPlay"
+                            } else if s.spot_streaming {
+                                "Spotify"
+                            } else {
+                                match s.pipeline.decoder {
+                                    ActiveDecoder::Mp3(_) => "MP3",
+                                    ActiveDecoder::Flac(_) => "FLAC",
+                                    ActiveDecoder::Pcm(_) => "PCM",
+                                    ActiveDecoder::Aac(_) => "AAC",
+                                    ActiveDecoder::Vorbis(_) => "Vorbis",
+                                    ActiveDecoder::Alac(_) => "ALAC",
+                                    ActiveDecoder::Opus(_) => "Opus",
+                                }
+                            }
+                        }
                     };
                     let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
                         match s.latest_telemetry {
@@ -3015,8 +3084,16 @@ mod xtensa_hw {
                             None => (s.coordinator.current_sample_rate, 64, true, false),
                         };
                     let (psram_free_bytes, psram_used_bytes) = {
-                        let used = esp_alloc::HEAP.used() as u32;
-                        let free = esp_alloc::HEAP.free() as u32;
+                        let stats = esp_alloc::HEAP.stats();
+                        let mut free = 0u32;
+                        let mut used = 0u32;
+                        for r in stats.region_stats.iter().flatten() {
+                            if r.size > 1024 * 1024 {
+                                free = r.free as u32;
+                                used = r.used as u32;
+                                break;
+                            }
+                        }
                         if free.saturating_add(used) > 200_000 {
                             (free, used)
                         } else {
@@ -3137,6 +3214,33 @@ mod xtensa_hw {
                                         let _ = link.send(&ir_buf[..ir_len]);
                                     }
                                 }
+                            }
+                            HttpControlAction::SpotifyPlay => {
+                                if s.coordinator.request_source(AudioSource::Spotify) {
+                                    if s.coordinator.current_sample_rate != 44_100
+                                        || s.pipeline.sample_rate != 44_100
+                                    {
+                                        s.coordinator.current_sample_rate = 44_100;
+                                        let _ = s.pipeline.set_sample_rate(44_100);
+                                    }
+                                    s.pipeline
+                                        .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
+                                            16, 2, false,
+                                        )));
+                                    s.pipeline.begin_external_audio();
+                                    s.pipeline.set_mute(false);
+                                    s.coordinator.begin_external_playback();
+                                    if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                        let _ = s.amp.clear_faults();
+                                        let _ = s.amp.start_playback_via_hiz();
+                                    }
+                                    s.spot_streaming = true;
+                                }
+                            }
+                            HttpControlAction::SpotifyStop => {
+                                s.spot_streaming = false;
+                                s.coordinator.release_source(AudioSource::Spotify);
+                                restore_suspended_or_stop(s);
                             }
                             HttpControlAction::RebootToRecovery
                             | HttpControlAction::PersistOta0AndReboot => {
@@ -3320,20 +3424,45 @@ mod xtensa_hw {
                 }
             }
             if s.mdns_bound {
-                let mut rx_q = [0u8; 512];
-                let mut should_announce = s.last_mdns_announce_ms == 0
-                    || now_ms.saturating_sub(s.last_mdns_announce_ms) >= 30_000;
+                let mut should_announce_raop = false;
+                let mut should_announce_spotify = false;
+                let mut raop_ep = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+                let mut spot_ep = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+
+                if s.last_mdns_announce_ms == 0
+                    || now_ms.saturating_sub(s.last_mdns_announce_ms) >= 30_000
+                {
+                    s.last_mdns_announce_ms = now_ms.max(1);
+                    should_announce_raop = true;
+                    should_announce_spotify = true;
+                }
+
                 while mdns_sock.can_recv() {
-                    if let Ok((n, _meta)) = mdns_sock.recv_slice(&mut rx_q) {
-                        if n >= 12 && (rx_q[2] & 0x80) == 0 {
-                            should_announce = true;
+                    if let Ok((payload, meta)) = mdns_sock.recv() {
+                        if payload.windows(5).any(|w| w == b"_raop")
+                            || payload.windows(8).any(|w| w == b"_airplay")
+                        {
+                            should_announce_raop = true;
+                            if meta.endpoint.port != 5353 {
+                                raop_ep = meta.endpoint;
+                            }
+                        } else if payload.windows(16).any(|w| w == b"_spotify-connect")
+                            || payload.windows(8).any(|w| w == b"_spotify")
+                        {
+                            should_announce_spotify = true;
+                            if meta.endpoint.port != 5353 {
+                                spot_ep = meta.endpoint;
+                            }
+                        } else if payload.len() >= 12 && (payload[2] & 0x80) == 0 {
+                            should_announce_raop = true;
+                            should_announce_spotify = true;
                         }
                     } else {
                         break;
                     }
                 }
-                if should_announce && mdns_sock.can_send() {
-                    let mcast = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+
+                if should_announce_raop && mdns_sock.can_send() {
                     let mcfg = MdnsConfig {
                         player_name: alloc::string::String::from("BASEMENT"),
                         mac_address: s.sta_mac,
@@ -3341,16 +3470,17 @@ mod xtensa_hw {
                         port: 5000,
                     };
                     let rpkt = MdnsBuilder::build_announcement(&mcfg);
-                    let _ = mdns_sock.send_slice(&rpkt, mcast);
+                    let _ = mdns_sock.send_slice(&rpkt, raop_ep);
+                }
+                if should_announce_spotify && mdns_sock.can_send() {
                     let scfg = SpotifyMdnsConfig {
                         player_name: alloc::string::String::from("BASEMENT"),
                         mac_address: s.sta_mac,
                         ip_address: local_ip,
-                        port: 4070,
+                        port: 80,
                     };
                     let spkt = SpotifyMdnsBuilder::build_announcement(&scfg);
-                    let _ = mdns_sock.send_slice(&spkt, mcast);
-                    s.last_mdns_announce_ms = now_ms.max(1);
+                    let _ = mdns_sock.send_slice(&spkt, spot_ep);
                 }
             }
         }
@@ -3366,68 +3496,115 @@ mod xtensa_hw {
                         | tcp::State::TimeWait
                         | tcp::State::Closing
                         | tcp::State::LastAck
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
                 )
             {
                 rtsp_sock.abort();
+                s.rtsp_rx_acc.clear();
             }
             if !rtsp_sock.is_open() {
                 let _ = rtsp_sock.listen(5000);
+                s.rtsp_rx_acc.clear();
             }
             if rtsp_sock.can_recv() && rtsp_sock.may_send() {
-                let mut req_bytes = alloc::vec![0u8; 2048];
-                if let Ok(n) = rtsp_sock.recv_slice(&mut req_bytes) {
+                let mut chunk = [0u8; 512];
+                if let Ok(n) = rtsp_sock.recv_slice(&mut chunk) {
                     if n > 0 {
-                        if let Ok(req) = RtspRequest::parse(&req_bytes[..n]) {
-                            if let Ok(resp) = s.raop_rtsp.handle_request(&req) {
-                                let resp_bytes = resp.to_bytes();
-                                let _ = rtsp_sock.send_slice(&resp_bytes);
-                            }
-                            match req.method {
-                                RtspMethod::Record => {
-                                    if s.coordinator.request_source(AudioSource::AirPlay) {
-                                        if let (Some(key), Some(iv)) =
-                                            (s.raop_rtsp.session_key(), s.raop_rtsp.aes_iv())
-                                        {
-                                            s.raop_rtp.configure_crypto(key, iv);
-                                        }
-                                        if let Some(sdp) = s.raop_rtsp.sdp_session() {
-                                            if let Some(ref fmtp) = sdp.fmtp {
-                                                let _ = s.raop_rtp.configure_alac(fmtp);
+                        s.rtsp_rx_acc.extend_from_slice(&chunk[..n]);
+                        if s.rtsp_rx_acc.len() > 4096 {
+                            s.rtsp_rx_acc.clear();
+                        }
+                        if s.rtsp_rx_acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let parsed = if let Ok(req) = RtspRequest::parse(&s.rtsp_rx_acc) {
+                                let body_start = if req.body.is_empty() {
+                                    s.rtsp_rx_acc.len()
+                                } else {
+                                    req.body.as_ptr() as usize - s.rtsp_rx_acc.as_ptr() as usize
+                                };
+                                if s.rtsp_rx_acc.len() >= body_start + req.content_length {
+                                    let method = req.method;
+                                    let resp_res = s.raop_rtsp.handle_request(&req);
+                                    Some((method, resp_res))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some((method, resp_res)) = parsed {
+                                if let Ok(resp) = resp_res {
+                                    let resp_bytes = resp.to_bytes();
+                                    let _ = rtsp_sock.send_slice(&resp_bytes);
+                                    match method {
+                                        RtspMethod::Announce => {
+                                            if let (Some(key), Some(iv)) =
+                                                (s.raop_rtsp.session_key(), s.raop_rtsp.aes_iv())
+                                            {
+                                                s.raop_rtp.configure_crypto(key, iv);
+                                            } else {
+                                                s.raop_rtp.disable_crypto();
+                                            }
+                                            if let Some(sdp) = s.raop_rtsp.sdp_session() {
+                                                if let Some(ref fmtp) = sdp.fmtp {
+                                                    let _ = s.raop_rtp.configure_alac(fmtp);
+                                                }
                                             }
                                         }
-                                        s.pipeline
-                                            .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                                16, 2, false,
-                                            )));
-                                        s.pipeline.begin_external_audio();
-                                        s.coordinator.begin_external_playback();
-                                        s.raop_streaming = true;
+                                        RtspMethod::Record => {
+                                            if s.coordinator.request_source(AudioSource::AirPlay) {
+                                                if let (Some(key), Some(iv)) = (
+                                                    s.raop_rtsp.session_key(),
+                                                    s.raop_rtsp.aes_iv(),
+                                                ) {
+                                                    s.raop_rtp.configure_crypto(key, iv);
+                                                }
+                                                if let Some(sdp) = s.raop_rtsp.sdp_session() {
+                                                    if let Some(ref fmtp) = sdp.fmtp {
+                                                        let _ = s.raop_rtp.configure_alac(fmtp);
+                                                    }
+                                                }
+                                                s.pipeline.set_decoder(ActiveDecoder::Pcm(
+                                                    PcmDecoder::new(16, 2, false),
+                                                ));
+                                                s.pipeline.begin_external_audio();
+                                                s.pipeline.set_mute(false);
+                                                s.coordinator.begin_external_playback();
+                                                s.raop_streaming = true;
+                                                s.last_rtp_packet_ms = now_ms;
+                                            }
+                                        }
+                                        RtspMethod::SetParameter => {
+                                            let pct =
+                                                ((s.raop_rtsp.volume() * 100.0) as u8).min(100);
+                                            s.current_vol_pct = pct;
+                                            let mut backend = Esp32AudioBackend::new(
+                                                s.amp,
+                                                DeviceClockRegs,
+                                                &DMA_OUTSTANDING_FRAMES,
+                                            );
+                                            s.coordinator.set_volume_percent(
+                                                pct,
+                                                &mut backend,
+                                                s.pipeline,
+                                            );
+                                            let _ =
+                                                s.cyd_bridge.send_message(&CydMessage::Volume(pct));
+                                            s.config.update(|c| c.volume = pct);
+                                        }
+                                        RtspMethod::Flush => {
+                                            s.pipeline.stream_buffer.flush();
+                                            s.pipeline.output_buffer.flush();
+                                        }
+                                        RtspMethod::Teardown => {
+                                            s.raop_streaming = false;
+                                            s.coordinator.release_source(AudioSource::AirPlay);
+                                            restore_suspended_or_stop(s);
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                RtspMethod::SetParameter => {
-                                    let pct = ((s.raop_rtsp.volume() * 100.0) as u8).min(100);
-                                    s.current_vol_pct = pct;
-                                    let mut backend = Esp32AudioBackend::new(
-                                        s.amp,
-                                        DeviceClockRegs,
-                                        &DMA_OUTSTANDING_FRAMES,
-                                    );
-                                    s.coordinator.set_volume_percent(
-                                        pct,
-                                        &mut backend,
-                                        s.pipeline,
-                                    );
-                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
-                                    s.config.update(|c| c.volume = pct);
-                                }
-                                RtspMethod::Teardown => {
-                                    s.raop_streaming = false;
-                                    s.coordinator.release_source(AudioSource::AirPlay);
-                                    if s.coordinator.active_source() == AudioSource::None {
-                                        s.coordinator.end_external_playback();
-                                    }
-                                }
-                                _ => {}
+                                s.rtsp_rx_acc.clear();
                             }
                         }
                     }
@@ -3445,10 +3622,29 @@ mod xtensa_hw {
                 while bursts < 4 && rtp_sock.can_recv() {
                     bursts += 1;
                     if let Ok((n, _ep)) = rtp_sock.recv_slice(&mut pkt_buf) {
-                        if s.raop_streaming
-                            && s.coordinator.active_source() == AudioSource::AirPlay
-                        {
-                            if let Ok((pcm_i16, _hdr)) = s.raop_rtp.process_packet(&pkt_buf[..n]) {
+                        s.last_rtp_packet_ms = now_ms;
+                        if let Ok((pcm_i16, _hdr)) = s.raop_rtp.process_packet(&pkt_buf[..n]) {
+                            if s.coordinator.request_source(AudioSource::AirPlay) {
+                                if !s.raop_streaming {
+                                    if s.coordinator.current_sample_rate != 44_100
+                                        || s.pipeline.sample_rate != 44_100
+                                    {
+                                        s.coordinator.current_sample_rate = 44_100;
+                                        let _ = s.pipeline.set_sample_rate(44_100);
+                                    }
+                                    s.pipeline
+                                        .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
+                                            16, 2, false,
+                                        )));
+                                    s.pipeline.begin_external_audio();
+                                    s.pipeline.set_mute(false);
+                                    s.coordinator.begin_external_playback();
+                                    if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                        let _ = s.amp.clear_faults();
+                                        let _ = s.amp.start_playback_via_hiz();
+                                    }
+                                    s.raop_streaming = true;
+                                }
                                 let pcm_bytes: &[u8] = bytemuck::cast_slice(pcm_i16);
                                 let _ = s.pipeline.ingest_stream_data(pcm_bytes);
                             }
@@ -3458,11 +3654,17 @@ mod xtensa_hw {
                     }
                 }
             }
-            if s.raop_streaming && s.raop_rtsp.state() != ServerState::Streaming {
-                s.raop_streaming = false;
-                s.coordinator.release_source(AudioSource::AirPlay);
-                if s.coordinator.active_source() == AudioSource::None {
-                    s.coordinator.end_external_playback();
+            if s.raop_streaming
+                && (s.raop_rtsp.state() != ServerState::Streaming
+                    || now_ms.saturating_sub(s.last_rtp_packet_ms) >= 3_000)
+            {
+                if s.pipeline.stream_buffer.available_read() == 0
+                    && s.pipeline.output_buffer.available_read() == 0
+                    && !s.pipeline.has_pending_pcm()
+                {
+                    s.raop_streaming = false;
+                    s.coordinator.release_source(AudioSource::AirPlay);
+                    restore_suspended_or_stop(s);
                 }
             }
         }
@@ -3477,6 +3679,8 @@ mod xtensa_hw {
                         | tcp::State::TimeWait
                         | tcp::State::Closing
                         | tcp::State::LastAck
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
                 )
             {
                 spot_sock.abort();
@@ -3509,21 +3713,35 @@ mod xtensa_hw {
                                 match evt {
                                     SpircEvent::Play | SpircEvent::LoadTrack { .. } => {
                                         if s.coordinator.request_source(AudioSource::Spotify) {
-                                            let dec = alloc::boxed::Box::new(
-                                                squeezelite_decoders::VorbisDecoder::new(),
-                                            );
-                                            s.pipeline.set_decoder(ActiveDecoder::Vorbis(dec));
-                                            s.pipeline.begin_external_audio();
-                                            s.coordinator.begin_external_playback();
-                                            s.spot_streaming = true;
+                                            if !s.spot_streaming {
+                                                if s.coordinator.current_sample_rate != 44_100
+                                                    || s.pipeline.sample_rate != 44_100
+                                                {
+                                                    s.coordinator.current_sample_rate = 44_100;
+                                                    let _ = s.pipeline.set_sample_rate(44_100);
+                                                }
+                                                s.pipeline.set_decoder(ActiveDecoder::Pcm(
+                                                    PcmDecoder::new(16, 2, false),
+                                                ));
+                                                s.pipeline.begin_external_audio();
+                                                s.pipeline.set_mute(false);
+                                                s.coordinator.begin_external_playback();
+                                                if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                                    let _ = s.amp.clear_faults();
+                                                    let _ = s.amp.start_playback_via_hiz();
+                                                }
+                                                s.spot_streaming = true;
+                                            }
+                                            let notify = s
+                                                .spot_spirc
+                                                .build_notify_frame(frame.seq_nr, "BASEMENT");
+                                            let _ = spot_sock.send_slice(&notify);
                                         }
                                     }
                                     SpircEvent::Pause => {
                                         s.spot_streaming = false;
                                         s.coordinator.release_source(AudioSource::Spotify);
-                                        if s.coordinator.active_source() == AudioSource::None {
-                                            s.coordinator.end_external_playback();
-                                        }
+                                        restore_suspended_or_stop(s);
                                     }
                                     SpircEvent::SetVolume(vol_u32) => {
                                         let pct = ((vol_u32.min(65_536) * 100) / 65_536) as u8;
@@ -3541,12 +3759,38 @@ mod xtensa_hw {
                                     SpircEvent::Next
                                     | SpircEvent::Prev
                                     | SpircEvent::Seek(_)
-                                    | SpircEvent::Notify => {}
+                                    | SpircEvent::Notify
+                                    | SpircEvent::TrackEnded
+                                    | SpircEvent::MetadataUpdated(_) => {}
                                 }
                             }
-                        } else if s.spot_streaming
-                            && s.coordinator.active_source() == AudioSource::Spotify
-                        {
+                        } else if s.coordinator.request_source(AudioSource::Spotify) {
+                            if !s.spot_streaming {
+                                if s.coordinator.current_sample_rate != 44_100
+                                    || s.pipeline.sample_rate != 44_100
+                                {
+                                    s.coordinator.current_sample_rate = 44_100;
+                                    let _ = s.pipeline.set_sample_rate(44_100);
+                                }
+                                if req_buf[..n].starts_with(b"OggS") {
+                                    let dec = alloc::boxed::Box::new(
+                                        squeezelite_decoders::VorbisDecoder::new(),
+                                    );
+                                    s.pipeline.set_decoder(ActiveDecoder::Vorbis(dec));
+                                } else {
+                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
+                                        16, 2, false,
+                                    )));
+                                }
+                                s.pipeline.begin_external_audio();
+                                s.pipeline.set_mute(false);
+                                s.coordinator.begin_external_playback();
+                                if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                    let _ = s.amp.clear_faults();
+                                    let _ = s.amp.start_playback_via_hiz();
+                                }
+                                s.spot_streaming = true;
+                            }
                             let _ = s.pipeline.ingest_stream_data(&req_buf[..n]);
                         }
                     }

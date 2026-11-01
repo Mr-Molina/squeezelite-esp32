@@ -71,6 +71,16 @@ pub enum HttpControlAction {
     SpotifyPlay,
     /// Stops Spotify playback arbitration and returns to suspended source.
     SpotifyStop,
+    /// Triggers an asynchronous 802.11 Wi-Fi AP scan (`/scan.json`).
+    TriggerWifiScan,
+    /// Initiates Wi-Fi station association with new credentials (`/connect.json`).
+    ConnectWifi,
+    /// Applies a key-value configuration mutation (`/config.json`).
+    UpdateConfig,
+    /// Dispatches a console CLI command (`/commands.json`).
+    ExecuteCliCommand,
+    /// Initiates streaming OTA firmware update (`/flash.json`).
+    StartOtaFlash,
 }
 
 /// Amp I2C NACK count per operation class (spec §4.8): the bus wrapper still
@@ -371,6 +381,421 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
 #[inline]
 pub fn format_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     write_status_json(snapshot, out_buf)
+}
+
+/// View of a single NVS / FlashJournal configuration entry serialized in
+/// `GET /config.json`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigEntryView<'a> {
+    /// Configuration key name (e.g. `"autoexec"`, `"dac_config"`).
+    pub key: &'a str,
+    /// Current serialized string value.
+    pub value: &'a str,
+    /// Value type label (`"str"`, `"u8"`, `"u32"`).
+    pub entry_type: &'a str,
+}
+
+impl<'a> ConfigEntryView<'a> {
+    /// Creates a new [`ConfigEntryView`].
+    #[must_use]
+    pub const fn new(key: &'a str, value: &'a str, entry_type: &'a str) -> Self {
+        Self {
+            key,
+            value,
+            entry_type,
+        }
+    }
+}
+
+/// Parsed key-value mutation from `POST /config.json`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedConfigUpdate<'a> {
+    /// Target configuration key.
+    pub key: &'a str,
+    /// New configuration value.
+    pub value: &'a str,
+}
+
+/// Formats the `/config.json` payload combining active snapshot settings and
+/// optional `extra_entries` into `out_buf`.
+pub fn write_config_json(
+    snapshot: &HttpStatusSnapshot<'_>,
+    extra_entries: &[ConfigEntryView<'_>],
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    write!(
+        writer,
+        "{{\"settings_seq\":{},\"config\":{{\"ssid\":\"{}\",\
+         \"lms_ip\":\"{}.{}.{}.{}\",\"lms_port\":{},\"lms_cport\":{},\
+         \"vol_pct\":{},\"eq_preset\":\"{}\",\"again_code\":{}",
+        snapshot.settings_seq,
+        JsonEscaped(snapshot.ssid),
+        snapshot.lms_ip[0],
+        snapshot.lms_ip[1],
+        snapshot.lms_ip[2],
+        snapshot.lms_ip[3],
+        snapshot.lms_port,
+        snapshot.lms_cport,
+        snapshot.vol_pct,
+        JsonEscaped(snapshot.eq_preset),
+        snapshot.again_code,
+    )
+    .ok()?;
+    for entry in extra_entries {
+        write!(
+            writer,
+            ",\"{}\":{{\"value\":\"{}\",\"type\":\"{}\"}}",
+            JsonEscaped(entry.key),
+            JsonEscaped(entry.value),
+            JsonEscaped(entry.entry_type),
+        )
+        .ok()?;
+    }
+    write!(writer, "}}}}").ok()?;
+    Some(writer.written_len())
+}
+
+fn extract_param_or_json_field<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    for part in input.split('&') {
+        let trimmed = part.trim();
+        if let Some(rest) = trimmed.strip_prefix(name) {
+            if let Some(val) = rest.strip_prefix('=') {
+                return Some(val);
+            }
+        }
+    }
+    // Minimal JSON string field fallback: `"<name>":"<val>"`
+    let mut marker: String<40> = String::new();
+    write!(marker, "\"{}\":\"", name).ok()?;
+    let start = input.find(marker.as_str())? + marker.len();
+    let rest = &input[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Parses a `key=...&value=...` query/form or `{"key":"...","value":"..."}`
+/// JSON body for `/config.json`.
+#[must_use]
+pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> {
+    let key = extract_param_or_json_field(input, "key")?;
+    if key.is_empty() {
+        return None;
+    }
+    let value = extract_param_or_json_field(input, "value")
+        .or_else(|| extract_param_or_json_field(input, "val"))
+        .unwrap_or("");
+    Some(ParsedConfigUpdate { key, value })
+}
+
+/// View of a single scanned 802.11 access point serialized in `GET /scan.json`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanApView<'a> {
+    /// Broadcast SSID.
+    pub ssid: &'a str,
+    /// 6-byte BSSID MAC address.
+    pub bssid: [u8; 6],
+    /// Signal strength in dBm.
+    pub rssi: i8,
+    /// 2.4 GHz channel (`1..=14`).
+    pub channel: u8,
+    /// Authentication mode label (`"OPEN"`, `"WPA2_PSK"`, etc.).
+    pub auth: &'a str,
+}
+
+impl<'a> ScanApView<'a> {
+    /// Creates a new [`ScanApView`].
+    #[must_use]
+    pub const fn new(
+        ssid: &'a str,
+        bssid: [u8; 6],
+        rssi: i8,
+        channel: u8,
+        auth: &'a str,
+    ) -> Self {
+        Self {
+            ssid,
+            bssid,
+            rssi,
+            channel,
+            auth,
+        }
+    }
+}
+
+/// Formats a slice of [`ScanApView`] entries as the `/scan.json` JSON array.
+pub fn write_scan_json(aps: &[ScanApView<'_>], out_buf: &mut [u8]) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    writer.write_str("{\"aps\":[").ok()?;
+    for (idx, ap) in aps.iter().enumerate() {
+        if idx > 0 {
+            writer.write_str(",").ok()?;
+        }
+        write!(
+            writer,
+            "{{\"ssid\":\"{}\",\"bssid\":\"{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}\",\
+             \"rssi\":{},\"chan\":{},\"auth\":\"{}\"}}",
+            JsonEscaped(ap.ssid),
+            ap.bssid[0],
+            ap.bssid[1],
+            ap.bssid[2],
+            ap.bssid[3],
+            ap.bssid[4],
+            ap.bssid[5],
+            ap.rssi,
+            ap.channel,
+            JsonEscaped(ap.auth),
+        )
+        .ok()?;
+    }
+    writer.write_str("]}").ok()?;
+    Some(writer.written_len())
+}
+
+/// Parsed Wi-Fi connection request from `POST /connect.json`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectRequest<'a> {
+    /// Target Wi-Fi SSID.
+    pub ssid: &'a str,
+    /// WPA/WPA2 passphrase (or empty for open AP).
+    pub password: &'a str,
+    /// Optional static IPv4 string.
+    pub static_ip: Option<&'a str>,
+}
+
+/// Parses a `/connect.json` form or JSON request body/query.
+#[must_use]
+pub fn parse_connect_request(input: &str) -> Option<ConnectRequest<'_>> {
+    let ssid = extract_param_or_json_field(input, "ssid")?;
+    if ssid.is_empty() {
+        return None;
+    }
+    let password = extract_param_or_json_field(input, "password")
+        .or_else(|| extract_param_or_json_field(input, "pass"))
+        .or_else(|| extract_param_or_json_field(input, "pwd"))
+        .unwrap_or("");
+    let static_ip = extract_param_or_json_field(input, "ip");
+    Some(ConnectRequest {
+        ssid,
+        password,
+        static_ip,
+    })
+}
+
+/// Formats the `/connect.json` Wi-Fi association status payload into `out_buf`.
+pub fn write_connect_status_json(
+    connected: bool,
+    ssid: &str,
+    ip: [u8; 4],
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    let status_label = if connected { "connected" } else { "disconnected" };
+    write!(
+        writer,
+        "{{\"connected\":{},\"status\":\"{}\",\"ssid\":\"{}\",\
+         \"ip\":\"{}.{}.{}.{}\"}}",
+        connected,
+        status_label,
+        JsonEscaped(ssid),
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+    )
+    .ok()?;
+    Some(writer.written_len())
+}
+
+/// View of a single syslog / console ringbuffer message for
+/// `GET /messages.json`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyslogMessageView<'a> {
+    /// Monotonic message sequence number.
+    pub seq: u32,
+    /// Uptime timestamp in milliseconds.
+    pub uptime_ms: u64,
+    /// Severity label (`"INFO"`, `"WARN"`, `"ERROR"`, `"DEBUG"`).
+    pub level: &'a str,
+    /// Log message text.
+    pub message: &'a str,
+}
+
+impl<'a> SyslogMessageView<'a> {
+    /// Creates a new [`SyslogMessageView`].
+    #[must_use]
+    pub const fn new(seq: u32, uptime_ms: u64, level: &'a str, message: &'a str) -> Self {
+        Self {
+            seq,
+            uptime_ms,
+            level,
+            message,
+        }
+    }
+}
+
+/// Formats a slice of [`SyslogMessageView`] entries into `out_buf` for
+/// `GET /messages.json`.
+pub fn write_messages_json(
+    messages: &[SyslogMessageView<'_>],
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    writer.write_str("{\"messages\":[").ok()?;
+    for (idx, msg) in messages.iter().enumerate() {
+        if idx > 0 {
+            writer.write_str(",").ok()?;
+        }
+        write!(
+            writer,
+            "{{\"seq\":{},\"uptime_ms\":{},\"level\":\"{}\",\"msg\":\"{}\"}}",
+            msg.seq,
+            msg.uptime_ms,
+            JsonEscaped(msg.level),
+            JsonEscaped(msg.message),
+        )
+        .ok()?;
+    }
+    writer.write_str("]}").ok()?;
+    Some(writer.written_len())
+}
+
+/// Descriptor for a registered console CLI command exposed via
+/// `/commands.json`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandCatalogEntry<'a> {
+    /// Command verb (e.g. `"system"`, `"i2c"`).
+    pub name: &'a str,
+    /// Argument synopsis.
+    pub usage: &'a str,
+    /// Short human-readable summary.
+    pub description: &'a str,
+}
+
+impl<'a> CommandCatalogEntry<'a> {
+    /// Creates a new [`CommandCatalogEntry`].
+    #[must_use]
+    pub const fn new(name: &'a str, usage: &'a str, description: &'a str) -> Self {
+        Self {
+            name,
+            usage,
+            description,
+        }
+    }
+}
+
+/// Default built-in CLI command catalog serialized by `GET /commands.json`.
+pub const DEFAULT_COMMAND_CATALOG: &[CommandCatalogEntry<'static>] = &[
+    CommandCatalogEntry::new(
+        "system",
+        "system <info|heap|reboot|recovery>",
+        "System diagnostics and reboot",
+    ),
+    CommandCatalogEntry::new("i2c", "i2c <scan|get|set>", "Hardware I2C bus tools"),
+    CommandCatalogEntry::new(
+        "config",
+        "config <get|set|erase|dump>",
+        "NVS / FlashJournal settings",
+    ),
+    CommandCatalogEntry::new("join", "join <ssid> [password]", "Associate with Wi-Fi AP"),
+    CommandCatalogEntry::new("update", "update <url>", "Trigger streaming OTA update"),
+    CommandCatalogEntry::new(
+        "player",
+        "player <play|pause|stop|vol>",
+        "Audio transport and volume",
+    ),
+    CommandCatalogEntry::new("sleep", "sleep [light|deep] <seconds>", "Enter low-power sleep mode"),
+    CommandCatalogEntry::new("help", "help", "List available console commands"),
+];
+
+/// Formats the `/commands.json` CLI catalog and optional execution output into
+/// `out_buf`.
+pub fn write_commands_json(
+    catalog: &[CommandCatalogEntry<'_>],
+    last_output: Option<&str>,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    writer.write_str("{\"commands\":[").ok()?;
+    for (idx, cmd) in catalog.iter().enumerate() {
+        if idx > 0 {
+            writer.write_str(",").ok()?;
+        }
+        write!(
+            writer,
+            "{{\"name\":\"{}\",\"usage\":\"{}\",\"desc\":\"{}\"}}",
+            JsonEscaped(cmd.name),
+            JsonEscaped(cmd.usage),
+            JsonEscaped(cmd.description),
+        )
+        .ok()?;
+    }
+    writer.write_str("]").ok()?;
+    if let Some(out) = last_output {
+        write!(writer, ",\"output\":\"{}\"", JsonEscaped(out)).ok()?;
+    }
+    writer.write_str("}").ok()?;
+    Some(writer.written_len())
+}
+
+/// Formats the `/flash.json` OTA status payload into `out_buf`.
+pub fn write_flash_status_json(
+    state_label: &str,
+    progress_pct: u8,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    write!(
+        writer,
+        "{{\"ok\":true,\"ota_state\":\"{}\",\"progress_pct\":{},\
+         \"target_partition\":\"ota_0_0x160000\"}}",
+        JsonEscaped(state_label),
+        progress_pct,
+    )
+    .ok()?;
+    Some(writer.written_len())
+}
+
+fn extract_query_or_body<'a>(raw_path: &'a str, req_bytes: &'a [u8]) -> &'a str {
+    let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    if !query.is_empty() {
+        return query;
+    }
+    let body_slice = req_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| &req_bytes[p + 4..])
+        .or_else(|| {
+            req_bytes
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|p| &req_bytes[p + 2..])
+        })
+        .unwrap_or(&[]);
+    core::str::from_utf8(body_slice).unwrap_or("").trim()
+}
+
+fn write_json_http_response(body_len: usize, out_buf: &mut [u8]) -> Option<usize> {
+    const HEADER_ROOM: usize = 160;
+    let mut header: String<HEADER_ROOM> = String::new();
+    write!(
+        header,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+        Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+        Connection: close\r\nCache-Control: no-store\r\n\r\n",
+        body_len
+    )
+    .ok()?;
+    let header_len = header.len();
+    out_buf.copy_within(HEADER_ROOM..HEADER_ROOM + body_len, header_len);
+    out_buf[..header_len].copy_from_slice(header.as_bytes());
+    Some(header_len + body_len)
 }
 
 /// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
@@ -724,6 +1149,168 @@ pub fn handle_http_request_streaming(
             }
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
             Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
+        }
+        ("GET", "/config.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let body_len = write_config_json(snapshot, &[], &mut out_buf[HEADER_ROOM..])?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::None))
+        }
+        ("POST", "/config.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let payload = extract_query_or_body(raw_path, req_bytes);
+            let (body_len, action) = if let Some(upd) = parse_config_update_query(payload) {
+                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                write!(
+                    writer,
+                    "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\"}}",
+                    JsonEscaped(upd.key),
+                    JsonEscaped(upd.value),
+                )
+                .ok()?;
+                (writer.written_len(), HttpControlAction::UpdateConfig)
+            } else {
+                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                writer
+                    .write_str("{\"ok\":false,\"error\":\"invalid_config_param\"}")
+                    .ok()?;
+                (writer.written_len(), HttpControlAction::None)
+            };
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], action))
+        }
+        ("GET", "/scan.json") | ("POST", "/scan.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let rssi_i8 = snapshot.rssi.clamp(-127, 0) as i8;
+            let active_ap = [ScanApView::new(
+                snapshot.ssid,
+                [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                rssi_i8,
+                6,
+                "WPA2_PSK",
+            )];
+            let body_len = write_scan_json(&active_ap, &mut out_buf[HEADER_ROOM..])?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            let action = if method == "POST" {
+                HttpControlAction::TriggerWifiScan
+            } else {
+                HttpControlAction::None
+            };
+            Some((total_len, &[], action))
+        }
+        ("GET", "/connect.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let connected = !snapshot.ssid.is_empty() && snapshot.ip != [0, 0, 0, 0];
+            let body_len = write_connect_status_json(
+                connected,
+                snapshot.ssid,
+                snapshot.ip,
+                &mut out_buf[HEADER_ROOM..],
+            )?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::None))
+        }
+        ("POST", "/connect.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let payload = extract_query_or_body(raw_path, req_bytes);
+            let (body_len, action) = if let Some(req) = parse_connect_request(payload) {
+                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                write!(
+                    writer,
+                    "{{\"ok\":true,\"status\":\"connecting\",\"ssid\":\"{}\"}}",
+                    JsonEscaped(req.ssid),
+                )
+                .ok()?;
+                (writer.written_len(), HttpControlAction::ConnectWifi)
+            } else {
+                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                writer
+                    .write_str("{\"ok\":false,\"error\":\"missing_ssid\"}")
+                    .ok()?;
+                (writer.written_len(), HttpControlAction::None)
+            };
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], action))
+        }
+        ("GET", "/messages.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let entries = [SyslogMessageView::new(
+                snapshot.settings_seq,
+                snapshot.uptime_ms,
+                "INFO",
+                snapshot.amp_mode,
+            )];
+            let body_len = write_messages_json(&entries, &mut out_buf[HEADER_ROOM..])?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::None))
+        }
+        ("GET", "/commands.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let body_len =
+                write_commands_json(DEFAULT_COMMAND_CATALOG, None, &mut out_buf[HEADER_ROOM..])?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::None))
+        }
+        ("POST", "/commands.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let payload = extract_query_or_body(raw_path, req_bytes);
+            let cmd_str = extract_param_or_json_field(payload, "cmd").unwrap_or("");
+            let (body_len, action) = if !cmd_str.is_empty() {
+                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                write!(
+                    writer,
+                    "{{\"ok\":true,\"cmd\":\"{}\"}}",
+                    JsonEscaped(cmd_str),
+                )
+                .ok()?;
+                (writer.written_len(), HttpControlAction::ExecuteCliCommand)
+            } else {
+                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                writer
+                    .write_str("{\"ok\":false,\"error\":\"missing_cmd\"}")
+                    .ok()?;
+                (writer.written_len(), HttpControlAction::None)
+            };
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], action))
+        }
+        ("GET", "/flash.json") | ("POST", "/flash.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let (state_label, action) = if method == "POST" {
+                ("starting_ota", HttpControlAction::StartOtaFlash)
+            } else {
+                ("idle", HttpControlAction::None)
+            };
+            let body_len = write_flash_status_json(state_label, 0, &mut out_buf[HEADER_ROOM..])?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], action))
         }
         _ => {
             let body = "{\"error\":\"not_found\"}";
@@ -1395,5 +1982,98 @@ mod tests {
         )
         .expect("spotify_stop");
         assert_eq!(act_stop, HttpControlAction::SpotifyStop);
+    }
+
+    #[test]
+    fn test_phase3_rest_endpoints_config_scan_connect_messages_commands_flash() {
+        let snap = HttpStatusSnapshot::default();
+        let mut buf = [0u8; 2048];
+
+        // 1. GET /config.json & POST /config.json
+        let (clen, cact) = handle_http_control_request(
+            b"GET /config.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("GET /config.json");
+        assert_eq!(cact, HttpControlAction::None);
+        let cstr = core::str::from_utf8(&buf[..clen]).expect("utf8");
+        assert!(cstr.contains("\"settings_seq\":1"));
+        assert!(cstr.contains("\"ssid\":\"iot\""));
+
+        let (ulen, uact) = handle_http_control_request(
+            b"POST /config.json HTTP/1.1\r\n\r\nkey=player_name&value=Kitchen",
+            &snap,
+            &mut buf,
+        )
+        .expect("POST /config.json");
+        assert_eq!(uact, HttpControlAction::UpdateConfig);
+        let ustr = core::str::from_utf8(&buf[..ulen]).expect("utf8");
+        assert!(ustr.contains("\"ok\":true,\"key\":\"player_name\",\"value\":\"Kitchen\""));
+
+        // 2. GET /scan.json & POST /scan.json
+        let (slen, sact) = handle_http_control_request(
+            b"POST /scan.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("POST /scan.json");
+        assert_eq!(sact, HttpControlAction::TriggerWifiScan);
+        let sstr = core::str::from_utf8(&buf[..slen]).expect("utf8");
+        assert!(sstr.contains("\"aps\":[{\"ssid\":\"iot\""));
+
+        // 3. GET /connect.json & POST /connect.json
+        let (klen, kact) = handle_http_control_request(
+            b"POST /connect.json HTTP/1.1\r\n\r\nssid=HomeWiFi&password=SecretPass123",
+            &snap,
+            &mut buf,
+        )
+        .expect("POST /connect.json");
+        assert_eq!(kact, HttpControlAction::ConnectWifi);
+        let kstr = core::str::from_utf8(&buf[..klen]).expect("utf8");
+        assert!(kstr.contains("\"status\":\"connecting\",\"ssid\":\"HomeWiFi\""));
+
+        // 4. GET /messages.json
+        let (mlen, mact) = handle_http_control_request(
+            b"GET /messages.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("GET /messages.json");
+        assert_eq!(mact, HttpControlAction::None);
+        let mstr = core::str::from_utf8(&buf[..mlen]).expect("utf8");
+        assert!(mstr.contains("\"messages\":[{\"seq\":1"));
+
+        // 5. GET /commands.json & POST /commands.json
+        let (xlen, xact) = handle_http_control_request(
+            b"GET /commands.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("GET /commands.json");
+        assert_eq!(xact, HttpControlAction::None);
+        let xstr = core::str::from_utf8(&buf[..xlen]).expect("utf8");
+        assert!(xstr.contains("\"commands\":[{\"name\":\"system\""));
+
+        let (elen, eact) = handle_http_control_request(
+            b"POST /commands.json HTTP/1.1\r\n\r\ncmd=system%20info",
+            &snap,
+            &mut buf,
+        )
+        .expect("POST /commands.json");
+        assert_eq!(eact, HttpControlAction::ExecuteCliCommand);
+        let estr = core::str::from_utf8(&buf[..elen]).expect("utf8");
+        assert!(estr.contains("\"ok\":true,\"cmd\":\"system%20info\""));
+
+        // 6. POST /flash.json
+        let (flen, fact) = handle_http_control_request(
+            b"POST /flash.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("POST /flash.json");
+        assert_eq!(fact, HttpControlAction::StartOtaFlash);
+        let fstr = core::str::from_utf8(&buf[..flen]).expect("utf8");
+        assert!(fstr.contains("\"ota_state\":\"starting_ota\""));
     }
 }

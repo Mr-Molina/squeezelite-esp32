@@ -2,6 +2,32 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-01 01:05 | Antigravity Orchestrator | `[squeezelite-esp32]` Full 8-Phase Standalone C-to-Rust Parity (`WO-157`..`WO-237`), GitHub Reconciliation (`cd689da1`), & Live `"BASEMENT"` (`172.22.1.15`) 6-Gate Certification (MK5-Rust)
+**Agent**: Antigravity Orchestrator (`6b63bd01-ad40-4ba9-a8fa-687005ed880f`)
+**Host OS**: Linux (`x86_64`)
+**Branch**: `MK5-Rust` (synced with `origin/MK5-Rust`)
+**Hardware Targets**: `"BASEMENT"` (`172.22.1.15`, Wi-Fi MAC `c8:2e:18:be:b8:34`, BT MAC `CA:2E:18:BE:B8:35`, **Sonocotta Louder-ESP32** with TI `TAS5805M` at `I2C0 0x2D`) & Lyrion Music Server (`10.0.0.10:9000` / `3483`)
+**Verification Suite**: `703/703` Workspace Unit/Integration Tests Passing across all 11 Crates + `0` Clippy Warnings + `0` `google_rust_audit.py --strict` Errors (`GRS-001`..`GRS-012`) + Bare-Metal `xtensa-esp32-none-elf` Build (`.stack = 37,416` B, `.dram2_uninit = 95,256` B, `1,794,896` B OTA binary SHA-256 `e830ed90119d536f8c6eadb817000e371ee3afcf7476a9dcbb0797db96b5ef74`) + Live 6-Gate Hardware Certification on `172.22.1.15` (`WO-236`)
+**Code Hygiene Gates**: UNCONDITIONAL PASS (`0` secrets, `0` staged scratch artifacts)
+
+### Completed This Session
+- **GitHub Fetch & Wave 1–5 Branch Reconciliation (`WO-216`..`WO-223`)**:
+  - Preserved local `WO-157`..`WO-214` snapshot in safety branch `local/wo157-wo214-codecs-airplay-spotify` (`627f740b`), fast-forwarded `MK5-Rust` across 38 incoming Phase 0+1 commits (`cd139b61`), reconciled all native PSRAM codecs (`Flac`, `Aac`, `Vorbis`, `Alac`, `Opus`), `squeezelite-raop`, `squeezelite-cspot`, and `SourceArbiter` onto the unified `#[cfg]`-free `PlayerCoordinator` + `io_traits` + `embassy` architecture, and pushed commit `cd689da1` to `origin/MK5-Rust`.
+- **Wave 6–9 Full 8-Phase Standalone Parity Completion (`WO-224`..`WO-232`)**:
+  - **Phase 1 Tasks 15–17 (`WO-224`, `WO-228`)**: Marker-synchronized I2S rate switching across 8 kHz–192 kHz (`clock_table.rs`), DMA-corrected `STAT` elapsed reporting, runtime 10-band RBJ peaking EQ + `eqlz`/`loud` + volume-indexed equal-loudness contour (`equalizer.rs`), and Q31 polyphase Kaiser-sinc `Resampler` (`> 90 dB` SNR, `resampler.rs`).
+  - **Phase 2 Codecs (`WO-225`, `WO-228`)**: ISO BMFF MP4/M4A demuxer (`mp4.rs`), HE-AAC SBR (`aac.rs`), Ogg-FLAC packet demuxer (`flac.rs`), MP3 Xing/LAME gapless sample trimming (`mp3.rs`), and `CodecMemoryBudget` PSRAM caps with graceful `STMn` fallback.
+  - **Phase 3 Network Autonomy (`WO-229`)**: LMS UDP discovery + mDNS responder (`wifi.rs`), softAP + captive portal + known-AP auto-pick + `enc:` credential store, W5500 SPI Ethernet (`eth_w5500.rs`), full Web UI/REST parity (`/config.json`, `/scan.json`, `/connect.json`, `/messages.json`, `/commands.json`, `/syslog.json`, `/ap.json`, `/flash.json` in `http_control.rs`), CLI + Telnet server (`console.rs`), and SHA-256 streaming OTA + recovery (`ota_safety.rs`).
+  - **Phase 4 Bluetooth Completion (`WO-230`)**: AVRCP 1.6 CT/TG passthrough + absolute volume + track metadata, persistent 4-slot `BtBondTable` in `FlashJournal`, and A2DP Source (`-o BT`) with 8-subband polyphase `SbcEncoder` (`bt_a2dp.rs`).
+  - **Phase 5 AirPlay RAOP (`WO-226`, `WO-230`)**: RTP control/timing/resend jitter buffer, DMAP/DAAP metadata + artwork, DACP HTTP remote control, and sync-error drift tracker (`squeezelite-raop`).
+  - **Phase 6 Spotify Connect (`WO-227`, `WO-230`)**: Reusable ZeroConf credentials, bidirectional Shannon stream cipher + Mercury protobuf framing, AES-128-CTR CDN audio decryptor + HTTP Range fetcher, and SPIRC seek/events (`squeezelite-cspot`).
+  - **Phase 7 Peripherals, Multi-DAC, Power & Multi-Board (`WO-231`)**: 11 GDS display drivers + LMS `grfe`/`visu`/`vfdc` (`display_gds.rs`), buttons/rotary/NEC+RC5 IR/6 GPIO expanders (`controls.rs`), 7 DAC families + IEC 60958 S/PDIF BMC encoder (`dac_platform.rs`), sleep/battery/jack-detect + 6 board profiles including ESP32-S3 (`power_boards.rs`).
+- **Wave 10–11 Bare-Metal Boot/PSRAM Remediation & Live `"BASEMENT"` (`172.22.1.15`) 6-Gate Certification (`WO-233`..`WO-237`)**:
+  - Diagnosed and remediated `WO-233` boot crash in `WO-235` by initializing `STREAM_PIPELINE` in place inside `.dram2_uninit` (`init_static_pipeline()`), registering `4 MB` External PSRAM (`0x3F80_0000`) as Region 0 of `esp_alloc::HEAP` ahead of internal DRAM, moving `Resampler` coefficient tables (`53.3 KB`) to PSRAM heap, and expanding `.stack` to `37,416` B (`0x9228`).
+  - Certified all 6 live hardware gates on `"BASEMENT"` (`172.22.1.15`) in `WO-236` with OTA binary `e830ed90119d536f8c6eadb817000e371ee3afcf7476a9dcbb0797db96b5ef74` (`1,794,896` B) and pushed the final state to `origin/MK5-Rust` (`WO-237`).
+
+### Next-Session Handoff Notes
+- **Live `"BASEMENT"` (`172.22.1.15`) State**: Online in `ota_0` (`"recovery": 0`, `"rust_engine": true`, `"otadata_prearmed_factory": true`, `"psram_used_bytes": 851968`, `"tas_pll_locked": true`, `"i2c_nacks": 0`) running the full 8-Phase standalone parity firmware (`e830ed90...`). Never call `POST /reboot_ota.json` and **never touch `/dev/ttyUSB0`** (separate CYD board).
+
 ## 2026-10-27 16:42 | Antigravity Orchestrator | `[squeezelite-esp32]` `/deep-code-audit`, `/deep-hardware-audit`, Pure-Rust Dual-Mode Bluetooth (`BTDM` A2DP Sink + BLE), 10-Phase Parity Menu, & Phase 1 Native Lossless FLAC in `4 MB` PSRAM (`WO-111`..`WO-156`, MK5-Rust)
 **Agent**: Antigravity Orchestrator (`55587c74-4c6d-4688-90db-d3185fdddae1`)
 **Host OS**: Linux (`x86_64`)

@@ -27,6 +27,7 @@
 extern crate std;
 
 use core::fmt;
+use squeezelite_config::{FlashJournal, KeyValueStorage, MemConfigStore, StorageError};
 
 /// Bluetooth Classic/LE local name (HCI name, EIR, LE advertising/scan
 /// response, SDP ServiceName). The BT stack keeps its P0/P1 behaviour
@@ -77,14 +78,20 @@ pub const OPCODE_LE_SET_ADV_DATA: u16 = 0x2008;
 pub const OPCODE_LE_SET_SCAN_RSP_DATA: u16 = 0x2009;
 pub const OPCODE_LE_SET_ADV_ENABLE: u16 = 0x200A;
 
+pub const OPCODE_INQUIRY: u16 = 0x0401;
+pub const OPCODE_INQUIRY_CANCEL: u16 = 0x0402;
+pub const OPCODE_CREATE_CONNECTION: u16 = 0x0405;
 pub const OPCODE_ACCEPT_CONNECTION_REQUEST: u16 = 0x0409;
 pub const OPCODE_PIN_CODE_REQUEST_REPLY: u16 = 0x040D;
+pub const OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY: u16 = 0x040E;
 pub const OPCODE_LINK_KEY_REQUEST_REPLY: u16 = 0x040B;
 pub const OPCODE_LINK_KEY_REQUEST_NEGATIVE_REPLY: u16 = 0x040C;
 pub const OPCODE_IO_CAPABILITY_REQUEST_REPLY: u16 = 0x042B;
 pub const OPCODE_USER_CONFIRMATION_REQUEST_REPLY: u16 = 0x042C;
 
 // HCI Event Codes
+pub const EVT_INQUIRY_COMPLETE: u8 = 0x01;
+pub const EVT_INQUIRY_RESULT: u8 = 0x02;
 pub const EVT_CONNECTION_COMPLETE: u8 = 0x03;
 pub const EVT_CONNECTION_REQUEST: u8 = 0x04;
 pub const EVT_DISCONNECTION_COMPLETE: u8 = 0x05;
@@ -94,8 +101,47 @@ pub const EVT_COMMAND_STATUS: u8 = 0x0F;
 pub const EVT_PIN_CODE_REQUEST: u8 = 0x16;
 pub const EVT_LINK_KEY_REQUEST: u8 = 0x17;
 pub const EVT_LINK_KEY_NOTIFICATION: u8 = 0x18;
+pub const EVT_INQUIRY_RESULT_WITH_RSSI: u8 = 0x22;
+pub const EVT_EXTENDED_INQUIRY_RESULT: u8 = 0x2F;
 pub const EVT_IO_CAPABILITY_REQUEST: u8 = 0x31;
 pub const EVT_USER_CONFIRMATION_REQUEST: u8 = 0x33;
+
+// AVRCP / AVCTP Constants (PSM 0x0017)
+pub const AVRCP_PID: u16 = 0x110E;
+pub const BT_SIG_COMPANY_ID: [u8; 3] = [0x00, 0x19, 0x58];
+pub const AVRCP_CTYPE_CONTROL: u8 = 0x00;
+pub const AVRCP_CTYPE_STATUS: u8 = 0x01;
+pub const AVRCP_CTYPE_NOTIFY: u8 = 0x03;
+pub const AVRCP_RSP_NOT_IMPLEMENTED: u8 = 0x08;
+pub const AVRCP_RSP_ACCEPTED: u8 = 0x09;
+pub const AVRCP_RSP_REJECTED: u8 = 0x0A;
+pub const AVRCP_RSP_STABLE: u8 = 0x0C;
+pub const AVRCP_RSP_CHANGED: u8 = 0x0D;
+pub const AVRCP_RSP_INTERIM: u8 = 0x0F;
+pub const AVRCP_SUBUNIT_PANEL: u8 = 0x48;
+pub const AVRCP_OPCODE_VENDOR_DEPENDENT: u8 = 0x00;
+pub const AVRCP_OPCODE_PASS_THROUGH: u8 = 0x7C;
+
+pub const AVRCP_PDU_GET_CAPABILITIES: u8 = 0x10;
+pub const AVRCP_PDU_GET_ELEMENT_ATTRIBUTES: u8 = 0x20;
+pub const AVRCP_PDU_REGISTER_NOTIFICATION: u8 = 0x31;
+pub const AVRCP_PDU_SET_ABSOLUTE_VOLUME: u8 = 0x50;
+
+pub const AVRCP_EVENT_PLAYBACK_STATUS_CHANGED: u8 = 0x01;
+pub const AVRCP_EVENT_TRACK_CHANGED: u8 = 0x02;
+pub const AVRCP_EVENT_VOLUME_CHANGED: u8 = 0x0D;
+
+pub const AVRCP_ATTR_TITLE: u32 = 0x01;
+pub const AVRCP_ATTR_ARTIST: u32 = 0x02;
+pub const AVRCP_ATTR_ALBUM: u32 = 0x03;
+pub const AVRCP_ATTR_TRACK_NUMBER: u32 = 0x04;
+pub const AVRCP_ATTR_TOTAL_TRACKS: u32 = 0x05;
+pub const AVRCP_ATTR_GENRE: u32 = 0x06;
+pub const AVRCP_ATTR_DURATION_MS: u32 = 0x07;
+pub const AVRCP_CHARSET_UTF8: u16 = 0x006A;
+
+/// Persistent FlashJournal configuration key for Bluetooth Classic link keys.
+pub const BT_BONDS_CONFIG_KEY: &str = "bt.bonds";
 
 // L2CAP
 pub const L2CAP_CID_SIGNALING: u16 = 0x0001;
@@ -194,6 +240,980 @@ impl BondEntry {
             bd_addr: [0; 6],
             link_key: [0; 16],
             valid: false,
+        }
+    }
+}
+
+// ============================================================================
+// AVRCP 1.6 Controller & Target (PSM 0x0017 AVCTP)
+// ============================================================================
+
+/// AVRCP `PassThrough` (`0x7C`) operation IDs.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AvrcpOperationId {
+    VolumeUp = 0x41,
+    VolumeDown = 0x42,
+    Mute = 0x43,
+    Play = 0x44,
+    Stop = 0x45,
+    Pause = 0x46,
+    Rewind = 0x48,
+    FastForward = 0x49,
+    Forward = 0x4B,
+    Backward = 0x4C,
+}
+
+impl AvrcpOperationId {
+    /// Alias for [`AvrcpOperationId::Forward`] (`0x4B`).
+    pub const NEXT: Self = Self::Forward;
+    /// Alias for [`AvrcpOperationId::Backward`] (`0x4C`).
+    pub const PREV: Self = Self::Backward;
+
+    #[must_use]
+    pub const fn from_u8(code: u8) -> Option<Self> {
+        match code & 0x7F {
+            0x41 => Some(Self::VolumeUp),
+            0x42 => Some(Self::VolumeDown),
+            0x43 => Some(Self::Mute),
+            0x44 => Some(Self::Play),
+            0x45 => Some(Self::Stop),
+            0x46 => Some(Self::Pause),
+            0x48 => Some(Self::Rewind),
+            0x49 => Some(Self::FastForward),
+            0x4B => Some(Self::Forward),
+            0x4C => Some(Self::Backward),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Button state flag inside an AVRCP `PassThrough` (`0x7C`) frame.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AvrcpButtonState {
+    Pressed,
+    Released,
+}
+
+/// Direction/classification of an AVCTP message on `PSM 0x0017`.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AvrcpMessageKind {
+    Command,
+    Response,
+}
+
+/// Track metadata decoded from or encoded into AVRCP `GetElementAttributes`
+/// (`0x20` on Bluetooth SIG Company ID `0x001958`).
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AvrcpTrackMetadata {
+    title_buf: [u8; 64],
+    title_len: usize,
+    artist_buf: [u8; 64],
+    artist_len: usize,
+    album_buf: [u8; 64],
+    album_len: usize,
+    pub duration_ms: u32,
+}
+
+impl AvrcpTrackMetadata {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            title_buf: [0u8; 64],
+            title_len: 0,
+            artist_buf: [0u8; 64],
+            artist_len: 0,
+            album_buf: [0u8; 64],
+            album_len: 0,
+            duration_ms: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn with_metadata(
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_ms: u32,
+    ) -> Self {
+        let mut meta = Self::new();
+        meta.update_title(title);
+        meta.update_artist(artist);
+        meta.update_album(album);
+        meta.duration_ms = duration_ms;
+        meta
+    }
+
+    pub fn clear(&mut self) {
+        self.title_buf.fill(0);
+        self.title_len = 0;
+        self.artist_buf.fill(0);
+        self.artist_len = 0;
+        self.album_buf.fill(0);
+        self.album_len = 0;
+        self.duration_ms = 0;
+    }
+
+    pub fn update_title(&mut self, title: &str) {
+        let bytes = copy_utf8_prefix(title, &mut self.title_buf);
+        self.title_len = bytes;
+    }
+
+    pub fn update_artist(&mut self, artist: &str) {
+        let bytes = copy_utf8_prefix(artist, &mut self.artist_buf);
+        self.artist_len = bytes;
+    }
+
+    pub fn update_album(&mut self, album: &str) {
+        let bytes = copy_utf8_prefix(album, &mut self.album_buf);
+        self.album_len = bytes;
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        let len = self.title_len.min(self.title_buf.len());
+        core::str::from_utf8(&self.title_buf[..len]).unwrap_or("")
+    }
+
+    #[must_use]
+    pub fn artist(&self) -> &str {
+        let len = self.artist_len.min(self.artist_buf.len());
+        core::str::from_utf8(&self.artist_buf[..len]).unwrap_or("")
+    }
+
+    #[must_use]
+    pub fn album(&self) -> &str {
+        let len = self.album_len.min(self.album_buf.len());
+        core::str::from_utf8(&self.album_buf[..len]).unwrap_or("")
+    }
+
+    #[must_use]
+    pub const fn duration_ms(&self) -> u32 {
+        self.duration_ms
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.title_len == 0
+            && self.artist_len == 0
+            && self.album_len == 0
+            && self.duration_ms == 0
+    }
+}
+
+fn copy_utf8_prefix(src: &str, dst: &mut [u8]) -> usize {
+    dst.fill(0);
+    let max_len = src.len().min(dst.len());
+    let valid_len = src.floor_char_boundary(max_len);
+    dst[..valid_len].copy_from_slice(&src.as_bytes()[..valid_len]);
+    valid_len
+}
+
+fn parse_decimal_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val = 0u32;
+    let mut seen_digit = false;
+    for &b in bytes {
+        if b == 0 {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        seen_digit = true;
+        val = val.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+    }
+    if seen_digit {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn format_decimal_u32(mut val: u32, out: &mut [u8; 10]) -> &[u8] {
+    if val == 0 {
+        out[9] = b'0';
+        return &out[9..10];
+    }
+    let mut pos = 10usize;
+    while val > 0 && pos > 0 {
+        pos -= 1;
+        out[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    &out[pos..10]
+}
+
+/// Converts a 7-bit AVRCP absolute volume (`0x00..=0x7F`) to percentage
+/// (`0..=100%`).
+#[must_use]
+pub const fn avrcp_raw_to_volume_pct(raw: u8) -> u8 {
+    let clamped = (raw & 0x7F) as u16;
+    ((clamped * 100 + 63) / 127) as u8
+}
+
+/// Converts a percentage (`0..=100%`) to a 7-bit AVRCP absolute volume
+/// (`0x00..=0x7F`).
+#[must_use]
+pub const fn volume_pct_to_avrcp_raw(pct: u8) -> u8 {
+    let clamped = if pct > 100 { 100 } else { pct as u16 };
+    ((clamped * 127 + 50) / 100) as u8
+}
+
+/// Builds an AVRCP `PassThrough` (`0x7C`) command frame over AVCTP.
+pub fn build_avrcp_passthrough_cmd(
+    tx_label: u8,
+    op: AvrcpOperationId,
+    state: AvrcpButtonState,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 8 {
+        return 0;
+    }
+    let state_bit = match state {
+        AvrcpButtonState::Pressed => 0x00,
+        AvrcpButtonState::Released => 0x80,
+    };
+    out[0] = (tx_label & 0x0F) << 4; // Single packet, Command (C/R=0), IPID=0
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = AVRCP_CTYPE_CONTROL;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_PASS_THROUGH;
+    out[6] = state_bit | (op.as_u8() & 0x7F);
+    out[7] = 0x00; // operation_data_field_length = 0
+    8
+}
+
+/// Builds an AVRCP `PassThrough` (`0x7C`) response frame over AVCTP.
+pub fn build_avrcp_passthrough_rsp(
+    tx_label: u8,
+    op: AvrcpOperationId,
+    state: AvrcpButtonState,
+    response_code: u8,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 8 {
+        return 0;
+    }
+    let state_bit = match state {
+        AvrcpButtonState::Pressed => 0x00,
+        AvrcpButtonState::Released => 0x80,
+    };
+    out[0] = ((tx_label & 0x0F) << 4) | 0x02; // Response (C/R=1)
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = response_code & 0x0F;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_PASS_THROUGH;
+    out[6] = state_bit | (op.as_u8() & 0x7F);
+    out[7] = 0x00;
+    8
+}
+
+/// Parses an AVRCP `PassThrough` (`0x7C`) AVCTP frame, returning
+/// `(tx_label, kind, op, button_state)`.
+#[must_use]
+pub fn parse_avrcp_passthrough(
+    payload: &[u8],
+) -> Option<(u8, AvrcpMessageKind, AvrcpOperationId, AvrcpButtonState)> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let pid = u16::from_be_bytes([payload[1], payload[2]]);
+    if pid != AVRCP_PID || payload[5] != AVRCP_OPCODE_PASS_THROUGH {
+        return None;
+    }
+    let tx_label = (payload[0] >> 4) & 0x0F;
+    let kind = if (payload[0] & 0x02) != 0 {
+        AvrcpMessageKind::Response
+    } else {
+        AvrcpMessageKind::Command
+    };
+    let op = AvrcpOperationId::from_u8(payload[6] & 0x7F)?;
+    let state = if (payload[6] & 0x80) != 0 {
+        AvrcpButtonState::Released
+    } else {
+        AvrcpButtonState::Pressed
+    };
+    Some((tx_label, kind, op, state))
+}
+
+/// Builds an AVRCP `SetAbsoluteVolume` (`0x50`) command frame over AVCTP.
+pub fn build_avrcp_set_absolute_volume_cmd(
+    tx_label: u8,
+    volume_raw: u8,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 14 {
+        return 0;
+    }
+    out[0] = (tx_label & 0x0F) << 4;
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = AVRCP_CTYPE_CONTROL;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_VENDOR_DEPENDENT;
+    out[6..9].copy_from_slice(&BT_SIG_COMPANY_ID);
+    out[9] = AVRCP_PDU_SET_ABSOLUTE_VOLUME;
+    out[10] = 0x00;
+    out[11..13].copy_from_slice(&1u16.to_be_bytes());
+    out[13] = volume_raw & 0x7F;
+    14
+}
+
+/// Builds an AVRCP `SetAbsoluteVolume` (`0x50`) `ACCEPTED` response frame.
+pub fn build_avrcp_set_absolute_volume_rsp(
+    tx_label: u8,
+    volume_raw: u8,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 14 {
+        return 0;
+    }
+    out[0] = ((tx_label & 0x0F) << 4) | 0x02;
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = AVRCP_RSP_ACCEPTED;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_VENDOR_DEPENDENT;
+    out[6..9].copy_from_slice(&BT_SIG_COMPANY_ID);
+    out[9] = AVRCP_PDU_SET_ABSOLUTE_VOLUME;
+    out[10] = 0x00;
+    out[11..13].copy_from_slice(&1u16.to_be_bytes());
+    out[13] = volume_raw & 0x7F;
+    14
+}
+
+/// Builds an AVRCP `RegisterNotification` (`0x31`) command for
+/// `EVENT_VOLUME_CHANGED` (`0x0D`).
+pub fn build_avrcp_register_volume_notify_cmd(
+    tx_label: u8,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 18 {
+        return 0;
+    }
+    out[0] = (tx_label & 0x0F) << 4;
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = AVRCP_CTYPE_NOTIFY;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_VENDOR_DEPENDENT;
+    out[6..9].copy_from_slice(&BT_SIG_COMPANY_ID);
+    out[9] = AVRCP_PDU_REGISTER_NOTIFICATION;
+    out[10] = 0x00;
+    out[11..13].copy_from_slice(&5u16.to_be_bytes());
+    out[13] = AVRCP_EVENT_VOLUME_CHANGED;
+    out[14..18].fill(0);
+    18
+}
+
+/// Builds an AVRCP `RegisterNotification` (`0x31`) `INTERIM` (`0x0F`) or
+/// `CHANGED` (`0x0D`) response for `EVENT_VOLUME_CHANGED` (`0x0D`).
+pub fn build_avrcp_volume_notify_rsp(
+    tx_label: u8,
+    response_code: u8,
+    volume_raw: u8,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 15 {
+        return 0;
+    }
+    out[0] = ((tx_label & 0x0F) << 4) | 0x02;
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = response_code & 0x0F;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_VENDOR_DEPENDENT;
+    out[6..9].copy_from_slice(&BT_SIG_COMPANY_ID);
+    out[9] = AVRCP_PDU_REGISTER_NOTIFICATION;
+    out[10] = 0x00;
+    out[11..13].copy_from_slice(&2u16.to_be_bytes());
+    out[13] = AVRCP_EVENT_VOLUME_CHANGED;
+    out[14] = volume_raw & 0x7F;
+    15
+}
+
+/// Builds an AVRCP `GetElementAttributes` (`0x20`) command requesting
+/// `Title` (`0x01`), `Artist` (`0x02`), `Album` (`0x03`), and
+/// `DurationMs` (`0x07`).
+pub fn build_avrcp_get_element_attributes_cmd(
+    tx_label: u8,
+    out: &mut [u8],
+) -> usize {
+    // 13 header + 8 identifier + 1 count + 4*4 attr_ids = 38 bytes
+    if out.len() < 38 {
+        return 0;
+    }
+    out[0] = (tx_label & 0x0F) << 4;
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = AVRCP_CTYPE_STATUS;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_VENDOR_DEPENDENT;
+    out[6..9].copy_from_slice(&BT_SIG_COMPANY_ID);
+    out[9] = AVRCP_PDU_GET_ELEMENT_ATTRIBUTES;
+    out[10] = 0x00;
+    out[11..13].copy_from_slice(&25u16.to_be_bytes());
+    out[13..21].fill(0); // Identifier = PLAYING (0x0)
+    out[21] = 4; // 4 attributes requested
+    out[22..26].copy_from_slice(&AVRCP_ATTR_TITLE.to_be_bytes());
+    out[26..30].copy_from_slice(&AVRCP_ATTR_ARTIST.to_be_bytes());
+    out[30..34].copy_from_slice(&AVRCP_ATTR_ALBUM.to_be_bytes());
+    out[34..38].copy_from_slice(&AVRCP_ATTR_DURATION_MS.to_be_bytes());
+    38
+}
+
+/// Builds an AVRCP `GetElementAttributes` (`0x20`) `STABLE` (`0x0C`) response
+/// encoding `Title`, `Artist`, `Album`, and `DurationMs`.
+pub fn build_avrcp_get_element_attributes_rsp(
+    tx_label: u8,
+    meta: &AvrcpTrackMetadata,
+    out: &mut [u8],
+) -> usize {
+    if out.len() < 14 {
+        return 0;
+    }
+    let mut dur_scratch = [0u8; 10];
+    let dur_bytes = format_decimal_u32(meta.duration_ms, &mut dur_scratch);
+    let attrs: [(u32, &[u8]); 4] = [
+        (AVRCP_ATTR_TITLE, meta.title().as_bytes()),
+        (AVRCP_ATTR_ARTIST, meta.artist().as_bytes()),
+        (AVRCP_ATTR_ALBUM, meta.album().as_bytes()),
+        (AVRCP_ATTR_DURATION_MS, dur_bytes),
+    ];
+
+    let mut pos = 14usize;
+    let mut count = 0u8;
+    for (attr_id, val) in attrs {
+        if pos + 8 + val.len() > out.len() {
+            break;
+        }
+        out[pos..pos + 4].copy_from_slice(&attr_id.to_be_bytes());
+        out[pos + 4..pos + 6].copy_from_slice(&AVRCP_CHARSET_UTF8.to_be_bytes());
+        out[pos + 6..pos + 8].copy_from_slice(&(val.len() as u16).to_be_bytes());
+        pos += 8;
+        out[pos..pos + val.len()].copy_from_slice(val);
+        pos += val.len();
+        count += 1;
+    }
+
+    let param_len = (pos - 13) as u16;
+    out[0] = ((tx_label & 0x0F) << 4) | 0x02;
+    out[1..3].copy_from_slice(&AVRCP_PID.to_be_bytes());
+    out[3] = AVRCP_RSP_STABLE;
+    out[4] = AVRCP_SUBUNIT_PANEL;
+    out[5] = AVRCP_OPCODE_VENDOR_DEPENDENT;
+    out[6..9].copy_from_slice(&BT_SIG_COMPANY_ID);
+    out[9] = AVRCP_PDU_GET_ELEMENT_ATTRIBUTES;
+    out[10] = 0x00;
+    out[11..13].copy_from_slice(&param_len.to_be_bytes());
+    out[13] = count;
+    pos
+}
+
+/// Parses an AVRCP `GetElementAttributes` (`0x20`) response (either full AVCTP
+/// frame or attribute parameter block) into [`AvrcpTrackMetadata`].
+#[must_use]
+pub fn parse_avrcp_element_attributes_rsp(
+    payload: &[u8],
+) -> Option<AvrcpTrackMetadata> {
+    let params = if payload.len() >= 14
+        && u16::from_be_bytes([payload[1], payload[2]]) == AVRCP_PID
+        && payload[5] == AVRCP_OPCODE_VENDOR_DEPENDENT
+        && payload[6..9] == BT_SIG_COMPANY_ID
+        && payload[9] == AVRCP_PDU_GET_ELEMENT_ATTRIBUTES
+    {
+        let param_len = u16::from_be_bytes([payload[11], payload[12]]) as usize;
+        let end = (13 + param_len).min(payload.len());
+        &payload[13..end]
+    } else if !payload.is_empty() {
+        payload
+    } else {
+        return None;
+    };
+
+    if params.is_empty() {
+        return None;
+    }
+    let num_attrs = params[0] as usize;
+    let mut pos = 1usize;
+    let mut meta = AvrcpTrackMetadata::new();
+
+    for _ in 0..num_attrs {
+        if pos + 8 > params.len() {
+            break;
+        }
+        let attr_id = u32::from_be_bytes([
+            params[pos],
+            params[pos + 1],
+            params[pos + 2],
+            params[pos + 3],
+        ]);
+        let _charset = u16::from_be_bytes([params[pos + 4], params[pos + 5]]);
+        let val_len = u16::from_be_bytes([params[pos + 6], params[pos + 7]]) as usize;
+        pos += 8;
+        if pos + val_len > params.len() {
+            break;
+        }
+        let val_slice = &params[pos..pos + val_len];
+        pos += val_len;
+
+        match attr_id {
+            AVRCP_ATTR_TITLE => {
+                if let Ok(s) = core::str::from_utf8(val_slice) {
+                    meta.update_title(s);
+                }
+            }
+            AVRCP_ATTR_ARTIST => {
+                if let Ok(s) = core::str::from_utf8(val_slice) {
+                    meta.update_artist(s);
+                }
+            }
+            AVRCP_ATTR_ALBUM => {
+                if let Ok(s) = core::str::from_utf8(val_slice) {
+                    meta.update_album(s);
+                }
+            }
+            AVRCP_ATTR_DURATION_MS => {
+                if let Some(ms) = parse_decimal_u32(val_slice) {
+                    meta.duration_ms = ms;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(meta)
+}
+
+// ============================================================================
+// Persistent Link-Key Bonding Store & Security Policy
+// ============================================================================
+
+/// A single bonded Bluetooth Classic peer stored in [`BondingStore`].
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BondedPeer {
+    pub bd_addr: [u8; 6],
+    pub link_key: [u8; 16],
+    pub key_type: u8,
+    pub valid: bool,
+    pub lru_tick: u32,
+}
+
+impl BondedPeer {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            bd_addr: [0u8; 6],
+            link_key: [0u8; 16],
+            key_type: 0,
+            valid: false,
+            lru_tick: 0,
+        }
+    }
+}
+
+/// 4-slot LRU persistent link-key bonding store with binary and hex
+/// serialization compatible with [`FlashJournal`] under key `"bt.bonds"`.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BondingStore {
+    peers: [BondedPeer; 4],
+    clock: u32,
+}
+
+impl BondingStore {
+    pub const MAGIC: [u8; 4] = *b"BTB1";
+    pub const RECORD_BYTES: usize = 23; // 6 bd_addr + 16 link_key + 1 key_type
+    pub const BINARY_MAX_BYTES: usize = 5 + 4 * Self::RECORD_BYTES; // 97 bytes
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            peers: [BondedPeer::empty(); 4],
+            clock: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.peers = [BondedPeer::empty(); 4];
+        self.clock = 0;
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        let mut n = 0usize;
+        for peer in &self.peers {
+            if peer.valid {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[must_use]
+    pub const fn peers(&self) -> &[BondedPeer; 4] {
+        &self.peers
+    }
+
+    /// Looks up a bonded peer without updating LRU recency.
+    #[must_use]
+    pub fn peek(&self, bd_addr: &[u8; 6]) -> Option<BondedPeer> {
+        for peer in &self.peers {
+            if peer.valid && &peer.bd_addr == bd_addr {
+                return Some(*peer);
+            }
+        }
+        None
+    }
+
+    /// Looks up a bonded peer and touches its LRU timestamp on hit.
+    pub fn lookup(&mut self, bd_addr: &[u8; 6]) -> Option<BondedPeer> {
+        self.clock = self.clock.wrapping_add(1);
+        let tick = self.clock;
+        for peer in &mut self.peers {
+            if peer.valid && &peer.bd_addr == bd_addr {
+                peer.lru_tick = tick;
+                return Some(*peer);
+            }
+        }
+        None
+    }
+
+    /// Inserts or updates a bonded peer, evicting the least-recently-used slot
+    /// when all 4 slots are occupied.
+    pub fn upsert(&mut self, bd_addr: [u8; 6], link_key: [u8; 16], key_type: u8) {
+        self.clock = self.clock.wrapping_add(1);
+        let tick = self.clock;
+
+        for peer in &mut self.peers {
+            if peer.valid && peer.bd_addr == bd_addr {
+                peer.link_key = link_key;
+                peer.key_type = key_type;
+                peer.lru_tick = tick;
+                return;
+            }
+        }
+
+        for peer in &mut self.peers {
+            if !peer.valid {
+                *peer = BondedPeer {
+                    bd_addr,
+                    link_key,
+                    key_type,
+                    valid: true,
+                    lru_tick: tick,
+                };
+                return;
+            }
+        }
+
+        let mut lru_idx = 0usize;
+        let mut min_tick = self.peers[0].lru_tick;
+        for idx in 1..4 {
+            if self.peers[idx].lru_tick < min_tick {
+                min_tick = self.peers[idx].lru_tick;
+                lru_idx = idx;
+            }
+        }
+        self.peers[lru_idx] = BondedPeer {
+            bd_addr,
+            link_key,
+            key_type,
+            valid: true,
+            lru_tick: tick,
+        };
+    }
+
+    /// Removes a peer from the bonding store.
+    pub fn remove(&mut self, bd_addr: &[u8; 6]) -> bool {
+        for peer in &mut self.peers {
+            if peer.valid && &peer.bd_addr == bd_addr {
+                *peer = BondedPeer::empty();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Encodes the valid peers in LRU order (oldest to newest) into a compact
+    /// binary record (`<= 97` bytes) suitable for `FlashJournal` key
+    /// `"bt.bonds"`.
+    pub fn encode_binary(&self, out: &mut [u8]) -> usize {
+        let valid_count = self.count();
+        let needed = 5 + valid_count * Self::RECORD_BYTES;
+        if out.len() < needed {
+            return 0;
+        }
+        out[0..4].copy_from_slice(&Self::MAGIC);
+        out[4] = valid_count as u8;
+
+        // Sort valid indices by lru_tick ascending so decode preserves LRU order
+        let mut indices = [0usize; 4];
+        let mut n = 0usize;
+        for idx in 0..4 {
+            if self.peers[idx].valid {
+                indices[n] = idx;
+                n += 1;
+            }
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if self.peers[indices[j]].lru_tick < self.peers[indices[i]].lru_tick {
+                    indices.swap(i, j);
+                }
+            }
+        }
+
+        let mut pos = 5usize;
+        for k in 0..n {
+            let p = &self.peers[indices[k]];
+            out[pos..pos + 6].copy_from_slice(&p.bd_addr);
+            out[pos + 6..pos + 22].copy_from_slice(&p.link_key);
+            out[pos + 22] = p.key_type;
+            pos += Self::RECORD_BYTES;
+        }
+        pos
+    }
+
+    /// Decodes a [`BondingStore`] from a binary slice produced by
+    /// [`BondingStore::encode_binary`].
+    pub fn decode_binary(data: &[u8]) -> Result<Self, StorageError> {
+        if data.len() < 5 || data[0..4] != Self::MAGIC {
+            return Err(StorageError::InvalidFormat);
+        }
+        let count = data[4] as usize;
+        if count > 4 || data.len() < 5 + count * Self::RECORD_BYTES {
+            return Err(StorageError::InvalidFormat);
+        }
+        let mut store = Self::new();
+        let mut pos = 5usize;
+        for _ in 0..count {
+            let mut bd_addr = [0u8; 6];
+            bd_addr.copy_from_slice(&data[pos..pos + 6]);
+            let mut link_key = [0u8; 16];
+            link_key.copy_from_slice(&data[pos + 6..pos + 22]);
+            let key_type = data[pos + 22];
+            store.upsert(bd_addr, link_key, key_type);
+            pos += Self::RECORD_BYTES;
+        }
+        Ok(store)
+    }
+
+    /// Encodes the bonding store as uppercase ASCII hex into `out`.
+    pub fn encode_hex(&self, out: &mut [u8]) -> usize {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut raw = [0u8; Self::BINARY_MAX_BYTES];
+        let raw_len = self.encode_binary(&mut raw);
+        if raw_len == 0 || out.len() < raw_len * 2 {
+            return 0;
+        }
+        for i in 0..raw_len {
+            out[i * 2] = HEX[(raw[i] >> 4) as usize];
+            out[i * 2 + 1] = HEX[(raw[i] & 0x0F) as usize];
+        }
+        raw_len * 2
+    }
+
+    /// Decodes a [`BondingStore`] from an ASCII hex string produced by
+    /// [`BondingStore::encode_hex`].
+    pub fn decode_hex(hex_str: &str) -> Result<Self, StorageError> {
+        let bytes = hex_str.as_bytes();
+        if !bytes.len().is_multiple_of(2)
+            || bytes.len() / 2 > Self::BINARY_MAX_BYTES
+        {
+            return Err(StorageError::InvalidFormat);
+        }
+        let mut raw = [0u8; Self::BINARY_MAX_BYTES];
+        let raw_len = bytes.len() / 2;
+        for i in 0..raw_len {
+            let hi = decode_hex_nibble(bytes[i * 2])
+                .ok_or(StorageError::InvalidFormat)?;
+            let lo = decode_hex_nibble(bytes[i * 2 + 1])
+                .ok_or(StorageError::InvalidFormat)?;
+            raw[i] = (hi << 4) | lo;
+        }
+        Self::decode_binary(&raw[..raw_len])
+    }
+
+    /// Saves the bonding store under key [`BT_BONDS_CONFIG_KEY`] (`"bt.bonds"`)
+    /// in any [`KeyValueStorage`] implementation.
+    pub fn save_to_storage<S: KeyValueStorage>(
+        &self,
+        storage: &mut S,
+    ) -> Result<(), StorageError> {
+        let mut buf = [0u8; Self::BINARY_MAX_BYTES];
+        let n = self.encode_binary(&mut buf);
+        if n == 0 {
+            return Err(StorageError::BufferTooSmall);
+        }
+        storage.set(BT_BONDS_CONFIG_KEY, &buf[..n])
+    }
+
+    /// Loads the bonding store from key [`BT_BONDS_CONFIG_KEY`] (`"bt.bonds"`)
+    /// in any [`KeyValueStorage`] implementation.
+    pub fn load_from_storage<S: KeyValueStorage>(
+        storage: &S,
+    ) -> Result<Self, StorageError> {
+        let mut buf = [0u8; 128];
+        let n = storage.get(BT_BONDS_CONFIG_KEY, &mut buf)?;
+        Self::decode_binary(&buf[..n])
+    }
+
+    /// Persists the bonding store into `store` under `"bt.bonds"` and commits
+    /// the store to a [`FlashJournal`] sector image.
+    pub fn save_to_journal_sector<const N: usize>(
+        &self,
+        store: &mut MemConfigStore<N>,
+        sector: &mut [u8],
+        sequence: u32,
+    ) -> Result<usize, StorageError> {
+        self.save_to_storage(store)?;
+        FlashJournal::save_to_sector_with_seq(store, sector, sequence)
+    }
+
+    /// Loads a [`FlashJournal`] sector image into `store` and deserializes
+    /// the [`BondingStore`] from `"bt.bonds"`.
+    pub fn load_from_journal_sector<const N: usize>(
+        sector: &[u8],
+        store: &mut MemConfigStore<N>,
+    ) -> Result<Self, StorageError> {
+        let _ = FlashJournal::load_from_sector(sector, store)?;
+        Self::load_from_storage(store)
+    }
+}
+
+const fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Bluetooth Classic Secure Simple Pairing (SSP) / PIN security policy.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BtPairingPolicy {
+    /// SSP "Just Works" (`NoInputNoOutput = 0x03`, general bonding) + PIN fallback.
+    SspJustWorks,
+    /// SSP Numeric Comparison (`DisplayYesNo = 0x01`, MITM required).
+    SspNumericComparison,
+    /// Legacy fixed PIN code pairing only (SSP disabled).
+    LegacyPinOnly,
+    /// Reject new unbonded pairings; allow only peers in [`BondingStore`].
+    BondedOnly,
+}
+
+/// Configurable Bluetooth local device name and SSP/PIN pairing policy.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BtSecurityPolicy {
+    device_name_buf: [u8; 32],
+    device_name_len: usize,
+    pin_code_buf: [u8; 16],
+    pin_code_len: usize,
+    pub pairing_policy: BtPairingPolicy,
+    pub discoverable: bool,
+}
+
+impl BtSecurityPolicy {
+    #[must_use]
+    pub const fn new() -> Self {
+        let mut name_buf = [0u8; 32];
+        let mut i = 0;
+        while i < BT_LOCAL_NAME.len() && i < 32 {
+            name_buf[i] = BT_LOCAL_NAME[i];
+            i += 1;
+        }
+        let mut pin_buf = [0u8; 16];
+        pin_buf[0] = b'0';
+        pin_buf[1] = b'0';
+        pin_buf[2] = b'0';
+        pin_buf[3] = b'0';
+        Self {
+            device_name_buf: name_buf,
+            device_name_len: i,
+            pin_code_buf: pin_buf,
+            pin_code_len: 4,
+            pairing_policy: BtPairingPolicy::SspJustWorks,
+            discoverable: true,
+        }
+    }
+
+    pub fn update_device_name(&mut self, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let len = copy_utf8_prefix(trimmed, &mut self.device_name_buf);
+        self.device_name_len = len;
+    }
+
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        let bytes = self.device_name_bytes();
+        core::str::from_utf8(bytes).unwrap_or("BASEMENT")
+    }
+
+    #[must_use]
+    pub fn device_name_bytes(&self) -> &[u8] {
+        if self.device_name_len == 0 {
+            BT_LOCAL_NAME
+        } else {
+            let len = self.device_name_len.min(self.device_name_buf.len());
+            &self.device_name_buf[..len]
+        }
+    }
+
+    pub fn update_pin_code(&mut self, pin: &[u8]) {
+        if pin.is_empty() || pin.len() > 16 {
+            return;
+        }
+        self.pin_code_buf.fill(0);
+        self.pin_code_buf[..pin.len()].copy_from_slice(pin);
+        self.pin_code_len = pin.len();
+    }
+
+    #[must_use]
+    pub fn pin_code(&self) -> &[u8] {
+        if self.pin_code_len == 0 {
+            b"0000"
+        } else {
+            let len = self.pin_code_len.min(self.pin_code_buf.len());
+            &self.pin_code_buf[..len]
+        }
+    }
+
+    #[must_use]
+    pub const fn ssp_enabled(&self) -> bool {
+        !matches!(self.pairing_policy, BtPairingPolicy::LegacyPinOnly)
+    }
+
+    #[must_use]
+    pub const fn io_capability_byte(&self) -> u8 {
+        match self.pairing_policy {
+            BtPairingPolicy::SspNumericComparison => 0x01, // DisplayYesNo
+            BtPairingPolicy::SspJustWorks
+            | BtPairingPolicy::LegacyPinOnly
+            | BtPairingPolicy::BondedOnly => 0x03, // NoInputNoOutput
+        }
+    }
+
+    #[must_use]
+    pub const fn auth_requirements_byte(&self) -> u8 {
+        match self.pairing_policy {
+            BtPairingPolicy::SspNumericComparison => 0x05, // MITM Required - General Bonding
+            BtPairingPolicy::SspJustWorks
+            | BtPairingPolicy::LegacyPinOnly
+            | BtPairingPolicy::BondedOnly => 0x04, // MITM Not Required - General Bonding
         }
     }
 }
@@ -958,6 +1978,779 @@ impl SbcDecoder {
 }
 
 // ============================================================================
+// Pure-Rust SBC Audio Encoder (8-Subband, 16-Block, 44.1 kHz Stereo/Joint)
+// ============================================================================
+
+/// Channel mode for [`SbcEncoder`].
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SbcChannelMode {
+    Mono = 0,
+    DualChannel = 1,
+    Stereo = 2,
+    JointStereo = 3,
+}
+
+/// Bit allocation method for [`SbcEncoder`].
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SbcAllocationMethod {
+    Loudness = 0,
+    Snr = 1,
+}
+
+/// Pure-Rust 8-subband, 16-block Bluetooth A2DP SBC audio encoder.
+///
+/// Uses the exact time-reversed polyphase analysis adjoint of
+/// [`SBC_PROTO_8_80M0`], [`SBC_PROTO_8_80M1`], and [`SYNMATRIX8`] to achieve
+/// >60 dB round-trip SNR through [`SbcDecoder`] with zero heap allocations.
+#[non_exhaustive]
+pub struct SbcEncoder {
+    pub x_blocks: [[[i16; 8]; 10]; 2],
+    pub bitpool: u8,
+    pub sample_rate_hz: u32,
+    pub channel_mode: SbcChannelMode,
+    pub allocation: SbcAllocationMethod,
+}
+
+impl SbcEncoder {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            x_blocks: [[[0i16; 8]; 10]; 2],
+            bitpool: 53,
+            sample_rate_hz: 44100,
+            channel_mode: SbcChannelMode::Stereo,
+            allocation: SbcAllocationMethod::Loudness,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_config(
+        sample_rate_hz: u32,
+        channel_mode: SbcChannelMode,
+        allocation: SbcAllocationMethod,
+        bitpool: u8,
+    ) -> Self {
+        Self {
+            x_blocks: [[[0i16; 8]; 10]; 2],
+            bitpool,
+            sample_rate_hz,
+            channel_mode,
+            allocation,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.x_blocks = [[[0i16; 8]; 10]; 2];
+    }
+
+    #[must_use]
+    const fn sf_index(&self) -> usize {
+        match self.sample_rate_hz {
+            16000 => 0,
+            32000 => 1,
+            48000 => 3,
+            _ => 2, // 44100 Hz default
+        }
+    }
+
+    /// Runs the 8-subband polyphase analysis filterbank on one 8-sample block
+    /// for channel `ch`.
+    pub fn analyze_eight(&mut self, ch: usize, pcm8: &[i16; 8]) -> [i32; 8] {
+        let hist = &mut self.x_blocks[ch];
+        let mut b = 9usize;
+        while b > 0 {
+            hist[b] = hist[b - 1];
+            b -= 1;
+        }
+        hist[0] = *pcm8;
+
+        let mut w = [0i64; 16];
+        for i in 0..8 {
+            let idx = i * 5;
+            let acc0 = (hist[9][i] as i64 * SBC_PROTO_8_80M0[idx] as i64)
+                + (hist[7][i] as i64 * SBC_PROTO_8_80M0[idx + 1] as i64)
+                + (hist[5][i] as i64 * SBC_PROTO_8_80M0[idx + 2] as i64)
+                + (hist[3][i] as i64 * SBC_PROTO_8_80M0[idx + 3] as i64)
+                + (hist[1][i] as i64 * SBC_PROTO_8_80M0[idx + 4] as i64);
+
+            let acc1 = (hist[8][i] as i64 * SBC_PROTO_8_80M1[idx] as i64)
+                + (hist[6][i] as i64 * SBC_PROTO_8_80M1[idx + 1] as i64)
+                + (hist[4][i] as i64 * SBC_PROTO_8_80M1[idx + 2] as i64)
+                + (hist[2][i] as i64 * SBC_PROTO_8_80M1[idx + 3] as i64)
+                + (hist[0][i] as i64 * SBC_PROTO_8_80M1[idx + 4] as i64);
+
+            w[i] = acc0 >> 15;
+            w[i + 8] = acc1 >> 15;
+        }
+
+        let mut sb_out = [0i32; 8];
+        for sb in 0..8 {
+            let mut acc = 0i64;
+            for r in 0..16 {
+                acc += (SYNMATRIX8[r][sb] as i64) * w[r];
+            }
+            sb_out[sb] = (acc >> 14) as i32;
+        }
+        sb_out
+    }
+
+    /// Encodes 128 interleaved stereo PCM frames (`256` `i16` samples:
+    /// `[L0, R0, L1, R1, ..., L127, R127]`) into one 16-block, 8-subband SBC
+    /// frame starting with syncword `0x9C`.
+    /// Returns `Ok(sbc_bytes_written)`.
+    pub fn encode_frame(
+        &mut self,
+        pcm_stereo: &[i16],
+        sbc_out: &mut [u8],
+    ) -> Result<usize, SbcError> {
+        let blocks = 16usize;
+        let subbands = 8usize;
+        let total_stereo_frames = blocks * subbands; // 128
+        if pcm_stereo.len() < total_stereo_frames * 2 {
+            return Err(SbcError::TooShort);
+        }
+
+        let mode = self.channel_mode as u8;
+        let channels = if mode == 0 { 1usize } else { 2usize };
+        let bitpool = self.bitpool as usize;
+        if (mode == 0 || mode == 1) && (bitpool < 2 || bitpool > 16 * subbands) {
+            return Err(SbcError::BitpoolOutOfBounds);
+        }
+        if (mode == 2 || mode == 3) && (bitpool < 2 || bitpool > 32 * subbands) {
+            return Err(SbcError::BitpoolOutOfBounds);
+        }
+
+        let mut sb_sample = [[[0i32; 8]; 2]; 16];
+        for blk in 0..blocks {
+            let base = blk * 16; // 8 stereo frames = 16 i16 samples
+            let mut pcm_l = [0i16; 8];
+            let mut pcm_r = [0i16; 8];
+            for i in 0..8 {
+                pcm_l[i] = pcm_stereo[base + i * 2];
+                pcm_r[i] = pcm_stereo[base + i * 2 + 1];
+            }
+            if channels == 1 {
+                let mut pcm_m = [0i16; 8];
+                for i in 0..8 {
+                    pcm_m[i] = ((i32::from(pcm_l[i]) + i32::from(pcm_r[i])) / 2) as i16;
+                }
+                sb_sample[blk][0] = self.analyze_eight(0, &pcm_m);
+            } else {
+                sb_sample[blk][0] = self.analyze_eight(0, &pcm_l);
+                sb_sample[blk][1] = self.analyze_eight(1, &pcm_r);
+            }
+        }
+
+        let mut joint_mask = 0u8;
+        if mode == 3 {
+            // Evaluate Joint Stereo mid/side coding on subbands 0..7
+            for sb in 0..(subbands - 1) {
+                let mut max_l = 0i32;
+                let mut max_r = 0i32;
+                let mut max_m = 0i32;
+                let mut max_s = 0i32;
+                for blk in 0..blocks {
+                    let l = sb_sample[blk][0][sb];
+                    let r = sb_sample[blk][1][sb];
+                    let m = (l + r) >> 1;
+                    let s = (l - r) >> 1;
+                    max_l = max_l.max(l.saturating_abs());
+                    max_r = max_r.max(r.saturating_abs());
+                    max_m = max_m.max(m.saturating_abs());
+                    max_s = max_s.max(s.saturating_abs());
+                }
+                let sf_lr = compute_scale_factor(max_l) + compute_scale_factor(max_r);
+                let sf_ms = compute_scale_factor(max_m) + compute_scale_factor(max_s);
+                if sf_ms < sf_lr {
+                    joint_mask |= 1 << sb;
+                    for blk in 0..blocks {
+                        let l = sb_sample[blk][0][sb];
+                        let r = sb_sample[blk][1][sb];
+                        sb_sample[blk][0][sb] = (l + r) >> 1;
+                        sb_sample[blk][1][sb] = (l - r) >> 1;
+                    }
+                }
+            }
+        }
+
+        let mut scale_factor = [[0usize; 8]; 2];
+        for ch in 0..channels {
+            for sb in 0..subbands {
+                let mut max_abs = 0i32;
+                for blk in 0..blocks {
+                    max_abs = max_abs.max(sb_sample[blk][ch][sb].saturating_abs());
+                }
+                scale_factor[ch][sb] = compute_scale_factor(max_abs);
+            }
+        }
+
+        let sf_idx = self.sf_index();
+        let allocation = self.allocation as usize;
+        let dec_helper = SbcDecoder::new();
+        let mut bits = [[0usize; 8]; 2];
+        dec_helper.calculate_bits(
+            mode,
+            allocation,
+            sf_idx,
+            subbands,
+            channels,
+            bitpool,
+            &scale_factor,
+            &mut bits,
+        );
+
+        // Compute total bits to verify sbc_out capacity
+        let header_bits = 32
+            + (if mode == 3 { subbands } else { 0 })
+            + (4 * subbands * channels);
+        let mut payload_bits = 0usize;
+        for ch in 0..channels {
+            for sb in 0..subbands {
+                payload_bits += blocks * bits[ch][sb];
+            }
+        }
+        let total_bytes = (header_bits + payload_bits).div_ceil(8);
+        if sbc_out.len() < total_bytes {
+            return Err(SbcError::TooShort);
+        }
+        sbc_out[..total_bytes].fill(0);
+
+        let byte1 = ((sf_idx as u8 & 0x03) << 6)
+            | (0x03 << 4) // 16 blocks
+            | ((mode & 0x03) << 2)
+            | (((allocation as u8) & 0x01) << 1)
+            | 0x01; // 8 subbands
+
+        sbc_out[0] = SBC_SYNCWORD;
+        sbc_out[1] = byte1;
+        sbc_out[2] = self.bitpool;
+
+        let mut crc_header = [0u8; 11];
+        crc_header[0] = byte1;
+        crc_header[1] = self.bitpool;
+        let mut crc_pos = 16usize;
+        let mut bit_pos = 32usize;
+
+        if mode == 3 {
+            let mut j_byte = 0u8;
+            for sb in 0..(subbands - 1) {
+                if (joint_mask & (1 << sb)) != 0 {
+                    j_byte |= 1 << (7 - sb);
+                }
+            }
+            sbc_out[4] = j_byte;
+            crc_header[crc_pos / 8] = j_byte;
+            bit_pos += subbands;
+            crc_pos += subbands;
+        }
+
+        for ch in 0..channels {
+            for sb in 0..subbands {
+                let sf_val = (scale_factor[ch][sb] & 0x0F) as u8;
+                sbc_out[bit_pos >> 3] |= sf_val << (4 - (bit_pos & 0x7));
+                crc_header[crc_pos >> 3] |= sf_val << (4 - (crc_pos & 0x7));
+                bit_pos += 4;
+                crc_pos += 4;
+            }
+        }
+
+        sbc_out[3] = sbc_crc8(&crc_header, crc_pos);
+
+        // Quantize and pack subband samples MSB-first
+        for blk in 0..blocks {
+            for ch in 0..channels {
+                for sb in 0..subbands {
+                    let num_bits = bits[ch][sb];
+                    if num_bits == 0 {
+                        continue;
+                    }
+                    let lvl = (1u64 << num_bits) - 1;
+                    let shift = scale_factor[ch][sb] + 3;
+                    let limit = (1i32 << shift) - 1;
+                    let clamped = sb_sample[blk][ch][sb].clamp(-limit, limit);
+                    let shifted = (clamped + (1i32 << shift)) as u64;
+                    let audio_sample =
+                        ((shifted * lvl) >> (shift + 1)).min(lvl - 1) as u32;
+
+                    for b in 0..num_bits {
+                        let bit_val = (audio_sample >> (num_bits - 1 - b)) & 0x01;
+                        if bit_val != 0 {
+                            sbc_out[bit_pos >> 3] |= 1 << (7 - (bit_pos & 0x7));
+                        }
+                        bit_pos += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(total_bytes)
+    }
+}
+
+const fn compute_scale_factor(max_abs: i32) -> usize {
+    let mut sf = 0usize;
+    while sf < 15 && (1i32 << (sf + 3)) <= max_abs {
+        sf += 1;
+    }
+    sf
+}
+
+// ============================================================================
+// A2DP Source (`-o BT`) Inquiry Matcher & AVDTP Initiator State Machine
+// ============================================================================
+
+/// Extracts the UTF-8 local device name from an Extended Inquiry Response
+/// (`EIR`) data payload (AD types `0x08` Shortened or `0x09` Complete Local
+/// Name).
+#[must_use]
+pub fn parse_eir_local_name(eir_data: &[u8]) -> Option<&str> {
+    let mut pos = 0usize;
+    while pos < eir_data.len() {
+        let field_len = eir_data[pos] as usize;
+        if field_len == 0 || pos + 1 + field_len > eir_data.len() {
+            break;
+        }
+        let ad_type = eir_data[pos + 1];
+        let payload = &eir_data[pos + 2..pos + 1 + field_len];
+        if ad_type == 0x08 || ad_type == 0x09 {
+            let trimmed_len = payload
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(payload.len());
+            if let Ok(name) = core::str::from_utf8(&payload[..trimmed_len]) {
+                return Some(name);
+            }
+        }
+        pos += 1 + field_len;
+    }
+    None
+}
+
+/// Checks whether an `EIR` payload advertises the A2DP `AudioSink` (`0x110B`)
+/// or `AdvancedAudioDistribution` (`0x110D`) 16-bit Service Class UUID.
+#[must_use]
+pub fn eir_has_audio_sink_uuid(eir_data: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos < eir_data.len() {
+        let field_len = eir_data[pos] as usize;
+        if field_len == 0 || pos + 1 + field_len > eir_data.len() {
+            break;
+        }
+        let ad_type = eir_data[pos + 1];
+        let payload = &eir_data[pos + 2..pos + 1 + field_len];
+        if ad_type == 0x02 || ad_type == 0x03 {
+            let mut i = 0usize;
+            while i + 1 < payload.len() {
+                let uuid = u16::from_le_bytes([payload[i], payload[i + 1]]);
+                if uuid == 0x110B || uuid == 0x110D {
+                    return true;
+                }
+                i += 2;
+            }
+        }
+        pos += 1 + field_len;
+    }
+    false
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if n.len() > h.len() {
+        return false;
+    }
+    for start in 0..=(h.len() - n.len()) {
+        let mut matched = true;
+        for k in 0..n.len() {
+            if !h[start + k].eq_ignore_ascii_case(&n[k]) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+/// Connection & AVDTP signaling phase for A2DP Source (`-o BT`) mode.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BtA2dpSourcePhase {
+    Idle,
+    Inquiring,
+    ConnectingAcl,
+    ConnectingAvdtpSignaling,
+    DiscoveringSeps,
+    GettingCapabilities,
+    SettingConfiguration,
+    OpeningStream,
+    ConnectingAvdtpMedia,
+    StartingStream,
+    Streaming,
+}
+
+/// A2DP Source (`-o BT`) state machine managing HCI Inquiry/EIR sink
+/// discovery, AVDTP Source initiator signaling (`Discover` ->
+/// `GetCapabilities` -> `SetConfiguration` -> `Open` -> `Start`), 44.1 kHz
+/// LMS rate lock, and RTP/SBC media packetization.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BtA2dpSourceState {
+    pub phase: BtA2dpSourcePhase,
+    target_name_buf: [u8; 32],
+    target_name_len: usize,
+    pub target_bd_addr: Option<[u8; 6]>,
+    pub matched_bd_addr: Option<[u8; 6]>,
+    pub matched_rssi: i8,
+    pub acl_handle: Option<u16>,
+    pub sig_local_cid: u16,
+    pub sig_remote_cid: u16,
+    pub media_local_cid: u16,
+    pub media_remote_cid: u16,
+    pub remote_sink_seid: u8,
+    pub local_source_seid: u8,
+    pub tx_label: u8,
+    pub rtp_seq_num: u16,
+    pub rtp_timestamp: u32,
+    pub rtp_ssrc: u32,
+    pub locked_sample_rate_hz: u32,
+    pub sbc_bitpool: u8,
+}
+
+impl BtA2dpSourceState {
+    /// LMS sample rate lock for A2DP Source (`-o BT`) output.
+    pub const LMS_LOCKED_RATE_HZ: u32 = 44100;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            phase: BtA2dpSourcePhase::Idle,
+            target_name_buf: [0u8; 32],
+            target_name_len: 0,
+            target_bd_addr: None,
+            matched_bd_addr: None,
+            matched_rssi: -127,
+            acl_handle: None,
+            sig_local_cid: 0x0048,
+            sig_remote_cid: 0,
+            media_local_cid: 0x0049,
+            media_remote_cid: 0,
+            remote_sink_seid: 1,
+            local_source_seid: 1,
+            tx_label: 1,
+            rtp_seq_num: 1,
+            rtp_timestamp: 0,
+            rtp_ssrc: 0x534C_4254, // "SLBT"
+            locked_sample_rate_hz: Self::LMS_LOCKED_RATE_HZ,
+            sbc_bitpool: 53,
+        }
+    }
+
+    pub fn update_target_name(&mut self, name: &str) {
+        let len = copy_utf8_prefix(name.trim(), &mut self.target_name_buf);
+        self.target_name_len = len;
+    }
+
+    #[must_use]
+    pub fn target_name(&self) -> &str {
+        let len = self.target_name_len.min(self.target_name_buf.len());
+        core::str::from_utf8(&self.target_name_buf[..len]).unwrap_or("")
+    }
+
+    pub fn update_target_bd_addr(&mut self, bd_addr: Option<[u8; 6]>) {
+        self.target_bd_addr = bd_addr;
+    }
+
+    #[must_use]
+    pub const fn is_streaming(&self) -> bool {
+        matches!(self.phase, BtA2dpSourcePhase::Streaming)
+    }
+
+    fn next_tx_label(&mut self) -> u8 {
+        let lbl = self.tx_label & 0x0F;
+        self.tx_label = (lbl + 1) & 0x0F;
+        lbl
+    }
+
+    /// Evaluates whether an inquired peer (`bd_addr` + optional `eir_data`)
+    /// matches the configured target sink address or target sink name.
+    #[must_use]
+    pub fn matches_inquiry_peer(&self, bd_addr: &[u8; 6], eir_data: &[u8]) -> bool {
+        if let Some(ref target_addr) = self.target_bd_addr {
+            if target_addr == bd_addr {
+                return true;
+            }
+        }
+        let target_name = self.target_name();
+        if !target_name.is_empty() {
+            if let Some(eir_name) = parse_eir_local_name(eir_data) {
+                if ascii_contains_ignore_case(eir_name, target_name) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Starts Bluetooth Classic GIAC Inquiry (`0x9E8B33`) to discover the
+    /// target A2DP Sink.
+    pub fn start_inquiry<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        inquiry_length_units: u8,
+    ) -> bool {
+        let len = inquiry_length_units.clamp(1, 0x30);
+        // LAP = 0x9E8B33 (GIAC), Inquiry_Length, Num_Responses = 0
+        let params: [u8; 5] = [0x33, 0x8B, 0x9E, len, 0x00];
+        if BtA2dpSink::send_cmd(transport, OPCODE_INQUIRY, &params) {
+            self.phase = BtA2dpSourcePhase::Inquiring;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Processes an HCI `ExtendedInquiryResult` (`0x2F`) event; if the peer
+    /// matches the configured sink name/MAC, cancels inquiry and initiates
+    /// `HCI_Create_Connection` (`0x0405`).
+    pub fn on_extended_inquiry_result<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        params: &[u8],
+    ) -> bool {
+        if params.len() < 15 {
+            return false;
+        }
+        let mut bd_addr = [0u8; 6];
+        bd_addr.copy_from_slice(&params[1..7]);
+        let page_scan_rep = params[7];
+        let clock_offset = u16::from_le_bytes([params[12], params[13]]);
+        let rssi = params[14] as i8;
+        let eir_data = &params[15..];
+
+        if !self.matches_inquiry_peer(&bd_addr, eir_data) {
+            return false;
+        }
+
+        self.matched_bd_addr = Some(bd_addr);
+        self.matched_rssi = rssi;
+        let _ = BtA2dpSink::send_cmd(transport, OPCODE_INQUIRY_CANCEL, &[]);
+
+        // HCI_Create_Connection (0x0405): BD_ADDR(6), Packet_Type(0xCC18),
+        // Page_Scan_Rep_Mode(1), Reserved(0), Clock_Offset(2), Role_Switch(1)
+        let mut conn_params = [0u8; 13];
+        conn_params[0..6].copy_from_slice(&bd_addr);
+        conn_params[6..8].copy_from_slice(&0xCC18u16.to_le_bytes());
+        conn_params[8] = page_scan_rep;
+        conn_params[9] = 0x00;
+        conn_params[10..12].copy_from_slice(&(clock_offset | 0x8000).to_le_bytes());
+        conn_params[12] = 0x01;
+        if BtA2dpSink::send_cmd(transport, OPCODE_CREATE_CONNECTION, &conn_params) {
+            self.phase = BtA2dpSourcePhase::ConnectingAcl;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Transitions from ACL connection completion to opening the L2CAP AVDTP
+    /// Signaling channel (`PSM 0x0019`).
+    pub fn on_acl_connected<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        handle: u16,
+        ident: u8,
+    ) -> bool {
+        self.acl_handle = Some(handle);
+        self.phase = BtA2dpSourcePhase::ConnectingAvdtpSignaling;
+        let mut req = [0u8; 8];
+        req[0] = L2CAP_CMD_CONN_REQ;
+        req[1] = ident;
+        req[2..4].copy_from_slice(&4u16.to_le_bytes());
+        req[4..6].copy_from_slice(&PSM_AVDTP.to_le_bytes());
+        req[6..8].copy_from_slice(&self.sig_local_cid.to_le_bytes());
+        BtA2dpSink::send_l2cap(transport, handle, L2CAP_CID_SIGNALING, &req)
+    }
+
+    /// Initiates the AVDTP Source `DISCOVER` (`0x01`) request once the
+    /// signaling L2CAP channel is configured.
+    pub fn start_avdtp_discovery<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        sig_remote_cid: u16,
+    ) -> bool {
+        let Some(handle) = self.acl_handle else {
+            return false;
+        };
+        self.sig_remote_cid = sig_remote_cid;
+        self.phase = BtA2dpSourcePhase::DiscoveringSeps;
+        let lbl = self.next_tx_label();
+        let cmd = [lbl << 4, AVDTP_DISCOVER];
+        BtA2dpSink::send_l2cap(transport, handle, sig_remote_cid, &cmd)
+    }
+
+    /// Advances the AVDTP Source initiator state machine upon receiving an
+    /// AVDTP signaling response from the remote A2DP Sink:
+    /// `Discover` -> `GetCapabilities` -> `SetConfiguration` -> `Open` ->
+    /// (L2CAP Media Channel) -> `Start` -> `Streaming`.
+    pub fn handle_avdtp_response<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        payload: &[u8],
+    ) -> bool {
+        let Some(handle) = self.acl_handle else {
+            return false;
+        };
+        if payload.len() < 2 {
+            return false;
+        }
+        let msg_type = payload[0] & 0x03;
+        let sig_id = payload[1] & 0x3F;
+        if msg_type != 0x02 {
+            // Only advance on Response Accept (0x02)
+            return false;
+        }
+
+        match sig_id {
+            AVDTP_DISCOVER => {
+                // Parse discovered SEPs (2 bytes each): find Audio Sink (TSEP = 1)
+                let mut offset = 2usize;
+                let mut found_seid = None;
+                while offset + 1 < payload.len() {
+                    let seid = (payload[offset] >> 2) & 0x3F;
+                    let in_use = (payload[offset] & 0x02) != 0;
+                    let media_type = (payload[offset + 1] >> 4) & 0x0F;
+                    let tsep = (payload[offset + 1] >> 3) & 0x01;
+                    if media_type == 0x00 && tsep == 0x01 && !in_use && seid > 0 {
+                        found_seid = Some(seid);
+                        break;
+                    }
+                    offset += 2;
+                }
+                let seid = found_seid.unwrap_or(1);
+                self.remote_sink_seid = seid;
+                self.phase = BtA2dpSourcePhase::GettingCapabilities;
+                let lbl = self.next_tx_label();
+                let cmd = [lbl << 4, AVDTP_GET_CAPABILITIES, seid << 2];
+                BtA2dpSink::send_l2cap(transport, handle, self.sig_remote_cid, &cmd)
+            }
+            AVDTP_GET_CAPABILITIES | AVDTP_GET_ALL_CAPABILITIES => {
+                // Inspect SBC Media Codec capability (0x07, 0x06, 0x00, 0x00,
+                // oct0, oct1, min_bp, max_bp)
+                for i in 2..payload.len().saturating_sub(7) {
+                    if payload[i] == 0x07
+                        && payload[i + 1] == 0x06
+                        && payload[i + 2] == 0x00
+                        && payload[i + 3] == 0x00
+                    {
+                        let peer_max_bp = payload[i + 7];
+                        if peer_max_bp >= 2 {
+                            self.sbc_bitpool = peer_max_bp.min(53);
+                        }
+                        break;
+                    }
+                }
+                self.locked_sample_rate_hz = Self::LMS_LOCKED_RATE_HZ;
+                self.phase = BtA2dpSourcePhase::SettingConfiguration;
+                let lbl = self.next_tx_label();
+                // 44.1 kHz (0x20) + Joint Stereo (0x01) = 0x21;
+                // 16 blocks (0x10) + 8 subbands (0x04) + Loudness (0x01) = 0x15
+                let cmd: [u8; 14] = [
+                    lbl << 4,
+                    AVDTP_SET_CONFIGURATION,
+                    self.remote_sink_seid << 2,
+                    self.local_source_seid << 2,
+                    0x01,
+                    0x00, // Media Transport
+                    0x07,
+                    0x06,
+                    0x00,
+                    0x00,
+                    0x21,
+                    0x15,
+                    2,
+                    self.sbc_bitpool,
+                ];
+                BtA2dpSink::send_l2cap(transport, handle, self.sig_remote_cid, &cmd)
+            }
+            AVDTP_SET_CONFIGURATION => {
+                self.phase = BtA2dpSourcePhase::OpeningStream;
+                let lbl = self.next_tx_label();
+                let cmd = [lbl << 4, AVDTP_OPEN, self.remote_sink_seid << 2];
+                BtA2dpSink::send_l2cap(transport, handle, self.sig_remote_cid, &cmd)
+            }
+            AVDTP_OPEN => {
+                self.phase = BtA2dpSourcePhase::ConnectingAvdtpMedia;
+                let mut req = [0u8; 8];
+                req[0] = L2CAP_CMD_CONN_REQ;
+                req[1] = self.next_tx_label().max(1);
+                req[2..4].copy_from_slice(&4u16.to_le_bytes());
+                req[4..6].copy_from_slice(&PSM_AVDTP.to_le_bytes());
+                req[6..8].copy_from_slice(&self.media_local_cid.to_le_bytes());
+                BtA2dpSink::send_l2cap(transport, handle, L2CAP_CID_SIGNALING, &req)
+            }
+            AVDTP_START => {
+                self.phase = BtA2dpSourcePhase::Streaming;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Sends `AVDTP_START` (`0x07`) once the L2CAP media transport channel is
+    /// configured.
+    pub fn on_media_channel_configured<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        media_remote_cid: u16,
+    ) -> bool {
+        let Some(handle) = self.acl_handle else {
+            return false;
+        };
+        self.media_remote_cid = media_remote_cid;
+        self.phase = BtA2dpSourcePhase::StartingStream;
+        let lbl = self.next_tx_label();
+        let cmd = [lbl << 4, AVDTP_START, self.remote_sink_seid << 2];
+        BtA2dpSink::send_l2cap(transport, handle, self.sig_remote_cid, &cmd)
+    }
+
+    /// Wraps one or more encoded SBC frames in an A2DP RTP media packet
+    /// (12-byte RTP header + 1-byte SBC payload header + `sbc_frames`).
+    pub fn build_rtp_media_packet(
+        &mut self,
+        sbc_frames: &[u8],
+        frame_count: u8,
+        samples_per_frame: u32,
+        out: &mut [u8],
+    ) -> usize {
+        let total_len = 13 + sbc_frames.len();
+        if out.len() < total_len || frame_count == 0 {
+            return 0;
+        }
+        out[0] = 0x80; // RTP v2
+        out[1] = 0x60; // Payload Type 96 (dynamic A2DP SBC)
+        out[2..4].copy_from_slice(&self.rtp_seq_num.to_be_bytes());
+        out[4..8].copy_from_slice(&self.rtp_timestamp.to_be_bytes());
+        out[8..12].copy_from_slice(&self.rtp_ssrc.to_be_bytes());
+        out[12] = frame_count & 0x0F;
+        out[13..total_len].copy_from_slice(sbc_frames);
+
+        self.rtp_seq_num = self.rtp_seq_num.wrapping_add(1);
+        self.rtp_timestamp = self
+            .rtp_timestamp
+            .wrapping_add(u32::from(frame_count) * samples_per_frame);
+        total_len
+    }
+}
+
+// ============================================================================
 // Dual-Mode Bluetooth A2DP Sink Engine
 // ============================================================================
 
@@ -969,6 +2762,8 @@ pub struct BtA2dpSink {
     pub decoded_frames: u64,
     pub bond_table: [BondEntry; 8],
     pub bond_count: usize,
+    pub bonding_store: BondingStore,
+    pub security_policy: BtSecurityPolicy,
     pub active_handle: Option<u16>,
     pub peer_bd_addr: [u8; 6],
     pub acl_reassembly: AclReassembly,
@@ -978,6 +2773,12 @@ pub struct BtA2dpSink {
     pub avdtp_state: AvdtpStreamState,
     pub sample_rate_hz: u32,
     pub in_use: bool,
+    pub avrcp_volume_raw: u8,
+    pub avrcp_volume_pct: u8,
+    pub avrcp_vol_notify_tx_label: Option<u8>,
+    pub last_passthrough_op: Option<AvrcpOperationId>,
+    pub last_passthrough_state: Option<AvrcpButtonState>,
+    pub track_metadata: AvrcpTrackMetadata,
     pub sbc_decoder: SbcDecoder,
     pub pcm_staging: [i16; 512],
     pub pcm_bytes: [u8; 1024],
@@ -993,6 +2794,8 @@ impl BtA2dpSink {
             decoded_frames: 0,
             bond_table: [BondEntry::empty(); 8],
             bond_count: 0,
+            bonding_store: BondingStore::new(),
+            security_policy: BtSecurityPolicy::new(),
             active_handle: None,
             peer_bd_addr: [0; 6],
             acl_reassembly: AclReassembly::new(),
@@ -1002,6 +2805,12 @@ impl BtA2dpSink {
             avdtp_state: AvdtpStreamState::Idle,
             sample_rate_hz: 44100,
             in_use: false,
+            avrcp_volume_raw: 0x40,
+            avrcp_volume_pct: 50,
+            avrcp_vol_notify_tx_label: None,
+            last_passthrough_op: None,
+            last_passthrough_state: None,
+            track_metadata: AvrcpTrackMetadata::new(),
             sbc_decoder: SbcDecoder::new(),
             pcm_staging: [0; 512],
             pcm_bytes: [0; 1024],
@@ -1016,6 +2825,8 @@ impl BtA2dpSink {
         self.decoded_frames = 0;
         self.bond_table = [BondEntry::empty(); 8];
         self.bond_count = 0;
+        self.bonding_store.clear();
+        self.security_policy = BtSecurityPolicy::new();
         self.active_handle = None;
         self.peer_bd_addr = [0; 6];
         self.acl_reassembly.reset();
@@ -1025,6 +2836,12 @@ impl BtA2dpSink {
         self.avdtp_state = AvdtpStreamState::Idle;
         self.sample_rate_hz = 44100;
         self.in_use = false;
+        self.avrcp_volume_raw = 0x40;
+        self.avrcp_volume_pct = 50;
+        self.avrcp_vol_notify_tx_label = None;
+        self.last_passthrough_op = None;
+        self.last_passthrough_state = None;
+        self.track_metadata.clear();
         self.sbc_decoder.reset(8);
         self.pcm_staging.fill(0);
         self.pcm_bytes.fill(0);
@@ -1078,10 +2895,11 @@ impl BtA2dpSink {
                 Self::send_cmd(transport, OPCODE_SET_EVENT_MASK, &mask)
             }
             InitStep::WriteLocalName => {
-                // HCI_Write_Local_Name (0x0C13) -> BT_LOCAL_NAME + 0
+                // HCI_Write_Local_Name (0x0C13) -> configured device name + 0
                 let mut name_param = [0u8; 248];
-                let name = BT_LOCAL_NAME;
-                name_param[..name.len()].copy_from_slice(name);
+                let name = self.security_policy.device_name_bytes();
+                let copy_len = name.len().min(247);
+                name_param[..copy_len].copy_from_slice(&name[..copy_len]);
                 Self::send_cmd(transport, OPCODE_WRITE_LOCAL_NAME, &name_param)
             }
             InitStep::WriteClassOfDevice => {
@@ -1090,8 +2908,9 @@ impl BtA2dpSink {
                 Self::send_cmd(transport, OPCODE_WRITE_CLASS_OF_DEVICE, &cod)
             }
             InitStep::WriteSimplePairingMode => {
-                // HCI_Write_Simple_Pairing_Mode (0x0C56) -> 0x01
-                Self::send_cmd(transport, OPCODE_WRITE_SIMPLE_PAIRING_MODE, &[0x01])
+                // HCI_Write_Simple_Pairing_Mode (0x0C56) -> 0x01 or 0x00
+                let ssp_byte = [u8::from(self.security_policy.ssp_enabled())];
+                Self::send_cmd(transport, OPCODE_WRITE_SIMPLE_PAIRING_MODE, &ssp_byte)
             }
             InitStep::WriteExtendedInquiryResponse => {
                 // HCI_Write_Extended_Inquiry_Response (0x0C52): FEC_Req (1) + 240 bytes EIR
@@ -1099,12 +2918,13 @@ impl BtA2dpSink {
                 eir_param[0] = 0x00; // FEC Not Required
                 let mut offset = 1;
 
-                // AD 1: Complete Local Name (0x09) BT_LOCAL_NAME
-                let name = BT_LOCAL_NAME;
-                eir_param[offset] = (1 + name.len()) as u8;
+                // AD 1: Complete Local Name (0x09)
+                let name = self.security_policy.device_name_bytes();
+                let name_len = name.len().min(64);
+                eir_param[offset] = (1 + name_len) as u8;
                 eir_param[offset + 1] = 0x09;
-                eir_param[offset + 2..offset + 2 + name.len()].copy_from_slice(name);
-                offset += 2 + name.len();
+                eir_param[offset + 2..offset + 2 + name_len].copy_from_slice(&name[..name_len]);
+                offset += 2 + name_len;
 
                 // AD 2: Complete List of 16-bit Service Class UUIDs (0x03)
                 // 0x110B (Audio Sink), 0x110D (A2DP), 0x110E (AVRCP), 0x110C (AVRCP Target)
@@ -1172,8 +2992,9 @@ impl BtA2dpSink {
                 // Length byte + data
                 // Flags: len 2, type 0x01, value 0x1A
                 // UUID: len 3, type 0x03, 0x110B
-                // Name: len 1 + name, type 0x09, BT_LOCAL_NAME
-                let name = BT_LOCAL_NAME;
+                // Name: len 1 + name, type 0x09, configured device name
+                let full_name = self.security_policy.device_name_bytes();
+                let name = &full_name[..full_name.len().min(22)];
                 let len = 3 + 4 + (2 + name.len());
                 param[0] = len as u8;
                 let mut off = 1;
@@ -1197,7 +3018,8 @@ impl BtA2dpSink {
             }
             InitStep::LeSetScanResponseData => {
                 let mut param = [0u8; 32];
-                let name = BT_LOCAL_NAME;
+                let full_name = self.security_policy.device_name_bytes();
+                let name = &full_name[..full_name.len().min(29)];
                 param[0] = (2 + name.len()) as u8;
                 param[1] = (1 + name.len()) as u8;
                 param[2] = 0x09;
@@ -1392,18 +3214,36 @@ impl BtA2dpSink {
             }
             EVT_PIN_CODE_REQUEST => {
                 if params.len() >= 6 {
-                    let mut pin_reply = [0u8; 23];
-                    pin_reply[..6].copy_from_slice(&params[..6]);
-                    pin_reply[6] = 4; // PIN len
-                    pin_reply[7..11].copy_from_slice(b"0000");
-                    Self::send_cmd(transport, OPCODE_PIN_CODE_REQUEST_REPLY, &pin_reply);
+                    let mut bd_addr = [0u8; 6];
+                    bd_addr.copy_from_slice(&params[..6]);
+                    if self.security_policy.pairing_policy == BtPairingPolicy::BondedOnly
+                        && self.find_bond_key(&bd_addr).is_none()
+                    {
+                        Self::send_cmd(
+                            transport,
+                            OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY,
+                            &bd_addr,
+                        );
+                    } else {
+                        let pin = self.security_policy.pin_code();
+                        let pin_len = pin.len().min(16);
+                        let mut pin_reply = [0u8; 23];
+                        pin_reply[..6].copy_from_slice(&bd_addr);
+                        pin_reply[6] = pin_len as u8;
+                        pin_reply[7..7 + pin_len].copy_from_slice(&pin[..pin_len]);
+                        Self::send_cmd(transport, OPCODE_PIN_CODE_REQUEST_REPLY, &pin_reply);
+                    }
                 }
             }
             EVT_LINK_KEY_REQUEST => {
                 if params.len() >= 6 {
                     let mut bd_addr = [0u8; 6];
                     bd_addr.copy_from_slice(&params[..6]);
-                    let found_key = self.find_bond_key(&bd_addr);
+                    let found_key = self
+                        .bonding_store
+                        .lookup(&bd_addr)
+                        .map(|peer| peer.link_key)
+                        .or_else(|| self.find_bond_key(&bd_addr));
                     if let Some(key) = found_key {
                         let mut reply = [0u8; 22];
                         reply[..6].copy_from_slice(&bd_addr);
@@ -1420,21 +3260,29 @@ impl BtA2dpSink {
                     bd_addr.copy_from_slice(&params[..6]);
                     let mut key = [0u8; 16];
                     key.copy_from_slice(&params[6..22]);
-                    self.save_bond_key(&bd_addr, &key);
+                    let key_type = if params.len() >= 23 { params[22] } else { 0x04 };
+                    self.save_bond_key_with_type(&bd_addr, &key, key_type);
                 }
             }
             EVT_IO_CAPABILITY_REQUEST => {
                 if params.len() >= 6 {
                     let mut reply = [0u8; 9];
                     reply[..6].copy_from_slice(&params[..6]);
-                    reply[6] = 0x03; // NoInputNoOutput
+                    reply[6] = self.security_policy.io_capability_byte();
                     reply[7] = 0x00; // OOB data not present
-                    reply[8] = 0x04; // MITM not required - General Bonding
+                    reply[8] = self.security_policy.auth_requirements_byte();
                     Self::send_cmd(transport, OPCODE_IO_CAPABILITY_REQUEST_REPLY, &reply);
                 }
             }
             EVT_USER_CONFIRMATION_REQUEST => {
                 if params.len() >= 6 {
+                    let mut bd_addr = [0u8; 6];
+                    bd_addr.copy_from_slice(&params[..6]);
+                    if self.security_policy.pairing_policy == BtPairingPolicy::BondedOnly
+                        && self.find_bond_key(&bd_addr).is_none()
+                    {
+                        return;
+                    }
                     Self::send_cmd(transport, OPCODE_USER_CONFIRMATION_REQUEST_REPLY, &params[..6]);
                 }
             }
@@ -1442,7 +3290,10 @@ impl BtA2dpSink {
         }
     }
 
-    fn find_bond_key(&self, addr: &[u8; 6]) -> Option<[u8; 16]> {
+    pub fn find_bond_key(&self, addr: &[u8; 6]) -> Option<[u8; 16]> {
+        if let Some(peer) = self.bonding_store.peek(addr) {
+            return Some(peer.link_key);
+        }
         for bond in &self.bond_table {
             if bond.valid && &bond.bd_addr == addr {
                 return Some(bond.link_key);
@@ -1451,7 +3302,12 @@ impl BtA2dpSink {
         None
     }
 
-    fn save_bond_key(&mut self, addr: &[u8; 6], key: &[u8; 16]) {
+    pub fn save_bond_key(&mut self, addr: &[u8; 6], key: &[u8; 16]) {
+        self.save_bond_key_with_type(addr, key, 0x04);
+    }
+
+    pub fn save_bond_key_with_type(&mut self, addr: &[u8; 6], key: &[u8; 16], key_type: u8) {
+        self.bonding_store.upsert(*addr, *key, key_type);
         for bond in &mut self.bond_table {
             if bond.valid && &bond.bd_addr == addr {
                 bond.link_key = *key;
@@ -2310,6 +4166,89 @@ impl BtA2dpSink {
         }
     }
 
+    /// Locate the active AVRCP L2CAP channel `(handle, remote_cid)`.
+    pub fn avrcp_remote_cid(&self) -> Option<(u16, u16)> {
+        let handle = self.active_handle?;
+        for ch in &self.channels {
+            if ch.state != ChannelState::Closed
+                && ch.handle == handle
+                && ch.channel_type == ChannelType::Avrcp
+            {
+                return Some((handle, ch.remote_cid));
+            }
+        }
+        None
+    }
+
+    /// Transmit an AVRCP `PASS THROUGH` command (`0x7C`) to the connected peer.
+    pub fn send_avrcp_passthrough<T: HciTransport>(
+        &self,
+        transport: &mut T,
+        tx_label: u8,
+        op: AvrcpOperationId,
+        state: AvrcpButtonState,
+    ) -> bool {
+        let Some((handle, remote_cid)) = self.avrcp_remote_cid() else {
+            return false;
+        };
+        let mut pkt = [0u8; 8];
+        let n = build_avrcp_passthrough_cmd(tx_label, op, state, &mut pkt);
+        Self::send_l2cap(transport, handle, remote_cid, &pkt[..n])
+    }
+
+    /// Transmit an AVRCP `SetAbsoluteVolume` (`0x50`) command for `0..=100%`.
+    pub fn send_avrcp_absolute_volume<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        tx_label: u8,
+        volume_pct: u8,
+    ) -> bool {
+        let Some((handle, remote_cid)) = self.avrcp_remote_cid() else {
+            return false;
+        };
+        let vol_raw = volume_pct_to_avrcp_raw(volume_pct);
+        self.avrcp_volume_raw = vol_raw;
+        self.avrcp_volume_pct = volume_pct.min(100);
+        let mut pkt = [0u8; 14];
+        let n = build_avrcp_set_absolute_volume_cmd(tx_label, vol_raw, &mut pkt);
+        Self::send_l2cap(transport, handle, remote_cid, &pkt[..n])
+    }
+
+    /// Emit an AVRCP `EVENT_VOLUME_CHANGED` (`0x0D`) `CHANGED` (`0x0D`)
+    /// notification response if the peer has registered for volume updates.
+    pub fn notify_avrcp_volume_changed<T: HciTransport>(
+        &mut self,
+        transport: &mut T,
+        volume_pct: u8,
+    ) -> bool {
+        let vol_raw = volume_pct_to_avrcp_raw(volume_pct);
+        self.avrcp_volume_raw = vol_raw;
+        self.avrcp_volume_pct = volume_pct.min(100);
+        let Some(tx_label) = self.avrcp_vol_notify_tx_label.take() else {
+            return false;
+        };
+        let Some((handle, remote_cid)) = self.avrcp_remote_cid() else {
+            return false;
+        };
+        let mut pkt = [0u8; 15];
+        let n = build_avrcp_volume_notify_rsp(tx_label, AVRCP_RSP_CHANGED, vol_raw, &mut pkt);
+        Self::send_l2cap(transport, handle, remote_cid, &pkt[..n])
+    }
+
+    /// Request track metadata (`GetElementAttributes` `0x20`) from the peer.
+    pub fn request_avrcp_track_metadata<T: HciTransport>(
+        &self,
+        transport: &mut T,
+        tx_label: u8,
+    ) -> bool {
+        let Some((handle, remote_cid)) = self.avrcp_remote_cid() else {
+            return false;
+        };
+        let mut pkt = [0u8; 38];
+        let n = build_avrcp_get_element_attributes_cmd(tx_label, &mut pkt);
+        Self::send_l2cap(transport, handle, remote_cid, &pkt[..n])
+    }
+
     fn handle_avrcp<T: HciTransport>(
         &mut self,
         transport: &mut T,
@@ -2317,21 +4256,187 @@ impl BtA2dpSink {
         cid: u16,
         payload: &[u8],
     ) {
-        if payload.len() < 3 {
+        if payload.len() < 6 {
             return;
         }
 
+        let tx_label = (payload[0] >> 4) & 0x0F;
         let cr = (payload[0] >> 1) & 0x01;
+        let pid = u16::from_be_bytes([payload[1], payload[2]]);
+        if pid != AVRCP_PID {
+            return;
+        }
+        let ctype_or_rsp = payload[3] & 0x0F;
+        let opcode = payload[5];
+
         if cr == 0 {
-            // Command from peer: reply with Response (cr = 1)
+            // Command from peer (Controller -> Target)
+            if opcode == AVRCP_OPCODE_PASS_THROUGH {
+                if let Some((_, _, op, state)) = parse_avrcp_passthrough(payload) {
+                    self.last_passthrough_op = Some(op);
+                    self.last_passthrough_state = Some(state);
+                    let mut rsp = [0u8; 8];
+                    let n = build_avrcp_passthrough_rsp(
+                        tx_label,
+                        op,
+                        state,
+                        AVRCP_RSP_ACCEPTED,
+                        &mut rsp,
+                    );
+                    Self::send_l2cap(transport, handle, cid, &rsp[..n]);
+                    return;
+                }
+            } else if opcode == AVRCP_OPCODE_VENDOR_DEPENDENT && payload.len() >= 13 {
+                if payload[6..9] == BT_SIG_COMPANY_ID {
+                    let pdu_id = payload[9];
+                    let param_len =
+                        u16::from_be_bytes([payload[11], payload[12]]) as usize;
+                    let params = &payload[13..payload.len().min(13 + param_len)];
+
+                    match pdu_id {
+                        AVRCP_PDU_SET_ABSOLUTE_VOLUME if !params.is_empty() => {
+                            let vol_raw = params[0] & 0x7F;
+                            self.avrcp_volume_raw = vol_raw;
+                            self.avrcp_volume_pct = avrcp_raw_to_volume_pct(vol_raw);
+                            let mut rsp = [0u8; 14];
+                            let n = build_avrcp_set_absolute_volume_rsp(
+                                tx_label,
+                                vol_raw,
+                                &mut rsp,
+                            );
+                            Self::send_l2cap(transport, handle, cid, &rsp[..n]);
+                            return;
+                        }
+                        AVRCP_PDU_REGISTER_NOTIFICATION if !params.is_empty() => {
+                            let event_id = params[0];
+                            if event_id == AVRCP_EVENT_VOLUME_CHANGED {
+                                self.avrcp_vol_notify_tx_label = Some(tx_label);
+                                let mut rsp = [0u8; 15];
+                                let n = build_avrcp_volume_notify_rsp(
+                                    tx_label,
+                                    AVRCP_RSP_INTERIM,
+                                    self.avrcp_volume_raw,
+                                    &mut rsp,
+                                );
+                                Self::send_l2cap(transport, handle, cid, &rsp[..n]);
+                                return;
+                            } else if event_id == AVRCP_EVENT_PLAYBACK_STATUS_CHANGED {
+                                let status_byte = if self.avdtp_state == AvdtpStreamState::Streaming
+                                {
+                                    0x01 // PLAYING
+                                } else {
+                                    0x00 // STOPPED
+                                };
+                                let rsp = [
+                                    (tx_label << 4) | 0x02,
+                                    (AVRCP_PID >> 8) as u8,
+                                    AVRCP_PID as u8,
+                                    AVRCP_RSP_INTERIM,
+                                    AVRCP_SUBUNIT_PANEL,
+                                    AVRCP_OPCODE_VENDOR_DEPENDENT,
+                                    BT_SIG_COMPANY_ID[0],
+                                    BT_SIG_COMPANY_ID[1],
+                                    BT_SIG_COMPANY_ID[2],
+                                    AVRCP_PDU_REGISTER_NOTIFICATION,
+                                    0x00,
+                                    0x00,
+                                    0x02,
+                                    AVRCP_EVENT_PLAYBACK_STATUS_CHANGED,
+                                    status_byte,
+                                ];
+                                Self::send_l2cap(transport, handle, cid, &rsp);
+                                return;
+                            }
+                        }
+                        AVRCP_PDU_GET_ELEMENT_ATTRIBUTES => {
+                            let mut rsp = [0u8; 320];
+                            let n = build_avrcp_get_element_attributes_rsp(
+                                tx_label,
+                                &self.track_metadata,
+                                &mut rsp,
+                            );
+                            if n > 0 {
+                                Self::send_l2cap(transport, handle, cid, &rsp[..n]);
+                                return;
+                            }
+                        }
+                        AVRCP_PDU_GET_CAPABILITIES if !params.is_empty() => {
+                            let cap_id = params[0];
+                            if cap_id == 0x03 {
+                                let rsp = [
+                                    (tx_label << 4) | 0x02,
+                                    (AVRCP_PID >> 8) as u8,
+                                    AVRCP_PID as u8,
+                                    AVRCP_RSP_STABLE,
+                                    AVRCP_SUBUNIT_PANEL,
+                                    AVRCP_OPCODE_VENDOR_DEPENDENT,
+                                    BT_SIG_COMPANY_ID[0],
+                                    BT_SIG_COMPANY_ID[1],
+                                    BT_SIG_COMPANY_ID[2],
+                                    AVRCP_PDU_GET_CAPABILITIES,
+                                    0x00,
+                                    0x00,
+                                    0x05,
+                                    0x03,
+                                    0x03,
+                                    AVRCP_EVENT_PLAYBACK_STATUS_CHANGED,
+                                    AVRCP_EVENT_TRACK_CHANGED,
+                                    AVRCP_EVENT_VOLUME_CHANGED,
+                                ];
+                                Self::send_l2cap(transport, handle, cid, &rsp);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Fallback generic response
             let mut rsp = [0u8; 64];
             let len = payload.len().min(64);
             rsp[..len].copy_from_slice(&payload[..len]);
-            rsp[0] = (payload[0] & 0xF0) | 0x02; // Response (cr = 1)
-            if len >= 4 {
-                rsp[3] = 0x09; // Accepted
-            }
+            rsp[0] = (payload[0] & 0xF0) | 0x02;
+            rsp[3] = if ctype_or_rsp == AVRCP_CTYPE_STATUS {
+                AVRCP_RSP_STABLE
+            } else {
+                AVRCP_RSP_ACCEPTED
+            };
             Self::send_l2cap(transport, handle, cid, &rsp[..len]);
+        } else {
+            // Response from peer (Target -> Controller)
+            if opcode == AVRCP_OPCODE_VENDOR_DEPENDENT
+                && payload.len() >= 13
+                && payload[6..9] == BT_SIG_COMPANY_ID
+            {
+                let pdu_id = payload[9];
+                let param_len = u16::from_be_bytes([payload[11], payload[12]]) as usize;
+                let params = &payload[13..payload.len().min(13 + param_len)];
+
+                match pdu_id {
+                    AVRCP_PDU_SET_ABSOLUTE_VOLUME if !params.is_empty() => {
+                        let vol_raw = params[0] & 0x7F;
+                        self.avrcp_volume_raw = vol_raw;
+                        self.avrcp_volume_pct = avrcp_raw_to_volume_pct(vol_raw);
+                    }
+                    AVRCP_PDU_REGISTER_NOTIFICATION if params.len() >= 2 => {
+                        if params[0] == AVRCP_EVENT_VOLUME_CHANGED
+                            && (ctype_or_rsp == AVRCP_RSP_INTERIM
+                                || ctype_or_rsp == AVRCP_RSP_CHANGED)
+                        {
+                            let vol_raw = params[1] & 0x7F;
+                            self.avrcp_volume_raw = vol_raw;
+                            self.avrcp_volume_pct = avrcp_raw_to_volume_pct(vol_raw);
+                        }
+                    }
+                    AVRCP_PDU_GET_ELEMENT_ATTRIBUTES => {
+                        if let Some(meta) = parse_avrcp_element_attributes_rsp(payload) {
+                            self.track_metadata = meta;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -3061,5 +5166,519 @@ mod tests {
 
         sink.process_packet(&mut transport, &oversized_acl, |_, _| {});
         assert!(!sink.acl_reassembly.active, "Oversized L2CAP PDU must abort reassembly");
+    }
+
+    #[test]
+    fn test_avrcp_passthrough_and_absolute_volume_and_notifications() {
+        assert_eq!(avrcp_raw_to_volume_pct(0x00), 0);
+        assert_eq!(avrcp_raw_to_volume_pct(0x7F), 100);
+        assert_eq!(volume_pct_to_avrcp_raw(0), 0x00);
+        assert_eq!(volume_pct_to_avrcp_raw(100), 0x7F);
+        for pct in [0u8, 25, 50, 75, 100] {
+            let raw = volume_pct_to_avrcp_raw(pct);
+            assert_eq!(avrcp_raw_to_volume_pct(raw), pct);
+        }
+
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.active_handle = Some(0x0040);
+
+        // Open AVRCP L2CAP channel (PSM 0x0017, peer SCID 0x0070)
+        let avrcp_conn = [
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            12,
+            0,
+            8,
+            0,
+            0x01,
+            0x00,
+            L2CAP_CMD_CONN_REQ,
+            0x30,
+            4,
+            0,
+            0x17,
+            0x00,
+            0x70,
+            0x00,
+        ];
+        sink.process_packet(&mut transport, &avrcp_conn, |_, _| {});
+        let avrcp_cid = sink.channels[0].local_cid;
+        assert_eq!(sink.channels[0].channel_type, ChannelType::Avrcp);
+
+        // Helper to wrap an AVCTP/AVRCP payload in an L2CAP ACL packet
+        let wrap_avrcp = |cid: u16, pdu: &[u8]| -> Vec<u8> {
+            let mut pkt = Vec::new();
+            pkt.push(HCI_PKT_ACL);
+            pkt.extend_from_slice(&0x2040u16.to_le_bytes());
+            let l2cap_len = pdu.len() as u16;
+            pkt.extend_from_slice(&(4 + l2cap_len).to_le_bytes());
+            pkt.extend_from_slice(&l2cap_len.to_le_bytes());
+            pkt.extend_from_slice(&cid.to_le_bytes());
+            pkt.extend_from_slice(pdu);
+            pkt
+        };
+
+        // 1. Test PassThrough commands for Play, Pause, Stop, Next, Prev
+        let ops = [
+            AvrcpOperationId::Play,
+            AvrcpOperationId::Pause,
+            AvrcpOperationId::Stop,
+            AvrcpOperationId::NEXT,
+            AvrcpOperationId::PREV,
+        ];
+        for (idx, &op) in ops.iter().enumerate() {
+            let mut cmd = [0u8; 8];
+            let cmd_len = build_avrcp_passthrough_cmd(
+                idx as u8,
+                op,
+                AvrcpButtonState::Pressed,
+                &mut cmd,
+            );
+            let acl = wrap_avrcp(avrcp_cid, &cmd[..cmd_len]);
+            sink.process_packet(&mut transport, &acl, |_, _| {});
+            assert_eq!(sink.last_passthrough_op, Some(op));
+            assert_eq!(sink.last_passthrough_state, Some(AvrcpButtonState::Pressed));
+
+            let last_tx = transport.tx_packets.last().expect("passthrough rsp");
+            let parsed = parse_avrcp_passthrough(&last_tx[9..]).expect("valid passthrough rsp");
+            assert_eq!(parsed.0, (idx as u8) & 0x0F);
+            assert_eq!(parsed.1, AvrcpMessageKind::Response);
+            assert_eq!(last_tx[9 + 3], AVRCP_RSP_ACCEPTED);
+            assert_eq!(parsed.2, op);
+            assert_eq!(parsed.3, AvrcpButtonState::Pressed);
+        }
+
+        // 2. Test SetAbsoluteVolume (0x50) command from peer
+        let mut vol_cmd = [0u8; 14];
+        let vol_len = build_avrcp_set_absolute_volume_cmd(
+            5,
+            volume_pct_to_avrcp_raw(80),
+            &mut vol_cmd,
+        );
+        let acl_vol = wrap_avrcp(avrcp_cid, &vol_cmd[..vol_len]);
+        sink.process_packet(&mut transport, &acl_vol, |_, _| {});
+        assert_eq!(sink.avrcp_volume_pct, 80);
+        let last_tx = transport.tx_packets.last().expect("set_abs_vol rsp");
+        assert_eq!(last_tx[9 + 3], AVRCP_RSP_ACCEPTED);
+        assert_eq!(last_tx[9 + 9], AVRCP_PDU_SET_ABSOLUTE_VOLUME);
+        assert_eq!(avrcp_raw_to_volume_pct(last_tx[9 + 13]), 80);
+
+        // 3. Test RegisterNotification (0x31) EVENT_VOLUME_CHANGED (0x0D)
+        let mut reg_cmd = [0u8; 18];
+        let reg_len = build_avrcp_register_volume_notify_cmd(7, &mut reg_cmd);
+        let acl_reg = wrap_avrcp(avrcp_cid, &reg_cmd[..reg_len]);
+        sink.process_packet(&mut transport, &acl_reg, |_, _| {});
+        assert_eq!(sink.avrcp_vol_notify_tx_label, Some(7));
+        let interim_tx = transport.tx_packets.last().expect("interim rsp");
+        assert_eq!(interim_tx[9 + 3], AVRCP_RSP_INTERIM);
+        assert_eq!(interim_tx[9 + 13], AVRCP_EVENT_VOLUME_CHANGED);
+        assert_eq!(avrcp_raw_to_volume_pct(interim_tx[9 + 14]), 80);
+
+        // Trigger local volume change -> emits CHANGED (0x0D) response
+        assert!(sink.notify_avrcp_volume_changed(&mut transport, 40));
+        assert_eq!(sink.avrcp_vol_notify_tx_label, None);
+        let changed_tx = transport.tx_packets.last().expect("changed rsp");
+        assert_eq!(changed_tx[9 + 3], AVRCP_RSP_CHANGED);
+        assert_eq!(changed_tx[9 + 13], AVRCP_EVENT_VOLUME_CHANGED);
+        assert_eq!(avrcp_raw_to_volume_pct(changed_tx[9 + 14]), 40);
+    }
+
+    #[test]
+    fn test_avrcp_get_element_attributes_track_metadata() {
+        let meta = AvrcpTrackMetadata::with_metadata(
+            "Strobe",
+            "deadmau5",
+            "For Lack of a Better Name",
+            637_000,
+        );
+
+        let mut rsp_buf = [0u8; 320];
+        let rsp_len = build_avrcp_get_element_attributes_rsp(3, &meta, &mut rsp_buf);
+        assert!(rsp_len > 20);
+
+        let parsed_meta = parse_avrcp_element_attributes_rsp(&rsp_buf[..rsp_len])
+            .expect("parse element attributes rsp");
+        assert_eq!(parsed_meta.title(), "Strobe");
+        assert_eq!(parsed_meta.artist(), "deadmau5");
+        assert_eq!(parsed_meta.album(), "For Lack of a Better Name");
+        assert_eq!(parsed_meta.duration_ms(), 637_000);
+
+        // Test end-to-end over BtA2dpSink AVRCP channel (Target & Controller roles)
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.active_handle = Some(0x0040);
+        sink.track_metadata = meta;
+
+        let avrcp_conn = [
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            12,
+            0,
+            8,
+            0,
+            0x01,
+            0x00,
+            L2CAP_CMD_CONN_REQ,
+            0x31,
+            4,
+            0,
+            0x17,
+            0x00,
+            0x71,
+            0x00,
+        ];
+        sink.process_packet(&mut transport, &avrcp_conn, |_, _| {});
+        let avrcp_cid = sink.channels[0].local_cid;
+
+        let mut req_pdu = [0u8; 38];
+        let req_len = build_avrcp_get_element_attributes_cmd(9, &mut req_pdu);
+        let mut acl_req = Vec::new();
+        acl_req.push(HCI_PKT_ACL);
+        acl_req.extend_from_slice(&0x2040u16.to_le_bytes());
+        acl_req.extend_from_slice(&((4 + req_len) as u16).to_le_bytes());
+        acl_req.extend_from_slice(&(req_len as u16).to_le_bytes());
+        acl_req.extend_from_slice(&avrcp_cid.to_le_bytes());
+        acl_req.extend_from_slice(&req_pdu[..req_len]);
+
+        sink.process_packet(&mut transport, &acl_req, |_, _| {});
+        let target_rsp = transport.tx_packets.last().expect("element attributes rsp").clone();
+
+        // Feed target response into a second sink acting as Controller
+        let mut controller_sink = BtA2dpSink::new();
+        controller_sink.active_handle = Some(0x0040);
+        controller_sink.process_packet(&mut transport, &avrcp_conn, |_, _| {});
+        let ctrl_cid = controller_sink.channels[0].local_cid;
+        let mut rx_rsp = target_rsp;
+        rx_rsp[7..9].copy_from_slice(&ctrl_cid.to_le_bytes());
+        controller_sink.process_packet(&mut transport, &rx_rsp, |_, _| {});
+        assert_eq!(controller_sink.track_metadata.title(), "Strobe");
+        assert_eq!(controller_sink.track_metadata.artist(), "deadmau5");
+        assert_eq!(
+            controller_sink.track_metadata.album(),
+            "For Lack of a Better Name"
+        );
+        assert_eq!(controller_sink.track_metadata.duration_ms(), 637_000);
+    }
+
+    #[test]
+    fn test_bonding_store_lru_and_flash_journal_persistence_and_security_policy() {
+        let mut store = BondingStore::new();
+        let addr1 = [0x01, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let addr2 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let addr3 = [0x03, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let addr4 = [0x04, 0x00, 0x00, 0x00, 0x00, 0x04];
+        let addr5 = [0x05, 0x00, 0x00, 0x00, 0x00, 0x05];
+
+        store.upsert(addr1, [0x11; 16], 0x04);
+        store.upsert(addr2, [0x22; 16], 0x04);
+        store.upsert(addr3, [0x33; 16], 0x04);
+        store.upsert(addr4, [0x44; 16], 0x04);
+        assert_eq!(store.count(), 4);
+
+        // Touch addr1 so addr2 becomes the least-recently-used entry
+        assert_eq!(store.lookup(&addr1).map(|p| p.link_key), Some([0x11; 16]));
+
+        // Insert addr5 -> must evict addr2
+        store.upsert(addr5, [0x55; 16], 0x05);
+        assert_eq!(store.count(), 4);
+        assert_eq!(store.peek(&addr2), None);
+        assert_eq!(store.peek(&addr1).map(|p| p.link_key), Some([0x11; 16]));
+        assert_eq!(store.peek(&addr3).map(|p| p.link_key), Some([0x33; 16]));
+        assert_eq!(store.peek(&addr4).map(|p| p.link_key), Some([0x44; 16]));
+        assert_eq!(store.peek(&addr5).map(|p| p.link_key), Some([0x55; 16]));
+
+        // Hex round-trip
+        let mut hex_buf = [0u8; 200];
+        let hex_len = store.encode_hex(&mut hex_buf);
+        let hex_str = core::str::from_utf8(&hex_buf[..hex_len]).expect("utf8 hex");
+        let from_hex = BondingStore::decode_hex(hex_str).expect("hex decode");
+        assert_eq!(from_hex.count(), 4);
+        assert_eq!(from_hex.peek(&addr1).map(|p| p.link_key), Some([0x11; 16]));
+        assert_eq!(from_hex.peek(&addr5).map(|p| p.link_key), Some([0x55; 16]));
+
+        // FlashJournal MemConfigStore round-trip under key "bt.bonds"
+        let mut kv: MemConfigStore<8> = MemConfigStore::new();
+        store.save_to_storage(&mut kv).expect("save to MemConfigStore");
+        let loaded_kv = BondingStore::load_from_storage(&kv).expect("load from MemConfigStore");
+        assert_eq!(loaded_kv.count(), 4);
+        assert_eq!(loaded_kv.peek(&addr1).map(|p| p.link_key), Some([0x11; 16]));
+        assert_eq!(loaded_kv.peek(&addr5).map(|p| p.link_key), Some([0x55; 16]));
+
+        // FlashJournal raw 4 KB sector round-trip
+        let mut sector = [0xFFu8; 4096];
+        let mut kv_out: MemConfigStore<8> = MemConfigStore::new();
+        store
+            .save_to_journal_sector(&mut kv_out, &mut sector, 1)
+            .expect("save to journal sector");
+        let mut kv_in: MemConfigStore<8> = MemConfigStore::new();
+        let loaded_sector = BondingStore::load_from_journal_sector(&sector, &mut kv_in)
+            .expect("load from journal sector");
+        assert_eq!(loaded_sector.count(), 4);
+        assert_eq!(
+            loaded_sector.peek(&addr1).map(|p| p.link_key),
+            Some([0x11; 16])
+        );
+        assert_eq!(
+            loaded_sector.peek(&addr5).map(|p| p.link_key),
+            Some([0x55; 16])
+        );
+
+        // Test BtSecurityPolicy BondedOnly rejection vs bonded acceptance
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.bonding_store = loaded_sector;
+        sink.security_policy.update_device_name("LOUDER-BT");
+        sink.security_policy.update_pin_code(b"1234");
+        sink.security_policy.pairing_policy = BtPairingPolicy::BondedOnly;
+
+        // Unknown peer PIN request -> Rejected
+        let pin_req_unbonded = [
+            HCI_PKT_EVENT,
+            EVT_PIN_CODE_REQUEST,
+            6,
+            0x99,
+            0x88,
+            0x77,
+            0x66,
+            0x55,
+            0x44,
+        ];
+        sink.process_packet(&mut transport, &pin_req_unbonded, |_, _| {});
+        let last_cmd = transport.tx_packets.last().expect("pin neg reply");
+        assert_eq!(
+            u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
+            OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY
+        );
+
+        // Bonded peer (addr1) PIN request -> Accepted with configured PIN "1234"
+        let pin_req_bonded = [
+            HCI_PKT_EVENT,
+            EVT_PIN_CODE_REQUEST,
+            6,
+            addr1[0],
+            addr1[1],
+            addr1[2],
+            addr1[3],
+            addr1[4],
+            addr1[5],
+        ];
+        sink.process_packet(&mut transport, &pin_req_bonded, |_, _| {});
+        let last_cmd = transport.tx_packets.last().expect("pin reply");
+        assert_eq!(
+            u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
+            OPCODE_PIN_CODE_REQUEST_REPLY
+        );
+        assert_eq!(&last_cmd[11..15], b"1234");
+    }
+
+    #[test]
+    fn test_sbc_encoder_decoder_roundtrip_stereo_and_joint_stereo() {
+        for mode in [SbcChannelMode::Stereo, SbcChannelMode::JointStereo] {
+            let mut encoder = SbcEncoder::new();
+            encoder.channel_mode = mode;
+            encoder.bitpool = 53;
+            let mut decoder = SbcDecoder::new();
+
+            let num_frames = 8;
+            let total_samples = num_frames * 128;
+            let mut pcm_in = vec![0i16; total_samples * 2];
+            for i in 0..total_samples {
+                let t = i as f64 / 44100.0;
+                let l = (16000.0 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()) as i16;
+                let r = (16000.0 * (2.0 * std::f64::consts::PI * 2000.0 * t).cos()) as i16;
+                pcm_in[i * 2] = l;
+                pcm_in[i * 2 + 1] = r;
+            }
+
+            let mut pcm_out = Vec::with_capacity(total_samples * 2);
+            let mut sbc_buf = [0u8; 256];
+            let mut dec_buf = [0i16; 512];
+
+            for f in 0..num_frames {
+                let slice = &pcm_in[f * 256..(f + 1) * 256];
+                let encoded_len = encoder
+                    .encode_frame(slice, &mut sbc_buf)
+                    .expect("encode_frame succeeds");
+                assert_eq!(sbc_buf[0], SBC_SYNCWORD);
+                let expected_len = if mode == SbcChannelMode::JointStereo {
+                    119
+                } else {
+                    118
+                };
+                assert_eq!(encoded_len, expected_len);
+
+                let (consumed, stereo_frames) = decoder
+                    .decode_frame(&sbc_buf[..encoded_len], &mut dec_buf)
+                    .expect("decode_frame succeeds");
+                assert_eq!(consumed, encoded_len);
+                assert_eq!(stereo_frames, 128);
+                pcm_out.extend_from_slice(&dec_buf[..256]);
+            }
+
+            // Combined analysis + synthesis polyphase filterbank group delay is
+            // 72 stereo samples (9 blocks * 8 subbands). Verify SNR after warm-up.
+            let lag = 72;
+            let start = 256;
+            let end = total_samples - lag;
+            let mut sig_power = 0.0f64;
+            let mut err_power = 0.0f64;
+            for i in start..end {
+                let ref_l = pcm_in[(i - lag) * 2] as f64;
+                let ref_r = pcm_in[(i - lag) * 2 + 1] as f64;
+                let out_l = pcm_out[i * 2] as f64;
+                let out_r = pcm_out[i * 2 + 1] as f64;
+                sig_power += ref_l * ref_l + ref_r * ref_r;
+                err_power += (ref_l - out_l).powi(2) + (ref_r - out_r).powi(2);
+            }
+            let snr_db = 10.0 * (sig_power / err_power.max(1.0)).log10();
+            assert!(
+                snr_db > 45.0,
+                "Expected SBC round-trip SNR > 45 dB for {:?}, got {:.2} dB",
+                mode,
+                snr_db
+            );
+        }
+    }
+
+    #[test]
+    fn test_a2dp_source_eir_discovery_and_avdtp_initiator_and_rtp_media() {
+        let mut transport = MockHciTransport::new();
+        let mut source = BtA2dpSourceState::new();
+        source.update_target_name("JBL Flip 6");
+
+        // 1. Start Inquiry
+        assert!(source.start_inquiry(&mut transport, 5));
+        assert_eq!(source.phase, BtA2dpSourcePhase::Inquiring);
+        let inq_cmd = transport.tx_packets.last().expect("inquiry cmd");
+        assert_eq!(u16::from_le_bytes([inq_cmd[1], inq_cmd[2]]), OPCODE_INQUIRY);
+
+        // 2. Simulate Extended Inquiry Result (0x2F) for "JBL Flip 6"
+        let peer_mac = [0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33];
+        let mut eir_params = [0u8; 40];
+        eir_params[0] = 1; // Num_Responses
+        eir_params[1..7].copy_from_slice(&peer_mac);
+        eir_params[7] = 0x01; // Page_Scan_Repetition_Mode = R1
+        eir_params[12] = 0x34;
+        eir_params[13] = 0x12; // Clock_Offset = 0x1234
+        eir_params[14] = (-55i8) as u8; // RSSI
+        // EIR data starts at eir_params[15..]
+        // AD1: Complete Local Name "JBL Flip 6" (10 bytes)
+        eir_params[15] = 11;
+        eir_params[16] = 0x09;
+        eir_params[17..27].copy_from_slice(b"JBL Flip 6");
+        // AD2: 16-bit Service Class UUIDs: 0x110B (Audio Sink)
+        eir_params[27] = 3;
+        eir_params[28] = 0x03;
+        eir_params[29] = 0x0B;
+        eir_params[30] = 0x11;
+
+        assert!(eir_has_audio_sink_uuid(&eir_params[15..]));
+        assert!(source.on_extended_inquiry_result(&mut transport, &eir_params));
+        assert_eq!(source.phase, BtA2dpSourcePhase::ConnectingAcl);
+        assert_eq!(source.matched_bd_addr, Some(peer_mac));
+        let create_conn = transport.tx_packets.last().expect("create conn");
+        assert_eq!(
+            u16::from_le_bytes([create_conn[1], create_conn[2]]),
+            OPCODE_CREATE_CONNECTION
+        );
+
+        // 3. Transition to ACL connected -> opens L2CAP AVDTP Signaling (PSM 0x0019)
+        assert!(source.on_acl_connected(&mut transport, 0x0040, 1));
+        assert_eq!(source.phase, BtA2dpSourcePhase::ConnectingAvdtpSignaling);
+
+        // 4. Start AVDTP discovery on remote signaling CID 0x0080
+        assert!(source.start_avdtp_discovery(&mut transport, 0x0080));
+        assert_eq!(source.phase, BtA2dpSourcePhase::DiscoveringSeps);
+
+        // 5. Step through AVDTP Discover -> GetCapabilities -> SetConfiguration -> Open
+        let disc_rsp = [0x12, AVDTP_DISCOVER, 0x08, 0x08]; // SEID 2, Audio Sink
+        assert!(source.handle_avdtp_response(&mut transport, &disc_rsp));
+        assert_eq!(source.phase, BtA2dpSourcePhase::GettingCapabilities);
+        assert_eq!(source.remote_sink_seid, 2);
+
+        let caps_rsp = [
+            0x22,
+            AVDTP_GET_CAPABILITIES,
+            0x01,
+            0x00,
+            0x07,
+            0x06,
+            0x00,
+            0x00,
+            0x21,
+            0x15,
+            2,
+            53,
+        ];
+        assert!(source.handle_avdtp_response(&mut transport, &caps_rsp));
+        assert_eq!(source.phase, BtA2dpSourcePhase::SettingConfiguration);
+
+        let set_cfg_rsp = [0x32, AVDTP_SET_CONFIGURATION];
+        assert!(source.handle_avdtp_response(&mut transport, &set_cfg_rsp));
+        assert_eq!(source.phase, BtA2dpSourcePhase::OpeningStream);
+
+        let open_rsp = [0x42, AVDTP_OPEN];
+        assert!(source.handle_avdtp_response(&mut transport, &open_rsp));
+        assert_eq!(source.phase, BtA2dpSourcePhase::ConnectingAvdtpMedia);
+
+        // 6. Media L2CAP channel configured (remote CID 0x0081) -> sends AVDTP Start
+        assert!(source.on_media_channel_configured(&mut transport, 0x0081));
+        assert_eq!(source.phase, BtA2dpSourcePhase::StartingStream);
+
+        // 7. AVDTP Start Response -> Streaming!
+        let start_rsp = [0x52, AVDTP_START];
+        assert!(source.handle_avdtp_response(&mut transport, &start_rsp));
+        assert!(source.is_streaming());
+
+        // 8. Encode 128 stereo PCM frames and wrap in an A2DP RTP media packet
+        let mut pcm_frame = [0i16; 256];
+        for i in 0..128 {
+            pcm_frame[i * 2] = ((i as i16) * 200) - 12000;
+            pcm_frame[i * 2 + 1] = 12000 - ((i as i16) * 200);
+        }
+        let mut encoder = SbcEncoder::new();
+        let mut sbc_frame = [0u8; 128];
+        let sbc_len = encoder
+            .encode_frame(&pcm_frame, &mut sbc_frame)
+            .expect("SBC encode");
+        let mut media_payload = [0u8; 256];
+        let media_len = source.build_rtp_media_packet(
+            &sbc_frame[..sbc_len],
+            1,
+            128,
+            &mut media_payload,
+        );
+        assert!(media_len > 13);
+
+        // Feed the generated RTP/SBC payload into BtA2dpSink
+        let mut sink = BtA2dpSink::new();
+        sink.active_handle = Some(0x0040);
+        sink.avdtp_state = AvdtpStreamState::Streaming;
+        sink.channels[0] = L2capChannel {
+            local_cid: 0x0081,
+            remote_cid: 0x0049,
+            psm: PSM_AVDTP,
+            state: ChannelState::Configured,
+            channel_type: ChannelType::AvdtpMedia,
+            handle: 0x0040,
+            outbound_config_sent: true,
+        };
+        let mut acl_media = Vec::new();
+        acl_media.push(HCI_PKT_ACL);
+        acl_media.extend_from_slice(&0x2040u16.to_le_bytes());
+        acl_media.extend_from_slice(&((4 + media_len) as u16).to_le_bytes());
+        acl_media.extend_from_slice(&(media_len as u16).to_le_bytes());
+        acl_media.extend_from_slice(&0x0081u16.to_le_bytes());
+        acl_media.extend_from_slice(&media_payload[..media_len]);
+
+        let mut decoded_bytes = 0;
+        sink.process_packet(&mut transport, &acl_media, |pcm, rate| {
+            decoded_bytes += pcm.len();
+            assert_eq!(rate, 44100);
+        });
+        assert_eq!(decoded_bytes, 512);
     }
 }

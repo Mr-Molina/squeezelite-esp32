@@ -1,7 +1,8 @@
 //! RTSP 1.0 protocol handler and SDP parser for AirPlay 1 (RAOP).
 //!
 //! Handles TCP port 5000 requests: OPTIONS, ANNOUNCE, SETUP, RECORD,
-//! SET_PARAMETER, FLUSH, TEARDOWN, and generates conforming responses.
+//! SET_PARAMETER (volume, progress, binary DMAP metadata, JPEG/PNG artwork),
+//! FLUSH, TEARDOWN, and generates conforming responses.
 
 use alloc::format;
 use alloc::string::String;
@@ -14,6 +15,14 @@ use crate::crypto::base64_decode;
 use crate::crypto::base64_encode;
 use crate::crypto::CryptoError;
 use crate::crypto::RsaPrivateKey;
+use crate::dacp::DacpClient;
+use crate::dacp::DacpCommand;
+use crate::dmap::ArtworkMimeType;
+use crate::dmap::CoverArtwork;
+use crate::dmap::DmapError;
+use crate::dmap::DmapMetadata;
+use crate::dmap::TrackProgress;
+use crate::rtp::parse_rtp_info;
 
 /// RTSP protocol errors.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,19 +44,28 @@ pub enum RtspError {
     InvalidSessionState,
     /// Cryptographic error during key decryption or response generation.
     Crypto(CryptoError),
+    /// Binary DMAP metadata parsing error.
+    Dmap(DmapError),
 }
 
 impl fmt::Display for RtspError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MalformedRequestLine => write!(f, "Malformed RTSP request line"),
+            Self::MalformedRequestLine => {
+                write!(f, "Malformed RTSP request line")
+            }
             Self::MalformedHeader => write!(f, "Malformed RTSP header line"),
             Self::UnknownMethod => write!(f, "Unknown RTSP method"),
             Self::MissingCSeq => write!(f, "Missing CSeq header"),
-            Self::InvalidContentLength => write!(f, "Invalid Content-Length header"),
+            Self::InvalidContentLength => {
+                write!(f, "Invalid Content-Length header")
+            }
             Self::MalformedSdp => write!(f, "Malformed SDP payload"),
-            Self::InvalidSessionState => write!(f, "Invalid RTSP session state"),
+            Self::InvalidSessionState => {
+                write!(f, "Invalid RTSP session state")
+            }
             Self::Crypto(e) => write!(f, "Crypto error: {}", e),
+            Self::Dmap(e) => write!(f, "DMAP error: {}", e),
         }
     }
 }
@@ -55,6 +73,12 @@ impl fmt::Display for RtspError {
 impl From<CryptoError> for RtspError {
     fn from(err: CryptoError) -> Self {
         Self::Crypto(err)
+    }
+}
+
+impl From<DmapError> for RtspError {
+    fn from(err: DmapError) -> Self {
+        Self::Dmap(err)
     }
 }
 
@@ -138,12 +162,15 @@ impl<'a> RtspRequest<'a> {
         let body = &buffer[sep + 4..];
 
         let mut lines = header_str.lines();
-        let request_line = lines.next().ok_or(RtspError::MalformedRequestLine)?;
+        let request_line =
+            lines.next().ok_or(RtspError::MalformedRequestLine)?;
 
         let mut req_parts = request_line.split_whitespace();
-        let method_str = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
+        let method_str =
+            req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
         let uri = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
-        let version = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
+        let version =
+            req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
 
         if !version.starts_with("RTSP/1.") {
             return Err(RtspError::MalformedRequestLine);
@@ -165,7 +192,8 @@ impl<'a> RtspRequest<'a> {
             if trimmed.is_empty() {
                 continue;
             }
-            let colon_idx = trimmed.find(':').ok_or(RtspError::MalformedHeader)?;
+            let colon_idx =
+                trimmed.find(':').ok_or(RtspError::MalformedHeader)?;
             let key = trimmed[..colon_idx].trim();
             let value = trimmed[colon_idx + 1..].trim();
 
@@ -235,10 +263,12 @@ impl SdpSession {
             }
 
             if let Some(rest) = trimmed.strip_prefix("a=rsaaeskey:") {
-                let decoded = base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
+                let decoded =
+                    base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
                 session.rsaaeskey = Some(decoded);
             } else if let Some(rest) = trimmed.strip_prefix("a=aesiv:") {
-                let decoded = base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
+                let decoded =
+                    base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
                 if decoded.len() == 16 {
                     let mut iv = [0u8; 16];
                     iv.copy_from_slice(&decoded);
@@ -296,16 +326,23 @@ impl RtspResponse {
     pub fn announce(cseq: u32, apple_response: Option<&str>) -> Self {
         let mut resp = Self::ok(cseq);
         if let Some(auth) = apple_response {
-            resp.headers.push(("Apple-Response".to_string(), auth.to_string()));
+            resp.headers
+                .push(("Apple-Response".to_string(), auth.to_string()));
         }
         resp
     }
 
     /// Builds standard SETUP response with ports and session ID.
-    pub fn setup(cseq: u32, server_port: u16, control_port: u16, timing_port: u16) -> Self {
+    pub fn setup(
+        cseq: u32,
+        server_port: u16,
+        control_port: u16,
+        timing_port: u16,
+    ) -> Self {
         let mut resp = Self::ok(cseq);
         let transport = format!(
-            "RTP/AVP/UDP;unicast;mode=record;server_port={};control_port={};timing_port={}",
+            "RTP/AVP/UDP;unicast;mode=record;\
+             server_port={};control_port={};timing_port={}",
             server_port, control_port, timing_port
         );
         resp.headers.push(("Transport".to_string(), transport));
@@ -316,7 +353,8 @@ impl RtspResponse {
     /// Builds standard RECORD response with audio latency indication.
     pub fn record(cseq: u32, latency: u32) -> Self {
         let mut resp = Self::ok(cseq);
-        resp.headers.push(("Audio-Latency".to_string(), latency.to_string()));
+        resp.headers
+            .push(("Audio-Latency".to_string(), latency.to_string()));
         resp
     }
 
@@ -333,14 +371,16 @@ impl RtspResponse {
     /// Builds standard TEARDOWN response with connection close.
     pub fn teardown(cseq: u32) -> Self {
         let mut resp = Self::ok(cseq);
-        resp.headers.push(("Connection".to_string(), "close".to_string()));
+        resp.headers
+            .push(("Connection".to_string(), "close".to_string()));
         resp
     }
 
     /// Serializes response to standard RTSP 1.0 byte stream.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let status_line = format!("RTSP/1.0 {} {}\r\n", self.status_code, self.status_text);
+        let status_line =
+            format!("RTSP/1.0 {} {}\r\n", self.status_code, self.status_text);
         out.extend_from_slice(status_line.as_bytes());
 
         let cseq_line = format!("CSeq: {}\r\n", self.cseq);
@@ -389,6 +429,13 @@ pub struct RtspServer {
     latency_frames: u32,
     mac_address: [u8; 6],
     ip_address: [u8; 4],
+    dacp_id: Option<String>,
+    active_remote: Option<String>,
+    metadata: Option<DmapMetadata>,
+    artwork: Option<CoverArtwork>,
+    progress: Option<TrackProgress>,
+    last_flush_seq: Option<u16>,
+    last_flush_rtptime: Option<u32>,
 }
 
 impl RtspServer {
@@ -413,6 +460,13 @@ impl RtspServer {
             latency_frames: 11025,
             mac_address,
             ip_address,
+            dacp_id: None,
+            active_remote: None,
+            metadata: None,
+            artwork: None,
+            progress: None,
+            last_flush_seq: None,
+            last_flush_rtptime: None,
         }
     }
 
@@ -461,6 +515,89 @@ impl RtspServer {
         self.server_timing_port
     }
 
+    /// Sender's UDP control port extracted from `SETUP` `Transport` header.
+    #[must_use]
+    pub fn client_control_port(&self) -> u16 {
+        self.client_control_port
+    }
+
+    /// Sender's UDP timing port extracted from `SETUP` `Transport` header.
+    #[must_use]
+    pub fn client_timing_port(&self) -> u16 {
+        self.client_timing_port
+    }
+
+    /// Latest DMAP track metadata (`minm`, `asar`, `asal`, `astm`) received via
+    /// `SET_PARAMETER`.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&DmapMetadata> {
+        self.metadata.as_ref()
+    }
+
+    /// Takes the latest DMAP track metadata out of the server state.
+    pub fn take_metadata(&mut self) -> Option<DmapMetadata> {
+        self.metadata.take()
+    }
+
+    /// Latest cover artwork (`image/jpeg` or `image/png`) received via
+    /// `SET_PARAMETER`.
+    #[must_use]
+    pub fn artwork(&self) -> Option<&CoverArtwork> {
+        self.artwork.as_ref()
+    }
+
+    /// Takes the latest cover artwork out of the server state.
+    pub fn take_artwork(&mut self) -> Option<CoverArtwork> {
+        self.artwork.take()
+    }
+
+    /// Latest track playback progress (`progress: start/curr/end`) received via
+    /// `SET_PARAMETER`.
+    #[must_use]
+    pub fn progress(&self) -> Option<&TrackProgress> {
+        self.progress.as_ref()
+    }
+
+    /// Sender's `DACP-ID` header value, if announced.
+    #[must_use]
+    pub fn dacp_id(&self) -> Option<&str> {
+        self.dacp_id.as_deref()
+    }
+
+    /// Sender's `Active-Remote` token header value, if announced.
+    #[must_use]
+    pub fn active_remote(&self) -> Option<&str> {
+        self.active_remote.as_deref()
+    }
+
+    /// Returns a configured `DacpClient` if `Active-Remote` has been captured.
+    #[must_use]
+    pub fn dacp_client(&self) -> Option<DacpClient> {
+        let active_remote = self.active_remote.as_deref()?;
+        let dacp_id = self.dacp_id.as_deref().unwrap_or("");
+        Some(DacpClient::new(dacp_id, active_remote))
+    }
+
+    /// Builds an HTTP/1.0 `GET /ctrl-int/1/<command>` DACP request using the
+    /// active session's `Active-Remote` and `DACP-ID` headers.
+    #[must_use]
+    pub fn build_dacp_command(&self, cmd: DacpCommand) -> Option<Vec<u8>> {
+        self.dacp_client()
+            .map(|client| client.build_command_request(cmd))
+    }
+
+    /// Sequence number from the most recent `FLUSH` (or `RECORD`) `RTP-Info`.
+    #[must_use]
+    pub fn last_flush_seq(&self) -> Option<u16> {
+        self.last_flush_seq
+    }
+
+    /// RTP timestamp from the most recent `FLUSH` (or `RECORD`) `RTP-Info`.
+    #[must_use]
+    pub fn last_flush_rtptime(&self) -> Option<u32> {
+        self.last_flush_rtptime
+    }
+
     /// Parses client ports from Transport header: `control_port=X;timing_port=Y`.
     fn extract_client_ports(&mut self, transport_str: &str) {
         for part in transport_str.split(';') {
@@ -477,9 +614,30 @@ impl RtspServer {
         }
     }
 
+    /// Captures `DACP-ID` and `Active-Remote` headers when present on any RTSP
+    /// request.
+    fn capture_dacp_headers(&mut self, req: &RtspRequest<'_>) {
+        if let Some(id) = req.dacp_id {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                self.dacp_id = Some(trimmed.to_string());
+            }
+        }
+        if let Some(remote) = req.active_remote {
+            let trimmed = remote.trim();
+            if !trimmed.is_empty() {
+                self.active_remote = Some(trimmed.to_string());
+            }
+        }
+    }
+
     /// Generates Apple-Response from Apple-Challenge header value.
-    fn generate_apple_response(&self, challenge_b64: &str) -> Result<String, RtspError> {
-        let raw_chal = base64_decode(challenge_b64).map_err(RtspError::Crypto)?;
+    fn generate_apple_response(
+        &self,
+        challenge_b64: &str,
+    ) -> Result<String, RtspError> {
+        let raw_chal =
+            base64_decode(challenge_b64).map_err(RtspError::Crypto)?;
         let mut buf = [0u8; 32];
         let copy_len = core::cmp::min(raw_chal.len(), 16);
         buf[..copy_len].copy_from_slice(&raw_chal[..copy_len]);
@@ -490,14 +648,69 @@ impl RtspServer {
         let p_mac = p_ip + 4;
         buf[p_mac..p_mac + 6].copy_from_slice(&self.mac_address);
 
-        let signed = self.rsa_key.sign_apple_challenge(&buf).map_err(RtspError::Crypto)?;
+        let signed = self
+            .rsa_key
+            .sign_apple_challenge(&buf)
+            .map_err(RtspError::Crypto)?;
         let b64 = base64_encode(&signed);
         let trimmed_b64 = b64.trim_end_matches('=').to_string();
         Ok(trimmed_b64)
     }
 
+    fn handle_set_parameter(
+        &mut self,
+        req: &RtspRequest<'_>,
+    ) -> Result<(), RtspError> {
+        let is_dmap = req.content_type.is_some_and(|ct| {
+            let media = ct.split(';').next().unwrap_or(ct).trim();
+            media.eq_ignore_ascii_case("application/x-dmap-tagged")
+        });
+
+        if is_dmap {
+            let meta = DmapMetadata::parse(req.body)?;
+            self.metadata = Some(meta);
+            return Ok(());
+        }
+
+        if let Some(mime) =
+            req.content_type.and_then(ArtworkMimeType::from_content_type)
+        {
+            let rtp_ts = req.rtp_info.and_then(|info| parse_rtp_info(info).1);
+            self.artwork =
+                Some(CoverArtwork::new(mime, req.body.to_vec(), rtp_ts));
+            return Ok(());
+        }
+
+        if let Ok(body_str) = core::str::from_utf8(req.body) {
+            for line in body_str.lines() {
+                let trimmed = line.trim();
+                if let Some(val) = trimmed.strip_prefix("volume:") {
+                    if let Ok(db) = val.trim().parse::<f32>() {
+                        // -144.0 dB = mute (0.0), 0.0 dB = max (1.0)
+                        if db <= -144.0 {
+                            self.volume_linear = 0.0;
+                        } else {
+                            let v = 1.0 + db / 30.0;
+                            self.volume_linear = v.clamp(0.0, 1.0);
+                        }
+                    }
+                } else if trimmed.starts_with("progress:") {
+                    if let Some(prog) = TrackProgress::parse(trimmed) {
+                        self.progress = Some(prog);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Processes an incoming RTSP request and produces a conforming response.
-    pub fn handle_request(&mut self, req: &RtspRequest<'_>) -> Result<RtspResponse, RtspError> {
+    pub fn handle_request(
+        &mut self,
+        req: &RtspRequest<'_>,
+    ) -> Result<RtspResponse, RtspError> {
+        self.capture_dacp_headers(req);
+
         match req.method {
             RtspMethod::Options => Ok(RtspResponse::options(req.cseq)),
             RtspMethod::Announce => {
@@ -506,7 +719,10 @@ impl RtspServer {
                 let sdp = SdpSession::parse(sdp_str)?;
 
                 if let Some(ref enc_key) = sdp.rsaaeskey {
-                    let key = self.rsa_key.decrypt_session_key(enc_key).map_err(RtspError::Crypto)?;
+                    let key = self
+                        .rsa_key
+                        .decrypt_session_key(enc_key)
+                        .map_err(RtspError::Crypto)?;
                     self.aes_session_key = Some(key);
                 }
                 if let Some(iv) = sdp.aesiv {
@@ -536,36 +752,46 @@ impl RtspServer {
                 ))
             }
             RtspMethod::Record => {
+                if let Some(info) = req.rtp_info {
+                    let (seq, rtptime) = parse_rtp_info(info);
+                    if seq.is_some() {
+                        self.last_flush_seq = seq;
+                    }
+                    if rtptime.is_some() {
+                        self.last_flush_rtptime = rtptime;
+                    }
+                }
                 self.state = ServerState::Streaming;
                 Ok(RtspResponse::record(req.cseq, self.latency_frames))
             }
             RtspMethod::SetParameter => {
-                if let Ok(body_str) = core::str::from_utf8(req.body) {
-                    for line in body_str.lines() {
-                        let trimmed = line.trim();
-                        if let Some(val) = trimmed.strip_prefix("volume:") {
-                            if let Ok(db) = val.trim().parse::<f32>() {
-                                // -144.0 dB = mute (0.0), 0.0 dB = max (1.0)
-                                if db <= -144.0 {
-                                    self.volume_linear = 0.0;
-                                } else {
-                                    let v = 1.0 + db / 30.0;
-                                    self.volume_linear = v.clamp(0.0, 1.0);
-                                }
-                            }
-                        }
-                    }
-                }
+                self.handle_set_parameter(req)?;
                 Ok(RtspResponse::set_parameter(req.cseq))
             }
             RtspMethod::Flush => {
+                if let Some(info) = req.rtp_info {
+                    let (seq, rtptime) = parse_rtp_info(info);
+                    self.last_flush_seq = seq;
+                    self.last_flush_rtptime = rtptime;
+                }
                 Ok(RtspResponse::flush(req.cseq))
+            }
+            RtspMethod::Pause => {
+                self.state = ServerState::Paused;
+                Ok(RtspResponse::ok(req.cseq))
             }
             RtspMethod::Teardown => {
                 self.state = ServerState::Idle;
                 self.aes_session_key = None;
                 self.aes_iv = None;
                 self.sdp_session = None;
+                self.dacp_id = None;
+                self.active_remote = None;
+                self.metadata = None;
+                self.artwork = None;
+                self.progress = None;
+                self.last_flush_seq = None;
+                self.last_flush_rtptime = None;
                 Ok(RtspResponse::teardown(req.cseq))
             }
             _ => Ok(RtspResponse::ok(req.cseq)),

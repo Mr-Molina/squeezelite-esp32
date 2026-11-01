@@ -1,9 +1,21 @@
-//! 10-Band Biquad Parametric Equalizer & Horner Loudness Evaluator
+//! 10-Band Biquad Parametric Equalizer, Runtime RBJ Designer & Loudness Contour
 //!
 //! Ported and modernized from the Milestone MK-5 optimized C equalizer,
-//! replacing transcendentals with fast $O(n)$ Horner polynomial evaluations,
-//! normalized floating-point processing, and Schur-Cohn stability verification.
+//! providing runtime RBJ Audio-EQ-Cookbook peaking filter synthesis,
+//! volume-indexed Fletcher-Munson loudness contour gains, normalized
+//! floating-point processing, and Schur-Cohn stability verification.
 
+/// Center frequencies (in Hz) for the 10-band ISO graphic equalizer.
+pub const EQ_BANDS_HZ: [f32; 10] = [
+    31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
+
+/// Default quality factor ($Q = \sqrt{2}$) for 1-octave peaking bands.
+pub const DEFAULT_EQ_Q: f32 = core::f32::consts::SQRT_2;
+
+/// Fletcher-Munson reference boost (in dB) at maximum loudness compensation.
+const LOUDNESS_REFERENCE_CONTOUR_DB: [f32; 10] =
+    [9.0, 7.5, 5.5, 3.0, 1.0, 0.0, 0.0, 1.5, 3.0, 4.5];
 
 /// Filter coefficients for a second-order IIR biquad filter section:
 /// $H(z) = \frac{b_0 + b_1 z^{-1} + b_2 z^{-2}}{1 + a_1 z^{-1} + a_2 z^{-2}}$
@@ -18,19 +30,16 @@ pub struct BiquadCoeffs {
 
 impl Default for BiquadCoeffs {
     fn default() -> Self {
-        Self {
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-            a1: 0.0,
-            a2: 0.0,
-        }
+        Self::bypass()
     }
 }
 
 impl BiquadCoeffs {
     /// 0-delay identity bypass filter coefficients ($H(z) = 1$).
     pub const BYPASS: Self = Self::bypass();
+
+    /// Unity scale factor in signed Q2.30 fixed-point (`1 << 30`).
+    pub const ONE_Q30: i32 = 1 << 30;
 
     /// Returns identity bypass filter coefficients
     /// ($b_0 = 1, b_1 = 0, b_2 = 0, a_1 = 0, a_2 = 0$).
@@ -45,12 +54,49 @@ impl BiquadCoeffs {
         }
     }
 
+    /// Alias for [`Self::bypass`] returning unity pass-through coefficients.
+    #[must_use]
+    pub const fn unity() -> Self {
+        Self::bypass()
+    }
+
+    /// Quantizes `b0` into signed Q2.30 fixed-point representation.
+    #[must_use]
+    pub fn b0_q30(&self) -> i32 {
+        quantize_q30(self.b0)
+    }
+
+    /// Quantizes `b1` into signed Q2.30 fixed-point representation.
+    #[must_use]
+    pub fn b1_q30(&self) -> i32 {
+        quantize_q30(self.b1)
+    }
+
+    /// Quantizes `b2` into signed Q2.30 fixed-point representation.
+    #[must_use]
+    pub fn b2_q30(&self) -> i32 {
+        quantize_q30(self.b2)
+    }
+
+    /// Quantizes `a1` into signed Q2.30 fixed-point representation.
+    #[must_use]
+    pub fn a1_q30(&self) -> i32 {
+        quantize_q30(self.a1)
+    }
+
+    /// Quantizes `a2` into signed Q2.30 fixed-point representation.
+    #[must_use]
+    pub fn a2_q30(&self) -> i32 {
+        quantize_q30(self.a2)
+    }
+
     /// Verifies Bounded-Input Bounded-Output (BIBO) stability under the
     /// Schur-Cohn / Jury stability criterion:
     /// 1. All numerator and denominator coefficients are finite
     ///    (rejecting NaN and Inf).
     /// 2. $|a_2| < 1.0$
     /// 3. $|a_1| < 1.0 + a_2$
+    #[must_use]
     pub fn is_stable(&self) -> bool {
         if !self.b0.is_finite()
             || !self.b1.is_finite()
@@ -62,6 +108,203 @@ impl BiquadCoeffs {
         }
         self.a2.abs() < 1.0 && self.a1.abs() < (1.0 + self.a2)
     }
+}
+
+fn quantize_q30(val: f32) -> i32 {
+    if !val.is_finite() {
+        return 0;
+    }
+    let scaled = f64::from(val) * f64::from(BiquadCoeffs::ONE_Q30);
+    let rounded = if scaled >= 0.0 {
+        scaled + 0.5
+    } else {
+        scaled - 0.5
+    };
+    rounded.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// Pure `no_std` IEEE-754 sine approximation on `f64` with range reduction
+/// into $[-\pi/2, \pi/2]$ and a 15th-order Taylor polynomial.
+fn sin_f64(x: f64) -> f64 {
+    const PI: f64 = core::f64::consts::PI;
+    const TAU: f64 = core::f64::consts::TAU;
+    const HALF_PI: f64 = core::f64::consts::FRAC_PI_2;
+
+    let mut angle = x % TAU;
+    if angle > PI {
+        angle -= TAU;
+    } else if angle < -PI {
+        angle += TAU;
+    }
+    if angle > HALF_PI {
+        angle = PI - angle;
+    } else if angle < -HALF_PI {
+        angle = -PI - angle;
+    }
+
+    let u2 = angle * angle;
+    let c3 = -1.0 / 6.0;
+    let c5 = 1.0 / 120.0;
+    let c7 = -1.0 / 5_040.0;
+    let c9 = 1.0 / 362_880.0;
+    let c11 = -1.0 / 39_916_800.0;
+    let c13 = 1.0 / 6_227_020_800.0;
+    let c15 = -1.0 / 1_307_674_368_000.0;
+
+    let poly = 1.0
+        + u2 * (c3 + u2 * (c5 + u2 * (c7 + u2 * (c9 + u2 * (c11 + u2 * (c13 + u2 * c15))))));
+    angle * poly
+}
+
+/// Pure `no_std` IEEE-754 cosine approximation on `f64`.
+fn cos_f64(x: f64) -> f64 {
+    sin_f64(core::f64::consts::FRAC_PI_2 - x)
+}
+
+/// Pure `no_std` base-10 exponentiation $10^x = e^{x \ln(10)}$ using $2^k e^r$
+/// range reduction onto $|r| \le \ln(2)/2$.
+fn pow10_f64(x: f64) -> f64 {
+    const LN_10: f64 = core::f64::consts::LN_10;
+    const LN_2: f64 = core::f64::consts::LN_2;
+
+    let y = (x * LN_10).clamp(-80.0, 80.0);
+    let k_float = y / LN_2;
+    let k = if k_float >= 0.0 {
+        (k_float + 0.5) as i32
+    } else {
+        (k_float - 0.5) as i32
+    };
+    let r = y - f64::from(k) * LN_2;
+
+    // 12-term Taylor series for exp(r) on |r| <= 0.3466 (error < 1e-16).
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    let mut n = 1;
+    while n <= 12 {
+        term *= r / f64::from(n);
+        sum += term;
+        n += 1;
+    }
+
+    if k >= 0 {
+        let mut i = 0;
+        while i < k {
+            sum *= 2.0;
+            i += 1;
+        }
+    } else {
+        let mut i = 0;
+        while i < -k {
+            sum *= 0.5;
+            i += 1;
+        }
+    }
+    sum
+}
+
+/// Synthesizes a second-order RBJ Audio-EQ-Cookbook peaking equalizer biquad
+/// for center frequency `f0_hz`, quality factor `q`, gain `gain_db` (dB), and
+/// sample rate `fs_hz`.
+///
+/// Returns [`BiquadCoeffs::unity()`] if inputs are non-finite, out of Nyquist
+/// bounds (`f0_hz <= 0.0`, `q <= 0.0`, `fs_hz <= 0.0`, or
+/// `f0_hz >= fs_hz * 0.495`), or when `gain_db.abs() < 1e-4`.
+#[must_use]
+pub fn design_peaking(f0_hz: f32, q: f32, gain_db: f32, fs_hz: f32) -> BiquadCoeffs {
+    if !f0_hz.is_finite()
+        || !q.is_finite()
+        || !gain_db.is_finite()
+        || !fs_hz.is_finite()
+        || gain_db.abs() < 1e-4
+        || f0_hz <= 0.0
+        || q <= 0.0
+        || fs_hz <= 0.0
+        || f0_hz >= fs_hz * 0.495
+    {
+        return BiquadCoeffs::unity();
+    }
+
+    let clamped_db = f64::from(gain_db.clamp(-24.0, 24.0));
+    let amp = pow10_f64(clamped_db / 40.0);
+    let w0 = core::f64::consts::TAU * f64::from(f0_hz) / f64::from(fs_hz);
+    let sin_w0 = sin_f64(w0);
+    let cos_w0 = cos_f64(w0);
+    let alpha = sin_w0 / (2.0 * f64::from(q));
+
+    let b0 = 1.0 + alpha * amp;
+    let b1 = -2.0 * cos_w0;
+    let b2 = 1.0 - alpha * amp;
+    let a0 = 1.0 + alpha / amp;
+    let a1 = -2.0 * cos_w0;
+    let a2 = 1.0 - alpha / amp;
+
+    if a0.abs() < 1e-12 {
+        return BiquadCoeffs::unity();
+    }
+
+    let coeffs = BiquadCoeffs {
+        b0: (b0 / a0) as f32,
+        b1: (b1 / a0) as f32,
+        b2: (b2 / a0) as f32,
+        a1: (a1 / a0) as f32,
+        a2: (a2 / a0) as f32,
+    };
+
+    if coeffs.is_stable() {
+        coeffs
+    } else {
+        BiquadCoeffs::unity()
+    }
+}
+
+/// Synthesizes all 10 ISO graphic equalizer bands at `EQ_BANDS_HZ` using
+/// `DEFAULT_EQ_Q` for sample rate `fs_hz`.
+#[must_use]
+pub fn design_bands(gains_db: &[f32; 10], fs_hz: f32) -> [BiquadCoeffs; 10] {
+    let mut out = [BiquadCoeffs::BYPASS; 10];
+    let mut i = 0;
+    while i < 10 {
+        out[i] = design_peaking(EQ_BANDS_HZ[i], DEFAULT_EQ_Q, gains_db[i], fs_hz);
+        i += 1;
+    }
+    out
+}
+
+/// Returns the 10-band gain vector (in dB) for a built-in [`EqPreset`].
+#[must_use]
+pub const fn preset_gains_db(preset: EqPreset) -> [f32; 10] {
+    match preset {
+        EqPreset::Flat => [0.0; 10],
+        EqPreset::BassBoost => [5.5, 4.5, 3.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        EqPreset::Loudness => [4.5, 3.5, 3.5, 1.5, 0.0, -1.0, 0.0, 1.0, 3.0, 3.0],
+        EqPreset::Vocal => [-2.0, -2.0, -1.0, 0.0, 0.0, 3.5, 3.5, 2.5, 0.0, 0.0],
+        EqPreset::Rock => [4.0, 4.0, 4.0, 1.0, -1.5, -1.5, 0.0, 3.5, 3.5, 2.0],
+    }
+}
+
+/// Computes the 10-band Fletcher-Munson loudness contour gain vector (in dB)
+/// for `volume_percent` (`0..=100`) and loudness `level` (`0..=10`).
+///
+/// Boost scales monotonically with `level / 10` and inversely with volume
+/// `(1.0 - volume_percent / 100.0)`. At `volume_percent >= 100` or
+/// `level == 0`, returns `[0.0; 10]`.
+#[must_use]
+pub fn loudness_gains_db(volume_percent: u8, level: u8) -> [f32; 10] {
+    if volume_percent >= 100 || level == 0 {
+        return [0.0; 10];
+    }
+    let clamped_level = level.min(10);
+    let vol_atten = 1.0 - (f32::from(volume_percent) / 100.0);
+    let level_scale = f32::from(clamped_level) / 10.0;
+    let scale = vol_atten * level_scale;
+
+    let mut gains = [0.0_f32; 10];
+    let mut i = 0;
+    while i < 10 {
+        gains[i] = LOUDNESS_REFERENCE_CONTOUR_DB[i] * scale;
+        i += 1;
+    }
+    gains
 }
 
 /// Built-in 10-band ISO graphic equalizer presets
@@ -115,6 +358,7 @@ impl EqPreset {
 
 pub struct Equalizer<const BANDS: usize> {
     filters: [BiquadCoeffs; BANDS],
+    gains_db: [f32; BANDS],
     hist_left: [(f32, f32); BANDS],
     hist_right: [(f32, f32); BANDS],
     pub enabled: bool,
@@ -138,6 +382,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
                 a1: 0.0,
                 a2: 0.0,
             }; BANDS],
+            gains_db: [0.0; BANDS],
             hist_left: [(0.0, 0.0); BANDS],
             hist_right: [(0.0, 0.0); BANDS],
             enabled: false,
@@ -147,8 +392,15 @@ impl<const BANDS: usize> Equalizer<BANDS> {
     }
 
     /// Returns a reference to the array of filter coefficients for all bands.
-    pub fn filters(&self) -> &[BiquadCoeffs; BANDS] {
+    #[must_use]
+    pub const fn filters(&self) -> &[BiquadCoeffs; BANDS] {
         &self.filters
+    }
+
+    /// Returns the most recently configured gain vector (in dB) for all bands.
+    #[must_use]
+    pub const fn gains_db(&self) -> &[f32; BANDS] {
+        &self.gains_db
     }
 
     /// Safely updates a filter band's coefficients after verifying stability.
@@ -567,6 +819,27 @@ pub const ROCK_COEFFS: [BiquadCoeffs; 10] = [
 ];
 
 impl Equalizer<10> {
+    /// Retunes all 10 equalizer bands for `gains_db` at sample rate `fs_hz`
+    /// using the RBJ peaking EQ designer, verifies Schur-Cohn BIBO stability
+    /// for each band, and resets internal filter delay history.
+    pub fn retune(&mut self, gains_db: &[f32; 10], fs_hz: f32) {
+        self.gains_db = *gains_db;
+        let bands = design_bands(gains_db, fs_hz);
+        let mut any_active = false;
+        for (i, &coeffs) in bands.iter().enumerate() {
+            if coeffs.is_stable() {
+                self.filters[i] = coeffs;
+            } else {
+                self.filters[i] = BiquadCoeffs::BYPASS;
+            }
+            if gains_db[i].is_finite() && gains_db[i].abs() >= 1e-4 {
+                any_active = true;
+            }
+        }
+        self.enabled = any_active && fs_hz.is_finite() && fs_hz > 0.0;
+        self.reset();
+    }
+
     /// Applies a pre-tuned 10-band graphic equalizer preset
     /// (`Flat`, `BassBoost`, `Loudness`, `Vocal`, `Rock`).
     ///
@@ -577,6 +850,7 @@ impl Equalizer<10> {
     /// smooth, click-free transitions.
     pub fn apply_preset(&mut self, preset: EqPreset) {
         self.current_preset = preset;
+        self.gains_db = preset_gains_db(preset);
         match preset {
             EqPreset::Flat => {
                 for i in 0..10 {
@@ -887,5 +1161,190 @@ mod tests {
         assert!(eq.set_band(0, BiquadCoeffs::BYPASS));
         assert!(!eq.set_band(10, BiquadCoeffs::BYPASS)); // out of bounds
         eq.reset();
+    }
+
+    #[test]
+    fn test_rbj_peaking_matches_reference_at_3_rates() {
+        let cases: [(f32, BiquadCoeffs); 3] = [
+            (
+                44_100.0,
+                BiquadCoeffs {
+                    b0: 1.0341633_f32,
+                    b1: -1.9117787_f32,
+                    b2: 0.89718485_f32,
+                    a1: -1.9117787_f32,
+                    a2: 0.93134815_f32,
+                },
+            ),
+            (
+                48_000.0,
+                BiquadCoeffs {
+                    b0: 1.0314914_f32,
+                    b1: -1.9201485_f32,
+                    b2: 0.90522593_f32,
+                    a1: -1.9201485_f32,
+                    a2: 0.9367174_f32,
+                },
+            ),
+            (
+                96_000.0,
+                BiquadCoeffs {
+                    b0: 1.0160326_f32,
+                    b1: -1.963569_f32,
+                    b2: 0.9517496_f32,
+                    a1: -1.963569_f32,
+                    a2: 0.9677822_f32,
+                },
+            ),
+        ];
+
+        let q30_tol = (1e-6_f64 * f64::from(BiquadCoeffs::ONE_Q30)) as i32 + 1;
+        for (fs, expected) in cases {
+            let actual = design_peaking(1000.0, 1.414, 6.0, fs);
+            assert!(actual.is_stable(), "coeffs at fs={fs} must be stable: {actual:?}");
+            assert!(
+                (actual.b0 - expected.b0).abs() < 1e-6,
+                "b0 mismatch at fs={fs}: got {}, expected {}",
+                actual.b0,
+                expected.b0
+            );
+            assert!(
+                (actual.b1 - expected.b1).abs() < 1e-6,
+                "b1 mismatch at fs={fs}: got {}, expected {}",
+                actual.b1,
+                expected.b1
+            );
+            assert!(
+                (actual.b2 - expected.b2).abs() < 1e-6,
+                "b2 mismatch at fs={fs}: got {}, expected {}",
+                actual.b2,
+                expected.b2
+            );
+            assert!(
+                (actual.a1 - expected.a1).abs() < 1e-6,
+                "a1 mismatch at fs={fs}: got {}, expected {}",
+                actual.a1,
+                expected.a1
+            );
+            assert!(
+                (actual.a2 - expected.a2).abs() < 1e-6,
+                "a2 mismatch at fs={fs}: got {}, expected {}",
+                actual.a2,
+                expected.a2
+            );
+            assert!(
+                (actual.b0_q30() - expected.b0_q30()).abs() <= q30_tol,
+                "b0_q30 mismatch at fs={fs}"
+            );
+            assert!(
+                (actual.a2_q30() - expected.a2_q30()).abs() <= q30_tol,
+                "a2_q30 mismatch at fs={fs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retune_on_rate_change_keeps_stability() {
+        let mut eq = Equalizer::<10>::new();
+        let gains = preset_gains_db(EqPreset::Rock);
+        let rates = [22_050.0_f32, 44_100.0, 48_000.0, 88_200.0, 96_000.0, 192_000.0];
+
+        let mut prev_b1 = 0.0_f32;
+        for &fs in &rates {
+            let _ = eq.process_frame(200_000, -200_000);
+            eq.retune(&gains, fs);
+            assert!(eq.is_enabled(), "retune with active gains at {fs} must enable EQ");
+            for (band_idx, c) in eq.filters().iter().enumerate() {
+                assert!(
+                    c.is_stable(),
+                    "band {band_idx} unstable at fs={fs}: {c:?}"
+                );
+            }
+            // At 22.05 kHz, band 9 (16 kHz >= 0.495 * 22.05 kHz) bypasses.
+            if fs == 22_050.0 {
+                assert_eq!(eq.filters()[9], BiquadCoeffs::BYPASS);
+            } else {
+                assert_ne!(eq.filters()[9], BiquadCoeffs::BYPASS);
+            }
+            let b1_band0 = eq.filters()[0].b1;
+            assert!(
+                (b1_band0 - prev_b1).abs() > 1e-7,
+                "retuning to a new sample rate ({fs}) must update biquad pole/zero angle"
+            );
+            prev_b1 = b1_band0;
+        }
+    }
+
+    #[test]
+    fn test_eqlz_packet_retunes_bands() {
+        // Simulate an LMS `eqlz` 10-band signed i8 payload (with out-of-range
+        // values clamped to [-12.0, 12.0] dB).
+        let raw_eqlz_i8: [i8; 10] = [6, 4, 2, 0, -3, -6, 0, 3, 6, 15];
+        let mut gains = [0.0_f32; 10];
+        for (i, &val) in raw_eqlz_i8.iter().enumerate() {
+            gains[i] = f32::from(val).clamp(-12.0, 12.0);
+        }
+
+        let mut eq = Equalizer::<10>::new();
+        eq.retune(&gains, 48_000.0);
+        assert!(eq.is_enabled());
+        assert_eq!(eq.gains_db(), &gains);
+        // Band 0 (+6 dB) boosts: b0 > 1.0
+        assert!(eq.filters()[0].b0 > 1.0);
+        // Band 3 (0 dB) is unity bypass
+        assert_eq!(eq.filters()[3], BiquadCoeffs::BYPASS);
+        // Band 5 (-6 dB) cuts: b0 < 1.0
+        assert!(eq.filters()[5].b0 < 1.0);
+        // Band 9 (+12 dB clamped) boosts: b0 > 1.0
+        assert!(eq.filters()[9].b0 > 1.0);
+    }
+
+    #[test]
+    fn test_loudness_contour_zero_at_full_volume() {
+        assert_eq!(loudness_gains_db(100, 10), [0.0; 10]);
+        assert_eq!(loudness_gains_db(120, 10), [0.0; 10]);
+        assert_eq!(loudness_gains_db(50, 0), [0.0; 10]);
+    }
+
+    #[test]
+    fn test_loudness_scales_with_level_and_volume() {
+        // Monotonic increase with `level` (1..=10) at fixed volume (40%)
+        let mut prev_level_gains = loudness_gains_db(40, 0);
+        for level in 1..=10u8 {
+            let cur = loudness_gains_db(40, level);
+            for i in 0..10 {
+                assert!(
+                    cur[i] >= prev_level_gains[i],
+                    "band {i} must not decrease when level increases to {level}"
+                );
+            }
+            assert!(
+                cur[0] > prev_level_gains[0],
+                "sub-bass boost must strictly increase with level={level}"
+            );
+            assert!(
+                cur[9] > prev_level_gains[9],
+                "treble air boost must strictly increase with level={level}"
+            );
+            prev_level_gains = cur;
+        }
+
+        // Monotonic increase as `volume_percent` drops from 100 to 0 at level 8
+        let mut prev_vol_gains = loudness_gains_db(100, 8);
+        for step in (0..10u8).rev() {
+            let vol = step * 10;
+            let cur = loudness_gains_db(vol, 8);
+            for i in 0..10 {
+                assert!(
+                    cur[i] >= prev_vol_gains[i],
+                    "band {i} must not decrease when volume drops to {vol}%"
+                );
+            }
+            assert!(
+                cur[0] > prev_vol_gains[0],
+                "sub-bass boost must strictly increase when volume drops to {vol}%"
+            );
+            prev_vol_gains = cur;
+        }
     }
 }

@@ -19,7 +19,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use squeezelite_audio_core::output::AudioOutputSink;
-use squeezelite_audio_core::VolumeScale;
+use squeezelite_audio_core::{ResampleQuality, VolumeScale};
 use squeezelite_cyd_link::{CydCommand, CydMessage, PlayState};
 use squeezelite_decoders::{DecoderError, PcmDecoder};
 use squeezelite_proto::{
@@ -421,6 +421,24 @@ pub struct PlayerCoordinator {
     /// Buffer server frames are received into (see [`Self::set_frame_buffer`]);
     /// `None` uses a [`SERVER_FRAME_BUF_LEN`]-byte stack buffer.
     frame_buffer: Option<&'static mut [u8]>,
+    /// Frames currently buffered in hardware I2S DMA descriptors (queried via
+    /// [`AudioBackend::dma_outstanding_frames`]) subtracted from
+    /// `pipeline.frames_played` when reporting elapsed `STAT` frames (Task 15).
+    dma_outstanding_frames: u32,
+    /// Hardware sample-rate switch deferred while the previous track's tail is
+    /// still draining in `output_buffer` across a gapless boundary (Task 15).
+    pending_rate: Option<u32>,
+    /// Sample rate reached when `pipeline.active_marker_crossed()` fired,
+    /// awaiting hardware backend application (Task 15).
+    crossed_rate: Option<u32>,
+    /// Maximum hardware sample rate cap (`0` = unlimited, Task 17).
+    max_sample_rate: u32,
+    /// Whether the polyphase FIR resampler may be engaged to convert unverified
+    /// stream rates into a verified I2S clock rate (Task 17).
+    resampler_enabled: bool,
+    /// Filter quality preset used when the polyphase FIR resampler is engaged
+    /// (Task 17).
+    resampler_quality: ResampleQuality,
 }
 
 impl PlayerCoordinator {
@@ -484,6 +502,12 @@ impl PlayerCoordinator {
             last_tick_frames: 0,
             buffer_threshold_reported: false,
             frame_buffer: None,
+            dma_outstanding_frames: 0,
+            pending_rate: None,
+            crossed_rate: None,
+            max_sample_rate: 0,
+            resampler_enabled: false,
+            resampler_quality: ResampleQuality::Low,
         }
     }
 
@@ -493,6 +517,64 @@ impl PlayerCoordinator {
     /// `buffer` is dropped by the transport.
     pub fn set_frame_buffer(&mut self, buffer: &'static mut [u8]) {
         self.frame_buffer = Some(buffer);
+    }
+
+    /// Configures a maximum hardware sample rate cap (`0` = unlimited). When an
+    /// incoming stream exceeds `max_rate`, the polyphase FIR resampler
+    /// downsamples it to `max_rate` (Task 17).
+    pub fn set_max_sample_rate(&mut self, max_rate: u32) {
+        self.max_sample_rate = max_rate;
+    }
+
+    /// Returns the configured maximum hardware sample rate cap (`0` =
+    /// unlimited).
+    #[must_use]
+    pub const fn max_sample_rate(&self) -> u32 {
+        self.max_sample_rate
+    }
+
+    /// Enables or disables automatic polyphase FIR resampling for unverified
+    /// stream sample rates (Task 17).
+    pub fn set_resampler_enabled(&mut self, enabled: bool) {
+        self.resampler_enabled = enabled;
+    }
+
+    /// Returns whether automatic polyphase FIR resampling for unverified rates
+    /// is enabled.
+    #[must_use]
+    pub const fn resampler_enabled(&self) -> bool {
+        self.resampler_enabled
+    }
+
+    /// Sets the polyphase FIR filter quality preset used when the resampler is
+    /// engaged.
+    pub fn set_resampler_quality(&mut self, quality: ResampleQuality) {
+        self.resampler_quality = quality;
+    }
+
+    /// Returns the configured polyphase FIR filter quality preset.
+    #[must_use]
+    pub const fn resampler_quality(&self) -> ResampleQuality {
+        self.resampler_quality
+    }
+
+    /// Takes a deferred hardware sample-rate switch that became active when a
+    /// gapless track boundary was crossed in [`Self::pump_output`] (Task 15).
+    pub fn take_crossed_rate(&mut self) -> Option<u32> {
+        self.crossed_rate.take()
+    }
+
+    /// Returns the DMA-corrected elapsed frame count for `STAT` and progress
+    /// reporting (`frames_pushed.saturating_sub(dma_outstanding_frames)`,
+    /// Task 15).
+    #[must_use]
+    pub const fn frames_for_stat<S: AudioOutputSink>(
+        &self,
+        pipeline: &StreamPipeline<'_, S>,
+    ) -> u64 {
+        pipeline
+            .frames_played
+            .saturating_sub(self.dma_outstanding_frames as u64)
     }
 
     /// The `HELO` capability string (see [`build_capabilities`] for the
@@ -566,8 +648,20 @@ impl PlayerCoordinator {
     /// finished LMS stream detached, so nothing about it is reported to LMS
     /// (no LMS output runs, so no heartbeat either).
     pub fn begin_external_playback(&mut self) {
+        let prev_stream = core::mem::replace(&mut self.stream, StreamLink::Idle);
+        let prev_format = self.current_format;
+        let had_open_lms = prev_stream == StreamLink::Open;
         self.reset();
-        self.stream = StreamLink::Idle;
+        if had_open_lms {
+            self.stream = StreamLink::Open;
+            self.current_format = prev_format;
+            self.lms_track = true;
+            self.decode_running = true;
+            self.output_started = true;
+            self.stream_past_threshold = true;
+        } else {
+            self.stream = StreamLink::Idle;
+        }
         self.buffer_threshold_bytes = 0;
         self.buffer_threshold_reported = true;
         self.output_underrun_reported = true;
@@ -576,10 +670,16 @@ impl PlayerCoordinator {
     }
 
     /// The external source stopped and its audio drained:
-    /// [`PlayerState::Stopped`].
+    /// [`PlayerState::Stopped`] (or [`PlayerState::Playing`] if a suspended LMS
+    /// stream is resumed).
     pub fn end_external_playback(&mut self) {
         self.external_playback = false;
-        self.state = PlayerState::Stopped;
+        if self.arbiter.active_source() == AudioSource::SlimProto && self.stream == StreamLink::Open
+        {
+            self.state = PlayerState::Playing;
+        } else {
+            self.state = PlayerState::Stopped;
+        }
     }
 
     /// Returns the currently active audio source owning the output pipeline.
@@ -759,13 +859,15 @@ impl PlayerCoordinator {
         self.decode_failed = false;
         self.external_playback = false;
         self.lms_track = false;
+        self.pending_rate = None;
+        self.crossed_rate = None;
         // A new track (`strm s`) or a stop (`strm q`) ends the previous ICY title.
         self.track_metadata = None;
     }
 
     /// Decodes SlimProto sample rate code into Hz.
-    /// Supports both ASCII '0'..='9', numeric 0..=9 codes, and colon ':' / 10
-    /// for 88.2 kHz (`RUST-16`).
+    /// Supports both ASCII '0'..='9', numeric 0..=9 codes, colon ':' / 10
+    /// for 88.2 kHz (`RUST-16`), and high-rate codes up to 384 kHz.
     pub fn decode_pcm_sample_rate_hz(code: u8) -> Option<u32> {
         match code {
             b'0' | 0 => Some(11025),
@@ -781,6 +883,8 @@ impl PlayerCoordinator {
             b':' | 10 => Some(88200),
             b';' | 11 => Some(176400),
             b'<' | 12 => Some(192000),
+            b'=' | 13 => Some(352_800),
+            b'>' | 14 => Some(384_000),
             _ => None,
         }
     }
@@ -840,6 +944,10 @@ impl PlayerCoordinator {
         now_ms: u32,
     ) -> Result<(), TransportError> {
         self.last_tick_frames = 0;
+        self.dma_outstanding_frames = backend.dma_outstanding_frames();
+        if let Some(rate) = self.crossed_rate.take() {
+            let _ = backend.set_sample_rate(rate);
+        }
         self.resume_stream_connect(transport, source, pipeline, now_ms)?;
         let link_lost = self.receive_command(transport, source, backend, pipeline, now_ms)?;
         let _ = self.poll_stream(source, pipeline);
@@ -852,6 +960,10 @@ impl PlayerCoordinator {
         } else {
             self.process_audio_step(pipeline)
         };
+        if let Some(rate) = self.crossed_rate.take() {
+            let _ = backend.set_sample_rate(rate);
+        }
+        self.dma_outstanding_frames = backend.dma_outstanding_frames();
         // C parity (slimproto.c:842-844, 907): a decoder that stopped with the stream
         // still open disconnects it, without a DSCO (stream_disconnect sets
         // STOPPED).
@@ -962,7 +1074,7 @@ impl PlayerCoordinator {
             StatEvent::Connected,
             pipeline.stream_buffer_available() as u32,
             pipeline.output_buffer_available() as u32,
-            pipeline.frames_played as u32,
+            self.frames_for_stat(pipeline) as u32,
             now_ms,
         )
     }
@@ -1084,8 +1196,10 @@ impl PlayerCoordinator {
         pipeline: &mut StreamPipeline<'_, S>,
         written: usize,
     ) {
-        if pipeline.active_marker_crossed().is_some() {
-            self.current_sample_rate = pipeline.sample_rate;
+        if let Some(marker) = pipeline.active_marker_crossed() {
+            let rate = self.pending_rate.take().unwrap_or(marker.sample_rate);
+            self.current_sample_rate = rate;
+            self.crossed_rate = Some(rate);
             if !self.external_playback {
                 self.pending_track_started = true;
             }
@@ -1396,7 +1510,7 @@ impl PlayerCoordinator {
                         StatEvent::Heartbeat,
                         pipeline.stream_buffer_available() as u32,
                         pipeline.output_buffer_available() as u32,
-                        pipeline.frames_played,
+                        self.frames_for_stat(pipeline),
                         self.current_sample_rate,
                         self.stream_bytes_received,
                         now_ms,
@@ -1519,8 +1633,22 @@ impl PlayerCoordinator {
                         // C parity (slimproto.c:600-601): a name change is confirmed with SETD.
                         send_setd_name(transport, &self.player_name)?;
                     }
-                } else if opcode == *b"eqlz" || opcode == *b"loud" {
-                    pipeline.equalizer.enabled = true;
+                } else if opcode == *b"eqlz" {
+                    if payload.len() >= 10 {
+                        let mut gains = [0.0_f32; 10];
+                        for (dst, &byte) in gains.iter_mut().zip(payload.iter().take(10)) {
+                            *dst = f32::from(byte as i8).clamp(-12.0, 12.0);
+                        }
+                        pipeline.set_eq_gains_db(&gains);
+                    } else {
+                        pipeline.equalizer.enabled = true;
+                    }
+                } else if opcode == *b"loud" {
+                    if let Some(&level) = payload.first() {
+                        pipeline.set_loudness_level(level.min(10));
+                    } else {
+                        pipeline.equalizer.enabled = true;
+                    }
                 }
                 Ok(())
             }
@@ -1558,11 +1686,48 @@ impl PlayerCoordinator {
             self.output_started = true;
             self.pending_track_started = pending_stms;
         }
-        let rate_hint = Self::decode_pcm_sample_rate_hz(p.pcm_sample_rate)
-            .unwrap_or_else(|| sample_rate_from_index(p.pcm_sample_rate));
+        let rate_hint = Self::decode_pcm_sample_rate_hz(p.pcm_sample_rate).unwrap_or(
+            if p.format == AudioFormat::Pcm {
+                0
+            } else {
+                sample_rate_from_index(p.pcm_sample_rate)
+            },
+        );
+        let capped_rate = self.max_sample_rate > 0 && rate_hint > self.max_sample_rate;
+        let unverified_rate = !crate::clock_table::VERIFIED_RATES.contains(&rate_hint);
+        let output_rate = if capped_rate {
+            if pipeline.configure_resampler(
+                rate_hint,
+                self.max_sample_rate,
+                self.resampler_quality,
+            ) {
+                self.max_sample_rate
+            } else {
+                rate_hint
+            }
+        } else if unverified_rate && self.resampler_enabled && rate_hint > 0 {
+            let fallback_rate = if rate_hint.is_multiple_of(11_025) {
+                44_100
+            } else {
+                48_000
+            };
+            let target_rate = if self.max_sample_rate > 0 && self.max_sample_rate < fallback_rate {
+                self.max_sample_rate
+            } else {
+                fallback_rate
+            };
+            if pipeline.configure_resampler(rate_hint, target_rate, self.resampler_quality) {
+                target_rate
+            } else {
+                rate_hint
+            }
+        } else {
+            pipeline.clear_resampler();
+            rate_hint
+        };
         // C slimproto.c:484-485: output.threshold and next_replay_gain for the new
         // track.
-        pipeline.begin_stream(rate_hint, p.replay_gain, p.output_threshold);
+        pipeline.begin_stream(output_rate, p.replay_gain, p.output_threshold);
         // C parity: slimproto.c:486-489, fade_mode, fade_secs, invert ((flags & 0x03)
         // == 0x03) and channels ((flags & 0x0c) >> 2). The fade settings arm
         // fades at the new track's first decoded frames and at the end of its
@@ -1597,7 +1762,7 @@ impl PlayerCoordinator {
         self.awaiting_cont = self.autostart_mode.requires_cont();
         self.server_rebooting = (p.flags & STRM_FLAG_SERVER_REBOOT) != 0;
 
-        let sample_rate = rate_hint;
+        let sample_rate = output_rate;
         self.current_format = Some(p.format);
         let bits = Self::normalize_pcm_bits(p.pcm_sample_size);
         let channels = Self::normalize_pcm_channels(p.pcm_channels);
@@ -1630,11 +1795,18 @@ impl PlayerCoordinator {
         // With the previous track still to play the clock is only checked here: it
         // switches when playback reaches the new track (C output.c:154,
         // pipeline track boundary).
-        let clock_ok = if output_idle {
+        let verified = crate::clock_table::VERIFIED_RATES.contains(&sample_rate)
+            && crate::clock_table::i2s_clock_config(sample_rate).is_some();
+        let clock_ok = if !verified {
+            false
+        } else if output_idle {
+            self.pending_rate = None;
+            self.crossed_rate = None;
             self.current_sample_rate = sample_rate;
             backend.set_sample_rate(sample_rate).is_ok()
         } else {
-            crate::clock_table::i2s_clock_config(sample_rate).is_some()
+            self.pending_rate = Some(sample_rate);
+            true
         };
         if !clock_ok && p.format == AudioFormat::Pcm {
             self.decode_ready = false;
@@ -1746,6 +1918,9 @@ impl PlayerCoordinator {
         // outputbuf).
         pipeline.discard_decoder_backlog();
         let flushed_output = pipeline.flush_streaming();
+        if flushed_output {
+            self.pending_rate = None;
+        }
         self.arbiter.release_source(AudioSource::SlimProto);
         self.buffer_threshold_bytes = 0;
         self.close_stream(source);
@@ -1766,7 +1941,7 @@ impl PlayerCoordinator {
                 StatEvent::StreamFlushed,
                 0,
                 0,
-                pipeline.frames_played as u32,
+                self.frames_for_stat(pipeline) as u32,
                 now_ms,
             )?;
         }
@@ -1835,6 +2010,14 @@ impl PlayerCoordinator {
         source: &mut R,
         pipeline: &mut StreamPipeline<'_, S>,
     ) -> Result<usize, StreamError> {
+        if self.external_playback
+            || matches!(
+                self.arbiter.active_source(),
+                AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+            )
+        {
+            return Ok(0);
+        }
         if self.awaiting_cont {
             if self.stream == StreamLink::Open {
                 self.take_stream_side_data(source);
@@ -1925,6 +2108,9 @@ impl PlayerCoordinator {
     /// that, `STMo` when it ran dry mid-stream.
     fn evaluate_state<S: AudioOutputSink>(&mut self, pipeline: &mut StreamPipeline<'_, S>) {
         self.frames_played = pipeline.frames_played;
+        if self.external_playback {
+            return;
+        }
 
         if !self.awaiting_cont
             && !self.stream_past_threshold
@@ -2075,7 +2261,7 @@ impl PlayerCoordinator {
         )));
 
         let elapsed_secs = if self.current_sample_rate > 0 {
-            (pipeline.frames_played / (self.current_sample_rate as u64)) as u32
+            (self.frames_for_stat(pipeline) / (self.current_sample_rate as u64)) as u32
         } else {
             0
         };
@@ -2213,7 +2399,7 @@ impl PlayerCoordinator {
             event,
             pipeline.stream_buffer.available_read() as u32,
             pipeline.output_buffer.available_read() as u32,
-            pipeline.frames_played,
+            self.frames_for_stat(pipeline),
             self.current_sample_rate,
             self.stream_bytes_received,
             now_ms,
@@ -6033,5 +6219,218 @@ mod tests {
         assert!(matches!(pipeline.decoder, ActiveDecoder::Alac(_)));
         rig.command(&mut pipeline, &server_frame(b"codc", b"u"), 40);
         assert!(matches!(pipeline.decoder, ActiveDecoder::Opus(_)));
+    }
+
+    struct DmaTrackingBackend {
+        inner: MockBackend,
+        dma_outstanding: u32,
+        rate_calls: usize,
+    }
+
+    impl DmaTrackingBackend {
+        fn new(dma_outstanding: u32) -> Self {
+            Self {
+                inner: MockBackend::new(),
+                dma_outstanding,
+                rate_calls: 0,
+            }
+        }
+    }
+
+    impl AudioBackend for DmaTrackingBackend {
+        fn set_sample_rate(
+            &mut self,
+            rate_hz: u32,
+        ) -> Result<(), crate::io_traits::ClockError> {
+            self.rate_calls += 1;
+            self.inner.set_sample_rate(rate_hz)
+        }
+
+        fn set_mute(&mut self, muted: bool) {
+            self.inner.set_mute(muted);
+        }
+
+        fn set_power(&mut self, on: bool) {
+            self.inner.set_power(on);
+        }
+
+        fn set_hw_volume(&mut self, left: u8, right: u8) {
+            self.inner.set_hw_volume(left, right);
+        }
+
+        fn has_hw_volume(&self) -> bool {
+            self.inner.has_hw_volume()
+        }
+
+        fn dma_outstanding_frames(&self) -> u32 {
+            self.dma_outstanding
+        }
+    }
+
+    #[test]
+    fn test_stat_elapsed_subtracts_dma_outstanding() {
+        let mut rig = Rig::new([0x31; 6], "DmaStat");
+        let mut backend = DmaTrackingBackend::new(2_000);
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        rig.coord.current_sample_rate = 40_000;
+        pipeline.frames_played = 10_000;
+
+        // Trigger a heartbeat query (`strm 't'`) with 2_000 frames still in DMA.
+        rig.lms.inject_frame(&simple_strm(b't')).unwrap();
+        rig.coord
+            .tick(&mut rig.lms, &mut rig.src, &mut backend, &mut pipeline, 500)
+            .unwrap();
+        rig.drain_sent();
+
+        assert_eq!(rig.coord.frames_for_stat(&pipeline), 8_000);
+        assert_eq!(rig.lines(), ["STAT:STMt"]);
+        let stat_payload = &rig.sent[0].1;
+        // STAT payload layout (after 8-byte frame header):
+        // [37..41] elapsed_seconds, [43..47] elapsed_ms.
+        // 8_000 frames at 40_000 Hz = 0 s, 200 ms (vs 250 ms without DMA subtraction).
+        let elapsed_secs = u32::from_be_bytes(stat_payload[37..41].try_into().unwrap());
+        let elapsed_ms = u32::from_be_bytes(stat_payload[43..47].try_into().unwrap());
+        assert_eq!(elapsed_secs, 0);
+        assert_eq!(elapsed_ms, 200);
+    }
+
+    #[test]
+    fn test_rate_switch_deferred_until_marker_crossed() {
+        let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 100));
+        let mut rig = gapless_rig(&[t1, t2]);
+        let (mut s, mut o) = (vec![0u8; 8192], vec![0u8; 16384]);
+        let mut p = gapless_pipeline(&mut s, &mut o);
+        let (mut now, mut stms_at) = (100, Vec::new());
+
+        // Track 1 starts at 44.1 kHz (`b'3'`).
+        rig.command(&mut p, &strm_start(1, b'3', true), now);
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMd") == 1
+        });
+        assert_eq!(rig.backend.rate, 44_100);
+        assert!(p.output_buffer_available() > 0);
+
+        // Track 2 (`48 kHz`, `b'4'`) arrives while Track 1 is still in `output_buffer`.
+        // Hardware rate switch MUST be deferred until the TrackMarker is crossed.
+        now += 10;
+        rig.command(&mut p, &strm_start(2, b'4', true), now);
+        assert_eq!(rig.coord.pending_rate, Some(48_000));
+        assert_eq!(rig.backend.rate, 44_100);
+        assert_eq!(rig.coord.current_sample_rate, 44_100);
+
+        // Drain until Track 2 crosses the boundary (`STMs` #2) and finishes (`STMu`).
+        run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
+            count(&r.lines(), "STAT:STMu") == 1
+        });
+        assert_eq!(rig.coord.pending_rate, None);
+        assert_eq!(rig.coord.current_sample_rate, 48_000);
+        assert_eq!(rig.backend.rate, 48_000);
+        assert_eq!(p.sink.rate, 48_000);
+    }
+
+    #[test]
+    fn test_unverified_rate_refused_at_strm_s() {
+        let mut rig = Rig::with_source(
+            [0x32; 6],
+            "UnverifiedRate",
+            GatedSource::new(b"/t1", segments(track_bytes(1, 32))),
+        );
+        let mut backend = DmaTrackingBackend::new(0);
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Rate code `b'>'` = 384_000 Hz, which is not in `VERIFIED_RATES`.
+        // With resampler disabled (default), `strm 's'` must refuse with `STMn`
+        // without calling `backend.set_sample_rate`.
+        rig.lms
+            .inject_frame(&strm_start(1, b'>', true))
+            .unwrap();
+        rig.coord
+            .tick(&mut rig.lms, &mut rig.src, &mut backend, &mut pipeline, 10)
+            .unwrap();
+        rig.drain_sent();
+
+        assert_eq!(rig.lines(), ["STAT:STMf", "STAT:STMn"]);
+        assert_eq!(backend.rate_calls, 0);
+        assert_eq!(rig.src.inner.connects, 0);
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+    }
+
+    #[test]
+    fn test_eqlz_and_loud_commands_retune_pipeline_eq() {
+        let mut rig = Rig::new([0x33; 6], "EqLoud");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Send `eqlz` with 10 signed i8 gains, including out-of-range values (+20, -18)
+        // that must clamp to [-12.0, +12.0].
+        let eqlz_payload: [u8; 10] = [
+            20i8 as u8,
+            -18i8 as u8,
+            6i8 as u8,
+            -4i8 as u8,
+            0,
+            3i8 as u8,
+            -2i8 as u8,
+            5i8 as u8,
+            8i8 as u8,
+            -10i8 as u8,
+        ];
+        rig.command(&mut pipeline, &server_frame(b"eqlz", &eqlz_payload), 10);
+        assert!(pipeline.equalizer.is_enabled());
+        assert_eq!(
+            *pipeline.eq_gains_db(),
+            [12.0, -12.0, 6.0, -4.0, 0.0, 3.0, -2.0, 5.0, 8.0, -10.0]
+        );
+
+        // Reset base EQ to flat, enable loudness level 10, and lower volume via `audg`.
+        rig.command(&mut pipeline, &server_frame(b"eqlz", &[0u8; 10]), 20);
+        assert!(!pipeline.equalizer.is_enabled());
+        rig.command(&mut pipeline, &server_frame(b"loud", &[10u8]), 30);
+        assert_eq!(pipeline.loudness_level(), 10);
+        rig.command(&mut pipeline, &audg_frame(1842, 1842, 1), 40);
+        assert!(pipeline.equalizer.is_enabled());
+        assert!(pipeline.equalizer.gains_db()[0] > 2.0);
+    }
+
+    #[test]
+    fn test_engages_only_for_unverified_or_capped_rates() {
+        let mut rig = gapless_rig(&[
+            track_bytes(1, 32),
+            track_bytes(2, 32),
+            track_bytes(3, 32),
+        ]);
+        let mut stream_storage = [0u8; 4096];
+        let mut output_storage = [0u8; 4096];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // 1. Verified rate (44.1 kHz, code `b'3'`) with no cap: resampler NOT engaged.
+        rig.command(&mut pipeline, &strm_start(1, b'3', true), 10);
+        assert!(!pipeline.is_resampler_engaged());
+        assert_eq!(rig.backend.rate, 44_100);
+
+        // 2. Cap max sample rate at 48 kHz and stream 96 kHz (`b'9'`):
+        //    resampler engages!
+        rig.command(&mut pipeline, &simple_strm(b'q'), 20);
+        rig.coord.set_max_sample_rate(48_000);
+        rig.command(&mut pipeline, &strm_start(2, b'9', true), 30);
+        assert!(pipeline.is_resampler_engaged());
+        assert_eq!(rig.backend.rate, 48_000);
+        assert_eq!(rig.coord.current_sample_rate, 48_000);
+
+        // 3. Unverified rate (384 kHz, code `b'>'`) with `resampler_enabled = true`:
+        //    resampler engages and targets 48 kHz!
+        rig.command(&mut pipeline, &simple_strm(b'q'), 40);
+        rig.coord.set_max_sample_rate(0);
+        rig.coord.set_resampler_enabled(true);
+        rig.command(&mut pipeline, &strm_start(3, b'>', true), 50);
+        assert!(pipeline.is_resampler_engaged());
+        assert_eq!(rig.backend.rate, 48_000);
+        assert_eq!(rig.coord.current_sample_rate, 48_000);
     }
 }

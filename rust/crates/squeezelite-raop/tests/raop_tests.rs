@@ -9,11 +9,29 @@ use squeezelite_raop::crypto::Aes128Cbc;
 use squeezelite_raop::crypto::BigUint;
 use squeezelite_raop::crypto::CryptoError;
 use squeezelite_raop::crypto::RsaPrivateKey;
+use squeezelite_raop::dacp::DacpClient;
+use squeezelite_raop::dacp::DacpCommand;
+use squeezelite_raop::dmap::ArtworkMimeType;
+use squeezelite_raop::dmap::DmapError;
+use squeezelite_raop::dmap::DmapMetadata;
+use squeezelite_raop::dmap::TrackProgress;
 use squeezelite_raop::mdns::MdnsBuilder;
 use squeezelite_raop::mdns::MdnsConfig;
+use squeezelite_raop::rtp::build_resend_request;
+use squeezelite_raop::rtp::ms_to_ntp;
+use squeezelite_raop::rtp::ntp_to_ms;
+use squeezelite_raop::rtp::parse_rtp_info;
+use squeezelite_raop::rtp::seq_diff;
+use squeezelite_raop::rtp::unwrap_retransmit_packet;
+use squeezelite_raop::rtp::NtpTimingPacket;
 use squeezelite_raop::rtp::RtpAudioReceiver;
+use squeezelite_raop::rtp::RtpControlPacket;
 use squeezelite_raop::rtp::RtpHeader;
+use squeezelite_raop::rtp::RtpJitterBuffer;
 use squeezelite_raop::rtp::RtpReceiverError;
+use squeezelite_raop::rtp::RtpResendRequest;
+use squeezelite_raop::rtp::RtpSyncPacket;
+use squeezelite_raop::rtp::SyncDriftTracker;
 use squeezelite_raop::rtsp::RtspError;
 use squeezelite_raop::rtsp::RtspMethod;
 use squeezelite_raop::rtsp::RtspRequest;
@@ -431,3 +449,369 @@ fn test_base64_roundtrip() {
     let dec2 = base64_decode(unpadded).expect("unpadded decode");
     assert_eq!(dec2, raw2);
 }
+
+fn make_raw_rtp_packet(seq: u16, timestamp: u32, payload: &[u8]) -> Vec<u8> {
+    let hdr = RtpHeader {
+        payload_type: 0x60,
+        sequence_number: seq,
+        timestamp,
+        ssrc: 0x1122_3344,
+    };
+    let mut pkt = Vec::with_capacity(12 + payload.len());
+    pkt.extend_from_slice(&hdr.to_bytes(false));
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+#[test]
+fn test_rtp_control_sync_and_retransmit_unwrap() {
+    // 1. Sync packet (0xD4 with first-sync extension bit 0x10 -> byte 0 = 0x90)
+    let sync = RtpSyncPacket::new(
+        true,
+        7,
+        100_000,
+        0xE3B0_1234,
+        0x8000_0000,
+        177_175,
+    );
+    let wire = sync.to_bytes();
+    assert_eq!(wire[0], 0x90);
+    assert_eq!(wire[1], 0xD4);
+
+    let parsed_ctrl =
+        RtpControlPacket::parse(&wire).expect("parse sync control packet");
+    match parsed_ctrl {
+        RtpControlPacket::Sync(s) => {
+            assert!(s.is_first_sync);
+            assert_eq!(s.flags, 7);
+            assert_eq!(s.rtp_timestamp_latency, 100_000);
+            assert_eq!(s.ntp_seconds, 0xE3B0_1234);
+            assert_eq!(s.ntp_fraction, 0x8000_0000);
+            assert_eq!(s.rtp_timestamp_now, 177_175);
+            // (177_175 - 100_000) + 11_025 (flags == 7) = 88_200 frames (2.0 s)
+            assert_eq!(s.effective_latency_frames(), 88_200);
+        }
+        other => panic!("expected Sync variant, got: {other:?}"),
+    }
+
+    // 2. Retransmit reply (0xD6) wrapping an inner RTP audio packet at +4
+    let inner_rtp = make_raw_rtp_packet(42, 42 * 352, &[0xAA, 0xBB, 0xCC, 0xDD]);
+    let mut retransmit_pkt = vec![0x80, 0xD6, 0x00, 0x09];
+    retransmit_pkt.extend_from_slice(&inner_rtp);
+
+    let (ctrl_seq, unwrapped) =
+        unwrap_retransmit_packet(&retransmit_pkt).expect("unwrap 0xD6");
+    assert_eq!(ctrl_seq, 9);
+    assert_eq!(unwrapped, &inner_rtp[..]);
+
+    let ctrl_parsed =
+        RtpControlPacket::parse(&retransmit_pkt).expect("parse 0xD6");
+    assert_eq!(
+        ctrl_parsed,
+        RtpControlPacket::Retransmit {
+            control_seq: 9,
+            inner_packet: &inner_rtp[..],
+        }
+    );
+}
+
+#[test]
+fn test_rtp_resend_request_builder_and_ntp_timing_codec() {
+    // 0x80 0xD5 resend request
+    let raw_req = build_resend_request(3, 1200, 5);
+    assert_eq!(raw_req, [0x80, 0xD5, 0x00, 0x03, 0x04, 0xB0, 0x00, 0x05]);
+
+    let parsed_resend =
+        RtpResendRequest::parse(&raw_req).expect("parse 0xD5 resend");
+    assert_eq!(parsed_resend.request_seq, 3);
+    assert_eq!(parsed_resend.missed_seq_start, 1200);
+    assert_eq!(parsed_resend.missed_count, 5);
+
+    // NTP timing request (0x52 / 0xD2) and response (0x53 / 0xD3)
+    let req_ntp = NtpTimingPacket::new_request_ms(50_000);
+    let req_bytes = req_ntp.to_bytes();
+    assert_eq!(req_bytes[0], 0x80);
+    assert_eq!(req_bytes[1], 0xD2);
+    assert_eq!(&req_bytes[2..4], &[0x00, 0x07]);
+
+    let parsed_req = NtpTimingPacket::parse(&req_bytes).expect("parse 0x52");
+    assert_eq!(parsed_req.payload_type, 0x52);
+    assert_eq!(parsed_req.transmit_ntp, 50_000);
+
+    let remote_rx = ms_to_ntp(123_456);
+    let remote_tx = ms_to_ntp(123_457);
+    let resp_ntp = NtpTimingPacket::new_response(50_000, remote_rx, remote_tx);
+    let resp_bytes = resp_ntp.to_bytes();
+    assert_eq!(resp_bytes[1], 0xD3);
+
+    let parsed_resp = NtpTimingPacket::parse(&resp_bytes).expect("parse 0x53");
+    assert_eq!(parsed_resp.payload_type, 0x53);
+    assert_eq!(parsed_resp.reference_low_u32(), 50_000);
+    assert_eq!(parsed_resp.roundtrip_ms(50_018), 18);
+    assert_eq!(ntp_to_ms(parsed_resp.receive_ntp), 123_456);
+}
+
+#[test]
+fn test_jitter_buffer_gap_detection_reordering_wrap_and_flush() {
+    let mut jb = RtpJitterBuffer::new(32);
+
+    // 1. Push seq 100 -> initial packet, no gap
+    let p100 = make_raw_rtp_packet(100, 35_200, &[1]);
+    assert_eq!(jb.push_packet(&p100).expect("push 100"), None);
+
+    // 2. Push seq 103 -> missing 101 and 102 (gap of 2) -> emits 0xD5 resend!
+    let p103 = make_raw_rtp_packet(103, 36_256, &[4]);
+    let resend = jb
+        .push_packet(&p103)
+        .expect("push 103")
+        .expect("gap should emit resend request");
+    assert_eq!(resend.request_seq, 1);
+    assert_eq!(resend.missed_seq_start, 101);
+    assert_eq!(resend.missed_count, 2);
+    assert_eq!(jb.missing_sequences(), vec![101, 102]);
+
+    // Pop 100 (ready), next is 101 (missing -> returns None)
+    let e100 = jb.pop_ready().expect("100 is ready");
+    assert_eq!(e100.header.sequence_number, 100);
+    assert!(jb.pop_ready().is_none(), "101 is still missing");
+
+    // 3. Push 102 out of order, then 101 wrapped in a 0xD6 retransmit packet
+    let p102 = make_raw_rtp_packet(102, 35_904, &[3]);
+    assert_eq!(jb.push_packet(&p102).expect("push 102"), None);
+    assert!(jb.pop_ready().is_none(), "still waiting for 101");
+
+    let p101_inner = make_raw_rtp_packet(101, 35_552, &[2]);
+    let mut p101_retransmit = vec![0x80, 0xD6, 0x00, 0x01];
+    p101_retransmit.extend_from_slice(&p101_inner);
+    assert_eq!(
+        jb.push_packet(&p101_retransmit)
+            .expect("push 0xD6 retransmit 101"),
+        None
+    );
+    assert_eq!(jb.recovered_packets(), 2);
+
+    // Now 101, 102, 103 drain in exact sequence order!
+    let ready = jb.drain_ready();
+    let seqs: Vec<u16> =
+        ready.iter().map(|e| e.header.sequence_number).collect();
+    assert_eq!(seqs, vec![101, 102, 103]);
+
+    // 4. Test 16-bit sequence wrap-around across 0xFFFF -> 0x0000
+    assert_eq!(seq_diff(0x0001, 0xFFFF), 2);
+    let mut jb_wrap = RtpJitterBuffer::new(16);
+    let p_fffe = make_raw_rtp_packet(0xFFFE, 1000, &[0xFE]);
+    let p_0001 = make_raw_rtp_packet(0x0001, 2056, &[0x01]);
+    assert_eq!(jb_wrap.push_packet(&p_fffe).expect("fffe"), None);
+    let wrap_resend = jb_wrap
+        .push_packet(&p_0001)
+        .expect("0001")
+        .expect("wrap gap resend");
+    assert_eq!(wrap_resend.missed_seq_start, 0xFFFF);
+    assert_eq!(wrap_resend.missed_count, 2); // 0xFFFF and 0x0000
+
+    // 5. Test RTSP FLUSH (seq=500;rtptime=999000)
+    let (f_seq, f_rtp) = parse_rtp_info("seq=500;rtptime=999000");
+    assert_eq!(f_seq, Some(500));
+    assert_eq!(f_rtp, Some(999_000));
+
+    let mut jb_flush = RtpJitterBuffer::new(16);
+    for seq in 498..=502 {
+        let pkt = make_raw_rtp_packet(seq, u32::from(seq) * 352, &[seq as u8]);
+        let _ = jb_flush.push_packet(&pkt).expect("push pre-flush");
+    }
+    jb_flush.flush(500, 999_000);
+    // Stale packet 499 arriving after FLUSH is ignored
+    let p499 = make_raw_rtp_packet(499, 499 * 352, &[0xFF]);
+    assert_eq!(jb_flush.push_packet(&p499).expect("stale 499"), None);
+
+    // Remaining buffered entries start cleanly at 500
+    let post_flush: Vec<u16> = jb_flush
+        .drain_ready()
+        .iter()
+        .map(|e| e.header.sequence_number)
+        .collect();
+    assert_eq!(post_flush, vec![500, 501, 502]);
+}
+
+#[test]
+fn test_dmap_metadata_artwork_and_progress_set_parameter() {
+    let rsa = airport_express_key();
+    let mut server = RtspServer::new(
+        rsa,
+        [0x24, 0x0A, 0xC4, 0x01, 0x02, 0x03],
+        [192, 168, 1, 50],
+    );
+
+    // 1. Binary DMAP metadata (`application/x-dmap-tagged`)
+    let expected_meta = DmapMetadata::new()
+        .with_title("So What")
+        .with_artist("Miles Davis")
+        .with_album("Kind of Blue")
+        .with_duration_ms(562_000);
+    let dmap_bytes = expected_meta.to_dmap_bytes();
+    let parsed_direct = DmapMetadata::parse(&dmap_bytes).expect("parse dmap");
+    assert_eq!(parsed_direct, expected_meta);
+
+    let mut dmap_req = format!(
+        concat!(
+            "SET_PARAMETER rtsp://192.168.1.50/123456 RTSP/1.0\r\n",
+            "CSeq: 10\r\n",
+            "Content-Type: application/x-dmap-tagged\r\n",
+            "Content-Length: {}\r\n\r\n"
+        ),
+        dmap_bytes.len()
+    )
+    .into_bytes();
+    dmap_req.extend_from_slice(&dmap_bytes);
+
+    let req = RtspRequest::parse(&dmap_req).expect("parse dmap rtsp");
+    let resp = server.handle_request(&req).expect("handle dmap set_parameter");
+    assert_eq!(resp.status_code, 200);
+    assert_eq!(server.metadata(), Some(&expected_meta));
+
+    // Truncated DMAP TLV returns DmapError::TruncatedPayload
+    assert_eq!(
+        DmapMetadata::parse(&dmap_bytes[..6]),
+        Err(DmapError::TruncatedPayload)
+    );
+
+    // 2. Cover artwork (`image/jpeg` and `image/png`)
+    let jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+    let mut art_req = format!(
+        concat!(
+            "SET_PARAMETER rtsp://192.168.1.50/123456 RTSP/1.0\r\n",
+            "CSeq: 11\r\n",
+            "Content-Type: image/jpeg\r\n",
+            "RTP-Info: rtptime=441000\r\n",
+            "Content-Length: {}\r\n\r\n"
+        ),
+        jpeg_bytes.len()
+    )
+    .into_bytes();
+    art_req.extend_from_slice(&jpeg_bytes);
+
+    let req_art = RtspRequest::parse(&art_req).expect("parse artwork rtsp");
+    server.handle_request(&req_art).expect("handle artwork");
+    let art = server.artwork().expect("artwork stored");
+    assert_eq!(art.mime_type, ArtworkMimeType::Jpeg);
+    assert_eq!(art.data, jpeg_bytes);
+    assert_eq!(art.rtp_timestamp, Some(441_000));
+
+    // 3. Track progress (`text/parameters`: `progress: start/curr/end`)
+    let prog_body = "progress: 10000/451000/1333000\r\n";
+    let prog_req = format!(
+        concat!(
+            "SET_PARAMETER rtsp://192.168.1.50/123456 RTSP/1.0\r\n",
+            "CSeq: 12\r\n",
+            "Content-Type: text/parameters\r\n",
+            "Content-Length: {}\r\n\r\n",
+            "{}"
+        ),
+        prog_body.len(),
+        prog_body
+    );
+    let req_prog = RtspRequest::parse(prog_req.as_bytes()).expect("parse prog");
+    server.handle_request(&req_prog).expect("handle prog");
+    let prog = server.progress().expect("progress stored");
+    assert_eq!(prog, &TrackProgress::new(10_000, 451_000, 1_333_000));
+    // (451_000 - 10_000) / 44_100 = 10.0 s = 10_000 ms
+    assert_eq!(prog.elapsed_ms(44_100), 10_000);
+    // (1_333_000 - 10_000) / 44_100 = 30.0 s = 30_000 ms
+    assert_eq!(prog.duration_ms(44_100), 30_000);
+}
+
+#[test]
+fn test_dacp_header_extraction_and_command_requests() {
+    let rsa = airport_express_key();
+    let mut server = RtspServer::new(
+        rsa,
+        [0x24, 0x0A, 0xC4, 0x01, 0x02, 0x03],
+        [192, 168, 1, 50],
+    );
+
+    let record_req = concat!(
+        "RECORD rtsp://192.168.1.50/123456 RTSP/1.0\r\n",
+        "CSeq: 4\r\n",
+        "DACP-ID: 1A2B3C4D5E6F7788\r\n",
+        "Active-Remote: 987654321\r\n",
+        "RTP-Info: seq=200;rtptime=88200\r\n\r\n"
+    );
+    let req = RtspRequest::parse(record_req.as_bytes()).expect("parse record");
+    server.handle_request(&req).expect("handle record");
+
+    assert_eq!(server.dacp_id(), Some("1A2B3C4D5E6F7788"));
+    assert_eq!(server.active_remote(), Some("987654321"));
+
+    let dacp = DacpClient::from_rtsp_request(&req).expect("dacp client");
+    assert_eq!(dacp.mdns_instance_prefix(), "iTunes_Ctrl_1A2B3C4D5E6F7788");
+
+    for (cmd, expected_path) in [
+        (DacpCommand::PlayPause, "/ctrl-int/1/playpause"),
+        (DacpCommand::NextItem, "/ctrl-int/1/nextitem"),
+        (DacpCommand::PrevItem, "/ctrl-int/1/previtem"),
+        (DacpCommand::VolumeUp, "/ctrl-int/1/volumeup"),
+        (DacpCommand::VolumeDown, "/ctrl-int/1/volumedown"),
+        (DacpCommand::MuteToggle, "/ctrl-int/1/mutetoggle"),
+        (DacpCommand::Stop, "/ctrl-int/1/stop"),
+    ] {
+        let http_bytes = server
+            .build_dacp_command(cmd)
+            .expect("build dacp command");
+        let http_str = core::str::from_utf8(&http_bytes).expect("utf8");
+        assert!(http_str.starts_with(&format!("GET {} HTTP/1.0\r\n", expected_path)));
+        assert!(http_str.contains("Active-Remote: 987654321\r\n"));
+        assert!(http_str.contains("DACP-ID: 1A2B3C4D5E6F7788\r\n"));
+    }
+}
+
+#[test]
+fn test_sync_drift_tracker_and_stereo_frame_stuff_drop() {
+    let mut tracker = SyncDriftTracker::default();
+    // 2 ms at 44.1 kHz = 88 stereo frames
+    assert_eq!(tracker.window_frames(), 88);
+
+    // 1. Within ±88 frames deadband -> 0 adjustment
+    assert_eq!(tracker.compute_frame_adjustment(10_000, 10_000), 0);
+    assert_eq!(tracker.compute_frame_adjustment(10_050, 10_000), 0);
+    assert_eq!(tracker.compute_frame_adjustment(10_000, 10_050), 0);
+
+    // 2. DAC lagging behind sender by 120 frames (> 88) -> drop 1 frame (-1)
+    assert_eq!(tracker.compute_frame_adjustment(10_120, 10_000), -1);
+    assert_eq!(tracker.frames_dropped(), 1);
+
+    // 3. DAC ahead of sender by 120 frames (> 88) -> stuff 1 frame (+1)
+    assert_eq!(tracker.compute_frame_adjustment(10_000, 10_120), 1);
+    assert_eq!(tracker.frames_stuffed(), 1);
+
+    // 4. NTP + RTP Sync anchor playtime and time-based drift check
+    let ntp = NtpTimingPacket::new_response(1_000, ms_to_ntp(50_000), ms_to_ntp(50_000));
+    assert!(tracker.record_ntp_timing(&ntp, 1_010));
+    let sync = RtpSyncPacket::new(
+        true,
+        0,
+        44_100,
+        (ms_to_ntp(50_500) >> 32) as u32,
+        ms_to_ntp(50_500) as u32,
+        88_200,
+    );
+    assert!(tracker.record_rtp_sync(&sync, 1_500));
+    assert!(tracker.is_synced());
+    assert_eq!(tracker.expected_playtime_ms(44_100), Some(1_500));
+    assert_eq!(tracker.compute_time_adjustment(44_100, 1_501), 0);
+    assert_eq!(tracker.compute_time_adjustment(44_100, 1_505), -1);
+    assert_eq!(tracker.compute_time_adjustment(44_100, 1_495), 1);
+
+    // 5. Verify stereo PCM adjustment (-1 drops 1 stereo frame, +1 stuffs 1)
+    let input_stereo: [i16; 6] = [10, 20, 30, 40, 50, 60]; // 3 stereo frames
+    let mut out = Vec::new();
+
+    SyncDriftTracker::apply_stereo_adjustment(0, &input_stereo, &mut out);
+    assert_eq!(out, vec![10, 20, 30, 40, 50, 60]);
+
+    SyncDriftTracker::apply_stereo_adjustment(-1, &input_stereo, &mut out);
+    assert_eq!(out, vec![10, 20, 30, 40]);
+
+    SyncDriftTracker::apply_stereo_adjustment(1, &input_stereo, &mut out);
+    assert_eq!(out, vec![10, 20, 30, 40, 50, 60, 50, 60]);
+}
+

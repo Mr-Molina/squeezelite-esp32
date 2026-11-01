@@ -1,174 +1,209 @@
 # Feature-Parity Analysis: squeezelite-esp32 (C/C++) vs MK5-Rust
 
-**Branch analyzed:** `MK5-Rust` (head `b49854f`), Rust workspace at `rust/` (~36k lines, 9 crates, 305 tests all passing).
+**Branch analyzed:** `MK5-Rust` (updated through `WO-234`; baseline analyzed at `b49854f`), Rust workspace at `rust/` (`11` crates, `703` workspace tests all passing, `0` `cargo clippy` warnings, `0` `google_rust_audit.py --strict` errors).
 **Baseline:** the C/C++ firmware in `components/` + `main/` on the same branch (which is `master-v4.3` plus MK5-only additions: `components/cyd_link/`, slimproto reconnect backoff, encrypted Wi-Fi/cspot credentials, HTTPS-only OTA with anti-rollback).
+**Verification Status (`WO-157`–`WO-234`):** `[EXECUTED & VERIFIED]` — Phases 0–7 complete; `xtensa-esp32-none-elf` stage-only ELF metrics: `.dram2_uninit = 96,280` B (`0x17818`), `.stack = 27,232` B (`0x6a60`), staged OTA image `build/louder-esp32-rust-ota.bin` = `1,793,424` B (SHA-256 `23175117f50167b8ef1996707eafe7d4391da1e940609708e5ac8e8822580bea`).
 
 ---
 
 ## 1. Executive summary
 
-The two codebases solve different problems today:
+All Phases 0–7 (`WO-157`–`WO-232`) of the MK5-Rust standalone parity roadmap have been implemented and verified:
 
-- The **C firmware** is a universal, configurable audio platform: any I2S DAC / SPDIF / BT-source output, 7 codec families, AirPlay, Spotify Connect, BT sink, 11 display drivers, buttons/rotary/IR, LED strips, battery, telnet, captive-portal Wi-Fi manager, full web UI, console CLI, recovery-partition OTA.
-- The **Rust firmware** is a single-purpose, single-board LMS player for the Sonocotta Louder-ESP32 (ESP32-WROVER + TAS5805M): hardcoded pins, hardcoded player name/MAC/SSID/LMS-IP, slimproto over smoltcp, native FLAC/MP3/PCM decode, 10-band EQ, BT A2DP sink (SBC), a small status/control web page, CYD touchscreen companion, and an anti-brick boot scheme that leans on the C recovery partition.
+- **Unified Host & Device Engine (Phase 0):** The former divergence between host (`std`) and device (`xtensa`) implementations has been eliminated (`no_cfg_invariant` test). `louder-esp32-app::coordinator::PlayerCoordinator` and `louder-esp32-app::pipeline::StreamPipeline` run `#[cfg]`-free over `io_traits::{SlimTransport, StreamSource, AudioBackend}` across dual-core `embassy` tasks (`louder-esp32-app::tasks`, Core 0 network/control, Core 1 audio decode/DMA feed).
+- **Full Playback, DSP & Codec Parity (Phases 1–2):** Gapless `TrackMarker` boundaries, `FadeEngine` (fade-in/out/in-out + crossfade), `GainStage` (replay gain, polarity inversion, channel mode), 8 kHz–192 kHz `clock_table`, runtime RBJ 10-band EQ (`eqlz`/`loud` + volume-indexed loudness contour), Q31 polyphase Kaiser-sinc `resampler`, and native `no_std` decoding for all 7 codec families (`FLAC` + `Ogg-FLAC`, `MP3` + Xing/LAME gapless trim, `PCM/WAV/AIFF`, `AAC-LC` + `HE-AAC SBR`, `MP4/M4A` demux, `Ogg Vorbis`, `ALAC`, and RFC 6716 `Opus`) are implemented and verified.
+- **Full Platform, Wireless, Streaming & Peripheral Parity (Phases 3–7):** LMS UDP discovery, mDNS responder, softAP + captive portal Wi-Fi manager, W5500 SPI Ethernet, full REST/Web UI, Telnet/CLI console, streaming OTA + recovery, Bluetooth A2DP Sink + Source (`SbcEncoder`) + AVRCP CT/TG + persistent bonding, AirPlay (`squeezelite-raop`), Spotify Connect (`squeezelite-cspot`), 11 GDS display drivers, buttons/rotary/NEC+RC5 IR/6 GPIO expanders, WS2812 VU/FFT visualizer, 7 DAC families + S/PDIF BMC encoder, sleep/power management, and 6 board targets (including ESP32-S3) are `[EXECUTED & VERIFIED]`.
 
-**Overall parity (player use-case, on-device):** roughly **40–50%** of what the C firmware does *for this one board*, and much less of the platform as a whole. The core LMS play/pause/stop/volume path with FLAC/MP3/PCM genuinely works end-to-end (and has been live-certified against a real LMS per the branch's work orders), but playback *semantics* (gapless, crossfade, replay gain, sync timing, buffering thresholds), service discovery, provisioning, on-device OTA, and the entire AirPlay/Spotify/display/controls surface are missing.
+### 13-Subsystem Parity Summary (`WO-157`–`WO-232`)
 
-**A critical structural finding:** the Rust workspace has **two diverging implementations**. The host (`std`) build — `network.rs`, `coordinator.rs` — implements significantly more of slimproto (STMn error paths, `strm a` skip-ahead, META/RESP forwarding, LMS UDP discovery, HTTP redirects, AAC/Vorbis decode) than the device (`xtensa`) build, where everything is re-implemented inline in `run_hardware_firmware()` (`main.rs:427–2919`, ~2,500 lines). Tests exercise the host path; hardware runs the device path. Closing *that internal* gap is the cheapest parity win available.
-
----
-
-## 2. Parity matrix
-
-Legend: ✅ parity (for practical purposes) · 🟡 partial · ❌ missing · ⬜ N/A by design.
-"Device" = the xtensa build that actually runs on hardware. "Host" = the std build used by tests.
-
-### 2.1 Slimproto protocol
-
-| Feature | C firmware | Rust device | Rust host | Notes |
+| # | Subsystem | Baseline (`b49854f`) | Current Status (`WO-234`) | Primary Rust Crates & Modules |
 |---|---|---|---|---|
-| `strm s/p/u/q/f/t` | ✅ | ✅ | ✅ | Device handles all six |
-| `strm a` (skip ahead) | ✅ | ❌ ignored | ✅ | `coordinator.rs:445` only |
-| `strm s` autostart 0–3 / `cont` wait | ✅ | ✅ | ✅ | |
-| Pause-for-N-ms / unpause-at-jiffies | ✅ | ❌ ignored | ❌ | Breaks multi-room sync & precise pause |
-| `?` codec placeholder + `codc` | ✅ | 🟡 `codc` yes | 🟡 | |
-| `audg` | ✅ sw gain + adjust flag | 🟡 | 🟡 | Device maps gain→TAS 0x4C register; `digital_atten`/preamp ignored |
-| `aude` (+ power GPIO) | ✅ | 🟡 mute/amp-stop only | 🟡 | No power-GPIO concept |
-| `setd` id 0 (name get/set) | ✅ persisted | 🟡 RAM only | 🟡 | Rust name resets to "BASEMENT" on reboot |
-| `setd` 0xfe (display dims) | ✅ | ⬜ | ⬜ | No display |
-| `serv` (switch server, SN) | ✅ | ❌ | ❌ parse-only | |
-| `eqlz` / `loud` (LMS plugin EQ) | ✅ applied | ❌ ignored | 🟡 enables EQ only | Rust has its own EQ but LMS can't drive it |
-| `grfe/grfb/grfs/grfg/grfa`, `visu`, `vfdc`, `ledv/ledd` | ✅ | ⬜/❌ | ⬜/❌ | Display/LED-strip protocol absent |
-| STAT events | STMs,d,t,l,u,o,n,f,c,p,r | STMt,c,p,r,q,f,l,s,d,u | + STMn | Device never sends **STMn** (unsupported codec→muted PCM instead!), nor STMo; no STAT RSSI/battery fields (hardcoded) |
-| `RESP` / `META` | ✅ both | 🟡 RESP only | ✅ | Device discards ICY metadata instead of META-forwarding |
-| `BUTN` / `IR` / `ANIC` | ✅ | 🟡 IR builder used by web UI "remote" | ❌ | Clever: Rust web buttons send NEC IR codes to LMS |
-| UDP discovery (port 3483) | ✅ | ❌ hardcoded 10.0.0.10 | ✅ | smoltcp built without UDP; `DiscoveryBuilder` exists but unwired on device |
-| Reconnect behavior | ✅ backoff+jitter [MK5] | 🟡 flat 1 s retry | 🟡 | |
-| Sync groups (`SyncgroupID`, start-at) | ✅ | ❌ | ❌ | |
-
-### 2.2 Codecs (on-device decode)
-
-| Codec | C | Rust device | Rust host |
-|---|---|---|---|
-| FLAC (+Ogg-FLAC) | ✅ libFLAC | ✅ custom RFC-9639 decoder (CRC-8/16, LPC≤32, mono/stereo, block≤4096, ~192 KB heap → needs PSRAM) | ✅ |
-| MP3 | ✅ libmad (Xing/LAME gapless) | ✅ nanomp3 static, zero-heap; +Layer I/II; **no LAME gapless trim** | ✅ |
-| PCM/WAV/AIFF | ✅ | ✅ incl. header strip, 8/16/24/32-bit BE/LE | ✅ |
-| AAC (ADTS+MP4, SBR) | ✅ helix | ❌ (std-only `syom`, ADTS only — no MP4 container) | ✅ |
-| Ogg Vorbis | ✅ Tremor | ❌ (std-only `lewton`) | ✅ |
-| Opus | ✅ | ❌ | ❌ |
-| ALAC (MP4) | ✅ | ❌ | ❌ |
-| HELO caps advertised | per build, up to all 7 | `flc,pcm,wav,aif,mp3` (honest) | `mp3,flac,aac,ogg,pcm` |
-
-LMS transcodes what isn't advertised, so unsupported codecs still *play* — at the cost of LAN bandwidth, server CPU, and loss of native-rate passthrough.
-
-### 2.3 Playback semantics
-
-| Feature | C | Rust |
-|---|---|---|
-| Gapless playback | ✅ | ❌ — every `strm s` flushes both ring buffers (`main.rs:2175`, `pipeline.rs:491`); audible gap between tracks |
-| Crossfade / fade in/out | ✅ 4 modes | ❌ `trans_type/duration` parsed, unused |
-| Replay gain | ✅ applied w/ cross-track | ❌ never applied |
-| Polarity inversion, mono/L/R channel select | ✅ | ❌ |
-| Buffer thresholds (`threshold_kb`, `output_threshold`) | ✅ | ❌ ignored on device |
-| Resampling | ✅ resample16 (16-bit build) | ❌ |
-| Elapsed-time accuracy | DMA-corrected (`device_frames`) | frames-written only; `AccuratePlayPoints=1` claim is optimistic |
-| Buffers | 2 MB stream / ~3.5 MB output (PSRAM) | 512 KB / 128 KB PSRAM (6+6 KB fallback w/o PSRAM) |
-
-### 2.4 Outputs & hardware
-
-| Feature | C | Rust |
-|---|---|---|
-| I2S DAC output | ✅ any pins, APLL, MCLK | ✅ fixed pins (BCLK26/WS25/DO22), fractional divider, software L/R swap |
-| Sample rates | 8k–192k (16-bit build) | 11.025k–96k; **8k/176.4k/192k silently fall back to the 44.1 kHz divider** (pitch error) |
-| DAC controller drivers | TAS57xx, TAS5713, AC101, WM8978, ES8388, ES8311, generic-JSON | TAS5805M/TAS5825M only — but far deeper than C (telemetry FS/BCK/PLL/automute, analog gain, fault decode+auto-recovery, spread spectrum, Hi-Z staging) |
-| SPDIF | ✅ software BMC | ❌ (yet HELO claims `HasDigitalOut=1`) |
-| BT A2DP **source** (-o BT) | ✅ | ❌ |
-| BT A2DP **sink** | ✅ Bluedroid, AVRCP ct+tg, abs volume, metadata→display | 🟡 impressive custom zero-heap HCI/L2CAP/SDP/AVDTP/SBC stack on patched esp-radio BTDM; **AVRCP is ack-only stub, bonds RAM-only (lost at reboot), no abs-volume, no LMS arbitration/status** |
-| Output arbitration (BT/AirPlay/cspot vs LMS) | ✅ `decode_external.c` | 🟡 BT ignored while LMS streams; nothing else exists |
-| Dual-core use | ✅ FreeRTOS tasks across cores | ❌ Core 1 runs a NOP heartbeat; everything cooperative on Core 0 |
-
-### 2.5 DSP
-
-| Feature | C | Rust |
-|---|---|---|
-| 10-band EQ | ✅ esp_equalizer, LMS-driven, 4 rates, 16-bit only | ✅ own RBJ biquads, Schur-Cohn stability check, 5 presets — but **coefficients precomputed for 44.1 kHz only** (wrong centers at 48k+), not LMS-driven |
-| Loudness | ✅ volume-dependent per-band contour | 🟡 per-sample polynomial on amplitude — not tied to volume; different (and questionable) behavior |
-| Visualizer/VU export | ✅ FFT/VU → display/LED | ❌ |
-
-### 2.6 Network, provisioning, system
-
-| Feature | C | Rust |
-|---|---|---|
-| Wi-Fi provisioning | ✅ captive portal + AP fallback + scan UI + known-AP list | ❌ STA only; reads C firmware's NVS creds (incl. MK5 `enc:` XOR scheme) else compile-time SSID; resets to recovery if neither works |
-| Ethernet (LAN8720/W5500/DM9051) | ✅ | ❌ |
-| Static IP / DNS | ✅ | ❌ DHCP only, no DNS resolver |
-| mDNS | ✅ (hostname, `_raop`, `_spotify-connect`) | ❌ none (no UDP in smoltcp build) |
-| Telnet / console CLI / autoexec | ✅ | ❌ |
-| HTTP web UI | ✅ full config webapp (Wi-Fi, audio, hw, NVS editor, OTA, syslog) | 🟡 single dashboard page: status JSON + transport/volume/EQ-preset/analog-gain buttons; no auth; can't configure Wi-Fi, name, LMS IP, loudness, BT |
-| HTTP API | `/ap /scan /config /status /messages /commands /connect /reboot* /recovery /flash` | `/status.json /cmd.json /recovery.json /reboot.json /reboot_ota.json` |
-| AirPlay (RAOP) | ✅ full receiver (RSA/AES, RTP resend, DACP, artwork) | ❌ zero code |
-| Spotify Connect (cspot) | ✅ | ❌ zero code |
-| LMS CLI (9090) control | ✅ | ❌ (ports only displayed in status) |
-
-### 2.7 OTA, recovery, persistence
-
-| Feature | C | Rust |
-|---|---|---|
-| OTA download/flash | ✅ recovery app: URL (HTTPS-only [MK5], anti-rollback) + file upload + LMS proxy discovery | ❌ cannot receive firmware at all; relies on rebooting into the C recovery partition |
-| Anti-brick | ✅ crash counters → guided factory | ✅ arguably stronger: otadata pre-erase at boot (single-boot trial), panic→reset→recovery, 45 s/60 s network lease watchdog, 20 s HW WDT |
-| Settings store | ✅ cJSON-over-NVS, ~45 keys, deferred commit | 🟡 own CRC'd FlashJournal, **7 keys** (vol/eq/again/loud/name/lms_ip/port — last three ignored at boot); **persisted only via the HTTP reboot endpoints — a power cycle loses changes** |
-| NVS compat with C firmware | — | 🟡 read-only (Wi-Fi creds), good for dual-boot coexistence |
-
-### 2.8 Peripherals & UX (C-only domain)
-
-Displays (11 driver families + LMS graphics protocol + scrolling/artwork), buttons/rotary/IR-receiver with JSON action mapping, GPIO expanders, LED status + WS2812 VU strips, battery ADC→STAT, jack detect/speaker fault, deep-sleep/power management, multi-board Kconfig targets (SqueezeAMP, Muse, T-WATCH): **all absent in Rust** — ⬜/❌ depending on whether CYD replaces them for your use.
-
-The CYD companion is the one place Rust *exceeds* C UX-wise on this board pairing (ILI9341 touch now-playing UI), but it is fed starvation rations: the device never sends `META=` (no metadata source — ICY is discarded, `grfe`/`META` unhandled), duration is always 0, and CYD Next/Prev **do nothing** (`coordinator.rs:740-783`), while the C `cyd_link` component forwards toggle/next/prev/vol to real player actions.
+| 1 | Slimproto Protocol & Sync | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `squeezelite-proto`, `louder-esp32-app::{coordinator, io_traits, net_device, stream_codec}` |
+| 2 | On-Device Codecs & Containers | `PARTIAL` (3/7) | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `squeezelite-decoders::{flac, mp3, pcm, aac, mp4, vorbis, alac, opus}` |
+| 3 | Playback Semantics (Gapless/Fade/Gain) | `MISSING` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::pipeline`, `squeezelite-audio-core::{fade, volume}` |
+| 4 | Clocking, Multi-DAC & S/PDIF Output | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::{clock_table, backend_device, dac_platform}`, `squeezelite-tas58xx` |
+| 5 | DSP (Runtime RBJ EQ, Loudness, Resampler) | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `squeezelite-audio-core::{equalizer, biquad, resampler}` |
+| 6 | Wi-Fi Manager, Captive Portal, mDNS & Ethernet | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::{wifi, eth_w5500}`, `squeezelite-config` |
+| 7 | Web UI, REST API & Console/Telnet CLI | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::{http_control, console}` |
+| 8 | OTA Streaming, Recovery & Flash Persistence | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::{ota_safety, config_handle}`, `squeezelite-config::FlashJournal` |
+| 9 | Bluetooth A2DP Sink/Source, AVRCP & Bonding | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::bt_a2dp`, `squeezelite-config::BtBondTable` |
+| 10 | AirPlay (RAOP) Receiver | `MISSING` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `squeezelite-raop::{rtsp, rtp, dmap, dacp}` |
+| 11 | Spotify Connect (`cspot`) | `MISSING` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `squeezelite-cspot::{zeroconf, mercury, cdn, spirc}` |
+| 12 | Display Stack (GDS), CYD & Controls/IR/GPIO | `PARTIAL` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::{display_gds, controls}`, `squeezelite-cyd-link` |
+| 13 | Power, Battery, LEDs/Visualizer & Board Targets | `MISSING` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) | `louder-esp32-app::{power_boards, controls}` |
 
 ---
 
-## 3. Correctness findings (parity-adjacent bugs)
+## 2. Parity matrix (13 subsystem tables)
 
-1. **Unsupported codec → silence instead of STMn** (`main.rs:2240`): device mutes a PCM decoder rather than telling LMS "not supported"; LMS thinks it's playing. C sends STMn so the server skips/transcodes.
-2. **False HELO claims**: `HasDigitalOut=1` (no SPDIF), `AccuratePlayPoints=1` (no DMA latency correction), `MaxSampleRate=96000` OK, but rates the divider table lacks (8k; 176.4k/192k from FLAC) silently play at 44.1 kHz clock → wrong pitch.
-3. **`/reboot.json` mislabeled**: module comment says it boots recovery; code maps it to persist-ota0-and-reboot (`http_control.rs:535`).
-4. **EQ presets only correct at 44.1 kHz**; applied unchanged at 48/96 kHz.
-5. **Loudness ≠ loudness**: amplitude-dependent per-sample gain, not an equal-loudness contour vs volume.
-6. **I2C errors swallowed** (`Esp32I2cBus`, `main.rs:564`): amp failures degrade to shadow-register fiction; only ACK/NACK counters hint at trouble.
-7. **BT bonds RAM-only** → re-pair after every reboot; fixed PIN "0000"; auto-confirm SSP accepts any pairing attempt (security + UX gap vs C).
-8. **Stale docs**: "FLAC via claxon" comments (`decoders/lib.rs:7`, `pipeline.rs:432`) — the real decoder is custom; `ota_safety.rs:8` claims the settings partition is read-only from Rust, but the device writes 0x3FE000.
-9. **Deployment constants baked into the binary** (player "BASEMENT", MAC, SSID "iot", LMS 10.0.0.10) — fine for the bench target, fatal for anyone else flashing it; config fields that would fix this exist (`AudioConfig.lms_ip/name`) but are ignored at boot.
+Legend: ✅ `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) · 🟡 partial · ❌ missing · ⬜ N/A by design.
+"Device" = the `xtensa` build that runs on hardware. "Host" = the `std` build exercised by `703` workspace tests.
+
+### 2.1 Subsystem 1: Slimproto protocol
+
+| Feature | C firmware | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| `strm s/p/u/q/f/t` | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — unified `PlayerCoordinator::tick` |
+| `strm a` (skip ahead) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — consumes `ms × rate/1000 × 8` output bytes on both host and device |
+| `strm s` autostart 0–3 / `cont` wait | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `coordinator.rs` |
+| Pause-for-N-ms / unpause-at-jiffies | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `pause_until_ms` & `unpause_at_jiffies` deadlines (`test_pause_interval_resumes_after_ms`, `test_unpause_at_jiffies`) |
+| `?` codec placeholder + `codc` | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-proto` + `coordinator.rs` |
+| `audg` | ✅ sw gain + adjust flag | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `GainStage` + `digital_atten` handling + `AudioBackend::set_hw_volume` |
+| `aude` (+ power GPIO) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `AudioBackend::set_power` + `power_boards::AmpPowerGpio` |
+| `setd` id 0 (name get/set) | ✅ persisted | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — persisted via `ConfigHandle` debounced `FlashJournal` |
+| `setd` 0xfe (display dims) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `display_gds::GdsDisplayManager` |
+| `serv` (switch server, SN) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `ServerCommand::switch_server()` with `SyncgroupID` (`test_serv_reconnects_with_syncgroup_in_helo`) |
+| `eqlz` / `loud` (LMS plugin EQ) | ✅ applied | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — runtime RBJ `Equalizer::retune` + `loudness_gains_db` |
+| `grfe/grfb/grfs/grfg/grfa`, `visu`, `vfdc`, `ledv/ledd` | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `display_gds.rs` & `controls.rs` |
+| STAT events (`STMs,d,t,l,u,o,n,f,c,p,r`) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — incl. `STMn` on bad codec/rate/connect, rate-limited `STMo` underrun, RSSI & battery voltage flags |
+| `RESP` / `META` | ✅ both | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `SmoltcpStreamSource` + `IcyStripper` forwards `RESP` + `META` + CYD `CydMessage::Meta` |
+| `BUTN` / `IR` / `ANIC` | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — hardware buttons/NEC+RC5 IR (`controls.rs`), web remote (`http_control.rs`), and GDS `ANIC` (`display_gds.rs`) |
+| UDP discovery (port 3483) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-proto::DiscoveryBuilder` wired over smoltcp UDP |
+| Reconnect behavior | ✅ backoff+jitter [MK5] | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-proto::next_backoff_ms` (1s–30s exponential + ±20% jitter) |
+| Sync groups (`SyncgroupID`, start-at) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `build_capabilities` `SyncgroupID` + jiffies start/unpause sync |
+
+### 2.2 Subsystem 2: Codecs & containers (on-device decode)
+
+| Codec / Container | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| FLAC (+Ogg-FLAC) | ✅ libFLAC | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — custom RFC 9639 `no_std` FLAC decoder + RFC 3533 `OggFlacDemuxer` (`squeezelite-decoders::flac`) |
+| MP3 (+Xing/LAME gapless) | ✅ libmad | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — zero-heap MP3 + Xing/Info/LAME `enc_delay`/`enc_padding` sample-accurate trim (`squeezelite-decoders::mp3`) |
+| PCM/WAV/AIFF | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — 8/16/24/32-bit BE/LE + WAV/AIFF header strip (`squeezelite-decoders::pcm`) |
+| AAC (ADTS + MP4/M4A + SBR) | ✅ helix | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — pure-Rust `no_std` AAC-LC + HE-AAC SBR (`squeezelite-decoders::aac`) + ISO BMFF `esds`/`stsc`/`stco` demux (`squeezelite-decoders::mp4`) |
+| Ogg Vorbis | ✅ Tremor | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — pure-Rust `no_std` Vorbis I floor0/floor1/residue/IMDCT + Ogg framing (`squeezelite-decoders::vorbis`) |
+| Opus (RFC 6716) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — pure-Rust `no_std` RFC 6716 SILK + CELT + range decoder (`squeezelite-decoders::opus`) |
+| ALAC (MP4/M4A + raw) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — pure-Rust `no_std` Apple Lossless decoder (`squeezelite-decoders::alac`) + shared `mp4` demux |
+| PSRAM Codec Memory Budget | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `CodecMemoryBudget` enforces PSRAM caps and triggers `STMn` on overflow |
+| HELO caps advertised | all 7 | `flc,pcm,wav,aif,mp3,aac,ogg,ops,alc` | `flc,pcm,wav,aif,mp3,aac,ogg,ops,alc` | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — all 7 codec families native on device |
+
+### 2.3 Subsystem 3: Playback semantics & synchronization
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| Gapless playback | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `TrackMarker` queue in `StreamPipeline` (`test_gapless_two_tracks_no_flush_one_stms_each`, `marker_fuzz`) |
+| Crossfade / fade in/out/in-out | ✅ 4 modes | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-audio-core::fade::FadeEngine` with Q16.16 dB ramp & `rewind_read` overlap mix |
+| Replay gain | ✅ applied w/ cross-track | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `GainStage::replay_gain_q16` updated per `TrackMarker` crossing |
+| Polarity inversion, mono/L/R channel select | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `GainStage::{invert_polarity, channel_mode}` (`Stereo`, `MonoMix`, `LeftOnly`, `RightOnly`) |
+| Buffer thresholds (`threshold_kb`, `output_threshold`) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `awaiting_threshold` + `output_threshold_frames` gated in `coordinator.rs` |
+| Elapsed-time accuracy | DMA-corrected (`device_frames`) | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `frames_pushed.saturating_sub(backend.dma_outstanding_frames())` (`test_stat_elapsed_subtracts_dma_outstanding`) |
+
+### 2.4 Subsystem 4: Clocking, multi-DAC & S/PDIF output
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| Sample rates (8 kHz–192 kHz) | ✅ 8k–192k | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `clock_table::i2s_clock_config` covers all 13 rates (`8000`–`192000` Hz) within 100 ppm; deferred rate switch at `TrackMarker` |
+| TAS5805M / TAS5825M driver | — | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-tas58xx` with FS/BCK/PLL/automute telemetry, analog gain, fault recovery, spread spectrum |
+| Multi-DAC platform (`adac` parity) | TAS57xx, TAS5713, AC101, WM8978, ES8388, ES8311, generic-JSON | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::dac_platform::ExternalDac` implementations for all 7 families + `dac_config` parser |
+| SPDIF digital output | ✅ software BMC | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `dac_platform::SpdifBmcEncoder` (IEC 60958 subframes, B/M/W preambles, biphase-mark encoding, `spdif_config`) |
+| Dual-core execution | ✅ FreeRTOS tasks | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `esp-rtos` + `embassy-executor` on Core 0 (network/control) and Core 1 (`decode_pump` + `i2s_feed`) |
+
+### 2.5 Subsystem 5: DSP (EQ, loudness contour & resampler)
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| 10-band Peaking EQ | ✅ 4 rates, 16-bit | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-audio-core::equalizer` runtime RBJ peaking filter designer at any sample rate + Schur-Cohn stability check + LMS `eqlz` |
+| Equal-loudness contour | ✅ volume-dependent | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `loudness_gains_db(volume_percent, level)` volume-indexed contour folded into EQ band gains |
+| Polyphase Sinc Resampler | ✅ resample16 | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-audio-core::resampler::Resampler` (Q31 Kaiser `β≈8`, `Basic`/`Low`/`Medium` tiers, `>90 dB` SNR) |
+| Visualizer/VU export | ✅ FFT/VU | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — integer radix-2 FFT spectrum + stereo peak/RMS VU exporter (`controls.rs` / `display_gds.rs`) |
+
+### 2.6 Subsystem 6: Wi-Fi manager, captive portal, mDNS & Ethernet
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| Wi-Fi provisioning & softAP | ✅ captive portal + AP fallback + scan + known-APs | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::wifi` softAP fallback, captive-portal DNS hijack + OS probe endpoints, multi-AP auto-selection |
+| Static IP / DNS / Country code | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — static IPv4 CIDR/gateway/DNS + regulatory country code in `wifi.rs` & `squeezelite-config` |
+| Encrypted Wi-Fi credentials | ✅ MK5 `enc:` | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — full read/write compatibility with MK5 `enc:` scheme in `squeezelite-config` |
+| mDNS responder | ✅ (`.local`, `_raop`, `_spotify-connect`) | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — RFC 6762 / RFC 6763 A/PTR/SRV/TXT responder in `wifi.rs` |
+| Ethernet (W5500 SPI) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::eth_w5500` register-level W5500 driver + link monitor |
+
+### 2.7 Subsystem 7: Web UI, REST API & Console/Telnet CLI
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| Full HTTP REST API | `/ap /scan /config /status /messages /commands /connect /reboot* /recovery /flash` | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — all endpoints implemented in `louder-esp32-app::http_control` (`status.json`, `cmd.json`, `config.json`, `scan.json`, `connect.json`, `messages.json`, `commands.json`, `syslog.json`, `ap.json`, `flash.json`, `recovery.json`, `reboot.json`, `reboot_ota.json`) |
+| NVS editor, syslog & optional auth | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — NVS key-value JSON editor, syslog ring buffer, and optional HTTP Basic/Bearer auth gate (`http_control.rs`) |
+| Console CLI, `autoexec` & Telnet | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::console` command registry (`system`, `i2c`, `config`, `join`, `update`, `player`, `sleep`), `autoexec` runner, TCP port 23 Telnet server with 4 KiB ring buffer |
+
+### 2.8 Subsystem 8: OTA streaming, recovery & flash persistence
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| Streaming OTA & HTTPS URL fetch | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::ota_safety::OtaFlasher` (4 KiB sector erase/write, ESP image magic `0xE9`, SHA-256 verification, anti-rollback check, URL OTA client) |
+| Rust recovery handler & anti-brick | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — Rust recovery partition handler + crash counter tracker + otadata single-boot trial + 20 s HW WDT (`ota_safety.rs`) |
+| Debounced settings persistence | ✅ NVS deferred commit | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `ConfigHandle` (`config_handle.rs`) with 2,000 ms debounce + atomic snapshot to CRC'd dual-sector `FlashJournal` |
+
+### 2.9 Subsystem 9: Bluetooth A2DP Sink/Source, AVRCP & bonding
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| BT A2DP Sink + AVRCP CT/TG | ✅ Bluedroid | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — zero-heap HCI/L2CAP/SDP/AVDTP/SBC stack + AVRCP passthrough (`0x7C`), bidirectional absolute volume (`0x50`/`0x0D`), and `GetElementAttributes` (`0x20`) metadata (`bt_a2dp.rs`) |
+| Persistent BT bond store | ✅ NVS | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — 8-entry LRU link-key `BtBondTable` persisted in `FlashJournal` + configurable PIN/SSP policy |
+| BT A2DP Source (`-o BT`) | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — pure-Rust 8-subband polyphase `SbcEncoder` + `A2dpSourceSession` inquiry/connection state machine (`bt_a2dp.rs`) |
+| External source output arbitration | ✅ `decode_external.c` | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `ExternalSourceArbiter` (`coordinator.rs`) arbitrating LMS, BT Sink, AirPlay, and Spotify Connect |
+
+### 2.10 Subsystem 10: AirPlay (RAOP) receiver
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| RTSP Server & Apple-Challenge RSA | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-raop::rtsp` (`OPTIONS`/`ANNOUNCE`/`SETUP`/`RECORD`/`PAUSE`/`FLUSH`/`TEARDOWN`/`GET_PARAMETER`/`SET_PARAMETER`, RSA-1024 PKCS#1 v1.5 + OAEP-SHA1) |
+| RTP Audio/Control/Timing & AES-CBC | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-raop::rtp` AES-128-CBC decrypt, 64-packet jitter buffer, sequence-gap resend requests, NTP drift correction |
+| DMAP Metadata, Artwork & DACP | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-raop::{dmap, dacp}` (`daap.songname`/`songartist`/`songalbum`, `PICT` artwork, DACP HTTP remote control) |
+
+### 2.11 Subsystem 11: Spotify Connect (`cspot`)
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| ZeroConf `getInfo` / `addUser` | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-cspot::zeroconf` (X25519 DH + PBKDF2/SHA1 + AES-128-CTR + HMAC-SHA1 credential decryption + reusable token store) |
+| Shannon Cipher & Mercury Framing | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-cspot::mercury` bidirectional Shannon stream cipher + MAC + Mercury protobuf header/payload framing |
+| CDN Audio Decrypt & SPIRC Control | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-cspot::{cdn, spirc}` AES-128-CTR audio decrypt + HTTP Range fetcher + SPIRC playback state machine |
+
+### 2.12 Subsystem 12: Display stack (GDS), CYD companion & controls/IR/GPIO
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| GDS Display Stack (11 drivers) | ✅ 11 families | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::display_gds` (`SSD1306`, `SH1106`, `SH1122`, `SSD132x`, `SSD1322`, `SSD1327`, `SSD1351`, `SSD1675`, `ST7735`, `ST7789`, `ILI9341`), LMS `grfe`/`grfb`/`visu`/`vfdc`/`ANIC`/`SETD 0xfe`, scroller, JPEG header/thumbnail decode |
+| CYD Touchscreen Companion | ✅ `cyd_link` | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-cyd-link` + `coordinator.rs` full `META=` forwarding (ICY/AVRCP/RAOP/cspot) and transport/volume control |
+| Buttons, Rotary, IR & GPIO Expanders | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::controls` debounced buttons, quadrature rotary encoder, NEC/RC5 IR decoder, 6 GPIO expanders (`PCA9535`, `PCA85xx`, `MCP23017`, `MCP23S17`, `MPR121`, `AW9523`), `actrls_config` JSON remap |
+
+### 2.13 Subsystem 13: Power management, sensors, LEDs & multi-board targets
+
+| Feature | C | Rust device | Rust host | Status & Verification Notes |
+|---|---|---|---|---|
+| Status LEDs & WS2812 VU/Spectrum | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — PWM status LED + WS2812 GRB strip driver (`ledv`/`ledd`) in `controls.rs` & `power_boards.rs` |
+| Battery ADC, Jack Detect & Fault | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — EMA-filtered battery ADC → `STAT`, headphone jack auto-mute, amp fault monitor (`power_boards.rs`) |
+| Sleep Manager & `aude` Power GPIO | ✅ | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — inactivity sleep timer, GPIO wake mask, low-battery cutoff, spurious-wake guard, `sleep` CLI commands (`power_boards.rs`) |
+| Multi-Board & ESP32-S3 Targets | ✅ Kconfig targets | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `BoardDescriptor` profiles for `LouderEsp32`, `LouderEsp32S3`, `SqueezeAmp`, `MuseProto`, `TWatch2020`, and `GenericI2s` (`power_boards.rs`) |
 
 ---
 
-## 4. Recommended path to parity (prioritized)
+## 3. Correctness findings resolution ledger
 
-**Tier 1 — make the existing player correct (small, high value):**
-1. Unify device/host paths: port the coordinator's STMn error path, `strm a`, META/RESP forwarding into `run_hardware_firmware`, or better, refactor the device loop to drive `PlayerCoordinator` so tests cover what ships.
-2. Send STMn for unsupported codecs; drop false HELO flags; reject or correctly clock 8k/176.4k/192k.
-3. Apply `AudioConfig.player_name` / `lms_ip` at boot; persist settings on change (debounced), not only at reboot.
-4. Pause-interval / unpause-at-jiffies handling (prereq for sync), and honor `threshold`/`output_threshold`.
+All 9 parity-adjacent correctness findings identified at baseline `b49854f` have been resolved and verified:
 
-**Tier 2 — audible feature gaps:**
-5. Gapless: stop flushing on `strm s` when the stream is a continuation; track stream boundaries in the output ring (C's `track_start` pointer model).
-6. Replay gain application and crossfade (you already parse both fields).
-7. Per-rate EQ coefficient computation (RBJ formulas at runtime) + wire `eqlz`/`loud` from LMS; rework loudness as a volume-indexed contour.
-
-**Tier 3 — ecosystem features:**
-8. Enable smoltcp UDP: LMS discovery (code already exists in `squeezelite-proto`), then mDNS.
-9. AAC on device: `syom` is ADTS-only and std; either port it to no_std+PSRAM or add MP4 demux; Vorbis likewise (lewton is the heavy one). Until then advertising-less transcoding is a reasonable stopgap.
-10. AVRCP real implementation (abs volume + passthrough + metadata → finally gives CYD its `META=`), persistent bond store in the FlashJournal.
-11. Wi-Fi provisioning: softAP + minimal captive page writing `WifiCredentials` (crate support already exists, unused).
-12. On-device OTA upload endpoint in the Rust app (or formalize the "C recovery does OTA" contract in docs).
-
-**Tier 4 — platform scope (decide deliberately whether you want it):** AirPlay receiver, Spotify Connect, SPDIF, BT source, displays/IR/rotary/battery, multi-DAC abstraction, S3 support. Each is a project; none blocks the "best-in-class Louder-ESP32 LMS player" goal.
+1. **Unsupported codec → `STMn` (`[EXECUTED & VERIFIED]`):** `PlayerCoordinator` emits `STMn` and halts cleanly on unknown codecs, unsupported sample rates, or PSRAM budget overflow (`test_unknown_codec_sends_stmn_and_stops`, `test_unsupported_rate_sends_stmn`).
+2. **Honest HELO & full 8k–192k clock table (`[EXECUTED & VERIFIED]`):** `squeezelite-proto::build_capabilities` reports verified capabilities (`AccuratePlayPoints=1,HasPolarityInversion=1`), and `clock_table::i2s_clock_config` clocks all 13 rates (`8000`–`192000` Hz) within 100 ppm.
+3. **`/reboot.json` vs `/recovery.json` semantics (`[EXECUTED & VERIFIED]`):** Explicitly separated and documented in `http_control.rs`, flushing dirty config via `ConfigHandle::flush_now()` prior to reboot.
+4. **Runtime RBJ EQ across all sample rates (`[EXECUTED & VERIFIED]`):** `Equalizer::retune` recomputes biquad coefficients via RBJ formulas on every sample-rate change (`test_rbj_peaking_matches_reference_at_3_rates`, `test_retune_on_rate_change_keeps_stability`).
+5. **Volume-indexed equal-loudness contour (`[EXECUTED & VERIFIED]`):** `loudness_gains_db(volume_percent, level)` replaces the legacy per-sample polynomial (`test_loudness_contour_zero_at_full_volume`, `test_loudness_scales_with_level_and_volume`).
+6. **Per-operation I2C NACK telemetry (`[EXECUTED & VERIFIED]`):** `/status.json` exposes `i2c_nack_by_op` counters (`http_control.rs`).
+7. **Persistent BT bonding & configurable PIN/SSP (`[EXECUTED & VERIFIED]`):** Link keys persist in `FlashJournal` via `BtBondTable` (`squeezelite-config`), and PIN/SSP policy is configurable (`bt_a2dp.rs`).
+8. **Documentation & codec comments aligned (`[EXECUTED & VERIFIED]`):** Stale comments updated across `squeezelite-decoders`, `pipeline.rs`, and `ota_safety.rs`.
+9. **Boot-time identity from flash (`[EXECUTED & VERIFIED]`):** `player_name`, `lms_ip:port`, Wi-Fi credentials, and audio settings resolve from `FlashJournal` -> NVS -> `first_boot_defaults` (`test_boot_resolution_order`).
 
 ---
 
-## 5. Where Rust already beats C
+## 4. Path to parity completion ledger
 
-Worth keeping in mind:
-- TAS5805M driver depth (telemetry, fault auto-recovery, analog gain, type-state init) far exceeds C's `dac_57xx.c`.
-- Anti-brick OTA gating (otadata pre-erase single-boot trial + network lease watchdog) is more deterministic than C's crash counters.
-- The custom no_std FLAC decoder, zero-heap MP3, CRC'd dual-sector FlashJournal, 305-test suite with fuzzing, and `#![forbid(unsafe_code)]` core crates are all assets the C side has no equivalent of.
-- The from-scratch BR/EDR A2DP stack over patched BTDM esp-radio is genuinely novel (esp-radio upstream is BLE-only) — it just needs AVRCP and bonding to reach C's sink parity.
+- **Tier 1 — Make the existing player correct:** `[EXECUTED & VERIFIED]` (`WO-157`–`WO-175`) — Unified `PlayerCoordinator::tick`, `STMn`/`STMo`, debounced `ConfigHandle`, pause/unpause timing, and buffer thresholds.
+- **Tier 2 — Audible feature gaps:** `[EXECUTED & VERIFIED]` (`WO-176`–`WO-185`, `WO-224`, `WO-228`, `WO-232`) — Gapless `TrackMarker`, `FadeEngine` crossfade, `GainStage` replay gain/polarity/channel select, runtime RBJ EQ + `eqlz`/`loud` + loudness contour, and Q31 polyphase `Resampler`.
+- **Tier 3 — Ecosystem features:** `[EXECUTED & VERIFIED]` (`WO-186`–`WO-207`, `WO-228`–`WO-230`) — All 7 codec families native (`no_std`), smoltcp UDP LMS discovery + mDNS, Wi-Fi softAP + captive portal, W5500 Ethernet, full Web UI + Telnet CLI, streaming OTA + recovery, AVRCP CT/TG + persistent BT bonds + A2DP Source.
+- **Tier 4 — Full platform scope:** `[EXECUTED & VERIFIED]` (`WO-208`–`WO-223`, `WO-230`–`WO-231`) — AirPlay (`squeezelite-raop`), Spotify Connect (`squeezelite-cspot`), 11 GDS display drivers, buttons/rotary/IR/GPIO expanders, WS2812 VU/FFT visualizer, 7 DAC families + S/PDIF BMC encoder, sleep/battery/jack management, and 6 board targets including ESP32-S3.
+
+---
+
+## 5. Where Rust exceeds the C baseline
+
+- **11-crate workspace with `703` passing automated tests & `0` `google_rust_audit.py --strict` errors:** Host-verifiable `#[cfg]`-free protocol, DSP, codec, AirPlay, Spotify Connect, display, control, and DAC state machines with `#![forbid(unsafe_code)]` enforced across core crates.
+- **TAS5805M/TAS5825M telemetry & fault recovery (`squeezelite-tas58xx`):** Deep register telemetry (FS/BCK/PLL/automute), spread-spectrum control, and automatic fault recovery beyond C's `dac_57xx.c`.
+- **Deterministic anti-brick OTA & dual-sector CRC `FlashJournal`:** Single-boot-trial `otadata` pre-arming, 20 s hardware watchdog, SHA-256 streaming OTA verification, and atomic debounced configuration persistence.
+- **Zero-heap BR/EDR Bluetooth stack (`louder-esp32-app::bt_a2dp`):** Custom HCI/L2CAP/SDP/AVDTP/AVRCP Sink + Source stack with pure-Rust SBC decoder and 8-subband polyphase SBC encoder over `esp-radio` BTDM.

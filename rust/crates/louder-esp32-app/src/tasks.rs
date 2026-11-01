@@ -302,7 +302,7 @@ mod device {
         handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
         LeaseHealth,
     };
-    use louder_esp32_app::io_traits::{NetAddr, SlimTransport};
+    use louder_esp32_app::io_traits::{AudioBackend, NetAddr, SlimTransport};
     use louder_esp32_app::net_device::{
         HttpStreamState, SlimLinkState, SlimReconnect, SmoltcpSlimTransport, SmoltcpStreamSource,
         TcpPhase, TcpSocketOps,
@@ -1463,6 +1463,11 @@ mod device {
     #[inline(never)]
     fn output_top_up_first(s: &mut FirmwareState) {
         s.coordinator.pump_output(s.pipeline, 16);
+        if let Some(rate) = s.coordinator.take_crossed_rate() {
+            let mut backend =
+                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            let _ = backend.set_sample_rate(rate);
+        }
     }
 
     /// `decode_pump`: with the DMA topped up, decode at most one audio frame (or a
@@ -1484,6 +1489,11 @@ mod device {
     #[inline(never)]
     fn output_top_up_final(s: &mut FirmwareState) {
         s.coordinator.pump_output(s.pipeline, 16);
+        if let Some(rate) = s.coordinator.take_crossed_rate() {
+            let mut backend =
+                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            let _ = backend.set_sample_rate(rate);
+        }
         s.coordinator.current_sample_rate = s.pipeline.sample_rate;
 
         if !s.coordinator.dac_enabled {
@@ -1526,8 +1536,9 @@ mod device {
             if s.coordinator.state == louder_esp32_app::PlayerState::Playing
                 && s.coordinator.current_sample_rate > 0
             {
-                let elapsed_secs =
-                    (s.pipeline.frames_played / s.coordinator.current_sample_rate as u64) as u32;
+                let elapsed_secs = (s.coordinator.frames_for_stat(s.pipeline)
+                    / s.coordinator.current_sample_rate as u64)
+                    as u32;
                 let _ = s.cyd_bridge.send_message(&CydMessage::Progress {
                     elapsed_secs,
                     duration_secs: 0,

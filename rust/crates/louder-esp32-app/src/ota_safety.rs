@@ -774,6 +774,638 @@ pub fn verify_ota_binary_header(image: &[u8]) -> Result<OtaBinarySummary, OtaSaf
     })
 }
 
+/// Minimum header byte count (`0x120 = 288` bytes) required to validate
+/// `esp_image_header_t` + segment 0 header + `esp_app_desc_t`.
+pub const OTA_MIN_HEADER_BYTES: usize = 0x120;
+
+/// Flash sector erase granularity (`4096` bytes).
+pub const OTA_FLASH_SECTOR_BYTES: u32 = 4096;
+
+/// Default consecutive boot crash threshold before entering guided recovery.
+pub const DEFAULT_CRASH_RECOVERY_THRESHOLD: u32 = 3;
+
+/// Upper 16-bit magic tag used to validate `RTC_CNTL_STORE` crash counters.
+pub const CRASH_COUNTER_RTC_MAGIC: u32 = 0xC8A5_0000;
+
+/// Incremental FIPS 180-4 SHA-256 hasher for arbitrary-length OTA streams.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sha256Incremental {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
+
+impl Default for Sha256Incremental {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256Incremental {
+    /// Initializes a new incremental SHA-256 state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    /// Feeds a slice of bytes into the running SHA-256 computation.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
+        while !data.is_empty() {
+            let space = 64 - self.buf_len;
+            let take = data.len().min(space);
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 64 {
+                Self::compress_block(&mut self.state, &self.buf);
+                self.buf_len = 0;
+            }
+        }
+    }
+
+    /// Completes SHA-256 padding and returns the 32-byte digest.
+    #[must_use]
+    pub fn finalize(&self) -> [u8; 32] {
+        let mut state = self.state;
+        let mut block = self.buf;
+        let mut idx = self.buf_len;
+        block[idx] = 0x80;
+        idx += 1;
+        if idx > 56 {
+            block[idx..64].fill(0);
+            Self::compress_block(&mut state, &block);
+            block.fill(0);
+        } else {
+            block[idx..56].fill(0);
+        }
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        Self::compress_block(&mut state, &block);
+
+        let mut out = [0u8; 32];
+        for (i, word) in state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// Lifecycle state of [`OtaStreamAssembler`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtaStreamState {
+    /// Accumulating the initial 288-byte header before verifying `esp_app_desc_t`.
+    AwaitingHeader,
+    /// Header verified; actively streaming chunks into `ota_0` (`0x160000`).
+    Streaming {
+        /// Validated header metadata (`version`, `project_name`).
+        summary: OtaBinarySummary,
+    },
+    /// Stream finished and verified.
+    Completed {
+        /// Final image summary with actual total byte length.
+        summary: OtaBinarySummary,
+        /// Full-stream SHA-256 digest.
+        sha256: [u8; 32],
+    },
+    /// Stream rejected due to invalid header or partition overflow.
+    Aborted(OtaSafetyError),
+}
+
+/// Describes the flash write window from [`OtaStreamAssembler::ingest_chunk`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtaFlashWriteOp {
+    /// Target absolute flash offset within `ota_0` (`0x160000..0x3F0000`).
+    pub flash_offset: u32,
+    /// Number of bytes accepted in this chunk.
+    pub bytes_written: usize,
+    /// First new 4 KB sector offset that must be erased for this write, if any.
+    pub first_new_sector_offset: Option<u32>,
+    /// Number of 4 KB sectors spanned that require erasing before write.
+    pub new_sectors_to_erase: u32,
+}
+
+/// Streaming HTTP/HTTPS OTA assembler that validates the `esp_app_desc_t`
+/// header on the first 288 bytes, tracks 4 KB sector erase boundaries within
+/// `ota_0` (`0x160000`), and computes an incremental SHA-256 digest.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct OtaStreamAssembler {
+    header_buf: [u8; OTA_MIN_HEADER_BYTES],
+    header_filled: usize,
+    bytes_received: usize,
+    expected_size: Option<usize>,
+    next_unerased_sector_index: u32,
+    hasher: Sha256Incremental,
+    state: OtaStreamState,
+}
+
+impl OtaStreamAssembler {
+    /// Creates a new streaming OTA assembler for `ota_0` (`0x160000`).
+    pub fn new(expected_size: Option<usize>) -> Result<Self, OtaSafetyError> {
+        if let Some(sz) = expected_size {
+            if sz < OTA_MIN_HEADER_BYTES {
+                return Err(OtaSafetyError::InvalidBinaryHeader(
+                    "expected_size shorter than 288-byte OTA header",
+                ));
+            }
+            if sz > OTA_0_PARTITION_SIZE as usize {
+                return Err(OtaSafetyError::InvalidBinaryHeader(
+                    "expected_size exceeds ota_0 partition capacity (0x290000 bytes)",
+                ));
+            }
+        }
+        Ok(Self {
+            header_buf: [0u8; OTA_MIN_HEADER_BYTES],
+            header_filled: 0,
+            bytes_received: 0,
+            expected_size,
+            next_unerased_sector_index: 0,
+            hasher: Sha256Incremental::new(),
+            state: OtaStreamState::AwaitingHeader,
+        })
+    }
+
+    /// Current state of the streaming OTA assembler.
+    #[must_use]
+    pub fn state(&self) -> &OtaStreamState {
+        &self.state
+    }
+
+    /// Total bytes ingested so far.
+    #[must_use]
+    pub fn bytes_received(&self) -> usize {
+        self.bytes_received
+    }
+
+    /// Returns completion percentage (`0..=100`) if `expected_size` is known.
+    #[must_use]
+    pub fn progress_pct(&self) -> u8 {
+        match self.expected_size {
+            Some(total) if total > 0 => {
+                let pct = (self.bytes_received as u64).saturating_mul(100) / (total as u64);
+                pct.min(100) as u8
+            }
+            _ => 0,
+        }
+    }
+
+    /// Ingests the next firmware chunk, validating the 288-byte header as soon
+    /// as enough bytes have arrived and returning the corresponding `ota_0`
+    /// flash write operation.
+    pub fn ingest_chunk(&mut self, chunk: &[u8]) -> Result<OtaFlashWriteOp, OtaSafetyError> {
+        if let OtaStreamState::Aborted(ref err) = self.state {
+            return Err(err.clone());
+        }
+        if matches!(self.state, OtaStreamState::Completed { .. }) {
+            return Err(OtaSafetyError::InvalidBinaryHeader(
+                "OTA stream already finalized",
+            ));
+        }
+        if chunk.is_empty() {
+            return Ok(OtaFlashWriteOp {
+                flash_offset: OTA_0_PARTITION_OFFSET + self.bytes_received as u32,
+                bytes_written: 0,
+                first_new_sector_offset: None,
+                new_sectors_to_erase: 0,
+            });
+        }
+
+        let new_total = self.bytes_received.saturating_add(chunk.len());
+        if new_total > OTA_0_PARTITION_SIZE as usize {
+            let err = OtaSafetyError::InvalidBinaryHeader(
+                "stream exceeds ota_0 partition capacity (0x290000 bytes)",
+            );
+            self.state = OtaStreamState::Aborted(err.clone());
+            return Err(err);
+        }
+        if let Some(expected) = self.expected_size {
+            if new_total > expected {
+                let err = OtaSafetyError::InvalidBinaryHeader(
+                    "stream exceeded declared expected_size",
+                );
+                self.state = OtaStreamState::Aborted(err.clone());
+                return Err(err);
+            }
+        }
+
+        if self.header_filled < OTA_MIN_HEADER_BYTES {
+            let need = OTA_MIN_HEADER_BYTES - self.header_filled;
+            let copy_len = chunk.len().min(need);
+            self.header_buf[self.header_filled..self.header_filled + copy_len]
+                .copy_from_slice(&chunk[..copy_len]);
+            self.header_filled += copy_len;
+
+            if self.header_filled == OTA_MIN_HEADER_BYTES {
+                match verify_ota_binary_header(&self.header_buf) {
+                    Ok(summary) => {
+                        self.state = OtaStreamState::Streaming { summary };
+                    }
+                    Err(err) => {
+                        self.state = OtaStreamState::Aborted(err.clone());
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        let start_offset = self.bytes_received as u32;
+        self.hasher.update(chunk);
+        self.bytes_received = new_total;
+
+        let end_offset = self.bytes_received as u32;
+        let required_sectors = end_offset.div_ceil(OTA_FLASH_SECTOR_BYTES);
+        let (first_new_sector_offset, new_sectors_to_erase) =
+            if required_sectors > self.next_unerased_sector_index {
+                let first = OTA_0_PARTITION_OFFSET
+                    + self.next_unerased_sector_index * OTA_FLASH_SECTOR_BYTES;
+                let count = required_sectors - self.next_unerased_sector_index;
+                self.next_unerased_sector_index = required_sectors;
+                (Some(first), count)
+            } else {
+                (None, 0)
+            };
+
+        Ok(OtaFlashWriteOp {
+            flash_offset: OTA_0_PARTITION_OFFSET + start_offset,
+            bytes_written: chunk.len(),
+            first_new_sector_offset,
+            new_sectors_to_erase,
+        })
+    }
+
+    /// Finalizes the OTA stream, verifying that the full header was validated
+    /// and `expected_size` (if specified) was met, returning the summary and
+    /// full-image SHA-256 digest.
+    pub fn finish(&mut self) -> Result<(OtaBinarySummary, [u8; 32]), OtaSafetyError> {
+        if let OtaStreamState::Aborted(ref err) = self.state {
+            return Err(err.clone());
+        }
+        if let Some(expected) = self.expected_size {
+            if self.bytes_received != expected {
+                let err = OtaSafetyError::InvalidBinaryHeader(
+                    "stream ended before reaching declared expected_size",
+                );
+                self.state = OtaStreamState::Aborted(err.clone());
+                return Err(err);
+            }
+        }
+        let mut summary = match &self.state {
+            OtaStreamState::Streaming { summary } => summary.clone(),
+            OtaStreamState::Completed { summary, sha256 } => {
+                return Ok((summary.clone(), *sha256));
+            }
+            OtaStreamState::AwaitingHeader => {
+                let err = OtaSafetyError::InvalidBinaryHeader(
+                    "image shorter than 288 bytes (incomplete header)",
+                );
+                self.state = OtaStreamState::Aborted(err.clone());
+                return Err(err);
+            }
+            OtaStreamState::Aborted(err) => return Err(err.clone()),
+        };
+        summary.image_size = self.bytes_received;
+        let sha256 = self.hasher.finalize();
+        self.state = OtaStreamState::Completed {
+            summary: summary.clone(),
+            sha256,
+        };
+        Ok((summary, sha256))
+    }
+}
+
+/// Boot routing decision emitted by [`CrashCounterPolicy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootRouteDecision {
+    /// Proceed with normal application execution in `ota_0`.
+    NormalOta0,
+    /// Crash threshold reached (`crash_count >= threshold`); enter guided
+    /// factory recovery mode (`0x10000`).
+    EnterGuidedRecovery {
+        /// Consecutive un-cleared boot crash count.
+        crash_count: u32,
+    },
+}
+
+/// Boot crash counter policy that triggers guided recovery when consecutive
+/// early crashes reach `threshold` (default `>= 3`).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashCounterPolicy {
+    crash_count: u32,
+    threshold: u32,
+    stable_uptime_cleared: bool,
+}
+
+impl Default for CrashCounterPolicy {
+    fn default() -> Self {
+        Self::new(DEFAULT_CRASH_RECOVERY_THRESHOLD)
+    }
+}
+
+impl CrashCounterPolicy {
+    /// Creates a new [`CrashCounterPolicy`] with the given `threshold`
+    /// (clamped to `>= 1`).
+    #[must_use]
+    pub const fn new(threshold: u32) -> Self {
+        let clamped = if threshold == 0 { 1 } else { threshold };
+        Self {
+            crash_count: 0,
+            threshold: clamped,
+            stable_uptime_cleared: false,
+        }
+    }
+
+    /// Reconstructs a [`CrashCounterPolicy`] from a 32-bit `RTC_CNTL_STORE`
+    /// register word. If the upper 16 bits do not match
+    /// [`CRASH_COUNTER_RTC_MAGIC`], initializes `crash_count` to `0`.
+    #[must_use]
+    pub const fn from_rtc_word(raw_word: u32, threshold: u32) -> Self {
+        let clamped = if threshold == 0 { 1 } else { threshold };
+        let count = if (raw_word & 0xFFFF_0000) == CRASH_COUNTER_RTC_MAGIC {
+            raw_word & 0x0000_FFFF
+        } else {
+            0
+        };
+        Self {
+            crash_count: count,
+            threshold: clamped,
+            stable_uptime_cleared: false,
+        }
+    }
+
+    /// Encodes the current crash counter into a 32-bit `RTC_CNTL_STORE` word
+    /// prefixed with [`CRASH_COUNTER_RTC_MAGIC`].
+    #[must_use]
+    pub const fn to_rtc_word(&self) -> u32 {
+        CRASH_COUNTER_RTC_MAGIC | (self.crash_count & 0x0000_FFFF)
+    }
+
+    /// Current consecutive crash count.
+    #[must_use]
+    pub const fn crash_count(&self) -> u32 {
+        self.crash_count
+    }
+
+    /// Configured crash threshold.
+    #[must_use]
+    pub const fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// Returns `true` if `crash_count >= threshold`.
+    #[must_use]
+    pub const fn is_recovery_required(&self) -> bool {
+        self.crash_count >= self.threshold
+    }
+
+    /// Increments the boot attempt counter and returns whether to boot
+    /// normally or enter guided recovery.
+    pub fn record_boot_attempt(&mut self) -> BootRouteDecision {
+        self.crash_count = self.crash_count.saturating_add(1);
+        self.stable_uptime_cleared = false;
+        if self.crash_count >= self.threshold {
+            BootRouteDecision::EnterGuidedRecovery {
+                crash_count: self.crash_count,
+            }
+        } else {
+            BootRouteDecision::NormalOta0
+        }
+    }
+
+    /// Clears the crash counter once the device has remained healthy for at
+    /// least `min_stable_ms` milliseconds.
+    pub fn mark_boot_stable(&mut self, uptime_ms: u64, min_stable_ms: u64) -> bool {
+        if uptime_ms >= min_stable_ms {
+            self.crash_count = 0;
+            self.stable_uptime_cleared = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Resets the crash counter unconditionally (e.g. after a fresh OTA flash).
+    pub fn reset(&mut self) {
+        self.crash_count = 0;
+        self.stable_uptime_cleared = true;
+    }
+}
+
+/// Operational state of the pure-Rust [`RecoveryCoordinator`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryModeState {
+    /// Waiting in recovery mode for an HTTP firmware upload or URL fetch command.
+    IdleWaitingForAction,
+    /// Actively fetching an OTA image from an HTTP/HTTPS URL.
+    FetchingFromUrl {
+        /// Source firmware URL.
+        url: String<128>,
+        /// Bytes written to `ota_0` so far.
+        bytes_received: usize,
+    },
+    /// Actively receiving a multipart/raw HTTP `POST` firmware upload.
+    ReceivingHttpUpload {
+        /// Bytes written to `ota_0` so far.
+        bytes_received: usize,
+    },
+    /// Firmware image verified in `ota_0` and ready to commit `otadata`.
+    FlashingVerified {
+        /// Total verified image size in bytes.
+        image_size: usize,
+        /// Full-image SHA-256 digest.
+        sha256: [u8; 32],
+    },
+    /// Last OTA attempt failed validation.
+    Failed(OtaSafetyError),
+}
+
+/// Pure-Rust Guided Recovery & Streaming OTA Coordinator.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct RecoveryCoordinator {
+    state: RecoveryModeState,
+    assembler: OtaStreamAssembler,
+    crash_policy: CrashCounterPolicy,
+}
+
+impl RecoveryCoordinator {
+    /// Creates a new [`RecoveryCoordinator`] with the given [`CrashCounterPolicy`].
+    #[must_use]
+    pub fn new(crash_policy: CrashCounterPolicy) -> Self {
+        let assembler = OtaStreamAssembler {
+            header_buf: [0u8; OTA_MIN_HEADER_BYTES],
+            header_filled: 0,
+            bytes_received: 0,
+            expected_size: None,
+            next_unerased_sector_index: 0,
+            hasher: Sha256Incremental::new(),
+            state: OtaStreamState::AwaitingHeader,
+        };
+        Self {
+            state: RecoveryModeState::IdleWaitingForAction,
+            assembler,
+            crash_policy,
+        }
+    }
+
+    /// Current recovery state.
+    #[must_use]
+    pub fn state(&self) -> &RecoveryModeState {
+        &self.state
+    }
+
+    /// Reference to the underlying [`CrashCounterPolicy`].
+    #[must_use]
+    pub fn crash_policy(&self) -> &CrashCounterPolicy {
+        &self.crash_policy
+    }
+
+    /// Mutable reference to the underlying [`CrashCounterPolicy`].
+    pub fn crash_policy_mut(&mut self) -> &mut CrashCounterPolicy {
+        &mut self.crash_policy
+    }
+
+    /// Starts a URL-based OTA download session into `ota_0`.
+    pub fn begin_url_ota(
+        &mut self,
+        url: &str,
+        expected_size: Option<usize>,
+    ) -> Result<(), OtaSafetyError> {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            let err = OtaSafetyError::InvalidBinaryHeader("OTA URL must start with http(s)://");
+            self.state = RecoveryModeState::Failed(err.clone());
+            return Err(err);
+        }
+        let mut url_str: String<128> = String::new();
+        url_str
+            .push_str(url)
+            .map_err(|()| OtaSafetyError::InvalidBinaryHeader("OTA URL exceeds 128 bytes"))?;
+        self.assembler = OtaStreamAssembler::new(expected_size)?;
+        self.state = RecoveryModeState::FetchingFromUrl {
+            url: url_str,
+            bytes_received: 0,
+        };
+        Ok(())
+    }
+
+    /// Starts an HTTP direct upload OTA session into `ota_0`.
+    pub fn begin_http_upload(
+        &mut self,
+        expected_size: Option<usize>,
+    ) -> Result<(), OtaSafetyError> {
+        self.assembler = OtaStreamAssembler::new(expected_size)?;
+        self.state = RecoveryModeState::ReceivingHttpUpload { bytes_received: 0 };
+        Ok(())
+    }
+
+    /// Feeds a chunk of firmware bytes into the active OTA session.
+    pub fn feed_ota_chunk(&mut self, chunk: &[u8]) -> Result<OtaFlashWriteOp, OtaSafetyError> {
+        match self.assembler.ingest_chunk(chunk) {
+            Ok(op) => {
+                let total = self.assembler.bytes_received();
+                match &mut self.state {
+                    RecoveryModeState::FetchingFromUrl { bytes_received, .. }
+                    | RecoveryModeState::ReceivingHttpUpload { bytes_received } => {
+                        *bytes_received = total;
+                    }
+                    _ => {
+                        self.state = RecoveryModeState::ReceivingHttpUpload {
+                            bytes_received: total,
+                        };
+                    }
+                }
+                Ok(op)
+            }
+            Err(err) => {
+                self.state = RecoveryModeState::Failed(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Finalizes the OTA image, resets the crash counter, and returns the
+    /// verified [`OtaBinarySummary`], 32-byte SHA-256 digest, and the
+    /// [`OtaSelectEntry`] for `ota_0`.
+    pub fn finalize_ota_and_build_otadata(
+        &mut self,
+    ) -> Result<(OtaBinarySummary, [u8; 32], OtaSelectEntry), OtaSafetyError> {
+        match self.assembler.finish() {
+            Ok((summary, sha256)) => {
+                self.crash_policy.reset();
+                self.state = RecoveryModeState::FlashingVerified {
+                    image_size: summary.image_size,
+                    sha256,
+                };
+                Ok((summary, sha256, OtaSelectEntry::new_ota_0()))
+            }
+            Err(err) => {
+                self.state = RecoveryModeState::Failed(err.clone());
+                Err(err)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1099,5 +1731,90 @@ mod tests {
         assert!(is_nvs_page_valid_state(NVS_PAGE_STATE_ACTIVE));
         assert!(is_nvs_page_valid_state(NVS_PAGE_STATE_FULL));
         assert!(!is_nvs_page_valid_state(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn test_ota_stream_assembler_chunked_validation_and_sector_tracking() {
+        let mut image = [0xA5u8; 4500];
+        image[0x00] = ESP_IMAGE_MAGIC_BYTE;
+        image[0x20..0x24].copy_from_slice(&ESP_APP_DESC_MAGIC_WORD.to_le_bytes());
+        image[0x30..0x30 + RUST_OTA_FIRMWARE_VERSION.len()]
+            .copy_from_slice(RUST_OTA_FIRMWARE_VERSION.as_bytes());
+        image[0x30 + RUST_OTA_FIRMWARE_VERSION.len()..0x50].fill(0);
+        image[0x50..0x50 + REQUIRED_OTA_PROJECT_NAME.len()]
+            .copy_from_slice(REQUIRED_OTA_PROJECT_NAME.as_bytes());
+        image[0x50 + REQUIRED_OTA_PROJECT_NAME.len()..0x70].fill(0);
+
+        let mut asm = OtaStreamAssembler::new(Some(image.len())).expect("valid assembler");
+        assert_eq!(asm.state(), &OtaStreamState::AwaitingHeader);
+
+        // First 100 bytes: awaiting full 288-byte header, erases sector 0
+        let op1 = asm.ingest_chunk(&image[..100]).expect("chunk 1");
+        assert_eq!(op1.flash_offset, OTA_0_PARTITION_OFFSET);
+        assert_eq!(op1.first_new_sector_offset, Some(OTA_0_PARTITION_OFFSET));
+        assert_eq!(op1.new_sectors_to_erase, 1);
+        assert_eq!(asm.state(), &OtaStreamState::AwaitingHeader);
+
+        // Next 200 bytes (300 >= 288): validates header -> Streaming
+        let op2 = asm.ingest_chunk(&image[100..300]).expect("chunk 2");
+        assert_eq!(op2.flash_offset, OTA_0_PARTITION_OFFSET + 100);
+        assert_eq!(op2.first_new_sector_offset, None);
+        assert!(matches!(asm.state(), OtaStreamState::Streaming { .. }));
+
+        // Remaining 4200 bytes (total 4500 > 4096): crosses into sector 1 (0x161000)
+        let op3 = asm.ingest_chunk(&image[300..]).expect("chunk 3");
+        assert_eq!(op3.flash_offset, OTA_0_PARTITION_OFFSET + 300);
+        assert_eq!(
+            op3.first_new_sector_offset,
+            Some(OTA_0_PARTITION_OFFSET + OTA_FLASH_SECTOR_BYTES)
+        );
+        assert_eq!(op3.new_sectors_to_erase, 1);
+        assert_eq!(asm.progress_pct(), 100);
+
+        let (summary, digest) = asm.finish().expect("finish ota");
+        assert_eq!(summary.image_size, 4500);
+        assert_eq!(summary.project_name.as_str(), "Squeezelite-ESP32");
+        let mut expected_hasher = Sha256Incremental::new();
+        expected_hasher.update(&image);
+        assert_eq!(digest, expected_hasher.finalize());
+    }
+
+    #[test]
+    fn test_crash_counter_policy_and_recovery_coordinator() {
+        let mut policy = CrashCounterPolicy::from_rtc_word(0, 3);
+        assert_eq!(policy.record_boot_attempt(), BootRouteDecision::NormalOta0);
+        assert_eq!(policy.record_boot_attempt(), BootRouteDecision::NormalOta0);
+        assert_eq!(
+            policy.record_boot_attempt(),
+            BootRouteDecision::EnterGuidedRecovery { crash_count: 3 }
+        );
+        assert!(policy.is_recovery_required());
+
+        // Round-trip through RTC_CNTL_STORE word
+        let rtc_word = policy.to_rtc_word();
+        let restored = CrashCounterPolicy::from_rtc_word(rtc_word, 3);
+        assert_eq!(restored.crash_count(), 3);
+
+        let mut coord = RecoveryCoordinator::new(restored);
+        assert_eq!(coord.state(), &RecoveryModeState::IdleWaitingForAction);
+        coord
+            .begin_url_ota("https://10.0.0.10/firmware.bin", Some(512))
+            .expect("begin url ota");
+
+        let mut img = [0u8; 512];
+        img[0x00] = ESP_IMAGE_MAGIC_BYTE;
+        img[0x20..0x24].copy_from_slice(&ESP_APP_DESC_MAGIC_WORD.to_le_bytes());
+        img[0x30..0x30 + RUST_OTA_FIRMWARE_VERSION.len()]
+            .copy_from_slice(RUST_OTA_FIRMWARE_VERSION.as_bytes());
+        img[0x50..0x50 + REQUIRED_OTA_PROJECT_NAME.len()]
+            .copy_from_slice(REQUIRED_OTA_PROJECT_NAME.as_bytes());
+
+        coord.feed_ota_chunk(&img).expect("feed chunk");
+        let (summary, _sha, ota_select) = coord
+            .finalize_ota_and_build_otadata()
+            .expect("finalize recovery");
+        assert_eq!(summary.image_size, 512);
+        assert_eq!(ota_select.ota_seq, 1);
+        assert_eq!(coord.crash_policy().crash_count(), 0);
     }
 }

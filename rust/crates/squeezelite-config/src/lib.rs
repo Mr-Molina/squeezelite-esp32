@@ -655,6 +655,13 @@ impl<'a> JournalView<'a> {
         self.sequence
     }
 
+    /// Returns the stored maximum output sample rate (`"audio.maxrate"`, in Hz),
+    /// or `0` (unlimited) if not present or malformed.
+    #[must_use]
+    pub fn max_sample_rate(&self) -> u32 {
+        self.get_u32(AudioConfig::KEY_MAXRATE).ok().flatten().unwrap_or(0)
+    }
+
     fn find(&self, key: &str) -> Option<&'a [u8]> {
         let mut offset = FlashJournal::HEADER_SIZE;
         for _ in 0..self.entry_count {
@@ -717,6 +724,12 @@ impl<'a> SectorWriter<'a> {
             offset: FlashJournal::HEADER_SIZE,
             entry_count: 0,
         })
+    }
+
+    /// Appends the maximum output sample rate (`"audio.maxrate"`, in Hz,
+    /// `0` = unlimited) to this sector image.
+    pub fn set_max_sample_rate(&mut self, rate_hz: u32) -> Result<(), ConfigError> {
+        self.set_u32(AudioConfig::KEY_MAXRATE, rate_hz)
     }
 
     /// Writes the header (magic, version, entry count, `sequence`) and the
@@ -960,6 +973,7 @@ pub struct AudioConfig {
     pub equalizer_preset: u8,
     pub analog_gain_code: u8,
     pub loudness_enabled: bool,
+    pub max_sample_rate: u32,
 }
 
 impl Default for AudioConfig {
@@ -974,6 +988,7 @@ impl Default for AudioConfig {
             equalizer_preset: 0,
             analog_gain_code: Self::DEFAULT_ANALOG_GAIN_CODE,
             loudness_enabled: false,
+            max_sample_rate: 0,
         }
     }
 }
@@ -986,9 +1001,21 @@ impl AudioConfig {
     pub const KEY_EQ: &'static str = "audio.eq";
     pub const KEY_AGAIN: &'static str = "audio.again";
     pub const KEY_LOUD: &'static str = "audio.loud";
+    pub const KEY_MAXRATE: &'static str = "audio.maxrate";
 
     pub const DEFAULT_ANALOG_GAIN_CODE: u8 = 0x08;
     pub const MAX_ANALOG_GAIN_CODE: u8 = 0x1F;
+
+    /// Returns the configured maximum sample rate in Hz (`0` = unlimited).
+    #[must_use]
+    pub const fn max_sample_rate(&self) -> u32 {
+        self.max_sample_rate
+    }
+
+    /// Sets the configured maximum sample rate in Hz (`0` = unlimited).
+    pub fn set_max_sample_rate(&mut self, rate_hz: u32) {
+        self.max_sample_rate = rate_hz;
+    }
 
     /// Sets the player name as received from LMS (`setd` id 0) or a user: the
     /// name is cut at its first NUL and truncated to the journal's 32-byte
@@ -1038,6 +1065,7 @@ impl AudioConfig {
         store.set_u8(Self::KEY_EQ, self.equalizer_preset)?;
         store.set_u32(Self::KEY_AGAIN, u32::from(self.analog_gain_code))?;
         store.set_bool(Self::KEY_LOUD, self.loudness_enabled)?;
+        store.set_u32(Self::KEY_MAXRATE, self.max_sample_rate)?;
 
         if let Some(ip) = self.lms_server_ip {
             store.set(Self::KEY_LMS_IP, &ip)?;
@@ -1085,6 +1113,10 @@ impl AudioConfig {
 
         if let Some(loud) = store.get_bool(Self::KEY_LOUD)? {
             config.loudness_enabled = loud;
+        }
+
+        if let Some(maxrate) = store.get_u32(Self::KEY_MAXRATE)? {
+            config.max_sample_rate = maxrate;
         }
 
         config.lms_server_ip = read_ip_opt(store, Self::KEY_LMS_IP)?;
@@ -1656,5 +1688,32 @@ mod tests {
         odd.push_str(&"é".repeat(20)).unwrap(); // 41 bytes: the cut falls inside a char
         assert!(cfg.set_player_name(odd.as_str()));
         assert_eq!(cfg.player_name.len(), 31);
+    }
+
+    #[test]
+    fn test_audio_config_max_sample_rate_roundtrip_and_journal_helpers() {
+        let mut cfg = AudioConfig::default();
+        assert_eq!(cfg.max_sample_rate(), 0);
+        cfg.set_max_sample_rate(48_000);
+        assert_eq!(cfg.max_sample_rate(), 48_000);
+
+        let mut store = MemConfigStore::<16>::new();
+        cfg.save_to(&mut store).unwrap();
+        let loaded = AudioConfig::load_from(&store).unwrap();
+        assert_eq!(loaded.max_sample_rate(), 48_000);
+
+        let mut sector = [0xFFu8; 512];
+        let mut writer = SectorWriter::new(&mut sector).unwrap();
+        writer.set_max_sample_rate(96_000).unwrap();
+        let len = writer.finish(11).unwrap();
+        let view = JournalView::new(&sector[..len]).unwrap();
+        assert_eq!(view.max_sample_rate(), 96_000);
+
+        // Missing audio.maxrate defaults to 0 (unlimited)
+        let mut empty_sector = [0xFFu8; 256];
+        let empty_writer = SectorWriter::new(&mut empty_sector).unwrap();
+        let empty_len = empty_writer.finish(1).unwrap();
+        let empty_view = JournalView::new(&empty_sector[..empty_len]).unwrap();
+        assert_eq!(empty_view.max_sample_rate(), 0);
     }
 }

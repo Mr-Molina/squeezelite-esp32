@@ -41,6 +41,15 @@ pub const MAX_STREAM_BUF: usize = 65536;
 /// Maximum block samples supported by FLAC decoder (RFC 9639 standard CD-DA).
 pub const MAX_FLAC_BLOCK_SAMPLES: usize = 4608;
 
+/// Maximum MP4/M4A sample table entries permitted in memory.
+pub const MAX_MP4_SAMPLES: usize = 65536;
+
+/// Minimum supported audio sample rate in Hz.
+pub const MIN_SAMPLE_RATE: u32 = 8000;
+
+/// Maximum supported audio sample rate in Hz.
+pub const MAX_SAMPLE_RATE: u32 = 192_000;
+
 /// Unified Audio Decoder Error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(thiserror::Error))]
@@ -55,6 +64,16 @@ pub enum DecoderError {
     UnsupportedSampleFormat,
     #[cfg_attr(feature = "std", error("Target PCM buffer too small for decoded frame"))]
     BufferOverflow,
+}
+
+/// Alias for [`DecoderError`] used by container and codec consumers.
+pub type DecodeError = DecoderError;
+
+impl DecoderError {
+    /// Stream uses an unsupported codec profile, channel count, sample rate,
+    /// or exceeds the decoder memory ceiling (triggers `STMn`).
+    #[allow(non_upper_case_globals)]
+    pub const UnsupportedFeature: Self = Self::UnsupportedSampleFormat;
 }
 
 #[cfg(not(feature = "std"))]
@@ -176,6 +195,9 @@ impl PcmDecoder {
                         fmt_payload[6],
                         fmt_payload[7],
                     ]);
+                    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
                     let bits_per_sample = u16::from_le_bytes([fmt_payload[14], fmt_payload[15]]);
 
                     self.channels = num_channels as u8;
@@ -246,6 +268,11 @@ impl PcmDecoder {
                     let mut ext = [0u8; 10];
                     ext.copy_from_slice(&comm_payload[8..18]);
                     let sample_rate = parse_aiff_extended_float(&ext);
+                    if sample_rate > 0
+                        && !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate)
+                    {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
 
                     self.channels = num_channels as u8;
                     if sample_size > 0 {
@@ -327,6 +354,11 @@ impl AudioDecoder for PcmDecoder {
 
         if self.channels != 1 && self.channels != 2 {
             return Err(DecoderError::UnsupportedSampleFormat);
+        }
+        if let Some(sr) = self.sample_rate {
+            if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sr) {
+                return Err(DecoderError::UnsupportedFeature);
+            }
         }
 
         let bytes_per_frame = bytes_per_sample * self.channels as usize;
@@ -533,6 +565,190 @@ impl AudioDecoder for PcmDecoder {
     }
 }
 
+/// Parsed MP3 Xing/Info VBR and LAME gapless header metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XingLameInfo {
+    /// Total number of audio MPEG frames in the stream (excluding the Xing
+    /// header frame), if present in the Xing/Info flags (`0x01`).
+    pub total_frames: Option<u32>,
+    /// Total stream byte length, if present in the Xing/Info flags (`0x02`).
+    pub total_bytes: Option<u32>,
+    /// Encoder delay in stereo PCM frames from the 24-bit LAME tag.
+    pub enc_delay: u16,
+    /// Encoder trailing padding in stereo PCM frames from the 24-bit LAME tag.
+    pub enc_padding: u16,
+    /// Number of PCM frames per MPEG frame (`1152` for MPEG-1, `576` for
+    /// MPEG-2/2.5).
+    pub samples_per_frame: u16,
+}
+
+/// Parses an MPEG Layer III frame for a `"Xing"` or `"Info"` VBR/CBR header
+/// and an optional LAME tag containing 24-bit `enc_delay` and `enc_padding`.
+#[must_use]
+pub fn parse_xing_lame_header(frame: &[u8]) -> Option<XingLameInfo> {
+    if frame.len() < 24 || frame[0] != 0xFF || (frame[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version_id = (frame[1] >> 3) & 0x03;
+    if version_id == 1 {
+        return None;
+    }
+    let layer = (frame[1] >> 1) & 0x03;
+    if layer != 1 {
+        return None;
+    }
+    let has_crc = (frame[1] & 0x01) == 0;
+    let channel_mode = (frame[3] >> 6) & 0x03;
+    let is_mono = channel_mode == 3;
+    let side_info_len = if version_id == 3 {
+        if is_mono { 17 } else { 32 }
+    } else if is_mono {
+        9
+    } else {
+        17
+    };
+    let crc_len = if has_crc { 2 } else { 0 };
+    let primary_off = 4 + crc_len + side_info_len;
+    let samples_per_frame = if version_id == 3 { 1152 } else { 576 };
+
+    let candidates = [primary_off, 36, 21, 13, 38, 23, 15];
+    let mut xing_off = None;
+    for &off in &candidates {
+        if off + 8 <= frame.len()
+            && (&frame[off..off + 4] == b"Xing" || &frame[off..off + 4] == b"Info")
+        {
+            xing_off = Some(off);
+            break;
+        }
+    }
+    let xing_off = xing_off?;
+
+    let flags = u32::from_be_bytes([
+        frame[xing_off + 4],
+        frame[xing_off + 5],
+        frame[xing_off + 6],
+        frame[xing_off + 7],
+    ]);
+    let mut pos = xing_off + 8;
+
+    let mut total_frames = None;
+    if (flags & 0x01) != 0 {
+        if pos + 4 > frame.len() {
+            return None;
+        }
+        let tf = u32::from_be_bytes([
+            frame[pos],
+            frame[pos + 1],
+            frame[pos + 2],
+            frame[pos + 3],
+        ]);
+        if tf > 0 {
+            total_frames = Some(tf);
+        }
+        pos += 4;
+    }
+
+    let mut total_bytes = None;
+    if (flags & 0x02) != 0 {
+        if pos + 4 > frame.len() {
+            return None;
+        }
+        total_bytes = Some(u32::from_be_bytes([
+            frame[pos],
+            frame[pos + 1],
+            frame[pos + 2],
+            frame[pos + 3],
+        ]));
+        pos += 4;
+    }
+
+    if (flags & 0x04) != 0 {
+        if pos + 100 > frame.len() {
+            return None;
+        }
+        pos += 100;
+    }
+
+    if (flags & 0x08) != 0 {
+        if pos + 4 > frame.len() {
+            return None;
+        }
+        pos += 4;
+    }
+
+    let mut enc_delay = 0u16;
+    let mut enc_padding = 0u16;
+
+    let lame_start = if pos + 24 <= frame.len()
+        && (&frame[pos..pos + 4] == b"LAME"
+            || &frame[pos..pos + 4] == b"Lavc"
+            || &frame[pos..pos + 4] == b"Lavf"
+            || &frame[pos..pos + 4] == b"GOGO"
+            || frame[pos..pos + 4].iter().all(|&b| (0x20..=0x7E).contains(&b)))
+    {
+        Some(pos)
+    } else if pos < frame.len() {
+        frame[pos..]
+            .windows(4)
+            .position(|w| w == b"LAME" || w == b"Lavc" || w == b"Lavf" || w == b"GOGO")
+            .map(|rel| pos + rel)
+    } else {
+        None
+    };
+
+    if let Some(l_off) = lame_start {
+        if l_off + 24 <= frame.len() {
+            let b0 = frame[l_off + 21];
+            let b1 = frame[l_off + 22];
+            let b2 = frame[l_off + 23];
+            let delay = ((b0 as u16) << 4) | ((b1 as u16) >> 4);
+            let padding = (((b1 as u16) & 0x0F) << 8) | (b2 as u16);
+            if delay <= 2880 && padding <= 2880 {
+                enc_delay = delay;
+                enc_padding = padding;
+            }
+        }
+    }
+
+    Some(XingLameInfo {
+        total_frames,
+        total_bytes,
+        enc_delay,
+        enc_padding,
+        samples_per_frame,
+    })
+}
+
+/// Applies gapless start (`lead_trim`) and end (`max_raw_frames`) trimming
+/// in-place to an interleaved stereo `pcm_out` buffer for a single decoded
+/// MPEG frame.
+fn apply_mp3_gapless_trim(
+    pcm_out: &mut [i32],
+    frames_produced: usize,
+    raw_frames_decoded: &mut u64,
+    lead_trim: u64,
+    max_raw_frames: Option<u64>,
+) -> usize {
+    let frame_start = *raw_frames_decoded;
+    let frame_end = frame_start + frames_produced as u64;
+    *raw_frames_decoded = frame_end;
+
+    let keep_start = frame_start.max(lead_trim);
+    let keep_end = match max_raw_frames {
+        Some(limit) => frame_end.min(limit),
+        None => frame_end,
+    };
+    if keep_start >= keep_end {
+        return 0;
+    }
+    let local_start = (keep_start - frame_start) as usize;
+    let local_len = (keep_end - keep_start) as usize;
+    if local_start > 0 {
+        pcm_out.copy_within(local_start * 2..(local_start + local_len) * 2, 0);
+    }
+    local_len
+}
+
 /// Pure-Rust MP3 Decoder using nanomp3-core (100% safe, no_std).
 ///
 /// Heap-boxes decoder state (22.5KB) and frame scratch buffer (9.2KB)
@@ -543,6 +759,10 @@ pub struct Mp3Decoder {
     decoder: Box<nanomp3_core::Decoder>,
     sample_buf: Box<[i32]>,
     id3_skip_remaining: usize,
+    xing_checked: bool,
+    xing_info: Option<XingLameInfo>,
+    include_decoder_delay: bool,
+    raw_frames_decoded: u64,
 }
 
 #[cfg(feature = "alloc")]
@@ -554,13 +774,64 @@ impl Default for Mp3Decoder {
 
 #[cfg(feature = "alloc")]
 impl Mp3Decoder {
+    /// Standard Layer III synthesis filterbank + MDCT decoder delay in
+    /// stereo frames.
+    pub const DECODER_DELAY_FRAMES: u16 = 529;
+
     pub fn new() -> Self {
         Self {
             sample_rate: 44100,
             decoder: Box::new(nanomp3_core::Decoder::new()),
             sample_buf: vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME].into_boxed_slice(),
             id3_skip_remaining: 0,
+            xing_checked: false,
+            xing_info: None,
+            include_decoder_delay: false,
+            raw_frames_decoded: 0,
         }
+    }
+
+    /// Configures whether the 529-sample MPEG Layer III synthesis filterbank
+    /// decoder delay is added to `enc_delay` during leading sample trimming.
+    #[must_use]
+    pub const fn with_decoder_delay(mut self, enabled: bool) -> Self {
+        self.include_decoder_delay = enabled;
+        self
+    }
+
+    /// Returns the parsed LAME encoder delay (`enc_delay`) in stereo frames.
+    #[must_use]
+    pub const fn enc_delay_frames(&self) -> u16 {
+        match self.xing_info {
+            Some(info) => info.enc_delay,
+            None => 0,
+        }
+    }
+
+    /// Returns the parsed LAME encoder padding (`enc_padding`) in stereo
+    /// frames.
+    #[must_use]
+    pub const fn enc_padding_frames(&self) -> u16 {
+        match self.xing_info {
+            Some(info) => info.enc_padding,
+            None => 0,
+        }
+    }
+
+    /// Returns the total audio frame count from the Xing/Info header, if
+    /// present.
+    #[must_use]
+    pub const fn total_frames(&self) -> Option<u32> {
+        match self.xing_info {
+            Some(info) => info.total_frames,
+            None => None,
+        }
+    }
+
+    /// Returns the full parsed Xing/Info/LAME metadata block, if present.
+    #[must_use]
+    pub const fn xing_info(&self) -> Option<XingLameInfo> {
+        self.xing_info
     }
 }
 
@@ -603,11 +874,44 @@ impl AudioDecoder for Mp3Decoder {
             return Err(DecoderError::NeedMoreData);
         }
 
+        if !self.xing_checked {
+            let mut idx = 0;
+            while idx + 4 <= encoded_in.len() {
+                let h = nanomp3_core::__private::Header::read(&encoded_in[idx..]);
+                if h.valid() {
+                    let frame_bytes = h.frame_bytes(0) + h.padding();
+                    if frame_bytes > 0 && frame_bytes <= 1728 {
+                        if idx > 0 {
+                            return Ok((idx, 0));
+                        }
+                        if encoded_in.len() < frame_bytes {
+                            return Err(DecoderError::NeedMoreData);
+                        }
+                        if let Some(xing) = parse_xing_lame_header(&encoded_in[..frame_bytes]) {
+                            self.xing_checked = true;
+                            self.xing_info = Some(xing);
+                            let sr = h.sample_rate_hz();
+                            if sr > 0 {
+                                self.sample_rate = sr;
+                            }
+                            return Ok((frame_bytes, 0));
+                        }
+                    }
+                    break;
+                }
+                idx += 1;
+            }
+        }
+
         let (consumed, result) = self.decoder.decode(encoded_in, &mut self.sample_buf);
 
         match result {
             Ok(info) => {
+                self.xing_checked = true;
                 if info.sample_rate > 0 {
+                    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&info.sample_rate) {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
                     self.sample_rate = info.sample_rate;
                 }
                 let channels = info.channels.num() as usize;
@@ -630,7 +934,31 @@ impl AudioDecoder for Mp3Decoder {
                         pcm_out[i * 2 + 1] = s;
                     }
                 }
-                Ok((consumed, frames_produced))
+
+                let trimmed_frames = if let Some(xing) = self.xing_info {
+                    let extra = if self.include_decoder_delay {
+                        Self::DECODER_DELAY_FRAMES as u64
+                    } else {
+                        0
+                    };
+                    let lead_trim = (xing.enc_delay as u64) + extra;
+                    let max_raw = xing.total_frames.map(|tf| {
+                        let total_raw = (tf as u64) * (xing.samples_per_frame as u64);
+                        total_raw.saturating_sub(xing.enc_padding as u64)
+                    });
+                    apply_mp3_gapless_trim(
+                        pcm_out,
+                        frames_produced,
+                        &mut self.raw_frames_decoded,
+                        lead_trim,
+                        max_raw,
+                    )
+                } else {
+                    self.raw_frames_decoded += frames_produced as u64;
+                    frames_produced
+                };
+
+                Ok((consumed, trimmed_frames))
             }
             Err(nanomp3_core::DecodeError::NoFrame) => {
                 if consumed > 0 {
@@ -662,6 +990,9 @@ impl AudioDecoder for Mp3Decoder {
         *self.decoder = nanomp3_core::Decoder::new();
         self.sample_buf.fill(0);
         self.id3_skip_remaining = 0;
+        self.xing_checked = false;
+        self.xing_info = None;
+        self.raw_frames_decoded = 0;
     }
 }
 
@@ -675,6 +1006,10 @@ pub struct StaticMp3Decoder {
     pub sample_rate: u32,
     decoder: nanomp3_core::Decoder,
     id3_skip_remaining: usize,
+    xing_checked: bool,
+    xing_info: Option<XingLameInfo>,
+    include_decoder_delay: bool,
+    raw_frames_decoded: u64,
 }
 
 impl Default for StaticMp3Decoder {
@@ -684,12 +1019,63 @@ impl Default for StaticMp3Decoder {
 }
 
 impl StaticMp3Decoder {
+    /// Standard Layer III synthesis filterbank + MDCT decoder delay in
+    /// stereo frames.
+    pub const DECODER_DELAY_FRAMES: u16 = 529;
+
     pub const fn new() -> Self {
         Self {
             sample_rate: 0,
             decoder: nanomp3_core::Decoder::new(),
             id3_skip_remaining: 0,
+            xing_checked: false,
+            xing_info: None,
+            include_decoder_delay: false,
+            raw_frames_decoded: 0,
         }
+    }
+
+    /// Configures whether the 529-sample MPEG Layer III synthesis filterbank
+    /// decoder delay is added to `enc_delay` during leading sample trimming.
+    #[must_use]
+    pub const fn with_decoder_delay(mut self, enabled: bool) -> Self {
+        self.include_decoder_delay = enabled;
+        self
+    }
+
+    /// Returns the parsed LAME encoder delay (`enc_delay`) in stereo frames.
+    #[must_use]
+    pub const fn enc_delay_frames(&self) -> u16 {
+        match self.xing_info {
+            Some(info) => info.enc_delay,
+            None => 0,
+        }
+    }
+
+    /// Returns the parsed LAME encoder padding (`enc_padding`) in stereo
+    /// frames.
+    #[must_use]
+    pub const fn enc_padding_frames(&self) -> u16 {
+        match self.xing_info {
+            Some(info) => info.enc_padding,
+            None => 0,
+        }
+    }
+
+    /// Returns the total audio frame count from the Xing/Info header, if
+    /// present.
+    #[must_use]
+    pub const fn total_frames(&self) -> Option<u32> {
+        match self.xing_info {
+            Some(info) => info.total_frames,
+            None => None,
+        }
+    }
+
+    /// Returns the full parsed Xing/Info/LAME metadata block, if present.
+    #[must_use]
+    pub const fn xing_info(&self) -> Option<XingLameInfo> {
+        self.xing_info
     }
 
     /// Resets the decoder state in-place without constructing a 23 KB
@@ -698,6 +1084,9 @@ impl StaticMp3Decoder {
         self.sample_rate = 44100;
         nanomp3_core::__private::init(&mut self.decoder);
         self.id3_skip_remaining = 0;
+        self.xing_checked = false;
+        self.xing_info = None;
+        self.raw_frames_decoded = 0;
     }
 }
 
@@ -766,10 +1155,22 @@ impl AudioDecoder for StaticMp3Decoder {
                 if frame_bytes == 0 || frame_bytes > 1728 {
                     return Ok((1, 0));
                 }
+                if encoded_in.len() < frame_bytes {
+                    return Err(DecoderError::NeedMoreData);
+                }
+                if !self.xing_checked {
+                    if let Some(xing) = parse_xing_lame_header(&encoded_in[..frame_bytes]) {
+                        self.xing_checked = true;
+                        self.xing_info = Some(xing);
+                        let sr = h.sample_rate_hz();
+                        if sr > 0 {
+                            self.sample_rate = sr;
+                        }
+                        return Ok((frame_bytes, 0));
+                    }
+                }
                 if encoded_in.len() == frame_bytes {
                     (frame_bytes, &encoded_in[..frame_bytes])
-                } else if encoded_in.len() < frame_bytes {
-                    return Err(DecoderError::NeedMoreData);
                 } else if encoded_in.len() < frame_bytes + 4 {
                     if encoded_in.len() >= frame_bytes + 2
                         && (encoded_in[frame_bytes] != 0xFF
@@ -793,7 +1194,11 @@ impl AudioDecoder for StaticMp3Decoder {
 
         match result {
             Ok(info) => {
+                self.xing_checked = true;
                 if info.sample_rate > 0 {
+                    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&info.sample_rate) {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
                     self.sample_rate = info.sample_rate;
                 }
                 let channels = info.channels.num() as usize;
@@ -811,7 +1216,31 @@ impl AudioDecoder for StaticMp3Decoder {
                         pcm_out[i * 2 + 1] = s;
                     }
                 }
-                Ok((consumed, frames_produced))
+
+                let trimmed_frames = if let Some(xing) = self.xing_info {
+                    let extra = if self.include_decoder_delay {
+                        Self::DECODER_DELAY_FRAMES as u64
+                    } else {
+                        0
+                    };
+                    let lead_trim = (xing.enc_delay as u64) + extra;
+                    let max_raw = xing.total_frames.map(|tf| {
+                        let total_raw = (tf as u64) * (xing.samples_per_frame as u64);
+                        total_raw.saturating_sub(xing.enc_padding as u64)
+                    });
+                    apply_mp3_gapless_trim(
+                        pcm_out,
+                        frames_produced,
+                        &mut self.raw_frames_decoded,
+                        lead_trim,
+                        max_raw,
+                    )
+                } else {
+                    self.raw_frames_decoded += frames_produced as u64;
+                    frames_produced
+                };
+
+                Ok((consumed, trimmed_frames))
             }
             Err(_) => {
                 if consumed > 0 {
@@ -1499,9 +1928,33 @@ fn decorrelate_samples(
     }
 }
 
+/// Computes the RFC 3533 Ogg page CRC-32 checksum (direct polynomial
+/// `0x04C11DB7`, zeroing the checksum field at bytes `22..26`).
+#[must_use]
+pub const fn ogg_crc32(page: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    let mut idx = 0usize;
+    while idx < page.len() {
+        let b = if idx >= 22 && idx < 26 { 0u8 } else { page[idx] };
+        crc ^= (b as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            if (crc & 0x8000_0000) != 0 {
+                crc = (crc << 1) ^ 0x04C1_1DB7;
+            } else {
+                crc <<= 1;
+            }
+            bit += 1;
+        }
+        idx += 1;
+    }
+    crc
+}
+
 #[cfg(any(feature = "alloc", feature = "std"))]
 /// Pure-Rust RFC 9639 Lossless FLAC Decoder with 64KB External PSRAM buffer
-/// placement.
+/// placement and native Ogg-FLAC (`"OggS"` / `\x7fFLAC\x01\x00`) container
+/// unwrapping.
 pub struct FlacDecoder {
     pub sample_rate: u32,
     pub bits_per_sample: u32,
@@ -1516,6 +1969,9 @@ pub struct FlacDecoder {
     min_block_size: u16,
     max_block_size: u16,
     need_more_input: bool,
+    is_ogg_flac: Option<bool>,
+    ogg_raw_buf: vec::Vec<u8>,
+    ogg_partial_pkt: vec::Vec<u8>,
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -1555,6 +2011,9 @@ impl FlacDecoder {
             min_block_size: 0,
             max_block_size: 0,
             need_more_input: true,
+            is_ogg_flac: None,
+            ogg_raw_buf: vec::Vec::new(),
+            ogg_partial_pkt: vec::Vec::new(),
         }
     }
 
@@ -1583,12 +2042,113 @@ impl FlacDecoder {
         self.meta_skip_remaining = 0;
         self.in_metadata = false;
         self.need_more_input = true;
+        self.is_ogg_flac = None;
+        self.ogg_raw_buf.clear();
+        self.ogg_partial_pkt.clear();
         if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
             self.stream_buf.truncate(self.header_len);
         } else {
             self.stream_buf.clear();
             self.header_len = 0;
         }
+    }
+
+    fn ingest_ogg_flac_bytes(&mut self, encoded_in: &[u8]) -> Result<usize, DecoderError> {
+        if self.ogg_raw_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.flush();
+            self.stream_buf.clear();
+            self.header_len = 0;
+            return Err(DecoderError::CorruptedFrame);
+        }
+        let input_taken = encoded_in.len();
+        self.ogg_raw_buf.extend_from_slice(encoded_in);
+
+        while let Some(pos) = self.ogg_raw_buf.windows(4).position(|w| w == b"OggS") {
+            if pos > 0 {
+                self.ogg_raw_buf.drain(..pos);
+            }
+            if self.ogg_raw_buf.len() < 27 {
+                break;
+            }
+            if self.ogg_raw_buf[4] != 0 {
+                self.ogg_raw_buf.drain(..4);
+                return Err(DecoderError::InvalidHeader);
+            }
+            let n_segs = self.ogg_raw_buf[26] as usize;
+            let page_hdr_len = 27 + n_segs;
+            if self.ogg_raw_buf.len() < page_hdr_len {
+                break;
+            }
+            let mut body_len = 0usize;
+            for &seg in &self.ogg_raw_buf[27..page_hdr_len] {
+                body_len += seg as usize;
+            }
+            let total_page_len = page_hdr_len + body_len;
+            if self.ogg_raw_buf.len() < total_page_len {
+                break;
+            }
+
+            let expected_crc = u32::from_le_bytes([
+                self.ogg_raw_buf[22],
+                self.ogg_raw_buf[23],
+                self.ogg_raw_buf[24],
+                self.ogg_raw_buf[25],
+            ]);
+            let actual_crc = ogg_crc32(&self.ogg_raw_buf[..total_page_len]);
+            if expected_crc != actual_crc {
+                self.ogg_raw_buf.drain(..total_page_len);
+                return Err(DecoderError::CorruptedFrame);
+            }
+
+            let header_type_flag = self.ogg_raw_buf[5];
+            let is_continued = (header_type_flag & 0x01) != 0;
+            if !is_continued && !self.ogg_partial_pkt.is_empty() {
+                self.ogg_partial_pkt.clear();
+            }
+
+            let mut seg_table_buf = [0u8; 255];
+            seg_table_buf[..n_segs].copy_from_slice(&self.ogg_raw_buf[27..page_hdr_len]);
+
+            let mut body_off = page_hdr_len;
+            for &seg_u8 in &seg_table_buf[..n_segs] {
+                let seg_len = seg_u8 as usize;
+                self.ogg_partial_pkt
+                    .extend_from_slice(&self.ogg_raw_buf[body_off..body_off + seg_len]);
+                body_off += seg_len;
+
+                if seg_u8 < 255 {
+                    if self.ogg_partial_pkt.starts_with(b"\x7fFLAC") {
+                        if self.ogg_partial_pkt.len() < 13
+                            || self.ogg_partial_pkt[5] != 1
+                            || self.ogg_partial_pkt[6] != 0
+                        {
+                            self.ogg_partial_pkt.clear();
+                            self.ogg_raw_buf.drain(..total_page_len);
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        if self.stream_buf.len() + (self.ogg_partial_pkt.len() - 9)
+                            > MAX_STREAM_BUF
+                        {
+                            self.flush();
+                            return Err(DecoderError::CorruptedFrame);
+                        }
+                        self.stream_buf
+                            .extend_from_slice(&self.ogg_partial_pkt[9..]);
+                    } else if !self.ogg_partial_pkt.is_empty() {
+                        if self.stream_buf.len() + self.ogg_partial_pkt.len() > MAX_STREAM_BUF {
+                            self.flush();
+                            return Err(DecoderError::CorruptedFrame);
+                        }
+                        self.stream_buf.extend_from_slice(&self.ogg_partial_pkt);
+                    }
+                    self.ogg_partial_pkt.clear();
+                }
+            }
+
+            self.ogg_raw_buf.drain(..total_page_len);
+        }
+
+        Ok(input_taken)
     }
 }
 
@@ -1620,22 +2180,58 @@ impl AudioDecoder for FlacDecoder {
             return Ok((0, to_copy));
         }
 
-        if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
-            self.stream_buf.clear();
-            self.header_len = 0;
-            self.pending_pcm.clear();
-            self.pending_offset = 0;
-            self.meta_skip_remaining = 0;
-            self.in_metadata = false;
-            return Err(DecoderError::CorruptedFrame);
+        if self.is_ogg_flac.is_none() {
+            let total_avail =
+                self.ogg_raw_buf.len() + self.stream_buf.len() + encoded_in.len();
+            if total_avail < 4 {
+                return Err(DecoderError::NeedMoreData);
+            }
+            let mut probe = [0u8; 4];
+            let mut filled = 0usize;
+            for &b in self
+                .ogg_raw_buf
+                .iter()
+                .chain(self.stream_buf.iter())
+                .chain(encoded_in.iter())
+            {
+                probe[filled] = b;
+                filled += 1;
+                if filled == 4 {
+                    break;
+                }
+            }
+            self.is_ogg_flac = Some(&probe == b"OggS");
         }
 
-        if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
-            return Err(DecoderError::NeedMoreData);
-        }
+        let input_taken = if self.is_ogg_flac == Some(true) {
+            let taken = self.ingest_ogg_flac_bytes(encoded_in)?;
+            if self.stream_buf.len() < 4 {
+                self.need_more_input = true;
+                if taken > 0 {
+                    return Ok((taken, 0));
+                }
+                return Err(DecoderError::NeedMoreData);
+            }
+            taken
+        } else {
+            if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+                self.stream_buf.clear();
+                self.header_len = 0;
+                self.pending_pcm.clear();
+                self.pending_offset = 0;
+                self.meta_skip_remaining = 0;
+                self.in_metadata = false;
+                return Err(DecoderError::CorruptedFrame);
+            }
 
-        let input_taken = encoded_in.len();
-        self.stream_buf.extend_from_slice(encoded_in);
+            if self.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
+                return Err(DecoderError::NeedMoreData);
+            }
+
+            let taken = encoded_in.len();
+            self.stream_buf.extend_from_slice(encoded_in);
+            taken
+        };
 
         if self.meta_skip_remaining > 0 {
             let start = self.header_len;
@@ -1648,8 +2244,6 @@ impl AudioDecoder for FlacDecoder {
                 return Ok((input_taken, 0));
             }
         }
-
-
 
         if self.header_len == 0 {
             if let Some(pos) = self.stream_buf.windows(4).position(|w| w == b"fLaC") {
@@ -1685,7 +2279,13 @@ impl AudioDecoder for FlacDecoder {
                 self.bits_per_sample = (((b12 & 1) << 4) | (b13 >> 4)) + 1;
 
                 if self.channels != 1 && self.channels != 2 {
-                    return Err(DecoderError::UnsupportedSampleFormat);
+                    return Err(DecoderError::UnsupportedFeature);
+                }
+                if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&self.sample_rate) {
+                    return Err(DecoderError::UnsupportedFeature);
+                }
+                if self.max_block_size as usize > MAX_FLAC_BLOCK_SAMPLES {
+                    return Err(DecoderError::UnsupportedFeature);
                 }
 
                 self.header_len = 42;
@@ -1890,8 +2490,255 @@ impl AudioDecoder for FlacDecoder {
     }
 }
 
+/// Standard ISO/IEC 14496-3 / 13818-7 ADTS sampling frequency table (indices
+/// `0..13`).
+pub const AAC_SAMPLE_RATES: [u32; 13] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+/// Parsed ISO-BMFF `esds` `AudioSpecificConfig` metadata for ADTS header
+/// synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AacAudioSpecificConfig {
+    /// Audio Object Type (`1` = Main, `2` = LC, `3` = SSR, `4` = LTP,
+    /// `5` = SBR/HE-AAC).
+    pub audio_object_type: u8,
+    /// 2-bit ADTS profile field (`(base_aot - 1) & 0x03`, `1` for AAC-LC).
+    pub adts_profile: u8,
+    /// 4-bit ADTS sampling frequency index (`0..=11` for `8000..=96000` Hz).
+    pub sampling_frequency_index: u8,
+    /// 4-bit channel configuration (`1` = mono, `2` = stereo).
+    pub channel_configuration: u8,
+    /// Resolved sample rate in Hz.
+    pub sample_rate: u32,
+}
+
+fn read_mp4_descr_len(buf: &[u8], mut idx: usize) -> Option<(usize, usize)> {
+    let mut len = 0usize;
+    for _ in 0..4 {
+        if idx >= buf.len() {
+            return None;
+        }
+        let b = buf[idx];
+        idx += 1;
+        len = (len << 7) | ((b & 0x7F) as usize);
+        if (b & 0x80) == 0 {
+            return Some((len, idx));
+        }
+    }
+    None
+}
+
+fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> {
+    if asc.len() < 2 {
+        return Err(DecoderError::InvalidHeader);
+    }
+    let b0 = asc[0];
+    let b1 = asc[1];
+    let audio_object_type = (b0 >> 3) & 0x1F;
+    if audio_object_type == 0 {
+        return Err(DecoderError::InvalidHeader);
+    }
+    if audio_object_type > 5 {
+        return Err(DecoderError::UnsupportedFeature);
+    }
+    let sampling_frequency_index = ((b0 & 0x07) << 1) | ((b1 >> 7) & 0x01);
+    if sampling_frequency_index as usize >= AAC_SAMPLE_RATES.len() {
+        return Err(DecoderError::UnsupportedFeature);
+    }
+    let sample_rate = AAC_SAMPLE_RATES[sampling_frequency_index as usize];
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+        return Err(DecoderError::UnsupportedFeature);
+    }
+    let channel_configuration = (b1 >> 3) & 0x0F;
+    if channel_configuration != 1 && channel_configuration != 2 {
+        return Err(DecoderError::UnsupportedFeature);
+    }
+    let adts_profile = if audio_object_type == 5 {
+        1
+    } else {
+        (audio_object_type - 1) & 0x03
+    };
+    Ok(AacAudioSpecificConfig {
+        audio_object_type,
+        adts_profile,
+        sampling_frequency_index,
+        channel_configuration,
+        sample_rate,
+    })
+}
+
+/// Parses an ISO-BMFF `esds` box payload (after the 8-byte box header) and
+/// extracts the `AudioSpecificConfig` from `DecoderSpecificInfo` (tag `0x05`).
+pub fn parse_esds_audio_specific_config(
+    esds_payload: &[u8],
+) -> Result<AacAudioSpecificConfig, DecoderError> {
+    if esds_payload.len() < 6 {
+        return Err(DecoderError::InvalidHeader);
+    }
+    let mut idx = if esds_payload.len() >= 4 && esds_payload[0] == 0 {
+        4
+    } else {
+        0
+    };
+
+    while idx < esds_payload.len() {
+        let tag = esds_payload[idx];
+        idx += 1;
+        let Some((descr_len, next_idx)) = read_mp4_descr_len(esds_payload, idx) else {
+            break;
+        };
+        idx = next_idx;
+        match tag {
+            0x03 => {
+                if idx + 3 > esds_payload.len() {
+                    return Err(DecoderError::InvalidHeader);
+                }
+                let flags = esds_payload[idx + 2];
+                idx += 3;
+                if (flags & 0x80) != 0 {
+                    idx += 2;
+                }
+                if (flags & 0x40) != 0 {
+                    if idx >= esds_payload.len() {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    let url_len = esds_payload[idx] as usize;
+                    idx += 1 + url_len;
+                }
+                if (flags & 0x20) != 0 {
+                    idx += 2;
+                }
+            }
+            0x04 => {
+                if idx + 13 > esds_payload.len() {
+                    return Err(DecoderError::InvalidHeader);
+                }
+                let obj_type = esds_payload[idx];
+                if obj_type != 0x40
+                    && obj_type != 0x66
+                    && obj_type != 0x67
+                    && obj_type != 0x68
+                {
+                    return Err(DecoderError::UnsupportedFeature);
+                }
+                idx += 13;
+            }
+            0x05 => {
+                if descr_len < 2 || idx + descr_len > esds_payload.len() {
+                    return Err(DecoderError::InvalidHeader);
+                }
+                return decode_asc_bytes(&esds_payload[idx..idx + descr_len]);
+            }
+            _ => {
+                idx = idx.saturating_add(descr_len);
+            }
+        }
+    }
+
+    for pos in 0..esds_payload.len().saturating_sub(2) {
+        if esds_payload[pos] == 0x05 {
+            if let Some((d_len, asc_start)) = read_mp4_descr_len(esds_payload, pos + 1) {
+                if d_len >= 2 && asc_start + d_len <= esds_payload.len() {
+                    return decode_asc_bytes(&esds_payload[asc_start..asc_start + d_len]);
+                }
+            }
+        }
+    }
+
+    Err(DecoderError::InvalidHeader)
+}
+
+/// Synthesizes a 7-byte MPEG-4 ADTS header (`protection_absent = 1`) around a
+/// raw `mdat` AAC access unit of `aac_payload_len` bytes.
+#[must_use]
+pub const fn synthesize_adts_header(
+    asc: AacAudioSpecificConfig,
+    aac_payload_len: usize,
+) -> [u8; 7] {
+    let full_len = aac_payload_len + 7;
+    let b0 = 0xFF;
+    let b1 = 0xF1;
+    let b2 = ((asc.adts_profile & 0x03) << 6)
+        | ((asc.sampling_frequency_index & 0x0F) << 2)
+        | ((asc.channel_configuration >> 2) & 0x01);
+    let b3 = ((asc.channel_configuration & 0x03) << 6) | (((full_len >> 11) as u8) & 0x03);
+    let b4 = ((full_len >> 3) & 0xFF) as u8;
+    let b5 = (((full_len & 0x07) as u8) << 5) | 0x1F;
+    let b6 = 0xFC;
+    [b0, b1, b2, b3, b4, b5, b6]
+}
+
 #[cfg(feature = "alloc")]
-/// Pure-Rust AAC (ADTS / LC / HE-AAC) Decoder using syom.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Mp4DemuxState {
+    SearchingAtoms,
+    ReadingMdat,
+    Eof,
+}
+
+#[cfg(feature = "alloc")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Mp4StscEntry {
+    first_chunk: u32,
+    samples_per_chunk: u32,
+}
+
+#[cfg(feature = "alloc")]
+struct AacMp4Demuxer {
+    state: Mp4DemuxState,
+    stream_buf: vec::Vec<u8>,
+    asc: Option<AacAudioSpecificConfig>,
+    sample_sizes: vec::Vec<usize>,
+    stsc_entries: vec::Vec<Mp4StscEntry>,
+    chunk_offsets: vec::Vec<usize>,
+    sample_idx: usize,
+    current_chunk_idx: usize,
+    sample_in_chunk_idx: usize,
+    bytes_to_skip: usize,
+    file_pos: usize,
+    adts_frame_scratch: vec::Vec<u8>,
+}
+
+#[cfg(feature = "alloc")]
+impl AacMp4Demuxer {
+    fn new() -> Self {
+        Self {
+            state: Mp4DemuxState::SearchingAtoms,
+            stream_buf: vec::Vec::new(),
+            asc: None,
+            sample_sizes: vec::Vec::new(),
+            stsc_entries: vec::Vec::new(),
+            chunk_offsets: vec::Vec::new(),
+            sample_idx: 0,
+            current_chunk_idx: 0,
+            sample_in_chunk_idx: 0,
+            bytes_to_skip: 0,
+            file_pos: 0,
+            adts_frame_scratch: vec::Vec::new(),
+        }
+    }
+
+    fn samples_in_chunk(&self, chunk_idx: usize) -> usize {
+        if self.stsc_entries.is_empty() {
+            return self.sample_sizes.len().max(1);
+        }
+        let chunk_num = (chunk_idx as u32).saturating_add(1);
+        let mut spc = self.stsc_entries[0].samples_per_chunk;
+        for entry in &self.stsc_entries {
+            if entry.first_chunk <= chunk_num {
+                spc = entry.samples_per_chunk;
+            } else {
+                break;
+            }
+        }
+        (spc as usize).max(1)
+    }
+}
+
+#[cfg(feature = "alloc")]
+/// Pure-Rust AAC (ADTS / LC / HE-AAC & ISO-BMFF MP4/M4A `mp4a`/`esds`) Decoder
+/// using syom.
 ///
 /// Propagates exact consumed byte counts returned by syom (DEC-004).
 /// Available with `alloc` (vendored `no_std + alloc` syom port, WO-199).
@@ -1900,6 +2747,8 @@ pub struct AacDecoder {
     pub sample_rate: u32,
     pub channels: u32,
     pending_pcm: vec::Vec<i32>,
+    is_mp4: Option<bool>,
+    mp4: Option<Box<AacMp4Demuxer>>,
 }
 
 #[cfg(feature = "alloc")]
@@ -1917,16 +2766,450 @@ impl AacDecoder {
             sample_rate: 44100,
             channels: 2,
             pending_pcm: vec::Vec::new(),
+            is_mp4: None,
+            mp4: None,
         }
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        !self.pending_pcm.is_empty()
+        if !self.pending_pcm.is_empty() {
+            return true;
+        }
+        if let Some(ref demux) = self.mp4 {
+            if demux.state == Mp4DemuxState::ReadingMdat
+                && demux.bytes_to_skip == 0
+                && demux.sample_idx < demux.sample_sizes.len()
+                && demux.stream_buf.len() >= demux.sample_sizes[demux.sample_idx]
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the parsed ISO-BMFF `esds` `AudioSpecificConfig` when decoding
+    /// an MP4/M4A stream.
+    #[must_use]
+    pub fn audio_specific_config(&self) -> Option<AacAudioSpecificConfig> {
+        self.mp4.as_ref().and_then(|d| d.asc)
     }
 
     pub fn flush(&mut self) {
         self.decoder.reset();
         self.pending_pcm.clear();
+        self.is_mp4 = None;
+        self.mp4 = None;
+    }
+
+    fn decode_mp4_stream(
+        &mut self,
+        encoded_in: &[u8],
+        pcm_out: &mut [i32],
+        mut frames_out: usize,
+        max_frames: usize,
+    ) -> Result<(usize, usize), DecoderError> {
+        if self.mp4.is_none() {
+            self.mp4 = Some(Box::new(AacMp4Demuxer::new()));
+        }
+        let Some(ref mut demux) = self.mp4 else {
+            return Err(DecoderError::InvalidHeader);
+        };
+
+        if demux.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
+            self.flush();
+            return Err(DecoderError::CorruptedFrame);
+        }
+
+        if demux.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
+            if frames_out > 0 {
+                return Ok((0, frames_out));
+            }
+            return Err(DecoderError::NeedMoreData);
+        }
+
+        let input_taken = encoded_in.len();
+        demux.stream_buf.extend_from_slice(encoded_in);
+
+        if demux.bytes_to_skip > 0 {
+            let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
+            demux.stream_buf.drain(..to_skip);
+            demux.bytes_to_skip -= to_skip;
+            demux.file_pos += to_skip;
+            if demux.bytes_to_skip > 0 {
+                if frames_out == 0 && input_taken == 0 {
+                    return Err(DecoderError::NeedMoreData);
+                }
+                return Ok((input_taken, frames_out));
+            }
+        }
+
+        while demux.state == Mp4DemuxState::SearchingAtoms {
+            if demux.bytes_to_skip > 0 {
+                let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
+                demux.stream_buf.drain(..to_skip);
+                demux.bytes_to_skip -= to_skip;
+                demux.file_pos += to_skip;
+                if demux.bytes_to_skip > 0 {
+                    break;
+                }
+            }
+
+            if demux.stream_buf.len() < 8 {
+                break;
+            }
+
+            let len = u32::from_be_bytes([
+                demux.stream_buf[0],
+                demux.stream_buf[1],
+                demux.stream_buf[2],
+                demux.stream_buf[3],
+            ]) as usize;
+
+            let fourcc = [
+                demux.stream_buf[4],
+                demux.stream_buf[5],
+                demux.stream_buf[6],
+                demux.stream_buf[7],
+            ];
+
+            match &fourcc {
+                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"wave" => {
+                    demux.stream_buf.drain(..8);
+                    demux.file_pos += 8;
+                }
+                b"stsd" => {
+                    if demux.stream_buf.len() < 16 {
+                        break;
+                    }
+                    demux.stream_buf.drain(..16);
+                    demux.file_pos += 16;
+                }
+                b"mp4a" => {
+                    if len < 36 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() < 36 {
+                        break;
+                    }
+                    let version = u16::from_be_bytes([
+                        demux.stream_buf[16],
+                        demux.stream_buf[17],
+                    ]);
+                    let hdr_size = match version {
+                        1 if len > 52 => 52,
+                        2 if len > 72 => 72,
+                        _ => 36,
+                    };
+                    if demux.stream_buf.len() < hdr_size {
+                        break;
+                    }
+                    demux.stream_buf.drain(..hdr_size);
+                    demux.file_pos += hdr_size;
+                }
+                b"esds" => {
+                    if len < 14 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() < len {
+                        break;
+                    }
+                    let asc = parse_esds_audio_specific_config(&demux.stream_buf[8..len])?;
+                    self.sample_rate = asc.sample_rate;
+                    self.channels = asc.channel_configuration as u32;
+                    demux.asc = Some(asc);
+                    demux.stream_buf.drain(..len);
+                    demux.file_pos += len;
+                }
+                b"stsz" => {
+                    if len < 20 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() < len {
+                        break;
+                    }
+                    let default_sz = u32::from_be_bytes([
+                        demux.stream_buf[12],
+                        demux.stream_buf[13],
+                        demux.stream_buf[14],
+                        demux.stream_buf[15],
+                    ]) as usize;
+                    let count = u32::from_be_bytes([
+                        demux.stream_buf[16],
+                        demux.stream_buf[17],
+                        demux.stream_buf[18],
+                        demux.stream_buf[19],
+                    ]) as usize;
+                    if count > MAX_MP4_SAMPLES {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
+                    demux.sample_sizes.clear();
+                    if default_sz == 0 {
+                        if len < 20 + count * 4 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        demux.sample_sizes.reserve(count);
+                        for i in 0..count {
+                            let off = 20 + i * 4;
+                            let sz = u32::from_be_bytes([
+                                demux.stream_buf[off],
+                                demux.stream_buf[off + 1],
+                                demux.stream_buf[off + 2],
+                                demux.stream_buf[off + 3],
+                            ]) as usize;
+                            demux.sample_sizes.push(sz);
+                        }
+                    } else {
+                        demux.sample_sizes = vec![default_sz; count];
+                    }
+                    demux.stream_buf.drain(..len);
+                    demux.file_pos += len;
+                }
+                b"stsc" => {
+                    if len < 16 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() < len {
+                        break;
+                    }
+                    let count = u32::from_be_bytes([
+                        demux.stream_buf[12],
+                        demux.stream_buf[13],
+                        demux.stream_buf[14],
+                        demux.stream_buf[15],
+                    ]) as usize;
+                    if count > MAX_MP4_SAMPLES {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
+                    if len < 16 + count * 12 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    demux.stsc_entries.clear();
+                    demux.stsc_entries.reserve(count);
+                    for i in 0..count {
+                        let off = 16 + i * 12;
+                        let first_chunk = u32::from_be_bytes([
+                            demux.stream_buf[off],
+                            demux.stream_buf[off + 1],
+                            demux.stream_buf[off + 2],
+                            demux.stream_buf[off + 3],
+                        ]);
+                        let samples_per_chunk = u32::from_be_bytes([
+                            demux.stream_buf[off + 4],
+                            demux.stream_buf[off + 5],
+                            demux.stream_buf[off + 6],
+                            demux.stream_buf[off + 7],
+                        ]);
+                        demux.stsc_entries.push(Mp4StscEntry {
+                            first_chunk,
+                            samples_per_chunk,
+                        });
+                    }
+                    demux.stream_buf.drain(..len);
+                    demux.file_pos += len;
+                }
+                b"stco" => {
+                    if len < 16 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() < len {
+                        break;
+                    }
+                    let count = u32::from_be_bytes([
+                        demux.stream_buf[12],
+                        demux.stream_buf[13],
+                        demux.stream_buf[14],
+                        demux.stream_buf[15],
+                    ]) as usize;
+                    if count > MAX_MP4_SAMPLES {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
+                    if len < 16 + count * 4 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    demux.chunk_offsets.clear();
+                    demux.chunk_offsets.reserve(count);
+                    for i in 0..count {
+                        let off = 16 + i * 4;
+                        let chunk_off = u32::from_be_bytes([
+                            demux.stream_buf[off],
+                            demux.stream_buf[off + 1],
+                            demux.stream_buf[off + 2],
+                            demux.stream_buf[off + 3],
+                        ]) as usize;
+                        demux.chunk_offsets.push(chunk_off);
+                    }
+                    demux.stream_buf.drain(..len);
+                    demux.file_pos += len;
+                }
+                b"co64" => {
+                    if len < 16 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() < len {
+                        break;
+                    }
+                    let count = u32::from_be_bytes([
+                        demux.stream_buf[12],
+                        demux.stream_buf[13],
+                        demux.stream_buf[14],
+                        demux.stream_buf[15],
+                    ]) as usize;
+                    if count > MAX_MP4_SAMPLES {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
+                    if len < 16 + count * 8 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    demux.chunk_offsets.clear();
+                    demux.chunk_offsets.reserve(count);
+                    for i in 0..count {
+                        let off = 16 + i * 8;
+                        let chunk_off = u64::from_be_bytes([
+                            demux.stream_buf[off],
+                            demux.stream_buf[off + 1],
+                            demux.stream_buf[off + 2],
+                            demux.stream_buf[off + 3],
+                            demux.stream_buf[off + 4],
+                            demux.stream_buf[off + 5],
+                            demux.stream_buf[off + 6],
+                            demux.stream_buf[off + 7],
+                        ]) as usize;
+                        demux.chunk_offsets.push(chunk_off);
+                    }
+                    demux.stream_buf.drain(..len);
+                    demux.file_pos += len;
+                }
+                b"mdat" => {
+                    if demux.asc.is_none() || demux.sample_sizes.is_empty() {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    let header_len = if len == 1 { 16 } else { 8 };
+                    if demux.stream_buf.len() < header_len {
+                        break;
+                    }
+                    demux.stream_buf.drain(..header_len);
+                    demux.file_pos += header_len;
+                    if let Some(&first_off) = demux.chunk_offsets.first() {
+                        if first_off > demux.file_pos {
+                            demux.bytes_to_skip = first_off - demux.file_pos;
+                            let to_skip =
+                                core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
+                            demux.stream_buf.drain(..to_skip);
+                            demux.bytes_to_skip -= to_skip;
+                            demux.file_pos += to_skip;
+                        }
+                    }
+                    demux.state = Mp4DemuxState::ReadingMdat;
+                }
+                _ => {
+                    if len < 8 {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    if demux.stream_buf.len() >= len {
+                        demux.stream_buf.drain(..len);
+                        demux.file_pos += len;
+                    } else {
+                        let avail = demux.stream_buf.len();
+                        demux.file_pos += avail;
+                        demux.bytes_to_skip = len - avail;
+                        demux.stream_buf.clear();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if demux.state == Mp4DemuxState::ReadingMdat {
+            let Some(asc) = demux.asc else {
+                return Err(DecoderError::InvalidHeader);
+            };
+            while frames_out < max_frames
+                && demux.sample_idx < demux.sample_sizes.len()
+                && demux.bytes_to_skip == 0
+            {
+                let pkt_len = demux.sample_sizes[demux.sample_idx];
+                if pkt_len == 0 || pkt_len + 7 >= 8192 {
+                    return Err(DecoderError::CorruptedFrame);
+                }
+                if demux.stream_buf.len() < pkt_len {
+                    break;
+                }
+                let adts_hdr = synthesize_adts_header(asc, pkt_len);
+                demux.adts_frame_scratch.clear();
+                demux.adts_frame_scratch.reserve(7 + pkt_len);
+                demux.adts_frame_scratch.extend_from_slice(&adts_hdr);
+                demux
+                    .adts_frame_scratch
+                    .extend_from_slice(&demux.stream_buf[..pkt_len]);
+
+                let pending_pcm = &mut self.pending_pcm;
+                let sample_rate = &mut self.sample_rate;
+                let channels = &mut self.channels;
+                let feed_res = self.decoder.feed(&demux.adts_frame_scratch, |frame| {
+                    *sample_rate = frame.sample_rate;
+                    *channels = frame.planar.len() as u32;
+                    if frame.planar.is_empty() {
+                        return Ok(());
+                    }
+                    let left = frame.planar[0];
+                    let right = if frame.planar.len() > 1 {
+                        frame.planar[1]
+                    } else {
+                        left
+                    };
+                    let samples = core::cmp::min(left.len(), right.len());
+                    for i in 0..samples {
+                        let l_f = left[i].clamp(-1.0, 1.0);
+                        let r_f = right[i].clamp(-1.0, 1.0);
+                        let l = (l_f * 2147483520.0) as i32;
+                        let r = (r_f * 2147483520.0) as i32;
+                        if frames_out < max_frames {
+                            pcm_out[frames_out * 2] = l;
+                            pcm_out[frames_out * 2 + 1] = r;
+                            frames_out += 1;
+                        } else {
+                            pending_pcm.push(l);
+                            pending_pcm.push(r);
+                        }
+                    }
+                    Ok(())
+                });
+
+                demux.stream_buf.drain(..pkt_len);
+                demux.file_pos += pkt_len;
+                demux.sample_idx += 1;
+                demux.sample_in_chunk_idx += 1;
+
+                let spc = demux.samples_in_chunk(demux.current_chunk_idx);
+                if demux.sample_in_chunk_idx >= spc {
+                    demux.current_chunk_idx += 1;
+                    demux.sample_in_chunk_idx = 0;
+                    if let Some(&next_off) = demux.chunk_offsets.get(demux.current_chunk_idx) {
+                        if next_off > demux.file_pos {
+                            demux.bytes_to_skip = next_off - demux.file_pos;
+                            let to_skip =
+                                core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
+                            demux.stream_buf.drain(..to_skip);
+                            demux.bytes_to_skip -= to_skip;
+                            demux.file_pos += to_skip;
+                        }
+                    }
+                }
+
+                if feed_res.is_err() && frames_out == 0 {
+                    return Err(DecoderError::CorruptedFrame);
+                }
+            }
+            if demux.sample_idx >= demux.sample_sizes.len() && !demux.sample_sizes.is_empty() {
+                demux.state = Mp4DemuxState::Eof;
+            }
+        }
+
+        if frames_out == 0 && input_taken == 0 {
+            Err(DecoderError::NeedMoreData)
+        } else {
+            Ok((input_taken, frames_out))
+        }
     }
 }
 
@@ -1961,6 +3244,36 @@ impl AudioDecoder for AacDecoder {
             }
         }
 
+        if self.is_mp4.is_none() {
+            if encoded_in.len() >= 2
+                && encoded_in[0] == 0xFF
+                && (encoded_in[1] & 0xF0) == 0xF0
+            {
+                self.is_mp4 = Some(false);
+            } else if encoded_in.len() >= 8 {
+                let fourcc = &encoded_in[4..8];
+                let is_box = fourcc == b"ftyp"
+                    || fourcc == b"moov"
+                    || fourcc == b"styp"
+                    || fourcc == b"free"
+                    || fourcc == b"skip"
+                    || fourcc == b"wide"
+                    || fourcc == b"mdat";
+                self.is_mp4 = Some(is_box);
+            } else if encoded_in.len() < 7 {
+                if frames_out > 0 {
+                    return Ok((0, frames_out));
+                }
+                return Err(DecoderError::NeedMoreData);
+            } else {
+                self.is_mp4 = Some(false);
+            }
+        }
+
+        if self.is_mp4 == Some(true) {
+            return self.decode_mp4_stream(encoded_in, pcm_out, frames_out, max_frames);
+        }
+
         if encoded_in.len() < 7 {
             if frames_out > 0 {
                 return Ok((0, frames_out));
@@ -1971,10 +3284,20 @@ impl AudioDecoder for AacDecoder {
         let pending_pcm = &mut self.pending_pcm;
         let sample_rate = &mut self.sample_rate;
         let channels = &mut self.channels;
+        let mut unsupported_format = false;
 
         let feed_res = self.decoder.feed(encoded_in, |frame| {
             *sample_rate = frame.sample_rate;
             *channels = frame.planar.len() as u32;
+
+            if *channels != 1 && *channels != 2 {
+                unsupported_format = true;
+                return Ok(());
+            }
+            if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(sample_rate) {
+                unsupported_format = true;
+                return Ok(());
+            }
 
             if frame.planar.is_empty() {
                 return Ok(());
@@ -2006,6 +3329,10 @@ impl AudioDecoder for AacDecoder {
 
             Ok(())
         });
+
+        if unsupported_format {
+            return Err(DecoderError::UnsupportedFeature);
+        }
 
         match feed_res {
             Ok(consumed) => {
@@ -2126,7 +3453,10 @@ impl VorbisDecoder {
                 let ident = lewton::header::read_header_ident(packet)
                     .map_err(|_| DecoderError::InvalidHeader)?;
                 if ident.audio_channels != 1 && ident.audio_channels != 2 {
-                    return Err(DecoderError::UnsupportedSampleFormat);
+                    return Err(DecoderError::UnsupportedFeature);
+                }
+                if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&ident.audio_sample_rate) {
+                    return Err(DecoderError::UnsupportedFeature);
                 }
                 self.sample_rate = ident.audio_sample_rate;
                 self.channels = ident.audio_channels as u32;
@@ -2576,10 +3906,21 @@ impl AudioDecoder for AlacDecoder {
                     });
                     match info {
                         Ok(stream_info) => {
+                            if stream_info.channels() != 1 && stream_info.channels() != 2 {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE)
+                                .contains(&stream_info.sample_rate())
+                            {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
                             self.sample_rate = stream_info.sample_rate();
                             self.channels = stream_info.channels() as u32;
                             self.bit_depth = stream_info.bit_depth();
                             let max_samples = stream_info.max_samples_per_packet() as usize;
+                            if max_samples > MAX_FLAC_BLOCK_SAMPLES * 2 {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
                             self.packet_out_buf.resize(max_samples, 0);
                             self.decoder = Some(alac::Decoder::new(stream_info));
                         }
@@ -2607,6 +3948,9 @@ impl AudioDecoder for AlacDecoder {
                         self.stream_buf[18],
                         self.stream_buf[19],
                     ]) as usize;
+                    if count > MAX_MP4_SAMPLES {
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
 
                     self.sample_sizes.clear();
                     if default_sz == 0 {
@@ -3934,5 +5278,429 @@ mod tests {
             assert_eq!(pcm_out[i * 2], 1000 << 16);
             assert_eq!(pcm_out[i * 2 + 1], -1000 << 16);
         }
+    }
+
+    #[test]
+    fn test_mp3_xing_lame_header_parse_and_gapless_trim() {
+        let mut xing_frame = [0u8; 417];
+        xing_frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        xing_frame[36..40].copy_from_slice(b"Xing");
+        xing_frame[40..44].copy_from_slice(&0x0000_0003u32.to_be_bytes());
+        xing_frame[44..48].copy_from_slice(&3u32.to_be_bytes());
+        xing_frame[48..52].copy_from_slice(&(3u32 * 417).to_be_bytes());
+        xing_frame[52..61].copy_from_slice(b"LAME3.100");
+        // enc_delay = 576 (0x240), enc_padding = 1152 (0x480) at LAME + 21
+        // (offset 73..76)
+        xing_frame[73] = 0x24;
+        xing_frame[74] = 0x04;
+        xing_frame[75] = 0x80;
+
+        let parsed = parse_xing_lame_header(&xing_frame).unwrap();
+        assert_eq!(parsed.total_frames, Some(3));
+        assert_eq!(parsed.total_bytes, Some(3 * 417));
+        assert_eq!(parsed.enc_delay, 576);
+        assert_eq!(parsed.enc_padding, 1152);
+        assert_eq!(parsed.samples_per_frame, 1152);
+
+        let mut audio_frame = [0u8; 417];
+        audio_frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+
+        let mut stream = std::vec::Vec::with_capacity(417 * 4);
+        stream.extend_from_slice(&xing_frame);
+        stream.extend_from_slice(&audio_frame);
+        stream.extend_from_slice(&audio_frame);
+        stream.extend_from_slice(&audio_frame);
+
+        // 1. Verify Mp3Decoder gapless trimming (enc_delay = 576, enc_padding = 1152)
+        let mut dec = Mp3Decoder::new();
+        let mut pcm_out = [0i32; 2304];
+        let mut offset = 0usize;
+        let mut frame_counts = std::vec::Vec::new();
+        while offset < stream.len() {
+            let (consumed, frames) = dec.decode(&stream[offset..], &mut pcm_out).unwrap();
+            assert!(consumed > 0);
+            offset += consumed;
+            frame_counts.push(frames);
+        }
+        assert_eq!(dec.enc_delay_frames(), 576);
+        assert_eq!(dec.enc_padding_frames(), 1152);
+        assert_eq!(dec.total_frames(), Some(3));
+        // Frame 0 (Xing): 0; Frame 1: 1152 - 576 = 576; Frame 2: 1152;
+        // Frame 3: 0 (trimmed)
+        assert_eq!(frame_counts, std::vec![0, 576, 1152, 0]);
+        assert_eq!(frame_counts.iter().sum::<usize>(), 3 * 1152 - 576 - 1152);
+
+        // 2. Verify with_decoder_delay(true) (+529 samples leading trim)
+        let mut dec_delay = Mp3Decoder::new().with_decoder_delay(true);
+        let mut off2 = 0usize;
+        let mut counts_with_delay = std::vec::Vec::new();
+        while off2 < stream.len() {
+            let (consumed, frames) = dec_delay.decode(&stream[off2..], &mut pcm_out).unwrap();
+            off2 += consumed;
+            counts_with_delay.push(frames);
+        }
+        assert_eq!(counts_with_delay, std::vec![0, 1152 - (576 + 529), 1152, 0]);
+
+        // 3. Verify StaticMp3Decoder gapless trimming parity
+        let mut static_dec = StaticMp3Decoder::new();
+        let mut off3 = 0usize;
+        let mut static_counts = std::vec::Vec::new();
+        while off3 < stream.len() {
+            let (consumed, frames) = static_dec.decode(&stream[off3..], &mut pcm_out).unwrap();
+            off3 += consumed;
+            static_counts.push(frames);
+        }
+        assert_eq!(static_dec.enc_delay_frames(), 576);
+        assert_eq!(static_dec.enc_padding_frames(), 1152);
+        assert_eq!(static_counts, std::vec![0, 576, 1152, 0]);
+    }
+
+    fn build_ogg_page(
+        header_type: u8,
+        granule_pos: u64,
+        serial: u32,
+        seq_no: u32,
+        packets: &[&[u8]],
+    ) -> std::vec::Vec<u8> {
+        let mut seg_table = std::vec::Vec::new();
+        let mut body = std::vec::Vec::new();
+        for &pkt in packets {
+            let mut rem = pkt.len();
+            while rem >= 255 {
+                seg_table.push(255u8);
+                rem -= 255;
+            }
+            seg_table.push(rem as u8);
+            body.extend_from_slice(pkt);
+        }
+        let mut page = std::vec::Vec::with_capacity(27 + seg_table.len() + body.len());
+        page.extend_from_slice(b"OggS");
+        page.push(0); // version
+        page.push(header_type);
+        page.extend_from_slice(&granule_pos.to_le_bytes());
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&seq_no.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder at 22..26
+        page.push(seg_table.len() as u8);
+        page.extend_from_slice(&seg_table);
+        page.extend_from_slice(&body);
+        let crc = ogg_crc32(&page);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+        page
+    }
+
+    #[test]
+    fn test_ogg_flac_container_unwrap_and_bit_exact_parity() {
+        let raw_flac = include_bytes!("../tests/fixtures/stereo_16bit.flac");
+        assert_eq!(&raw_flac[0..4], b"fLaC");
+
+        // 1. Decode native FLAC fixture as reference
+        let mut ref_dec = FlacDecoder::new();
+        let mut ref_pcm = std::vec::Vec::new();
+        let mut pcm_buf = [0i32; 1024];
+        let mut off = 0usize;
+        while off < raw_flac.len()
+            || ref_dec.has_pending_pcm()
+            || ref_dec.stream_buf.len() > ref_dec.header_len
+        {
+            let end = (off + 512).min(raw_flac.len());
+            match ref_dec.decode(&raw_flac[off..end], &mut pcm_buf) {
+                Ok((consumed, frames)) => {
+                    off += consumed;
+                    ref_pcm.extend_from_slice(&pcm_buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && off >= raw_flac.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if off >= raw_flac.len() && !ref_dec.has_pending_pcm() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("Reference FLAC decode failed: {:?}", e),
+            }
+        }
+        assert!(!ref_pcm.is_empty());
+
+        // 2. Wrap raw_flac into Ogg-FLAC pages:
+        // Page 0 (BOS = 0x02): \x7fFLAC\x01\x00\x00\x00 + fLaC + STREAMINFO (42 bytes)
+        let mut bos_pkt = std::vec::Vec::with_capacity(9 + 42);
+        bos_pkt.extend_from_slice(b"\x7fFLAC\x01\x00\x00\x00");
+        bos_pkt.extend_from_slice(&raw_flac[..42]);
+
+        let mut ogg_stream = std::vec::Vec::new();
+        ogg_stream.extend_from_slice(&build_ogg_page(0x02, 0, 0x1234_5678, 0, &[&bos_pkt]));
+
+        // Wrap remaining FLAC bytes across multiple Ogg pages
+        let audio_bytes = &raw_flac[42..];
+        let mut seq = 1u32;
+        let mut pos = 0usize;
+        while pos < audio_bytes.len() {
+            let chunk_end = (pos + 2048).min(audio_bytes.len());
+            let hdr_type = if chunk_end == audio_bytes.len() { 0x04 } else { 0x00 };
+            let page = build_ogg_page(
+                hdr_type,
+                (seq as u64) * 1024,
+                0x1234_5678,
+                seq,
+                &[&audio_bytes[pos..chunk_end]],
+            );
+            ogg_stream.extend_from_slice(&page);
+            pos = chunk_end;
+            seq += 1;
+        }
+
+        // 3. Decode Ogg-FLAC stream in 512-byte chunks and assert bit-exact parity
+        let mut ogg_dec = FlacDecoder::new();
+        let mut ogg_pcm = std::vec::Vec::new();
+        let mut ogg_off = 0usize;
+        while ogg_off < ogg_stream.len()
+            || ogg_dec.has_pending_pcm()
+            || ogg_dec.stream_buf.len() > ogg_dec.header_len
+        {
+            let end = (ogg_off + 512).min(ogg_stream.len());
+            match ogg_dec.decode(&ogg_stream[ogg_off..end], &mut pcm_buf) {
+                Ok((consumed, frames)) => {
+                    ogg_off += consumed;
+                    ogg_pcm.extend_from_slice(&pcm_buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && ogg_off >= ogg_stream.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if ogg_off >= ogg_stream.len() && !ogg_dec.has_pending_pcm() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("Ogg-FLAC decode failed: {:?}", e),
+            }
+        }
+        assert_eq!(ogg_pcm.len(), ref_pcm.len());
+        assert_eq!(ogg_pcm, ref_pcm);
+
+        // 4. Verify corrupted Ogg page CRC is rejected with CorruptedFrame
+        let mut bad_ogg = ogg_stream.clone();
+        bad_ogg[22] ^= 0xFF;
+        let mut bad_dec = FlacDecoder::new();
+        assert_eq!(
+            bad_dec.decode(&bad_ogg, &mut pcm_buf),
+            Err(DecoderError::CorruptedFrame)
+        );
+    }
+
+    fn make_mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> std::vec::Vec<u8> {
+        let total = (8 + payload.len()) as u32;
+        let mut out = std::vec::Vec::with_capacity(total as usize);
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn test_aac_mp4_m4a_esds_demux_and_adts_synthesis_parity() {
+        warm_up_decoders();
+        let adts_fixture =
+            include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+
+        // 1. Extract raw AAC access units from the ADTS fixture (first 12 frames)
+        let mut raw_aus: std::vec::Vec<&[u8]> = std::vec::Vec::new();
+        let mut adts_prefix = std::vec::Vec::new();
+        let mut pos = 0usize;
+        while pos + 7 <= adts_fixture.len() && raw_aus.len() < 12 {
+            assert_eq!(adts_fixture[pos], 0xFF);
+            assert_eq!(adts_fixture[pos + 1] & 0xF0, 0xF0);
+            let frame_len = (((adts_fixture[pos + 3] as usize) & 0x03) << 11)
+                | ((adts_fixture[pos + 4] as usize) << 3)
+                | (((adts_fixture[pos + 5] as usize) >> 5) & 0x07);
+            assert!(frame_len > 7 && pos + frame_len <= adts_fixture.len());
+            adts_prefix.extend_from_slice(&adts_fixture[pos..pos + frame_len]);
+            raw_aus.push(&adts_fixture[pos + 7..pos + frame_len]);
+            pos += frame_len;
+        }
+        assert_eq!(raw_aus.len(), 12);
+
+        // 2. Decode the 12-frame ADTS stream directly as reference
+        let mut ref_dec = AacDecoder::new();
+        let mut ref_pcm = std::vec::Vec::new();
+        let mut pcm_buf = [0i32; 2048];
+        let (consumed_ref, frames_ref) = ref_dec.decode(&adts_prefix, &mut pcm_buf).unwrap();
+        assert_eq!(consumed_ref, adts_prefix.len());
+        ref_pcm.extend_from_slice(&pcm_buf[..frames_ref * 2]);
+        while ref_dec.has_pending_pcm() {
+            let (_, f) = ref_dec.decode(&[], &mut pcm_buf).unwrap();
+            ref_pcm.extend_from_slice(&pcm_buf[..f * 2]);
+        }
+        assert_eq!(ref_pcm.len(), 12 * 1024 * 2);
+
+        // 3. Build an ISO-BMFF M4A container with ftyp + moov (trak -> mdia -> minf
+        //    -> stbl -> stsd -> mp4a -> esds + stsc + stsz + stco) + mdat
+        let ftyp = make_mp4_box(b"ftyp", b"M4A \x00\x00\x02\x00M4A mp42isom");
+
+        // esds payload: version/flags (4) + ES_Descriptor (0x03) + DecoderConfig (0x04)
+        // + DecoderSpecificInfo (0x05) with AudioSpecificConfig [0x12, 0x10]
+        // (AAC-LC = 2, 44100 Hz index = 4, Stereo = 2)
+        let esds_payload: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, // version + flags
+            0x03, 23, 0x00, 0x01, 0x00, // ES_Descriptor
+            0x04, 15, 0x40, 0x15, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x01,
+            0xF4, 0x00, // DecoderConfigDescriptor (objectType = 0x40)
+            0x05, 2, 0x12, 0x10, // DecoderSpecificInfo (AudioSpecificConfig)
+        ];
+        let esds_box = make_mp4_box(b"esds", esds_payload);
+
+        let mut mp4a_payload = std::vec![0u8; 28]; // 36-byte mp4a header = 8 box + 28 payload
+        mp4a_payload[6..8].copy_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        mp4a_payload[16..18].copy_from_slice(&2u16.to_be_bytes()); // channels = 2
+        mp4a_payload[18..20].copy_from_slice(&16u16.to_be_bytes()); // sample_size = 16
+        mp4a_payload[24..28].copy_from_slice(&(44100u32 << 16).to_be_bytes());
+        mp4a_payload.extend_from_slice(&esds_box);
+        let mp4a_box = make_mp4_box(b"mp4a", &mp4a_payload);
+
+        let mut stsd_payload = std::vec![0u8; 8];
+        stsd_payload[4..8].copy_from_slice(&1u32.to_be_bytes()); // 1 entry
+        stsd_payload.extend_from_slice(&mp4a_box);
+        let stsd_box = make_mp4_box(b"stsd", &stsd_payload);
+
+        // stsc: 1 entry -> first_chunk = 1, samples_per_chunk = 6, sample_desc_idx = 1
+        let mut stsc_payload = std::vec![0u8; 8];
+        stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&6u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        let stsc_box = make_mp4_box(b"stsc", &stsc_payload);
+
+        // stsz: default_sz = 0, count = 12
+        let mut stsz_payload = std::vec![0u8; 12];
+        stsz_payload[8..12].copy_from_slice(&(raw_aus.len() as u32).to_be_bytes());
+        for au in &raw_aus {
+            stsz_payload.extend_from_slice(&(au.len() as u32).to_be_bytes());
+        }
+        let stsz_box = make_mp4_box(b"stsz", &stsz_payload);
+
+        // Compute chunk offsets for 2 chunks of 6 samples each with a 16-byte gap
+        // between chunk 0 and chunk 1 inside mdat
+        let chunk0_len: usize = raw_aus[0..6].iter().map(|a| a.len()).sum();
+        let inter_chunk_gap = 16usize;
+        let placeholder_stco = make_mp4_box(b"stco", &[0u8; 16]);
+        let stbl_len =
+            8 + stsd_box.len() + stsc_box.len() + stsz_box.len() + placeholder_stco.len();
+        let moov_len = 8 + 8 + 8 + 8 + stbl_len; // moov -> trak -> mdia -> minf -> stbl
+        let mdat_data_start = ftyp.len() + moov_len + 8 + 12; // +12 leading pad inside mdat
+        let chunk0_off = mdat_data_start as u32;
+        let chunk1_off = (mdat_data_start + chunk0_len + inter_chunk_gap) as u32;
+
+        let mut stco_payload = std::vec![0u8; 8];
+        stco_payload[4..8].copy_from_slice(&2u32.to_be_bytes()); // 2 chunks
+        stco_payload.extend_from_slice(&chunk0_off.to_be_bytes());
+        stco_payload.extend_from_slice(&chunk1_off.to_be_bytes());
+        let stco_box = make_mp4_box(b"stco", &stco_payload);
+
+        let mut stbl_payload = std::vec::Vec::new();
+        stbl_payload.extend_from_slice(&stsd_box);
+        stbl_payload.extend_from_slice(&stsc_box);
+        stbl_payload.extend_from_slice(&stsz_box);
+        stbl_payload.extend_from_slice(&stco_box);
+        let stbl_box = make_mp4_box(b"stbl", &stbl_payload);
+        let minf_box = make_mp4_box(b"minf", &stbl_box);
+        let mdia_box = make_mp4_box(b"mdia", &minf_box);
+        let trak_box = make_mp4_box(b"trak", &mdia_box);
+        let moov_box = make_mp4_box(b"moov", &trak_box);
+
+        let mut mdat_payload = std::vec![0xAAu8; 12]; // 12-byte pre-chunk padding
+        for au in &raw_aus[0..6] {
+            mdat_payload.extend_from_slice(au);
+        }
+        mdat_payload.extend_from_slice(&[0xBBu8; 16]); // 16-byte inter-chunk gap
+        for au in &raw_aus[6..12] {
+            mdat_payload.extend_from_slice(au);
+        }
+        let mdat_box = make_mp4_box(b"mdat", &mdat_payload);
+
+        let mut m4a_stream = std::vec::Vec::new();
+        m4a_stream.extend_from_slice(&ftyp);
+        m4a_stream.extend_from_slice(&moov_box);
+        m4a_stream.extend_from_slice(&mdat_box);
+
+        // 4. Decode M4A stream in 256-byte chunks and verify bit-exact PCM parity
+        let mut m4a_dec = AacDecoder::new();
+        let mut m4a_pcm = std::vec::Vec::new();
+        let mut m4a_off = 0usize;
+        while m4a_off < m4a_stream.len() || m4a_dec.has_pending_pcm() {
+            let end = (m4a_off + 256).min(m4a_stream.len());
+            let chunk = &m4a_stream[m4a_off..end];
+            match m4a_dec.decode(chunk, &mut pcm_buf) {
+                Ok((consumed, frames)) => {
+                    m4a_off += consumed;
+                    m4a_pcm.extend_from_slice(&pcm_buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && m4a_off >= m4a_stream.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if m4a_off >= m4a_stream.len() && !m4a_dec.has_pending_pcm() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("M4A decode failed: {:?}", e),
+            }
+        }
+
+        let asc = m4a_dec.audio_specific_config().unwrap();
+        assert_eq!(asc.audio_object_type, 2);
+        assert_eq!(asc.sampling_frequency_index, 4);
+        assert_eq!(asc.channel_configuration, 2);
+        assert_eq!(asc.sample_rate, 44100);
+        assert_eq!(m4a_dec.sample_rate, 44100);
+        assert_eq!(m4a_dec.channels, 2);
+        assert_eq!(m4a_pcm.len(), ref_pcm.len());
+        assert_eq!(m4a_pcm, ref_pcm);
+    }
+
+    #[test]
+    fn test_decoder_memory_budget_and_unsupported_feature_ceilings() {
+        // 1. DecodeError::UnsupportedFeature aliases
+        // DecoderError::UnsupportedSampleFormat
+        assert_eq!(
+            DecodeError::UnsupportedFeature,
+            DecoderError::UnsupportedSampleFormat
+        );
+
+        // 2. PcmDecoder rejects sample rate > 192 kHz with UnsupportedFeature
+        let mut pcm = PcmDecoder::new(16, 2, false);
+        pcm.sample_rate = Some(384_000);
+        let mut pcm_out = [0i32; 16];
+        assert_eq!(
+            pcm.decode(&[0u8; 16], &mut pcm_out),
+            Err(DecodeError::UnsupportedFeature)
+        );
+
+        // 3. AacDecoder esds rejects >2 channels (5.1ch = 6) with UnsupportedFeature
+        let esds_5_1: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x12, 0x30, // AOT=2, sr_idx=4, ch=6
+        ];
+        assert_eq!(
+            parse_esds_audio_specific_config(esds_5_1),
+            Err(DecodeError::UnsupportedFeature)
+        );
+
+        // 4. AacDecoder MP4 stsz rejects sample count > MAX_MP4_SAMPLES
+        let ftyp = make_mp4_box(b"ftyp", b"M4A \x00\x00\x02\x00");
+        let mut stsz_oversized = std::vec![0u8; 12];
+        stsz_oversized[0..4].copy_from_slice(&0u32.to_be_bytes());
+        stsz_oversized[4..8].copy_from_slice(&256u32.to_be_bytes()); // default_sz = 256
+        stsz_oversized[8..12]
+            .copy_from_slice(&((MAX_MP4_SAMPLES as u32) + 1).to_be_bytes());
+        let stsz_box = make_mp4_box(b"stsz", &stsz_oversized);
+        let moov_box = make_mp4_box(b"moov", &stsz_box);
+        let mut bad_m4a = std::vec::Vec::new();
+        bad_m4a.extend_from_slice(&ftyp);
+        bad_m4a.extend_from_slice(&moov_box);
+
+        let mut aac_dec = AacDecoder::new();
+        assert_eq!(
+            aac_dec.decode(&bad_m4a, &mut pcm_out),
+            Err(DecodeError::UnsupportedFeature)
+        );
     }
 }

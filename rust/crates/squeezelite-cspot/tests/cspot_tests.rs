@@ -1,8 +1,11 @@
-//! Comprehensive unit and golden vector tests for pure-Rust Spotify Connect (cspot) engine.
+//! Comprehensive unit and golden vector tests for pure-Rust Spotify Connect
+//! (`cspot`) engine.
 
+use squeezelite_cspot::cdn::AudioKeyDecryptor;
 use squeezelite_cspot::cdn::CdnAudioDecryptor;
 use squeezelite_cspot::cdn::CdnStreamFeeder;
 use squeezelite_cspot::cdn::AUDIO_AES_IV;
+use squeezelite_cspot::cdn::SPOTIFY_HEADER_SIZE;
 use squeezelite_cspot::crypto::base64_decode;
 use squeezelite_cspot::crypto::base64_encode;
 use squeezelite_cspot::crypto::big_num_add;
@@ -10,8 +13,13 @@ use squeezelite_cspot::crypto::hmac_sha1;
 use squeezelite_cspot::crypto::pbkdf2_hmac_sha1;
 use squeezelite_cspot::crypto::Aes128Ctr;
 use squeezelite_cspot::crypto::Aes192Ecb;
+use squeezelite_cspot::crypto::CryptoError;
 use squeezelite_cspot::crypto::OakleyGroup1Dh;
 use squeezelite_cspot::crypto::Sha1;
+use squeezelite_cspot::mercury::AudioKeyPacket;
+use squeezelite_cspot::mercury::MercuryError;
+use squeezelite_cspot::mercury::MercuryHeader;
+use squeezelite_cspot::mercury::MercuryPacket;
 use squeezelite_cspot::mercury::MercuryPacketBuilder;
 use squeezelite_cspot::mercury::MercuryType;
 use squeezelite_cspot::shannon::Shannon;
@@ -22,9 +30,15 @@ use squeezelite_cspot::spirc::SpircEvent;
 use squeezelite_cspot::spirc::SpircFrame;
 use squeezelite_cspot::spirc::SpircMessageType;
 use squeezelite_cspot::spirc::SpircStateMachine;
+use squeezelite_cspot::spirc::TrackMetadata;
+use squeezelite_cspot::spirc::SPOTIFY_MAX_VOLUME;
+use squeezelite_cspot::zeroconf::ReusableCredentials;
 use squeezelite_cspot::zeroconf::SpotifyMdnsBuilder;
 use squeezelite_cspot::zeroconf::SpotifyMdnsConfig;
 use squeezelite_cspot::zeroconf::ZeroConfServer;
+use squeezelite_cspot::zeroconf::AP_AUTH_DECLINED_CMD;
+use squeezelite_cspot::zeroconf::AP_WELCOME_CMD;
+use squeezelite_cspot::zeroconf::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS;
 
 // --- Shannon Golden Vector Tests ---
 
@@ -422,3 +436,306 @@ fn test_cdn_stream_feeder_initialization() {
     feeder.flush();
     assert_eq!(feeder.sample_rate(), 44100);
 }
+
+// --- Phase 6 Completion Tests (WO-227) ---
+
+#[test]
+fn test_reusable_credentials_ap_welcome_and_encrypted_persistence() {
+    let creds = ReusableCredentials::stored_spotify(
+        "spotify_user_canonical",
+        vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04],
+    );
+    assert_eq!(
+        creds.auth_type,
+        AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS
+    );
+
+    // Encode APWelcome (0xAC) and parse back
+    let welcome_bytes = creds.encode_ap_welcome();
+    let parsed_welcome =
+        ReusableCredentials::from_ap_welcome_packet(AP_WELCOME_CMD, &welcome_bytes)
+            .expect("parse APWelcome 0xAC");
+    assert_eq!(parsed_welcome, creds);
+
+    // Reject non-0xAC command (e.g., 0xAD declined)
+    let declined = ReusableCredentials::from_ap_welcome_packet(
+        AP_AUTH_DECLINED_CMD,
+        &welcome_bytes,
+    );
+    assert_eq!(declined, Err(CryptoError::DecryptionFailed));
+
+    // Encrypt for FlashJournal with AES-128-CTR + HMAC-SHA1
+    let secret = b"louder-esp32-device-unique-secret";
+    let iv = [0x3Cu8; 16];
+    let encrypted = creds.encrypt(secret, iv);
+    assert!(encrypted.len() > 36);
+
+    let decrypted = ReusableCredentials::decrypt(&encrypted, secret)
+        .expect("decrypt valid credentials");
+    assert_eq!(decrypted, creds);
+
+    // Base64 FlashJournal roundtrip
+    let b64 = creds.encrypt_base64(secret, iv);
+    let from_b64 = ReusableCredentials::decrypt_base64(&b64, secret)
+        .expect("decrypt base64 credentials");
+    assert_eq!(from_b64, creds);
+
+    // Tamper with ciphertext byte -> must fail HMAC-SHA1 check
+    let mut tampered_ct = encrypted.clone();
+    tampered_ct[20] ^= 0x01;
+    assert_eq!(
+        ReusableCredentials::decrypt(&tampered_ct, secret),
+        Err(CryptoError::DecryptionFailed)
+    );
+
+    // Tamper with HMAC tag byte -> must fail HMAC-SHA1 check
+    let mut tampered_mac = encrypted.clone();
+    let last = tampered_mac.len() - 1;
+    tampered_mac[last] ^= 0x80;
+    assert_eq!(
+        ReusableCredentials::decrypt(&tampered_mac, secret),
+        Err(CryptoError::DecryptionFailed)
+    );
+
+    // Wrong secret key -> must fail HMAC-SHA1 check
+    assert_eq!(
+        ReusableCredentials::decrypt(&encrypted, b"wrong-secret"),
+        Err(CryptoError::DecryptionFailed)
+    );
+}
+
+#[test]
+fn test_mercury_header_and_multipart_packet_framing() {
+    let header = MercuryHeader::new("hm://remote/user/spotify/v1", "SUB")
+        .with_status_code(200)
+        .with_content_type("application/x-protobuf");
+
+    let encoded_hdr = header.encode();
+    let decoded_hdr =
+        MercuryHeader::decode(&encoded_hdr).expect("decode mercury header");
+    assert_eq!(decoded_hdr, header);
+
+    // Full MercuryPacket roundtrip for 0xB2..0xB5
+    for (method, expected_cmd) in [
+        ("SEND", MercuryType::MercuryReq),
+        ("GET", MercuryType::MercuryReq),
+        ("SUB", MercuryType::MercurySub),
+        ("UNSUB", MercuryType::MercuryUnsub),
+    ] {
+        let pkt = MercuryPacket::request(
+            4242,
+            method,
+            "hm://metadata/4/track/abcdef",
+            vec![b"part1".to_vec(), b"part2".to_vec()],
+        );
+        assert_eq!(pkt.cmd, expected_cmd);
+        let (cmd_byte, body) = pkt.encode_ap_frame();
+        let decoded =
+            MercuryPacket::decode(cmd_byte, &body).expect("decode mercury pkt");
+        assert_eq!(decoded.cmd, expected_cmd);
+        assert_eq!(decoded.seq_id, 4242);
+        assert_eq!(decoded.header.uri, "hm://metadata/4/track/abcdef");
+        assert_eq!(decoded.header.method, method);
+        assert_eq!(decoded.payload_parts.len(), 2);
+        assert_eq!(decoded.payload_parts[0], b"part1");
+        assert_eq!(decoded.payload_parts[1], b"part2");
+    }
+
+    // Multipart assembly across two fragments (0xB5 MercuryEvent)
+    let event_hdr = MercuryHeader::new("hm://remote/user/spotify/", "SEND")
+        .with_status_code(200);
+    let hdr_bytes = event_hdr.encode();
+
+    let mut frag1 = Vec::new();
+    frag1.extend_from_slice(&8u16.to_be_bytes());
+    frag1.extend_from_slice(&99u64.to_be_bytes());
+    frag1.push(0x00); // partial fragment
+    frag1.extend_from_slice(&1u16.to_be_bytes());
+    frag1.extend_from_slice(&(hdr_bytes.len() as u16).to_be_bytes());
+    frag1.extend_from_slice(&hdr_bytes);
+
+    let mut frag2 = Vec::new();
+    frag2.extend_from_slice(&8u16.to_be_bytes());
+    frag2.extend_from_slice(&99u64.to_be_bytes());
+    frag2.push(0x01); // final fragment
+    frag2.extend_from_slice(&2u16.to_be_bytes());
+    frag2.extend_from_slice(&6u16.to_be_bytes());
+    frag2.extend_from_slice(b"chunkA");
+    frag2.extend_from_slice(&6u16.to_be_bytes());
+    frag2.extend_from_slice(b"chunkB");
+
+    let assembled = MercuryPacket::assemble_multipart(
+        MercuryType::MercuryEvent as u8,
+        &[&frag1, &frag2],
+    )
+    .expect("assemble multipart");
+    assert_eq!(assembled.cmd, MercuryType::MercuryEvent);
+    assert_eq!(assembled.seq_id, 99);
+    assert_eq!(assembled.flags, 0x01);
+    assert_eq!(assembled.header, event_hdr);
+    assert_eq!(
+        assembled.payload_parts,
+        vec![b"chunkA".to_vec(), b"chunkB".to_vec()]
+    );
+}
+
+#[test]
+fn test_audio_key_packet_codec_roundtrip() {
+    let req = AudioKeyPacket::RequestKey {
+        file_id: [0x11; 20],
+        track_gid: [0x22; 16],
+        seq: 12345,
+    };
+    let (cmd_req, bytes_req) = req.encode();
+    assert_eq!(cmd_req, 0x0C);
+    assert_eq!(
+        AudioKeyPacket::decode(cmd_req, &bytes_req).expect("decode 0x0C"),
+        req
+    );
+
+    let key_resp = AudioKeyPacket::AesKey {
+        seq: 12345,
+        key: [0x7F; 16],
+    };
+    let (cmd_key, bytes_key) = key_resp.encode();
+    assert_eq!(cmd_key, 0x0D);
+    assert_eq!(
+        AudioKeyPacket::decode(cmd_key, &bytes_key).expect("decode 0x0D"),
+        key_resp
+    );
+
+    let err_resp = AudioKeyPacket::AesKeyError {
+        seq: 12345,
+        error_code: 0x0102,
+    };
+    let (cmd_err, bytes_err) = err_resp.encode();
+    assert_eq!(cmd_err, 0x0E);
+    assert_eq!(
+        AudioKeyPacket::decode(cmd_err, &bytes_err).expect("decode 0x0E"),
+        err_resp
+    );
+    assert_eq!(
+        MercuryPacketBuilder::parse_audio_key_response(cmd_err, &bytes_err),
+        Err(MercuryError::AudioKeyFailed(0x0102))
+    );
+}
+
+#[test]
+fn test_audio_key_decryptor_arbitrary_offset_and_header_strip() {
+    let key = [0x42u8; 16];
+    let decryptor = AudioKeyDecryptor::new(key);
+
+    // Construct a 400-byte simulated Spotify CDN file:
+    // - 167 bytes (0xA7) proprietary Spotify header
+    // - 233 bytes Ogg Vorbis payload starting with "OggS"
+    let mut plaintext = vec![0xAAu8; SPOTIFY_HEADER_SIZE];
+    plaintext.extend_from_slice(b"OggS-Vorbis-Stream-Payload-");
+    while plaintext.len() < 400 {
+        plaintext.push((plaintext.len() & 0xFF) as u8);
+    }
+
+    // Encrypt full file at offset 0
+    let mut ciphertext = plaintext.clone();
+    decryptor.decrypt_in_place(&mut ciphertext, 0);
+    assert_ne!(ciphertext, plaintext);
+
+    // Decrypt from offset 0 via decrypt_chunk -> must strip 0xA7 (167-byte) header
+    let mut chunk0 = ciphertext.clone();
+    let ogg_slice = decryptor.decrypt_chunk(&mut chunk0, 0);
+    assert_eq!(ogg_slice.len(), 400 - SPOTIFY_HEADER_SIZE);
+    assert!(ogg_slice.starts_with(b"OggS-Vorbis-Stream-Payload-"));
+    assert_eq!(ogg_slice, &plaintext[SPOTIFY_HEADER_SIZE..]);
+
+    // Decrypt at unaligned byte offsets (e.g. offset 7, offset 173)
+    for offset in [7usize, 16, 31, 167, 173, 255] {
+        let mut sub_cipher = ciphertext[offset..offset + 64].to_vec();
+        decryptor.decrypt_in_place(&mut sub_cipher, offset);
+        assert_eq!(
+            &sub_cipher[..],
+            &plaintext[offset..offset + 64],
+            "mismatch at byte_offset={offset}"
+        );
+    }
+
+    // Stateful streaming decryptor with seek(0)
+    let mut stateful = AudioKeyDecryptor::from_slice(&key).expect("valid key");
+    stateful.seek(0);
+    let mut first_half = ciphertext[..200].to_vec();
+    let ogg_part1 = stateful.decrypt_next(&mut first_half);
+    assert_eq!(ogg_part1, &plaintext[SPOTIFY_HEADER_SIZE..200]);
+    assert_eq!(stateful.byte_offset(), 200);
+}
+
+#[test]
+fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
+    let mut sm = SpircStateMachine::new();
+    sm.set_track_queue(
+        vec![
+            "spotify:track:track_1".to_string(),
+            "spotify:track:track_2".to_string(),
+            "spotify:track:track_3".to_string(),
+        ],
+        0,
+    );
+    assert_eq!(sm.current_track(), Some("spotify:track:track_1"));
+    assert_eq!(sm.playing_track_index(), 0);
+
+    // Track metadata with 20-byte artwork image ID -> https://i.scdn.co/image/<hex_id>
+    let meta = TrackMetadata::new(
+        "Money for Nothing",
+        "Dire Straits",
+        "Brothers in Arms",
+        245_000,
+        Some("ab67616d0000b2730123456789abcdef01234567".to_string()),
+    );
+    let meta_bytes = meta.encode_protobuf();
+    let decoded_meta =
+        TrackMetadata::decode_protobuf(&meta_bytes).expect("decode track proto");
+    assert_eq!(decoded_meta, meta);
+    assert_eq!(
+        decoded_meta.artwork_url().as_deref(),
+        Some("https://i.scdn.co/image/ab67616d0000b2730123456789abcdef01234567")
+    );
+
+    let meta_ev = sm.set_metadata(decoded_meta.clone());
+    assert_eq!(meta_ev, SpircEvent::MetadataUpdated(decoded_meta));
+    assert_eq!(
+        sm.artwork_url().as_deref(),
+        Some("https://i.scdn.co/image/ab67616d0000b2730123456789abcdef01234567")
+    );
+
+    // Seek frame roundtrip & state update
+    let seek_frame = SpircFrame::seek(10, 90_000);
+    let seek_parsed =
+        SpircFrame::parse(&seek_frame.encode()).expect("parse seek frame");
+    assert_eq!(seek_parsed, seek_frame);
+    assert_eq!(sm.handle_frame(&seek_parsed), Some(SpircEvent::Seek(90_000)));
+    assert_eq!(sm.position_ms(), 90_000);
+
+    // Volume clamping to 0..=65535
+    let vol_frame = SpircFrame::volume(11, 99_999);
+    assert_eq!(
+        sm.handle_frame(&vol_frame),
+        Some(SpircEvent::SetVolume(SPOTIFY_MAX_VOLUME))
+    );
+    assert_eq!(sm.volume(), 65535);
+
+    // Next / Prev transitions
+    let next_frame = SpircFrame::next(12);
+    assert_eq!(sm.handle_frame(&next_frame), Some(SpircEvent::Next));
+    assert_eq!(sm.current_track(), Some("spotify:track:track_2"));
+    assert_eq!(sm.position_ms(), 0);
+
+    let prev_frame = SpircFrame::prev(13);
+    assert_eq!(sm.handle_frame(&prev_frame), Some(SpircEvent::Prev));
+    assert_eq!(sm.current_track(), Some("spotify:track:track_1"));
+
+    // Start playing and advance position until TrackEnded
+    sm.set_status(PlayStatus::Play);
+    assert_eq!(sm.advance_position_ms(200_000), None);
+    assert_eq!(sm.position_ms(), 200_000);
+    assert_eq!(sm.advance_position_ms(50_000), Some(SpircEvent::TrackEnded));
+    assert_eq!(sm.current_track(), Some("spotify:track:track_2"));
+    assert_eq!(sm.position_ms(), 0);
+}
+

@@ -9,13 +9,17 @@ use alloc::boxed::Box;
 
 use squeezelite_audio_core::fade::{cross_sample, ChunkGain, FadeEngine, FadeStep};
 use squeezelite_audio_core::{
-    AudioOutputSink, AudioRingBuffer, Equalizer, GainStage, RingBufferError,
+    loudness_gains_db, preset_gains_db, AudioOutputSink, AudioRingBuffer, Equalizer, GainStage,
+    InterpolationMode, ResampleQuality, Resampler, RingBufferError,
 };
 use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
+
+use crate::amp::lms_gain_to_hardware_volume_percent;
 
 pub use squeezelite_audio_core::ChannelMode;
 pub use squeezelite_audio_core::EqPreset;
 pub use squeezelite_audio_core::FadeMode;
+pub use squeezelite_audio_core::ResampleQuality as PipelineResampleQuality;
 pub type ActiveCodec = ActiveDecoder;
 
 // Scratch sizing follows the codec set: the `std-codecs` decoders (FLAC
@@ -321,6 +325,15 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     /// First non-zero decode step time in microseconds since the current
     /// decoder was installed.
     pub decode_us_first: u32,
+    /// Per-band graphic equalizer gains in dB (`-12.0..=12.0`), combined with
+    /// the volume-indexed loudness contour in [`Self::retune_equalizer`].
+    pub eq_gains_db: [f32; 10],
+    /// LMS `loud` contour level (`0..=10`; `0` = disabled).
+    pub loudness_level: u8,
+    /// Active sample rate in Hz used to tune the 10-band RBJ equalizer.
+    pub active_sample_rate_hz: u32,
+    /// Optional polyphase FIR resampler stage between decoder output and EQ.
+    pub resampler: Option<Box<Resampler>>,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -355,6 +368,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             fade: FadeEngine::new(),
             decode_us_max: 0,
             decode_us_first: 0,
+            eq_gains_db: [0.0; 10],
+            loudness_level: 0,
+            active_sample_rate_hz: sample_rate,
+            resampler: None,
         }
     }
 
@@ -429,6 +446,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
             if frames_produced > 0 {
                 self.mark_track_start();
+                let frames_produced = self.resample_decoded_pcm(frames_produced);
                 let active_pcm = &mut self.pcm_scratch[..frames_produced * 2];
                 self.equalizer.process_interleaved(active_pcm);
 
@@ -499,6 +517,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             // output.c:154 switches). A rate change inside a track is ignored,
             // as in C (only `new_stream` reads the rate).
             self.mark_track_start();
+            let frames_produced = self.resample_decoded_pcm(frames_produced);
             // Equalizer preset and loudness contour, in place, exactly once before
             // buffering. The gain stage runs at output time (C parity:
             // output.c:54-57, output_i2s.c:510), so a volume change reaches
@@ -530,6 +549,37 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
 
         Ok(consumed)
+    }
+
+    /// Passes `frames_produced` stereo frames in `self.pcm_scratch` through the
+    /// optional polyphase [`Resampler`] stage before EQ and output buffering.
+    fn resample_decoded_pcm(&mut self, frames_produced: usize) -> usize {
+        let Some(resampler) = self.resampler.as_mut() else {
+            return frames_produced;
+        };
+        let in_samples = frames_produced * 2;
+        if in_samples == 0 {
+            return 0;
+        }
+        let to_hz = u64::from(resampler.to_hz());
+        let from_hz = u64::from(resampler.from_hz().max(1));
+        let est_frames = ((frames_produced as u64) * to_hz).div_ceil(from_hz) as usize + 8;
+        let max_out_samples = (est_frames * 2).min(PCM_SCRATCH_SAMPLES);
+        if max_out_samples <= 512 {
+            let mut stack_out = [0i32; 512];
+            let (_consumed, produced) = resampler.process(
+                &self.pcm_scratch[..in_samples],
+                &mut stack_out[..max_out_samples],
+            );
+            self.pcm_scratch[..produced].copy_from_slice(&stack_out[..produced]);
+            produced / 2
+        } else {
+            let mut heap_out = alloc::vec![0i32; max_out_samples];
+            let (_consumed, produced) =
+                resampler.process(&self.pcm_scratch[..in_samples], &mut heap_out);
+            self.pcm_scratch[..produced].copy_from_slice(&heap_out[..produced]);
+            produced / 2
+        }
     }
 
     /// Flushes output ringbuffer frames to the audio output sink (I2S DMA).
@@ -765,6 +815,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             && self.sink.set_sample_rate(marker.sample_rate).is_ok()
         {
             self.sample_rate = marker.sample_rate;
+            self.active_sample_rate_hz = marker.sample_rate;
+            self.retune_equalizer();
         }
         // C parity: output.c:157-159, a crossfade keeps the old track's gain for its
         // tail.
@@ -806,10 +858,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return;
         }
         self.boundary.new_stream = false;
-        let sample_rate = self
-            .decoder
-            .sample_rate()
-            .unwrap_or(self.boundary.stream_rate_hint);
+        let sample_rate = match self.resampler.as_ref() {
+            Some(resampler) => resampler.to_hz(),
+            None => self
+                .decoder
+                .sample_rate()
+                .unwrap_or(self.boundary.stream_rate_hint),
+        };
         self.boundary.next_sample_rate = sample_rate;
         let output_threshold_frames =
             (u64::from(self.boundary.output_threshold) * u64::from(sample_rate) / 10) as u32;
@@ -971,6 +1026,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// decoder stops).
     pub fn discard_decoder_backlog(&mut self) {
         self.decoder.flush();
+        if let Some(resampler) = self.resampler.as_mut() {
+            resampler.reset();
+        }
         self.pcm_pending_offset = 0;
         self.pcm_pending_samples = 0;
     }
@@ -1049,8 +1107,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Records the volume LMS asked for (C `set_volume`'s arguments: the `audg`
     /// gains, or unity when `digital_atten` is 0, slimproto.c:569),
     /// whatever attenuates it: the amplifier or [`Self::set_volume`].
+    ///
+    /// When Fletcher-Munson loudness compensation (`loudness_level > 0`) is
+    /// active, retunes the 10-band equalizer with the updated volume-indexed
+    /// loudness contour (C `equalizer_set_volume`, `output_embedded.c:126`).
     pub fn set_requested_volume(&mut self, left_gain: u32, right_gain: u32) {
+        let changed = self.requested_volume != (left_gain, right_gain);
         self.requested_volume = (left_gain, right_gain);
+        if changed && self.loudness_level > 0 {
+            self.retune_equalizer();
+        }
     }
 
     /// The volume LMS last asked for, Q16.16 per channel, independent of
@@ -1139,10 +1205,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         true
     }
 
-    /// Applies a 10-band biquad graphic equalizer preset to the audio pipeline.
+    /// Applies a 10-band biquad graphic equalizer preset to the audio pipeline,
+    /// synthesizing RBJ peaking biquads for the active sample rate.
     pub fn apply_eq_preset(&mut self, preset: EqPreset) {
         self.current_eq_preset = preset;
-        self.equalizer.apply_preset(preset);
+        self.equalizer.current_preset = preset;
+        self.eq_gains_db = preset_gains_db(preset);
+        self.retune_equalizer();
     }
 
     /// Sets the 10-band equalizer preset (alias for `apply_eq_preset`).
@@ -1156,6 +1225,42 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.current_eq_preset
     }
 
+    /// Updates the 10-band graphic equalizer gain vector (in dB, clamped to
+    /// `[-12.0, 12.0]`) and retunes the RBJ biquad filter bank for the active
+    /// sample rate (`eqlz` SlimProto command).
+    pub fn set_eq_gains_db(&mut self, gains_db: &[f32; 10]) {
+        let mut i = 0;
+        while i < 10 {
+            self.eq_gains_db[i] = gains_db[i].clamp(-12.0, 12.0);
+            i += 1;
+        }
+        self.retune_equalizer();
+    }
+
+    /// Returns the base 10-band graphic equalizer gain vector (in dB) before
+    /// loudness contour addition.
+    #[must_use]
+    pub const fn eq_gains_db(&self) -> &[f32; 10] {
+        &self.eq_gains_db
+    }
+
+    /// Sets the Fletcher-Munson loudness compensation level (`0..=10`, where
+    /// `0` disables loudness contour addition) and retunes the 10-band
+    /// equalizer (`loud` SlimProto command).
+    pub fn set_loudness_level(&mut self, level: u8) {
+        let clamped = level.min(10);
+        if self.loudness_level != clamped {
+            self.loudness_level = clamped;
+            self.retune_equalizer();
+        }
+    }
+
+    /// Returns the configured Fletcher-Munson loudness level (`0..=10`).
+    #[must_use]
+    pub const fn loudness_level(&self) -> u8 {
+        self.loudness_level
+    }
+
     /// Enables or disables Horner's polynomial loudness contour compensation.
     pub fn set_loudness(&mut self, enabled: bool) {
         self.equalizer.set_loudness_contour(enabled);
@@ -1164,7 +1269,67 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Returns whether the loudness contour is currently enabled.
     #[must_use]
     pub const fn loudness_enabled(&self) -> bool {
-        self.equalizer.loudness_enabled()
+        self.equalizer.loudness_enabled() || self.loudness_level > 0
+    }
+
+    /// Returns the effective sample rate (in Hz) used for RBJ equalizer synthesis.
+    #[must_use]
+    const fn effective_sample_rate_hz(&self) -> u32 {
+        if self.active_sample_rate_hz > 0 {
+            self.active_sample_rate_hz
+        } else if self.sample_rate > 0 {
+            self.sample_rate
+        } else {
+            44_100
+        }
+    }
+
+    /// Synthesizes and loads the 10-band RBJ biquad filter coefficients for
+    /// `eq_gains_db + loudness_gains` (clamped to `[-12.0, 12.0]`) at the
+    /// active output sample rate.
+    fn retune_equalizer(&mut self) {
+        let fs_hz = self.effective_sample_rate_hz() as f32;
+        let (left_q16, right_q16) = self.requested_volume;
+        let vol_pct = lms_gain_to_hardware_volume_percent(left_q16.max(right_q16));
+        let loud_gains = loudness_gains_db(vol_pct, self.loudness_level);
+        let mut effective = [0.0_f32; 10];
+        let mut i = 0;
+        while i < 10 {
+            effective[i] = (self.eq_gains_db[i] + loud_gains[i]).clamp(-12.0, 12.0);
+            i += 1;
+        }
+        self.equalizer.retune(&effective, fs_hz);
+    }
+
+    /// Configures or disengages the polyphase FIR resampler between the decoder
+    /// and the output ring.
+    ///
+    /// When `in_rate == out_rate`, `in_rate == 0`, or `out_rate == 0`, the
+    /// resampler is disengaged (`None`) and zero heap stays allocated.
+    pub fn configure_resampler(
+        &mut self,
+        in_rate: u32,
+        out_rate: u32,
+        quality: ResampleQuality,
+    ) -> bool {
+        if in_rate == 0 || out_rate == 0 || in_rate == out_rate {
+            self.resampler = None;
+            return false;
+        }
+        let resampler = Resampler::new(in_rate, out_rate, quality, InterpolationMode::LinearPhase);
+        self.resampler = Some(Box::new(resampler));
+        true
+    }
+
+    /// Disengages and drops any active polyphase FIR resampler.
+    pub fn clear_resampler(&mut self) {
+        self.resampler = None;
+    }
+
+    /// Returns `true` when the polyphase FIR resampler is currently engaged.
+    #[must_use]
+    pub const fn is_resampler_engaged(&self) -> bool {
+        self.resampler.is_some()
     }
 
     /// Dynamically selects and instantiates the audio decoder based on the LMS
@@ -1210,11 +1375,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// such as Bluetooth set it).
     pub fn set_sample_rate(&mut self, rate: u32) -> Result<(), S::Error> {
         self.sink.set_sample_rate(rate)?;
-        if self.sample_rate != rate {
-            self.equalizer.reset_history();
-        }
+        let prev_rate = self.effective_sample_rate_hz();
         self.sample_rate = rate;
+        self.active_sample_rate_hz = rate;
         self.boundary.stream_rate_hint = rate;
+        if prev_rate != rate {
+            self.retune_equalizer();
+        }
         Ok(())
     }
 
@@ -1243,6 +1410,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.stream_buffer.flush();
         self.output_buffer.flush();
         self.decoder.flush();
+        if let Some(resampler) = self.resampler.as_mut() {
+            resampler.reset();
+        }
         self.equalizer.reset_history();
         self.sink.set_mute(true);
         self.pcm_pending_offset = 0;
@@ -2889,5 +3059,66 @@ mod tests {
         assert!(matches!(p.decoder, ActiveDecoder::Opus(_)));
         p.select_format(b'f');
         assert!(matches!(p.decoder, ActiveDecoder::Flac(_)));
+    }
+
+    #[test]
+    fn test_runtime_eq_retunes_on_sample_rate_and_loudness_changes() {
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        let gains = [6.0_f32, 3.0, 0.0, -3.0, 0.0, 2.0, 4.0, 0.0, -2.0, 5.0];
+        p.set_eq_gains_db(&gains);
+        assert!(p.equalizer.is_enabled());
+        let b1_44k1 = p.equalizer.filters()[5].b1;
+
+        p.set_sample_rate(96_000).unwrap();
+        let b1_96k = p.equalizer.filters()[5].b1;
+        assert!(
+            (b1_96k - b1_44k1).abs() > 1e-4,
+            "1 kHz band b1 must retune when sample rate changes from 44.1 kHz to 96 kHz"
+        );
+
+        // Enable Fletcher-Munson loudness level 8 and drop volume from 100% to ~55%.
+        p.set_eq_gains_db(&[0.0; 10]);
+        assert!(!p.equalizer.is_enabled());
+        p.set_loudness_level(8);
+        assert_eq!(p.loudness_level(), 8);
+        // At unity volume (100%), loudness contour adds 0 dB.
+        assert_eq!(p.equalizer.gains_db()[0], 0.0);
+
+        // Lower requested volume to Q16 1842 (~55% perceptual volume):
+        // low-frequency contour boost must be folded into band 0.
+        p.set_requested_volume(1842, 1842);
+        assert!(
+            p.equalizer.gains_db()[0] > 1.0,
+            "band 0 gain should include Fletcher-Munson boost at reduced volume, got {}",
+            p.equalizer.gains_db()[0]
+        );
+        assert!(p.equalizer.is_enabled());
+    }
+
+    #[test]
+    fn test_pipeline_resampler_stage_downsamples_96k_to_48k() {
+        let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.set_sample_rate(48_000).unwrap();
+        assert!(!p.is_resampler_engaged());
+
+        assert!(p.configure_resampler(96_000, 48_000, ResampleQuality::Low));
+        assert!(p.is_resampler_engaged());
+
+        p.begin_stream(96_000, 0, 0);
+        p.open_stream();
+        // Feed 200 stereo frames at 96 kHz -> resampler emits ~100 at 48 kHz.
+        feed(&mut p, &track_pcm(1, 200));
+        assert_eq!(p.track_marker().map(|m| m.sample_rate), Some(48_000));
+        let out_frames = p.output_buffer_available() / OUTPUT_FRAME_BYTES;
+        assert!(
+            (80..=110).contains(&out_frames),
+            "expected ~100 downsampled frames in output ring, got {out_frames}"
+        );
+
+        p.clear_resampler();
+        assert!(!p.is_resampler_engaged());
     }
 }
