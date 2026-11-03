@@ -221,11 +221,10 @@ impl<'a> RtspRequest<'a> {
 
         let cseq_val = cseq.ok_or(RtspError::MissingCSeq)?;
 
-        let body_slice = if body.len() >= content_length {
-            &body[..content_length]
-        } else {
-            body
-        };
+        if body.len() < content_length {
+            return Err(RtspError::InvalidContentLength);
+        }
+        let body_slice = &body[..content_length];
 
         Ok(Self {
             method,
@@ -270,11 +269,12 @@ impl SdpSession {
             } else if let Some(rest) = trimmed.strip_prefix("a=aesiv:") {
                 let decoded =
                     base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
-                if decoded.len() == 16 {
-                    let mut iv = [0u8; 16];
-                    iv.copy_from_slice(&decoded);
-                    session.aesiv = Some(iv);
+                if decoded.len() != 16 {
+                    return Err(RtspError::MalformedSdp);
                 }
+                let mut iv = [0u8; 16];
+                iv.copy_from_slice(&decoded);
+                session.aesiv = Some(iv);
             } else if let Some(rest) = trimmed.strip_prefix("a=fmtp:") {
                 session.fmtp = Some(rest.trim().to_string());
             } else if let Some(rest) = trimmed.strip_prefix("a=rtpmap:") {
@@ -677,8 +677,9 @@ impl RtspServer {
             req.content_type.and_then(ArtworkMimeType::from_content_type)
         {
             let rtp_ts = req.rtp_info.and_then(|info| parse_rtp_info(info).1);
+            let copy_len = core::cmp::min(req.body.len(), 65_536);
             self.artwork =
-                Some(CoverArtwork::new(mime, req.body.to_vec(), rtp_ts));
+                Some(CoverArtwork::new(mime, req.body[..copy_len].to_vec(), rtp_ts));
             return Ok(());
         }
 
@@ -753,6 +754,9 @@ impl RtspServer {
                 ))
             }
             RtspMethod::Record => {
+                if self.state == ServerState::Announced {
+                    return Err(RtspError::InvalidSessionState);
+                }
                 if let Some(info) = req.rtp_info {
                     let (seq, rtptime) = parse_rtp_info(info);
                     if seq.is_some() {
@@ -795,6 +799,7 @@ impl RtspServer {
                 self.last_flush_rtptime = None;
                 Ok(RtspResponse::teardown(req.cseq))
             }
+            RtspMethod::Unknown => Err(RtspError::UnknownMethod),
             _ => Ok(RtspResponse::ok(req.cseq)),
         }
     }

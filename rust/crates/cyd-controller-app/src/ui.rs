@@ -263,6 +263,7 @@ pub struct NowPlayingUi {
     pub has_sent_first_vol: bool,
     pub dirty_flags: u8,
     pub cached_state: CydTelemetryState,
+    pub mirrored_y_panel: bool,
 }
 
 impl Default for NowPlayingUi {
@@ -282,6 +283,7 @@ impl Default for NowPlayingUi {
             has_sent_first_vol: false,
             dirty_flags: 0,
             cached_state: CydTelemetryState::default(),
+            mirrored_y_panel: false,
         };
         let _ = ui.mode_label.push_str("[STANDBY]");
         let _ = ui.ip_label.push_str("---.---.---.---");
@@ -359,6 +361,11 @@ impl NowPlayingUi {
     /// Clear all dirty region bitflags.
     pub fn clear_dirty(&mut self) {
         self.dirty_flags = 0;
+    }
+
+    /// Configure mirrored-Y panel revision mode.
+    pub fn set_mirrored_y_panel(&mut self, mirrored: bool) {
+        self.mirrored_y_panel = mirrored;
     }
 
     /// Check whether the link is currently offline.
@@ -609,7 +616,11 @@ impl NowPlayingUi {
         now_ms: u32,
         link: &mut CydDisplayLink,
     ) -> Option<Vec<u8, 64>> {
-        let effective_y = if (9..=58).contains(&y) { 239 - y } else { y };
+        let effective_y = if self.mirrored_y_panel || (9..=58).contains(&y) {
+            239 - y
+        } else {
+            y
+        };
         if (12..=56).contains(&x) && (184..=228).contains(&effective_y) {
             if released {
                 self.click_button(UiButtonId::Prev, link).ok()
@@ -704,13 +715,13 @@ impl NowPlayingUi {
             true,
         );
 
-        // Track Title (x: 98..312, y: 44..64): 2x if len <= 13, else 1x
+        // Track Title (x: 98..312, y: 44..64): 2x if chars <= 13, else 1x
         let (title_text, title_color) = if !self.cached_state.link_active {
             ("UART LINK LOST", UI_COLOR_OFFLINE_565)
         } else {
             (self.title_label(), UI_COLOR_TEXT_PRIMARY_565)
         };
-        let title_scale = if title_text.len() <= 13 { 2 } else { 1 };
+        let title_scale = if title_text.chars().count() <= 13 { 2 } else { 1 };
         draw_text_box(
             display,
             98,
@@ -739,6 +750,10 @@ impl NowPlayingUi {
         );
 
         // Audio Status Pill (x: 98..312, y: 98..112)
+        self.render_audio_status_pill(display);
+    }
+
+    fn render_audio_status_pill<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
         let status_text = if self.play_pause_icon.as_str() == "PAUSE" {
             "STATUS: PLAYING"
         } else {
@@ -799,6 +814,9 @@ impl NowPlayingUi {
     }
 
     fn render_transport_buttons<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
+        // Also ensure on-screen audio status pill updates on Play/Pause transitions
+        self.render_audio_status_pill(display);
+
         // Prev Button (x: 12..56, y: 184..228)
         draw_text_box(
             display,
@@ -1058,6 +1076,23 @@ mod tests {
         // PERF-602: DIRTY_TRANSPORT must be set, but DIRTY_TRACK must not be
         assert_eq!(ui.dirty_flags() & DIRTY_TRANSPORT, DIRTY_TRANSPORT);
         assert_eq!(ui.dirty_flags() & DIRTY_TRACK, 0);
+    }
+
+    #[test]
+    fn test_ui_title_scale_utf8_char_count() {
+        // "Café de Paris" has 13 Unicode chars but 14 UTF-8 bytes (é is 2 bytes).
+        // chars().count() <= 13 yields scale 2 (len() <= 13 would have yielded 1).
+        let title = "Café de Paris";
+        assert_eq!(title.chars().count(), 13);
+        assert_eq!(title.len(), 14);
+        let scale = if title.chars().count() <= 13 { 2 } else { 1 };
+        assert_eq!(scale, 2);
+
+        // 14 characters yields scale 1
+        let title14 = "Café de Paris!";
+        assert_eq!(title14.chars().count(), 14);
+        let scale14 = if title14.chars().count() <= 13 { 2 } else { 1 };
+        assert_eq!(scale14, 1);
     }
 
     #[test]

@@ -347,6 +347,15 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     /// Whether pre-buffer cushion threshold has been satisfied for the current
     /// stream.
     pub threshold_satisfied: bool,
+    /// Pending resampled and equalized samples waiting for output buffer space.
+    pub resample_tail: [i32; 256],
+    /// Read offset in `resample_tail`.
+    pub resample_tail_offset: usize,
+    /// Number of valid pending resampled samples in `resample_tail`.
+    pub resample_tail_samples: usize,
+    /// Number of unconsumed raw input samples staged in `pcm_scratch` awaiting
+    /// resampling after output backpressure.
+    pub resample_input_pending: usize,
 }
 
 impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
@@ -387,6 +396,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             resampler: None,
             output_threshold_frames: 0,
             threshold_satisfied: true,
+            resample_tail: [0i32; 256],
+            resample_tail_offset: 0,
+            resample_tail_samples: 0,
+            resample_input_pending: 0,
         }
     }
 
@@ -462,6 +475,38 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             if self.pcm_pending_samples == 0 {
                 self.pcm_pending_offset = 0;
             }
+            return Ok(frames_written);
+        }
+
+        // Drain pending resampled tail frames before accepting new decoder frames
+        if self.resample_tail_samples > 0 {
+            let avail_frames = self.output_buffer.available_write() / 8;
+            if avail_frames == 0 {
+                return Ok(0);
+            }
+            let pending_frames = self.resample_tail_samples / 2;
+            let frames_to_write = pending_frames.min(avail_frames);
+            let samples_to_write = frames_to_write * 2;
+            let slice = &self.resample_tail
+                [self.resample_tail_offset..self.resample_tail_offset + samples_to_write];
+            let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
+            let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+            let frames_written = written / 8;
+            let samples_written = frames_written * 2;
+            self.resample_tail_offset += samples_written;
+            self.resample_tail_samples -= samples_written;
+            if self.resample_tail_samples == 0 {
+                self.resample_tail_offset = 0;
+            }
+            return Ok(frames_written);
+        }
+
+        // Process any unconsumed raw input frames held back during
+        // resampler backpressure
+        if self.resample_input_pending > 0 {
+            let frames = self.resample_input_pending / 2;
+            self.resample_input_pending = 0;
+            let frames_written = self.commit_decoded_pcm(frames);
             return Ok(frames_written);
         }
 
@@ -595,11 +640,40 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// drops during polyphase upsampling without in-place collision (`PIPE-201`).
     fn commit_decoded_pcm(&mut self, frames_produced: usize) -> usize {
         if let Some(resampler) = self.resampler.as_mut() {
+            let mut total_frames_written = 0;
+            if self.resample_tail_samples > 0 {
+                let avail_frames = self.output_buffer.available_write() / 8;
+                let pending_frames = self.resample_tail_samples / 2;
+                let frames_to_write = pending_frames.min(avail_frames);
+                let samples_to_write = frames_to_write * 2;
+                let frames_written = if frames_to_write > 0 {
+                    let pcm_bytes: &[u8] = bytemuck::cast_slice(
+                        &self.resample_tail[self.resample_tail_offset
+                            ..self.resample_tail_offset + samples_to_write],
+                    );
+                    debug_assert_eq!(pcm_bytes.len() % 8, 0);
+                    let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                    written / 8
+                } else {
+                    0
+                };
+                total_frames_written += frames_written;
+                let samples_written = frames_written * 2;
+                self.resample_tail_offset += samples_written;
+                self.resample_tail_samples -= samples_written;
+                if self.resample_tail_samples == 0 {
+                    self.resample_tail_offset = 0;
+                } else {
+                    // Output buffer remains constrained; preserve input frames
+                    self.resample_input_pending = frames_produced * 2;
+                    return total_frames_written;
+                }
+            }
+
             let in_samples = frames_produced * 2;
             let mut in_pos = 0;
             let in_end = in_samples;
             let mut chunk_out = [0i32; 256];
-            let mut total_frames_written = 0;
 
             while in_pos < in_end {
                 let (consumed, produced) = resampler.process(
@@ -622,12 +696,18 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                         0
                     };
                     total_frames_written += frames_written;
-                    if samples_to_write < produced {
-                        let rem = produced - samples_to_write;
-                        self.pcm_scratch[..rem]
-                            .copy_from_slice(&chunk_out[samples_to_write..produced]);
-                        self.pcm_pending_offset = 0;
-                        self.pcm_pending_samples = rem;
+                    let samples_written = frames_written * 2;
+                    if samples_written < produced {
+                        let rem = produced - samples_written;
+                        self.resample_tail[..rem]
+                            .copy_from_slice(&chunk_out[samples_written..produced]);
+                        self.resample_tail_offset = 0;
+                        self.resample_tail_samples = rem;
+                        if in_pos < in_end {
+                            let unconsumed = in_end - in_pos;
+                            self.pcm_scratch.copy_within(in_pos..in_end, 0);
+                            self.resample_input_pending = unconsumed;
+                        }
                         break;
                     }
                 }
@@ -1132,6 +1212,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
         self.pcm_pending_offset = 0;
         self.pcm_pending_samples = 0;
+        self.resample_tail_offset = 0;
+        self.resample_tail_samples = 0;
+        self.resample_input_pending = 0;
     }
 
     /// `strm f` (C `output_flush_streaming`, output.c:461-470): drops
@@ -1419,14 +1502,26 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             self.resampler = None;
             return false;
         }
-        let resampler = Resampler::new(in_rate, out_rate, quality, InterpolationMode::LinearPhase);
+        if let Some(ref mut r) = self.resampler {
+            if r.quality() == quality {
+                r.reconfigure(in_rate, out_rate);
+                return true;
+            }
+        }
+        let resampler = Resampler::new(
+            in_rate,
+            out_rate,
+            quality,
+            InterpolationMode::LinearPhase,
+        );
         self.resampler = Some(Box::new(resampler));
         true
     }
 
     /// Drains the FIR group-delay tail of the active polyphase resampler into
     /// the output buffer so the final audio frames are not abruptly truncated
-    /// on EOF (LOGIC-207).
+    /// on EOF (LOGIC-207). If output ringbuffer has insufficient space,
+    /// unwritten tail frames are staged into `pcm_scratch` as pending PCM.
     pub fn flush_resampler_tail(&mut self) {
         let Some(resampler) = self.resampler.as_mut() else {
             return;
@@ -1438,9 +1533,38 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 break;
             }
             self.equalizer.process_interleaved(&mut tail_buf[..produced]);
-            let pcm_bytes: &[u8] = bytemuck::cast_slice(&tail_buf[..produced]);
-            let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
-            if written < pcm_bytes.len() {
+            let avail_frames = self.output_buffer.available_write() / 8;
+            let frames_to_write = (produced / 2).min(avail_frames);
+            let samples_to_write = frames_to_write * 2;
+            let frames_written = if frames_to_write > 0 {
+                let pcm_bytes: &[u8] = bytemuck::cast_slice(&tail_buf[..samples_to_write]);
+                debug_assert_eq!(pcm_bytes.len() % 8, 0);
+                let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                written / 8
+            } else {
+                0
+            };
+            let samples_written = frames_written * 2;
+            if samples_written < produced {
+                let rem = produced - samples_written;
+                let dest = if self.pcm_pending_samples == 0 {
+                    self.pcm_pending_offset = 0;
+                    0
+                } else if self.pcm_pending_offset > 0 {
+                    self.pcm_scratch.copy_within(
+                        self.pcm_pending_offset
+                            ..self.pcm_pending_offset + self.pcm_pending_samples,
+                        0,
+                    );
+                    self.pcm_pending_offset = 0;
+                    self.pcm_pending_samples
+                } else {
+                    self.pcm_pending_samples
+                };
+                let to_copy = rem.min(PCM_SCRATCH_SAMPLES.saturating_sub(dest));
+                self.pcm_scratch[dest..dest + to_copy]
+                    .copy_from_slice(&tail_buf[samples_written..samples_written + to_copy]);
+                self.pcm_pending_samples += to_copy;
                 break;
             }
         }
@@ -1525,7 +1649,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// Returns `true` if decoded PCM samples are still waiting to be drained
     /// into `output_buffer` (`COORD-504`).
     pub fn has_pending_pcm(&self) -> bool {
-        self.pcm_pending_samples > 0 || self.decoder.has_pending_pcm()
+        self.pcm_pending_samples > 0
+            || self.resample_tail_samples > 0
+            || self.resample_input_pending > 0
+            || self.decoder.has_pending_pcm()
     }
 
     /// Flushes both stream and output ringbuffers, clears pending PCM, and
@@ -1544,6 +1671,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.sink.set_mute(true);
         self.pcm_pending_offset = 0;
         self.pcm_pending_samples = 0;
+        self.resample_tail_offset = 0;
+        self.resample_tail_samples = 0;
+        self.resample_input_pending = 0;
         self.boundary.marker = None;
         self.boundary.crossed = None;
         self.boundary.silence_frames = 0;
@@ -3316,5 +3446,122 @@ mod tests {
         // in_rate == out_rate == 48000.
         assert_eq!(p.active_sample_rate_hz, 48_000);
         assert!(!p.is_resampler_engaged());
+    }
+
+    #[test]
+    fn test_pipeline_configure_resampler_inplace_reconfiguration() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 32768]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        // First configuration allocates resampler
+        assert!(p.configure_resampler(44_100, 96_000, ResampleQuality::Low));
+        assert!(p.is_resampler_engaged());
+        let resampler_ref = p.resampler.as_ref().expect("resampler must exist");
+        assert_eq!(resampler_ref.from_hz(), 44_100);
+        assert_eq!(resampler_ref.to_hz(), 96_000);
+        let ptr_before: *const _ = &**resampler_ref;
+
+        // Reconfigure with same quality modifies in-place without new Box allocation
+        assert!(p.configure_resampler(48_000, 96_000, ResampleQuality::Low));
+        let resampler_after = p.resampler.as_ref().expect("resampler must exist");
+        let ptr_after: *const _ = &**resampler_after;
+        assert_eq!(ptr_before, ptr_after);
+        assert_eq!(resampler_after.from_hz(), 48_000);
+        assert_eq!(resampler_after.to_hz(), 96_000);
+        assert_eq!(resampler_after.quality(), ResampleQuality::Low);
+
+        // Quality change replaces allocation
+        assert!(p.configure_resampler(48_000, 96_000, ResampleQuality::Medium));
+        assert_eq!(
+            p.resampler.as_ref().expect("resampler").quality(),
+            ResampleQuality::Medium
+        );
+    }
+
+    #[test]
+    fn test_pipeline_commit_decoded_pcm_partial_backpressure_with_resampling() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 1024]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        assert!(p.configure_resampler(44_100, 96_000, ResampleQuality::Low));
+
+        // Fill pcm_scratch with 600 stereo frames (1200 samples)
+        for i in 0..1200 {
+            p.pcm_scratch[i] = ((i as i32) + 1) * 100;
+        }
+
+        // Pre-fill output buffer so only 16 stereo frames (128 bytes) can fit
+        let avail_bytes = p.output_buffer.available_write();
+        let fill_bytes = avail_bytes.saturating_sub(128);
+        let dummy = [0u8; 128];
+        let mut written_total = 0;
+        while written_total < fill_bytes {
+            let chunk = (fill_bytes - written_total).min(dummy.len());
+            let w = p.output_buffer.write(&dummy[..chunk]).unwrap_or(0);
+            if w == 0 {
+                break;
+            }
+            written_total += w;
+        }
+
+        // Commit 600 frames under heavy backpressure
+        let written_frames = p.commit_decoded_pcm(600);
+        assert!(written_frames <= 16);
+        assert!(p.has_pending_pcm());
+        assert!(p.resample_tail_samples > 0 || p.resample_input_pending > 0);
+
+        // Read out all bytes from output buffer to relieve backpressure
+        let mut drain_buf = [0u8; 1024];
+        let avail = p.output_buffer.available_read();
+        assert_eq!(p.output_buffer.read(&mut drain_buf[..avail]), Ok(avail));
+
+        // Process decode steps until all pending resampled/input frames drain
+        while p.has_pending_pcm() {
+            let avail = p.output_buffer.available_read();
+            if avail > 0 {
+                let to_read = avail.min(drain_buf.len());
+                let _ = p.output_buffer.read(&mut drain_buf[..to_read]);
+            }
+            let res = p.process_decode_step().expect("pending drain must succeed");
+            assert!(res > 0);
+        }
+        assert!(!p.has_pending_pcm());
+        assert_eq!(p.resample_tail_samples, 0);
+        assert_eq!(p.resample_input_pending, 0);
+    }
+
+    #[test]
+    fn test_pipeline_flush_resampler_tail_backpressure_staging() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 512]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        assert!(p.configure_resampler(44_100, 48_000, ResampleQuality::Low));
+
+        // Feed some frames through resampler so FIR history is populated
+        for i in 0..200 {
+            p.pcm_scratch[i] = 10_000;
+        }
+        p.commit_decoded_pcm(100);
+
+        // Fill output buffer so almost no space remains
+        let avail = p.output_buffer.available_write();
+        let fill = avail.saturating_sub(16);
+        let dummy = [0u8; 64];
+        let mut w = 0;
+        while w < fill {
+            let c = (fill - w).min(dummy.len());
+            let nw = p.output_buffer.write(&dummy[..c]).unwrap_or(0);
+            if nw == 0 {
+                break;
+            }
+            w += nw;
+        }
+
+        // Flush resampler tail under backpressure
+        p.flush_resampler_tail();
+
+        // Staged remainder must be present in pcm_scratch as pending PCM
+        assert!(p.pcm_pending_samples > 0);
+        assert!(p.has_pending_pcm());
     }
 }

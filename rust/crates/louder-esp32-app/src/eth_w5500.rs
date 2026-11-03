@@ -400,10 +400,17 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.read_socket0_ring_block(rx_rd, BSB_S0_RX_BUF, &mut len_hdr)?;
         let packet_size = u16::from_be_bytes(len_hdr);
         if packet_size < 2 || packet_size > rsr {
+            let advance = if packet_size >= 2 { packet_size } else { 2 };
+            let new_rx_rd = rx_rd.wrapping_add(advance);
+            self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
+            self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
             return Err(W5500Error::InvalidRxHeader(packet_size));
         }
         let frame_len = usize::from(packet_size - 2);
         if frame_len > out_frame.len() {
+            let new_rx_rd = rx_rd.wrapping_add(packet_size);
+            self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
+            self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
             return Err(W5500Error::BufferTooSmall {
                 required: frame_len,
                 capacity: out_frame.len(),
@@ -440,6 +447,93 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.write_u16_be(S0_TX_WR, BSB_S0_REG, new_tx_wr)?;
         self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_SEND)?;
         Ok(frame.len())
+    }
+
+    /// Receives a UDP or raw frame, un-wedging the RX ring buffer even on errors.
+    pub fn recv_udp_frame(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<usize, W5500Error<SPI::Error>> {
+        self.read_frame(buf)
+    }
+
+    /// Alias for [`Self::init_macraw`] initializing hardware and Socket 0.
+    pub fn init(&mut self) -> Result<(), W5500Error<SPI::Error>> {
+        self.init_macraw()
+    }
+
+    /// Executes a Socket command by writing to `S0_CR` and polling until cleared
+    /// to 0x00 (bounded to 16 iterations).
+    pub fn exec_socket_cmd(
+        &mut self,
+        block_select: u8,
+        cmd: u8,
+    ) -> Result<(), W5500Error<SPI::Error>> {
+        self.write_u8(S0_CR, block_select, cmd)?;
+        for _ in 0..16 {
+            let cr = self.read_u8(S0_CR, block_select)?;
+            if cr == 0x00 {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Polls physical link and manages state transitions. When recovering from
+    /// [`W5500LinkState::LinkDown`] to [`W5500LinkState::LinkUp`], transitions
+    /// to [`W5500LinkState::Init`] and re-initializes hardware before entering
+    /// [`W5500LinkState::DhcpDiscover`].
+    pub fn poll_link(
+        &mut self,
+        current: W5500LinkState,
+    ) -> Result<W5500LinkState, W5500Error<SPI::Error>> {
+        let phy = self.phy_status()?;
+        if !phy.link_up {
+            return Ok(W5500LinkState::LinkDown);
+        }
+        match current {
+            W5500LinkState::LinkDown | W5500LinkState::Init => {
+                self.init()?;
+                Ok(W5500LinkState::DhcpDiscover)
+            }
+            W5500LinkState::LinkUp => Ok(W5500LinkState::DhcpDiscover),
+            other => Ok(other),
+        }
+    }
+}
+
+/// Link state machine for W5500 Ethernet interface.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum W5500LinkState {
+    /// Interface is uninitialized or in reset.
+    Init,
+    /// Physical Ethernet cable is disconnected.
+    LinkDown,
+    /// Physical link is up.
+    LinkUp,
+    /// DHCP discover / IP lease acquisition in progress.
+    DhcpDiscover,
+    /// Link and IP address are fully configured.
+    Configured,
+}
+
+/// Helper wrapper representing an active W5500 socket.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct W5500Socket<'a, SPI> {
+    driver: &'a mut W5500Driver<SPI>,
+}
+
+impl<'a, SPI: SpiDevice> W5500Socket<'a, SPI> {
+    /// Wraps a [`W5500Driver`] reference.
+    pub fn new(driver: &'a mut W5500Driver<SPI>) -> Self {
+        Self { driver }
+    }
+
+    /// Receives a frame from Socket 0, advancing RX pointers even on error.
+    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, W5500Error<SPI::Error>> {
+        self.driver.recv_udp_frame(buf)
     }
 }
 

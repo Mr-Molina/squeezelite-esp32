@@ -737,14 +737,23 @@ fn l3_huffman(
         << (bs.pos & 7);
 
     while big_val_cnt > 0 {
+        if ireg >= gr_info.table_select.len() || ireg >= gr_info.region_count.len() {
+            break;
+        }
         let tab_num = gr_info.table_select[ireg] as usize;
         let mut sfb_cnt = i32::from(gr_info.region_count[ireg]);
         ireg += 1;
         let codebook = &L3_HUFFMAN_TABS[L3_HUFFMAN_TABINDEX[tab_num] as usize..];
         let linbits = i32::from(L3_HUFFMAN_G_LINBITS[tab_num]);
         loop {
+            if sfb >= sfbtab.len() || scf_idx >= scf.len() {
+                break;
+            }
             let np = i32::from(sfbtab[sfb]) / 2;
             sfb += 1;
+            if np <= 0 {
+                break;
+            }
             let pairs_to_decode = big_val_cnt.min(np) as usize;
             one = scf[scf_idx];
             scf_idx += 1;
@@ -785,6 +794,9 @@ fn l3_huffman(
         for half in 0..2 {
             np -= 1;
             if np == 0 {
+                if sfb >= sfbtab.len() || scf_idx >= scf.len() {
+                    break 'count1;
+                }
                 np = i32::from(sfbtab[sfb]) / 2;
                 sfb += 1;
                 if np == 0 {
@@ -1562,6 +1574,12 @@ pub fn mp3dec_decode_frame<S: Sample>(
         return hdr.frame_samples() as usize;
     };
 
+    let required_samples = hdr.frame_samples() as usize * (info.channels as usize);
+    if pcm.len() < required_samples {
+        info.status = Status::Corrupt;
+        return 0;
+    }
+
     let frame = mp3.get(i + HDR_SIZE..i + frame_size).unwrap_or(&[]);
     let mut bs_frame = Bs::new(frame, frame_size as i32 - HDR_SIZE as i32);
     if hdr.is_crc() {
@@ -1620,4 +1638,39 @@ pub fn mp3dec_decode_frame<S: Sample>(
     l3_save_reservoir(dec, &bs);
     info.status = if success { Status::Decoded } else { Status::ReservoirUnavailable };
     success as usize * Header(dec.header).frame_samples() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mp3dec_decode_frame_small_pcm_buffer() {
+        let mut dec = Mp3Dec::new();
+        let mut info = FrameInfo::default();
+        let test_mp3 = include_bytes!("tests/The Washington Post.mp3");
+        let mut tiny_pcm = [0i16; 10];
+        let samples = mp3dec_decode_frame(
+            &mut dec,
+            test_mp3,
+            Some(&mut tiny_pcm),
+            &mut info,
+            false,
+        );
+        assert_eq!(samples, 0);
+        assert_eq!(info.status, Status::Corrupt);
+    }
+
+    #[test]
+    fn test_l3_huffman_bounds_guard() {
+        let mut dst = [0.0f32; 576];
+        let scf = [1.0f32; 40];
+        let dummy_data = [0u8; 64];
+        let mut bs = Bs::new(&dummy_data, 64);
+        let mut gr_info = GrInfo::default();
+        gr_info.big_values = 100;
+        gr_info.region_count = [10, 10, 10];
+        // Must not panic on out-of-bounds indexing or zero-width sfb
+        l3_huffman(&mut dst, &mut bs, &gr_info, &scf, 500);
+    }
 }

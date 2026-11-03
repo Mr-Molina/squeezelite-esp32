@@ -20,12 +20,16 @@ extern crate alloc;
 #[cfg(feature = "std")]
 use std::boxed::Box;
 #[cfg(feature = "std")]
+use std::collections::VecDeque;
+#[cfg(feature = "std")]
 use std::vec;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::boxed::Box;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::collections::VecDeque;
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::vec;
 #[cfg(all(feature = "alloc", not(feature = "std")))]
@@ -37,6 +41,9 @@ use core::fmt;
 /// Maximum stream buffer size for compressed audio decoders (FLAC, Vorbis)
 /// (PERF-201).
 pub const MAX_STREAM_BUF: usize = 65536;
+
+/// Maximum queued audio packets in Vorbis and Opus decoders (AUD12-PERF-001).
+pub const MAX_PACKET_QUEUE: usize = 64;
 
 /// Maximum block samples supported by FLAC decoder (RFC 9639 standard CD-DA).
 pub const MAX_FLAC_BLOCK_SAMPLES: usize = 4608;
@@ -2344,6 +2351,12 @@ impl AudioDecoder for FlacDecoder {
             }
             let b0 = self.stream_buf[self.header_len];
             let is_last = (b0 & 0x80) != 0;
+            let block_type = b0 & 0x7F;
+            // Allow secondary metadata blocks (1..=6) to be skipped cleanly
+            // (AUD12-LOGIC-004)
+            if block_type == 0 || block_type > 6 {
+                return Err(DecoderError::InvalidHeader);
+            }
             let block_len = ((self.stream_buf[self.header_len + 1] as usize) << 16)
                 | ((self.stream_buf[self.header_len + 2] as usize) << 8)
                 | (self.stream_buf[self.header_len + 3] as usize);
@@ -2610,6 +2623,16 @@ fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> 
     }
     if audio_object_type > 5 {
         return Err(DecoderError::UnsupportedFeature);
+    }
+    if audio_object_type == 5 {
+        let ext_freq_idx = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)?;
+        if ext_freq_idx == 0x0F {
+            let _ = reader.read_bits(24).ok_or(DecoderError::InvalidHeader)?;
+        }
+        let base_aot = reader.read_bits(5).ok_or(DecoderError::InvalidHeader)?;
+        if base_aot == 0 || base_aot > 4 {
+            return Err(DecoderError::UnsupportedFeature);
+        }
     }
     let freq_idx = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)?;
     let (sample_rate, sampling_frequency_index) = if freq_idx == 0x0F {
@@ -2920,7 +2943,7 @@ impl AacDecoder {
             let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
             demux.stream_buf.drain(..to_skip);
             demux.bytes_to_skip -= to_skip;
-            demux.file_pos += to_skip;
+            demux.file_pos = demux.file_pos.saturating_add(to_skip);
             if demux.bytes_to_skip > 0 {
                 if frames_out == 0 && input_taken == 0 {
                     return Err(DecoderError::NeedMoreData);
@@ -2934,7 +2957,7 @@ impl AacDecoder {
                 let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
                 demux.stream_buf.drain(..to_skip);
                 demux.bytes_to_skip -= to_skip;
-                demux.file_pos += to_skip;
+                demux.file_pos = demux.file_pos.saturating_add(to_skip);
                 if demux.bytes_to_skip > 0 {
                     break;
                 }
@@ -2961,14 +2984,14 @@ impl AacDecoder {
             match &fourcc {
                 b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"wave" => {
                     demux.stream_buf.drain(..8);
-                    demux.file_pos += 8;
+                    demux.file_pos = demux.file_pos.saturating_add(8);
                 }
                 b"stsd" => {
                     if demux.stream_buf.len() < 16 {
                         break;
                     }
                     demux.stream_buf.drain(..16);
-                    demux.file_pos += 16;
+                    demux.file_pos = demux.file_pos.saturating_add(16);
                 }
                 b"mp4a" => {
                     if len < 36 {
@@ -2990,7 +3013,7 @@ impl AacDecoder {
                         break;
                     }
                     demux.stream_buf.drain(..hdr_size);
-                    demux.file_pos += hdr_size;
+                    demux.file_pos = demux.file_pos.saturating_add(hdr_size);
                 }
                 b"esds" => {
                     if len < 14 {
@@ -3004,7 +3027,7 @@ impl AacDecoder {
                     self.channels = asc.channel_configuration as u32;
                     demux.asc = Some(asc);
                     demux.stream_buf.drain(..len);
-                    demux.file_pos += len;
+                    demux.file_pos = demux.file_pos.saturating_add(len);
                 }
                 b"stsz" => {
                     if len < 20 {
@@ -3048,7 +3071,7 @@ impl AacDecoder {
                         demux.sample_sizes = vec![default_sz; count];
                     }
                     demux.stream_buf.drain(..len);
-                    demux.file_pos += len;
+                    demux.file_pos = demux.file_pos.saturating_add(len);
                 }
                 b"stsc" => {
                     if len < 16 {
@@ -3091,7 +3114,7 @@ impl AacDecoder {
                         });
                     }
                     demux.stream_buf.drain(..len);
-                    demux.file_pos += len;
+                    demux.file_pos = demux.file_pos.saturating_add(len);
                 }
                 b"stco" => {
                     if len < 16 {
@@ -3125,7 +3148,7 @@ impl AacDecoder {
                         demux.chunk_offsets.push(chunk_off);
                     }
                     demux.stream_buf.drain(..len);
-                    demux.file_pos += len;
+                    demux.file_pos = demux.file_pos.saturating_add(len);
                 }
                 b"co64" => {
                     if len < 16 {
@@ -3163,7 +3186,7 @@ impl AacDecoder {
                         demux.chunk_offsets.push(chunk_off);
                     }
                     demux.stream_buf.drain(..len);
-                    demux.file_pos += len;
+                    demux.file_pos = demux.file_pos.saturating_add(len);
                 }
                 b"mdat" => {
                     if demux.asc.is_none() || demux.sample_sizes.is_empty() {
@@ -3174,15 +3197,15 @@ impl AacDecoder {
                         break;
                     }
                     demux.stream_buf.drain(..header_len);
-                    demux.file_pos += header_len;
+                    demux.file_pos = demux.file_pos.saturating_add(header_len);
                     if let Some(&first_off) = demux.chunk_offsets.first() {
                         if first_off > demux.file_pos {
-                            demux.bytes_to_skip = first_off - demux.file_pos;
+                            demux.bytes_to_skip = first_off.saturating_sub(demux.file_pos);
                             let to_skip =
                                 core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
                             demux.stream_buf.drain(..to_skip);
                             demux.bytes_to_skip -= to_skip;
-                            demux.file_pos += to_skip;
+                            demux.file_pos = demux.file_pos.saturating_add(to_skip);
                         }
                     }
                     demux.state = Mp4DemuxState::ReadingMdat;
@@ -3193,11 +3216,11 @@ impl AacDecoder {
                     }
                     if demux.stream_buf.len() >= len {
                         demux.stream_buf.drain(..len);
-                        demux.file_pos += len;
+                        demux.file_pos = demux.file_pos.saturating_add(len);
                     } else {
                         let avail = demux.stream_buf.len();
-                        demux.file_pos += avail;
-                        demux.bytes_to_skip = len - avail;
+                        demux.file_pos = demux.file_pos.saturating_add(avail);
+                        demux.bytes_to_skip = len.saturating_sub(avail);
                         demux.stream_buf.clear();
                         break;
                     }
@@ -3262,7 +3285,7 @@ impl AacDecoder {
                 });
 
                 demux.stream_buf.drain(..pkt_len);
-                demux.file_pos += pkt_len;
+                demux.file_pos = demux.file_pos.saturating_add(pkt_len);
                 demux.sample_idx += 1;
                 demux.sample_in_chunk_idx += 1;
 
@@ -3272,12 +3295,12 @@ impl AacDecoder {
                     demux.sample_in_chunk_idx = 0;
                     if let Some(&next_off) = demux.chunk_offsets.get(demux.current_chunk_idx) {
                         if next_off > demux.file_pos {
-                            demux.bytes_to_skip = next_off - demux.file_pos;
+                            demux.bytes_to_skip = next_off.saturating_sub(demux.file_pos);
                             let to_skip =
                                 core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
                             demux.stream_buf.drain(..to_skip);
                             demux.bytes_to_skip -= to_skip;
-                            demux.file_pos += to_skip;
+                            demux.file_pos = demux.file_pos.saturating_add(to_skip);
                         }
                     }
                 }
@@ -3477,7 +3500,7 @@ pub struct VorbisDecoder {
     pub packets_decoded: usize,
     stream_buf: Vec<u8>,
     partial_packet: Vec<u8>,
-    packet_queue: Vec<Vec<u8>>,
+    packet_queue: VecDeque<Vec<u8>>,
     pending_pcm: Vec<i32>,
     state: VorbisState,
 }
@@ -3498,7 +3521,7 @@ impl VorbisDecoder {
             packets_decoded: 0,
             stream_buf: Vec::new(),
             partial_packet: Vec::new(),
-            packet_queue: Vec::new(),
+            packet_queue: VecDeque::new(),
             pending_pcm: Vec::new(),
             state: VorbisState::WaitingIdent,
         }
@@ -3696,7 +3719,7 @@ impl AudioDecoder for VorbisDecoder {
 
         // 2. Process queued complete packets
         while frames_out < max_frames && !self.packet_queue.is_empty() {
-            let packet = self.packet_queue.remove(0);
+            let Some(packet) = self.packet_queue.pop_front() else { break; };
             self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -3815,8 +3838,8 @@ impl AudioDecoder for VorbisDecoder {
                         &mut frames_out,
                         max_frames,
                     )?;
-                } else {
-                    self.packet_queue.push(packet);
+                } else if self.packet_queue.len() < MAX_PACKET_QUEUE {
+                    self.packet_queue.push_back(packet);
                 }
             }
 
@@ -3972,7 +3995,7 @@ impl AudioDecoder for AlacDecoder {
             let to_skip = core::cmp::min(self.bytes_to_skip, self.stream_buf.len());
             self.stream_buf.drain(..to_skip);
             self.bytes_to_skip -= to_skip;
-            self.file_pos += to_skip;
+            self.file_pos = self.file_pos.saturating_add(to_skip);
             if self.bytes_to_skip > 0 {
                 if frames_out == 0 && input_taken == 0 {
                     return Err(DecoderError::NeedMoreData);
@@ -3988,7 +4011,7 @@ impl AudioDecoder for AlacDecoder {
                 let to_skip = core::cmp::min(self.bytes_to_skip, self.stream_buf.len());
                 self.stream_buf.drain(..to_skip);
                 self.bytes_to_skip -= to_skip;
-                self.file_pos += to_skip;
+                self.file_pos = self.file_pos.saturating_add(to_skip);
                 if self.bytes_to_skip > 0 {
                     break;
                 }
@@ -4015,21 +4038,21 @@ impl AudioDecoder for AlacDecoder {
             match &fourcc {
                 b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
                     self.stream_buf.drain(..8);
-                    self.file_pos += 8;
+                    self.file_pos = self.file_pos.saturating_add(8);
                 }
                 b"stsd" => {
                     if self.stream_buf.len() < 16 {
                         break;
                     }
                     self.stream_buf.drain(..16);
-                    self.file_pos += 16;
+                    self.file_pos = self.file_pos.saturating_add(16);
                 }
                 b"mp4a" => {
                     if self.stream_buf.len() < 36 {
                         break;
                     }
                     self.stream_buf.drain(..36);
-                    self.file_pos += 36;
+                    self.file_pos = self.file_pos.saturating_add(36);
                 }
                 b"alac" => {
                     if len < 36 {
@@ -4069,7 +4092,7 @@ impl AudioDecoder for AlacDecoder {
                         Err(_) => return Err(DecoderError::InvalidHeader),
                     }
                     self.stream_buf.drain(..len);
-                    self.file_pos += len;
+                    self.file_pos = self.file_pos.saturating_add(len);
                 }
                 b"stsz" => {
                     if len < 20 {
@@ -4114,7 +4137,7 @@ impl AudioDecoder for AlacDecoder {
                         self.sample_sizes = vec![default_sz; count];
                     }
                     self.stream_buf.drain(..len);
-                    self.file_pos += len;
+                    self.file_pos = self.file_pos.saturating_add(len);
                 }
                 b"stco" => {
                     if len < 16 {
@@ -4139,7 +4162,7 @@ impl AudioDecoder for AlacDecoder {
                         self.first_chunk_offset = Some(off);
                     }
                     self.stream_buf.drain(..len);
-                    self.file_pos += len;
+                    self.file_pos = self.file_pos.saturating_add(len);
                 }
                 b"co64" => {
                     if len < 16 {
@@ -4168,7 +4191,7 @@ impl AudioDecoder for AlacDecoder {
                         self.first_chunk_offset = Some(off);
                     }
                     self.stream_buf.drain(..len);
-                    self.file_pos += len;
+                    self.file_pos = self.file_pos.saturating_add(len);
                 }
                 b"mdat" => {
                     if self.decoder.is_none() {
@@ -4179,14 +4202,14 @@ impl AudioDecoder for AlacDecoder {
                         break;
                     }
                     self.stream_buf.drain(..header_len);
-                    self.file_pos += header_len;
+                    self.file_pos = self.file_pos.saturating_add(header_len);
                     if let Some(first_off) = self.first_chunk_offset {
                         if first_off > self.file_pos {
-                            self.bytes_to_skip = first_off - self.file_pos;
+                            self.bytes_to_skip = first_off.saturating_sub(self.file_pos);
                             let to_skip = core::cmp::min(self.bytes_to_skip, self.stream_buf.len());
                             self.stream_buf.drain(..to_skip);
                             self.bytes_to_skip -= to_skip;
-                            self.file_pos += to_skip;
+                            self.file_pos = self.file_pos.saturating_add(to_skip);
                         }
                     }
                     self.state = AlacState::ReadingMdat;
@@ -4197,11 +4220,11 @@ impl AudioDecoder for AlacDecoder {
                     }
                     if self.stream_buf.len() >= len {
                         self.stream_buf.drain(..len);
-                        self.file_pos += len;
+                        self.file_pos = self.file_pos.saturating_add(len);
                     } else {
                         let avail = self.stream_buf.len();
-                        self.file_pos += avail;
-                        self.bytes_to_skip = len - avail;
+                        self.file_pos = self.file_pos.saturating_add(avail);
+                        self.bytes_to_skip = len.saturating_sub(avail);
                         self.stream_buf.clear();
                         break;
                     }
@@ -4259,7 +4282,7 @@ impl AudioDecoder for AlacDecoder {
                     }
                 }
                 self.stream_buf.drain(..pkt_len);
-                self.file_pos += pkt_len;
+                self.file_pos = self.file_pos.saturating_add(pkt_len);
                 self.sample_idx += 1;
             }
             if self.sample_idx >= self.sample_sizes.len() && !self.sample_sizes.is_empty() {
@@ -4308,7 +4331,7 @@ pub struct OpusDecoder {
     pub packets_decoded: usize,
     stream_buf: Vec<u8>,
     partial_packet: Vec<u8>,
-    packet_queue: Vec<Vec<u8>>,
+    packet_queue: VecDeque<Vec<u8>>,
     pending_pcm: Vec<i32>,
     state: OpusState,
     float_buf: Vec<f32>,
@@ -4330,7 +4353,7 @@ impl OpusDecoder {
             packets_decoded: 0,
             stream_buf: Vec::new(),
             partial_packet: Vec::new(),
-            packet_queue: Vec::new(),
+            packet_queue: VecDeque::new(),
             pending_pcm: Vec::new(),
             state: OpusState::WaitingHead,
             float_buf: vec![0.0f32; 11520],
@@ -4518,7 +4541,7 @@ impl AudioDecoder for OpusDecoder {
 
         // 2. Process queued complete packets
         while frames_out < max_frames && !self.packet_queue.is_empty() {
-            let packet = self.packet_queue.remove(0);
+            let Some(packet) = self.packet_queue.pop_front() else { break; };
             self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -4637,8 +4660,8 @@ impl AudioDecoder for OpusDecoder {
                         &mut frames_out,
                         max_frames,
                     )?;
-                } else {
-                    self.packet_queue.push(packet);
+                } else if self.packet_queue.len() < MAX_PACKET_QUEUE {
+                    self.packet_queue.push_back(packet);
                 }
             }
 
@@ -4828,14 +4851,40 @@ mod tests {
         assert_eq!(cfg.channel_configuration, 2);
         assert_eq!(cfg.adts_profile, 1);
 
-        // 2. Explicit SBR (AOT 5): AOT=5, freq_idx=4 (44100 Hz), ch=2
-        let asc_sbr = [0x2A, 0x10];
+        // 2. Explicit SBR (AOT 5): AOT=5, ext_freq_idx=4, base_aot=2, freq_idx=4, ch=2
+        let asc_sbr = [0x2A, 0x09, 0x08];
         let cfg_sbr = decode_asc_bytes(&asc_sbr).unwrap();
         assert_eq!(cfg_sbr.audio_object_type, 5);
         assert_eq!(cfg_sbr.sample_rate, 44100);
         assert_eq!(cfg_sbr.sampling_frequency_index, 4);
         assert_eq!(cfg_sbr.channel_configuration, 2);
         assert_eq!(cfg_sbr.adts_profile, 1);
+
+        // 3. HE-AAC with explicit 24-bit extension frequency (0x0F)
+        let mut asc_bits = [0u8; 8];
+        let vals: &[(u32, usize)] = &[
+            (5, 5),      // AOT 5 (SBR)
+            (15, 4),     // extensionSamplingFrequencyIndex = 15
+            (48000, 24), // 24-bit extension frequency
+            (2, 5),      // base audioObjectType = 2 (AAC-LC)
+            (4, 4),      // samplingFrequencyIndex = 4 (44100 Hz)
+            (2, 4),      // channelConfiguration = 2 (stereo)
+        ];
+        let mut bit_pos = 0;
+        for &(val, n) in vals {
+            for i in (0..n).rev() {
+                let bit = ((val >> i) & 1) as u8;
+                let byte_idx = bit_pos / 8;
+                let bit_idx = 7 - (bit_pos % 8);
+                asc_bits[byte_idx] |= bit << bit_idx;
+                bit_pos += 1;
+            }
+        }
+        let total_bytes = bit_pos.div_ceil(8);
+        let cfg_sbr_24 = decode_asc_bytes(&asc_bits[..total_bytes]).unwrap();
+        assert_eq!(cfg_sbr_24.audio_object_type, 5);
+        assert_eq!(cfg_sbr_24.sample_rate, 44100);
+        assert_eq!(cfg_sbr_24.channel_configuration, 2);
     }
 
     #[test]

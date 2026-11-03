@@ -699,7 +699,7 @@ fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
     );
 
     let meta_ev = sm.set_metadata(decoded_meta.clone());
-    assert_eq!(meta_ev, SpircEvent::MetadataUpdated(decoded_meta));
+    assert_eq!(meta_ev, SpircEvent::MetadataUpdated(decoded_meta.clone()));
     assert_eq!(
         sm.artwork_url().as_deref(),
         Some("https://i.scdn.co/image/ab67616d0000b2730123456789abcdef01234567")
@@ -732,6 +732,7 @@ fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
     assert_eq!(sm.current_track(), Some("spotify:track:track_1"));
 
     // Start playing and advance position until TrackEnded
+    sm.set_metadata(decoded_meta);
     sm.set_status(PlayStatus::Play);
     assert_eq!(sm.advance_position_ms(200_000), None);
     assert_eq!(sm.position_ms(), 200_000);
@@ -759,9 +760,9 @@ fn test_wo253_zeroconf_url_decode_utf8() {
 
 #[test]
 fn test_wo253_mercury_truncated_part_allocation() {
-    // seq_len = 2, seq_id = 0x0102, flags = 0x01, part_count = 1000
+    // seq_len = 2, seq_id = 0x0102, flags = 0x01, part_count = 10 (within MAX_MERCURY_PARTS bound)
     // but data ends right after part_count
-    let corrupt = vec![0x00, 0x02, 0x01, 0x02, 0x01, 0x03, 0xE8];
+    let corrupt = vec![0x00, 0x02, 0x01, 0x02, 0x01, 0x00, 0x0A];
     let err = MercuryPacket::decode(0xB2, &corrupt);
     assert_eq!(err, Err(MercuryError::TruncatedPacket));
 }

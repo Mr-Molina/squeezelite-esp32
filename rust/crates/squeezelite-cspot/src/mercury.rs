@@ -107,6 +107,8 @@ pub enum MercuryError {
     AudioKeyFailed(u16),
     /// UTF-8 decode error.
     InvalidUtf8,
+    /// Packet size or parts count exceeded bounds.
+    PacketTooLarge,
 }
 
 impl fmt::Display for MercuryError {
@@ -118,6 +120,7 @@ impl fmt::Display for MercuryError {
                 write!(f, "audio key request failed: code {code}")
             }
             Self::InvalidUtf8 => write!(f, "invalid utf-8 string in header"),
+            Self::PacketTooLarge => write!(f, "mercury packet too large"),
         }
     }
 }
@@ -292,6 +295,12 @@ pub struct MercuryPacket {
     pub payload_parts: Vec<Vec<u8>>,
 }
 
+/// Maximum allowed Mercury payload parts per packet.
+pub const MAX_MERCURY_PARTS: usize = 64;
+
+/// Maximum allowed total multipart payload size in bytes.
+pub const MAX_MULTIPART_BYTES: usize = 65_536;
+
 impl MercuryPacket {
     /// Creates a new complete `MercuryPacket` (`flags = 0x01`).
     #[must_use]
@@ -361,6 +370,9 @@ impl MercuryPacket {
         if data.len() < 2 {
             return Err(MercuryError::TruncatedPacket);
         }
+        if data.len() > MAX_MULTIPART_BYTES {
+            return Err(MercuryError::PacketTooLarge);
+        }
         let seq_len = u16::from_be_bytes([data[0], data[1]]) as usize;
         if seq_len == 0 || seq_len > 8 || 2 + seq_len + 3 > data.len() {
             return Err(MercuryError::InvalidFraming);
@@ -379,6 +391,9 @@ impl MercuryPacket {
         pos += 2;
         if part_count == 0 {
             return Err(MercuryError::InvalidFraming);
+        }
+        if part_count > MAX_MERCURY_PARTS {
+            return Err(MercuryError::PacketTooLarge);
         }
         if pos + part_count.saturating_mul(2) > data.len() {
             return Err(MercuryError::TruncatedPacket);
@@ -450,8 +465,13 @@ impl MercuryPacket {
         let mut expected_seq = None;
         let mut final_flags = 0u8;
         let mut all_parts: Vec<Vec<u8>> = Vec::new();
+        let mut total_bytes = 0usize;
 
         for &frag in fragments {
+            total_bytes = total_bytes.saturating_add(frag.len());
+            if total_bytes > MAX_MULTIPART_BYTES {
+                return Err(MercuryError::PacketTooLarge);
+            }
             let (seq_id, flags, parts) = Self::parse_raw_parts(frag)?;
             if let Some(prev_seq) = expected_seq {
                 if prev_seq != seq_id {
@@ -462,6 +482,9 @@ impl MercuryPacket {
             }
             final_flags = flags;
             all_parts.extend(parts);
+            if all_parts.len() > MAX_MERCURY_PARTS {
+                return Err(MercuryError::PacketTooLarge);
+            }
         }
 
         if all_parts.is_empty() {
@@ -676,5 +699,27 @@ impl MercuryPacketBuilder {
                 Err(MercuryError::InvalidFraming)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mercury_packet_too_large_parts() {
+        // Construct raw data with part_count = 65 (> MAX_MERCURY_PARTS = 64)
+        let mut data = Vec::new();
+        // seq_len = 2
+        data.extend_from_slice(&[0x00, 0x02]);
+        // seq_id = 0x0102
+        data.extend_from_slice(&[0x01, 0x02]);
+        // flags = 1
+        data.push(0x01);
+        // part_count = 65
+        data.extend_from_slice(&65u16.to_be_bytes());
+
+        let res = MercuryPacket::parse_raw_parts(&data);
+        assert_eq!(res.err(), Some(MercuryError::PacketTooLarge));
     }
 }

@@ -3,7 +3,7 @@
 //! Includes Oakley Group 1 Diffie-Hellman (RFC 2409), pure-Rust SHA-1,
 //! HMAC-SHA1, PBKDF2-HMAC-SHA1, AES-128-CTR, AES-192-ECB, and Base64.
 
-#![allow(clippy::chunks_exact_to_as_chunks, clippy::manual_div_ceil)]
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks, clippy::manual_div_ceil)]
 
 extern crate alloc;
 
@@ -164,7 +164,7 @@ impl BigUint {
         res
     }
 
-    /// Subtracts another BigUint (panics if other > self).
+    /// Subtracts another BigUint, clamping to zero on underflow.
     pub fn sub(&self, other: &Self) -> Self {
         let mut result = Vec::with_capacity(self.limbs.len());
         let mut borrow = 0i64;
@@ -180,6 +180,9 @@ impl BigUint {
                 result.push(diff as u32);
                 borrow = 0;
             }
+        }
+        if borrow != 0 {
+            return Self::zero();
         }
         let mut res = Self { limbs: result };
         res.normalize();
@@ -299,6 +302,9 @@ pub fn montgomery_mod_pow(
     if !modulus.is_odd() || modulus.is_zero() {
         return Err(CryptoError::InvalidModulus);
     }
+    if modulus.limbs.len() >= 127 {
+        return Err(CryptoError::InvalidModulus);
+    }
     if exp.is_zero() {
         return Ok(BigUint::one());
     }
@@ -375,13 +381,17 @@ pub fn montgomery_mod_pow(
     one_padded[0] = 1;
     let mut res_bar = mont_mul(&one_padded, &r_squared_padded, &n_limbs, n_prime);
 
-    let bit_count = exp.bit_len();
+    let total_bits = k * 32;
     let mut current_base_bar = x_bar_initial;
 
-    for bit_idx in 0..bit_count {
+    for bit_idx in 0..total_bits {
         let limb_idx = bit_idx / 32;
         let bit_in_limb = bit_idx % 32;
-        let bit = (exp.limbs[limb_idx] >> bit_in_limb) & 1;
+        let bit = if limb_idx < exp.limbs.len() {
+            (exp.limbs[limb_idx] >> bit_in_limb) & 1
+        } else {
+            0
+        };
 
         let next = mont_mul(&res_bar, &current_base_bar, &n_limbs, n_prime);
         let mask = 0u32.wrapping_sub(bit);
@@ -402,6 +412,10 @@ pub fn montgomery_mod_pow(
 }
 
 /// Oakley Group 1 (RFC 2409) 768-bit MODP Diffie-Hellman prime.
+///
+/// Note: Oakley Group 1 uses a 768-bit modulus, which is cryptographically
+/// legacy/weak by modern standards, but is strictly protocol-mandated by
+/// Spotify's proprietary Shannon authentication and key exchange wire format.
 pub const DH_PRIME: [u8; 96] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2,
     0x21, 0x68, 0xc2, 0x34, 0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1,
@@ -449,6 +463,11 @@ impl OakleyGroup1Dh {
         }
         let p = BigUint::from_be_bytes(&DH_PRIME);
         let y = BigUint::from_be_bytes(remote_key);
+        let two = BigUint::from_u32(2);
+        let p_minus_two = p.sub(&two);
+        if y < two || y > p_minus_two {
+            return Err(CryptoError::InvalidCiphertext);
+        }
         let x = BigUint::from_be_bytes(&self.private_key);
         let shared = montgomery_mod_pow(&y, &x, &p)?;
         let shared_vec = shared.to_be_bytes_padded(96)?;
@@ -1003,13 +1022,31 @@ impl Aes192Ecb {
     }
 
     /// Decrypts slice of 16-byte blocks in place.
+    ///
+    /// If `data` is not aligned to 16-byte block boundaries, any partial
+    /// trailing remainder bytes are zeroized to avoid leaking unauthenticated
+    /// or partial plaintext.
     pub fn decrypt(&self, data: &mut [u8]) {
-        for chunk in data.chunks_exact_mut(16) {
+        let rem_start = data.len() - (data.len() % 16);
+        for chunk in data[..rem_start].chunks_exact_mut(16) {
             let mut block = [0u8; 16];
             block.copy_from_slice(chunk);
             self.decrypt_block(&mut block);
             chunk.copy_from_slice(&block);
         }
+        for b in &mut data[rem_start..] {
+            *b = 0;
+        }
+    }
+
+    /// Decrypts slice of 16-byte blocks in place, returning an error if not
+    /// block-aligned.
+    pub fn decrypt_checked(&self, data: &mut [u8]) -> Result<(), CryptoError> {
+        if !data.len().is_multiple_of(16) {
+            return Err(CryptoError::InvalidCiphertext);
+        }
+        self.decrypt(data);
+        Ok(())
     }
 }
 
@@ -1120,4 +1157,121 @@ pub fn base64_decode(data: &str) -> Result<Vec<u8>, CryptoError> {
     }
 
     Ok(out)
+}
+
+/// Compares two byte slices in constant time using bitwise XOR accumulation.
+///
+/// Returns `true` if and only if `a` and `b` have equal length and
+/// identical contents.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dh_reject_public_key_out_of_bounds() -> Result<(), CryptoError> {
+        let priv_key = [0x42u8; 96];
+        let dh = OakleyGroup1Dh::from_private_key(priv_key)?;
+
+        // y = 0 (< 2)
+        let zero_key = [0u8; 96];
+        assert_eq!(
+            dh.calculate_shared(&zero_key),
+            Err(CryptoError::InvalidCiphertext)
+        );
+
+        // y = 1 (< 2)
+        let mut one_key = [0u8; 96];
+        one_key[95] = 1;
+        assert_eq!(
+            dh.calculate_shared(&one_key),
+            Err(CryptoError::InvalidCiphertext)
+        );
+
+        // y = p - 1 (> p - 2)
+        let mut p_minus_one = DH_PRIME;
+        p_minus_one[95] = 0xfe;
+        assert_eq!(
+            dh.calculate_shared(&p_minus_one),
+            Err(CryptoError::InvalidCiphertext)
+        );
+
+        // y = p (> p - 2)
+        assert_eq!(
+            dh.calculate_shared(&DH_PRIME),
+            Err(CryptoError::InvalidCiphertext)
+        );
+
+        // y = 2 (valid lower bound)
+        let mut two_key = [0u8; 96];
+        two_key[95] = 2;
+        assert!(dh.calculate_shared(&two_key).is_ok());
+
+        // y = p - 2 (valid upper bound)
+        let mut p_minus_two = DH_PRIME;
+        p_minus_two[95] = 0xfd;
+        assert!(dh.calculate_shared(&p_minus_two).is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        let a = b"hello world secure token";
+        let b = b"hello world secure token";
+        let c = b"hello world secure tokez";
+        let d = b"short";
+
+        assert!(constant_time_eq(a, b));
+        assert!(!constant_time_eq(a, c));
+        assert!(!constant_time_eq(a, d));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_biguint_sub_underflow_clamps_to_zero() {
+        let a = BigUint::from_u32(10);
+        let b = BigUint::from_u32(20);
+        assert_eq!(a.sub(&b), BigUint::zero());
+    }
+
+    #[test]
+    fn test_aes192_ecb_remainder_zeroized_and_checked() {
+        let key = [0x55u8; 24];
+        let cipher = Aes192Ecb::new(&key);
+
+        let mut data = [0xffu8; 20];
+        assert_eq!(
+            cipher.decrypt_checked(&mut data),
+            Err(CryptoError::InvalidCiphertext)
+        );
+
+        // decrypt() zeroizes remainder
+        cipher.decrypt(&mut data);
+        assert_eq!(&data[16..], &[0u8; 4]);
+    }
+
+    #[test]
+    fn test_montgomery_mod_pow_excessive_modulus_rejected() {
+        let base = BigUint::from_u32(3);
+        let exp = BigUint::from_u32(5);
+        let mut huge_mod = BigUint {
+            limbs: vec![1; 127],
+        };
+        huge_mod.limbs[0] |= 1;
+        assert_eq!(
+            montgomery_mod_pow(&base, &exp, &huge_mod),
+            Err(CryptoError::InvalidModulus)
+        );
+    }
 }

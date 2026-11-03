@@ -194,15 +194,18 @@ impl DmapMetadata {
             if Self::is_container_tag(&tag) {
                 Self::parse_slice(value, meta, depth + 1)?;
             } else if &tag == b"minm" || &tag == b"cann" {
-                if let Ok(s) = core::str::from_utf8(value) {
+                let capped = &value[..value.len().min(512)];
+                if let Ok(s) = core::str::from_utf8(capped) {
                     meta.title = Some(s.to_string());
                 }
             } else if &tag == b"asar" || &tag == b"cana" {
-                if let Ok(s) = core::str::from_utf8(value) {
+                let capped = &value[..value.len().min(512)];
+                if let Ok(s) = core::str::from_utf8(capped) {
                     meta.artist = Some(s.to_string());
                 }
             } else if &tag == b"asal" || &tag == b"canl" {
-                if let Ok(s) = core::str::from_utf8(value) {
+                let capped = &value[..value.len().min(512)];
+                if let Ok(s) = core::str::from_utf8(capped) {
                     meta.album = Some(s.to_string());
                 }
             } else if &tag == b"astm" || &tag == b"cast" {
@@ -320,15 +323,23 @@ impl TrackProgress {
             };
 
             let mut parts = val_part.split('/');
-            let start_s = parts.next()?.trim();
-            let curr_s = parts.next()?.trim();
-            let end_s = parts.next()?.trim();
+            let (Some(start_s), Some(curr_s), Some(end_s)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
             if parts.next().is_some() {
                 continue;
             }
-            let rtp_start: u32 = start_s.parse().ok()?;
-            let rtp_current: u32 = curr_s.parse().ok()?;
-            let rtp_end: u32 = end_s.parse().ok()?;
+            let Ok(rtp_start) = start_s.trim().parse::<u32>() else {
+                continue;
+            };
+            let Ok(rtp_current) = curr_s.trim().parse::<u32>() else {
+                continue;
+            };
+            let Ok(rtp_end) = end_s.trim().parse::<u32>() else {
+                continue;
+            };
             return Some(Self {
                 rtp_start,
                 rtp_current,
@@ -342,7 +353,12 @@ impl TrackProgress {
     #[must_use]
     pub fn elapsed_ms(&self, sample_rate_hz: u32) -> u32 {
         let rate = u64::from(sample_rate_hz.max(1));
-        let delta = u64::from(self.rtp_current.wrapping_sub(self.rtp_start));
+        let raw_diff = self.rtp_current.wrapping_sub(self.rtp_start);
+        let delta = if raw_diff > 0x8000_0000 {
+            0
+        } else {
+            u64::from(raw_diff)
+        };
         ((delta * 1000) / rate) as u32
     }
 
@@ -352,5 +368,44 @@ impl TrackProgress {
         let rate = u64::from(sample_rate_hz.max(1));
         let delta = u64::from(self.rtp_end.wrapping_sub(self.rtp_start));
         ((delta * 1000) / rate) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_progress_multi_line_with_leading_headers() {
+        let text = concat!(
+            "volume: -15.000000\r\n",
+            "client-instance: 0123456789ABCDEF\r\n",
+            "progress: 1000/5000/10000\r\n"
+        );
+        let progress = TrackProgress::parse(text).expect("progress parse succeeds");
+        assert_eq!(progress.rtp_start, 1000);
+        assert_eq!(progress.rtp_current, 5000);
+        assert_eq!(progress.rtp_end, 10000);
+    }
+
+    #[test]
+    fn test_track_progress_elapsed_ms_negative_jitter_clamped() {
+        // Current is before start due to jitter: wrapping_sub produces
+        // a value > 0x8000_0000.
+        let progress = TrackProgress::new(10_000, 9_900, 20_000);
+        assert_eq!(progress.elapsed_ms(44_100), 0);
+    }
+
+    #[test]
+    fn test_dmap_metadata_cap_512_bytes() {
+        let mut buf = Vec::new();
+        let long_title = [b'A'; 600];
+        DmapMetadata::append_tlv(&mut buf, b"minm", &long_title);
+        let mut wrapper = Vec::new();
+        DmapMetadata::append_tlv(&mut wrapper, b"mlit", &buf);
+
+        let parsed = DmapMetadata::parse(&wrapper).expect("metadata parses");
+        let title = parsed.title.expect("title present");
+        assert_eq!(title.len(), 512);
     }
 }

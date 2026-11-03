@@ -316,7 +316,7 @@ proptest! {
     }
 
     /// Invariant: setd parses correctly for 1-byte setting query and
-    /// 4-byte sample rate.
+    /// 4-byte sample rate (or 4-byte id=0 unknown setting per AUD08-03).
     #[test]
     fn fuzz_parse_setd(
         sample_rate in any::<u32>(),
@@ -331,7 +331,17 @@ proptest! {
         prop_assert!(res_4b.is_ok());
         let (cmd, consumed) = res_4b.unwrap();
         prop_assert_eq!(consumed, 10);
-        prop_assert_eq!(cmd, ServerCommand::SetDevice { sample_rate });
+        if buf_4b[6] != 0 {
+            prop_assert_eq!(cmd, ServerCommand::SetDevice { sample_rate });
+        } else {
+            prop_assert_eq!(
+                cmd,
+                ServerCommand::Unknown {
+                    opcode: *b"setd",
+                    payload: &buf_4b[6..10],
+                }
+            );
+        }
 
         // 1-byte setting query (6-byte frame)
         let mut buf_1b = [0u8; 7];

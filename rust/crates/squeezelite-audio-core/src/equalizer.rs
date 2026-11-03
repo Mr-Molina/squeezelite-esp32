@@ -356,6 +356,51 @@ impl EqPreset {
     }
 }
 
+/// Error returned when parsing an unrecognized equalizer preset string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseEqPresetError;
+
+impl core::fmt::Display for ParseEqPresetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "unknown equalizer preset")
+    }
+}
+
+impl core::str::FromStr for EqPreset {
+    type Err = ParseEqPresetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        let stripped = if let Some(rest) = trimmed.strip_prefix("eq_") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("EQ_") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("eq-") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("EQ-") {
+            rest
+        } else {
+            trimmed
+        };
+
+        if stripped.eq_ignore_ascii_case("flat") {
+            Ok(Self::Flat)
+        } else if stripped.eq_ignore_ascii_case("bass")
+            || stripped.eq_ignore_ascii_case("bassboost")
+        {
+            Ok(Self::BassBoost)
+        } else if stripped.eq_ignore_ascii_case("loudness") {
+            Ok(Self::Loudness)
+        } else if stripped.eq_ignore_ascii_case("vocal") || stripped.eq_ignore_ascii_case("voice") {
+            Ok(Self::Vocal)
+        } else if stripped.eq_ignore_ascii_case("rock") {
+            Ok(Self::Rock)
+        } else {
+            Err(ParseEqPresetError)
+        }
+    }
+}
+
 pub struct Equalizer<const BANDS: usize> {
     filters: [BiquadCoeffs; BANDS],
     gains_db: [f32; BANDS],
@@ -364,6 +409,7 @@ pub struct Equalizer<const BANDS: usize> {
     pub enabled: bool,
     pub current_preset: EqPreset,
     pub loudness_enabled: bool,
+    pub sample_rate_hz: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +434,14 @@ impl<const BANDS: usize> Equalizer<BANDS> {
             enabled: false,
             current_preset: EqPreset::Flat,
             loudness_enabled: false,
+            sample_rate_hz: 0.0,
         }
+    }
+
+    /// Returns the currently configured sample rate in Hz.
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> f32 {
+        self.sample_rate_hz
     }
 
     /// Returns a reference to the array of filter coefficients for all bands.
@@ -523,6 +576,13 @@ impl<const BANDS: usize> Equalizer<BANDS> {
                     if z2_r.abs() < 1e-15 { *z2_r = 0.0; }
                 }
                 r = out_r;
+            }
+
+            if self.loudness_enabled {
+                let lvl = l.abs().max(r.abs()).clamp(0.0, 1.0);
+                let gain = horner_loudness(lvl);
+                l *= gain;
+                r *= gain;
             }
 
             let scaled_l = l * DENORM;
@@ -838,9 +898,11 @@ impl Equalizer<10> {
             .iter()
             .chain(self.hist_right.iter())
             .any(|&(z1, z2)| !z1.is_finite() || !z2.is_finite());
-        if !self.enabled || has_non_finite_history {
+        let rate_changed = (fs_hz - self.sample_rate_hz).abs() > 1.0 && self.sample_rate_hz > 0.0;
+        if !self.enabled || has_non_finite_history || rate_changed {
             self.reset();
         }
+        self.sample_rate_hz = fs_hz;
     }
 
     /// Applies a pre-tuned 10-band graphic equalizer preset
@@ -1185,6 +1247,22 @@ mod tests {
         assert_eq!(EqPreset::from_u8(3), EqPreset::Vocal);
         assert_eq!(EqPreset::from_u8(4), EqPreset::Rock);
         assert_eq!(EqPreset::from_u8(99), EqPreset::Flat);
+
+        use core::str::FromStr;
+        assert_eq!(EqPreset::from_str("Flat").unwrap(), EqPreset::Flat);
+        assert_eq!(EqPreset::from_str("flat").unwrap(), EqPreset::Flat);
+        assert_eq!(EqPreset::from_str("eq_flat").unwrap(), EqPreset::Flat);
+        assert_eq!(EqPreset::from_str("Bass").unwrap(), EqPreset::BassBoost);
+        assert_eq!(EqPreset::from_str("BassBoost").unwrap(), EqPreset::BassBoost);
+        assert_eq!(EqPreset::from_str("eq_bass").unwrap(), EqPreset::BassBoost);
+        assert_eq!(EqPreset::from_str("Loudness").unwrap(), EqPreset::Loudness);
+        assert_eq!(EqPreset::from_str("eq_loudness").unwrap(), EqPreset::Loudness);
+        assert_eq!(EqPreset::from_str("Vocal").unwrap(), EqPreset::Vocal);
+        assert_eq!(EqPreset::from_str("Voice").unwrap(), EqPreset::Vocal);
+        assert_eq!(EqPreset::from_str("eq_voice").unwrap(), EqPreset::Vocal);
+        assert_eq!(EqPreset::from_str("Rock").unwrap(), EqPreset::Rock);
+        assert_eq!(EqPreset::from_str("eq_rock").unwrap(), EqPreset::Rock);
+        assert!(EqPreset::from_str("invalid").is_err());
 
         assert_eq!(EqPreset::Flat.as_str(), "Flat");
         assert_eq!(EqPreset::BassBoost.as_str(), "Bass");

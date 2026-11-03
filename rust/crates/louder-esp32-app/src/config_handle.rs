@@ -321,6 +321,7 @@ pub struct RamJournal<'a> {
     target: JournalSlot,
     policy: FlashTargetPolicy,
     flash_pending: bool,
+    pending_wifi: Option<WifiStaCredentials>,
 }
 
 impl<'a> RamJournal<'a> {
@@ -344,7 +345,18 @@ impl<'a> RamJournal<'a> {
             target,
             policy,
             flash_pending: false,
+            pending_wifi: None,
         }
+    }
+
+    /// Sets pending Wi-Fi credentials to be written on the next commit.
+    pub fn set_pending_wifi(&mut self, creds: Option<WifiStaCredentials>) {
+        self.pending_wifi = creds;
+    }
+
+    /// Pending Wi-Fi credentials, if explicitly scheduled.
+    pub fn pending_wifi(&self) -> Option<&WifiStaCredentials> {
+        self.pending_wifi.as_ref()
     }
 
     /// Sequence of the newest journal (RAM image, or the boot journal before any
@@ -385,7 +397,41 @@ impl<'a> RamJournal<'a> {
 impl ConfigJournal for RamJournal<'_> {
     fn commit(&mut self, cfg: &AudioConfig) -> bool {
         let next = self.sequence.wrapping_add(1);
-        match serialize_image(&mut self.image.0, cfg, next) {
+        let mut preserved_ssid = heapless::String::<32>::new();
+        let mut preserved_pass = heapless::String::<64>::new();
+        let mut has_wifi = false;
+
+        if let Some(ref creds) = self.pending_wifi {
+            let _ = preserved_ssid.push_str(creds.ssid.as_str());
+            let _ = preserved_pass.push_str(creds.password.as_str());
+            has_wifi = !preserved_ssid.is_empty();
+        } else if squeezelite_config::FlashJournal::validate_sector(&self.image.0).is_ok() {
+            let mut store = squeezelite_config::MemConfigStore::<16>::new();
+            if squeezelite_config::FlashJournal::load_from_sector(
+                &self.image.0,
+                &mut store,
+            )
+            .is_ok()
+            {
+                if let Ok(Some(s)) = store.get_str::<32>("wifi.ssid") {
+                    if !s.is_empty() {
+                        let _ = preserved_ssid.push_str(s.as_str());
+                        if let Ok(Some(p)) = store.get_str::<64>("wifi.pass") {
+                            let _ = preserved_pass.push_str(p.as_str());
+                        }
+                        has_wifi = true;
+                    }
+                }
+            }
+        }
+
+        let wifi_ref = if has_wifi {
+            Some((preserved_ssid.as_str(), preserved_pass.as_str()))
+        } else {
+            None
+        };
+
+        match serialize_image(&mut self.image.0, cfg, next, wifi_ref) {
             Ok(len) => {
                 self.image_len = len;
                 self.sequence = next;
@@ -393,8 +439,7 @@ impl ConfigJournal for RamJournal<'_> {
                 true
             }
             Err(_) => {
-                // Validation runs before the image is touched, so this is a refused config and
-                // the previous image is intact. Never leave a damaged image pending regardless.
+                // Staged write protects sector if serialization failed.
                 if squeezelite_config::FlashJournal::validate_sector(&self.image.0).is_err() {
                     self.flash_pending = false;
                 }
@@ -502,21 +547,31 @@ pub fn resolve_boot_wifi_with_journal<S: KeyValueStorage>(
     resolve_boot_wifi(nvs, default)
 }
 
-/// Serializes `cfg` (audio/identity keys only, never `wifi.*`) as a complete
-/// journal image into
-/// `sector` with `sequence`; returns the image length. `cfg` is validated
-/// first, so on `Err`
-/// `sector` is untouched.
+/// Serializes `cfg` (and optional Wi-Fi credentials) as a complete
+/// journal image into `sector` with `sequence`; returns image length.
+/// Staged into a temporary buffer so `sector` is not wiped with `0xFF` if
+/// validation or serialization fails.
 fn serialize_image(
     sector: &mut [u8; JOURNAL_SECTOR_SIZE],
     cfg: &AudioConfig,
     sequence: u32,
+    wifi: Option<(&str, &str)>,
 ) -> Result<usize, squeezelite_config::StorageError> {
     cfg.validate()?;
-    sector.fill(0xFF);
-    let mut writer = SectorWriter::new(&mut sector[..])?;
+    let mut tmp = [0xFFu8; JOURNAL_SECTOR_SIZE];
+    let mut writer = SectorWriter::new(&mut tmp[..])?;
     cfg.save_to(&mut writer)?;
-    writer.finish(sequence)
+    if let Some((ssid, pass)) = wifi {
+        if !ssid.is_empty() {
+            writer.set_str("wifi.ssid", ssid)?;
+            if !pass.is_empty() {
+                writer.set_str("wifi.pass", pass)?;
+            }
+        }
+    }
+    let len = writer.finish(sequence)?;
+    sector.copy_from_slice(&tmp);
+    Ok(len)
 }
 
 #[cfg(test)]
@@ -682,5 +737,62 @@ mod tests {
         .expect("resolved with resolve_boot_wifi");
         assert_eq!(src, ConfigSource::Nvs);
         assert_eq!(res_creds.ssid.as_str(), "NvsAP");
+    }
+
+    #[test]
+    fn test_ram_journal_commit_preserves_wifi_credentials() {
+        use squeezelite_config::MemConfigStore;
+
+        let mut image = JournalSector::erased();
+        let mut initial_store = MemConfigStore::<16>::new();
+        initial_store.set_str("wifi.ssid", "StationAP").expect("ssid");
+        initial_store.set_str("wifi.pass", "StationKey").expect("pass");
+        initial_store.set_str(AudioConfig::KEY_NAME, "MyPlayer").expect("name");
+        squeezelite_config::FlashJournal::save_to_sector_with_seq(
+            &initial_store,
+            &mut image.0,
+            1,
+        )
+        .expect("initial save");
+
+        let mut ram = RamJournal::new(
+            &mut image,
+            Some((JournalSlot::A, 1)),
+            FlashTargetPolicy::FixedA,
+        );
+
+        // Commit an audio config update with pending_wifi == None
+        let updated_audio = AudioConfig {
+            volume: 77,
+            ..AudioConfig::default()
+        };
+        assert!(ram.commit(&updated_audio));
+
+        // Verify that wifi.ssid and wifi.pass were preserved in the serialized sector
+        let mut verified_store = MemConfigStore::<16>::new();
+        squeezelite_config::FlashJournal::load_from_sector(
+            &ram.image.0,
+            &mut verified_store,
+        )
+        .expect("load sector");
+        assert_eq!(
+            verified_store.get_str::<32>("wifi.ssid").unwrap().as_deref(),
+            Some("StationAP")
+        );
+        assert_eq!(
+            verified_store.get_str::<64>("wifi.pass").unwrap().as_deref(),
+            Some("StationKey")
+        );
+        assert_eq!(
+            verified_store.get_u8(AudioConfig::KEY_VOL).unwrap(),
+            Some(77)
+        );
+
+        // Verify staging: invalid config does not corrupt the sector
+        let mut bad_cfg = AudioConfig::default();
+        bad_cfg.player_name.clear();
+        let snapshot = ram.image.0;
+        assert!(!ram.commit(&bad_cfg));
+        assert_eq!(ram.image.0, snapshot);
     }
 }

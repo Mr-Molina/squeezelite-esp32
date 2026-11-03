@@ -3,7 +3,9 @@
 //! Verifies zero-panic guarantees, roundtrip fidelity, and corruption
 //! resistance across arbitrary keys, values, and sector bit-flips.
 
-use proptest::prelude::{any, prop_assert, prop_assert_eq, prop_assume, ProptestConfig};
+use proptest::prelude::{
+    any, prop_assert, prop_assert_eq, prop_assume, prop_oneof, Just, ProptestConfig,
+};
 use proptest::proptest;
 use squeezelite_config::{
     crc32_update, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials,
@@ -33,7 +35,7 @@ proptest! {
     #[test]
     fn fuzz_wifi_credentials_roundtrip(
         ssid in "[a-zA-Z0-9_\\- ]{1,32}",
-        pass in "[a-zA-Z0-9!@#$%^&*()]{0,64}",
+        pass in prop_oneof![Just(String::new()), "[a-zA-Z0-9!@#$%^&*()]{8,63}"],
         auto in any::<bool>(),
         ip in proptest::option::of(any::<[u8; 4]>()),
         gw in proptest::option::of(any::<[u8; 4]>()),

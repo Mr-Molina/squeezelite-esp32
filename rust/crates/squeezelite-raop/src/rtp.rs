@@ -20,6 +20,7 @@ pub const RTP_PT_SYNC: u8 = 0x54;
 pub const RTP_PT_RESEND_REQUEST: u8 = 0x55;
 /// RTP payload type for control retransmit reply (`0x56` / `0xD6` with marker).
 pub const RTP_PT_RETRANSMIT_REPLY: u8 = 0x56;
+pub const RTP_PT_RETRANSMIT_RESPONSE: u8 = RTP_PT_RETRANSMIT_REPLY;
 /// RTP payload type for standard RAOP audio data (`0x60` / `96`).
 pub const RTP_PT_AUDIO_DATA: u8 = 0x60;
 
@@ -592,7 +593,7 @@ impl RtpJitterBuffer {
     /// to at least 4 slots).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        let cap = capacity.max(4);
+        let cap = capacity.max(1).next_power_of_two();
         Self {
             capacity: cap,
             slots: vec![None; cap],
@@ -694,6 +695,11 @@ impl RtpJitterBuffer {
             packet
         };
         let (header, payload) = RtpHeader::parse(inner)?;
+        if header.payload_type != RTP_PT_AUDIO_DATA
+            && header.payload_type != RTP_PT_RETRANSMIT_RESPONSE
+        {
+            return Err(RtpReceiverError::UnexpectedPayloadType(header.payload_type));
+        }
         let entry = JitterEntry::new(header, payload.to_vec(), Vec::new());
         Ok(self.insert_entry(entry))
     }
@@ -1073,7 +1079,7 @@ impl SyncDriftTracker {
         if delta_ms >= 0 {
             Some(local_anchor_ms.wrapping_add(delta_ms as u64))
         } else {
-            Some(local_anchor_ms.wrapping_sub((-delta_ms) as u64))
+            Some(local_anchor_ms.saturating_sub((-delta_ms) as u64))
         }
     }
 
@@ -1135,6 +1141,7 @@ impl SyncDriftTracker {
         input_pcm: &[i16],
         out_pcm: &mut Vec<i16>,
     ) {
+        let input_pcm = &input_pcm[..input_pcm.len() & !1];
         out_pcm.clear();
         if input_pcm.len() < 2 {
             out_pcm.extend_from_slice(input_pcm);

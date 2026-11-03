@@ -174,8 +174,25 @@ pub struct OtaSelectEntry {
 }
 
 impl OtaSelectEntry {
+    /// `ESP_OTA_IMG_PENDING_VERIFY` state constant (0x0000_0001).
+    pub const OTA_IMG_PENDING_VERIFY: u32 = 0x0000_0001;
     /// `ESP_OTA_IMG_VALID` state constant.
     pub const OTA_IMG_VALID: u32 = 0x0000_0002;
+
+    /// Constructs an `OtaSelectEntry` in `OTA_IMG_PENDING_VERIFY` state
+    /// selecting `ota_0` with sequence `seq.max(1)`.
+    #[must_use]
+    pub fn new_ota_0_pending(seq: u32) -> Self {
+        let ota_seq = seq.max(1);
+        let seq_bytes = ota_seq.to_le_bytes();
+        let crc = esp_crc32_le(0xFFFF_FFFF, &seq_bytes);
+        Self {
+            ota_seq,
+            seq_label: [0xFF; 20],
+            ota_state: Self::OTA_IMG_PENDING_VERIFY,
+            crc,
+        }
+    }
 
     /// Constructs a valid `OtaSelectEntry` selecting `ota_0` (`ota_seq = 1`).
     #[must_use]
@@ -329,7 +346,7 @@ fn decode_hex_nibble(b: u8) -> Result<u8, OtaSafetyError> {
 fn heapless_string_from_str<const N: usize>(s: &str) -> Result<String<N>, OtaSafetyError> {
     let mut out = String::<N>::new();
     out.push_str(s)
-        .map_err(|()| OtaSafetyError::CredentialStringError)?;
+        .map_err(|_| OtaSafetyError::CredentialStringError)?;
     Ok(out)
 }
 
@@ -778,6 +795,27 @@ pub fn verify_ota_binary_header(image: &[u8]) -> Result<OtaBinarySummary, OtaSaf
 /// `esp_image_header_t` + segment 0 header + `esp_app_desc_t`.
 pub const OTA_MIN_HEADER_BYTES: usize = 0x120;
 
+/// Minimum valid firmware byte count (288 bytes = header + app_desc).
+pub const MIN_FIRMWARE_BYTES: usize = OTA_MIN_HEADER_BYTES;
+
+/// Returns `true` if `offset` is 4-byte (word) aligned.
+#[inline]
+#[must_use]
+pub const fn is_flash_word_aligned(offset: u32) -> bool {
+    (offset & 0x3) == 0
+}
+
+/// Verifies that a flash offset is 4-byte aligned.
+pub fn verify_flash_offset_aligned(offset: u32) -> Result<(), OtaSafetyError> {
+    if is_flash_word_aligned(offset) {
+        Ok(())
+    } else {
+        Err(OtaSafetyError::InvalidBinaryHeader(
+            "flash write offset is not 4-byte aligned",
+        ))
+    }
+}
+
 /// Flash sector erase granularity (`4096` bytes).
 pub const OTA_FLASH_SECTOR_BYTES: u32 = 4096;
 
@@ -943,6 +981,17 @@ pub struct OtaFlashWriteOp {
 }
 
 impl OtaFlashWriteOp {
+    /// Returns `true` if `flash_offset` is 4-byte word aligned.
+    #[must_use]
+    pub const fn is_aligned(&self) -> bool {
+        is_flash_word_aligned(self.flash_offset)
+    }
+
+    /// Verifies that `flash_offset` is 4-byte word aligned.
+    pub fn verify_aligned(&self) -> Result<(), OtaSafetyError> {
+        verify_flash_offset_aligned(self.flash_offset)
+    }
+
     /// Returns an empty flash write operation (no bytes written, no sectors
     /// erased).
     #[must_use]
@@ -968,6 +1017,9 @@ pub struct OtaStreamAssembler {
     expected_size: Option<usize>,
     next_unerased_sector_index: u32,
     hasher: Sha256Incremental,
+    payload_hasher: Sha256Incremental,
+    tail_buf: [u8; 32],
+    tail_len: usize,
     state: OtaStreamState,
 }
 
@@ -993,6 +1045,9 @@ impl OtaStreamAssembler {
             expected_size,
             next_unerased_sector_index: 0,
             hasher: Sha256Incremental::new(),
+            payload_hasher: Sha256Incremental::new(),
+            tail_buf: [0u8; 32],
+            tail_len: 0,
             state: OtaStreamState::AwaitingHeader,
         })
     }
@@ -1007,6 +1062,106 @@ impl OtaStreamAssembler {
     #[must_use]
     pub fn bytes_received(&self) -> usize {
         self.bytes_received
+    }
+
+    /// Returns the initial 288-byte header buffer accumulated so far.
+    #[must_use]
+    pub const fn header_buf(&self) -> &[u8; OTA_MIN_HEADER_BYTES] {
+        &self.header_buf
+    }
+
+    /// For a chunk that just crossed the 288-byte header boundary (or any chunk),
+    /// provides the byte slices that must be written to flash for this operation.
+    ///
+    /// When multi-chunk OTA headers (<288 B per chunk) cross the 288-byte boundary,
+    /// the first slice is the complete 288-byte `header_buf` and the second slice
+    /// is any trailing bytes from `chunk`.
+    #[must_use]
+    pub fn get_flash_write_slices<'a>(
+        &'a self,
+        chunk: &'a [u8],
+        op: &OtaFlashWriteOp,
+    ) -> (&'a [u8], &'a [u8]) {
+        if op.bytes_written == 0 {
+            (&[], &[])
+        } else if op.flash_offset == OTA_0_PARTITION_OFFSET && op.bytes_written > chunk.len() {
+            let tail_len = op.bytes_written - OTA_MIN_HEADER_BYTES;
+            let tail_start = chunk.len().saturating_sub(tail_len);
+            (&self.header_buf, &chunk[tail_start..])
+        } else {
+            (&[], chunk)
+        }
+    }
+
+    /// Writes the payload of this operation to flash via a closure, ensuring that
+    /// when multi-chunk headers cross the 288-byte boundary, the full 288-byte
+    /// `header_buf` plus trailing chunk bytes are written.
+    pub fn write_chunk_to_flash<F>(
+        &self,
+        chunk: &[u8],
+        op: &OtaFlashWriteOp,
+        mut write_flash: F,
+    ) -> Result<(), OtaSafetyError>
+    where
+        F: FnMut(u32, &[u8]),
+    {
+        let (slice1, slice2) = self.get_flash_write_slices(chunk, op);
+        let mut cur_offset = op.flash_offset;
+        if !slice1.is_empty() {
+            verify_flash_offset_aligned(cur_offset)?;
+            write_flash(cur_offset, slice1);
+            cur_offset = cur_offset.saturating_add(slice1.len() as u32);
+        }
+        if !slice2.is_empty() {
+            verify_flash_offset_aligned(cur_offset)?;
+            write_flash(cur_offset, slice2);
+        }
+        Ok(())
+    }
+
+    /// Updates running hasher and rolling 32-byte tail window for appended SHA-256.
+    fn update_hashers(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+        let mut data = chunk;
+        if self.tail_len < 32 {
+            let fill = (32 - self.tail_len).min(data.len());
+            self.tail_buf[self.tail_len..self.tail_len + fill].copy_from_slice(&data[..fill]);
+            self.tail_len += fill;
+            data = &data[fill..];
+        }
+        if !data.is_empty() {
+            if data.len() >= 32 {
+                self.payload_hasher.update(&self.tail_buf);
+                let mid = data.len() - 32;
+                if mid > 0 {
+                    self.payload_hasher.update(&data[..mid]);
+                }
+                self.tail_buf.copy_from_slice(&data[mid..]);
+            } else {
+                let shift = data.len();
+                self.payload_hasher.update(&self.tail_buf[..shift]);
+                self.tail_buf.copy_within(shift..32, 0);
+                self.tail_buf[32 - shift..].copy_from_slice(data);
+            }
+        }
+    }
+
+    /// Verifies the appended 32-byte SHA-256 when `header_buf[23] == 1`.
+    pub fn verify_appended_sha256(&self) -> Result<(), OtaSafetyError> {
+        if self.header_buf[23] == 1 {
+            if self.bytes_received < OTA_MIN_HEADER_BYTES + 32 {
+                return Err(OtaSafetyError::InvalidBinaryHeader(
+                    "image shorter than 320 bytes with hash_appended flag",
+                ));
+            }
+            let computed = self.payload_hasher.finalize();
+            if computed != self.tail_buf {
+                return Err(OtaSafetyError::InvalidBinaryHeader(
+                    "appended SHA-256 digest verification failed",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns completion percentage (`0..=100`) if `expected_size` is known.
@@ -1065,7 +1220,7 @@ impl OtaStreamAssembler {
             self.header_filled += copy_len;
 
             if self.header_filled < OTA_MIN_HEADER_BYTES {
-                self.hasher.update(chunk);
+                self.update_hashers(chunk);
                 self.bytes_received = new_total;
                 return Ok(OtaFlashWriteOp::empty(
                     OTA_0_PARTITION_OFFSET + self.bytes_received as u32,
@@ -1087,7 +1242,7 @@ impl OtaStreamAssembler {
             // Header is verified. Commit chunk to hasher, update total received bytes,
             // and emit initial sector 0 erase and write operation covering all buffered
             // bytes plus the remainder of this chunk.
-            self.hasher.update(chunk);
+            self.update_hashers(chunk);
             self.bytes_received = new_total;
 
             let end_offset = self.bytes_received as u32;
@@ -1112,7 +1267,7 @@ impl OtaStreamAssembler {
         }
 
         let start_offset = self.bytes_received as u32;
-        self.hasher.update(chunk);
+        self.update_hashers(chunk);
         self.bytes_received = new_total;
 
         let end_offset = self.bytes_received as u32;
@@ -1136,12 +1291,33 @@ impl OtaStreamAssembler {
         })
     }
 
+    /// Finalizes the stream and verifies minimum firmware byte length
+    /// and appended SHA-256 (if header has `hash_appended == 1`).
+    pub fn finish_verified(&mut self) -> Result<(OtaBinarySummary, [u8; 32]), OtaSafetyError> {
+        if self.bytes_received < MIN_FIRMWARE_BYTES {
+            let err = OtaSafetyError::InvalidBinaryHeader(
+                "image shorter than 288 bytes (incomplete header)",
+            );
+            self.state = OtaStreamState::Aborted(err.clone());
+            return Err(err);
+        }
+        self.verify_appended_sha256()?;
+        self.finish()
+    }
+
     /// Finalizes the OTA stream, verifying that the full header was validated
     /// and `expected_size` (if specified) was met, returning the summary and
     /// full-image SHA-256 digest.
     pub fn finish(&mut self) -> Result<(OtaBinarySummary, [u8; 32]), OtaSafetyError> {
         if let OtaStreamState::Aborted(ref err) = self.state {
             return Err(err.clone());
+        }
+        if self.bytes_received < MIN_FIRMWARE_BYTES {
+            let err = OtaSafetyError::InvalidBinaryHeader(
+                "image shorter than 288 bytes (incomplete header)",
+            );
+            self.state = OtaStreamState::Aborted(err.clone());
+            return Err(err);
         }
         if let Some(expected) = self.expected_size {
             if self.bytes_received != expected {
@@ -1344,6 +1520,9 @@ impl RecoveryCoordinator {
             expected_size: None,
             next_unerased_sector_index: 0,
             hasher: Sha256Incremental::new(),
+            payload_hasher: Sha256Incremental::new(),
+            tail_buf: [0u8; 32],
+            tail_len: 0,
             state: OtaStreamState::AwaitingHeader,
         };
         Self {
@@ -1370,6 +1549,12 @@ impl RecoveryCoordinator {
         &mut self.crash_policy
     }
 
+    /// Initial 288-byte header buffer accumulated so far.
+    #[must_use]
+    pub const fn header_buf(&self) -> &[u8; OTA_MIN_HEADER_BYTES] {
+        self.assembler.header_buf()
+    }
+
     /// Starts a URL-based OTA download session into `ota_0`.
     pub fn begin_url_ota(
         &mut self,
@@ -1384,7 +1569,7 @@ impl RecoveryCoordinator {
         let mut url_str: String<128> = String::new();
         url_str
             .push_str(url)
-            .map_err(|()| OtaSafetyError::InvalidBinaryHeader("OTA URL exceeds 128 bytes"))?;
+            .map_err(|_| OtaSafetyError::InvalidBinaryHeader("OTA URL exceeds 128 bytes"))?;
         self.assembler = OtaStreamAssembler::new(expected_size)?;
         self.state = RecoveryModeState::FetchingFromUrl {
             url: url_str,
@@ -1428,20 +1613,34 @@ impl RecoveryCoordinator {
         }
     }
 
+    /// Feeds a chunk into the OTA session and writes to flash via `write_flash`.
+    pub fn feed_ota_chunk_and_write<F>(
+        &mut self,
+        chunk: &[u8],
+        mut write_flash: F,
+    ) -> Result<OtaFlashWriteOp, OtaSafetyError>
+    where
+        F: FnMut(u32, &[u8]),
+    {
+        let op = self.feed_ota_chunk(chunk)?;
+        self.assembler.write_chunk_to_flash(chunk, &op, &mut write_flash)?;
+        Ok(op)
+    }
+
     /// Finalizes the OTA image, resets the crash counter, and returns the
     /// verified [`OtaBinarySummary`], 32-byte SHA-256 digest, and the
-    /// [`OtaSelectEntry`] for `ota_0`.
+    /// [`OtaSelectEntry`] for `ota_0` in `OTA_IMG_PENDING_VERIFY` state.
     pub fn finalize_ota_and_build_otadata(
         &mut self,
     ) -> Result<(OtaBinarySummary, [u8; 32], OtaSelectEntry), OtaSafetyError> {
-        match self.assembler.finish() {
+        match self.assembler.finish_verified() {
             Ok((summary, sha256)) => {
                 self.crash_policy.reset();
                 self.state = RecoveryModeState::FlashingVerified {
                     image_size: summary.image_size,
                     sha256,
                 };
-                Ok((summary, sha256, OtaSelectEntry::new_ota_0()))
+                Ok((summary, sha256, OtaSelectEntry::new_ota_0_pending(1)))
             }
             Err(err) => {
                 self.state = RecoveryModeState::Failed(err.clone());
@@ -1883,6 +2082,107 @@ mod tests {
             .expect("finalize recovery");
         assert_eq!(summary.image_size, 512);
         assert_eq!(ota_select.ota_seq, 1);
+        assert_eq!(ota_select.ota_state, OtaSelectEntry::OTA_IMG_PENDING_VERIFY);
         assert_eq!(coord.crash_policy().crash_count(), 0);
+    }
+
+    #[test]
+    fn test_new_ota_0_pending() {
+        let entry0 = OtaSelectEntry::new_ota_0_pending(0);
+        assert_eq!(entry0.ota_seq, 1);
+        assert_eq!(entry0.ota_state, OtaSelectEntry::OTA_IMG_PENDING_VERIFY);
+        assert_eq!(entry0.crc, esp_crc32_le(0xFFFF_FFFF, &1u32.to_le_bytes()));
+
+        let entry5 = OtaSelectEntry::new_ota_0_pending(5);
+        assert_eq!(entry5.ota_seq, 5);
+        assert_eq!(entry5.ota_state, OtaSelectEntry::OTA_IMG_PENDING_VERIFY);
+        assert_eq!(entry5.crc, esp_crc32_le(0xFFFF_FFFF, &5u32.to_le_bytes()));
+    }
+
+    #[test]
+    fn test_multi_chunk_ota_assembly_preserves_full_header_and_tail() {
+        let mut img = [0xB4u8; 400];
+        img[0x00] = ESP_IMAGE_MAGIC_BYTE;
+        img[0x20..0x24].copy_from_slice(&ESP_APP_DESC_MAGIC_WORD.to_le_bytes());
+        img[0x30..0x50].fill(0);
+        img[0x30..0x30 + RUST_OTA_FIRMWARE_VERSION.len()]
+            .copy_from_slice(RUST_OTA_FIRMWARE_VERSION.as_bytes());
+        img[0x50..0x70].fill(0);
+        img[0x50..0x50 + REQUIRED_OTA_PROJECT_NAME.len()]
+            .copy_from_slice(REQUIRED_OTA_PROJECT_NAME.as_bytes());
+
+        let mut asm = OtaStreamAssembler::new(Some(img.len())).expect("asm");
+        // Three chunks of 100, 100, and 200 bytes (< 288 bytes per initial chunk)
+        let op1 = asm.ingest_chunk(&img[0..100]).expect("chunk 1");
+        assert_eq!(op1.bytes_written, 0);
+
+        let op2 = asm.ingest_chunk(&img[100..200]).expect("chunk 2");
+        assert_eq!(op2.bytes_written, 0);
+
+        // Chunk 3 crosses the 288-byte boundary (reaches 400 bytes)
+        let op3 = asm.ingest_chunk(&img[200..400]).expect("chunk 3");
+        assert_eq!(op3.flash_offset, OTA_0_PARTITION_OFFSET);
+        assert_eq!(op3.bytes_written, 400);
+
+        assert_eq!(asm.header_buf(), &img[0..288]);
+
+        let (slice1, slice2) = asm.get_flash_write_slices(&img[200..400], &op3);
+        assert_eq!(slice1.len(), 288);
+        assert_eq!(slice1, &img[0..288]);
+        assert_eq!(slice2.len(), 112);
+        assert_eq!(slice2, &img[288..400]);
+
+        let mut flash_mem = [0u8; 400];
+        asm.write_chunk_to_flash(&img[200..400], &op3, |off, data| {
+            let rel = (off - OTA_0_PARTITION_OFFSET) as usize;
+            flash_mem[rel..rel + data.len()].copy_from_slice(data);
+        })
+        .expect("flash write");
+        assert_eq!(&flash_mem[..], &img[..]);
+    }
+
+    #[test]
+    fn test_appended_sha256_verification_when_flag_set() {
+        let mut img = [0x77u8; 352]; // 320 payload + 32 SHA-256
+        img[0x00] = ESP_IMAGE_MAGIC_BYTE;
+        img[23] = 1; // hash_appended flag set!
+        img[0x20..0x24].copy_from_slice(&ESP_APP_DESC_MAGIC_WORD.to_le_bytes());
+        img[0x30..0x50].fill(0);
+        img[0x30..0x30 + RUST_OTA_FIRMWARE_VERSION.len()]
+            .copy_from_slice(RUST_OTA_FIRMWARE_VERSION.as_bytes());
+        img[0x50..0x70].fill(0);
+        img[0x50..0x50 + REQUIRED_OTA_PROJECT_NAME.len()]
+            .copy_from_slice(REQUIRED_OTA_PROJECT_NAME.as_bytes());
+
+        // Calculate expected SHA-256 over payload (first 320 bytes)
+        let mut p_hasher = Sha256Incremental::new();
+        p_hasher.update(&img[..320]);
+        let expected_digest = p_hasher.finalize();
+        img[320..352].copy_from_slice(&expected_digest);
+
+        let mut asm = OtaStreamAssembler::new(Some(352)).expect("asm");
+        asm.ingest_chunk(&img[..200]).expect("chunk 1");
+        asm.ingest_chunk(&img[200..]).expect("chunk 2");
+        assert!(asm.verify_appended_sha256().is_ok());
+        let (summary, _digest) = asm.finish_verified().expect("verified finish");
+        assert_eq!(summary.image_size, 352);
+
+        // Corrupted appended digest should fail verification
+        img[351] ^= 0xFF;
+        let mut bad_asm = OtaStreamAssembler::new(Some(352)).expect("bad asm");
+        bad_asm.ingest_chunk(&img).expect("feed corrupted");
+        assert!(bad_asm.verify_appended_sha256().is_err());
+        assert!(bad_asm.finish_verified().is_err());
+    }
+
+    #[test]
+    fn test_flash_word_alignment_helpers() {
+        assert!(is_flash_word_aligned(0x0016_0000));
+        assert!(is_flash_word_aligned(0x0016_0004));
+        assert!(!is_flash_word_aligned(0x0016_0001));
+        assert!(!is_flash_word_aligned(0x0016_0002));
+        assert!(!is_flash_word_aligned(0x0016_0003));
+        assert!(verify_flash_offset_aligned(0x0016_0000).is_ok());
+        assert!(verify_flash_offset_aligned(0x0016_0001).is_err());
     }
 }

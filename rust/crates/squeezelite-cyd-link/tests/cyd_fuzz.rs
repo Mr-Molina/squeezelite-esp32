@@ -38,9 +38,9 @@ proptest! {
         let _ = CydLinkProtocol::parse_command(s.as_bytes());
     }
 
-    /// Invariant: Roundtrip encoding & decoding of volume levels (0..=255).
+    /// Invariant: Roundtrip encoding & decoding of volume levels (0..=100).
     #[test]
-    fn fuzz_volume_roundtrip(vol in any::<u8>()) {
+    fn fuzz_volume_roundtrip(vol in 0..=100u8) {
         let mut buf = Vec::new();
         let enc_res = CydLinkProtocol::encode_message(&CydMessage::Volume(vol), &mut buf);
         prop_assert!(enc_res.is_ok());

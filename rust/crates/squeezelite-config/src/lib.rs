@@ -513,6 +513,9 @@ impl FlashJournal {
     /// `(sequence, entry_count, data_len)`.
     pub fn validate_sector(sector: &[u8]) -> Result<(u32, usize, usize), StorageError> {
         let (sequence, entry_count, data_len) = Self::read_sector_meta(sector)?;
+        if entry_count > 64 {
+            return Err(StorageError::CapacityExceeded);
+        }
         let mut offset = Self::HEADER_SIZE;
         for index in 0..entry_count {
             let (key, val, expected_crc, next) = Self::entry_at(sector, offset);
@@ -594,8 +597,8 @@ impl FlashJournal {
         sector_a: &mut [u8],
         sector_b: &mut [u8],
     ) -> Result<(bool, usize), StorageError> {
-        let meta_a = Self::read_sector_meta(sector_a);
-        let meta_b = Self::read_sector_meta(sector_b);
+        let meta_a = Self::validate_sector(sector_a);
+        let meta_b = Self::validate_sector(sector_b);
 
         let (write_to_b, next_seq) = match (meta_a, meta_b) {
             (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
@@ -874,6 +877,9 @@ impl WifiCredentials {
         if self.ssid.is_empty() {
             return Err(StorageError::InvalidFormat);
         }
+        if !self.passphrase.is_empty() && self.passphrase.len() < 8 {
+            return Err(StorageError::InvalidFormat);
+        }
         if let Some(ip) = self.static_ip {
             if ip == [0, 0, 0, 0] || ip == [255, 255, 255, 255] {
                 return Err(StorageError::InvalidFormat);
@@ -886,6 +892,11 @@ impl WifiCredentials {
         }
         if let Some(mask) = self.subnet {
             if mask == [0, 0, 0, 0] {
+                return Err(StorageError::InvalidFormat);
+            }
+        }
+        if let Some(dns) = self.dns {
+            if dns == [0, 0, 0, 0] || dns == [255, 255, 255, 255] {
                 return Err(StorageError::InvalidFormat);
             }
         }
@@ -1291,6 +1302,33 @@ mod tests {
     }
 
     #[test]
+    fn test_save_to_dual_sectors_corrupt_entry_crc_in_sector_b() {
+        let mut store = MemConfigStore::<16>::new();
+        store.set_str("k1", "v1").unwrap();
+
+        let mut sector_a = [0u8; 256];
+        let mut sector_b = [0u8; 256];
+
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_a, 1).unwrap();
+        store.set_str("k1", "v2").unwrap();
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 2).unwrap();
+
+        // Corrupt entry CRC in sector B
+        sector_b[FlashJournal::HEADER_SIZE + 3] ^= 0xFF;
+
+        // With validate_sector, sector B is detected as CorruptedData,
+        // falling back to valid sector A (seq 1) and overwriting sector B with seq 2
+        let (wrote_b, bytes) =
+            FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+        assert!(wrote_b);
+        assert!(bytes > FlashJournal::HEADER_SIZE);
+
+        let (seq_b, count_b, _) = FlashJournal::validate_sector(&sector_b).unwrap();
+        assert_eq!(seq_b, 2);
+        assert_eq!(count_b, 1);
+    }
+
+    #[test]
     fn test_non_destructive_load_on_corruption() {
         let mut store = MemConfigStore::<16>::new();
         store.set_str("existing", "preserved").unwrap();
@@ -1383,7 +1421,16 @@ mod tests {
 
     #[test]
     fn test_wifi_credentials_validation() {
-        let mut creds = WifiCredentials::new("SSID", "PASS").unwrap();
+        let mut creds = WifiCredentials::new("SSID", "ValidPassword123").unwrap();
+        assert!(creds.validate().is_ok());
+
+        // Passphrase validation: empty is allowed (open Wi-Fi), but 1..=7 is rejected
+        creds.passphrase.clear();
+        assert!(creds.validate().is_ok());
+        creds.passphrase.push_str("short").unwrap();
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.passphrase.clear();
+        creds.passphrase.push_str("12345678").unwrap();
         assert!(creds.validate().is_ok());
 
         creds.static_ip = Some([0, 0, 0, 0]);
@@ -1405,12 +1452,20 @@ mod tests {
         creds.subnet = Some([255, 255, 255, 0]);
         assert!(creds.validate().is_ok());
 
+        // DNS validation: 0.0.0.0 and 255.255.255.255 are rejected
+        creds.dns = Some([0, 0, 0, 0]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.dns = Some([255, 255, 255, 255]);
+        assert_eq!(creds.validate(), Err(StorageError::InvalidFormat));
+        creds.dns = Some([1, 1, 1, 1]);
+        assert!(creds.validate().is_ok());
+
         // PROTOCFG-808: save_to and load_from enforce validation
         let mut store = MemConfigStore::<16>::new();
-        let mut bad_creds = WifiCredentials::new("", "PASS").unwrap();
+        let mut bad_creds = WifiCredentials::new("", "ValidPassword123").unwrap();
         assert_eq!(bad_creds.save_to(&mut store), Err(ConfigError::InvalidFormat));
 
-        bad_creds = WifiCredentials::new("ValidSSID", "PASS").unwrap();
+        bad_creds = WifiCredentials::new("ValidSSID", "ValidPassword123").unwrap();
         bad_creds.static_ip = Some([0, 0, 0, 0]);
         assert_eq!(bad_creds.save_to(&mut store), Err(ConfigError::InvalidFormat));
 

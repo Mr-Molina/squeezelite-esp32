@@ -1,4 +1,5 @@
-//! Comprehensive unit and golden vector tests for pure-Rust AirPlay 1 (RAOP) engine.
+//! Comprehensive unit and golden vector tests for pure-Rust AirPlay 1 (RAOP)
+//! engine.
 
 use squeezelite_raop::crypto::airport_express_key;
 use squeezelite_raop::crypto::base64_decode;
@@ -66,7 +67,8 @@ const CT1024_B64: &str = concat!(
     "cAjUosPDzEfF3RdGUqSHmjQNeNM+FBFs6hs="
 );
 
-// Encrypted AES session key under 2048-bit Airport Express key with PKCS#1 v1.5 padding
+// Encrypted AES session key under 2048-bit Airport Express key with PKCS#1
+// v1.5 padding
 const CT2048_PKCS1_B64: &str = concat!(
     "FqQK+xm2PQ0e+qwm4aFnbxq7wMcEi6VyUOKwPnYqROLFZ1ZtRdyam+eC8ocOVYVDiddV",
     "R1D2PPDCYeytdmu4f6hbXz16wta/9oGkjhtISBmKW/5X6sEhiTT9SDjnDpSNBEQ3dPE/",
@@ -76,7 +78,8 @@ const CT2048_PKCS1_B64: &str = concat!(
     "AA=="
 );
 
-// Encrypted AES session key under 2048-bit Airport Express key with OAEP padding
+// Encrypted AES session key under 2048-bit Airport Express key with OAEP
+// padding
 const CT2048_OAEP_B64: &str = concat!(
     "N+L5GvPLwoErSURs01KvbNP6CVp+T0CRP9pys3q6vbgHkn5GpslsU9JEcIcT4nzxLpjk",
     "Ir4uLNCE7RF70tQjxTxLXd4WZMuclBWeXxzC6lC0SQdUMWJf8Gn8EcQesumslJ+1xUr/",
@@ -167,7 +170,9 @@ fn test_rsa_padding_validation_and_errors() {
     );
 
     // Plaintext with too short padding (< 8 bytes)
-    let short_pad = [0x00, 0x02, 0xAA, 0xBB, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let short_pad = [
+        0x00, 0x02, 0xAA, 0xBB, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    ];
     assert_eq!(
         unpad_pkcs1_v15_type2(&short_pad),
         Err(CryptoError::InvalidPadding)
@@ -190,7 +195,10 @@ fn test_aes128_cbc_audio_packet_decryption() {
         0x0f, 0x10,
     ];
     let ct = hex_to_bytes("7be957563e9135f57b777a5ec15efe9853af3807d7ba56b47b4c27e6904c2116212223");
-    let pt_expected = hex_to_bytes("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223");
+    let pt_expected = hex_to_bytes(concat!(
+        "0102030405060708090a0b0c0d0e0f10",
+        "1112131415161718191a1b1c1d1e1f20212223"
+    ));
 
     let mut buf = ct.clone();
     let cipher = Aes128Cbc::new(&GOLDEN_AES_KEY);
@@ -344,7 +352,10 @@ fn test_rtsp_errors() {
         Err(RtspError::MalformedRequestLine)
     );
 
-    let invalid_cl = "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 1\r\nContent-Length: not-a-number\r\n\r\n";
+    let invalid_cl = concat!(
+        "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r\n",
+        "CSeq: 1\r\nContent-Length: not-a-number\r\n\r\n"
+    );
     assert_eq!(
         RtspRequest::parse(invalid_cl.as_bytes()),
         Err(RtspError::InvalidContentLength)
@@ -401,6 +412,13 @@ fn test_rtp_audio_receiver_configure_alac() {
     let fmtp = "96 352 0 16 40 10 14 2 255 0 0 44100";
     rx.configure_alac(fmtp).expect("alac init");
     rx.configure_crypto(&GOLDEN_AES_KEY, &[1u8; 16]);
+
+    let pkt = [
+        0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00, 0x00,
+        0x00,
+    ];
+    let _ = rx.process_packet(&pkt);
+    assert_eq!(rx.packets_received(), 1);
 }
 
 #[test]
@@ -860,7 +878,8 @@ fn test_wo253_sync_drift_negative_ntp_rejected() {
     let ntp = NtpTimingPacket::new_response(1_000, ms_to_ntp(50_000), ms_to_ntp(50_000));
     assert!(tracker.record_ntp_timing(&ntp, 1_010));
 
-    // Sync packet with remote NTP timestamp earlier than anchor (40_000 < 50_000): must be rejected
+    // Sync packet with remote NTP timestamp earlier than anchor (40_000 <
+    // 50_000): must be rejected
     let stale_sync = RtpSyncPacket::new(
         true,
         0,
@@ -870,6 +889,50 @@ fn test_wo253_sync_drift_negative_ntp_rejected() {
         88_200,
     );
     assert!(!tracker.record_rtp_sync(&stale_sync, 1_500));
+}
+
+#[test]
+fn test_rtsp_truncated_body_rejected() {
+    let req_truncated = concat!(
+        "SET_PARAMETER rtsp://127.0.0.1/1 RTSP/1.0\r\n",
+        "CSeq: 1\r\n",
+        "Content-Length: 10\r\n\r\n",
+        "short"
+    );
+    assert_eq!(
+        RtspRequest::parse(req_truncated.as_bytes()),
+        Err(RtspError::InvalidContentLength)
+    );
+}
+
+#[test]
+fn test_jitter_buffer_non_power_of_two_capacity_rounding() {
+    let jb5 = RtpJitterBuffer::new(5);
+    assert_eq!(jb5.capacity(), 8);
+    let jb0 = RtpJitterBuffer::new(0);
+    assert_eq!(jb0.capacity(), 1);
+    let jb17 = RtpJitterBuffer::new(17);
+    assert_eq!(jb17.capacity(), 32);
+}
+
+#[test]
+fn test_expected_playtime_ms_negative_delta_saturating() {
+    let mut tracker = SyncDriftTracker::new(44_100, 10);
+    let ntp = NtpTimingPacket::new_response(1_000, ms_to_ntp(50_000), ms_to_ntp(50_000));
+    assert!(tracker.record_ntp_timing(&ntp, 1_010));
+
+    let sync = RtpSyncPacket::new(
+        true,
+        0,
+        0,
+        (ms_to_ntp(50_100) >> 32) as u32,
+        ms_to_ntp(50_100) as u32,
+        441_000,
+    );
+    assert!(tracker.record_rtp_sync(&sync, 1_100));
+
+    let playtime = tracker.expected_playtime_ms(0);
+    assert_eq!(playtime, Some(0));
 }
 
 

@@ -174,6 +174,19 @@ impl Resampler {
         self.interp
     }
 
+    /// Reconfigures sample rates in-place without heap reallocation.
+    pub fn reconfigure(&mut self, from_hz: u32, to_hz: u32) {
+        let safe_from = from_hz.max(1);
+        let safe_to = to_hz.max(1);
+        if self.from_hz == safe_from && self.to_hz == safe_to {
+            return;
+        }
+        self.from_hz = safe_from;
+        self.to_hz = safe_to;
+        populate_polyphase_table(&mut self.coeffs_q30, safe_from, safe_to, self.quality);
+        self.reset();
+    }
+
     /// Resets the internal delay history and rational phase accumulator.
     pub fn reset(&mut self) {
         for frame in &mut self.history {
@@ -226,7 +239,7 @@ impl Resampler {
         let out_frames = output.len() / 2;
         let mut out_idx = 0usize;
 
-        while out_idx < out_frames && self.flush_remaining > 0 {
+        while out_idx < out_frames {
             while self.need_input_frames > 0 {
                 if self.flush_remaining == 0 {
                     return out_idx * 2;
@@ -243,6 +256,10 @@ impl Resampler {
             out_idx += 1;
 
             self.advance_phase();
+
+            if self.flush_remaining == 0 && self.need_input_frames > 0 {
+                break;
+            }
         }
 
         out_idx * 2
@@ -310,18 +327,20 @@ impl Resampler {
             }
         }
 
-        let out_l = ((acc_l + HALF_Q30) >> 30).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
-        let out_r = ((acc_r + HALF_Q30) >> 30).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        let out_l = (acc_l.saturating_add(HALF_Q30) >> 30)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        let out_r = (acc_r.saturating_add(HALF_Q30) >> 30)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
         (out_l as i32, out_r as i32)
     }
 }
 
-fn build_polyphase_table(
+fn populate_polyphase_table(
+    table: &mut [[i32; MAX_TAPS]],
     from_hz: u32,
     to_hz: u32,
     quality: ResampleQuality,
-) -> Box<[[i32; MAX_TAPS]]> {
-    let mut table = alloc::vec![[0_i32; MAX_TAPS]; PHASE_ROWS].into_boxed_slice();
+) {
     let taps = quality.taps();
     let beta = quality.kaiser_beta();
     let i0_beta = bessel_i0_f64(beta);
@@ -387,7 +406,15 @@ fn build_polyphase_table(
 
         phase += 1;
     }
+}
 
+fn build_polyphase_table(
+    from_hz: u32,
+    to_hz: u32,
+    quality: ResampleQuality,
+) -> Box<[[i32; MAX_TAPS]]> {
+    let mut table = alloc::vec![[0_i32; MAX_TAPS]; PHASE_ROWS].into_boxed_slice();
+    populate_polyphase_table(&mut table, from_hz, to_hz, quality);
     table
 }
 
@@ -495,5 +522,22 @@ mod tests {
         assert!(tail_samples > 0);
         r.reset();
         assert_eq!(r.flush(&mut tail), 0);
+    }
+
+    #[test]
+    fn test_resampler_reconfigure_in_place() {
+        let mut r = Resampler::with_interpolation(44_100, 48_000, ResampleQuality::Basic);
+        assert_eq!(r.from_hz(), 44_100);
+        assert_eq!(r.to_hz(), 48_000);
+
+        r.reconfigure(48_000, 96_000);
+        assert_eq!(r.from_hz(), 48_000);
+        assert_eq!(r.to_hz(), 96_000);
+
+        let in_buf = [10_000_i32; 64];
+        let mut out_buf = [0_i32; 128];
+        let (consumed, produced) = r.process(&in_buf, &mut out_buf);
+        assert_eq!(consumed, 64);
+        assert!(produced > 64);
     }
 }

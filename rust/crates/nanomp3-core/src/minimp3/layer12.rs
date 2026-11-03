@@ -112,7 +112,9 @@ fn l12_read_scalefactors(bs: &mut Bs, sci: &mut ScaleInfo, bands: usize) {
         for (j, m) in [4, 2, 1].into_iter().enumerate() {
             if mask & m != 0 {
                 let b = bs.get_bits(6) as usize;
-                s = G_DEQ_L12[ba - 2][b % 3] * (1 << 21 >> (b / 3)) as f32;
+                if ba >= 2 {
+                    s = G_DEQ_L12[ba - 2][b % 3] * (1 << 21 >> (b / 3)) as f32;
+                }
             }
             sci.scf[3 * i + j] = s;
         }
@@ -220,6 +222,10 @@ pub(super) fn decode_frame<S: Sample>(
     nch: usize,
     compat: bool,
 ) -> usize {
+    let required_samples = hdr.frame_samples() as usize * nch;
+    if pcm.len() < required_samples {
+        return 0;
+    }
     let mut sci = ScaleInfo {
         scf: [0.; 3 * 64],
         total_bands: 0,
@@ -261,4 +267,23 @@ pub(super) fn decode_frame<S: Sample>(
         }
     }
     hdr.frame_samples() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_l12_read_scalefactors_ba_lt_2() {
+        let dummy = [0xFFu8; 16];
+        let mut bs = Bs::new(&dummy, 16);
+        let mut sci = ScaleInfo {
+            scf: [0.0; 3 * 64],
+            total_bands: 4,
+            stereo_bands: 0,
+            bitalloc: [1; 64], // ba = 1 (< 2), must not panic underflowing ba - 2
+            scfcod: [0; 64],
+        };
+        l12_read_scalefactors(&mut bs, &mut sci, 4);
+    }
 }

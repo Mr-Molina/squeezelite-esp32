@@ -430,7 +430,7 @@ impl<'a> ServerCommand<'a> {
             Self::Unknown {
                 opcode: [b'e', b'q', b'l', b'z'],
                 payload,
-            } => Some(payload),
+            } if !payload.is_empty() && payload.len() <= 16 => Some(payload),
             _ => None,
         }
     }
@@ -440,6 +440,29 @@ impl<'a> ServerCommand<'a> {
         match *self {
             Self::Unknown {
                 opcode: [b'l', b'o', b'u', b'd'],
+                payload,
+            } if !payload.is_empty() => Some(payload[0]),
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(true)` if loudness is enabled (`!= 0`) or `Some(false)`
+    /// if disabled (`0`) when this command is a `loud` frame.
+    pub fn loudness_enabled(&self) -> Option<bool> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'l', b'o', b'u', b'd'],
+                payload,
+            } if !payload.is_empty() => Some(payload[0] != 0),
+            _ => None,
+        }
+    }
+
+    /// Extracts the audio codec format byte if this command is a `codc` frame.
+    pub fn codec_format(&self) -> Option<u8> {
+        match *self {
+            Self::Unknown {
+                opcode: [b'c', b'o', b'd', b'c'],
                 payload,
             } if !payload.is_empty() => Some(payload[0]),
             _ => None,
@@ -600,12 +623,12 @@ impl SlimprotoParser {
             let gl = if old_left <= 0 {
                 0
             } else {
-                (old_left as u32) << 8
+                ((old_left as u32).saturating_mul(256)).min(65536)
             };
             let gr = if old_right <= 0 {
                 0
             } else {
-                (old_right as u32) << 8
+                ((old_right as u32).saturating_mul(256)).min(65536)
             };
             (gl, gr)
         } else {
@@ -640,7 +663,7 @@ impl SlimprotoParser {
         // SetDevice; variable-length device setting frames (e.g. id=0 player
         // name strings) must not corrupt sample_rate with ASCII name bytes.
         match payload.len() {
-            4 => {
+            4 if payload[0] != 0 => {
                 let sample_rate =
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(ServerCommand::SetDevice { sample_rate })
@@ -1548,14 +1571,14 @@ mod tests {
 
     #[test]
     fn test_parse_setd_variants() {
-        // Standard 4-byte payload (6-byte frame header)
+        // Standard 4-byte payload (6-byte frame header) with non-zero ID
         let mut frame_4b = [0u8; 10]; // 2 + 4 + 4
         frame_4b[0..2].copy_from_slice(&8u16.to_be_bytes()); // length = 8 (4 opcode + 4 payload)
         frame_4b[2..6].copy_from_slice(b"setd");
-        frame_4b[6..10].copy_from_slice(&44100u32.to_be_bytes());
+        frame_4b[6..10].copy_from_slice(&0x01020304u32.to_be_bytes());
         let (cmd, consumed) = SlimprotoParser::parse_frame(&frame_4b).unwrap();
         assert_eq!(consumed, 10);
-        assert_eq!(cmd, ServerCommand::SetDevice { sample_rate: 44100 });
+        assert_eq!(cmd, ServerCommand::SetDevice { sample_rate: 0x01020304 });
 
         // 1-byte payload (6-byte frame header)
         let mut frame_1b = [0u8; 7]; // 2 + 4 + 1
@@ -1684,6 +1707,21 @@ mod tests {
         let dac_setting = cmd_dac.device_setting().expect("Expected 1-byte device setting");
         assert_eq!(dac_setting.id, 4);
         assert!(dac_setting.data.is_empty());
+
+        // AUD08-01: 4-byte setd with id = 0 (3-char player name e.g. "Bob")
+        // must parse as Unknown / device_setting, not SetDevice { sample_rate }
+        let frame_bob = [0x00, 0x08, b's', b'e', b't', b'd', 0x00, b'B', b'o', b'b'];
+        let (cmd_bob, _) = SlimprotoParser::parse_frame(&frame_bob).unwrap();
+        assert!(matches!(
+            cmd_bob,
+            ServerCommand::Unknown {
+                opcode: [b's', b'e', b't', b'd'],
+                ..
+            }
+        ));
+        let setting_bob = cmd_bob.device_setting().expect("Expected 3-char player name");
+        assert_eq!(setting_bob.id, 0);
+        assert_eq!(setting_bob.data, b"Bob");
     }
 
     #[test]
@@ -1872,6 +1910,30 @@ mod tests {
     }
 
     #[test]
+    fn test_audg_legacy_positive_old_gain_saturation() {
+        let mut frame = [0u8; 26];
+        frame[0..4].copy_from_slice(b"audg");
+        frame[4..8].copy_from_slice(&18u32.to_be_bytes());
+        frame[8..12].copy_from_slice(&1000i32.to_be_bytes());
+        frame[12..16].copy_from_slice(&i32::MAX.to_be_bytes());
+        frame[16] = 0;
+        frame[17] = 128;
+        frame[18..22].copy_from_slice(&0u32.to_be_bytes());
+        frame[22..26].copy_from_slice(&0u32.to_be_bytes());
+
+        let (cmd, _) = SlimprotoParser::parse_frame(&frame).unwrap();
+        assert_eq!(
+            cmd,
+            ServerCommand::AudioGain {
+                gain_left: 65536,
+                gain_right: 65536,
+                digital_atten: 0,
+                preamp: 128,
+            }
+        );
+    }
+
+    #[test]
     fn test_build_resp_dsco_meta_and_setd_name() {
         // RESP
         let headers = b"HTTP/1.0 200 OK\r\nContent-Type: audio/flac\r\n\r\n";
@@ -2040,7 +2102,7 @@ mod tests {
         assert_eq!(sample_rate_from_index(b'8'), 24000);
         assert_eq!(sample_rate_from_index(b'9'), 96000);
 
-        // eqlz / loud helper accessors
+        // eqlz / loud / codc helper accessors
         let mut eqlz_frame = [0u8; 14];
         eqlz_frame[0..4].copy_from_slice(b"eqlz");
         eqlz_frame[4..8].copy_from_slice(&6u32.to_be_bytes());
@@ -2051,12 +2113,31 @@ mod tests {
             Some(&[10, 20, 30, 40, 50, 60][..])
         );
 
+        // eqlz frames with > 16 bytes must return None
+        let mut eqlz_too_long = [0u8; 25];
+        eqlz_too_long[0..4].copy_from_slice(b"eqlz");
+        eqlz_too_long[4..8].copy_from_slice(&17u32.to_be_bytes());
+        let (cmd_eqlz_long, _) = SlimprotoParser::parse_frame(&eqlz_too_long).unwrap();
+        assert_eq!(cmd_eqlz_long.equalizer_gains(), None);
+
         let mut loud_frame = [0u8; 9];
         loud_frame[0..4].copy_from_slice(b"loud");
         loud_frame[4..8].copy_from_slice(&1u32.to_be_bytes());
         loud_frame[8] = 42;
         let (cmd_loud, _) = SlimprotoParser::parse_frame(&loud_frame).unwrap();
         assert_eq!(cmd_loud.loudness_gain(), Some(42));
+        assert_eq!(cmd_loud.loudness_enabled(), Some(true));
+
+        loud_frame[8] = 0;
+        let (cmd_loud_off, _) = SlimprotoParser::parse_frame(&loud_frame).unwrap();
+        assert_eq!(cmd_loud_off.loudness_enabled(), Some(false));
+
+        let mut codc_frame = [0u8; 9];
+        codc_frame[0..4].copy_from_slice(b"codc");
+        codc_frame[4..8].copy_from_slice(&1u32.to_be_bytes());
+        codc_frame[8] = b'p';
+        let (cmd_codc, _) = SlimprotoParser::parse_frame(&codc_frame).unwrap();
+        assert_eq!(cmd_codc.codec_format(), Some(b'p'));
     }
 
     #[test]

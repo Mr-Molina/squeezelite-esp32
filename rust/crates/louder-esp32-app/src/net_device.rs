@@ -428,11 +428,35 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> SmoltcpStreamSource<S, St>
             let location = head.header(b"location").ok_or(StreamError::BadResponse)?;
             let (addr, host, path) = match RedirectPolicy::classify(location)? {
                 RedirectTarget::SameOrigin { path } => (st.addr, st.host.clone(), path.to_vec()),
-                RedirectTarget::Absolute { authority, path } => (
-                    parse_ipv4_authority(authority).ok_or(StreamError::ConnectFailed)?,
-                    authority.to_vec(),
-                    path.to_vec(),
-                ),
+                RedirectTarget::Absolute { authority, path } => {
+                    let addr = if let Some(parsed) = parse_ipv4_authority(authority) {
+                        parsed
+                    } else {
+                        // Reuse initial stream's IP if host matches, with updated port.
+                        let (host_part, port_part) =
+                            match authority.iter().position(|&b| b == b':') {
+                                Some(idx) => (&authority[..idx], Some(&authority[idx + 1..])),
+                                None => (authority, None),
+                            };
+                        let initial_host_part = match st.host.iter().position(|&b| b == b':') {
+                            Some(idx) => &st.host[..idx],
+                            None => &st.host[..],
+                        };
+                        if host_part.eq_ignore_ascii_case(initial_host_part) {
+                            let port = port_part
+                                .and_then(|p| core::str::from_utf8(p).ok())
+                                .and_then(|p| p.parse::<u16>().ok())
+                                .unwrap_or(st.addr.port);
+                            NetAddr {
+                                ip: st.addr.ip,
+                                port,
+                            }
+                        } else {
+                            return Err(StreamError::ConnectFailed);
+                        }
+                    };
+                    (addr, authority.to_vec(), path.to_vec())
+                }
             };
             st.request = RedirectPolicy::rewrite_request(&st.template, &host, &path);
             st.host = host;

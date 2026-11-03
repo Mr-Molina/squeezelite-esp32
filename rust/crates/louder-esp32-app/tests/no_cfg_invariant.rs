@@ -1,8 +1,9 @@
 //! Device/host parity invariant (spec §3.3, Task 7).
 //!
-//! The coordinator and the pipeline are the single engine shared by host and device. Platform
-//! differences live in the I/O trait implementations and in bring-up, never in these two files,
-//! so neither may mention `target_arch`. Codec-set differences use the `std-codecs` feature.
+//! The coordinator and the pipeline are the single engine shared by host and
+//! device. Platform differences live in the I/O trait implementations and in
+//! bring-up, never in these two files, so neither may mention `target_arch`.
+//! Codec-set differences use the `std-codecs` feature.
 
 const COORDINATOR_SRC: &str = include_str!("../src/coordinator.rs");
 const PIPELINE_SRC: &str = include_str!("../src/pipeline.rs");
@@ -27,8 +28,9 @@ fn pipeline_has_no_target_arch_cfg() {
     assert!(hits.is_empty(), "src/pipeline.rs mentions target_arch: {hits:?}");
 }
 
-/// Task 10: the persistence logic is platform-free and fully host-tested; the device flash
-/// commit and its `runtime-flash-persist` gate live only in `tasks.rs` / `main.rs`.
+/// Task 10: the persistence logic is platform-free and fully host-tested; the
+/// device flash commit and its `runtime-flash-persist` gate live only in
+/// `tasks.rs` / `main.rs`.
 const CONFIG_HANDLE_SRC: &str = include_str!("../src/config_handle.rs");
 
 #[test]

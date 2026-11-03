@@ -63,14 +63,48 @@ impl MdnsConfig {
     }
 }
 
+/// DNS standard IN class (Internet).
+pub const DNS_CLASS_IN: u16 = 0x0001;
+/// DNS IN class with cache-flush bit set.
+pub const DNS_CLASS_IN_FLUSH: u16 = 0x8001;
+
 /// Binary mDNS response packet encoder.
 pub struct MdnsBuilder;
 
 impl MdnsBuilder {
     /// Encodes a dotted domain name into length-prefixed DNS wire labels
-    /// ending with a zero byte.
+    /// ending with a zero byte. Safely preserves instance names that contain dots.
     pub fn encode_dns_name(name: &str) -> Vec<u8> {
         let mut out = Vec::new();
+
+        if let Some(prefix) = name.strip_suffix("._raop._tcp.local") {
+            let bytes = prefix.as_bytes();
+            let len = core::cmp::min(bytes.len(), 63) as u8;
+            out.push(len);
+            out.extend_from_slice(&bytes[..len as usize]);
+            for label in &["_raop", "_tcp", "local"] {
+                let b = label.as_bytes();
+                out.push(b.len() as u8);
+                out.extend_from_slice(b);
+            }
+            out.push(0);
+            return out;
+        }
+
+        if let Some(prefix) = name.strip_suffix("._airplay._tcp.local") {
+            let bytes = prefix.as_bytes();
+            let len = core::cmp::min(bytes.len(), 63) as u8;
+            out.push(len);
+            out.extend_from_slice(&bytes[..len as usize]);
+            for label in &["_airplay", "_tcp", "local"] {
+                let b = label.as_bytes();
+                out.push(b.len() as u8);
+                out.extend_from_slice(b);
+            }
+            out.push(0);
+            return out;
+        }
+
         for label in name.split('.') {
             if label.is_empty() {
                 continue;
@@ -93,7 +127,7 @@ impl MdnsBuilder {
     ) {
         records.extend_from_slice(&Self::encode_dns_name(service_type));
         records.extend_from_slice(&12u16.to_be_bytes()); // Type: PTR
-        records.extend_from_slice(&0x8001u16.to_be_bytes()); // Class: IN (cache-flush)
+        records.extend_from_slice(&DNS_CLASS_IN.to_be_bytes()); // Class: IN (no cache-flush on PTR)
         records.extend_from_slice(&ttl.to_be_bytes());
 
         let target_bytes = Self::encode_dns_name(instance_target);

@@ -154,9 +154,25 @@ impl CydLinkProtocol {
     }
 
     /// Parses a single line from a buffer (supporting `\n` or `\r\n`).
-    /// Implements symmetric deserialization for all message types.
+    /// Implements symmetric deserialization for all message types and NDJSON.
     pub fn parse_line(line: &[u8]) -> Result<CydMessage, LinkError> {
-        let trimmed = Self::trim_crlf(line);
+        let mut trimmed = Self::trim_crlf(line);
+
+        // Optional *XX XOR checksum validation suffix (AUD14-SEC-001)
+        if trimmed.len() >= 3 && trimmed[trimmed.len() - 3] == b'*' {
+            let payload = &trimmed[..trimmed.len() - 3];
+            let hex1 = trimmed[trimmed.len() - 2];
+            let hex2 = trimmed[trimmed.len() - 1];
+            let parsed_chk = parse_hex_u8(hex1, hex2).ok_or(LinkError::InvalidFrame)?;
+            let mut calc_chk = 0u8;
+            for &b in payload {
+                calc_chk ^= b;
+            }
+            if parsed_chk != calc_chk {
+                return Err(LinkError::InvalidFrame);
+            }
+            trimmed = payload;
+        }
 
         if let Some(rest) = trimmed.strip_prefix(b"STATE=") {
             // Exact single-byte match to prevent semantic inversion (CYD-005)
@@ -168,8 +184,14 @@ impl CydLinkProtocol {
             }
         } else if let Some(rest) = trimmed.strip_prefix(b"VOL=") {
             let s = core::str::from_utf8(rest).map_err(|_| LinkError::InvalidFrame)?;
-            let vol: u8 = parse_u8(s).ok_or(LinkError::InvalidFrame)?;
-            Ok(CydMessage::Volume(vol))
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(LinkError::InvalidFrame);
+            }
+            let vol = parse_u32(s).ok_or(LinkError::ValueOutOfRange)?;
+            if vol > 100 {
+                return Err(LinkError::ValueOutOfRange);
+            }
+            Ok(CydMessage::Volume(vol as u8))
         } else if let Some(rest) = trimmed.strip_prefix(b"META=") {
             let mut parts = rest.splitn(2, |&b| b == b';');
             let artist_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
@@ -208,6 +230,13 @@ impl CydLinkProtocol {
             let rssi_str = core::str::from_utf8(rssi_bytes).map_err(|_| LinkError::InvalidFrame)?;
             let rssi: i8 = parse_i8(rssi_str).ok_or(LinkError::InvalidFrame)?;
             Ok(CydMessage::WifiStatus { connected, rssi })
+        } else if let Ok(s) = core::str::from_utf8(trimmed) {
+            let s = s.trim();
+            if s.starts_with('{') && s.ends_with('}') {
+                parse_json_message(s)
+            } else {
+                Err(LinkError::InvalidFrame)
+            }
         } else {
             Err(LinkError::InvalidFrame)
         }
@@ -358,30 +387,28 @@ fn find_json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                 in_quotes = false;
             }
             i += 1;
-        } else {
-            if b == b'"' {
-                // Outside string quotes: check if this quote starts `"key":`
-                if i + pat_len <= bytes.len()
-                    && &bytes[i + 1..i + 1 + k_bytes.len()] == k_bytes
-                    && bytes[i + 1 + k_bytes.len()] == b'"'
-                {
-                    // Check if followed by optional whitespace and ':'
-                    let mut colon_idx = i + pat_len;
-                    while colon_idx < bytes.len() && bytes[colon_idx].is_ascii_whitespace() {
-                        colon_idx += 1;
-                    }
-                    if colon_idx < bytes.len() && bytes[colon_idx] == b':' {
-                        let after_colon = &json[colon_idx + 1..];
-                        return Some(after_colon.trim_start());
-                    }
+        } else if b == b'"' {
+            // Outside string quotes: check if this quote starts `"key":`
+            if i + pat_len <= bytes.len()
+                && &bytes[i + 1..i + 1 + k_bytes.len()] == k_bytes
+                && bytes[i + 1 + k_bytes.len()] == b'"'
+            {
+                // Check if followed by optional whitespace and ':'
+                let mut colon_idx = i + pat_len;
+                while colon_idx < bytes.len() && bytes[colon_idx].is_ascii_whitespace() {
+                    colon_idx += 1;
                 }
-                // Entered a string property or string value
-                in_quotes = true;
-                escaped = false;
-                i += 1;
-            } else {
-                i += 1;
+                if colon_idx < bytes.len() && bytes[colon_idx] == b':' {
+                    let after_colon = &json[colon_idx + 1..];
+                    return Some(after_colon.trim_start());
+                }
             }
+            // Entered a string property or string value
+            in_quotes = true;
+            escaped = false;
+            i += 1;
+        } else {
+            i += 1;
         }
     }
     None
@@ -543,6 +570,124 @@ fn parse_i8(s: &str) -> Option<i8> {
     }
 }
 
+fn parse_hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_hex_u8(b1: u8, b2: u8) -> Option<u8> {
+    let h1 = parse_hex_digit(b1)?;
+    let h2 = parse_hex_digit(b2)?;
+    Some((h1 << 4) | h2)
+}
+
+fn parse_json_message(json: &str) -> Result<CydMessage, LinkError> {
+    let evt_rest = find_json_field(json, "event").ok_or(LinkError::InvalidFrame)?;
+    let evt_inner = evt_rest.strip_prefix('"').ok_or(LinkError::InvalidFrame)?;
+    let end_quote = evt_inner.find('"').ok_or(LinkError::InvalidFrame)?;
+    let evt_name = &evt_inner[..end_quote];
+
+    match evt_name {
+        "meta" => {
+            let mut artist = String::<64>::new();
+            if let Some(a_rest) = find_json_field(json, "artist") {
+                if let Some(a_inner) = a_rest.strip_prefix('"') {
+                    if let Some(end) = a_inner.find('"') {
+                        let _ = artist.push_str(truncate_utf8(&a_inner[..end], 64));
+                    }
+                }
+            }
+            let mut title = String::<64>::new();
+            if let Some(t_rest) = find_json_field(json, "title") {
+                if let Some(t_inner) = t_rest.strip_prefix('"') {
+                    if let Some(end) = t_inner.find('"') {
+                        let _ = title.push_str(truncate_utf8(&t_inner[..end], 64));
+                    }
+                }
+            }
+            Ok(CydMessage::TrackMetadata { artist, title })
+        }
+        "status" => {
+            let has_state = find_json_field(json, "state").is_some();
+            let has_vol = find_json_field(json, "vol").is_some();
+            let has_progress = find_json_field(json, "elapsed").is_some()
+                || find_json_field(json, "duration").is_some();
+            let has_wifi = find_json_field(json, "wifi").is_some();
+
+            // Compound telemetry frames cannot map to a single CydMessage variant
+            let field_types = (has_state as u8)
+                + (has_vol as u8)
+                + (has_progress as u8)
+                + (has_wifi as u8);
+            if field_types != 1 {
+                return Err(LinkError::InvalidFrame);
+            }
+
+            if let Some(st_rest) = find_json_field(json, "state") {
+                if let Some(st_inner) = st_rest.strip_prefix('"') {
+                    if let Some(end) = st_inner.find('"') {
+                        let state = match &st_inner[..end] {
+                            "play" => PlayState::Playing,
+                            "pause" => PlayState::Paused,
+                            _ => PlayState::Stopped,
+                        };
+                        return Ok(CydMessage::PlaybackState(state));
+                    }
+                }
+            }
+            if let Some(vol_rest) = find_json_field(json, "vol") {
+                let end = vol_rest
+                    .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+                    .unwrap_or(vol_rest.len());
+                let num_str = &vol_rest[..end];
+                if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
+                    let vol = parse_u32(num_str).ok_or(LinkError::ValueOutOfRange)?;
+                    if vol > 100 {
+                        return Err(LinkError::ValueOutOfRange);
+                    }
+                    return Ok(CydMessage::Volume(vol as u8));
+                }
+            }
+            if let Some(el_rest) = find_json_field(json, "elapsed") {
+                let end = el_rest
+                    .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+                    .unwrap_or(el_rest.len());
+                let elapsed = parse_u32(&el_rest[..end]).unwrap_or(0);
+                let duration = if let Some(dur_rest) = find_json_field(json, "duration") {
+                    let dur_end = dur_rest
+                        .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+                        .unwrap_or(dur_rest.len());
+                    parse_u32(&dur_rest[..dur_end]).unwrap_or(0)
+                } else {
+                    0
+                };
+                return Ok(CydMessage::Progress {
+                    elapsed_secs: elapsed,
+                    duration_secs: duration,
+                });
+            }
+            if let Some(w_rest) = find_json_field(json, "wifi") {
+                let connected = w_rest.starts_with("true") || w_rest.starts_with('1');
+                let rssi = if let Some(r_rest) = find_json_field(json, "rssi") {
+                    let end = r_rest
+                        .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+                        .unwrap_or(r_rest.len());
+                    parse_i8(&r_rest[..end]).unwrap_or(0)
+                } else {
+                    0
+                };
+                return Ok(CydMessage::WifiStatus { connected, rssi });
+            }
+            Err(LinkError::InvalidFrame)
+        }
+        _ => Err(LinkError::InvalidFrame),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +714,72 @@ mod tests {
 
         let parsed = CydLinkProtocol::parse_line(&buf).unwrap();
         assert_eq!(parsed, CydMessage::Volume(85));
+
+        // AUD14-LOGIC-001: Out-of-range volume rejection (>100) on VOL= frames
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=101\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=250\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=255\r\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=999\n"),
+            Err(LinkError::ValueOutOfRange)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=abc\n"),
+            Err(LinkError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn test_optional_checksum_validation_and_ndjson_telemetry() {
+        // Valid *XX XOR checksum: b"VOL=50" XOR sum is 0x6D
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=50*6D\n"),
+            Ok(CydMessage::Volume(50))
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=50*6d\r\n"),
+            Ok(CydMessage::Volume(50))
+        );
+        // Invalid checksum should be rejected
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=50*00\n"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"VOL=50*ZZ\n"),
+            Err(LinkError::InvalidFrame)
+        );
+
+        // NDJSON telemetry parsing
+        let meta_ndjson = b"{\"event\":\"meta\",\"title\":\"Echoes\",\"artist\":\"Pink Floyd\"}\n";
+        match CydLinkProtocol::parse_line(meta_ndjson) {
+            Ok(CydMessage::TrackMetadata { artist, title }) => {
+                assert_eq!(artist.as_str(), "Pink Floyd");
+                assert_eq!(title.as_str(), "Echoes");
+            }
+            other => panic!("Expected TrackMetadata, got {:?}", other),
+        }
+
+        let status_play = b"{\"event\":\"status\",\"state\":\"play\"}\n";
+        assert_eq!(
+            CydLinkProtocol::parse_line(status_play),
+            Ok(CydMessage::PlaybackState(PlayState::Playing))
+        );
+
+        let status_vol = b"{\"event\":\"status\",\"vol\":70}\n";
+        assert_eq!(
+            CydLinkProtocol::parse_line(status_vol),
+            Ok(CydMessage::Volume(70))
+        );
     }
 
     #[test]

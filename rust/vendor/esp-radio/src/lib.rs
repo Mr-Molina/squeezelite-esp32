@@ -304,6 +304,8 @@ const _: () = {
 pub(crate) fn init() {
     esp_hal::if_unstable_hal! {
         #[cfg(esp32)]
+        // JUSTIFICATION: Conjure token required by esp-hal to claim ADC2.
+        // SAFETY: Called during init while protected by RadioRefGuard refcount.
         if hal::analog::adc::try_claim_adc2(unsafe { hal::Internal::conjure() }).is_err() {
             panic!(
                 "ADC2 is currently in use by esp-hal, but esp-radio requires it for Wi-Fi operation."
@@ -349,7 +351,11 @@ pub(crate) fn deinit() {
     // Disable coexistence
     #[cfg(feature = "coex")]
     {
+        // JUSTIFICATION: Vendor FFI to disable Wi-Fi/BT coexistence.
+        // SAFETY: Called during deinit when RadioRefGuard reaches zero.
         unsafe { crate::wifi::os_adapter::coex_disable() };
+        // JUSTIFICATION: Vendor FFI to deinitialize coexistence adapter.
+        // SAFETY: Coexistence was disabled above; no concurrent callers.
         unsafe { crate::wifi::os_adapter::coex_deinit() };
     }
 
@@ -375,6 +381,8 @@ pub(crate) fn deinit() {
     // ESP-IDF's `esp_phy_modem_deinit`, "Fix the issue caused by the power
     // domain off. This issue is only on ESP32C3.").
     #[cfg(esp32c3)]
+    // JUSTIFICATION: Vendor FFI to reset PHY driver internal init flag.
+    // SAFETY: Called after modem domain is powered off during radio deinit.
     unsafe {
         crate::sys::include::phy_init_flag()
     };
@@ -382,6 +390,8 @@ pub(crate) fn deinit() {
     esp_hal::if_unstable_hal! {
         // Allow using `ADC2` again
         #[cfg(esp32)]
+        // JUSTIFICATION: Conjure token required by esp-hal to release ADC2.
+        // SAFETY: Called during deinit when RadioRefGuard reaches zero.
         hal::analog::adc::release_adc2(unsafe { esp_hal::Internal::conjure() });
 
         esp_hal::rtc_cntl::WakeLock::release();
@@ -427,6 +437,8 @@ impl Drop for RadioRefGuard {
 #[instability::unstable]
 pub fn wifi_set_log_verbose() {
     #[cfg(all(feature = "print-logs-from-driver", not(esp32h2)))]
+    // JUSTIFICATION: Vendor FFI to set Wi-Fi driver log verbosity level.
+    // SAFETY: Valid enum constant passed to driver log initialization.
     unsafe {
         use crate::sys::include::{
             esp_wifi_internal_set_log_level,

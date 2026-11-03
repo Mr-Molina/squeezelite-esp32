@@ -1133,6 +1133,7 @@ impl SpircStateMachine {
             }
             SpircMessageType::Next => {
                 self.position_ms = 0;
+                self.metadata = None;
                 if !self.track_queue.is_empty()
                     && self.playing_track_index + 1 < self.track_queue.len()
                 {
@@ -1145,6 +1146,7 @@ impl SpircStateMachine {
             }
             SpircMessageType::Prev => {
                 self.position_ms = 0;
+                self.metadata = None;
                 if !self.track_queue.is_empty() && self.playing_track_index > 0 {
                     self.playing_track_index -= 1;
                     self.current_track = Some(
@@ -1173,6 +1175,7 @@ impl SpircStateMachine {
                 Some(SpircEvent::SetVolume(self.volume))
             }
             SpircMessageType::Load | SpircMessageType::Replace => {
+                self.metadata = None;
                 if let Some(uri) = &frame.track_uri {
                     self.current_track = Some(uri.clone());
                     let pos = frame.position_ms.unwrap_or(0);
@@ -1186,6 +1189,11 @@ impl SpircStateMachine {
                 } else {
                     None
                 }
+            }
+            SpircMessageType::Logout | SpircMessageType::Goodbye => {
+                self.status = PlayStatus::Stop;
+                self.is_active = false;
+                None
             }
             SpircMessageType::Notify => Some(SpircEvent::Notify),
             _ => None,

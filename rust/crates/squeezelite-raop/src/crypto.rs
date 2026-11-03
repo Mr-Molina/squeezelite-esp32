@@ -284,7 +284,7 @@ fn mont_reduce(t: &mut [u32], n: &[u32], n_prime: u32) -> Vec<u32> {
     let n_big = BigUint {
         limbs: n.to_vec(),
     };
-    while res >= n_big {
+    if res >= n_big {
         res = res.sub(&n_big);
     }
 
@@ -407,12 +407,16 @@ pub fn montgomery_mod_pow(
     let mut prod_one_r2 = mul_limbs(&one_limbs, &r2_limbs);
     let mut x_bar = mont_reduce(&mut prod_one_r2, &n_limbs, n_prime);
 
-    // Exponentiate MSB to LSB
-    let exp_bits = exp.bit_len();
-    for bit_idx in (0..exp_bits).rev() {
+    // Exponentiate MSB to LSB over fixed modulus bit size (k * 32)
+    let total_bits = k * 32;
+    for bit_idx in (0..total_bits).rev() {
         let limb_idx = bit_idx / 32;
         let bit_in_limb = bit_idx % 32;
-        let bit = (exp.limbs[limb_idx] >> bit_in_limb) & 1;
+        let bit = if limb_idx < exp.limbs.len() {
+            (exp.limbs[limb_idx] >> bit_in_limb) & 1
+        } else {
+            0
+        };
 
         let mut sq = mul_limbs(&x_bar, &x_bar);
         x_bar = mont_reduce(&mut sq, &n_limbs, n_prime);
@@ -576,22 +580,30 @@ pub fn unpad_pkcs1_v15_type2(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> 
     if plaintext.len() < 11 {
         return Err(CryptoError::InvalidPadding);
     }
-    if plaintext[0] != 0x00 || plaintext[1] != 0x02 {
-        return Err(CryptoError::InvalidPadding);
-    }
-    let mut sep_idx = None;
+
+    let mut bad_pad = 0u32;
+    bad_pad |= plaintext[0] as u32;
+    bad_pad |= (plaintext[1] as u32) ^ 0x02;
+
+    let mut found_sep = 0u32;
+    let mut sep_idx = 0usize;
     for (i, &b) in plaintext.iter().enumerate().skip(2) {
-        if b == 0x00 {
-            sep_idx = Some(i);
-            break;
-        }
+        let is_zero = if b == 0x00 { 1u32 } else { 0u32 };
+        let first_zero = is_zero & (1 ^ found_sep);
+        found_sep |= is_zero;
+        sep_idx |= i * (first_zero as usize);
     }
-    let sep = sep_idx.ok_or(CryptoError::InvalidPadding)?;
-    if sep < 10 {
-        // Less than 8 bytes of padding
+
+    bad_pad |= 1 ^ found_sep;
+    if sep_idx < 10 {
+        bad_pad |= 1;
+    }
+
+    if bad_pad != 0 {
         return Err(CryptoError::InvalidPadding);
     }
-    let payload = &plaintext[sep + 1..];
+
+    let payload = &plaintext[sep_idx + 1..];
     if payload.len() != 16 {
         return Err(CryptoError::InvalidKeyLength);
     }
@@ -605,9 +617,10 @@ pub fn unpad_oaep_sha1(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> {
     if plaintext.len() < 42 {
         return Err(CryptoError::InvalidPadding);
     }
-    if plaintext[0] != 0x00 {
-        return Err(CryptoError::InvalidPadding);
-    }
+
+    let mut bad = 0u32;
+    bad |= plaintext[0] as u32;
+
     let masked_seed = &plaintext[1..21];
     let masked_db = &plaintext[21..];
 
@@ -624,22 +637,32 @@ pub fn unpad_oaep_sha1(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> {
     }
 
     let l_hash = Sha1::digest(b"");
-    if db[0..20] != l_hash[..] {
+    for i in 0..20 {
+        bad |= (db[i] ^ l_hash[i]) as u32;
+    }
+
+    let mut looking_for_one = 1u32;
+    let mut sep_idx = 0usize;
+    let mut invalid_ps = 0u32;
+
+    for (i, &b) in db.iter().enumerate().skip(20) {
+        let is_one = if b == 0x01 { 1u32 } else { 0u32 };
+        let is_zero = if b == 0x00 { 1u32 } else { 0u32 };
+
+        invalid_ps |= looking_for_one & (1 ^ (is_zero | is_one));
+        let first_one = is_one & looking_for_one;
+        sep_idx |= i * (first_one as usize);
+        looking_for_one &= 1 ^ is_one;
+    }
+
+    bad |= invalid_ps;
+    bad |= looking_for_one;
+
+    if bad != 0 {
         return Err(CryptoError::InvalidPadding);
     }
 
-    let mut sep_idx = None;
-    for (i, &b) in db.iter().enumerate().skip(20) {
-        if b == 0x01 {
-            sep_idx = Some(i);
-            break;
-        } else if b != 0x00 {
-            return Err(CryptoError::InvalidPadding);
-        }
-    }
-
-    let sep = sep_idx.ok_or(CryptoError::InvalidPadding)?;
-    let payload = &db[sep + 1..];
+    let payload = &db[sep_idx + 1..];
     if payload.len() != 16 {
         return Err(CryptoError::InvalidKeyLength);
     }
@@ -936,7 +959,7 @@ impl Aes128Cbc {
     /// Following the RAOP specification (`components/raop/rtp.c`):
     /// Only complete 16-byte blocks (`data.len() & !0x0f`) are decrypted.
     /// Trailing bytes remain unencrypted.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     pub fn decrypt_in_place(&self, iv: &[u8; 16], data: &mut [u8]) {
         let aes_len = data.len() & !0x0f;
         let mut prev_block = *iv;
@@ -1109,4 +1132,34 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, CryptoError> {
         i += 4;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_time_unpad_pkcs1_v15_corrupted_prefix() {
+        let mut pad = [0xFFu8; 32];
+        pad[0] = 0x01; // corrupted byte 0
+        pad[1] = 0x02;
+        pad[15] = 0x00; // sep
+        assert_eq!(unpad_pkcs1_v15_type2(&pad), Err(CryptoError::InvalidPadding));
+    }
+
+    #[test]
+    fn test_constant_time_unpad_oaep_corrupted_prefix() {
+        let mut oaep = [0u8; 64];
+        oaep[0] = 0x01; // corrupted byte 0
+        assert_eq!(unpad_oaep_sha1(&oaep), Err(CryptoError::InvalidPadding));
+    }
+
+    #[test]
+    fn test_montgomery_mod_pow_fixed_bit_len() {
+        let base = BigUint::from_u32(3);
+        let exp1 = BigUint::from_u32(5);
+        let modulus = BigUint::from_u32(17);
+        let res1 = montgomery_mod_pow(&base, &exp1, &modulus).expect("mod pow succeeds");
+        assert_eq!(res1, BigUint::from_u32(5)); // 3^5 = 243 = 14*17 + 5 = 5 mod 17
+    }
 }

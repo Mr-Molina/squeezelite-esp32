@@ -513,7 +513,25 @@ fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, S
         )
     })?;
 
+    // AUD03-SEC-002: Reject unroutable, broadcast, or multicast target IPs.
+    if let SocketAddr::V4(v4) = addr {
+        let ip = v4.ip();
+        if ip.is_unspecified() || ip.is_broadcast() || ip.octets()[0] >= 224 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unroutable redirect target IP: {ip}"),
+            ));
+        }
+    }
+
     Ok((addr, host_port.to_string(), path.to_string()))
+}
+
+/// Validates and parses an HTTP redirect Location URL (AUD03-SEC-002).
+pub fn parse_redirect_location(
+    location: &str,
+) -> std::io::Result<(SocketAddr, String, String)> {
+    parse_http_location(location)
 }
 
 /// Opens a TCP connection to `addr` and writes `request` while the socket is
@@ -2054,5 +2072,14 @@ mod tests {
         assert_eq!(client.next_cseq(), 5);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_redirect_unroutable_ip_rejection() {
+        assert!(parse_redirect_location("http://0.0.0.0/stream").is_err());
+        assert!(parse_redirect_location("http://255.255.255.255/stream").is_err());
+        assert!(parse_redirect_location("http://224.0.0.1/stream").is_err());
+        assert!(parse_redirect_location("http://239.255.255.250/stream").is_err());
+        assert!(parse_redirect_location("http://127.0.0.1:8080/stream").is_ok());
     }
 }

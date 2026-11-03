@@ -29,7 +29,11 @@ impl Sample for i16 {
 impl Sample for i32 {
     #[inline(always)]
     fn from_decoder(sample: i32, bits: u8) -> Self {
-        sample << (32 - bits)
+        if bits > 0 && bits < 32 {
+            sample << (32 - bits)
+        } else {
+            sample
+        }
     }
 
     #[inline(always)]
@@ -291,7 +295,9 @@ fn decode_audio_element<'a, S: Sample>(
             }
 
             // We have a seperate function for this
-            assert!(lpc_order[i] != 31);
+            if lpc_order[i] >= 31 {
+                return Err(invalid_data("lpc_order must be less than 31"));
+            }
 
             let lpc_coefs = &mut lpc_coefs[i][..lpc_order[i] as usize];
             lpc_predict(mix_buf[i], chan_bits, lpc_coefs, lpc_quant[i]);
@@ -533,7 +539,11 @@ fn lpc_predict(buf: &mut [i32], bps: u8, lpc_coefs: &mut [i16], lpc_quant: u32) 
 
         // Round up to and then truncate by lpc_quant bits.
         // 1 << (lpc_quant - 1) sets the (lpc_quant - 1)'th bit.
-        let predicted = (predicted + (1 << (lpc_quant - 1))) >> lpc_quant;
+        let predicted = if lpc_quant > 0 {
+            (predicted + (1 << (lpc_quant - 1))) >> lpc_quant
+        } else {
+            predicted
+        };
 
         // Store the sample for output and to be used in the next prediction.
         let prediction_error = buf[lpc_order];

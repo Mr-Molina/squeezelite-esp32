@@ -73,6 +73,13 @@ impl SpiDisplayBus for MockSpiDisplayBus {
     }
 }
 
+/// Supported TFT display controller panel variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayPanelVariant {
+    Ili9341,
+    St7789,
+}
+
 /// ILI9341 320x240 Landscape TFT Display Driver.
 pub struct Ili9341Display<B: SpiDisplayBus> {
     bus: B,
@@ -131,80 +138,107 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
 
     /// Execute the full ILI9341 initialization sequence for 320x240 landscape mode.
     pub fn init(&mut self) {
-        // 1. Software Reset
-        self.bus.send_cmd(0x01);
-        // 2. Display OFF
-        self.bus.send_cmd(0x28);
-        // 3. Power Control B
-        self.bus.send_cmd(0xCF);
-        self.bus.send_data(&[0x00, 0xC1, 0x30]);
-        // 4. Power on Sequence Control
-        self.bus.send_cmd(0xED);
-        self.bus.send_data(&[0x64, 0x03, 0x12, 0x81]);
-        // 5. Driver Timing Control A
-        self.bus.send_cmd(0xE8);
-        self.bus.send_data(&[0x85, 0x00, 0x78]);
-        // 6. Power Control A
-        self.bus.send_cmd(0xCB);
-        self.bus.send_data(&[0x39, 0x2C, 0x00, 0x34, 0x02]);
-        // 7. Pump Ratio Control
-        self.bus.send_cmd(0xF7);
-        self.bus.send_data(&[0x20]);
-        // 8. Driver Timing Control B
-        self.bus.send_cmd(0xEA);
-        self.bus.send_data(&[0x00, 0x00]);
-        // 9. Power Control 1
-        self.bus.send_cmd(0xC0);
-        self.bus.send_data(&[0x23]);
-        // 10. Power Control 2
-        self.bus.send_cmd(0xC1);
-        self.bus.send_data(&[0x10]);
-        // 11. VCOM Control 1
-        self.bus.send_cmd(0xC5);
-        self.bus.send_data(&[0x3E, 0x28]);
-        // 12. VCOM Control 2
-        self.bus.send_cmd(0xC7);
-        self.bus.send_data(&[0x86]);
-        // 13. MADCTL: Memory Access Control (Landscape MV=1, BGR=1 -> 0x28)
-        self.bus.send_cmd(0x36);
-        self.bus.send_data(&[0x28]);
-        // 14. Pixel Format: 16-bit RGB565 (0x55)
-        self.bus.send_cmd(0x3A);
-        self.bus.send_data(&[0x55]);
-        // 15. Frame Rate Control
-        self.bus.send_cmd(0xB1);
-        self.bus.send_data(&[0x00, 0x18]);
-        // 16. Display Function Control
-        self.bus.send_cmd(0xB6);
-        self.bus.send_data(&[0x08, 0x82, 0x27]);
-        // 17. 3Gamma Function Disable
-        self.bus.send_cmd(0xF2);
-        self.bus.send_data(&[0x00]);
-        // 18. Gamma Curve Selected
-        self.bus.send_cmd(0x26);
-        self.bus.send_data(&[0x01]);
-        // 19. Positive Gamma Correction
-        self.bus.send_cmd(0xE0);
-        self.bus.send_data(&[
-            0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E, 0x09,
-            0x00,
-        ]);
-        // 20. Negative Gamma Correction
-        self.bus.send_cmd(0xE1);
-        self.bus.send_data(&[
-            0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36,
-            0x0F,
-        ]);
-        // 21. Display Inversion OFF (INVOFF)
-        self.bus.send_cmd(0x20);
-        // 22. Sleep OUT (SLPOUT)
-        self.bus.send_cmd(0x11);
-        // 23. Display ON (DISPON)
-        self.bus.send_cmd(0x29);
+        self.init_with_variant(DisplayPanelVariant::Ili9341);
+    }
 
-        // Turn backlight on to 100% duty
-        self.set_backlight(100);
-        self.initialized = true;
+    /// Execute the display initialization sequence for the specified panel variant.
+    pub fn init_with_variant(&mut self, variant: DisplayPanelVariant) {
+        match variant {
+            DisplayPanelVariant::Ili9341 => {
+                // 1. Software Reset
+                self.bus.send_cmd(0x01);
+                // 2. Display OFF
+                self.bus.send_cmd(0x28);
+                // 3. Power Control B
+                self.bus.send_cmd(0xCF);
+                self.bus.send_data(&[0x00, 0xC1, 0x30]);
+                // 4. Power on Sequence Control
+                self.bus.send_cmd(0xED);
+                self.bus.send_data(&[0x64, 0x03, 0x12, 0x81]);
+                // 5. Driver Timing Control A
+                self.bus.send_cmd(0xE8);
+                self.bus.send_data(&[0x85, 0x00, 0x78]);
+                // 6. Power Control A
+                self.bus.send_cmd(0xCB);
+                self.bus.send_data(&[0x39, 0x2C, 0x00, 0x34, 0x02]);
+                // 7. Pump Ratio Control
+                self.bus.send_cmd(0xF7);
+                self.bus.send_data(&[0x20]);
+                // 8. Driver Timing Control B
+                self.bus.send_cmd(0xEA);
+                self.bus.send_data(&[0x00, 0x00]);
+                // 9. Power Control 1
+                self.bus.send_cmd(0xC0);
+                self.bus.send_data(&[0x23]);
+                // 10. Power Control 2
+                self.bus.send_cmd(0xC1);
+                self.bus.send_data(&[0x10]);
+                // 11. VCOM Control 1
+                self.bus.send_cmd(0xC5);
+                self.bus.send_data(&[0x3E, 0x28]);
+                // 12. VCOM Control 2
+                self.bus.send_cmd(0xC7);
+                self.bus.send_data(&[0x86]);
+                // 13. MADCTL: Memory Access Control (Landscape MV=1, BGR=1 -> 0x28)
+                self.bus.send_cmd(0x36);
+                self.bus.send_data(&[0x28]);
+                // 14. Pixel Format: 16-bit RGB565 (0x55)
+                self.bus.send_cmd(0x3A);
+                self.bus.send_data(&[0x55]);
+                // 15. Frame Rate Control
+                self.bus.send_cmd(0xB1);
+                self.bus.send_data(&[0x00, 0x18]);
+                // 16. Display Function Control
+                self.bus.send_cmd(0xB6);
+                self.bus.send_data(&[0x08, 0x82, 0x27]);
+                // 17. 3Gamma Function Disable
+                self.bus.send_cmd(0xF2);
+                self.bus.send_data(&[0x00]);
+                // 18. Gamma Curve Selected
+                self.bus.send_cmd(0x26);
+                self.bus.send_data(&[0x01]);
+                // 19. Positive Gamma Correction
+                self.bus.send_cmd(0xE0);
+                self.bus.send_data(&[
+                    0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E,
+                    0x09, 0x00,
+                ]);
+                // 20. Negative Gamma Correction
+                self.bus.send_cmd(0xE1);
+                self.bus.send_data(&[
+                    0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31,
+                    0x36, 0x0F,
+                ]);
+                // 21. Display Inversion OFF (INVOFF)
+                self.bus.send_cmd(0x20);
+                // 22. Sleep OUT (SLPOUT)
+                self.bus.send_cmd(0x11);
+                // 23. Display ON (DISPON)
+                self.bus.send_cmd(0x29);
+
+                self.set_backlight(100);
+                self.initialized = true;
+            }
+            DisplayPanelVariant::St7789 => {
+                // 1. Software Reset
+                self.bus.send_cmd(0x01);
+                // 2. Sleep OUT (SLPOUT)
+                self.bus.send_cmd(0x11);
+                // 3. Pixel Format: 16-bit RGB565 (0x55)
+                self.bus.send_cmd(0x3A);
+                self.bus.send_data(&[0x55]);
+                // 4. Memory Access Control (MADCTL): Landscape BGR (0x70)
+                self.bus.send_cmd(0x36);
+                self.bus.send_data(&[0x70]);
+                // 5. Display Inversion ON (INVON: 0x21)
+                self.bus.send_cmd(0x21);
+                // 6. Display ON (DISPON)
+                self.bus.send_cmd(0x29);
+
+                self.set_backlight(100);
+                self.initialized = true;
+            }
+        }
     }
 
     /// Configure hardware display inversion (`0x21` = INVON, `0x20` = INVOFF).
@@ -795,6 +829,28 @@ mod tests {
         let mut filtered_touch = Xpt2046Touch::new(scripted);
         // Trimmed mean drops 300 and 3800, leaving exact (2050, 2050) -> (159, 119)
         assert_eq!(filtered_touch.read(), Some((159, 119)));
+    }
+
+    #[test]
+    fn test_st7789_init_sequence() {
+        let bus = MockSpiDisplayBus::default();
+        let mut display = Ili9341Display::new(bus);
+        assert!(!display.is_initialized());
+
+        display.init_with_variant(DisplayPanelVariant::St7789);
+        assert!(display.is_initialized());
+        assert_eq!(display.backlight_percent(), 100);
+        assert_eq!(display.bus().duty_10bit, 1023);
+
+        // Verify ST7789 command sequence:
+        // 0x01, 0x11, 0x3A, 0x36, 0x21 (INVON), 0x29 (DISPON)
+        let cmds = &display.bus().commands;
+        assert_eq!(cmds[0], 0x01); // Reset
+        assert_eq!(cmds[1], 0x11); // SLPOUT
+        assert_eq!(cmds[2], 0x3A); // COLMOD
+        assert_eq!(cmds[3], 0x36); // MADCTL
+        assert_eq!(cmds[4], 0x21); // INVON
+        assert_eq!(cmds[5], 0x29); // DISPON
     }
 
     #[test]

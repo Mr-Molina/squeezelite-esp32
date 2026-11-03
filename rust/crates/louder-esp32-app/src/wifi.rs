@@ -59,6 +59,10 @@ pub struct SoftApConfig {
     pub ap_ip: [u8; 4],
     /// SoftAP IPv4 subnet mask.
     pub netmask: [u8; 4],
+    /// Optional binary WPA2 passphrase (`8..=64` bytes).
+    pub ap_passphrase: Option<[u8; 64]>,
+    /// Length of binary passphrase (`ap_passphrase`).
+    pub ap_passphrase_len: u8,
 }
 
 impl Default for SoftApConfig {
@@ -71,6 +75,8 @@ impl Default for SoftApConfig {
             channel: 1,
             ap_ip: DEFAULT_SOFTAP_IP,
             netmask: DEFAULT_SOFTAP_NETMASK,
+            ap_passphrase: None,
+            ap_passphrase_len: 0,
         }
     }
 }
@@ -92,7 +98,25 @@ impl SoftApConfig {
             channel,
             ap_ip,
             netmask: DEFAULT_SOFTAP_NETMASK,
+            ap_passphrase: None,
+            ap_passphrase_len: 0,
         })
+    }
+
+    /// Configures an optional binary WPA2 passphrase (`8..=64` bytes).
+    #[must_use]
+    pub const fn with_passphrase(mut self, pass: &[u8]) -> Self {
+        if pass.len() >= 8 && pass.len() <= 64 {
+            let mut buf = [0u8; 64];
+            let mut i = 0;
+            while i < pass.len() {
+                buf[i] = pass[i];
+                i += 1;
+            }
+            self.ap_passphrase = Some(buf);
+            self.ap_passphrase_len = pass.len() as u8;
+        }
+        self
     }
 }
 
@@ -169,6 +193,15 @@ impl CaptivePortalDns {
         Self { portal_ip }
     }
 
+    /// Parses a raw UDP DNS query and builds a wildcard A-record response.
+    ///
+    /// Validates that the DNS question name contains no compression pointers
+    /// before formatting the response.
+    #[must_use]
+    pub fn handle_query(&self, query: &[u8], out_buf: &mut [u8]) -> Option<usize> {
+        self.build_response(query, out_buf)
+    }
+
     /// Parses a raw UDP DNS query packet and writes a wildcard `A`-record
     /// response pointing to `self.portal_ip` into `out_buf`.
     ///
@@ -201,13 +234,9 @@ impl CaptivePortalDns {
                 pos += 1;
                 break;
             }
-            // Allow 2-byte DNS compression pointer (top two bits 11 == 0xC0)
+            // Reject DNS compression pointer (0xC0) in question name (AUD03-SEC-001).
             if (query[pos] & 0xC0) == 0xC0 {
-                if pos + 2 > query.len() {
-                    return None;
-                }
-                pos += 2;
-                break;
+                return None;
             }
             // Reject invalid label lengths (> 63).
             if label_len > 63 || pos + 1 + label_len >= query.len() {
@@ -765,6 +794,7 @@ impl Default for WifiConfig {
 pub struct WifiManager<S = MemConfigStore<32>> {
     state: WifiState,
     pub config: WifiConfig,
+    pub credentials: Option<WifiCredentials>,
     store: S,
     retry_count: u32,
     base_backoff_ms: u32,
@@ -791,6 +821,7 @@ impl<S: KeyValueStorage> WifiManager<S> {
         let mut mgr = Self {
             state: WifiState::Disconnected,
             config: WifiConfig::default(),
+            credentials: None,
             store,
             retry_count: 0,
             base_backoff_ms: 500,
@@ -803,6 +834,7 @@ impl<S: KeyValueStorage> WifiManager<S> {
             let _ = mgr.config.ssid.push_str(creds.ssid.as_str());
             mgr.config.password.clear();
             let _ = mgr.config.password.push_str(creds.passphrase.as_str());
+            mgr.credentials = Some(creds.clone());
 
             if creds.autoconnect && !creds.ssid.is_empty() {
                 mgr.state = WifiState::Connecting;
@@ -864,6 +896,7 @@ impl<S: KeyValueStorage> WifiManager<S> {
         }
         creds.save_to(&mut self.store)?;
 
+        self.credentials = Some(creds);
         self.state = WifiState::Connecting;
         Ok(self.state)
     }
@@ -884,6 +917,25 @@ impl<S: KeyValueStorage> WifiManager<S> {
         let shift = core::cmp::min(self.retry_count - 1, 6);
         let delay = self.base_backoff_ms.saturating_mul(1 << shift);
         core::cmp::min(delay, self.max_backoff_ms)
+    }
+
+    /// Returns the reconnect delay in milliseconds (alias for
+    /// [`Self::current_backoff_ms`]).
+    #[must_use]
+    pub fn reconnect_delay_ms(&self) -> u32 {
+        self.current_backoff_ms()
+    }
+
+    /// Adds deterministic jitter (`jitter_seed % 500`) to reconnect delay.
+    #[must_use]
+    pub fn reconnect_delay_with_jitter_ms(&self, jitter_seed: u32) -> u32 {
+        self.reconnect_delay_ms().saturating_add(jitter_seed % 500)
+    }
+
+    /// Deterministic jitter helper for current backoff delay.
+    #[must_use]
+    pub fn current_backoff_with_jitter_ms(&self, jitter_seed: u32) -> u32 {
+        self.reconnect_delay_with_jitter_ms(jitter_seed)
     }
 
     /// Records a failed connection attempt and increments backoff counter
@@ -925,6 +977,20 @@ impl<S: KeyValueStorage> WifiManager<S> {
     pub fn forget_credentials(&mut self) -> Result<(), StorageError> {
         self.config.ssid.clear();
         self.config.password.clear();
+        for _ in 0..64 {
+            let _ = self.config.password.push('\0');
+        }
+        self.config.password.clear();
+
+        if let Some(mut creds) = self.credentials.take() {
+            creds.passphrase.clear();
+            for _ in 0..64 {
+                let _ = creds.passphrase.push('\0');
+            }
+            creds.passphrase.clear();
+        }
+        self.credentials = None;
+
         self.state = WifiState::Disconnected;
         self.retry_count = 0;
         WifiCredentials::clear(&mut self.store)
@@ -1113,6 +1179,12 @@ mod tests {
         // Success resets backoff
         wifi.record_success();
         assert_eq!(wifi.current_backoff_ms(), 0);
+        assert_eq!(wifi.reconnect_delay_with_jitter_ms(250), 250);
+        assert_eq!(wifi.reconnect_delay_with_jitter_ms(750), 250);
+
+        let ap_cfg = SoftApConfig::default().with_passphrase(b"12345678");
+        assert_eq!(ap_cfg.ap_passphrase_len, 8);
+        assert!(ap_cfg.ap_passphrase.is_some());
     }
 
     #[test]
@@ -1220,6 +1292,7 @@ mod tests {
         assert_eq!(dns.build_response(&invalid_opcode_query, &mut resp), None);
 
         // 2. Query with 2-byte DNS compression pointer (0xC00C) in QNAME
+        // must be rejected (AUD03-SEC-001).
         let compressed_query: [u8; 18] = [
             0x11, 0x22, // ID
             0x01, 0x00, // Flags: standard query, RD=1
@@ -1229,11 +1302,8 @@ mod tests {
             0x00, 0x01, // QTYPE = A
             0x00, 0x01, // QCLASS = IN
         ];
-        let len = dns
-            .build_response(&compressed_query, &mut resp)
-            .expect("compression pointer must be accepted");
-        assert_eq!(len, compressed_query.len() + 16);
-        assert_eq!(&resp[len - 4..len], &[10, 0, 0, 1]);
+        assert_eq!(dns.build_response(&compressed_query, &mut resp), None);
+        assert_eq!(dns.handle_query(&compressed_query, &mut resp), None);
     }
 
     #[test]

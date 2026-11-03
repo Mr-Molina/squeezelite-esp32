@@ -439,6 +439,9 @@ pub struct PlayerCoordinator {
     /// Filter quality preset used when the polyphase FIR resampler is engaged
     /// (Task 17).
     resampler_quality: ResampleQuality,
+    pub pcm_bits: u8,
+    pub pcm_channels: u8,
+    pub pcm_big_endian: bool,
 }
 
 impl PlayerCoordinator {
@@ -508,6 +511,9 @@ impl PlayerCoordinator {
             max_sample_rate: 0,
             resampler_enabled: false,
             resampler_quality: ResampleQuality::Low,
+            pcm_bits: 16,
+            pcm_channels: 2,
+            pcm_big_endian: false,
         }
     }
 
@@ -702,7 +708,13 @@ impl PlayerCoordinator {
     ) {
         pipeline.stream_buffer.flush();
         let format = self.current_format.unwrap_or(AudioFormat::Mp3);
-        Self::select_decoder(pipeline, format, 16, 2, false);
+        Self::select_decoder(
+            pipeline,
+            format,
+            self.pcm_bits,
+            self.pcm_channels,
+            self.pcm_big_endian,
+        );
     }
 
     /// The external source stopped and its audio drained:
@@ -855,7 +867,18 @@ impl PlayerCoordinator {
     /// into artist and title on the first `" - "` (best effort: no
     /// separator means title only).
     fn track_metadata_message(&self) -> Option<CydMessage> {
-        let text = core::str::from_utf8(self.track_metadata.as_deref()?).ok()?;
+        let raw = self.track_metadata.as_deref()?;
+        let owned: alloc::string::String;
+        let text: &str = match core::str::from_utf8(raw) {
+            Ok(s) => s,
+            Err(_) => {
+                owned = raw
+                    .iter()
+                    .map(|&b| if b < 0x80 { b as char } else { '?' })
+                    .collect();
+                &owned
+            }
+        };
         let (artist, title) = text.split_once(" - ").unwrap_or(("", text));
         Some(CydMessage::TrackMetadata {
             artist: truncated(artist),
@@ -987,7 +1010,7 @@ impl PlayerCoordinator {
         let link_lost = self.receive_command(transport, source, backend, pipeline, now_ms)?;
         let _ = self.poll_stream(source, pipeline);
         self.apply_output_deadlines(pipeline, backend, now_ms);
-        self.last_tick_frames = if self.external_audio_pump {
+        self.last_tick_frames = if self.external_audio_pump || self.external_playback {
             // Decode/output belong to the caller's pump phases; only the play state moves
             // here.
             self.evaluate_state(pipeline);
@@ -1482,7 +1505,7 @@ impl PlayerCoordinator {
                         // plays once started. Rust has no frame-exact silence insertion yet, so
                         // the deadline is checked every tick.
                         self.unpause_at_jiffies = None;
-                        if self.state != PlayerState::Buffering {
+                        if !self.external_playback && self.state != PlayerState::Buffering {
                             self.state = PlayerState::Paused;
                         }
                         self.pause_until_ms = Some(now_ms.wrapping_add(interval));
@@ -1491,12 +1514,14 @@ impl PlayerCoordinator {
                     // Interval 0: output STOPPED and an STMp (slimproto.c:402-408).
                     self.pause_until_ms = None;
                     self.unpause_at_jiffies = None;
-                    self.state = PlayerState::Paused;
-                    self.buffer_threshold_bytes = 0;
-                    pipeline.sink.set_mute(true);
-                    backend.set_mute(true);
+                    if !self.external_playback {
+                        self.state = PlayerState::Paused;
+                        self.buffer_threshold_bytes = 0;
+                        pipeline.sink.set_mute(true);
+                        backend.set_mute(true);
+                        self.push_cyd(CydNote::State(PlayState::Paused));
+                    }
                     self.send_metrics_stat(transport, StatEvent::TrackPaused, pipeline, now_ms)?;
-                    self.push_cyd(CydNote::State(PlayState::Paused));
                     Ok(())
                 }
                 StreamCommandType::Resume => {
@@ -1525,17 +1550,23 @@ impl PlayerCoordinator {
                     // C parity (slimproto.c:386-394): decode_flush, output_flush, frames_played
                     // = 0, stream_disconnect, streambuf flush, and no reply (the STMf there is
                     // only for 'f').
-                    self.state = PlayerState::Stopped;
                     self.arbiter.release_source(AudioSource::SlimProto);
                     self.buffer_threshold_bytes = 0;
                     self.close_stream(source);
+                    let was_external = self.external_playback;
                     self.reset();
-                    pipeline.flush();
-                    pipeline.frames_played = 0;
-                    self.frames_played = 0;
-                    pipeline.sink.set_mute(true);
-                    backend.set_mute(true);
-                    self.push_cyd(CydNote::State(PlayState::Stopped));
+                    if was_external {
+                        self.external_playback = true;
+                        self.state = PlayerState::Playing;
+                    } else {
+                        self.state = PlayerState::Stopped;
+                        pipeline.flush();
+                        pipeline.frames_played = 0;
+                        self.frames_played = 0;
+                        pipeline.sink.set_mute(true);
+                        backend.set_mute(true);
+                        self.push_cyd(CydNote::State(PlayState::Stopped));
+                    }
                     Ok(())
                 }
                 StreamCommandType::Flush => self.flush_command(transport, source, pipeline, now_ms),
@@ -1622,7 +1653,9 @@ impl PlayerCoordinator {
             }
             ServerCommand::Flush => self.flush_command(transport, source, pipeline, now_ms),
             ServerCommand::Body { data } => {
-                if self.state == PlayerState::Playing || self.state == PlayerState::Buffering {
+                if !self.external_playback
+                    && (self.state == PlayerState::Playing || self.state == PlayerState::Buffering)
+                {
                     let _ = pipeline.ingest_stream_data(data);
                 }
                 Ok(())
@@ -1652,23 +1685,39 @@ impl PlayerCoordinator {
                         .get(4)
                         .is_none_or(|&b| matches!(Endianness::from_byte(b), Endianness::BigEndian));
                     self.current_format = Some(format);
-                    self.decode_ready =
-                        Self::select_decoder(pipeline, format, bits, channels, is_be);
-                    // C decode.c:287: codec_open starts a new stream (next track start).
-                    pipeline.open_stream();
+                    self.pcm_bits = bits;
+                    self.pcm_channels = channels;
+                    self.pcm_big_endian = is_be;
+                    if !self.external_playback {
+                        self.decode_ready =
+                            Self::select_decoder(pipeline, format, bits, channels, is_be);
+                        // C decode.c:287: codec_open starts a new stream (next track start).
+                        pipeline.open_stream();
+                    } else {
+                        self.decode_ready = true;
+                    }
                 } else if let Some((ip, syncgroup)) = cmd.switch_server() {
                     self.switch_server(ip, syncgroup);
                 } else if let Some(setting) = cmd.device_setting() {
                     if setting.id == 0 {
                         // LMS NUL-terminates the name; never keep (or echo) the terminator.
                         let data = setting.data.split(|&b| b == 0).next().unwrap_or(&[]);
-                        if !data.is_empty() {
+                        if !data.is_empty() && data.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
                             if let Ok(name) = core::str::from_utf8(data) {
                                 self.set_player_name(name);
                             }
+                            send_setd_name(transport, &self.player_name)?;
+                        } else if payload.len() == 4 {
+                            let sample_rate = u32::from_be_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            self.current_sample_rate = sample_rate;
+                            let _ = pipeline.set_sample_rate(sample_rate);
+                            let _ = backend.set_sample_rate(sample_rate);
+                        } else {
+                            // C parity (slimproto.c:600-601): a name change is confirmed with SETD.
+                            send_setd_name(transport, &self.player_name)?;
                         }
-                        // C parity (slimproto.c:600-601): a name change is confirmed with SETD.
-                        send_setd_name(transport, &self.player_name)?;
                     }
                 } else if opcode == *b"eqlz" {
                     if !payload.is_empty() {
@@ -1719,6 +1768,9 @@ impl PlayerCoordinator {
         let was_external = self.external_playback;
         self.close_stream(source);
         self.reset();
+        if was_external {
+            self.external_playback = true;
+        }
         if output_continues {
             self.output_started = true;
             self.pending_track_started = pending_stms;
@@ -1803,6 +1855,9 @@ impl PlayerCoordinator {
         self.current_format = Some(p.format);
         let bits = Self::normalize_pcm_bits(p.pcm_sample_size);
         let channels = Self::normalize_pcm_channels(p.pcm_channels);
+        self.pcm_bits = bits;
+        self.pcm_channels = channels;
+        self.pcm_big_endian = p.big_endian;
 
         // codec_open (slimproto.c:455-463): '?' waits for `codc` and needs autostart >=
         // 2.
@@ -1813,7 +1868,7 @@ impl PlayerCoordinator {
                 self.push_cyd(CydNote::State(PlayState::Stopped));
                 return Ok(());
             }
-        } else {
+        } else if !was_external {
             // C decode.c:286-317: READY only if a codec for the format exists. A missing
             // one is no error (no STMn); the track simply never starts. (A
             // format this build cannot decode also gets a muted PCM decoder,
@@ -1822,6 +1877,8 @@ impl PlayerCoordinator {
                 Self::select_decoder(pipeline, p.format, bits, channels, p.big_endian);
             // codec_open: its first frames start the next track (C decode.c:287).
             pipeline.open_stream();
+        } else {
+            self.decode_ready = true;
         }
 
         // The clock must support a PCM track's rate. C has no clean equivalent
@@ -1836,6 +1893,8 @@ impl PlayerCoordinator {
             && crate::clock_table::i2s_clock_config(sample_rate).is_some();
         let clock_ok = if !verified {
             false
+        } else if was_external {
+            true
         } else if output_idle {
             self.pending_rate = None;
             self.crossed_rate = None;
@@ -1849,7 +1908,7 @@ impl PlayerCoordinator {
             self.decode_ready = false;
             self.decode_failed = true;
             self.pending_not_supported = true;
-            if !output_continues {
+            if !output_continues && !was_external {
                 self.state = PlayerState::Stopped;
                 pipeline.sink.set_mute(true);
                 backend.set_mute(true);
@@ -1909,10 +1968,12 @@ impl PlayerCoordinator {
 
         // STREAMING_BUFFERING until more than the threshold arrived (stream.c:527). A
         // RUNNING output keeps playing meanwhile (gapless).
-        if !output_continues {
+        if !output_continues && !was_external {
             self.state = PlayerState::Buffering;
         }
-        self.push_cyd(CydNote::State(PlayState::Playing));
+        if !was_external {
+            self.push_cyd(CydNote::State(PlayState::Playing));
+        }
         Ok(())
     }
 
@@ -1950,14 +2011,21 @@ impl PlayerCoordinator {
         now_ms: u32,
     ) -> Result<(), TransportError> {
         let had_stream = self.stream_active();
-        // C decode_flush(false): the decoder stops; PCM it decoded but did not deliver
-        // yet is audio C would not have decoded (its decoders write straight to
-        // outputbuf).
-        pipeline.discard_decoder_backlog();
-        let flushed_output = pipeline.flush_streaming();
-        if flushed_output {
-            self.pending_rate = None;
+        if !self.external_playback {
+            // C decode_flush(false): the decoder stops; PCM it decoded but did not deliver
+            // yet is audio C would not have decoded (its decoders write straight to
+            // outputbuf).
+            pipeline.discard_decoder_backlog();
         }
+        let flushed_output = if self.external_playback {
+            false
+        } else {
+            let flushed = pipeline.flush_streaming();
+            if flushed {
+                self.pending_rate = None;
+            }
+            flushed
+        };
         self.arbiter.release_source(AudioSource::SlimProto);
         self.buffer_threshold_bytes = 0;
         self.close_stream(source);
@@ -1968,10 +2036,12 @@ impl PlayerCoordinator {
         self.decode_running = false;
         self.pause_until_ms = None;
         self.unpause_at_jiffies = None;
-        if self.state == PlayerState::Buffering {
+        if !self.external_playback && self.state == PlayerState::Buffering {
             self.state = PlayerState::Stopped;
         }
-        pipeline.stream_buffer.flush();
+        if !self.external_playback {
+            pipeline.stream_buffer.flush();
+        }
         if had_stream || flushed_output {
             send_stat(
                 transport,
@@ -2466,10 +2536,16 @@ fn icy_stream_title(block: &[u8]) -> Option<&[u8]> {
     const KEY: &[u8] = b"StreamTitle='";
     let start = block.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
     let rest = &block[start..];
-    let end = rest
-        .windows(2)
-        .position(|w| w == b"';")
-        .unwrap_or(rest.len());
+    let end = match rest.windows(2).position(|w| w == b"';") {
+        Some(pos) => pos,
+        None => {
+            let mut len = rest.len();
+            while len > 0 && rest[len - 1] == 0 {
+                len -= 1;
+            }
+            len
+        }
+    };
     let title = &rest[..end];
     (!title.is_empty()).then_some(title)
 }
@@ -6518,5 +6594,69 @@ mod tests {
         assert!(!rig.coord.external_playback);
         assert_eq!(pipeline.stream_buffer.available_read(), 0);
         assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+    }
+
+    #[test]
+    fn test_reinstall_lms_decoder_restores_24bit_mono_pcm() {
+        let mut rig = gapless_rig(&[track_bytes(1, 32)]);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Configure LMS track with 24-bit mono little-endian PCM
+        rig.coord.current_format = Some(AudioFormat::Pcm);
+        rig.coord.pcm_bits = 24;
+        rig.coord.pcm_channels = 1;
+        rig.coord.pcm_big_endian = false;
+        rig.coord.stream = StreamLink::Open;
+
+        // Begin external playback
+        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        assert!(rig.coord.external_playback);
+
+        // Ingest external PCM bytes
+        pipeline.ingest_stream_data(&[0x42; 64]).unwrap();
+        assert_eq!(pipeline.stream_buffer.available_read(), 64);
+
+        // End external playback and restore LMS PCM decoder
+        rig.coord.end_external_playback_and_restore(&mut pipeline);
+        assert!(!rig.coord.external_playback);
+        match &pipeline.decoder {
+            ActiveDecoder::Pcm(d) => {
+                assert_eq!(
+                    (d.bits_per_sample, d.channels, d.big_endian),
+                    (24, 1, false)
+                );
+            }
+            _ => panic!("expected 24-bit mono PCM decoder"),
+        }
+    }
+
+    #[test]
+    fn test_lms_strm_q_isolated_during_active_external_playback() {
+        let mut rig = gapless_rig(&[track_bytes(1, 32)]);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        // Active external playback owns arbiter
+        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        assert!(rig.coord.external_playback);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+
+        // Unmute sink and backend for active playback
+        pipeline.sink.set_mute(false);
+        rig.backend.set_mute(false);
+        pipeline.ingest_stream_data(&[0x99; 32]).unwrap();
+
+        // LMS sends strm q (Stop) while preempted
+        rig.command(&mut pipeline, &simple_strm(b'q'), 20);
+
+        // External playback must stay playing, unmuted, with buffer intact
+        assert!(rig.coord.external_playback);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+        assert!(!pipeline.sink.muted);
+        assert!(!rig.backend.muted);
+        assert_eq!(pipeline.stream_buffer.available_read(), 32);
     }
 }

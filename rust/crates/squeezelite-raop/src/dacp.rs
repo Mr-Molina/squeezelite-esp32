@@ -143,6 +143,9 @@ impl DacpClient {
     /// request from a linear volume (`0.0..=1.0`).
     #[must_use]
     pub fn build_volume_request(&self, volume_linear: f32) -> Option<Vec<u8>> {
+        if volume_linear.is_nan() {
+            return None;
+        }
         let clamped = volume_linear.clamp(0.0, 1.0);
         let db = if clamped <= 0.0001 {
             -144.0_f32
@@ -159,11 +162,14 @@ impl DacpClient {
     #[must_use]
     pub fn build_raw_action_request(&self, action: &str) -> Option<Vec<u8>> {
         let trimmed = action.trim_start_matches('/');
-        if trimmed.is_empty() || self.active_remote.is_empty() {
+        if trimmed.is_empty() || self.active_remote.is_empty() || trimmed.contains("..") {
             return None;
         }
-        let has_ctrl = |s: &str| s.bytes().any(|b| b < 0x20 || b == 0x7F);
-        if has_ctrl(trimmed) || has_ctrl(&self.active_remote) || has_ctrl(&self.dacp_id) {
+        let has_invalid = |s: &str| s.bytes().any(|b| !(0x20..0x7F).contains(&b));
+        if has_invalid(trimmed)
+            || has_invalid(&self.active_remote)
+            || has_invalid(&self.dacp_id)
+        {
             return None;
         }
 

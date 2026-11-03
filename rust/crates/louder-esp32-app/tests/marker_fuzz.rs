@@ -1,11 +1,13 @@
-//! Task 12 Review Focus: the gapless track boundary (C `output.track_start`) under arbitrary
-//! interleavings of decoding, partial sink writes, rewinds, skips, `strm f` and new streams.
+//! Task 12 Review Focus: the gapless track boundary (C `output.track_start`)
+//! under arbitrary interleavings of decoding, partial sink writes, rewinds,
+//! skips, `strm f` and new streams.
 //!
 //! The pipeline keeps the boundary as a distance from the output read position
-//! ([`TrackMarker::bytes_ahead`]). Whatever moves the read position (output, skip, rewind) or
-//! the write position (decode, `strm f` truncation) must keep that distance on the first frame
-//! of the track it marks: never behind the read position (a "negative" distance), never past
-//! the written data, never off a frame boundary.
+//! ([`TrackMarker::bytes_ahead`]). Whatever moves the read position (output,
+//! skip, rewind) or the write position (decode, `strm f` truncation) must
+//! keep that distance on the first frame of the track it marks: never behind
+//! the read position (a "negative" distance), never past the written data,
+//! never off a frame boundary.
 #![cfg(not(target_arch = "xtensa"))]
 
 use louder_esp32_app::pipeline::ActiveDecoder;
@@ -24,7 +26,8 @@ use proptest::proptest;
 use squeezelite_audio_core::OutputError;
 use squeezelite_decoders::PcmDecoder;
 
-/// Frames per track are numbered from 0; a frame's left sample is `track * 1000 + index`.
+/// Frames per track are numbered from 0; a frame's left sample is
+/// `track * 1000 + index`.
 const TRACK_STRIDE: i16 = 1000;
 const MAX_TRACK_FRAMES: usize = 900;
 

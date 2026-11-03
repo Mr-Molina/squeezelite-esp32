@@ -308,7 +308,8 @@ mod device {
         TcpPhase, TcpSocketOps,
     };
     use louder_esp32_app::ota_safety::{
-        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET, SETTINGS_JOURNAL_OFFSET,
+        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET,
+        OTADATA_PARTITION_OFFSET as OTADATA_SECTOR_0_OFFSET, SETTINGS_JOURNAL_OFFSET,
     };
     use louder_esp32_app::pipeline::ActiveDecoder;
     use louder_esp32_app::{AmpManager, CydUartBridge, PlayerCoordinator, PlayerState};
@@ -652,7 +653,7 @@ mod device {
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
             let _ = s.flash.erase(offset, offset + 4096);
-            let _ = s.flash.write(offset, image.sector);
+            let _ = s.flash.write_nor(offset, &image.sector[..image.used_len]);
         }
     }
 
@@ -875,15 +876,22 @@ mod device {
                             }
                             s.bt_audio_active = true;
                         }
-                        let _ = s.pipeline.ingest_stream_data(pcm_bytes);
+                        let avail = s.pipeline.stream_buffer.available_write() & !3;
+                        let aligned_len = (pcm_bytes.len() & !3).min(avail);
+                        if aligned_len > 0 {
+                            let _ = s.pipeline.ingest_stream_data(&pcm_bytes[..aligned_len]);
+                        }
                     }
                 });
 
             if s.bt_audio_active && !s.bt_sink.is_streaming() {
-                if s.pipeline.stream_buffer.available_read() == 0
+                if s.pipeline.stream_buffer.available_read() < 4
                     && s.pipeline.output_buffer.available_read() == 0
                     && !s.pipeline.has_pending_pcm()
                 {
+                    if s.pipeline.stream_buffer.available_read() > 0 {
+                        s.pipeline.stream_buffer.flush();
+                    }
                     s.coordinator.release_source(louder_esp32_app::AudioSource::Bluetooth);
                     s.coordinator.end_external_playback_and_restore(s.pipeline);
                     s.bt_audio_active = false;
@@ -950,6 +958,15 @@ mod device {
         match dhcp_event {
             Some(dhcpv4::Event::Configured(config)) => {
                 let ip_octets = config.address.address().octets();
+                let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
+                if ip_changed {
+                    s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
+                    s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
+                    s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                    s.helo_sent = false;
+                    s.pending_http_body = &[];
+                    s.pending_http_closing = false;
+                }
                 s.assigned_ip = Some(ip_octets);
                 let prefix_len = config.address.prefix_len();
                 let mask_u32 = if prefix_len == 0 {
@@ -1264,12 +1281,13 @@ mod device {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    let _ = s.flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
-                    println!(
-                        "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
-                         wrote ota_0 select entry & resetting"
-                    );
-                    esp_hal::system::software_reset();
+                    if s.flash.write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes).is_ok() {
+                        println!(
+                            "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
+                             wrote ota_0 select entry & resetting"
+                        );
+                        esp_hal::system::software_reset();
+                    }
                 }
                 _ => {}
             }
@@ -1530,7 +1548,9 @@ mod device {
             s.last_fault_check_ms = now_ms;
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
-                if s.coordinator.state == louder_esp32_app::PlayerState::Playing {
+                if s.coordinator.state == louder_esp32_app::PlayerState::Playing
+                    || s.coordinator.external_playback
+                {
                     if fault.has_critical_amp_fault() {
                         let faults = CONSECUTIVE_FAULTS.load(core::sync::atomic::Ordering::Relaxed);
                         let last_rec = LAST_RECOVERY_MS.load(core::sync::atomic::Ordering::Relaxed);

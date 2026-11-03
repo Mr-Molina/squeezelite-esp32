@@ -416,7 +416,25 @@ impl CliRegistry {
         let sub = tokens.get(1).copied().unwrap_or("");
         match sub {
             "dump" | "list" => {
-                let _ = out.push_str("OK: dumping configuration");
+                if tokens.len() > 2 {
+                    let _ = out.push_str("OK: config dump:");
+                    for &item in &tokens[2..] {
+                        if let Some((k, v)) = item.split_once('=') {
+                            let display_v = if k == "wifi.pass" || k == "wifi_pass" {
+                                "***"
+                            } else {
+                                v
+                            };
+                            let _ = write!(out, " {}={}", k, display_v);
+                        } else if item == "wifi.pass" || item == "wifi_pass" {
+                            let _ = write!(out, " {}=***", item);
+                        } else {
+                            let _ = write!(out, " {}", item);
+                        }
+                    }
+                } else {
+                    let _ = out.push_str("OK: dumping configuration");
+                }
                 CliCommandResult {
                     ok: true,
                     output: out.clone(),
@@ -447,7 +465,12 @@ impl CliRegistry {
                     let mut key: String<32> = String::new();
                     let mut value: String<64> = String::new();
                     if !k.is_empty() && key.push_str(k).is_ok() && value.push_str(v).is_ok() {
-                        let _ = write!(out, "OK: config set {}={}", k, v);
+                        let display_v = if k == "wifi.pass" || k == "wifi_pass" {
+                            "***"
+                        } else {
+                            v
+                        };
+                        let _ = write!(out, "OK: config set {}={}", k, display_v);
                         return CliCommandResult {
                             ok: true,
                             output: out.clone(),
@@ -900,6 +923,7 @@ pub struct TelnetSession {
     iac_state: IacState,
     line_buf: String<128>,
     skip_next_lf: bool,
+    overflowed: bool,
 }
 
 impl Default for TelnetSession {
@@ -916,6 +940,7 @@ impl TelnetSession {
             iac_state: IacState::Normal,
             line_buf: String::new(),
             skip_next_lf: false,
+            overflowed: false,
         }
     }
 
@@ -930,6 +955,7 @@ impl TelnetSession {
         self.iac_state = IacState::Normal;
         self.line_buf.clear();
         self.skip_next_lf = false;
+        self.overflowed = false;
     }
 
     /// Feeds raw TCP bytes from port 23, stripping Telnet `IAC` negotiations
@@ -964,22 +990,39 @@ impl TelnetSession {
                             if byte == b'\r' {
                                 self.skip_next_lf = true;
                             }
-                            let res = registry.execute(self.line_buf.as_str());
-                            self.line_buf.clear();
-                            if res.side_effect != CliSideEffect::None {
-                                last_effect = res.side_effect;
+                            if self.overflowed {
+                                self.overflowed = false;
+                                self.line_buf.clear();
+                                tx_len = Self::append_reply(
+                                    tx_out,
+                                    tx_len,
+                                    "ERR: line exceeds 128 bytes limit",
+                                );
+                            } else {
+                                let res = registry.execute(self.line_buf.as_str());
+                                self.line_buf.clear();
+                                if res.side_effect != CliSideEffect::None {
+                                    last_effect = res.side_effect;
+                                }
+                                tx_len = Self::append_reply(
+                                    tx_out,
+                                    tx_len,
+                                    res.output.as_str(),
+                                );
                             }
-                            tx_len = Self::append_reply(
-                                tx_out,
-                                tx_len,
-                                res.output.as_str(),
-                            );
                         }
                         0x08 | 0x7F => {
-                            let _ = self.line_buf.pop();
+                            if !self.overflowed {
+                                let _ = self.line_buf.pop();
+                            }
                         }
                         0x20..=0x7E => {
-                            let _ = self.line_buf.push(byte as char);
+                            if self.overflowed {
+                                // Line already exceeded capacity; discard remainder.
+                            } else if self.line_buf.push(byte as char).is_err() {
+                                self.overflowed = true;
+                                self.line_buf.clear();
+                            }
                         }
                         _ => {}
                     }
@@ -992,7 +1035,10 @@ impl TelnetSession {
                         self.iac_state = IacState::InSubnegotiation;
                     }
                     TELNET_IAC => {
-                        let _ = self.line_buf.push(TELNET_IAC as char);
+                        if !self.overflowed && self.line_buf.push(TELNET_IAC as char).is_err() {
+                            self.overflowed = true;
+                            self.line_buf.clear();
+                        }
                         self.iac_state = IacState::Normal;
                     }
                     _ => {
@@ -1229,5 +1275,43 @@ mod tests {
         ];
         session2.ingest_bytes(stream2, &reg, &mut tx);
         assert_eq!(session2.pending_line(), "c");
+    }
+
+    #[test]
+    fn test_exec_config_redacts_wifi_pass() {
+        let reg = CliRegistry::new();
+
+        // 1. config set wifi.pass redaction
+        let res_set = reg.execute("config set wifi.pass SuperSecretPassword123");
+        assert!(res_set.ok);
+        assert_eq!(res_set.output.as_str(), "OK: config set wifi.pass=***");
+
+        // 2. config dump redaction
+        let res_dump = reg.execute("config dump player_name=Basement wifi.pass=Secret");
+        assert!(res_dump.ok);
+        assert!(res_dump.output.contains("wifi.pass=***"));
+        assert!(res_dump.output.contains("player_name=Basement"));
+    }
+
+    #[test]
+    fn test_telnet_session_overflow_discards_line_and_emits_error() {
+        let reg = CliRegistry::new();
+        let mut session = TelnetSession::new();
+        let mut tx = [0u8; 512];
+
+        // Send 130 bytes without a newline (exceeding 128 bytes limit)
+        let mut long_cmd = [b'a'; 130];
+        long_cmd[0..4].copy_from_slice(b"help");
+        session.ingest_bytes(&long_cmd, &reg, &mut tx);
+
+        // Session must be in overflowed state and pending_line cleared
+        assert_eq!(session.pending_line(), "");
+
+        // Sending a newline now emits an error response rather than executing
+        let (tx_len, effect) = session.ingest_bytes(b"\r\n", &reg, &mut tx);
+        assert_eq!(effect, CliSideEffect::None);
+        let reply = core::str::from_utf8(&tx[..tx_len]).expect("utf8");
+        assert!(reply.contains("ERR: line exceeds 128 bytes limit"));
+        assert!(reply.ends_with(TELNET_PROMPT));
     }
 }

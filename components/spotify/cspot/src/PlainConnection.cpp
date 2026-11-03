@@ -13,6 +13,13 @@
 #else
 #include <ws2tcpip.h>
 #endif
+#ifdef ESP_PLATFORM
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#else
+#define pdMS_TO_TICKS(ms) ((ms) / 10)
+#define vTaskDelay(ticks) ((void)0)
+#endif
 #include "BellLogger.h"  // for AbstractLogger
 #include "Logger.h"      // for CSPOT_LOG
 #include "Packet.h"      // for cspot
@@ -147,6 +154,10 @@ void PlainConnection::readBlock(const uint8_t* dst, size_t size) {
     if ((n = recv(this->apSock, (char*)&dst[idx], size - idx, 0)) <= 0) {
       switch (getErrno()) {
         case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        case EWOULDBLOCK:
+#endif
+          vTaskDelay(pdMS_TO_TICKS(10));
         case ETIMEDOUT:
           if (timeoutHandler()) {
             CSPOT_LOG(error, "Connection lost, will need to reconnect...");

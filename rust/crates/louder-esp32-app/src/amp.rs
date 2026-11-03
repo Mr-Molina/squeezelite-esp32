@@ -342,10 +342,11 @@ where
                 self.inner = Some(AmpInner::Play(play));
                 Ok(())
             }
-            other => {
-                self.inner = other;
-                Ok(())
+            Some(AmpInner::PowerDown(pd)) => {
+                self.inner = Some(AmpInner::PowerDown(pd));
+                Err(DriverError::InvalidParameter)
             }
+            None => Err(DriverError::InvalidParameter),
         }
     }
 
@@ -375,10 +376,11 @@ where
                 self.inner = Some(AmpInner::Play(play));
                 Ok(())
             }
-            other => {
-                self.inner = other;
-                Ok(())
+            Some(AmpInner::PowerDown(pd)) => {
+                self.inner = Some(AmpInner::PowerDown(pd));
+                Err(DriverError::InvalidParameter)
             }
+            None => Err(DriverError::InvalidParameter),
         }
     }
 
@@ -428,9 +430,15 @@ where
     }
 
     /// Sets hardware mute state on the amplifier (`0xFF` mute).
+    /// Preserves `self.current_volume` when muted so unmuting restores
+    /// it (AUD13-001).
     pub fn set_mute(&mut self, mute: bool) -> Result<(), DriverError<E>> {
         if mute {
-            self.set_volume(VOL_MUTE)
+            match self.inner.as_mut() {
+                Some(AmpInner::Play(driver)) => driver.set_digital_volume(VOL_MUTE),
+                Some(AmpInner::Standby(driver)) => driver.set_digital_volume(VOL_MUTE),
+                Some(AmpInner::PowerDown(_)) | None => Err(DriverError::InvalidParameter),
+            }
         } else {
             self.set_volume(self.current_volume)
         }
@@ -447,8 +455,7 @@ where
                 Ok(Some((faults, telem)))
             }
             Some(AmpInner::Standby(driver)) => {
-                let faults = driver.check_faults()?;
-                let telem = driver.read_telemetry()?;
+                let (faults, telem) = driver.check_faults_and_telemetry()?;
                 Ok(Some((faults, telem)))
             }
             _ => Ok(None),
@@ -472,10 +479,13 @@ where
     }
 
     /// Executes the 3-step TI datasheet fault recovery sequence in Play mode
-    /// (PERIPH-603).
+    /// (PERIPH-603). Restores digital volume after clearing faults (AUD13-004).
     pub fn recover_from_fault(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.as_mut() {
-            Some(AmpInner::Play(driver)) => driver.recover_from_fault(),
+            Some(AmpInner::Play(driver)) => {
+                driver.recover_from_fault()?;
+                driver.set_digital_volume(self.current_volume)
+            }
             Some(AmpInner::Standby(driver)) => driver.clear_faults(),
             Some(AmpInner::PowerDown(_)) | None => Err(DriverError::InvalidParameter),
         }
@@ -723,7 +733,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
@@ -736,14 +746,15 @@ mod tests {
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
         ];
         let mut i2c = I2cMock::new(&expectations);
 
         let mut amp = AmpManager::new(&mut i2c);
-        // In PowerDown, set_volume and clear_faults return Err
+        // In PowerDown, set_volume, clear_faults, and start_playback return Err
         assert_eq!(amp.set_volume(0x40), Err(DriverError::InvalidParameter));
         assert_eq!(amp.clear_faults(), Err(DriverError::InvalidParameter));
+        assert_eq!(amp.start_playback(), Err(DriverError::InvalidParameter));
 
         amp.initialize(32).unwrap();
         assert_eq!(amp.mode(), AmpMode::Standby);
@@ -754,6 +765,23 @@ mod tests {
         amp.clear_faults().unwrap();
 
         i2c.done();
+    }
+
+    #[test]
+    fn test_amp_manager_mute_preserves_and_restores_volume() {
+        let i2c = TargetI2cBus::new();
+        let mut amp = AmpManager::with_config(i2c, AmpConfig::default());
+        amp.initialize(32).expect("init ok");
+        assert_eq!(amp.mode(), AmpMode::Standby);
+
+        amp.set_volume(0x40).expect("set_volume ok");
+        assert_eq!(amp.current_volume(), 0x40);
+
+        amp.set_mute(true).expect("set_mute true ok");
+        assert_eq!(amp.current_volume(), 0x40);
+
+        amp.set_mute(false).expect("set_mute false ok");
+        assert_eq!(amp.current_volume(), 0x40);
     }
 
     #[test]

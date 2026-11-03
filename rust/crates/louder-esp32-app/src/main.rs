@@ -843,11 +843,19 @@ mod xtensa_hw {
                     if let Ok(mut new_buf) = esp_hal::dma::DmaTxStreamBuf::new(descriptors, buffer)
                     {
                         Self::prefill_silence(&mut new_buf);
-                        if let Ok(new_transfer) = i2s_tx.write(new_buf) {
-                            self.transfer = Some(new_transfer);
-                            let rate = self.sample_rate_hz;
-                            self.sample_rate_hz = 0;
-                            let _ = self.set_clock_rate(rate);
+                        match i2s_tx.write(new_buf) {
+                            Ok(new_transfer) => {
+                                self.transfer = Some(new_transfer);
+                                let rate = self.sample_rate_hz;
+                                self.sample_rate_hz = 0;
+                                let _ = self.set_clock_rate(rate);
+                            }
+                            Err((_, fallback_tx, fallback_buf)) => {
+                                // Preserve self.i2s_tx across transient DMA errors
+                                if let Ok(fallback_transfer) = fallback_tx.write(fallback_buf) {
+                                    self.transfer = Some(fallback_transfer);
+                                }
+                            }
                         }
                     }
                 }
@@ -1154,11 +1162,28 @@ mod xtensa_hw {
     }
     pub(crate) static CORE1_HEARTBEAT: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
+    pub(crate) static CORE1_PARK_REQ: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    pub(crate) static CORE1_PARKED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
     #[cfg(not(feature = "esp-rtos-core1"))]
     #[esp_hal::ram]
     fn app_core_loop() {
         loop {
+            if CORE1_PARK_REQ.load(core::sync::atomic::Ordering::Acquire) {
+                CORE1_PARKED.store(true, core::sync::atomic::Ordering::Release);
+                while CORE1_PARK_REQ.load(core::sync::atomic::Ordering::Acquire) {
+                    #[allow(unsafe_code)]
+                    // JUSTIFICATION: Cooperative park wait loop for Core 1 during flash
+                    // erase and write.
+                    // SAFETY: Nop instruction has no memory or register side effects.
+                    unsafe {
+                        core::arch::asm!("nop");
+                    }
+                }
+                CORE1_PARKED.store(false, core::sync::atomic::Ordering::Release);
+            }
             CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             for _ in 0..10_000 {
                 #[allow(unsafe_code)]
@@ -1739,6 +1764,13 @@ mod xtensa_hw {
         /// Parks APP_CPU before the reboot-time settings flash write (Core-1
         /// parking rule).
         pub(crate) fn park_for_flash_write(&mut self) {
+            CORE1_PARK_REQ.store(true, core::sync::atomic::Ordering::Release);
+            for _ in 0..100_000 {
+                if CORE1_PARKED.load(core::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
             #[cfg(not(feature = "esp-rtos-core1"))]
             #[allow(unsafe_code)]
             // JUSTIFICATION: Parking APP_CPU before SPI flash erase/write to
@@ -1769,6 +1801,7 @@ mod xtensa_hw {
         /// heartbeat, so it resumes where it was parked.
         #[cfg(feature = "runtime-flash-persist")]
         pub(crate) fn unpark_after_flash_write(&mut self) {
+            CORE1_PARK_REQ.store(false, core::sync::atomic::Ordering::Release);
             #[cfg(not(feature = "esp-rtos-core1"))]
             self.cpu_ctrl.unpark_core(esp_hal::system::Cpu::AppCpu);
         }
@@ -2895,7 +2928,7 @@ mod xtensa_hw {
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
             let _ = s.flash.erase(offset, offset + 4096);
-            let _ = s.flash.write(offset, image.sector);
+            let _ = s.flash.write_nor(offset, &image.sector[..image.used_len]);
         }
     }
 
@@ -2962,15 +2995,22 @@ mod xtensa_hw {
                             }
                             s.bt_audio_active = true;
                         }
-                        let _ = s.pipeline.ingest_stream_data(pcm_bytes);
+                        let avail = s.pipeline.stream_buffer.available_write() & !3;
+                        let aligned_len = (pcm_bytes.len() & !3).min(avail);
+                        if aligned_len > 0 {
+                            let _ = s.pipeline.ingest_stream_data(&pcm_bytes[..aligned_len]);
+                        }
                     }
                 });
 
             if s.bt_audio_active && !s.bt_sink.is_streaming() {
-                if s.pipeline.stream_buffer.available_read() == 0
+                if s.pipeline.stream_buffer.available_read() < 4
                     && s.pipeline.output_buffer.available_read() == 0
                     && !s.pipeline.has_pending_pcm()
                 {
+                    if s.pipeline.stream_buffer.available_read() > 0 {
+                        s.pipeline.stream_buffer.flush();
+                    }
                     s.bt_audio_active = false;
                     s.coordinator.release_source(AudioSource::Bluetooth);
                     restore_suspended_or_stop(s);
@@ -3035,6 +3075,23 @@ mod xtensa_hw {
         match dhcp_event {
             Some(dhcpv4::Event::Configured(config)) => {
                 let ip_octets = config.address.address().octets();
+                let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
+                if ip_changed {
+                    s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
+                    s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
+                    s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                    s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
+                    s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
+                    s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
+                    s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
+                    s.mdns_bound = false;
+                    s.raop_streaming = false;
+                    s.spot_streaming = false;
+                    s.rtsp_rx_acc.clear();
+                    s.helo_sent = false;
+                    s.pending_http_body = &[];
+                    s.pending_http_closing = false;
+                }
                 s.assigned_ip = Some(ip_octets);
                 s.raop_rtsp.set_ip_address(ip_octets);
                 let _ = s
@@ -3400,12 +3457,13 @@ mod xtensa_hw {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    let _ = s.flash.write(OTADATA_PARTITION_OFFSET, &entry_bytes);
-                    println!(
-                        "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
-                         wrote ota_0 select entry & resetting"
-                    );
-                    esp_hal::system::software_reset();
+                    if s.flash.write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes).is_ok() {
+                        println!(
+                            "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
+                             wrote ota_0 select entry & resetting"
+                        );
+                        esp_hal::system::software_reset();
+                    }
                 }
                 _ => {}
             }
@@ -3971,7 +4029,8 @@ mod xtensa_hw {
             s.last_fault_check_ms = now_ms;
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
-                if s.coordinator.state == PlayerState::Playing
+                if (s.coordinator.state == PlayerState::Playing
+                    || s.coordinator.external_playback)
                     && fault.has_critical_amp_fault()
                     && now_ms.saturating_sub(s.last_fault_recovery_ms) >= 30_000
                 {
@@ -3985,8 +4044,8 @@ mod xtensa_hw {
             s.last_cyd_progress_ms = now_ms;
             if s.coordinator.state == PlayerState::Playing && s.coordinator.current_sample_rate > 0
             {
-                let elapsed_secs =
-                    (s.pipeline.frames_played / s.coordinator.current_sample_rate as u64) as u32;
+                let elapsed_secs = (s.coordinator.frames_for_stat(s.pipeline)
+                    / s.coordinator.current_sample_rate as u64) as u32;
                 let _ = s.cyd_bridge.send_message(&CydMessage::Progress {
                     elapsed_secs,
                     duration_secs: 0,
@@ -4118,13 +4177,18 @@ mod tests {
                 vec![registers::CHAN_FAULT],
                 vec![0x01, 0x00, 0x00, 0x00],
             ),
-            // recover_from_fault: Hi-Z -> clear fault -> Play
+            // recover_from_fault: Hi-Z -> clear fault -> Play -> restore volume (AUD13-004)
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
         ];
         let mut i2c = I2cMock::new(&expectations);
         let mut amp = AmpManager::new(&mut i2c);

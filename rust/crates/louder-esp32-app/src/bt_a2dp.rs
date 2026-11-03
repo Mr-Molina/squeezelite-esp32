@@ -3333,6 +3333,25 @@ impl BtA2dpSink {
         self.bond_count += 1;
     }
 
+    /// Saves the bonding store under `"bt.bonds"` via [`BondingStore`].
+    pub fn save_bonds_to_storage<S: KeyValueStorage>(
+        &self,
+        storage: &mut S,
+    ) -> Result<(), StorageError> {
+        self.bonding_store.save_to_storage(storage)
+    }
+
+    /// Loads the bonding store from `"bt.bonds"` via [`BondingStore`].
+    pub fn load_bonds_from_storage<S: KeyValueStorage>(
+        &mut self,
+        storage: &S,
+    ) -> Result<(), StorageError> {
+        let store = BondingStore::load_from_storage(storage)?;
+        self.bonding_store = store;
+        self.bond_count = store.count();
+        Ok(())
+    }
+
     fn handle_hci_acl<T: HciTransport, F: FnMut(&[u8], u32)>(
         &mut self,
         transport: &mut T,

@@ -1,6 +1,7 @@
-//! ICY metadata end to end: a real HTTP server, the host `HttpAudioStream` adapter, the
-//! coordinator `tick`, and the `META` frame it sends to LMS. The largest block ICY can carry
-//! (255 * 16 = 4080 bytes) must reach LMS un-truncated.
+//! ICY metadata end to end: a real HTTP server, the host `HttpAudioStream`
+//! adapter, the coordinator `tick`, and the `META` frame it sends to LMS.
+//! The largest block ICY can carry (255 * 16 = 4080 bytes) must reach LMS
+//! un-truncated.
 #![cfg(not(target_arch = "xtensa"))]
 
 use std::io::{Read, Write};
@@ -14,7 +15,8 @@ use louder_esp32_app::pipeline::{ActiveDecoder, StreamPipeline};
 use louder_esp32_app::NullAudioSink;
 use squeezelite_decoders::PcmDecoder;
 
-/// `strm s` (8-byte header form): PCM 16-bit / 44.1 kHz / stereo, autostart, threshold 0.
+/// `strm s` (8-byte header form): PCM 16-bit / 44.1 kHz / stereo, autostart,
+/// threshold 0.
 fn strm_start(port: u16) -> Vec<u8> {
     let mut payload = [0u8; 24];
     payload[0] = b's';
@@ -34,13 +36,16 @@ fn strm_start(port: u16) -> Vec<u8> {
 
 #[test]
 fn test_max_size_icy_block_reaches_lms_untruncated() {
-    // Metadata block: 255 length units = 4080 bytes, no NUL padding (nothing is trimmed).
+    // Metadata block: 255 length units = 4080 bytes, no NUL padding
+    // (nothing is trimmed).
     let mut meta = b"StreamTitle='".to_vec();
     meta.resize(4078, b'm');
     meta.extend_from_slice(b"';");
     assert_eq!(meta.len(), 255 * 16);
 
-    let mut response = b"HTTP/1.0 200 OK\r\nContent-Type: audio/L16\r\nicy-metaint: 16\r\n\r\n".to_vec();
+    let mut response =
+        b"HTTP/1.0 200 OK\r\nContent-Type: audio/L16\r\nicy-metaint: 16\r\n\r\n"
+            .to_vec();
     response.extend_from_slice(&[0u8; 16]);
     response.push(255);
     response.extend_from_slice(&meta);

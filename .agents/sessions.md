@@ -2,6 +2,28 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-03 10:24 | Antigravity Orchestrator | `[squeezelite-esp32]` Joint `/deep-hardware-audit` & `/deep-code-audit` (`AUD-01`..`AUD-16`, `HW-01`..`HW-08`), Full 127-Finding Remediation across Waves 1–3 (`REM-01`..`REM-19`), & 7-Agent `pro` Counter-Verification (`CV-01`..`CV-07`, MK5-Rust)
+**Agent**: Antigravity Orchestrator (`a13abc13-a35b-4ff9-935f-36176c47169e`)
+**Host OS**: Linux (`x86_64`)
+**Branch**: `MK5-Rust` (synced with `origin/MK5-Rust`)
+**Hardware Targets**: `pc-1` (`Dell Precision Tower 3431`, `Linux 6.12.113+deb13-amd64`), `"BASEMENT"` (`172.22.1.15`, Wi-Fi MAC `c8:2e:18:be:b8:34`, BT MAC `CA:2E:18:BE:B8:35`, **Sonocotta Louder-ESP32** with TI `TAS5805M` at `I2C0 0x2D`), & Lyrion Music Server (`10.0.0.10:9000` / `3483`)
+**Verification Suite**: `743 passed; 0 failed; 0 ignored` across all 27 test targets (`cargo test --workspace -q`) + `0` Clippy Warnings (`cargo clippy --workspace --all-targets -- -D warnings`) + `0` `google_rust_audit.py --strict` Errors/Warnings across all 11 workspace crates (`GRS-001`..`GRS-012`) + 7/7 `Model: "pro"` Read-Only Counter-Verifiers (`CV-01`..`CV-07`) `[PASS]`
+**Code Hygiene Gates**: UNCONDITIONAL PASS (`goodbye_preflight.py`: `"status": "clean"`, `0` secrets, `0` scratch artifacts)
+
+### Completed This Session
+- **`/deep-hardware-audit` (`HW-01`..`HW-08`)**:
+  - Audited 24 hardware/network/storage/audio subsystems across `pc-1`, `"BASEMENT"` (`172.22.1.15`), and LMS (`10.0.0.10`) in `hardware_audit_master_matrix.md`. Per user approval (`Report Only`), all 24 hardware subsystems were kept untouched (`[SKIPPED / UNMODIFIED]`).
+- **`/deep-code-audit` (`AUD-01`..`AUD-16` -> `REM-01`..`REM-19` -> `CV-01`..`CV-07`)**:
+  - Audited `80,493` first-party Rust LOC (`11` crates) + `132,387` vendored Rust LOC (`5` crates) + C++ bridge files, consolidating **127 deduplicated findings** (`9 CRITICAL`, `29 HIGH`, `52 MEDIUM`, `37 LOW`) in `audit_master_matrix.md`.
+  - **Wave 1 (`REM-01`..`REM-10`)**: Remediated cryptographic (`squeezelite-cspot` DH/Shannon/PBKDF2/HMAC zeroization, constant-time MAC checks, `squeezelite-raop` AES/RSA-OAEP hardening), protocol framing (`squeezelite-proto`, `squeezelite-cyd-link`, `squeezelite-config` WPA2 passphrase length validation), lock-free SPSC ring buffer & equalizer/resampler DSP (`squeezelite-audio-core`), and audio decoders (`squeezelite-decoders`, `nanomp3-core`, vendored `alac`).
+  - **Wave 2 (`REM-11`..`REM-16` + `FIX-04`, `FIX-07`, `FIX-08`, `FIX-14`)**: Remediated OTA safety (`ota_safety.rs`), HTTP control authentication/CSRF/POST enforcement (`http_control.rs`), Wi-Fi & W5500 socket bounds (`wifi.rs`, `eth_w5500.rs`, `network.rs`, `net_device.rs`), audio pipeline & gapless coordinator state machine (`pipeline.rs`, `coordinator.rs`), Bluetooth A2DP (`bt_a2dp.rs`), and TAS5805M I2C driver (`squeezelite-tas58xx`, `amp.rs`, `hal.rs`).
+  - **Wave 3 (`REM-17`..`REM-19` + `FIX-09`..`FIX-13`)**: Remediated runtime tasks & main entry (`tasks.rs`, `main.rs`), expanded integration/proptest suites (`743` passing tests), pinned `rust/rust-toolchain.toml`, added `.github/workflows/rust-ci.yml`, and replaced busy-wait spin in `components/spotify/cspot/src/PlainConnection.cpp`.
+  - **Counter-Verification (`CV-01`..`CV-07`)**: All 7 independent read-only `Model: "pro"` counter-verifiers audited every remediation wave and returned `[PASS]`.
+
+### Next-Session Handoff Notes
+- **Live `"BASEMENT"` (`172.22.1.15`) State**: Running untouched in `ota_0`; never call `POST /reboot_ota.json` and **never touch `/dev/ttyUSB0`** (separate CYD board).
+- **Host Tooling Note**: `cargo-audit` is not installed on `pc-1`; `.agents/.manifest_hash` remains unmarked until `cargo-audit` is installed.
+
 ## 2026-11-01 12:52 | Antigravity Orchestrator | `[squeezelite-esp32]` Joint `/deep-hardware-audit` & `/deep-code-audit` (`WO-238`..`WO-250`), Full 60-Finding Code + LMS `SqueezeDSP`/`TAS5805M` Remediation (`WO-251`..`WO-257`), & Live `"BASEMENT"` (`172.22.1.15`) 6-Gate Certification (`WO-258`, MK5-Rust)
 **Agent**: Antigravity Orchestrator (`6b63bd01-ad40-4ba9-a8fa-687005ed880f`)
 **Host OS**: Linux (`x86_64`)

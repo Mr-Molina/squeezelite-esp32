@@ -146,6 +146,8 @@ impl Shannon {
         self.load_key(key_bytes);
         self.genkonst();
         self.save_state();
+        self.sbuf = 0;
+        self.mbuf = 0;
         self.nbuf = 0;
     }
 
@@ -155,6 +157,8 @@ impl Shannon {
         self.konst = INITKONST;
         self.load_key(nonce_bytes);
         self.genkonst();
+        self.sbuf = 0;
+        self.mbuf = 0;
         self.nbuf = 0;
     }
 
@@ -371,5 +375,94 @@ impl Shannon {
                 break;
             }
         }
+    }
+
+    /// Computes final MAC and verifies against `expected` in constant time.
+    ///
+    /// Returns `true` if and only if the generated MAC matches `expected`.
+    pub fn finish_and_verify(&mut self, expected: &[u8]) -> bool {
+        let mut diff = 0u8;
+        let mut pos = 0;
+        let mut nbytes = expected.len();
+
+        if self.nbuf != 0 {
+            self.macfunc(self.mbuf);
+        }
+
+        self.cycle();
+        self.r[KEYP] ^= INITKONST ^ ((self.nbuf as u32) << 3);
+        self.nbuf = 0;
+
+        for i in 0..SHANNON_N {
+            self.r[i] ^= self.crc[i];
+        }
+        self.diffuse();
+
+        while nbytes > 0 {
+            self.cycle();
+            let w = self.sbuf.to_le_bytes();
+            let take = core::cmp::min(4, nbytes);
+            for i in 0..take {
+                diff |= expected[pos + i] ^ w[i];
+            }
+            pos += take;
+            nbytes -= take;
+        }
+
+        diff == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_finish_and_verify() {
+        let key = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let mut s1 = Shannon::new();
+        s1.key(&key);
+        s1.nonce(&[0x10, 0x20]);
+        let mut msg1 = *b"test payload message";
+        s1.encrypt(&mut msg1);
+        let mut mac = [0u8; 4];
+        s1.finish(&mut mac);
+
+        let mut s2 = Shannon::new();
+        s2.key(&key);
+        s2.nonce(&[0x10, 0x20]);
+        let mut msg2 = *b"test payload message";
+        s2.encrypt(&mut msg2);
+
+        // Matches valid MAC
+        assert!(s2.finish_and_verify(&mac));
+
+        // Corrupted MAC fails
+        let mut s3 = Shannon::new();
+        s3.key(&key);
+        s3.nonce(&[0x10, 0x20]);
+        let mut msg3 = *b"test payload message";
+        s3.encrypt(&mut msg3);
+        let mut bad_mac = mac;
+        bad_mac[0] ^= 0x01;
+        assert!(!s3.finish_and_verify(&bad_mac));
+    }
+
+    #[test]
+    fn test_shannon_nonce_clears_state() {
+        let key = [0xaa; 16];
+        let mut s = Shannon::new();
+        s.key(&key);
+
+        // Partially consume keystream to populate sbuf / nbuf
+        let mut stream_buf = [0u8; 3];
+        s.stream(&mut stream_buf);
+        assert_ne!(s.nbuf, 0);
+
+        // Call nonce() - must clear sbuf, mbuf, nbuf
+        s.nonce(&[0x01, 0x02, 0x03]);
+        assert_eq!(s.sbuf, 0);
+        assert_eq!(s.mbuf, 0);
+        assert_eq!(s.nbuf, 0);
     }
 }

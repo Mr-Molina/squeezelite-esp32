@@ -247,10 +247,7 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
                     if w == 0 {
                         retries += 1;
                         if retries >= 64 {
-                            // CODE-HAL-002: round down to 8-byte frame boundary and break out cleanly
-                            // instead of looping indefinitely into false HardwareFault.
-                            written_bytes &= !7;
-                            break;
+                            return Err(OutputError::HardwareFault);
                         }
                         continue;
                     }
@@ -631,7 +628,7 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
         if range.end > FLASH_SECTOR_SIZE {
             self.flash.erase_sector(1)?;
         }
-        if range.start == 0 && range.end >= FLASH_SECTOR_SIZE * 2 {
+        if range.start < FLASH_SECTOR_SIZE && range.end > FLASH_SECTOR_SIZE {
             self.last_seq = 0;
             self.scratch.fill(0xFF);
         }
@@ -744,13 +741,18 @@ impl I2c for TargetI2cBus {
             }
         }
 
-        // Hardware simulation: FAULT_CLEAR register (0x78) bit 7 clears
-        // faults (0x70..=0x73)
-        if write.len() > 1 && write[0] == registers::FAULT_CLEAR && (write[1] & 0x80) != 0 {
-            self.registers[registers::CHAN_FAULT as usize] = 0;
-            self.registers[registers::GLOBAL_FAULT1 as usize] = 0;
-            self.registers[registers::GLOBAL_FAULT2 as usize] = 0;
-            self.registers[registers::OTW as usize] = 0;
+        // Hardware simulation: FAULT_CLEAR register (0x78) handling (AUD13-009).
+        // Bit 7 clears analog faults (0x70, 0x72, 0x73).
+        // Bit 0 or bit 7 clears GLOBAL_FAULT1 (0x71).
+        if write.len() > 1 && write[0] == registers::FAULT_CLEAR {
+            if (write[1] & 0x80) != 0 {
+                self.registers[registers::CHAN_FAULT as usize] = 0;
+                self.registers[registers::GLOBAL_FAULT2 as usize] = 0;
+                self.registers[registers::OTW as usize] = 0;
+            }
+            if (write[1] & 0x01) != 0 || (write[1] & 0x80) != 0 {
+                self.registers[registers::GLOBAL_FAULT1 as usize] = 0;
+            }
         }
 
         Ok(())
@@ -957,6 +959,19 @@ mod tests {
         assert_eq!(sink.driver.written.len(), 8);
         assert_eq!(&sink.driver.written[0..4], &0x11223344i32.to_le_bytes());
         assert_eq!(&sink.driver.written[4..8], &0x55667788i32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_esp_i2s_sink_partial_dma_retry_exhaustion_returns_hardware_fault() {
+        // AUD13-002: DMA returns 3 bytes then 0 bytes for >=64 retries.
+        let mut steps = vec![3];
+        steps.resize(70, 0);
+        let driver = PartialDmaDriver::new(steps);
+        let mut sink = EspI2sSink::for_active_board(driver, 44100);
+
+        let frames = [0x11223344i32, 0x55667788i32];
+        let res = sink.write_frames(&frames);
+        assert_eq!(res, Err(OutputError::HardwareFault));
     }
 
     #[test]
@@ -1182,6 +1197,12 @@ mod tests {
 
         backend.erase_range(0..4096).unwrap();
         assert_eq!(backend.flash().read_sector(0).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
+
+        // AUD13-007: verify erase_range spanning both sectors resets last_seq
+        let _ = backend.commit_store(&store).unwrap();
+        assert!(backend.last_seq() > 0);
+        backend.erase_range(100..5000).unwrap();
+        assert_eq!(backend.last_seq(), 0);
 
         // CODE-HAL-003: verify bounds checking on erase_range
         assert_eq!(backend.erase_range(0..0), Err(HalError::StorageBoundsError));

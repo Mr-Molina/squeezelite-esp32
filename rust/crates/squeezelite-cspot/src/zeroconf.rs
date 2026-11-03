@@ -681,12 +681,32 @@ impl ZeroConfServer {
         self.last_user.take()
     }
 
+    /// Escapes quotes and backslashes and strips control characters (< 0x20)
+    /// for safe JSON string interpolation.
+    pub fn escape_json_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if (c as u32) < 0x20 {
+                continue;
+            }
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
     /// Builds JSON response for `action=getInfo`.
     pub fn build_get_info_json(
         device_id: &str,
         remote_name: &str,
         public_key_b64: &str,
     ) -> String {
+        let esc_device_id = Self::escape_json_string(device_id);
+        let esc_remote_name = Self::escape_json_string(remote_name);
+        let esc_pub_key = Self::escape_json_string(public_key_b64);
         format!(
             "{{\"status\":101,\"statusString\":\"OK\",\"spotifyError\":0,\
 \"version\":\"2.7.1\",\"libraryVersion\":\"1.0.0\",\"accountReq\":\"PREMIUM\",\
@@ -695,7 +715,7 @@ impl ZeroConfServer {
 \"resolverVersion\":\"0\",\"scope\":\"streaming,client-authorization-universal\",\
 \"activeUser\":\"\",\"deviceID\":\"{}\",\"remoteName\":\"{}\",\
 \"publicKey\":\"{}\",\"deviceType\":\"AudioDongle\"}}",
-            remote_name, device_id, remote_name, public_key_b64
+            esc_remote_name, esc_device_id, esc_remote_name, esc_pub_key
         )
     }
 
@@ -724,7 +744,8 @@ impl ZeroConfServer {
             .map_err(|_| CryptoError::InvalidCiphertext)?;
 
         let mac = hmac_sha1(&checksum_key, &encrypted);
-        if mac != checksum {
+        let diff = (0..20).fold(0u8, |acc, i| acc | (mac[i] ^ checksum[i]));
+        if diff != 0 {
             return Err(CryptoError::DecryptionFailed);
         }
 
@@ -758,17 +779,18 @@ impl ZeroConfServer {
         // Parse extracted loginData
         let mut pos = 1;
         let skip_len = read_blob_int(&blob_data, &mut pos)? as usize;
-        pos += skip_len;
-        pos += 1;
+        pos = pos.checked_add(skip_len).ok_or(CryptoError::DecryptionFailed)?;
+        pos = pos.checked_add(1).ok_or(CryptoError::DecryptionFailed)?;
         let auth_type = read_blob_int(&blob_data, &mut pos)?;
-        pos += 1;
+        pos = pos.checked_add(1).ok_or(CryptoError::DecryptionFailed)?;
         let auth_size = read_blob_int(&blob_data, &mut pos)? as usize;
 
-        if pos + auth_size > blob_data.len() {
+        let end_pos = pos.checked_add(auth_size).ok_or(CryptoError::DecryptionFailed)?;
+        if end_pos > blob_data.len() {
             return Err(CryptoError::DecryptionFailed);
         }
 
-        let auth_data = blob_data[pos..pos + auth_size].to_vec();
+        let auth_data = blob_data[pos..end_pos].to_vec();
         Ok((auth_type, auth_data))
     }
 
@@ -809,6 +831,10 @@ impl ZeroConfServer {
                 })
             }
             "addUser" => {
+                if body.trim().is_empty() {
+                    // Reject GET requests attempting addUser
+                    return Err(ZeroConfError::NotFound);
+                }
                 let username = get_param(&combined_params, "userName")
                     .ok_or(ZeroConfError::MissingParameter)?;
                 let blob_b64 = get_param(&combined_params, "blob")
@@ -836,10 +862,12 @@ impl ZeroConfServer {
                     device_name: dev_name.clone(),
                 });
 
+                let esc_username = Self::escape_json_string(&username);
+                let esc_dev_name = Self::escape_json_string(&dev_name);
                 let resp_json = format!(
                     "{{\"status\":101,\"statusString\":\"OK\",\"spotifyError\":0,\
 \"userName\":\"{}\",\"deviceName\":\"{}\"}}",
-                    username, dev_name
+                    esc_username, esc_dev_name
                 );
 
                 Ok(ZeroConfResponse {
@@ -850,5 +878,26 @@ impl ZeroConfServer {
             }
             _ => Err(ZeroConfError::NotFound),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_json_string() {
+        let raw = "foo\"bar\\baz\u{0007}\ntest";
+        let escaped = ZeroConfServer::escape_json_string(raw);
+        assert_eq!(escaped, "foo\\\"bar\\\\baztest");
+    }
+
+    #[test]
+    fn test_reject_add_user_get_request() {
+        let dh = OakleyGroup1Dh::from_private_key([0x01u8; 96]).expect("dh init");
+        let mut server = ZeroConfServer::new();
+        let uri = "/?action=addUser&userName=alice";
+        let res = server.handle_request(uri, "", &dh, "dev1", "living");
+        assert_eq!(res.err(), Some(ZeroConfError::NotFound));
     }
 }

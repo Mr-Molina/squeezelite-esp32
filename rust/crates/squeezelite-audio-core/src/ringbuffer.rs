@@ -128,13 +128,19 @@ impl<'a> AudioRingBuffer<'a> {
     /// `output_pack.c:366-376`).
     #[inline]
     pub fn peek_at(&self, offset: usize, dst: &mut [u8]) -> usize {
-        let avail = self.available_read();
+        let r_snap = self.read_pos.load(Ordering::Acquire);
+        let w = self.write_pos.load(Ordering::Acquire);
+        let avail = if w >= r_snap {
+            w - r_snap
+        } else {
+            self.capacity - (r_snap - w)
+        };
         if offset >= avail {
             return 0;
         }
 
         let to_peek = core::cmp::min(dst.len(), avail - offset);
-        let r = (self.read_pos.load(Ordering::Relaxed) + offset) % self.capacity;
+        let r = (r_snap + offset) % self.capacity;
 
         let data_to_end = self.capacity - r;
         if to_peek <= data_to_end {
@@ -246,9 +252,6 @@ impl<'a> AudioRingBuffer<'a> {
         }
 
         let to_write = core::cmp::min(src.len(), free);
-        let max_rew = self.capacity.saturating_sub(avail_read + to_write);
-        self.rewindable.fetch_min(max_rew, Ordering::Release);
-
         let w = self.write_pos.load(Ordering::Relaxed);
 
         let space_to_end = self.capacity - w;
@@ -280,6 +283,9 @@ impl<'a> AudioRingBuffer<'a> {
 
         let new_w = (w + to_write) % self.capacity;
         self.write_pos.store(new_w, Ordering::Release);
+
+        let max_rew = self.capacity.saturating_sub(avail_read + to_write);
+        self.rewindable.fetch_min(max_rew, Ordering::AcqRel);
 
         Ok(to_write)
     }
@@ -323,10 +329,11 @@ impl<'a> AudioRingBuffer<'a> {
         }
 
         let new_r = (r + to_read) % self.capacity;
-        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_add(to_read).min(self.capacity()))
-        });
         self.read_pos.store(new_r, Ordering::Release);
+        let avail_w = self.available_write();
+        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_add(to_read).min(avail_w))
+        });
 
         Ok(to_read)
     }
@@ -338,10 +345,11 @@ impl<'a> AudioRingBuffer<'a> {
         let to_consume = core::cmp::min(count, avail);
         let r = self.read_pos.load(Ordering::Relaxed);
         let new_r = (r + to_consume) % self.capacity;
-        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_add(to_consume).min(self.capacity()))
-        });
         self.read_pos.store(new_r, Ordering::Release);
+        let avail_w = self.available_write();
+        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_add(to_consume).min(avail_w))
+        });
     }
 
     #[allow(deprecated)]

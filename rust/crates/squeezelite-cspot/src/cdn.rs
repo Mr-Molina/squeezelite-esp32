@@ -251,6 +251,9 @@ impl CdnStreamFeeder {
         offset: usize,
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), CdnError> {
+        if offset == 0 {
+            self.header_stripped = false;
+        }
         let mut decrypted = chunk.to_vec();
         self.decryptor.decrypt_chunk(&mut decrypted, offset);
 

@@ -966,6 +966,211 @@ pub fn derive_zeroconf_dh_private_key(status: &HttpStatusSnapshot<'_>) -> [u8; 9
     key
 }
 
+/// Derives a 768-bit Diffie-Hellman private key from the assigned IP address
+/// and an explicit entropy source (such as hardware RNG or device MAC address).
+#[must_use]
+pub fn derive_zeroconf_dh_private_key_with_entropy(ip: [u8; 4], entropy: [u8; 8]) -> [u8; 96] {
+    const SEED_PREFIX: &[u8] = b"louder-esp32-zeroconf-dh-v1";
+    let mut key = [0u8; 96];
+    let mut material = [0u8; 12];
+    material[0..4].copy_from_slice(&ip);
+    material[4..12].copy_from_slice(&entropy);
+
+    for (counter, chunk) in key.chunks_mut(20).enumerate() {
+        let mut msg = [0u8; 13];
+        msg[0..12].copy_from_slice(&material);
+        msg[12] = counter as u8;
+        let digest = hmac_sha1(SEED_PREFIX, &msg);
+        let len = chunk.len().min(digest.len());
+        chunk[..len].copy_from_slice(&digest[..len]);
+    }
+
+    key[95] |= 0x01;
+    key
+}
+
+/// Formats the `/eq.json` payload containing equalizer status into `out_buf`.
+pub fn write_eq_json(
+    snapshot: &HttpStatusSnapshot<'_>,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    write!(
+        writer,
+        "{{\"ok\":true,\"eq_preset\":\"{}\",\"eq_enabled\":{},\
+         \"again_code\":{},\"vol_pct\":{}}}",
+        JsonEscaped(snapshot.eq_preset),
+        snapshot.eq_enabled,
+        snapshot.again_code,
+        snapshot.vol_pct,
+    )
+    .ok()?;
+    Some(writer.written_len())
+}
+
+fn redact_command_password(cmd: &str) -> String<160> {
+    let mut out: String<160> = String::new();
+    let is_urlencoded = cmd.contains("%20");
+    let sep = if is_urlencoded { "%20" } else { " " };
+    let parts: heapless::Vec<&str, 8> = cmd.split(sep).collect();
+    if parts.first() == Some(&"join") && parts.len() >= 3 {
+        let _ = write!(out, "join{}{}{}***", sep, parts[1], sep);
+        for extra in &parts[3..] {
+            let _ = write!(out, "{}{}", sep, extra);
+        }
+    } else if parts.first() == Some(&"config")
+        && parts.get(1) == Some(&"set")
+        && (parts.get(2) == Some(&"wifi.pass") || parts.get(2) == Some(&"wifi_pass"))
+        && parts.len() >= 4
+    {
+        let _ = write!(
+            out,
+            "config{}set{}{}{}***",
+            sep,
+            sep,
+            parts[2],
+            sep
+        );
+    } else if let Some(idx) = cmd.find("wifi.pass=") {
+        let prefix = &cmd[..idx + "wifi.pass=".len()];
+        let rest = &cmd[idx + "wifi.pass=".len()..];
+        let end_idx = rest.find('&').or_else(|| rest.find(' ')).unwrap_or(rest.len());
+        let _ = write!(out, "{}***{}", prefix, &rest[end_idx..]);
+    } else if let Some(idx) = cmd.find("password=") {
+        let prefix = &cmd[..idx + "password=".len()];
+        let rest = &cmd[idx + "password=".len()..];
+        let end_idx = rest.find('&').or_else(|| rest.find(' ')).unwrap_or(rest.len());
+        let _ = write!(out, "{}***{}", prefix, &rest[end_idx..]);
+    } else {
+        let _ = out.push_str(cmd);
+    }
+    out
+}
+
+fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
+    let Ok(req_str) = core::str::from_utf8(req_bytes) else {
+        return false;
+    };
+    if let Some(first_line) = req_str.lines().next() {
+        if let Some(path_and_query) = first_line.split_whitespace().nth(1) {
+            if let Some((_, query)) = path_and_query.split_once('?') {
+                for param in query.split('&') {
+                    if let Some(val) = param.strip_prefix("auth=") {
+                        if val == expected_token {
+                            return true;
+                        }
+                    }
+                    if let Some(val) = param.strip_prefix("token=") {
+                        if val == expected_token {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for line in req_str.lines() {
+        let trimmed = line.trim();
+        if let Some(auth_val) = trimmed.strip_prefix("Authorization:")
+            .or_else(|| trimmed.strip_prefix("authorization:"))
+        {
+            let auth_val = auth_val.trim();
+            if let Some(bearer_val) = auth_val.strip_prefix("Bearer ")
+                .or_else(|| auth_val.strip_prefix("bearer "))
+            {
+                if bearer_val.trim() == expected_token {
+                    return true;
+                }
+            } else if auth_val == expected_token {
+                return true;
+            }
+        } else if let Some(token_val) = trimmed.strip_prefix("X-Auth-Token:")
+            .or_else(|| trimmed.strip_prefix("x-auth-token:"))
+        {
+            if token_val.trim() == expected_token {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Port 80 HTTP Control router with optional authentication token enforcement.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpControlRouter {
+    /// Optional authentication token required for HTTP requests.
+    pub auth_token: Option<String<32>>,
+}
+
+impl HttpControlRouter {
+    /// Creates a new unauthenticated router (`auth_token: None`).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { auth_token: None }
+    }
+
+    /// Creates a router with an authentication token.
+    #[must_use]
+    pub fn with_auth_token(token: &str) -> Self {
+        let mut s = String::new();
+        let _ = s.push_str(token);
+        Self {
+            auth_token: Some(s),
+        }
+    }
+
+    /// Handles an HTTP request with streaming support.
+    pub fn handle_request_streaming(
+        &self,
+        req_bytes: &[u8],
+        snapshot: &HttpStatusSnapshot<'_>,
+        out_buf: &mut [u8],
+    ) -> Option<(usize, &'static [u8], HttpControlAction)> {
+        if let Some(ref token) = self.auth_token {
+            if !is_authorized(req_bytes, token.as_str()) {
+                const BODY: &str = "{\"error\":\"unauthorized\"}";
+                let mut response: String<256> = String::new();
+                let _ = write!(
+                    response,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+                    Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                    Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                let resp_bytes = response.as_bytes();
+                if resp_bytes.len() > out_buf.len() {
+                    return None;
+                }
+                out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+                return Some((resp_bytes.len(), &[], HttpControlAction::None));
+            }
+        }
+        handle_http_request_streaming_impl(req_bytes, snapshot, out_buf)
+    }
+
+    /// Handles an HTTP request into `out_buf`.
+    pub fn handle_request(
+        &self,
+        req_bytes: &[u8],
+        snapshot: &HttpStatusSnapshot<'_>,
+        out_buf: &mut [u8],
+    ) -> Option<(usize, HttpControlAction)> {
+        let (hdr_len, static_body, action) =
+            self.handle_request_streaming(req_bytes, snapshot, out_buf)?;
+        if !static_body.is_empty() {
+            let total_len = hdr_len + static_body.len();
+            if total_len > out_buf.len() {
+                return None;
+            }
+            out_buf[hdr_len..total_len].copy_from_slice(static_body);
+            Some((total_len, action))
+        } else {
+            Some((hdr_len, action))
+        }
+    }
+}
+
 /// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
 /// response for JSON) into `out_buf`.
 ///
@@ -976,7 +1181,7 @@ pub fn derive_zeroconf_dh_private_key(status: &HttpStatusSnapshot<'_>) -> [u8; 9
 ///
 /// Returns `None` if `req_bytes` does not yet contain a complete request line
 /// (`\r\n` or `\n`).
-pub fn handle_http_request_streaming(
+pub fn handle_http_request_streaming_impl(
     req_bytes: &[u8],
     snapshot: &HttpStatusSnapshot<'_>,
     out_buf: &mut [u8],
@@ -1273,7 +1478,25 @@ pub fn handle_http_request_streaming(
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
             Some((resp_bytes.len(), &[], action))
         }
-        ("POST", "/recovery.json") | ("GET", "/recovery.json") => {
+        ("GET", "/recovery.json") | ("GET", "/reboot.json") | ("GET", "/reboot_ota.json") => {
+            let body = "{\"error\":\"method_not_allowed\"}";
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::None))
+        }
+        ("POST", "/recovery.json") => {
             let body = "{\"status\":\"rebooting_to_recovery\",\
                 \"target_partition\":\"factory_0x10000\"}";
             let mut response: String<256> = String::new();
@@ -1292,7 +1515,7 @@ pub fn handle_http_request_streaming(
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
             Some((resp_bytes.len(), &[], HttpControlAction::RebootToRecovery))
         }
-        ("POST", "/reboot.json") | ("GET", "/reboot.json") => {
+        ("POST", "/reboot.json") => {
             let body = "{\"status\":\"rebooting_to_ota_0\",\
                 \"target_partition\":\"ota_0_0x160000\"}";
             let mut response: String<256> = String::new();
@@ -1330,6 +1553,15 @@ pub fn handle_http_request_streaming(
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
             Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
         }
+        ("GET", "/eq.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let body_len = write_eq_json(snapshot, &mut out_buf[HEADER_ROOM..])?;
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::None))
+        }
         ("GET", "/config.json") => {
             const HEADER_ROOM: usize = 160;
             if out_buf.len() <= HEADER_ROOM {
@@ -1347,6 +1579,10 @@ pub fn handle_http_request_streaming(
             let payload = extract_query_or_body(raw_path, req_bytes);
             let (body_len, action) = if let Some(upd) = parse_config_update_query(payload) {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                let mut decoded_key_buf = [0u8; 64];
+                let decoded_key = percent_decode_into(upd.key, &mut decoded_key_buf)
+                    .and_then(|len| core::str::from_utf8(&decoded_key_buf[..len]).ok())
+                    .unwrap_or(upd.key);
                 let mut decoded_val_buf = [0u8; 128];
                 let decoded_val = percent_decode_into(upd.value, &mut decoded_val_buf)
                     .and_then(|len| core::str::from_utf8(&decoded_val_buf[..len]).ok())
@@ -1354,7 +1590,7 @@ pub fn handle_http_request_streaming(
                 write!(
                     writer,
                     "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\"}}",
-                    JsonEscaped(upd.key),
+                    JsonEscaped(decoded_key),
                     JsonEscaped(decoded_val),
                 )
                 .ok()?;
@@ -1418,6 +1654,10 @@ pub fn handle_http_request_streaming(
                 let decoded_ssid = percent_decode_into(req.ssid, &mut decoded_buf)
                     .and_then(|len| core::str::from_utf8(&decoded_buf[..len]).ok())
                     .unwrap_or(req.ssid);
+                let mut decoded_pass_buf = [0u8; 64];
+                let _decoded_password = percent_decode_into(req.password, &mut decoded_pass_buf)
+                    .and_then(|len| core::str::from_utf8(&decoded_pass_buf[..len]).ok())
+                    .unwrap_or(req.password);
                 write!(
                     writer,
                     "{{\"ok\":true,\"status\":\"connecting\",\"ssid\":\"{}\"}}",
@@ -1469,10 +1709,11 @@ pub fn handle_http_request_streaming(
             let cmd_str = extract_param_or_json_field(payload, "cmd").unwrap_or("");
             let (body_len, action) = if !cmd_str.is_empty() {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                let redacted = redact_command_password(cmd_str);
                 write!(
                     writer,
                     "{{\"ok\":true,\"cmd\":\"{}\"}}",
-                    JsonEscaped(cmd_str),
+                    JsonEscaped(redacted.as_str()),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::ExecuteCliCommand)
@@ -1521,6 +1762,16 @@ pub fn handle_http_request_streaming(
     }
 }
 
+/// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
+/// response for JSON) into `out_buf`.
+pub fn handle_http_request_streaming(
+    req_bytes: &[u8],
+    snapshot: &HttpStatusSnapshot<'_>,
+    out_buf: &mut [u8],
+) -> Option<(usize, &'static [u8], HttpControlAction)> {
+    HttpControlRouter::new().handle_request_streaming(req_bytes, snapshot, out_buf)
+}
+
 /// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1
 /// response into `out_buf`.
 ///
@@ -1531,18 +1782,7 @@ pub fn handle_http_control_request(
     snapshot: &HttpStatusSnapshot<'_>,
     out_buf: &mut [u8],
 ) -> Option<(usize, HttpControlAction)> {
-    let (hdr_len, static_body, action) =
-        handle_http_request_streaming(req_bytes, snapshot, out_buf)?;
-    if !static_body.is_empty() {
-        let total_len = hdr_len + static_body.len();
-        if total_len > out_buf.len() {
-            return None;
-        }
-        out_buf[hdr_len..total_len].copy_from_slice(static_body);
-        Some((total_len, action))
-    } else {
-        Some((hdr_len, action))
-    }
+    HttpControlRouter::new().handle_request(req_bytes, snapshot, out_buf)
 }
 
 /// Static HTML dashboard embedded for `GET /` and `GET /index.html` requests.
@@ -2346,5 +2586,130 @@ mod tests {
 
         let mut ok_buf = [0u8; 256];
         assert!(write_json_http_response(20, &mut ok_buf).is_some());
+    }
+
+    #[test]
+    fn test_get_eq_json_endpoint() {
+        let snap = HttpStatusSnapshot {
+            eq_preset: "Bass",
+            eq_enabled: true,
+            again_code: 0x0C,
+            vol_pct: 75,
+            ..HttpStatusSnapshot::default()
+        };
+        let mut buf = [0u8; 512];
+        let req = b"GET /eq.json HTTP/1.1\r\n\r\n";
+        let (len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
+        assert_eq!(act, HttpControlAction::None);
+        let resp = core::str::from_utf8(&buf[..len]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("\"ok\":true"));
+        assert!(resp.contains("\"eq_preset\":\"Bass\""));
+        assert!(resp.contains("\"eq_enabled\":true"));
+        assert!(resp.contains("\"again_code\":12"));
+        assert!(resp.contains("\"vol_pct\":75"));
+    }
+
+    #[test]
+    fn test_percent_decoding_key_and_password() {
+        let snap = HttpStatusSnapshot::default();
+        let mut buf = [0u8; 1024];
+
+        // 1. POST /config.json with percent-encoded key
+        let req = b"POST /config.json HTTP/1.1\r\n\r\nkey=player%20name&value=Kitchen%20HiFi";
+        let (len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
+        assert_eq!(act, HttpControlAction::UpdateConfig);
+        let resp = core::str::from_utf8(&buf[..len]).unwrap();
+        assert!(resp.contains("\"key\":\"player name\""));
+        assert!(resp.contains("\"value\":\"Kitchen HiFi\""));
+
+        // 2. POST /connect.json with percent-encoded password
+        let req_conn =
+            b"POST /connect.json HTTP/1.1\r\n\r\nssid=Home%20Net&password=My%20Secret%21";
+        let (clen, cact) = handle_http_control_request(req_conn, &snap, &mut buf).unwrap();
+        assert_eq!(cact, HttpControlAction::ConnectWifi);
+        let cresp = core::str::from_utf8(&buf[..clen]).unwrap();
+        assert!(cresp.contains("\"ssid\":\"Home Net\""));
+    }
+
+    #[test]
+    fn test_derive_zeroconf_dh_private_key_with_entropy() {
+        let ip = [192, 168, 1, 50];
+        let entropy = [1, 2, 3, 4, 5, 6, 7, 8];
+        let key1 = derive_zeroconf_dh_private_key_with_entropy(ip, entropy);
+        let key2 = derive_zeroconf_dh_private_key_with_entropy(ip, entropy);
+        assert_eq!(key1, key2);
+        assert_eq!(key1[95] & 0x01, 1);
+        assert!(OakleyGroup1Dh::from_private_key(key1).is_ok());
+
+        let key3 = derive_zeroconf_dh_private_key_with_entropy(ip, [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn test_rejects_get_on_recovery_and_reboot_and_supports_auth() {
+        let snap = HttpStatusSnapshot::default();
+        let mut buf = [0u8; 2048];
+
+        // GET /recovery.json rejected with 405
+        let (len1, act1) = handle_http_control_request(
+            b"GET /recovery.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(act1, HttpControlAction::None);
+        let resp1 = core::str::from_utf8(&buf[..len1]).unwrap();
+        assert!(resp1.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+
+        // GET /reboot.json rejected with 405
+        let (len2, act2) = handle_http_control_request(
+            b"GET /reboot.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(act2, HttpControlAction::None);
+        let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
+        assert!(resp2.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+
+        // Authenticated router rejects missing token
+        let router = HttpControlRouter::with_auth_token("secret_token_123");
+        let (len3, _) = router.handle_request(
+            b"GET /status.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .unwrap();
+        let resp3 = core::str::from_utf8(&buf[..len3]).unwrap();
+        assert!(resp3.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+
+        // Authenticated router accepts valid header
+        let (len4, _) = router.handle_request(
+            b"GET /status.json HTTP/1.1\r\nAuthorization: Bearer secret_token_123\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .unwrap();
+        let resp4 = core::str::from_utf8(&buf[..len4]).unwrap();
+        assert!(resp4.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn test_commands_json_redacts_passwords() {
+        let snap = HttpStatusSnapshot::default();
+        let mut buf = [0u8; 1024];
+
+        let req = b"POST /commands.json HTTP/1.1\r\n\r\ncmd=join%20MyWiFi%20SuperSecretPass";
+        let (len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
+        assert_eq!(act, HttpControlAction::ExecuteCliCommand);
+        let resp = core::str::from_utf8(&buf[..len]).unwrap();
+        assert!(resp.contains("\"cmd\":\"join%20MyWiFi%20***\""));
+
+        let req2 = b"POST /commands.json HTTP/1.1\r\n\r\ncmd=config set wifi.pass SuperSecretPass";
+        let (len2, act2) = handle_http_control_request(req2, &snap, &mut buf).unwrap();
+        assert_eq!(act2, HttpControlAction::ExecuteCliCommand);
+        let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
+        assert!(resp2.contains("\"cmd\":\"config set wifi.pass ***\""));
     }
 }
