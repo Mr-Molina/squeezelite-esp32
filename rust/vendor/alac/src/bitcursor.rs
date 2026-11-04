@@ -25,7 +25,7 @@ impl<'a> BitCursor<'a> {
         cursor
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_bit(&mut self) -> Result<bool, NotEnoughData> {
         Ok(match self.read_u32(1)? {
             0 => false,
@@ -34,19 +34,19 @@ impl<'a> BitCursor<'a> {
         })
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_u8(&mut self, bits: usize) -> Result<u8, NotEnoughData> {
         assert!(bits <= 8);
         Ok(self.read_u32(bits)? as u8)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_u16(&mut self, bits: usize) -> Result<u16, NotEnoughData> {
         assert!(bits <= 16);
         Ok(self.read_u32(bits)? as u16)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn read_u32(&mut self, bits: usize) -> Result<u32, NotEnoughData> {
         assert!(bits <= 32);
         self.check_enough_bits(bits)?;
@@ -66,7 +66,7 @@ impl<'a> BitCursor<'a> {
         Ok(val >> (U32_BITS - bits))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn skip(&mut self, bits: usize) -> Result<(), NotEnoughData> {
         self.check_enough_bits(bits)?;
 
@@ -82,7 +82,7 @@ impl<'a> BitCursor<'a> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn skip_to_byte(&mut self) -> Result<(), NotEnoughData> {
         let pos_into_byte = self.current_pos & 7;
         if pos_into_byte != 0 {
@@ -92,7 +92,7 @@ impl<'a> BitCursor<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn check_enough_bits(&self, bits: usize) -> Result<(), NotEnoughData> {
         if bits <= (self.buf.len() << 3) + (self.current_len - self.current_pos) as usize {
             Ok(())

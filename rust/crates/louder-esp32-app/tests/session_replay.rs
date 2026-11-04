@@ -1,21 +1,23 @@
 //! Behavior-preservation replay fixture (Task 4).
 //!
-//! Drives the host `PlayerCoordinator` through a scripted LMS session against mock
-//! SlimProto and HTTP servers, parses every outbound SlimProto frame into a
-//! [`ClientMessage`], and compares the ordered opcode sequence with
+//! Drives the host `PlayerCoordinator` through a scripted LMS session against
+//! mock SlimProto and HTTP servers, parses every outbound SlimProto frame into
+//! a [`ClientMessage`], and compares the ordered opcode sequence with
 //! `fixtures/strm_session_baseline.txt`.
 //!
-//! Since Task 7 the session is driven only through `PlayerCoordinator::tick` over the real
-//! host adapters (`SlimprotoClient` as `SlimTransport`, `HttpAudioStream` as `StreamSource`);
-//! the fixture itself is unchanged.
+//! Since Task 7 the session is driven only through `PlayerCoordinator::tick`
+//! over the real host adapters (`SlimprotoClient` as `SlimTransport`,
+//! `HttpAudioStream` as `StreamSource`); the fixture itself is unchanged.
 //!
-//! The fixture is the regression net for the coordinator refactor: it must keep passing.
-//! A legitimate behavior change updates the fixture with a comment line naming the task
-//! (Task 11 re-pinned it to C squeezelite's STAT/DSCO sequencing).
+//! The fixture is the regression net for the coordinator refactor: it must
+//! keep passing. A legitimate behavior change updates the fixture with a
+//! comment line naming the task (Task 11 re-pinned it to C squeezelite's
+//! STAT/DSCO sequencing).
+#![cfg(test)]
 #![cfg(not(target_arch = "xtensa"))]
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use louder_esp32_app::coordinator::PlayerCoordinator;
@@ -29,18 +31,21 @@ const BASELINE_FIXTURE: &str = include_str!("fixtures/strm_session_baseline.txt"
 const MAC: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 const DEADLINE: Duration = Duration::from_secs(5);
 
-/// Placeholder `strm` server port, replaced with the mock HTTP server's real port.
+/// Placeholder `strm` server port, replaced with the mock HTTP server's real
+/// port.
 const HTTP_PORT_PLACEHOLDER: u16 = 0xFFFF;
 
 /// One scripted event in a replayed LMS session.
 enum ScriptStep {
-    /// A complete SlimProto server frame sent to the player on the control connection.
+    /// A complete SlimProto server frame sent to the player on the control
+    /// connection.
     Server(Vec<u8>),
     /// Raw audio bytes written to the HTTP stream connection.
     StreamBytes(Vec<u8>),
     /// The HTTP stream server closes the connection (end of stream).
     StreamEof,
-    /// Advance the simulated clock by this many milliseconds and run one coordinator tick.
+    /// Advance the simulated clock by this many milliseconds and run one
+    /// coordinator tick.
     AdvanceMs(u32),
 }
 
@@ -90,7 +95,8 @@ fn parse_client_frames(mut bytes: &[u8]) -> Vec<ClientMessage> {
     messages
 }
 
-/// Builds a server `strm` frame (8-byte header + 24-byte payload) for PCM 44.1 kHz / 16-bit stereo.
+/// Builds a server `strm` frame (8-byte header + 24-byte payload) for PCM 44.1
+/// kHz / 16-bit stereo.
 fn strm_frame(command: u8, autostart: u8, replay_gain: u32) -> Vec<u8> {
     let mut payload = [0u8; 24];
     payload[0] = command;
@@ -124,14 +130,22 @@ fn pcm_bytes(len: usize) -> Vec<u8> {
 }
 
 fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
-    listener.set_nonblocking(true).unwrap();
+    let Ok(()) = listener.set_nonblocking(true) else {
+        panic!("set_nonblocking failed");
+    };
     let start = Instant::now();
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(DEADLINE)).unwrap();
-                stream.set_write_timeout(Some(DEADLINE)).unwrap();
+                let Ok(()) = stream.set_nonblocking(false) else {
+                    panic!("set_nonblocking failed");
+                };
+                let Ok(()) = stream.set_read_timeout(Some(DEADLINE)) else {
+                    panic!("set_read_timeout failed");
+                };
+                let Ok(()) = stream.set_write_timeout(Some(DEADLINE)) else {
+                    panic!("set_write_timeout failed");
+                };
                 return stream;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -143,7 +157,8 @@ fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
     }
 }
 
-/// Accepts the player's HTTP stream connection, consumes the request and answers `200 OK`.
+/// Accepts the player's HTTP stream connection, consumes the request and
+/// answers `200 OK`.
 fn accept_http_stream(listener: &TcpListener) -> TcpStream {
     let mut conn = accept_with_deadline(listener);
     let mut request = Vec::new();
@@ -152,15 +167,16 @@ fn accept_http_stream(listener: &TcpListener) -> TcpStream {
         conn.read_exact(&mut byte).expect("HTTP request header");
         request.push(byte[0]);
     }
-    conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: audio/L16\r\n\r\n")
-        .unwrap();
+    let Ok(()) = conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: audio/L16\r\n\r\n") else {
+        panic!("write_all failed");
+    };
     conn
 }
 
 type Pipeline<'a> = StreamPipeline<'a, NullAudioSink>;
 
-/// The player's control connection, counting the server frames handed to the coordinator so the
-/// script knows when a command has been consumed.
+/// The player's control connection, counting the server frames handed to the
+/// coordinator so the script knows when a command has been consumed.
 struct Lms {
     client: SlimprotoClient,
     frames_delivered: usize,
@@ -202,7 +218,12 @@ impl Player<'_> {
 }
 
 /// Ticks the coordinator until `done` holds.
-fn tick_until(player: &mut Player<'_>, now_ms: u32, what: &str, done: impl Fn(&Player<'_>) -> bool) {
+fn tick_until(
+    player: &mut Player<'_>,
+    now_ms: u32,
+    what: &str,
+    done: impl Fn(&Player<'_>) -> bool,
+) {
     let start = Instant::now();
     while !done(player) {
         player.tick(now_ms);
@@ -211,7 +232,8 @@ fn tick_until(player: &mut Player<'_>, now_ms: u32, what: &str, done: impl Fn(&P
     }
 }
 
-/// Ticks until four consecutive ticks produce no output frames, so deferred STAT events flush.
+/// Ticks until four consecutive ticks produce no output frames, so deferred
+/// STAT events flush.
 fn quiesce(player: &mut Player<'_>, now_ms: u32) {
     let mut idle = 0;
     for _ in 0..10_000 {
@@ -228,15 +250,28 @@ fn quiesce(player: &mut Player<'_>, now_ms: u32) {
     panic!("coordinator never went idle");
 }
 
-/// Replays `script` against a fresh host coordinator and returns every outbound frame, in order.
+/// Replays `script` against a fresh host coordinator and returns every outbound
+/// frame, in order.
 fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
-    let lms_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let lms_addr: SocketAddr = lms_listener.local_addr().unwrap();
-    let http_port = http_listener.local_addr().unwrap().port();
+    let Ok(lms_listener) = TcpListener::bind("127.0.0.1:0") else {
+        panic!("bind lms_listener failed");
+    };
+    let Ok(http_listener) = TcpListener::bind("127.0.0.1:0") else {
+        panic!("bind http_listener failed");
+    };
+    let Ok(lms_addr) = lms_listener.local_addr() else {
+        panic!("lms local_addr failed");
+    };
+    let Ok(http_addr) = http_listener.local_addr() else {
+        panic!("http local_addr failed");
+    };
+    let http_port = http_addr.port();
 
-    // The connect completes against the listen backlog; HELO is sent during connect.
-    let client = SlimprotoClient::connect(lms_addr, MAC, "TestPlayer").unwrap();
+    // The connect completes against the listen backlog; HELO is sent during
+    // connect.
+    let Ok(client) = SlimprotoClient::connect(lms_addr, MAC, "TestPlayer") else {
+        panic!("SlimprotoClient::connect failed");
+    };
     let mut lms_conn = accept_with_deadline(&lms_listener);
 
     let mut stream_storage = [0u8; 8192];
@@ -263,10 +298,14 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
         match step {
             ScriptStep::Server(frame) => {
                 let mut frame = frame.clone();
-                if &frame[0..4] == b"strm" && frame[8 + 18..8 + 20] == HTTP_PORT_PLACEHOLDER.to_be_bytes() {
+                if &frame[0..4] == b"strm"
+                    && frame[8 + 18..8 + 20] == HTTP_PORT_PLACEHOLDER.to_be_bytes()
+                {
                     frame[8 + 18..8 + 20].copy_from_slice(&http_port.to_be_bytes());
                 }
-                lms_conn.write_all(&frame).unwrap();
+                let Ok(()) = lms_conn.write_all(&frame) else {
+                    panic!("write_all failed");
+                };
 
                 let delivered = player.lms.frames_delivered + 1;
                 tick_until(&mut player, now_ms, "server command", |p| {
@@ -278,11 +317,13 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
                 }
             }
             ScriptStep::StreamBytes(bytes) => {
-                http_conn
+                let Ok(()) = http_conn
                     .as_mut()
                     .expect("StreamBytes before a stream was started")
                     .write_all(bytes)
-                    .unwrap();
+                else {
+                    panic!("write_all failed");
+                };
                 stream_bytes_sent += bytes.len() as u64;
                 tick_until(&mut player, now_ms, "stream bytes", |p| {
                     p.coordinator.stream_bytes_received >= stream_bytes_sent
@@ -301,10 +342,13 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
         }
     }
 
-    // Closing the client lets the mock server read everything the player sent up to EOF.
+    // Closing the client lets the mock server read everything the player sent
+    // up to EOF.
     drop(player);
     let mut outbound = Vec::new();
-    lms_conn.read_to_end(&mut outbound).unwrap();
+    let Ok(_) = lms_conn.read_to_end(&mut outbound) else {
+        panic!("read_to_end failed");
+    };
     parse_client_frames(&outbound)
 }
 

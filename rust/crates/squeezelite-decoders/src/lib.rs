@@ -389,8 +389,17 @@ impl AudioDecoder for PcmDecoder {
         let frames_to_decode = core::cmp::min(max_output_frames, available_frames);
 
         match (self.bits_per_sample, self.big_endian, self.channels) {
-            // 8-bit Stereo (unsigned PCM centered at 128)
-            (8, _, 2) => {
+            // 8-bit Stereo (unsigned PCM centered at 128 for WAV, signed for AIFF)
+            (8, true, 2) => {
+                for i in 0..frames_to_decode {
+                    let off = i * 2;
+                    let l = (pcm_in[off] as i8 as i32) << 24;
+                    let r = (pcm_in[off + 1] as i8 as i32) << 24;
+                    pcm_out[i * 2] = l;
+                    pcm_out[i * 2 + 1] = r;
+                }
+            }
+            (8, false, 2) => {
                 for i in 0..frames_to_decode {
                     let off = i * 2;
                     let l = ((pcm_in[off] as i32) - 128) << 24;
@@ -399,8 +408,16 @@ impl AudioDecoder for PcmDecoder {
                     pcm_out[i * 2 + 1] = r;
                 }
             }
-            // 8-bit Mono (unsigned PCM centered at 128, duplicated to stereo)
-            (8, _, 1) => {
+            // 8-bit Mono (unsigned PCM centered at 128 for WAV, signed for AIFF)
+            (8, true, 1) => {
+                for i in 0..frames_to_decode {
+                    let off = i;
+                    let s = (pcm_in[off] as i8 as i32) << 24;
+                    pcm_out[i * 2] = s;
+                    pcm_out[i * 2 + 1] = s;
+                }
+            }
+            (8, false, 1) => {
                 for i in 0..frames_to_decode {
                     let off = i;
                     let s = ((pcm_in[off] as i32) - 128) << 24;
@@ -410,12 +427,15 @@ impl AudioDecoder for PcmDecoder {
             }
             // 16-bit Stereo Big-Endian (Common Squeezebox PCM format)
             (16, true, 2) => {
-                for i in 0..frames_to_decode {
-                    let off = i * 4;
-                    let l = i16::from_be_bytes([pcm_in[off], pcm_in[off + 1]]) as i32;
-                    let r = i16::from_be_bytes([pcm_in[off + 2], pcm_in[off + 3]]) as i32;
-                    pcm_out[i * 2] = l << 16;
-                    pcm_out[i * 2 + 1] = r << 16;
+                for (src, dst) in pcm_in
+                    .chunks_exact(4)
+                    .zip(pcm_out.chunks_exact_mut(2))
+                    .take(frames_to_decode)
+                {
+                    let l = i16::from_be_bytes([src[0], src[1]]) as i32;
+                    let r = i16::from_be_bytes([src[2], src[3]]) as i32;
+                    dst[0] = l << 16;
+                    dst[1] = r << 16;
                 }
             }
             // 16-bit Mono Big-Endian (DEC-010: Mono duplication)
@@ -429,12 +449,15 @@ impl AudioDecoder for PcmDecoder {
             }
             // 16-bit Stereo Little-Endian
             (16, false, 2) => {
-                for i in 0..frames_to_decode {
-                    let off = i * 4;
-                    let l = i16::from_le_bytes([pcm_in[off], pcm_in[off + 1]]) as i32;
-                    let r = i16::from_le_bytes([pcm_in[off + 2], pcm_in[off + 3]]) as i32;
-                    pcm_out[i * 2] = l << 16;
-                    pcm_out[i * 2 + 1] = r << 16;
+                for (src, dst) in pcm_in
+                    .chunks_exact(4)
+                    .zip(pcm_out.chunks_exact_mut(2))
+                    .take(frames_to_decode)
+                {
+                    let l = i16::from_le_bytes([src[0], src[1]]) as i32;
+                    let r = i16::from_le_bytes([src[2], src[3]]) as i32;
+                    dst[0] = l << 16;
+                    dst[1] = r << 16;
                 }
             }
             // 16-bit Mono Little-Endian (DEC-010)
@@ -900,35 +923,43 @@ impl AudioDecoder for Mp3Decoder {
             idx += 1;
         }
 
-        if let Some((sync_idx, h)) = sync_offset {
-            let frame_bytes = h.frame_bytes(0) + h.padding();
-            if frame_bytes > 0 && frame_bytes <= 1728 {
-                let remaining = encoded_in.len().saturating_sub(sync_idx);
-                if remaining < frame_bytes {
-                    if sync_idx > 0 {
-                        return Ok((sync_idx, 0));
-                    }
-                    return Err(DecoderError::NeedMoreData);
-                }
-                if sync_idx > 0 {
-                    return Ok((sync_idx, 0));
-                }
-                if !self.xing_checked {
-                    if let Some(xing) = parse_xing_lame_header(&encoded_in[..frame_bytes]) {
-                        self.xing_checked = true;
-                        self.xing_info = Some(xing);
-                        let sr = h.sample_rate_hz();
-                        if sr > 0 {
-                            self.sample_rate = sr;
-                        }
-                        return Ok((frame_bytes, 0));
-                    }
-                    self.xing_checked = true;
-                }
-            }
+        let (sync_idx, h) = match sync_offset {
+            None => return Ok((encoded_in.len(), 0)),
+            Some((idx, h)) => (idx, h),
+        };
+
+        if sync_idx > 0 {
+            return Ok((sync_idx, 0));
         }
 
-        let (consumed, result) = self.decoder.decode(encoded_in, &mut self.sample_buf);
+        let frame_bytes = h.frame_bytes(0) + h.padding();
+        if frame_bytes == 0 || frame_bytes > 2881 {
+            return Ok((sync_idx + 1, 0));
+        }
+
+        let remaining = encoded_in.len().saturating_sub(sync_idx);
+        if remaining < frame_bytes {
+            return Err(DecoderError::NeedMoreData);
+        }
+        if !self.xing_checked {
+            if let Some(xing) = parse_xing_lame_header(&encoded_in[..frame_bytes]) {
+                self.xing_checked = true;
+                self.xing_info = Some(xing);
+                let sr = h.sample_rate_hz();
+                if sr > 0 {
+                    self.sample_rate = sr;
+                }
+                return Ok((frame_bytes, 0));
+            }
+            self.xing_checked = true;
+        }
+
+        let direct = pcm_out.len() >= nanomp3_core::MAX_SAMPLES_PER_FRAME;
+        let (consumed, result) = if direct {
+            self.decoder.decode(encoded_in, pcm_out)
+        } else {
+            self.decoder.decode(encoded_in, &mut self.sample_buf)
+        };
 
         match result {
             Ok(info) => {
@@ -947,7 +978,15 @@ impl AudioDecoder for Mp3Decoder {
                     return Err(DecoderError::BufferOverflow);
                 }
 
-                if channels == 2 {
+                if direct {
+                    if channels == 1 {
+                        for i in (0..frames_produced).rev() {
+                            let s = pcm_out[i];
+                            pcm_out[i * 2] = s;
+                            pcm_out[i * 2 + 1] = s;
+                        }
+                    }
+                } else if channels == 2 {
                     let total_samples = frames_produced * 2;
                     if self.sample_buf.len() >= total_samples && pcm_out.len() >= total_samples {
                         pcm_out[..total_samples].copy_from_slice(&self.sample_buf[..total_samples]);
@@ -1766,22 +1805,32 @@ fn decode_subframe(
                 0 => {}
                 1 => {
                     for i in 1..block_size {
-                        out[i] += out[i - 1];
+                        out[i] = out[i].wrapping_add(out[i - 1]);
                     }
                 }
                 2 => {
                     for i in 2..block_size {
-                        out[i] += 2 * out[i - 1] - out[i - 2];
+                        let term = (2i64).wrapping_mul(out[i - 1]).wrapping_sub(out[i - 2]);
+                        out[i] = out[i].wrapping_add(term);
                     }
                 }
                 3 => {
                     for i in 3..block_size {
-                        out[i] += 3 * out[i - 1] - 3 * out[i - 2] + out[i - 3];
+                        let term = (3i64)
+                            .wrapping_mul(out[i - 1])
+                            .wrapping_sub((3i64).wrapping_mul(out[i - 2]))
+                            .wrapping_add(out[i - 3]);
+                        out[i] = out[i].wrapping_add(term);
                     }
                 }
                 4 => {
                     for i in 4..block_size {
-                        out[i] += 4 * out[i - 1] - 6 * out[i - 2] + 4 * out[i - 3] - out[i - 4];
+                        let term = (4i64)
+                            .wrapping_mul(out[i - 1])
+                            .wrapping_sub((6i64).wrapping_mul(out[i - 2]))
+                            .wrapping_add((4i64).wrapping_mul(out[i - 3]))
+                            .wrapping_sub(out[i - 4]);
+                        out[i] = out[i].wrapping_add(term);
                     }
                 }
                 _ => return Err(()),
@@ -1810,13 +1859,26 @@ fn decode_subframe(
             }
             decode_residual(reader, block_size, order, &mut out[order..block_size])?;
 
-            for i in order..block_size {
-                let mut sum: i64 = 0;
-                for j in 0..order {
-                    sum += coeffs[j] * out[i - 1 - j];
+            if eff_bps <= 16 && qlp_prec <= 15 && order <= 12 {
+                for i in order..block_size {
+                    let mut sum: i32 = 0;
+                    for j in 0..order {
+                        sum = sum.wrapping_add(
+                            (coeffs[j] as i32).wrapping_mul(out[i - 1 - j] as i32),
+                        );
+                    }
+                    let predicted = (sum >> qlp_shift) as i64;
+                    out[i] = out[i].wrapping_add(predicted);
                 }
-                let predicted = sum >> qlp_shift;
-                out[i] += predicted;
+            } else {
+                for i in order..block_size {
+                    let mut sum: i64 = 0;
+                    for j in 0..order {
+                        sum = sum.wrapping_add(coeffs[j].wrapping_mul(out[i - 1 - j]));
+                    }
+                    let predicted = sum >> qlp_shift;
+                    out[i] = out[i].wrapping_add(predicted);
+                }
             }
         }
         _ => return Err(()),
@@ -1930,22 +1992,22 @@ fn decorrelate_samples(
             let ch0 = scratch[i];
             let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
             let l = (ch0 as i32) << shift;
-            let r = ((ch0 - ch1) as i32) << shift;
+            let r = (ch0.wrapping_sub(ch1) as i32) << shift;
             (l, r)
         }
         9 => {
             let ch0 = scratch[i];
             let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let l = ((ch1 + ch0) as i32) << shift;
+            let l = (ch1.wrapping_add(ch0) as i32) << shift;
             let r = (ch1 as i32) << shift;
             (l, r)
         }
         10 => {
             let ch0 = scratch[i];
             let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let mid = (ch0 << 1) | (ch1 & 1);
-            let l = (((mid + ch1) >> 1) as i32) << shift;
-            let r = (((mid - ch1) >> 1) as i32) << shift;
+            let mid = ch0.wrapping_shl(1) | (ch1 & 1);
+            let l = (((mid.wrapping_add(ch1)) >> 1) as i32) << shift;
+            let r = (((mid.wrapping_sub(ch1)) >> 1) as i32) << shift;
             (l, r)
         }
         _ => {
@@ -2163,11 +2225,17 @@ impl FlacDecoder {
                             self.stream_buf.clear();
                             self.header_len = 0;
                         }
-                        if self.stream_buf.len() + (self.ogg_partial_pkt.len() - 9)
+                        let flac_magic_needed = self.ogg_partial_pkt.len() >= 13
+                            && &self.ogg_partial_pkt[9..13] != b"fLaC";
+                        let extra_len = if flac_magic_needed { 4 } else { 0 };
+                        if self.stream_buf.len() + (self.ogg_partial_pkt.len() - 9) + extra_len
                             > MAX_STREAM_BUF
                         {
                             self.flush();
                             return Err(DecoderError::CorruptedFrame);
+                        }
+                        if flac_magic_needed {
+                            self.stream_buf.extend_from_slice(b"fLaC");
                         }
                         self.stream_buf
                             .extend_from_slice(&self.ogg_partial_pkt[9..]);
@@ -2759,7 +2827,8 @@ pub const fn synthesize_adts_header(
     asc: AacAudioSpecificConfig,
     aac_payload_len: usize,
 ) -> [u8; 7] {
-    let full_len = aac_payload_len + 7;
+    let raw_len = aac_payload_len.saturating_add(7);
+    let full_len = if raw_len > 8191 { 8191 } else { raw_len };
     let b0 = 0xFF;
     let b1 = 0xF1;
     let b2 = ((asc.adts_profile & 0x03) << 6)
@@ -3238,6 +3307,9 @@ impl AacDecoder {
             {
                 let pkt_len = demux.sample_sizes[demux.sample_idx];
                 if pkt_len == 0 || pkt_len + 7 >= 8192 {
+                    demux.sample_idx += 1;
+                    let drain_len = pkt_len.min(demux.stream_buf.len());
+                    demux.stream_buf.drain(..drain_len);
                     return Err(DecoderError::CorruptedFrame);
                 }
                 if demux.stream_buf.len() < pkt_len {
@@ -3307,6 +3379,12 @@ impl AacDecoder {
 
                 if feed_res.is_err() && frames_out == 0 {
                     return Err(DecoderError::CorruptedFrame);
+                }
+
+                if !(1..=2).contains(&self.channels)
+                    || !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&self.sample_rate)
+                {
+                    return Err(DecoderError::UnsupportedSampleFormat);
                 }
             }
             if demux.sample_idx >= demux.sample_sizes.len() && !demux.sample_sizes.is_empty() {
@@ -4236,6 +4314,11 @@ impl AudioDecoder for AlacDecoder {
         if self.state == AlacState::ReadingMdat {
             while frames_out < max_frames && self.sample_idx < self.sample_sizes.len() {
                 let pkt_len = self.sample_sizes[self.sample_idx];
+                if pkt_len > MAX_STREAM_BUF {
+                    self.sample_idx += 1;
+                    self.stream_buf.clear();
+                    return Err(DecoderError::CorruptedFrame);
+                }
                 if self.stream_buf.len() < pkt_len {
                     break;
                 }

@@ -57,7 +57,8 @@ impl AudioOutputSink for LimitedSink {
 enum Op {
     /// Stream this many more frames of the current track and decode them.
     Feed(usize),
-    /// `strm s` for the next track (stream ring flushed, codec opened, output kept).
+    /// `strm s` for the next track (stream ring flushed, codec opened,
+    /// output kept).
     NewTrack,
     /// One output step with a sink accepting at most this many frames.
     Output(usize),
@@ -80,7 +81,8 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Left sample of an output-ring frame (native-endian i32 pair), as (track, index).
+/// Left sample of an output-ring frame (native-endian i32 pair), as
+/// (track, index).
 fn frame_id(bytes: &[u8]) -> (i32, i32) {
     let left = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) >> 16;
     (left / i32::from(TRACK_STRIDE), left % i32::from(TRACK_STRIDE))
@@ -96,13 +98,21 @@ fn pcm(track: i16, from: usize, frames: usize) -> Vec<u8> {
     out
 }
 
-/// The boundary sits on whole frames inside the unread output, on the first frame of a track
-/// that is not newer than the current one.
-fn check_marker(p: &StreamPipeline<'_, LimitedSink>, current_track: i16) -> Result<(), TestCaseError> {
+/// The boundary sits on whole frames inside the unread output, on the first
+/// frame of a track that is not newer than the current one.
+fn check_marker(
+    p: &StreamPipeline<'_, LimitedSink>,
+    current_track: i16,
+) -> Result<(), TestCaseError> {
     let Some(marker) = p.track_marker().copied() else { return Ok(()) };
     let unread = p.output_buffer_available() as u64;
     prop_assert_eq!(marker.bytes_ahead % 8, 0, "boundary off a frame: {:?}", marker);
-    prop_assert!(marker.bytes_ahead <= unread, "boundary past the written data: {:?} unread {}", marker, unread);
+    prop_assert!(
+        marker.bytes_ahead <= unread,
+        "boundary past the written data: {:?} unread {}",
+        marker,
+        unread
+    );
     if marker.bytes_ahead < unread {
         let at = marker.bytes_ahead as usize;
         let mut buf = vec![0u8; at + 8];
@@ -125,7 +135,8 @@ proptest! {
     #[test]
     fn marker_distances_never_negative_after_rewind(ops in collection::vec(op(), 1..120)) {
         let mut stream_storage = [0u8; 1024];
-        // Small odd-sized output ring: positions wrap and rewinds can be clamped mid-frame.
+        // Small odd-sized output ring: positions wrap and rewinds can be
+        // clamped mid-frame.
         let mut output_storage = [0u8; 517];
         let mut p = StreamPipeline::new(
             &mut stream_storage,

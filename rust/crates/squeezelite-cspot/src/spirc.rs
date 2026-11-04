@@ -1141,6 +1141,10 @@ impl SpircStateMachine {
                     self.current_track = Some(
                         self.track_queue[self.playing_track_index].clone(),
                     );
+                } else {
+                    self.status = PlayStatus::Stop;
+                    self.position_ms = 0;
+                    self.metadata = None;
                 }
                 Some(SpircEvent::Next)
             }
@@ -1194,6 +1198,9 @@ impl SpircStateMachine {
                 self.status = PlayStatus::Stop;
                 self.is_active = false;
                 None
+            }
+            SpircMessageType::Shuffle | SpircMessageType::Repeat => {
+                Some(SpircEvent::Notify)
             }
             SpircMessageType::Notify => Some(SpircEvent::Notify),
             _ => None,

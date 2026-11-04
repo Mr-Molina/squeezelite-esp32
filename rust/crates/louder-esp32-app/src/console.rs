@@ -277,10 +277,12 @@ impl CliRegistry {
                 }
             }
             "system" => self.exec_system(&tokens, &mut out),
+            "reboot" | "restart" => self.exec_system(&["system", "reboot"], &mut out),
             "i2c" => self.exec_i2c(&tokens, &mut out),
             "config" | "nvs" => self.exec_config(&tokens, &mut out),
             "join" => self.exec_join(&tokens, &mut out),
             "update" => self.exec_update(&tokens, &mut out),
+            "ota" => self.exec_update(&tokens, &mut out),
             "player" => self.exec_player(&tokens, &mut out),
             "sleep" => self.exec_sleep(&tokens, &mut out),
             _ => {
@@ -295,7 +297,13 @@ impl CliRegistry {
     }
 
     fn exec_system(&self, tokens: &[&str], out: &mut String<256>) -> CliCommandResult {
-        let sub = tokens.get(1).copied().unwrap_or("info");
+        let sub = tokens
+            .get(1)
+            .copied()
+            .unwrap_or_else(|| match tokens.first().copied() {
+                Some("reboot" | "restart") => "reboot",
+                _ => "info",
+            });
         match sub {
             "info" => {
                 let _ = out.push_str(
@@ -413,6 +421,20 @@ impl CliRegistry {
     }
 
     fn exec_config(&self, tokens: &[&str], out: &mut String<256>) -> CliCommandResult {
+        let is_sensitive = |k: &str| -> bool {
+            let contains_ci = |needle: &str| -> bool {
+                k.as_bytes().windows(needle.len()).any(|w| {
+                    w.iter()
+                        .zip(needle.as_bytes())
+                        .all(|(&b1, &b2)| b1.eq_ignore_ascii_case(&b2))
+                })
+            };
+            k.eq_ignore_ascii_case("wifi.pass")
+                || k.eq_ignore_ascii_case("wifi_pass")
+                || contains_ci("pass")
+                || contains_ci("secret")
+                || contains_ci("token")
+        };
         let sub = tokens.get(1).copied().unwrap_or("");
         match sub {
             "dump" | "list" => {
@@ -420,13 +442,13 @@ impl CliRegistry {
                     let _ = out.push_str("OK: config dump:");
                     for &item in &tokens[2..] {
                         if let Some((k, v)) = item.split_once('=') {
-                            let display_v = if k == "wifi.pass" || k == "wifi_pass" {
+                            let display_v = if is_sensitive(k) {
                                 "***"
                             } else {
                                 v
                             };
                             let _ = write!(out, " {}={}", k, display_v);
-                        } else if item == "wifi.pass" || item == "wifi_pass" {
+                        } else if is_sensitive(item) {
                             let _ = write!(out, " {}=***", item);
                         } else {
                             let _ = write!(out, " {}", item);

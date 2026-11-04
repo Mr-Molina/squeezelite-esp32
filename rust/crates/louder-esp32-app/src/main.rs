@@ -1088,12 +1088,14 @@ mod xtensa_hw {
         // JUSTIFICATION: Place static MP3 decoder in DRAM2 uninitialized section.
         // SAFETY: Guarded by atomic MP3_DEC_TAKEN ensuring exclusive access.
         #[unsafe(link_section = ".dram2_uninit")]
-        static mut STATIC_MP3_DEC: squeezelite_decoders::StaticMp3Decoder =
-            squeezelite_decoders::StaticMp3Decoder::new();
+        static mut STATIC_MP3_DEC: core::mem::MaybeUninit<
+            squeezelite_decoders::StaticMp3Decoder,
+        > = core::mem::MaybeUninit::uninit();
         // JUSTIFICATION: Access to global static MP3 decoder singleton in DRAM2.
         // SAFETY: Exclusive singleton access is guaranteed by MP3_DEC_TAKEN.
         unsafe {
-            let dec = &mut *core::ptr::addr_of_mut!(STATIC_MP3_DEC);
+            let dec = (*core::ptr::addr_of_mut!(STATIC_MP3_DEC))
+                .write(squeezelite_decoders::StaticMp3Decoder::new());
             dec.reset_in_place();
             dec
         }
@@ -1301,7 +1303,7 @@ mod xtensa_hw {
                 psize: u32,
                 num: u32,
             ) -> i32;
-            static mut g_rom_spiflash_dummy_len_plus: u8;
+            static mut g_rom_spiflash_dummy_len_plus: [u8; 2];
         }
 
         const SPI0_CTRL_REG: *mut u32 = 0x3FF4_3008 as *mut u32;
@@ -1392,7 +1394,7 @@ mod xtensa_hw {
                 7
             };
 
-            let dummy_ptr = core::ptr::addr_of_mut!(g_rom_spiflash_dummy_len_plus);
+            let dummy_ptr = core::ptr::addr_of_mut!(g_rom_spiflash_dummy_len_plus) as *mut u8;
             dummy_ptr.add(0).write_volatile(1);
             dummy_ptr.add(1).write_volatile(1);
 
@@ -1875,7 +1877,7 @@ mod xtensa_hw {
     ) -> &'static mut AmpManager<Esp32I2cBus<'static>> {
         let i2c_cfg = I2cConfig::default().with_frequency(Rate::from_khz(400));
         let hal_i2c = HalI2c::new(i2c0, i2c_cfg)
-            .expect("Failed to initialize I2C0")
+            .unwrap_or_else(|_| esp_hal::system::software_reset())
             .with_sda(sda)
             .with_scl(scl);
         let i2c_bus = Esp32I2cBus::new(hal_i2c);
@@ -1946,9 +1948,10 @@ mod xtensa_hw {
                 .unsize()
         };
         let mut tx_buffer = esp_hal::dma::DmaTxStreamBuf::new(tx_descriptors, dma_tx_slice)
-            .expect("Failed to create I2S DMA tx stream buffer");
+            .unwrap_or_else(|_| esp_hal::system::software_reset());
         Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
-        let i2s = I2s::new(i2s0, dma, i2s_tdm_cfg).expect("Failed to initialize I2S0");
+        let i2s = I2s::new(i2s0, dma, i2s_tdm_cfg)
+            .unwrap_or_else(|_| esp_hal::system::software_reset());
         let i2s_tx = i2s
             .i2s_tx
             .with_bclk(bclk)
@@ -1957,7 +1960,7 @@ mod xtensa_hw {
             .build();
         let i2s_transfer = i2s_tx
             .write(tx_buffer)
-            .expect("Failed to start I2S0 TX streaming DMA");
+            .unwrap_or_else(|_| esp_hal::system::software_reset());
         let hw_i2s_driver = Esp32HardwareI2sDma::new(i2s_transfer, 44_100);
         let sink = EspI2sSink::for_active_board(hw_i2s_driver, 44_100);
         init_static_pipeline(stream_storage, output_storage, sink)
@@ -1974,7 +1977,7 @@ mod xtensa_hw {
         let uart2_rx = Input::new(rx, InputConfig::default().with_pull(Pull::None));
         let uart2_cfg = UartConfig::default().with_baudrate(460_800);
         let hal_uart2 = Uart::new(uart2, uart2_cfg)
-            .expect("Failed to initialize UART2")
+            .unwrap_or_else(|_| esp_hal::system::software_reset())
             .with_tx(tx)
             .with_rx(uart2_rx);
         let uart2_port = Esp32Uart2Port::new(hal_uart2);
@@ -3446,8 +3449,9 @@ mod xtensa_hw {
         if s.pending_http_action != HttpControlAction::None
             && now_ms >= s.pending_action_deadline_ms
         {
+            let action = core::mem::replace(&mut s.pending_http_action, HttpControlAction::None);
             flush_settings_before_reboot(s);
-            match s.pending_http_action {
+            match action {
                 HttpControlAction::RebootToRecovery => {
                     println!(
                         "[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json \
@@ -3457,7 +3461,11 @@ mod xtensa_hw {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    if s.flash.write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes).is_ok() {
+                    let mut verify_buf = [0u8; 32];
+                    if s.flash.write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes).is_ok()
+                        && s.flash.read_nor(OTADATA_PARTITION_OFFSET, &mut verify_buf).is_ok()
+                        && verify_buf == entry_bytes
+                    {
                         println!(
                             "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
                              wrote ota_0 select entry & resetting"
@@ -3947,33 +3955,7 @@ mod xtensa_hw {
                                     | SpircEvent::MetadataUpdated(_) => {}
                                 }
                             }
-                        } else if s.coordinator.request_source(AudioSource::Spotify) {
-                            if !s.spot_streaming {
-                                if s.coordinator.current_sample_rate != 44_100
-                                    || s.pipeline.sample_rate != 44_100
-                                {
-                                    s.coordinator.current_sample_rate = 44_100;
-                                    let _ = s.pipeline.set_sample_rate(44_100);
-                                }
-                                if req_buf[..n].starts_with(b"OggS") {
-                                    let dec = alloc::boxed::Box::new(
-                                        squeezelite_decoders::VorbisDecoder::new(),
-                                    );
-                                    s.pipeline.set_decoder(ActiveDecoder::Vorbis(dec));
-                                } else {
-                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                        16, 2, false,
-                                    )));
-                                }
-                                s.pipeline.begin_external_audio();
-                                s.pipeline.set_mute(false);
-                                s.coordinator.begin_external_playback();
-                                if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                    let _ = s.amp.clear_faults();
-                                    let _ = s.amp.start_playback_via_hiz();
-                                }
-                                s.spot_streaming = true;
-                            }
+                        } else if s.spot_streaming {
                             let _ = s.pipeline.ingest_stream_data(&req_buf[..n]);
                         }
                     }
@@ -4017,7 +3999,7 @@ mod xtensa_hw {
         let has_buffered_audio =
             s.pipeline.output_buffer.available_read() >= 8 || s.pipeline.has_pending_pcm();
         s.pipeline.sink.driver.pump_silence_if_needed(
-            s.coordinator.state == PlayerState::Playing,
+            s.coordinator.state == PlayerState::Playing || s.coordinator.external_playback,
             has_buffered_audio,
         );
     }

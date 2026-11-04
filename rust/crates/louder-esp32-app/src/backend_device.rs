@@ -158,6 +158,7 @@ impl<I: I2c, R: I2sClockRegisters> AudioBackend for Esp32AudioBackend<'_, I, R> 
     }
 
     fn set_mute(&mut self, mute: bool) {
+        let _ = self.amp.set_mute(mute);
         self.muted = mute;
     }
 

@@ -2,6 +2,28 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-04 15:12 | Antigravity Orchestrator | `[squeezelite-esp32]` Full 88-Finding `/deep-code-audit` Remediation (`MA-01`..`MA-22`, `REM-01`..`REM-32`, `IPV-01`..`IPV-08`) & 10-Point Embedded Performance Tuning Sprint (`OPT-01`..`OPT-08`, `MK5-Rust`)
+**Agent**: Antigravity Orchestrator (`81d81b4e-ee39-48f7-976b-a792cedd098a`)
+**Host OS**: Windows 11 (`pwsh`)
+**Branch**: `MK5-Rust` (synced with `origin/MK5-Rust`)
+**Verification Suite**: `634/634` unit + `aac_alloc_equivalence` tests passing (`796/796` including all integration suites) + `0` Clippy Warnings (`cargo clippy --workspace --all-targets -- -D warnings`) + `0` `google_rust_audit.py crates --strict` Errors/Warnings (`GRS-001`..`GRS-012`) + `8/8` `Model: "pro"` Independent Patch Verifiers (`IPV-01`..`IPV-08`) `[VERIFIED]`
+**Code Hygiene Gates**: UNCONDITIONAL PASS (`goodbye_preflight.py`: `"status": "clean"`, `0` secrets, `0` scratch artifacts)
+
+### Completed This Session
+- **Repo Sync (`MK5-Rust`)**:
+  - Fast-forwarded `MK5-Rust` 76 commits from `51d805a3` to `6d06bac3`.
+- **`/deep-code-audit` (`MA-01`..`MA-22` -> `REM-01`..`REM-32` -> `IPV-01`..`IPV-08`)**:
+  - Dispatched 22 domain-weighted Phase 1 Micro-Auditors across all 11 first-party workspace crates and vendored `nanomp3-core` / `alac`, synthesizing **88 deduplicated findings** (`4 Critical`, `22 High`, `46 Medium`, `16 Low/Style`) in `audit_master_matrix.md`.
+  - Remediated all 88 findings across `louder-esp32-app`, `cyd-controller-app`, `squeezelite-audio-core`, `squeezelite-decoders`, `squeezelite-raop`, `squeezelite-cspot`, `squeezelite-proto`, `squeezelite-tas58xx`, `squeezelite-cyd-link`, and `nanomp3-core`, and certified all 88 patches via 8 independent `Model: "pro"` Patch Verifiers (`IPV-01`..`IPV-08`).
+- **Performance Tuning Sprint (`PERF-01`..`PERF-06` -> `OPT-01`..`OPT-08` -> `OPT-VERIFY`)**:
+  - Profiled the `MK5-Rust` hot paths via 6 parallel profilers and executed all 10 high-impact optimizations across 3 tiers:
+    1. **Tier 1 (Audio Core, PSRAM & Pipeline)**: Active-window-only PSRAM zeroing in `SpscRingBuffer::flush_internal` (eliminating ~500 ms SPI stall on seek/skip), subtraction-loop phase advance & pre-sliced FIR taps in `PolyphaseResampler`, `active_mask: u16` flat-EQ bypass & `trailing_zeros()` active-band iteration in `Equalizer`, and direct zero-copy peek into `output_i32_scratch` with doubled `512`-sample (`2048 B`) firmware DMA batching in `StreamPipeline::process_output_step`.
+    2. **Tier 2 (Audio Decoders)**: 32-bit `i32` hardware-multiply LPC fast path for 16-bit CD-quality FLAC (`eff_bps <= 16 && qlp_prec <= 15 && order <= 12`), `chunks_exact(4)` 16-bit BE/LE stereo PCM unpack, direct-to-output zero-copy MP3 frame decode, and `#[inline(always)]` `alac::BitCursor` + indexed `lpc_predict` loop.
+    3. **Tier 3 (Crypto, RTP, W5500 & CYD UI)**: Branchless constant-time `xtime` AES-128 `MixColumns`/`InvMixColumns` in `squeezelite-raop` and `squeezelite-cspot`, `copy_within` LFSR shift in `Shannon::cycle`, `O(1)` `buffered_count` + `& (capacity - 1)` bitmask indexing in `RtpJitterBuffer`, `#[inline(always)]` `W5500Driver` SPI register helpers, 4-row tile strip batching in `cyd-controller-app` `draw_text_box`, and `[profile.dev.package.*]` `opt-level = 2` overrides in `rust/Cargo.toml`.
+
+### Next-Session Handoff Notes
+- All 53 modified files in `rust/` and `.agents/sessions.md` are committed and pushed to `origin/MK5-Rust`. Ready for bare-metal firmware flashing or next feature work.
+
 ## 2026-11-03 10:24 | Antigravity Orchestrator | `[squeezelite-esp32]` Joint `/deep-hardware-audit` & `/deep-code-audit` (`AUD-01`..`AUD-16`, `HW-01`..`HW-08`), Full 127-Finding Remediation across Waves 1–3 (`REM-01`..`REM-19`), & 7-Agent `pro` Counter-Verification (`CV-01`..`CV-07`, MK5-Rust)
 **Agent**: Antigravity Orchestrator (`a13abc13-a35b-4ff9-935f-36176c47169e`)
 **Host OS**: Linux (`x86_64`)

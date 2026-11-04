@@ -486,7 +486,9 @@ impl KnownApEntry {
         if ssid.is_empty() || ssid.len() > 32 {
             return Err(StorageError::InvalidFormat);
         }
-        if !password.is_empty() && !(8..=63).contains(&password.len()) {
+        let valid_len = (8..=63).contains(&password.len())
+            || (password.len() == 64 && password.chars().all(|c| c.is_ascii_hexdigit()));
+        if !password.is_empty() && !valid_len {
             return Err(StorageError::InvalidFormat);
         }
         let mut s = String::new();
@@ -872,7 +874,9 @@ impl<S: KeyValueStorage> WifiManager<S> {
         if ssid.is_empty() || ssid.len() > 32 {
             return Err(StorageError::InvalidFormat);
         }
-        if !password.is_empty() && !(8..=63).contains(&password.len()) {
+        let valid_len = (8..=63).contains(&password.len())
+            || (password.len() == 64 && password.chars().all(|c| c.is_ascii_hexdigit()));
+        if !password.is_empty() && !valid_len {
             return Err(StorageError::InvalidFormat);
         }
 
@@ -1142,9 +1146,13 @@ mod tests {
         assert_eq!(wifi.connect("ValidSSID", "short"), Err(StorageError::InvalidFormat));
         assert_eq!(wifi.connect("ValidSSID", "1234567"), Err(StorageError::InvalidFormat));
 
-        // Long WPA2 passphrase (> 63 bytes) fails
-        let long_pass = "1234567890123456789012345678901234567890123456789012345678901234";
+        // Long WPA2 passphrase (> 63 bytes and not 64-hex raw PSK) fails
+        let long_pass = "123456789012345678901234567890123456789012345678901234567890123z";
         assert_eq!(wifi.connect("ValidSSID", long_pass), Err(StorageError::InvalidFormat));
+
+        // 64-byte valid ASCII hex raw PSK succeeds
+        let hex_psk = "1234567890123456789012345678901234567890123456789012345678901234";
+        assert!(wifi.connect("ValidSSID", hex_psk).is_ok());
 
         // Open network (empty password) succeeds
         assert!(wifi.connect("OpenNetwork", "").is_ok());

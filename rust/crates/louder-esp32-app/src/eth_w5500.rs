@@ -90,6 +90,7 @@ pub enum SpiAccessMode {
 
 /// Encodes the 3-byte W5500 SPI header (`[Offset_Hi, Offset_Lo, Control]`)
 /// in Variable Data Length Mode (`OM = 0b00`).
+#[inline(always)]
 #[must_use]
 pub const fn encode_spi_header(
     offset: u16,
@@ -227,6 +228,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
     }
 
     /// Writes `data` to `offset` inside `block_select`.
+    #[inline(always)]
     pub fn write_block(
         &mut self,
         offset: u16,
@@ -239,6 +241,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
     }
 
     /// Reads `out.len()` bytes from `offset` inside `block_select`.
+    #[inline(always)]
     pub fn read_block(
         &mut self,
         offset: u16,
@@ -250,6 +253,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.spi.transaction(&mut ops).map_err(W5500Error::Spi)
     }
 
+    #[inline(always)]
     fn write_u8(
         &mut self,
         offset: u16,
@@ -259,6 +263,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.write_block(offset, block_select, &[val])
     }
 
+    #[inline(always)]
     fn read_u8(
         &mut self,
         offset: u16,
@@ -269,6 +274,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         Ok(buf[0])
     }
 
+    #[inline(always)]
     fn write_u16_be(
         &mut self,
         offset: u16,
@@ -279,6 +285,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.write_block(offset, block_select, &bytes)
     }
 
+    #[inline(always)]
     fn read_u16_be(
         &mut self,
         offset: u16,
@@ -400,8 +407,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.read_socket0_ring_block(rx_rd, BSB_S0_RX_BUF, &mut len_hdr)?;
         let packet_size = u16::from_be_bytes(len_hdr);
         if packet_size < 2 || packet_size > rsr {
-            let advance = if packet_size >= 2 { packet_size } else { 2 };
-            let new_rx_rd = rx_rd.wrapping_add(advance);
+            let new_rx_rd = rx_rd.wrapping_add(2);
             self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
             self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
             return Err(W5500Error::InvalidRxHeader(packet_size));

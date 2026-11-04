@@ -144,6 +144,25 @@ pub struct WifiStaCredentials {
     pub password: String<64>,
 }
 
+impl Drop for WifiStaCredentials {
+    fn drop(&mut self) {
+        // Zeroize sensitive credentials in RAM to prevent memory exposure.
+        // Overwrite backing buffer with null bytes using black_box and fences
+        // under forbid(unsafe_code).
+        self.ssid.clear();
+        while self.ssid.push('\0').is_ok() {}
+        core::hint::black_box(&mut self.ssid);
+        self.ssid.clear();
+
+        self.password.clear();
+        while self.password.push('\0').is_ok() {}
+        core::hint::black_box(&mut self.password);
+        self.password.clear();
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Summary of a validated ESP32 OTA `.bin` image header (`esp_image_header_t`
 /// + `esp_app_desc_t`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1093,6 +1112,16 @@ impl OtaStreamAssembler {
         }
     }
 
+    /// Returns the byte slices that must be written to flash for this operation.
+    #[must_use]
+    pub fn flash_write_slices<'a>(
+        &'a self,
+        chunk: &'a [u8],
+        op: &OtaFlashWriteOp,
+    ) -> (&'a [u8], &'a [u8]) {
+        self.get_flash_write_slices(chunk, op)
+    }
+
     /// Writes the payload of this operation to flash via a closure, ensuring that
     /// when multi-chunk headers cross the 288-byte boundary, the full 288-byte
     /// `header_buf` plus trailing chunk bytes are written.
@@ -1500,6 +1529,65 @@ pub enum RecoveryModeState {
     Failed(OtaSafetyError),
 }
 
+/// Checks whether an extracted hostname or IPv4 address belongs to a local LAN
+/// (RFC1918, link-local, loopback).
+#[must_use]
+pub fn is_local_lan_host(host: &str) -> bool {
+    if host.starts_with("192.168.")
+        || host.starts_with("10.")
+        || host.starts_with("169.254.")
+        || host.starts_with("127.")
+        || host == "localhost"
+    {
+        return true;
+    }
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(dot_pos) = rest.find('.') {
+            if let Ok(second_octet) = rest[..dot_pos].parse::<u8>() {
+                if (16..=31).contains(&second_octet) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Derives a 768-bit (96-byte) Diffie-Hellman private key from device MAC
+/// and boot count using SplitMix64 and FNV-1a nonlinear permutation across
+/// all 96 bytes.
+#[must_use]
+pub fn derive_zeroconf_dh_private_key(mac: &[u8; 6], boot_count: u32) -> [u8; 96] {
+    let mut key = [0u8; 96];
+    let mut state: u64 = 0xcbf29ce484222325;
+    for &b in mac {
+        state ^= b as u64;
+        state = state.wrapping_mul(0x100000001b3);
+    }
+    state ^= boot_count as u64;
+    state = state.wrapping_mul(0x100000001b3);
+
+    for chunk in key.chunks_mut(8) {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        let val = z ^ (z >> 31);
+        let bytes = val.to_le_bytes();
+        let len = chunk.len().min(bytes.len());
+        chunk[..len].copy_from_slice(&bytes[..len]);
+    }
+
+    // Clamp bits so it is non-zero and has valid DH private key format
+    key[0] |= 0x01;
+    key[95] &= 0x7F;
+    key[95] |= 0x40;
+    key
+}
+
+/// Type alias aligning guided recovery coordinator with OTA updater interface.
+pub type OtaUpdater = RecoveryCoordinator;
+
 /// Pure-Rust Guided Recovery & Streaming OTA Coordinator.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -1565,6 +1653,17 @@ impl RecoveryCoordinator {
             let err = OtaSafetyError::InvalidBinaryHeader("OTA URL must start with http(s)://");
             self.state = RecoveryModeState::Failed(err.clone());
             return Err(err);
+        }
+        if let Some(host_part) = url.strip_prefix("http://") {
+            let host_end = host_part.find(&['/', ':'][..]).unwrap_or(host_part.len());
+            let host = &host_part[..host_end];
+            if !is_local_lan_host(host) {
+                let err = OtaSafetyError::InvalidBinaryHeader(
+                    "http:// OTA only permitted for local LAN hosts; use https://",
+                );
+                self.state = RecoveryModeState::Failed(err.clone());
+                return Err(err);
+            }
         }
         let mut url_str: String<128> = String::new();
         url_str

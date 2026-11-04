@@ -663,17 +663,44 @@ mod device {
     pub(crate) fn run_core0_executor(shared: &'static Shared) -> ! {
         static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
         EXECUTOR0.init(Executor::new()).run(|spawner| {
-            spawner.spawn(watchdog_lease(shared).expect("watchdog_lease task token"));
-            spawner.spawn(bt_a2dp(shared).expect("bt_a2dp task token"));
-            spawner.spawn(net_stack(shared).expect("net_stack task token"));
-            spawner.spawn(http_control(shared).expect("http_control task token"));
-            spawner.spawn(slimproto_session(shared).expect("slimproto_session task token"));
-            spawner.spawn(cyd_bridge(shared).expect("cyd_bridge task token"));
+            spawner.spawn(
+                watchdog_lease(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                bt_a2dp(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                net_stack(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                http_control(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                slimproto_session(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                cyd_bridge(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
             // Core-0 placement of the audio tasks: see "Core placement" in the
             // module docs.
-            spawner.spawn(decode_pump(shared).expect("decode_pump task token"));
-            spawner.spawn(i2s_feed(shared).expect("i2s_feed task token"));
-            spawner.spawn(config_writer(shared).expect("config_writer task token"));
+            spawner.spawn(
+                decode_pump(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                i2s_feed(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
+            spawner.spawn(
+                config_writer(shared)
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
             let first = PHASE_ORDER[0];
             TURN[first.owner().index()].signal(first);
         })
@@ -698,7 +725,10 @@ mod device {
     pub(crate) fn run_core1_executor() -> ! {
         static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
         EXECUTOR1.init(Executor::new()).run(|spawner| {
-            spawner.spawn(core1_heartbeat().expect("core1_heartbeat task token"));
+            spawner.spawn(
+                core1_heartbeat()
+                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+            );
         })
     }
 

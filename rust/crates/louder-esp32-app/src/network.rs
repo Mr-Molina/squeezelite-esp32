@@ -523,6 +523,15 @@ fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, S
             ));
         }
     }
+    if let SocketAddr::V6(v6) = addr {
+        let ip = v6.ip();
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unroutable redirect target IPv6: {ip}"),
+            ));
+        }
+    }
 
     Ok((addr, host_port.to_string(), path.to_string()))
 }

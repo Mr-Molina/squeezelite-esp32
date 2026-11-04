@@ -236,11 +236,14 @@ impl MercuryHeader {
                     let len = decode_varint(data, &mut pos)
                         .map_err(|_| MercuryError::TruncatedPacket)?
                         as usize;
-                    if pos + len > data.len() {
+                    let end = pos
+                        .checked_add(len)
+                        .ok_or(MercuryError::TruncatedPacket)?;
+                    if end > data.len() {
                         return Err(MercuryError::TruncatedPacket);
                     }
-                    let slice = &data[pos..pos + len];
-                    pos += len;
+                    let slice = &data[pos..end];
+                    pos = end;
 
                     match field_num {
                         1 => {

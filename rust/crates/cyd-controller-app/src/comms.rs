@@ -211,7 +211,7 @@ impl CydDisplayLink {
                         }
                     } else {
                         self.state.artist = artist;
-                        self.state.album.clear();
+                        // Preserve existing album on NDJSON TrackMetadata (AUD12-006)
                         self.state.title = title;
                     }
                 }
@@ -273,6 +273,12 @@ impl CydDisplayLink {
     }
 }
 
+/// Truncates a UTF-8 string slice to at most 64 bytes without splitting
+/// code points.
+pub fn truncate_to_64(s: &str) -> &str {
+    truncate_utf8(s, 64)
+}
+
 /// Parse legacy JSON event strings into telemetry state.
 pub fn parse_json_event(json_str: &str, state: &mut CydTelemetryState) -> Result<(), LinkError> {
     let trimmed = json_str.trim();
@@ -286,19 +292,19 @@ pub fn parse_json_event(json_str: &str, state: &mut CydTelemetryState) -> Result
         "meta" => {
             if let Some(t) = extract_json_str(trimmed, "title") {
                 state.title.clear();
-                let _ = state.title.push_str(truncate_utf8(t.as_str(), 63));
+                let _ = state.title.push_str(truncate_to_64(t.as_str()));
             } else {
                 state.title.clear();
             }
             if let Some(a) = extract_json_str(trimmed, "artist") {
                 state.artist.clear();
-                let _ = state.artist.push_str(truncate_utf8(a.as_str(), 63));
+                let _ = state.artist.push_str(truncate_to_64(a.as_str()));
             } else {
                 state.artist.clear();
             }
             if let Some(alb) = extract_json_str(trimmed, "album") {
                 state.album.clear();
-                let _ = state.album.push_str(truncate_utf8(alb.as_str(), 63));
+                let _ = state.album.push_str(truncate_to_64(alb.as_str()));
             } else {
                 state.album.clear();
             }
@@ -506,7 +512,7 @@ mod tests {
         let _ = write!(json_buf, "{{\"event\":\"meta\",\"title\":\"{}\"}}", long_title);
 
         assert!(parse_json_event(&json_buf, &mut state).is_ok());
-        assert_eq!(state.title.len(), 63);
+        assert_eq!(state.title.len(), 64);
         assert_eq!(&state.title[..1], "A");
     }
 

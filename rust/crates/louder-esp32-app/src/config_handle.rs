@@ -58,6 +58,18 @@ pub const DEBOUNCE_MS: u32 = 2000;
 /// Size of one settings journal sector (one flash erase unit).
 pub const JOURNAL_SECTOR_SIZE: usize = 4096;
 
+/// Standard flash sector size alias for journal sector operations.
+pub const FLASH_SECTOR_SIZE: usize = JOURNAL_SECTOR_SIZE;
+
+/// Key for maximum sample rate in audio configuration.
+pub const KEY_MAXRATE: &str = AudioConfig::KEY_MAXRATE;
+
+/// Key for Wi-Fi passphrase in configuration journal.
+pub const KEY_WIFI_PASS: &str = "wifi.pass";
+
+/// Default maximum sample rate (0 = unlimited / native DAC limit).
+pub const DEFAULT_MAX_SAMPLE_RATE: u32 = 0;
+
 /// Something that durably records a configuration snapshot (device:
 /// [`RamJournal`]).
 pub trait ConfigJournal {
@@ -170,6 +182,49 @@ impl ConfigHandle {
     /// Reads the configuration under the lock without copying all of it.
     pub fn read<R>(&self, f: impl FnOnce(&AudioConfig) -> R) -> R {
         self.state.lock(|state| f(&state.borrow().cfg))
+    }
+
+    /// Exports the configuration as a compact JSON string.
+    pub fn export_json(&self) -> Result<heapless::String<1024>, squeezelite_config::StorageError> {
+        let mut json = heapless::String::<1024>::new();
+        self.read(|cfg| {
+            use core::fmt::Write;
+            write!(
+                &mut json,
+                "{{\"player_name\":\"{}\",\"volume\":{},\"equalizer_preset\":{},\
+\"analog_gain\":{},\"loudness\":{},\"max_sample_rate\":{}}}",
+                cfg.player_name.as_str(),
+                cfg.volume,
+                cfg.equalizer_preset,
+                cfg.analog_gain_code,
+                cfg.loudness_enabled,
+                cfg.max_sample_rate
+            ).map_err(|_| squeezelite_config::StorageError::CapacityExceeded)
+        })?;
+        Ok(json)
+    }
+
+    /// Exports the configuration as JSON with `KEY_WIFI_PASS` redacted to `"***"`.
+    pub fn export_json_redacted(
+        &self,
+    ) -> Result<heapless::String<1024>, squeezelite_config::StorageError> {
+        let mut json = heapless::String::<1024>::new();
+        self.read(|cfg| {
+            use core::fmt::Write;
+            write!(
+                &mut json,
+                "{{\"player_name\":\"{}\",\"volume\":{},\"equalizer_preset\":{},\
+\"analog_gain\":{},\"loudness\":{},\"max_sample_rate\":{},\"{}\":\"***\"}}",
+                cfg.player_name.as_str(),
+                cfg.volume,
+                cfg.equalizer_preset,
+                cfg.analog_gain_code,
+                cfg.loudness_enabled,
+                cfg.max_sample_rate,
+                KEY_WIFI_PASS
+            ).map_err(|_| squeezelite_config::StorageError::CapacityExceeded)
+        })?;
+        Ok(json)
     }
 }
 
@@ -392,6 +447,35 @@ impl<'a> RamJournal<'a> {
             }
         }
     }
+
+    /// Commits pending journal image to flash storage, reusing `old_buf`
+    /// for both the pre-read skip check and post-write verification.
+    ///
+    /// Eliminates a second 4 KiB stack scratch buffer.
+    pub fn commit_flash_verified(
+        &mut self,
+        mut read_fn: impl FnMut(JournalSlot, &mut [u8; JOURNAL_SECTOR_SIZE]) -> bool,
+        mut write_fn: impl FnMut(JournalSlot, &[u8; JOURNAL_SECTOR_SIZE]) -> bool,
+        old_buf: &mut [u8; JOURNAL_SECTOR_SIZE],
+    ) -> bool {
+        if !self.flash_pending {
+            return true;
+        }
+        // Pre-read skip check using old_buf
+        if read_fn(self.target, old_buf) && old_buf == &self.image.0 {
+            self.mark_flash_written();
+            return true;
+        }
+        if !write_fn(self.target, &self.image.0) {
+            return false;
+        }
+        // Reuse old_buf for read-back verification without a second 4 KiB buffer
+        if !read_fn(self.target, old_buf) || old_buf != &self.image.0 {
+            return false;
+        }
+        self.mark_flash_written();
+        true
+    }
 }
 
 impl ConfigJournal for RamJournal<'_> {
@@ -505,6 +589,11 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(
     if let Ok(Some(loud)) = j.get_bool(AudioConfig::KEY_LOUD) {
         cfg.loudness_enabled = loud;
     }
+    if let Ok(Some(rate)) = j.get_u32(AudioConfig::KEY_MAXRATE) {
+        cfg.max_sample_rate = rate;
+    } else {
+        cfg.max_sample_rate = DEFAULT_MAX_SAMPLE_RATE;
+    }
     cfg
 }
 
@@ -549,8 +638,9 @@ pub fn resolve_boot_wifi_with_journal<S: KeyValueStorage>(
 
 /// Serializes `cfg` (and optional Wi-Fi credentials) as a complete
 /// journal image into `sector` with `sequence`; returns image length.
-/// Staged into a temporary buffer so `sector` is not wiped with `0xFF` if
-/// validation or serialization fails.
+///
+/// Serializes directly into `sector` after `cfg.validate()` to avoid
+/// secondary 4 KiB stack allocations.
 fn serialize_image(
     sector: &mut [u8; JOURNAL_SECTOR_SIZE],
     cfg: &AudioConfig,
@@ -558,8 +648,7 @@ fn serialize_image(
     wifi: Option<(&str, &str)>,
 ) -> Result<usize, squeezelite_config::StorageError> {
     cfg.validate()?;
-    let mut tmp = [0xFFu8; JOURNAL_SECTOR_SIZE];
-    let mut writer = SectorWriter::new(&mut tmp[..])?;
+    let mut writer = SectorWriter::new(&mut sector[..])?;
     cfg.save_to(&mut writer)?;
     if let Some((ssid, pass)) = wifi {
         if !ssid.is_empty() {
@@ -570,7 +659,9 @@ fn serialize_image(
         }
     }
     let len = writer.finish(sequence)?;
-    sector.copy_from_slice(&tmp);
+    if len < JOURNAL_SECTOR_SIZE {
+        sector[len..].fill(0xFF);
+    }
     Ok(len)
 }
 
@@ -794,5 +885,57 @@ mod tests {
         let snapshot = ram.image.0;
         assert!(!ram.commit(&bad_cfg));
         assert_eq!(ram.image.0, snapshot);
+    }
+
+    #[test]
+    fn test_export_json_redacted_and_maxrate_resolution() {
+        let mut cfg = AudioConfig::default();
+        cfg.player_name.clear();
+        cfg.player_name.push_str("TestBox").unwrap();
+        cfg.volume = 65;
+        cfg.set_max_sample_rate(96_000);
+
+        let handle = ConfigHandle::new(cfg);
+        let redacted = handle.export_json_redacted().expect("json export");
+        assert!(redacted.contains("\"player_name\":\"TestBox\""));
+        assert!(redacted.contains("\"volume\":65"));
+        assert!(redacted.contains("\"max_sample_rate\":96000"));
+        assert!(redacted.contains("\"wifi.pass\":\"***\""));
+
+        let unredacted = handle.export_json().expect("unredacted json export");
+        assert!(!unredacted.contains("\"wifi.pass\""));
+
+        let mut store = squeezelite_config::MemConfigStore::<16>::new();
+        store.set_u32(KEY_MAXRATE, 192_000).expect("store maxrate");
+        let resolved = resolve_boot_audio(Some(&store), &AudioConfig::default());
+        assert_eq!(resolved.max_sample_rate(), 192_000);
+
+        let empty_store = squeezelite_config::MemConfigStore::<16>::new();
+        let fallback = resolve_boot_audio(Some(&empty_store), &AudioConfig::default());
+        assert_eq!(fallback.max_sample_rate(), DEFAULT_MAX_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn test_ram_journal_commit_flash_verified_reusing_buffer() {
+        let mut image = JournalSector::erased();
+        let mut ram = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
+        assert!(ram.commit(&AudioConfig::default()));
+
+        let simulated_flash = core::cell::RefCell::new([0xFFu8; JOURNAL_SECTOR_SIZE]);
+        let mut old_buf = [0u8; JOURNAL_SECTOR_SIZE];
+
+        let committed = ram.commit_flash_verified(
+            |_slot, buf| {
+                buf.copy_from_slice(&*simulated_flash.borrow());
+                true
+            },
+            |_slot, data| {
+                simulated_flash.borrow_mut().copy_from_slice(data);
+                true
+            },
+            &mut old_buf,
+        );
+        assert!(committed);
+        assert_eq!(*simulated_flash.borrow(), ram.image.0);
     }
 }

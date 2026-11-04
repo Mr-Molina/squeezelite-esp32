@@ -481,7 +481,11 @@ impl GdsFramebuffer {
     /// Exports a rectangular tile `[x..x+w, y..y+h)` as big-endian RGB565
     /// bytes for ST7735/ST7789/ILI9341/SSD1351 SPI burst transfers.
     pub fn export_rgb565_tile(&self, x: u16, y: u16, w: u16, h: u16, out: &mut [u8]) -> usize {
-        let required = (w as usize) * (h as usize) * 2;
+        let Some(required) =
+            (w as usize).checked_mul(h as usize).and_then(|px| px.checked_mul(2))
+        else {
+            return 0;
+        };
         if out.len() < required {
             return 0;
         }
@@ -946,18 +950,27 @@ impl ExternalMetadataScreen {
 
     /// Updates track title, artist, and album strings.
     pub fn set_metadata(&mut self, title: &str, artist: &str, album: &str) {
-        let t_bytes = title.as_bytes();
-        self.title_len = t_bytes.len().min(self.title.len());
-        self.title[..self.title_len].copy_from_slice(&t_bytes[..self.title_len]);
+        let mut t_len = title.len().min(self.title.len());
+        while t_len > 0 && !title.is_char_boundary(t_len) {
+            t_len -= 1;
+        }
+        self.title_len = t_len;
+        self.title[..t_len].copy_from_slice(&title.as_bytes()[..t_len]);
         self.scroller.reset(self.title_len);
 
-        let ar_bytes = artist.as_bytes();
-        self.artist_len = ar_bytes.len().min(self.artist.len());
-        self.artist[..self.artist_len].copy_from_slice(&ar_bytes[..self.artist_len]);
+        let mut ar_len = artist.len().min(self.artist.len());
+        while ar_len > 0 && !artist.is_char_boundary(ar_len) {
+            ar_len -= 1;
+        }
+        self.artist_len = ar_len;
+        self.artist[..ar_len].copy_from_slice(&artist.as_bytes()[..ar_len]);
 
-        let al_bytes = album.as_bytes();
-        self.album_len = al_bytes.len().min(self.album.len());
-        self.album[..self.album_len].copy_from_slice(&al_bytes[..self.album_len]);
+        let mut al_len = album.len().min(self.album.len());
+        while al_len > 0 && !album.is_char_boundary(al_len) {
+            al_len -= 1;
+        }
+        self.album_len = al_len;
+        self.album[..al_len].copy_from_slice(&album.as_bytes()[..al_len]);
     }
 
     /// Updates track playback progress (`elapsed_ms`, `duration_ms`).

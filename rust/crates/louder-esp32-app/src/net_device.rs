@@ -576,7 +576,7 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> StreamSource for SmoltcpSt
                     },
                 },
                 StreamPhase::Idle | StreamPhase::Body | StreamPhase::Done => {
-                    unreachable!("connect leaves the loop before reaching a non-connect phase")
+                    return self.fail(StreamError::Disconnected);
                 }
             }
         }

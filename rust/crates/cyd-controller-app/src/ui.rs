@@ -215,26 +215,34 @@ pub fn draw_text_box<B: SpiDisplayBus>(
     };
     let text_y0 = y1 + ((height - glyph_h) / 2).max(0);
 
-    for y in y1..=y2 {
-        let mut row_buf = [bg; 320];
-        if y >= text_y0 && y < text_y0 + glyph_h {
-            let gy = ((y - text_y0) / scale) as usize;
-            for (ch_idx, &ch) in chars[..char_count].iter().enumerate() {
-                let ch_x0 = start_x + (ch_idx as i32) * glyph_w;
-                for gx in 0..8 {
-                    if glyph_pixel(ch, gx, gy) {
-                        let px_start = ch_x0 + (gx as i32) * scale;
-                        for sx in 0..scale {
-                            let rx = px_start + sx;
-                            if rx >= 0 && (rx as usize) < width {
-                                row_buf[rx as usize] = fg;
+    let mut strip_y1 = y1;
+    while strip_y1 <= y2 {
+        let strip_y2 = (strip_y1 + 3).min(y2);
+        let strip_rows = (strip_y2 - strip_y1 + 1) as usize;
+        let mut tile_buf = [bg; 320 * 4];
+        for row_idx in 0..strip_rows {
+            let y = strip_y1 + row_idx as i32;
+            let row_offset = row_idx * width;
+            if y >= text_y0 && y < text_y0 + glyph_h {
+                let gy = ((y - text_y0) / scale) as usize;
+                for (ch_idx, &ch) in chars[..char_count].iter().enumerate() {
+                    let ch_x0 = start_x + (ch_idx as i32) * glyph_w;
+                    for gx in 0..8 {
+                        if glyph_pixel(ch, gx, gy) {
+                            let px_start = ch_x0 + (gx as i32) * scale;
+                            for sx in 0..scale {
+                                let rx = px_start + sx;
+                                if rx >= 0 && (rx as usize) < width {
+                                    tile_buf[row_offset + rx as usize] = fg;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        display.flush(x1, y, x2, y, &row_buf[..width]);
+        display.flush(x1, strip_y1, x2, strip_y2, &tile_buf[..width * strip_rows]);
+        strip_y1 = strip_y2 + 1;
     }
 }
 
@@ -616,7 +624,7 @@ impl NowPlayingUi {
         now_ms: u32,
         link: &mut CydDisplayLink,
     ) -> Option<Vec<u8, 64>> {
-        let effective_y = if self.mirrored_y_panel || (9..=58).contains(&y) {
+        let effective_y = if self.mirrored_y_panel {
             239 - y
         } else {
             y
@@ -1269,6 +1277,14 @@ mod tests {
         ui.update(link.state());
         assert_eq!(ui.volume_slider, 77);
 
+        // Non-mirrored touches in top header band (9..=58) do not trigger
+        // bottom buttons
+        assert!(ui.handle_touch_point(80, 39, true, 600, &mut link).is_none());
+        assert!(ui.handle_touch_point(80, 9, true, 650, &mut link).is_none());
+
+        // Configure mirrored-Y panel for inverted touch coordinates
+        ui.set_mirrored_y_panel(true);
+
         // Mirrored-Y touch coordinate (y = 39 -> effective_y = 200)
         let res = ui.handle_touch_point(80, 39, true, 600, &mut link);
         assert_eq!(res.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
@@ -1278,6 +1294,9 @@ mod tests {
         assert_eq!(res9.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
         let res11 = ui.handle_touch_point(80, 11, true, 700, &mut link);
         assert_eq!(res11.as_deref(), Some(&b"CMD=TOGGLE\n"[..]));
+
+        // Reset to non-mirrored for standard coordinate testing
+        ui.set_mirrored_y_panel(false);
 
         // Volume slider division rounding: midpoint x = 252 (rel_x = 57) yields 50%
         let vol_res = ui.handle_touch_point(252, 200, true, 750, &mut link);

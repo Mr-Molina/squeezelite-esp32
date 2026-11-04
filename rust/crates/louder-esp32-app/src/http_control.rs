@@ -918,6 +918,53 @@ fn extract_query_or_body<'a>(raw_path: &'a str, req_bytes: &'a [u8]) -> &'a str 
     core::str::from_utf8(body_slice).unwrap_or("").trim()
 }
 
+/// Parses a query parameter and decodes `+` as space (`b' '`).
+pub fn parse_query_string<const N: usize>(query: &str, param_name: &str) -> Option<String<N>> {
+    for part in query.split('&') {
+        let trimmed = part.trim();
+        if let Some(rest) = trimmed.strip_prefix(param_name) {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                return percent_decode_str::<N>(val.trim());
+            }
+        }
+    }
+    None
+}
+
+/// Formats a complete HTTP response including standard security headers:
+/// `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+pub fn write_http_response(
+    status_code: u16,
+    content_type: &str,
+    body: &[u8],
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    const HEADER_ROOM: usize = 256;
+    if HEADER_ROOM.saturating_add(body.len()) > out_buf.len() {
+        return None;
+    }
+    let mut header: String<HEADER_ROOM> = String::new();
+    write!(
+        header,
+        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        X-Frame-Options: DENY\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Content-Length: {}\r\n\
+        Connection: close\r\n\
+        Cache-Control: no-store\r\n\r\n",
+        status_code,
+        content_type,
+        body.len()
+    )
+    .ok()?;
+    let header_len = header.len();
+    out_buf[..header_len].copy_from_slice(header.as_bytes());
+    out_buf[header_len..header_len + body.len()].copy_from_slice(body);
+    Some(header_len + body.len())
+}
+
 fn write_json_http_response(body_len: usize, out_buf: &mut [u8]) -> Option<usize> {
     const HEADER_ROOM: usize = 160;
     if HEADER_ROOM.saturating_add(body_len) > out_buf.len() {
@@ -962,7 +1009,27 @@ pub fn derive_zeroconf_dh_private_key(status: &HttpStatusSnapshot<'_>) -> [u8; 9
         chunk[..len].copy_from_slice(&digest[..len]);
     }
 
-    key[95] |= 0x01;
+    // SplitMix64 / FNV-1a nonlinear permutation across all 96 bytes
+    let mut state: u64 = 0xcbf29ce484222325;
+    for &b in &status.ip {
+        state ^= b as u64;
+        state = state.wrapping_mul(0x100000001b3);
+    }
+    for chunk in key.chunks_mut(8) {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        let val = z ^ (z >> 31);
+        let b = val.to_le_bytes();
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte ^= b[i % 8];
+        }
+    }
+
+    key[0] |= 0x01;
+    key[95] &= 0x7F;
+    key[95] |= 0x40;
     key
 }
 
@@ -1013,9 +1080,19 @@ fn redact_command_password(cmd: &str) -> String<160> {
     let is_urlencoded = cmd.contains("%20");
     let sep = if is_urlencoded { "%20" } else { " " };
     let parts: heapless::Vec<&str, 8> = cmd.split(sep).collect();
-    if parts.first() == Some(&"join") && parts.len() >= 3 {
-        let _ = write!(out, "join{}{}{}***", sep, parts[1], sep);
+    let ws_parts: heapless::Vec<&str, 8> = cmd.split_whitespace().collect();
+    if (parts.first() == Some(&"join") || parts.first() == Some(&"connect")) && parts.len() >= 3 {
+        let mask = if parts.first() == Some(&"connect") { "<redacted>" } else { "***" };
+        let _ = write!(out, "{}{}{}{}{}", parts[0], sep, parts[1], sep, mask);
         for extra in &parts[3..] {
+            let _ = write!(out, "{}{}", sep, extra);
+        }
+    } else if (ws_parts.first() == Some(&"join") || ws_parts.first() == Some(&"connect"))
+        && ws_parts.len() >= 3
+    {
+        let mask = if ws_parts.first() == Some(&"connect") { "<redacted>" } else { "***" };
+        let _ = write!(out, "{}{}{}{}{}", ws_parts[0], sep, ws_parts[1], sep, mask);
+        for extra in &ws_parts[3..] {
             let _ = write!(out, "{}{}", sep, extra);
         }
     } else if parts.first() == Some(&"config")
@@ -1171,6 +1248,30 @@ impl HttpControlRouter {
     }
 }
 
+fn is_permitted_origin(req_bytes: &[u8]) -> bool {
+    let Ok(req_str) = core::str::from_utf8(req_bytes) else {
+        return false;
+    };
+    for line in req_str.lines() {
+        let trimmed = line.trim();
+        if let Some(origin_val) = trimmed.strip_prefix("Origin:")
+            .or_else(|| trimmed.strip_prefix("origin:"))
+        {
+            let val = origin_val.trim();
+            if val.is_empty() || val == "null" {
+                return false;
+            }
+            let host_part = val.strip_prefix("http://")
+                .or_else(|| val.strip_prefix("https://"))
+                .unwrap_or(val);
+            let host_end = host_part.find(&['/', ':'][..]).unwrap_or(host_part.len());
+            let host = &host_part[..host_end];
+            return crate::ota_safety::is_local_lan_host(host);
+        }
+    }
+    true
+}
+
 /// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
 /// response for JSON) into `out_buf`.
 ///
@@ -1195,6 +1296,27 @@ pub fn handle_http_request_streaming_impl(
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
     let path = raw_path.split('?').next().unwrap_or(raw_path);
+
+    if method == "POST" && !is_permitted_origin(req_bytes) {
+        const BODY: &str = "{\"error\":\"forbidden_cross_origin\"}";
+        let mut response: String<256> = String::new();
+        let _ = write!(
+            response,
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
+            X-Content-Type-Options: nosniff\r\n\
+            X-Frame-Options: DENY\r\n\
+            Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+            Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
+            BODY.len(),
+            BODY
+        );
+        let resp_bytes = response.as_bytes();
+        if resp_bytes.len() > out_buf.len() {
+            return None;
+        }
+        out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+        return Some((resp_bytes.len(), &[], HttpControlAction::None));
+    }
 
     // Spotify Connect ZeroConf HTTP handling
     // (GET /?action=getInfo, POST /?action=addUser, /spotify_info)

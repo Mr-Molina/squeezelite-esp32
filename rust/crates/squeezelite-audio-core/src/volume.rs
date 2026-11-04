@@ -256,11 +256,7 @@ pub fn scale_samples_inplace(samples: &mut [i32], volume: VolumeScale) {
         chunk[1] = r.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
 
-    let rem = chunks.into_remainder();
-    if let Some(last) = rem.first_mut() {
-        let l = ((*last as i64 * volume.gain_left as i64) + 0x8000) >> 16;
-        *last = l.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    }
+    let _rem = chunks.into_remainder();
 }
 
 #[cfg(test)]
@@ -291,7 +287,9 @@ mod tests {
             muted: false,
         };
         scale_samples_inplace(&mut samples, half);
-        assert_eq!(samples, [5000, -5000, 10000, -10000, 4000]);
+        // Odd remainder trailing sample (8000) must remain unmodified
+        // (PAT-2026-1025-004).
+        assert_eq!(samples, [5000, -5000, 10000, -10000, 8000]);
     }
 
     #[test]

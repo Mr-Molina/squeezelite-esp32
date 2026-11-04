@@ -640,7 +640,8 @@ fn test_audio_key_decryptor_arbitrary_offset_and_header_strip() {
     decryptor.decrypt_in_place(&mut ciphertext, 0);
     assert_ne!(ciphertext, plaintext);
 
-    // Decrypt from offset 0 via decrypt_chunk -> must strip 0xA7 (167-byte) header
+    // Decrypt from offset 0 via decrypt_chunk -> must strip
+    // 0xA7 (167-byte) header
     let mut chunk0 = ciphertext.clone();
     let ogg_slice = decryptor.decrypt_chunk(&mut chunk0, 0);
     assert_eq!(ogg_slice.len(), 400 - SPOTIFY_HEADER_SIZE);
@@ -681,7 +682,8 @@ fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
     assert_eq!(sm.current_track(), Some("spotify:track:track_1"));
     assert_eq!(sm.playing_track_index(), 0);
 
-    // Track metadata with 20-byte artwork image ID -> https://i.scdn.co/image/<hex_id>
+    // Track metadata with 20-byte artwork image ID ->
+    // https://i.scdn.co/image/<hex_id>
     let meta = TrackMetadata::new(
         "Money for Nothing",
         "Dire Straits",
@@ -760,7 +762,8 @@ fn test_wo253_zeroconf_url_decode_utf8() {
 
 #[test]
 fn test_wo253_mercury_truncated_part_allocation() {
-    // seq_len = 2, seq_id = 0x0102, flags = 0x01, part_count = 10 (within MAX_MERCURY_PARTS bound)
+    // seq_len = 2, seq_id = 0x0102, flags = 0x01,
+    // part_count = 10 (within MAX_MERCURY_PARTS bound),
     // but data ends right after part_count
     let corrupt = vec![0x00, 0x02, 0x01, 0x02, 0x01, 0x00, 0x0A];
     let err = MercuryPacket::decode(0xB2, &corrupt);
@@ -769,7 +772,8 @@ fn test_wo253_mercury_truncated_part_allocation() {
 
 #[test]
 fn test_wo253_spirc_protobuf_wire_types_1_and_5() {
-    // Construct a protobuf Track submessage with unknown wire type 1 and 5 fields
+    // Construct a protobuf Track submessage with unknown wire type 1
+    // and 5 fields
     let mut data = Vec::new();
     // Field 99 (wire type 1 = 64-bit fixed)
     data.push((99 << 3) | 1);

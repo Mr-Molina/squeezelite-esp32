@@ -64,6 +64,14 @@ pub fn apply_gain(samples: &mut [i32], g: i32) {
     }
 }
 
+/// Scales a sample by a Q16.16 gain clamped to i32 range (AUD02-006).
+#[inline]
+#[must_use]
+pub fn scale_sample_q16(sample: i32, gain_val: u32) -> i32 {
+    let g = (gain_val.min(i32::MAX as u32)) as i32;
+    gain(g, sample)
+}
+
 /// One crossfaded sample (C `_apply_cross`, `output_pack.c:373`): the old
 /// track's sample weighted by `gain_out` plus the new track's weighted by
 /// `gain_in`.
@@ -401,10 +409,12 @@ impl FadeEngine {
                     let mut gain_out = FIXED_ONE - gain_in;
                     // Each track keeps its own replay gain (C output.c:234-239; 0 = none).
                     if current_rg != 0 {
-                        gain_out = gain(gain_out, current_rg as i32);
+                        let g = (current_rg.min(i32::MAX as u32)) as i32;
+                        gain_out = gain(gain_out, g);
                     }
                     if next_rg != 0 {
-                        gain_in = gain(gain_in, next_rg as i32);
+                        let g = (next_rg.min(i32::MAX as u32)) as i32;
+                        gain_in = gain(gain_in, g);
                     }
                     // C output.c:245: cross_ptr = fade_end + cur_f = read position + dur_f.
                     step.gain = ChunkGain::Cross { gain_in, gain_out, new_ahead: dur };
@@ -461,7 +471,9 @@ impl FadeEngine {
     /// its own later frames). Such a fade is dropped here; the replacement
     /// track's first frames arm a fresh one (C `_checkfade(true)`).
     pub fn discard_from(&mut self, kept_frames: u64) {
-        if self.state == FadeState::Due && self.start_ahead >= kept_frames {
+        if (self.state == FadeState::Due && self.start_ahead >= kept_frames)
+            || self.state == FadeState::Active
+        {
             self.state = FadeState::Inactive;
         }
     }

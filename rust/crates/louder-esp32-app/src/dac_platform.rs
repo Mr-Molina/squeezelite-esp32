@@ -367,6 +367,31 @@ fn parse_i8(s: &str) -> Option<i8> {
     if start >= bytes.len() {
         return None;
     }
+    if bytes.len() >= start + 2
+        && bytes[start] == b'0'
+        && (bytes[start + 1] == b'x' || bytes[start + 1] == b'X')
+    {
+        let mut idx = start + 2;
+        if idx == bytes.len() {
+            return None;
+        }
+        let mut acc = 0i16;
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            let digit = match b {
+                b'0'..=b'9' => (b - b'0') as i16,
+                b'a'..=b'f' => (b - b'a' + 10) as i16,
+                b'A'..=b'F' => (b - b'A' + 10) as i16,
+                _ => return None,
+            };
+            acc = acc * 16 + digit;
+            if acc > 127 {
+                return None;
+            }
+            idx += 1;
+        }
+        return Some(if neg { -(acc as i8) } else { acc as i8 });
+    }
     let mut acc = 0i16;
     let mut idx = start;
     while idx < bytes.len() {

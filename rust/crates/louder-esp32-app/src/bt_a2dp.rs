@@ -2736,7 +2736,7 @@ impl BtA2dpSourceState {
         out: &mut [u8],
     ) -> usize {
         let total_len = 13 + sbc_frames.len();
-        if out.len() < total_len || frame_count == 0 {
+        if out.len() < total_len || frame_count == 0 || frame_count > 15 {
             return 0;
         }
         out[0] = 0x80; // RTP v2
@@ -2883,6 +2883,9 @@ impl BtA2dpSink {
         self.acl_reassembly.reset();
         self.avdtp_state = AvdtpStreamState::Idle;
         self.in_use = false;
+        self.avrcp_vol_notify_tx_label = None;
+        self.track_metadata.clear();
+        self.peer_bd_addr = [0; 6];
     }
 
     /// Step the HCI controller initialization sequence forward.
@@ -3574,13 +3577,16 @@ impl BtA2dpSink {
                 L2CAP_CMD_CONFIG_RSP => {
                     if cmd_data.len() >= 6 {
                         let scid = u16::from_le_bytes([cmd_data[0], cmd_data[1]]);
-                        for ch in &mut self.channels {
-                            if ch.state != ChannelState::Closed
-                                && ch.handle == handle
-                                && ch.local_cid == scid
-                            {
-                                ch.state = ChannelState::Configured;
-                                break;
+                        let result = u16::from_le_bytes([cmd_data[4], cmd_data[5]]);
+                        if result == 0 {
+                            for ch in &mut self.channels {
+                                if ch.state != ChannelState::Closed
+                                    && ch.handle == handle
+                                    && ch.local_cid == scid
+                                {
+                                    ch.state = ChannelState::Configured;
+                                    break;
+                                }
                             }
                         }
                     }

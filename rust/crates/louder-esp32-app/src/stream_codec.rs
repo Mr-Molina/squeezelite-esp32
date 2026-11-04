@@ -195,7 +195,7 @@ impl ChunkedDecoder {
                     },
                 },
                 ChunkState::Done => ChunkState::Done,
-                ChunkState::Data(_) => unreachable!("handled above"),
+                ChunkState::Data(n) => ChunkState::Data(n),
             };
         }
         Ok(w)

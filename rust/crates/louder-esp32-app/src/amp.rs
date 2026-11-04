@@ -144,6 +144,7 @@ pub struct AmpManager<I2C> {
     inner: Option<AmpInner<I2C>>,
     current_volume: u8,
     current_again_code: u8,
+    is_muted: bool,
     config: AmpConfig,
 }
 
@@ -178,6 +179,7 @@ where
             inner: Some(AmpInner::PowerDown(Tas58xx::new(i2c, addr))),
             current_volume: cfg.initial_volume,
             current_again_code: cfg.initial_again_code,
+            is_muted: false,
             config: cfg,
         }
     }
@@ -188,6 +190,7 @@ where
             inner: Some(AmpInner::PowerDown(Tas58xx::new(i2c, config.i2c_addr))),
             current_volume: config.initial_volume.max(VOL_UNITY_0DB),
             current_again_code: config.initial_again_code,
+            is_muted: false,
             config,
         }
     }
@@ -244,6 +247,11 @@ where
     /// Returns the current configured digital volume attenuation.
     pub fn current_volume(&self) -> u8 {
         self.current_volume
+    }
+
+    /// Returns whether the amplifier is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.is_muted
     }
 
     /// Consumes the AmpManager and extracts the underlying I2C peripheral.
@@ -323,7 +331,12 @@ where
     pub fn start_playback(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.take() {
             Some(AmpInner::Standby(mut driver)) => {
-                if let Err(e) = driver.set_digital_volume(self.current_volume) {
+                let vol = if self.is_muted {
+                    VOL_MUTE
+                } else {
+                    self.current_volume
+                };
+                if let Err(e) = driver.set_digital_volume(vol) {
                     self.inner = Some(AmpInner::Standby(driver));
                     return Err(e);
                 }
@@ -357,7 +370,12 @@ where
     pub fn start_playback_via_hiz(&mut self) -> Result<(), DriverError<E>> {
         match self.inner.take() {
             Some(AmpInner::Standby(mut driver)) => {
-                if let Err(e) = driver.set_digital_volume(self.current_volume) {
+                let vol = if self.is_muted {
+                    VOL_MUTE
+                } else {
+                    self.current_volume
+                };
+                if let Err(e) = driver.set_digital_volume(vol) {
                     self.inner = Some(AmpInner::Standby(driver));
                     return Err(e);
                 }
@@ -433,6 +451,7 @@ where
     /// Preserves `self.current_volume` when muted so unmuting restores
     /// it (AUD13-001).
     pub fn set_mute(&mut self, mute: bool) -> Result<(), DriverError<E>> {
+        self.is_muted = mute;
         if mute {
             match self.inner.as_mut() {
                 Some(AmpInner::Play(driver)) => driver.set_digital_volume(VOL_MUTE),
@@ -484,7 +503,12 @@ where
         match self.inner.as_mut() {
             Some(AmpInner::Play(driver)) => {
                 driver.recover_from_fault()?;
-                driver.set_digital_volume(self.current_volume)
+                let vol = if self.is_muted {
+                    VOL_MUTE
+                } else {
+                    self.current_volume
+                };
+                driver.set_digital_volume(vol)
             }
             Some(AmpInner::Standby(driver)) => driver.clear_faults(),
             Some(AmpInner::PowerDown(_)) | None => Err(DriverError::InvalidParameter),

@@ -572,6 +572,7 @@ impl JitterEntry {
 pub struct RtpJitterBuffer {
     capacity: usize,
     slots: Vec<Option<JitterEntry>>,
+    buffered_count: usize,
     read_seq: Option<u16>,
     write_seq: Option<u16>,
     min_allowed_seq: Option<u16>,
@@ -597,6 +598,7 @@ impl RtpJitterBuffer {
         Self {
             capacity: cap,
             slots: vec![None; cap],
+            buffered_count: 0,
             read_seq: None,
             write_seq: None,
             min_allowed_seq: None,
@@ -658,23 +660,34 @@ impl RtpJitterBuffer {
     }
 
     /// Number of populated slots currently waiting in the ring buffer.
+    #[inline(always)]
     #[must_use]
     pub fn buffered_count(&self) -> usize {
-        let mut count = 0usize;
-        for slot in &self.slots {
-            if slot.is_some() {
-                count += 1;
-            }
-        }
-        count
+        self.buffered_count
     }
 
+    #[inline(always)]
     fn slot_index(&self, seq: u16) -> usize {
-        (seq as usize) % self.capacity
+        (seq as usize) & (self.capacity - 1)
     }
 
     fn clear_slots(&mut self) {
         self.slots.fill(None);
+        self.buffered_count = 0;
+    }
+
+    fn put_slot(&mut self, idx: usize, entry: JitterEntry) {
+        if self.slots[idx].replace(entry).is_none() {
+            self.buffered_count += 1;
+        }
+    }
+
+    fn take_slot(&mut self, idx: usize) -> Option<JitterEntry> {
+        let taken = self.slots[idx].take();
+        if taken.is_some() {
+            self.buffered_count -= 1;
+        }
+        taken
     }
 
     /// Pushes a raw RTP audio packet (`0x60`) or retransmit reply (`0x56`/`0xD6`)
@@ -735,7 +748,7 @@ impl RtpJitterBuffer {
             }
             if self.write_seq.is_none() {
                 let idx = self.slot_index(seq);
-                self.slots[idx] = Some(entry);
+                self.put_slot(idx, entry);
                 self.read_seq = Some(seq);
                 self.write_seq = Some(seq);
                 self.min_allowed_seq = None;
@@ -747,7 +760,7 @@ impl RtpJitterBuffer {
         let (Some(last_w), Some(cur_r)) = (self.write_seq, self.read_seq)
         else {
             let idx = self.slot_index(seq);
-            self.slots[idx] = Some(entry);
+            self.put_slot(idx, entry);
             self.read_seq = Some(seq);
             self.write_seq = Some(seq);
             return None;
@@ -757,7 +770,7 @@ impl RtpJitterBuffer {
         if diff_w == 1 {
             // Expected next packet in sequence
             let idx = self.slot_index(seq);
-            self.slots[idx] = Some(entry);
+            self.put_slot(idx, entry);
             self.write_seq = Some(seq);
             let d = seq_diff(seq, cur_r);
             if d > 0 && (d as usize) >= self.capacity {
@@ -773,7 +786,7 @@ impl RtpJitterBuffer {
                 // Gap exceeds ring capacity: reset ring to new anchor
                 self.clear_slots();
                 let idx = self.slot_index(seq);
-                self.slots[idx] = Some(entry);
+                self.put_slot(idx, entry);
                 self.read_seq = Some(seq);
                 self.write_seq = Some(seq);
                 return None;
@@ -784,12 +797,12 @@ impl RtpJitterBuffer {
             let mut s = last_w.wrapping_add(1);
             while s != seq {
                 let s_idx = self.slot_index(s);
-                self.slots[s_idx] = None;
+                let _ = self.take_slot(s_idx);
                 s = s.wrapping_add(1);
             }
 
             let idx = self.slot_index(seq);
-            self.slots[idx] = Some(entry);
+            self.put_slot(idx, entry);
             self.write_seq = Some(seq);
 
             let d = seq_diff(seq, cur_r);
@@ -816,7 +829,7 @@ impl RtpJitterBuffer {
                     self.recovered_packets =
                         self.recovered_packets.saturating_add(1);
                 }
-                self.slots[idx] = Some(entry);
+                self.put_slot(idx, entry);
             } else {
                 self.late_packets = self.late_packets.saturating_add(1);
             }
@@ -834,7 +847,7 @@ impl RtpJitterBuffer {
         if !is_match {
             return None;
         }
-        let entry = self.slots[idx].take();
+        let entry = self.take_slot(idx);
         if self.write_seq.is_some() {
             self.read_seq = Some(r_seq.wrapping_add(1));
         }
@@ -908,6 +921,7 @@ impl RtpJitterBuffer {
                 .is_some_and(|e| seq_before(e.header.sequence_number, flush_seq));
             if should_drop {
                 *slot = None;
+                self.buffered_count -= 1;
             }
         }
 
@@ -1141,7 +1155,8 @@ impl SyncDriftTracker {
         input_pcm: &[i16],
         out_pcm: &mut Vec<i16>,
     ) {
-        let input_pcm = &input_pcm[..input_pcm.len() & !1];
+        let even_len = input_pcm.len() & !1;
+        let input_pcm = &input_pcm[..even_len];
         out_pcm.clear();
         if input_pcm.len() < 2 {
             out_pcm.extend_from_slice(input_pcm);
@@ -1170,6 +1185,17 @@ impl SyncDriftTracker {
                 out_pcm.push(last_r);
             }
         }
+    }
+
+    /// Applies drift adjustment by ensuring samples are stereo-aligned
+    /// (even length).
+    pub fn apply_drift_adjustment(
+        adjustment: i8,
+        samples: &[i16],
+        out_pcm: &mut Vec<i16>,
+    ) {
+        let even_len = samples.len() & !1;
+        Self::apply_stereo_adjustment(adjustment, &samples[..even_len], out_pcm);
     }
 }
 

@@ -33,6 +33,8 @@ pub trait SpiDisplayBus {
     fn send_data(&mut self, data: &[u8]);
     /// Set backlight PWM duty cycle (0..=1023 for 10-bit resolution).
     fn set_backlight_duty(&mut self, duty_10bit: u16);
+    /// Optional blocking delay in milliseconds (default no-op).
+    fn delay_ms(&mut self, _ms: u32) {}
 }
 
 /// In-memory mock bus recording commands and transmitted bytes for unit tests.
@@ -147,6 +149,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
             DisplayPanelVariant::Ili9341 => {
                 // 1. Software Reset
                 self.bus.send_cmd(0x01);
+                self.bus.delay_ms(5);
                 // 2. Display OFF
                 self.bus.send_cmd(0x28);
                 // 3. Power Control B
@@ -213,6 +216,7 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
                 self.bus.send_cmd(0x20);
                 // 22. Sleep OUT (SLPOUT)
                 self.bus.send_cmd(0x11);
+                self.bus.delay_ms(120);
                 // 23. Display ON (DISPON)
                 self.bus.send_cmd(0x29);
 
@@ -222,8 +226,10 @@ impl<B: SpiDisplayBus> Ili9341Display<B> {
             DisplayPanelVariant::St7789 => {
                 // 1. Software Reset
                 self.bus.send_cmd(0x01);
+                self.bus.delay_ms(5);
                 // 2. Sleep OUT (SLPOUT)
                 self.bus.send_cmd(0x11);
+                self.bus.delay_ms(120);
                 // 3. Pixel Format: 16-bit RGB565 (0x55)
                 self.bus.send_cmd(0x3A);
                 self.bus.send_data(&[0x55]);

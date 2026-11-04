@@ -35,6 +35,7 @@ pub struct SleepManager {
     last_activity_ms: u32,
     last_wake_ms: u32,
     spurious_wake_count: u8,
+    pre_sleep_soft_mute: bool,
 }
 
 impl SleepManager {
@@ -59,6 +60,7 @@ impl SleepManager {
             last_activity_ms: 0,
             last_wake_ms: 0,
             spurious_wake_count: 0,
+            pre_sleep_soft_mute: false,
         }
     }
 
@@ -94,6 +96,25 @@ impl SleepManager {
         matches!(self.state, SleepState::Active) && self.aude_dac_enabled
     }
 
+    /// Returns whether the amplifier power rail should be energized.
+    #[must_use]
+    pub const fn should_enable_amp_power(&self) -> bool {
+        self.is_amp_power_enabled()
+    }
+
+    /// Returns whether soft-mute is requested prior to entering deep sleep
+    /// or power cutoff, preventing speaker pop.
+    #[must_use]
+    pub const fn soft_mute_requested(&self) -> bool {
+        self.pre_sleep_soft_mute
+            || matches!(self.state, SleepState::DeepSleep | SleepState::LightSleep)
+    }
+
+    /// Sets or clears the pre-sleep soft-mute hold flag.
+    pub fn set_pre_sleep_soft_mute(&mut self, soft_mute: bool) {
+        self.pre_sleep_soft_mute = soft_mute;
+    }
+
     /// Returns the count of filtered spurious wakes.
     #[must_use]
     pub const fn spurious_wake_count(&self) -> u8 {
@@ -114,6 +135,7 @@ impl SleepManager {
     pub fn record_activity(&mut self, now_ms: u32) {
         self.last_activity_ms = now_ms;
         self.state = SleepState::Active;
+        self.pre_sleep_soft_mute = false;
     }
 
     /// Evaluates inactivity and battery thresholds at `now_ms`, transitioning
@@ -126,6 +148,7 @@ impl SleepManager {
     ) -> SleepState {
         if let Some(mv) = battery_mv {
             if self.low_battery_cutoff_mv > 0 && mv > 0 && mv <= self.low_battery_cutoff_mv {
+                self.pre_sleep_soft_mute = true;
                 self.state = SleepState::DeepSleep;
                 return self.state;
             }
@@ -133,11 +156,13 @@ impl SleepManager {
         if is_playing {
             self.last_activity_ms = now_ms;
             self.state = SleepState::Active;
+            self.pre_sleep_soft_mute = false;
             return self.state;
         }
         if self.inactivity_timeout_ms > 0 {
             let idle_ms = now_ms.wrapping_sub(self.last_activity_ms);
             if idle_ms >= self.inactivity_timeout_ms.saturating_mul(2) {
+                self.pre_sleep_soft_mute = true;
                 self.state = SleepState::DeepSleep;
             } else if idle_ms >= self.inactivity_timeout_ms {
                 self.state = SleepState::LightSleep;
@@ -334,7 +359,7 @@ impl BoardProfile {
         match self {
             Self::LouderEsp32 => Some(33),
             Self::LouderEsp32S3 => Some(17),
-            Self::SqueezeAmp => Some(12),
+            Self::SqueezeAmp => Some(33),
             Self::MuseProto => Some(21),
             Self::TWatch2020 | Self::GenericI2s => None,
         }
@@ -363,6 +388,8 @@ mod tests {
         mgr.add_wake_gpio(34);
         assert_eq!(mgr.wake_pin_mask(), (1u64 << 0) | (1u64 << 34));
         assert!(mgr.is_amp_power_enabled());
+        assert!(mgr.should_enable_amp_power());
+        assert!(!mgr.soft_mute_requested());
 
         assert_eq!(mgr.evaluate(5_000, false, Some(3_800)), SleepState::Active);
         assert_eq!(
@@ -370,10 +397,12 @@ mod tests {
             SleepState::LightSleep
         );
         assert!(!mgr.is_amp_power_enabled());
+        assert!(mgr.soft_mute_requested());
         assert_eq!(
             mgr.evaluate(25_000, false, Some(3_800)),
             SleepState::DeepSleep
         );
+        assert!(mgr.soft_mute_requested());
 
         assert_eq!(
             mgr.evaluate_wake_window(30_000, 31_000, false),
@@ -434,6 +463,7 @@ mod tests {
             assert!(bck >= 0 && ws >= 0 && dout >= 0);
         }
         assert_eq!(BoardProfile::SqueezeAmp.battery_adc_channel(), Some(7));
+        assert_eq!(BoardProfile::SqueezeAmp.amp_power_gpio(), Some(33));
         assert_eq!(BoardProfile::LouderEsp32.amp_power_gpio(), Some(33));
         assert_eq!(BoardProfile::LouderEsp32S3.amp_power_gpio(), Some(17));
     }

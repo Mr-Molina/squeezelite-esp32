@@ -34,6 +34,24 @@ unsafe_op_in_unsafe_fn = "warn"
 borrowed_box = "deny"
 ptr_arg = "deny"
 
+[profile.dev.package.squeezelite-audio-core]
+opt-level = 2
+
+[profile.dev.package.squeezelite-decoders]
+opt-level = 2
+
+[profile.dev.package.nanomp3-core]
+opt-level = 2
+
+[profile.dev.package.alac]
+opt-level = 2
+
+[profile.dev.package.syom]
+opt-level = 2
+
+[profile.dev.package.lewton]
+opt-level = 2
+
 [profile.release]
 opt-level = 2
 lto = false

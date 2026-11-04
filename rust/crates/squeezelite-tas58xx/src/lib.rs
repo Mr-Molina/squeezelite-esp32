@@ -298,7 +298,7 @@ impl Tas5805mTelemetry {
         (self.clkdet_status & 0x08) != 0
             || ((self.clkdet_status & 0x07) == 0
                 && self.detected_sample_rate_hz() > 0
-                && self.bck_mon >= 32)
+                && self.bck_ratio() >= 32)
     }
 
     /// Returns `true` if both Left and Right channels are currently
@@ -335,6 +335,8 @@ impl<E: fmt::Display> fmt::Display for DriverError<E> {
 pub struct Tas58xx<I2C, STATE> {
     i2c: I2C,
     addr: u8,
+    current_book: u8,
+    current_page: u8,
     _state: PhantomData<STATE>,
 }
 
@@ -359,6 +361,8 @@ where
         Self {
             i2c,
             addr,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData,
         }
     }
@@ -388,6 +392,8 @@ where
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData,
         })
     }
@@ -415,6 +421,13 @@ where
 
     /// Selects Book 0 and Page 0, ensuring Page 0 is selected first (RUST-18).
     pub fn select_page0_book0(&mut self) -> Result<(), DriverError<E>> {
+        self.select_book_page(0x00, 0x00)
+    }
+
+    fn ensure_page0_book0(&mut self) -> Result<(), DriverError<E>> {
+        if self.current_book == 0 && self.current_page == 0 {
+            return Ok(());
+        }
         self.select_book_page(0x00, 0x00)
     }
 
@@ -472,6 +485,7 @@ where
     /// Configures the I2S audio interface bit depth (16, 20, 24, or 32 bits).
     /// Bits [1:0] WORD_LENGTH: 00 = 16-bit, 01 = 20-bit, 10 = 24-bit, 11 = 32-bit.
     pub fn configure_audio_format(&mut self, word_length_bits: u8) -> Result<(), DriverError<E>> {
+        self.ensure_page0_book0()?;
         let val = match word_length_bits {
             16 => 0x00,
             20 => 0x01,
@@ -571,6 +585,8 @@ where
         self.i2c
             .write(self.addr, &[registers::BOOK_SELECT, 0x00])
             .map_err(DriverError::I2cError)?;
+        self.current_book = 0;
+        self.current_page = 0;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
             .map_err(DriverError::I2cError)
@@ -595,7 +611,10 @@ where
             .map_err(DriverError::I2cError)?;
         self.i2c
             .write(self.addr, &[registers::PAGE_SELECT, page])
-            .map_err(DriverError::I2cError)
+            .map_err(DriverError::I2cError)?;
+        self.current_book = book;
+        self.current_page = page;
+        Ok(())
     }
 
     /// Stages the amplifier into Hi-Z mode and clears latched faults (RUST-17).
@@ -626,6 +645,9 @@ where
     pub fn try_start_playback_via_hiz(
         mut self,
     ) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
+        if let Err(e) = self.ensure_page0_book0() {
+            return Err((self, e));
+        }
         if let Err(e) = self
             .i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
@@ -654,6 +676,8 @@ where
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
+            current_book: self.current_book,
+            current_page: self.current_page,
             _state: PhantomData,
         })
     }
@@ -666,6 +690,9 @@ where
 
     /// Transitions into `Play` mode, returning `Self` on I2C error (PERIPH-604).
     pub fn try_start_playback(mut self) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
+        if let Err(e) = self.ensure_page0_book0() {
+            return Err((self, e));
+        }
         if let Err(e) = self
             .i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
@@ -688,6 +715,8 @@ where
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
+            current_book: self.current_book,
+            current_page: self.current_page,
             _state: PhantomData,
         })
     }
@@ -703,6 +732,9 @@ where
     pub fn try_enter_deep_sleep(
         mut self,
     ) -> Result<Tas58xx<I2C, PowerDown>, (Self, DriverError<E>)> {
+        if let Err(e) = self.ensure_page0_book0() {
+            return Err((self, e));
+        }
         if let Err(e) = self
             .i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_DEEP_SLEEP])
@@ -712,6 +744,8 @@ where
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
+            current_book: self.current_book,
+            current_page: self.current_page,
             _state: PhantomData,
         })
     }
@@ -800,12 +834,18 @@ where
             .map_err(DriverError::I2cError)?;
         self.i2c
             .write(self.addr, &[registers::PAGE_SELECT, page])
-            .map_err(DriverError::I2cError)
+            .map_err(DriverError::I2cError)?;
+        self.current_book = book;
+        self.current_page = page;
+        Ok(())
     }
 
     /// Transitions back to `Standby` mode, returning `Self` on I2C
     /// error (PERIPH-604).
     pub fn try_stop_playback(mut self) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
+        if let Err(e) = self.ensure_page0_book0() {
+            return Err((self, e));
+        }
         if let Err(e) = self
             .i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_PLAY_MUTE])
@@ -822,6 +862,8 @@ where
         Ok(Tas58xx {
             i2c: self.i2c,
             addr: self.addr,
+            current_book: self.current_book,
+            current_page: self.current_page,
             _state: PhantomData,
         })
     }
@@ -834,6 +876,13 @@ where
 
     /// Selects Book 0 and Page 0, ensuring Page 0 is selected first (RUST-18).
     pub fn select_page0_book0(&mut self) -> Result<(), DriverError<E>> {
+        self.select_book_page(0x00, 0x00)
+    }
+
+    fn ensure_page0_book0(&mut self) -> Result<(), DriverError<E>> {
+        if self.current_book == 0 && self.current_page == 0 {
+            return Ok(());
+        }
         self.select_book_page(0x00, 0x00)
     }
 
@@ -1004,6 +1053,8 @@ mod tests {
         let mut playing = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Play>,
         };
 
@@ -1029,6 +1080,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
 
@@ -1055,6 +1108,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
 
@@ -1078,6 +1133,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
 
@@ -1223,6 +1280,8 @@ mod tests {
         let mut playing = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Play>,
         };
 
@@ -1249,6 +1308,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
         standby.clear_faults().unwrap();
@@ -1256,6 +1317,8 @@ mod tests {
         let mut play = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Play>,
         };
         play.clear_faults().unwrap();
@@ -1276,6 +1339,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
 
@@ -1313,6 +1378,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
         standby.select_book_page(0x8C, 0x2A).unwrap();
@@ -1320,6 +1387,8 @@ mod tests {
         let mut playing = Tas58xx {
             i2c: &mut i2c,
             addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Play>,
         };
         playing.select_book_page(0x00, 0x00).unwrap();
@@ -1344,6 +1413,8 @@ mod tests {
         let mut standby = Tas58xx {
             i2c: &mut i2c,
             addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
 
@@ -1377,6 +1448,8 @@ mod tests {
         let standby = Tas58xx {
             i2c: &mut i2c,
             addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Standby>,
         };
 
@@ -1532,6 +1605,8 @@ mod tests {
         let mut playing = Tas58xx {
             i2c: &mut i2c,
             addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
             _state: PhantomData::<Play>,
         };
 

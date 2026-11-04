@@ -203,6 +203,9 @@ impl Resampler {
     /// (always even multiples of 2).
     #[inline]
     pub fn process(&mut self, input: &[i32], output: &mut [i32]) -> (usize, usize) {
+        if self.to_hz == 0 {
+            return (0, 0);
+        }
         let in_frames = input.len() / 2;
         let out_frames = output.len() / 2;
         let mut in_idx = 0usize;
@@ -280,8 +283,13 @@ impl Resampler {
     #[inline]
     fn advance_phase(&mut self) {
         self.phase_num += u64::from(self.from_hz);
-        self.need_input_frames = (self.phase_num / u64::from(self.to_hz)) as u32;
-        self.phase_num %= u64::from(self.to_hz);
+        let to_hz = u64::from(self.to_hz);
+        let mut step = 0_u32;
+        while self.phase_num >= to_hz {
+            self.phase_num -= to_hz;
+            step += 1;
+        }
+        self.need_input_frames = step;
     }
 
     #[inline]
@@ -289,6 +297,7 @@ impl Resampler {
         let taps = usize::from(self.taps);
         let pos = usize::from(self.hist_pos);
         let hist_slice = &self.history[pos..pos + taps];
+        let h = &hist_slice[..taps];
 
         let scaled_phase =
             ((self.phase_num * (NUM_PHASES as u64)) << 16) / u64::from(self.to_hz);
@@ -307,22 +316,25 @@ impl Resampler {
                     phase_idx
                 };
                 let row = &self.coeffs_q30[nearest_idx];
+                let r0 = &row[..taps];
                 for k in 0..taps {
-                    let c = i64::from(row[k]);
-                    let frame = hist_slice[k];
-                    acc_l = acc_l.saturating_add(i64::from(frame[0]) * c);
-                    acc_r = acc_r.saturating_add(i64::from(frame[1]) * c);
+                    let c = i64::from(r0[k]);
+                    let frame = h[k];
+                    acc_l += i64::from(frame[0]) * c;
+                    acc_r += i64::from(frame[1]) * c;
                 }
             }
             InterpolationMode::LinearPhase => {
                 let row1 = &self.coeffs_q30[phase_idx + 1];
+                let r0 = &row0[..taps];
+                let r1 = &row1[..taps];
                 for k in 0..taps {
-                    let c0 = i64::from(row0[k]);
-                    let c1 = i64::from(row1[k]);
+                    let c0 = i64::from(r0[k]);
+                    let c1 = i64::from(r1[k]);
                     let c = c0 + (((c1 - c0) * frac_q16 + 32_768) >> 16);
-                    let frame = hist_slice[k];
-                    acc_l = acc_l.saturating_add(i64::from(frame[0]) * c);
-                    acc_r = acc_r.saturating_add(i64::from(frame[1]) * c);
+                    let frame = h[k];
+                    acc_l += i64::from(frame[0]) * c;
+                    acc_r += i64::from(frame[1]) * c;
                 }
             }
         }

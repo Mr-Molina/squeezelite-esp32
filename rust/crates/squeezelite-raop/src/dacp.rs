@@ -165,7 +165,9 @@ impl DacpClient {
         if trimmed.is_empty() || self.active_remote.is_empty() || trimmed.contains("..") {
             return None;
         }
-        let has_invalid = |s: &str| s.bytes().any(|b| !(0x20..0x7F).contains(&b));
+        let has_invalid = |s: &str| {
+            s.bytes().any(|b| b == b' ' || !(0x20..0x7F).contains(&b))
+        };
         if has_invalid(trimmed)
             || has_invalid(&self.active_remote)
             || has_invalid(&self.dacp_id)

@@ -609,7 +609,7 @@ fn read_blob_int(data: &[u8], pos: &mut usize) -> Result<u32, CryptoError> {
     }
     let hi = data[*pos];
     *pos += 1;
-    Ok(((lo & 0x7f) as u32) | ((hi as u32) << 7))
+    Ok(((lo & 0x7f) as u32) | (((hi & 0x7f) as u32) << 7))
 }
 
 fn url_decode(s: &str) -> String {
@@ -805,7 +805,7 @@ impl ZeroConfServer {
         remote_name: &str,
     ) -> Result<ZeroConfResponse, ZeroConfError> {
         let combined_params = if let Some(idx) = uri.find('?') {
-            format!("{}&{}", &uri[idx + 1..], body)
+            format!("{}&{}", body, &uri[idx + 1..])
         } else {
             body.to_string()
         };

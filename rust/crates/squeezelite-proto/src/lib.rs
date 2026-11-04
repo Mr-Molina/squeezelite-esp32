@@ -490,7 +490,7 @@ impl SlimprotoParser {
         }
 
         let (opcode, payload, total_frame_len) = if !buf[0].is_ascii_alphabetic()
-            && buf[2..6].iter().all(|b| b.is_ascii_alphabetic())
+            && buf[2..6].iter().all(|b| b.is_ascii_alphanumeric() || *b == b' ')
         {
             let length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
             if length < 4 {

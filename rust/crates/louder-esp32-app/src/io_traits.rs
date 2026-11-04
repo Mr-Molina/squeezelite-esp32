@@ -302,15 +302,17 @@ impl SlimTransport for LoopbackTransport {
         if !self.connected {
             return Err(TransportError::Disconnected);
         }
-        let f = Frame::from_slice(frame).map_err(|_| TransportError::Io)?;
+        if frame.len() > LOOPBACK_FRAME_CAP {
+            return Err(TransportError::Io);
+        }
         if self.tx.is_full() || (self.echo && self.rx.is_full()) {
             return Err(TransportError::WouldBlock);
         }
         if self.echo {
             // Capacity checked above, so neither push can fail.
-            let _ = self.rx.push_back(f.clone());
+            let _ = self.rx.push_back(Frame::from_slice(frame).map_err(|_| TransportError::Io)?);
         }
-        let _ = self.tx.push_back(f);
+        let _ = self.tx.push_back(Frame::from_slice(frame).map_err(|_| TransportError::Io)?);
         Ok(())
     }
 

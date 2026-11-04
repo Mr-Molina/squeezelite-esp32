@@ -92,14 +92,8 @@ pub const VERIFIED_RATES: &[u32] = &[
 ];
 
 /// Highest rate in [`VERIFIED_RATES`].
-pub fn max_verified_rate() -> u32 {
-    let mut max = 0;
-    for &r in VERIFIED_RATES {
-        if r > max {
-            max = r;
-        }
-    }
-    max
+pub const fn max_verified_rate() -> u32 {
+    VERIFIED_RATES[VERIFIED_RATES.len() - 1]
 }
 
 /// Divider configuration for `rate_hz`, or `None` for a rate not in the table.

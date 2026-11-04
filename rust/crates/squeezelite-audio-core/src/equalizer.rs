@@ -406,6 +406,7 @@ pub struct Equalizer<const BANDS: usize> {
     gains_db: [f32; BANDS],
     hist_left: [(f32, f32); BANDS],
     hist_right: [(f32, f32); BANDS],
+    active_mask: u16,
     pub enabled: bool,
     pub current_preset: EqPreset,
     pub loudness_enabled: bool,
@@ -431,6 +432,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
             gains_db: [0.0; BANDS],
             hist_left: [(0.0, 0.0); BANDS],
             hist_right: [(0.0, 0.0); BANDS],
+            active_mask: 0,
             enabled: false,
             current_preset: EqPreset::Flat,
             loudness_enabled: false,
@@ -465,6 +467,15 @@ impl<const BANDS: usize> Equalizer<BANDS> {
             return Err(EqualizerError::UnstableCoefficients);
         }
         self.filters[band] = coeffs;
+        if band < 16 {
+            let gain_active =
+                self.gains_db[band].is_finite() && self.gains_db[band].abs() > 1e-4;
+            if gain_active || coeffs != BiquadCoeffs::BYPASS {
+                self.active_mask |= 1u16 << band;
+            } else {
+                self.active_mask &= !(1u16 << band);
+            }
+        }
         Ok(())
     }
 
@@ -532,18 +543,31 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         if !self.enabled {
             return;
         }
+        if self.active_mask == 0 && !self.loudness_enabled {
+            return;
+        }
 
         const NORM: f32 = 1.0 / 2147483648.0;
         const DENORM: f32 = 2147483648.0;
         const MAX_F32_I32: f32 = 2147483520.0; // Largest representable f32 <= i32::MAX
         const MIN_F32_I32: f32 = i32::MIN as f32;
 
+        let loud_gain = if self.loudness_enabled {
+            horner_loudness(0.5)
+        } else {
+            1.0
+        };
+        let out_scale = DENORM * loud_gain;
+
         let mut chunks = samples.chunks_exact_mut(2);
         for chunk in &mut chunks {
             let mut l = chunk[0] as f32 * NORM;
             let mut r = chunk[1] as f32 * NORM;
 
-            for i in 0..BANDS {
+            let mut mask = self.active_mask;
+            while mask != 0 {
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
                 let f = &self.filters[i];
 
                 // Left channel biquad (Direct Form II Transposed)
@@ -578,15 +602,8 @@ impl<const BANDS: usize> Equalizer<BANDS> {
                 r = out_r;
             }
 
-            if self.loudness_enabled {
-                let lvl = l.abs().max(r.abs()).clamp(0.0, 1.0);
-                let gain = horner_loudness(lvl);
-                l *= gain;
-                r *= gain;
-            }
-
-            let scaled_l = l * DENORM;
-            let scaled_r = r * DENORM;
+            let scaled_l = l * out_scale;
+            let scaled_r = r * out_scale;
             chunk[0] = if scaled_l.is_nan() {
                 0
             } else {
@@ -881,18 +898,19 @@ impl Equalizer<10> {
     pub fn retune(&mut self, gains_db: &[f32; 10], fs_hz: f32) {
         self.gains_db = *gains_db;
         let bands = design_bands(gains_db, fs_hz);
-        let mut any_active = false;
+        let mut mask = 0u16;
         for (i, &coeffs) in bands.iter().enumerate() {
             if coeffs.is_stable() {
                 self.filters[i] = coeffs;
             } else {
                 self.filters[i] = BiquadCoeffs::BYPASS;
             }
-            if gains_db[i].is_finite() && gains_db[i].abs() >= 1e-4 {
-                any_active = true;
+            if self.gains_db[i].is_finite() && self.gains_db[i].abs() > 1e-4 {
+                mask |= 1u16 << i;
             }
         }
-        self.enabled = any_active && fs_hz.is_finite() && fs_hz > 0.0;
+        self.active_mask = mask;
+        self.enabled = mask != 0 && fs_hz.is_finite() && fs_hz > 0.0;
         let has_non_finite_history = self
             .hist_left
             .iter()
@@ -952,6 +970,13 @@ impl Equalizer<10> {
                 self.set_enabled(true);
             }
         }
+        let mut mask = 0u16;
+        for (i, &g) in self.gains_db.iter().enumerate() {
+            if g.is_finite() && g.abs() > 1e-4 {
+                mask |= 1u16 << i;
+            }
+        }
+        self.active_mask = mask;
     }
 }
 

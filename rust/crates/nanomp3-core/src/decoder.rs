@@ -173,7 +173,7 @@ impl Decoder {
         mp3: &[u8],
         pcm: &mut [S],
     ) -> (usize, Result<FrameInfo, DecodeError>) {
-        assert!(pcm.len() >= MAX_SAMPLES_PER_FRAME, "pcm buffer too small");
+        debug_assert!(pcm.len() >= MAX_SAMPLES_PER_FRAME, "pcm buffer too small");
 
         let mut info = minimp3::FrameInfo::default();
         let samples = minimp3::mp3dec_decode_frame(

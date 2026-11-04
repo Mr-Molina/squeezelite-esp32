@@ -477,6 +477,14 @@ impl OakleyGroup1Dh {
     }
 }
 
+impl Drop for OakleyGroup1Dh {
+    fn drop(&mut self) {
+        self.private_key.fill(0);
+        core::hint::black_box(&mut self.private_key);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Pure-Rust SHA-1 message digest implementation.
 #[derive(Clone, Debug)]
 pub struct Sha1 {
@@ -719,20 +727,17 @@ fn rot_word(w: u32) -> u32 {
     w.rotate_left(8)
 }
 
-fn gmul(mut a: u8, mut b: u8) -> u8 {
-    let mut p = 0u8;
-    for _ in 0..8 {
-        if (b & 1) != 0 {
-            p ^= a;
-        }
-        let hi = (a & 0x80) != 0;
-        a <<= 1;
-        if hi {
-            a ^= 0x1b;
-        }
-        b >>= 1;
-    }
-    p
+#[inline(always)]
+const fn xtime(x: u8) -> u8 {
+    (x << 1) ^ (((x >> 7) & 1).wrapping_neg() & 0x1b)
+}
+
+#[inline(always)]
+const fn inv_mix_muls(x: u8) -> (u8, u8, u8, u8) {
+    let x2 = xtime(x);
+    let x4 = xtime(x2);
+    let x8 = xtime(x4);
+    (x8 ^ x, x8 ^ x2 ^ x, x8 ^ x4 ^ x, x8 ^ x4 ^ x2)
 }
 
 /// AES-128 CTR mode stream cipher.
@@ -815,10 +820,10 @@ impl Aes128Ctr {
                 let s2 = temp[4 * c + 2];
                 let s3 = temp[4 * c + 3];
 
-                state[4 * c] = gmul(2, s0) ^ gmul(3, s1) ^ s2 ^ s3;
-                state[4 * c + 1] = s0 ^ gmul(2, s1) ^ gmul(3, s2) ^ s3;
-                state[4 * c + 2] = s0 ^ s1 ^ gmul(2, s2) ^ gmul(3, s3);
-                state[4 * c + 3] = gmul(3, s0) ^ s1 ^ s2 ^ gmul(2, s3);
+                state[4 * c] = xtime(s0) ^ (xtime(s1) ^ s1) ^ s2 ^ s3;
+                state[4 * c + 1] = s0 ^ xtime(s1) ^ (xtime(s2) ^ s2) ^ s3;
+                state[4 * c + 2] = s0 ^ s1 ^ xtime(s2) ^ (xtime(s3) ^ s3);
+                state[4 * c + 3] = (xtime(s0) ^ s0) ^ s1 ^ s2 ^ xtime(s3);
             }
 
             // AddRoundKey
@@ -968,19 +973,15 @@ impl Aes192Ecb {
             }
 
             for c in 0..4 {
-                let s0 = temp[4 * c];
-                let s1 = temp[4 * c + 1];
-                let s2 = temp[4 * c + 2];
-                let s3 = temp[4 * c + 3];
+                let (s0_9, s0_11, s0_13, s0_14) = inv_mix_muls(temp[4 * c]);
+                let (s1_9, s1_11, s1_13, s1_14) = inv_mix_muls(temp[4 * c + 1]);
+                let (s2_9, s2_11, s2_13, s2_14) = inv_mix_muls(temp[4 * c + 2]);
+                let (s3_9, s3_11, s3_13, s3_14) = inv_mix_muls(temp[4 * c + 3]);
 
-                state[4 * c] = gmul(0x0e, s0) ^ gmul(0x0b, s1)
-                    ^ gmul(0x0d, s2) ^ gmul(0x09, s3);
-                state[4 * c + 1] = gmul(0x09, s0) ^ gmul(0x0e, s1)
-                    ^ gmul(0x0b, s2) ^ gmul(0x0d, s3);
-                state[4 * c + 2] = gmul(0x0d, s0) ^ gmul(0x09, s1)
-                    ^ gmul(0x0e, s2) ^ gmul(0x0b, s3);
-                state[4 * c + 3] = gmul(0x0b, s0) ^ gmul(0x0d, s1)
-                    ^ gmul(0x09, s2) ^ gmul(0x0e, s3);
+                state[4 * c] = s0_14 ^ s1_11 ^ s2_13 ^ s3_9;
+                state[4 * c + 1] = s0_9 ^ s1_14 ^ s2_11 ^ s3_13;
+                state[4 * c + 2] = s0_13 ^ s1_9 ^ s2_14 ^ s3_11;
+                state[4 * c + 3] = s0_11 ^ s1_13 ^ s2_9 ^ s3_14;
             }
         }
 

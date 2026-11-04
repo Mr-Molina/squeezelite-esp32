@@ -189,6 +189,51 @@ impl I2sPinConfig {
     }
 }
 
+/// Minimum internal DMA-capable SRAM floor required for stable DMA transfers.
+pub const MIN_INTERNAL_DMA_SRAM_BYTES: usize = 32 * 1024;
+
+/// Target memory requirements and verification budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    pub min_internal_sram_bytes: usize,
+    pub min_psram_bytes: usize,
+    pub requires_psram: bool,
+}
+
+impl MemoryBudget {
+    pub const fn new(
+        min_internal_sram_bytes: usize,
+        min_psram_bytes: usize,
+        requires_psram: bool,
+    ) -> Self {
+        Self {
+            min_internal_sram_bytes,
+            min_psram_bytes,
+            requires_psram,
+        }
+    }
+
+    /// Checks whether the available heap meets the budget requirements.
+    ///
+    /// Even when `self.requires_psram` is true, a minimum internal DMA-capable
+    /// SRAM floor (`MIN_INTERNAL_DMA_SRAM_BYTES`) is always verified.
+    #[must_use]
+    pub fn has_sufficient_heap(&self, free_internal: usize, free_psram: usize) -> bool {
+        if free_internal < self.min_internal_sram_bytes {
+            return false;
+        }
+        if self.requires_psram {
+            if free_internal < MIN_INTERNAL_DMA_SRAM_BYTES {
+                return false;
+            }
+            if free_psram < self.min_psram_bytes {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +267,18 @@ mod tests {
         assert_eq!(cfg.lms_server_ip, Some(first_boot_defaults::LMS_SERVER_IP));
         assert_eq!(cfg.lms_server_port, Some(first_boot_defaults::LMS_SERVER_PORT));
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_memory_budget_dma_sram_floor() {
+        let budget = MemoryBudget::new(16 * 1024, 2 * 1024 * 1024, true);
+        assert!(!budget.has_sufficient_heap(16 * 1024, 4 * 1024 * 1024));
+        assert!(budget.has_sufficient_heap(32 * 1024, 2 * 1024 * 1024));
+        assert!(!budget.has_sufficient_heap(32 * 1024, 1024 * 1024));
+
+        let non_psram = MemoryBudget::new(16 * 1024, 0, false);
+        assert!(non_psram.has_sufficient_heap(16 * 1024, 0));
+        assert!(!non_psram.has_sufficient_heap(8 * 1024, 0));
     }
 }
 

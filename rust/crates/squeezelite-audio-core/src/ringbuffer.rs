@@ -99,8 +99,19 @@ impl<'a> AudioRingBuffer<'a> {
     /// Returns the number of bytes free and available for writing.
     #[inline]
     pub fn available_write(&self) -> usize {
-        // Reserve 1 slot to distinguish between empty and full states (CONC-007)
-        self.capacity.saturating_sub(self.available_read() + 1)
+        let avail_read = self.available_read();
+        self.capacity.saturating_sub(avail_read + 1)
+    }
+
+    /// Returns the number of bytes free and available for writing aligned to
+    /// whole audio frames of size `frame_bytes`.
+    #[inline]
+    pub fn available_write_frames(&self, frame_bytes: usize) -> usize {
+        if frame_bytes == 0 {
+            0
+        } else {
+            (self.available_write() / frame_bytes) * frame_bytes
+        }
     }
 
     /// Writes data from `src` into the ringbuffer.
@@ -293,13 +304,18 @@ impl<'a> AudioRingBuffer<'a> {
     #[inline]
     #[allow(deprecated)]
     pub(crate) fn read_internal(&self, dst: &mut [u8]) -> Result<usize, RingBufferError> {
-        let avail = self.available_read();
+        let r = self.read_pos.load(Ordering::Relaxed);
+        let w = self.write_pos.load(Ordering::Acquire);
+        let avail = if w >= r {
+            w - r
+        } else {
+            self.capacity - (r - w)
+        };
         if avail == 0 {
             return Err(RingBufferError::BufferEmpty);
         }
 
         let to_read = core::cmp::min(dst.len(), avail);
-        let r = self.read_pos.load(Ordering::Relaxed);
 
         let data_to_end = self.capacity - r;
         if to_read <= data_to_end {
@@ -330,7 +346,10 @@ impl<'a> AudioRingBuffer<'a> {
 
         let new_r = (r + to_read) % self.capacity;
         self.read_pos.store(new_r, Ordering::Release);
-        let avail_w = self.available_write();
+        let avail_w = self
+            .capacity
+            .saturating_sub(avail.saturating_sub(to_read))
+            .saturating_sub(1);
         let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
             Some(cur.saturating_add(to_read).min(avail_w))
         });
@@ -370,7 +389,30 @@ impl<'a> AudioRingBuffer<'a> {
 
     #[inline]
     pub(crate) fn flush_internal(&self) {
+        let r = self.read_pos.load(Ordering::Relaxed);
         let w = self.write_pos.load(Ordering::Acquire);
+        let avail = if w >= r {
+            w - r
+        } else {
+            self.capacity - (r - w)
+        };
+        if avail > 0 {
+            let first = avail.min(self.capacity - r);
+            let second = avail - first;
+            // Wipe unread PCM audio window on flush (AUD02-002).
+            // JUSTIFICATION: Erases unread audio bytes before releasing them to
+            // the producer when the ringbuffer is flushed.
+            // SAFETY: `self.storage` is non-null and valid for `self.capacity`
+            // bytes during `'a`. `r + first <= self.capacity` and
+            // `second < self.capacity`, and the consumer owns the unread window
+            // prior to advancing `read_pos`.
+            unsafe {
+                core::ptr::write_bytes(self.storage.add(r), 0, first);
+                if second > 0 {
+                    core::ptr::write_bytes(self.storage, 0, second);
+                }
+            }
+        }
         self.read_pos.store(w, Ordering::Release);
         self.rewindable.store(0, Ordering::Release);
     }
@@ -398,6 +440,13 @@ impl<'ring, 'buf> Producer<'ring, 'buf> {
     #[inline]
     pub fn available_write(&self) -> usize {
         self.ring.available_write()
+    }
+
+    /// Returns the number of bytes free and available for writing aligned to
+    /// whole audio frames of size `frame_bytes`.
+    #[inline]
+    pub fn available_write_frames(&self, frame_bytes: usize) -> usize {
+        self.ring.available_write_frames(frame_bytes)
     }
 }
 
@@ -429,6 +478,11 @@ impl<'ring, 'buf> Consumer<'ring, 'buf> {
     #[inline]
     pub fn peek(&self, dst: &mut [u8]) -> usize {
         self.ring.peek(dst)
+    }
+
+    #[inline]
+    pub fn peek_at(&self, offset: usize, dst: &mut [u8]) -> usize {
+        self.ring.peek_at(offset, dst)
     }
 
     #[inline]

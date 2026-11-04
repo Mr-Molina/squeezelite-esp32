@@ -37,12 +37,12 @@ pub const READ_SCRATCH_BYTES: usize = 1728;
 #[cfg(feature = "std-codecs")]
 pub const WRITE_SCRATCH_BYTES: usize = 512;
 #[cfg(not(feature = "std-codecs"))]
-pub const WRITE_SCRATCH_BYTES: usize = 1024;
+pub const WRITE_SCRATCH_BYTES: usize = 2048;
 
 #[cfg(feature = "std-codecs")]
 pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 128;
 #[cfg(not(feature = "std-codecs"))]
-pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 256;
+pub const OUTPUT_I32_SCRATCH_SAMPLES: usize = 512;
 
 /// Stream ring of the firmware when PSRAM is mapped: 512 KiB (C `-b 500:2000`
 /// asks 500 KiB; C parity: main/Kconfig.projbuild:465).
@@ -524,8 +524,14 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             {
                 Ok(res) => res,
                 Err(DecoderError::NeedMoreData) => (0, 0),
-                Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
-                Err(e) => return Err(e),
+                Err(DecoderError::BufferOverflow) => {
+                    self.decoder.flush();
+                    return Err(DecoderError::BufferOverflow);
+                }
+                Err(e) => {
+                    self.decoder.flush();
+                    return Err(e);
+                }
             };
 
             if frames_produced > 0 {
@@ -712,6 +718,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                     }
                 }
                 if consumed == 0 && produced == 0 {
+                    if in_pos < in_end {
+                        let unconsumed = in_end - in_pos;
+                        self.pcm_scratch.copy_within(in_pos..in_end, 0);
+                        self.resample_input_pending = unconsumed;
+                    }
                     break;
                 }
             }
@@ -755,7 +766,6 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     /// ([`Self::prepare_fade`], [`Self::scale_chunk`]): a chunk never runs
     /// past a fade start or end either. Returns the frames written to the
     /// sink, including rate-change silence.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_output_step(&mut self) -> Result<usize, S::Error> {
         if self.boundary.silence_frames > 0 {
             return self.write_boundary_silence();
@@ -794,14 +804,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         // C parity: output.c:174-252, after the track start (output.c:126-166).
         let fade = self.prepare_fade();
         let bytes_avail = self.output_buffer.available_read();
-        let mut to_read = core::cmp::min(self.write_scratch.len(), bytes_avail);
+        let max_output_bytes = self.output_i32_scratch.len() * 4;
+        let mut to_read = core::cmp::min(max_output_bytes, bytes_avail);
         if let Some(marker) = self.boundary.marker {
-            // C parity: output.c:163-166, the chunk ends exactly on the track start.
+            // C parity: output.c:163-166, the chunk ends exactly on the track
+            // start.
             to_read = to_read.min(usize::try_from(marker.bytes_ahead).unwrap_or(usize::MAX));
         }
         if let Some(max_frames) = fade.max_frames {
-            // C parity: output.c:178-180, 212-214, the chunk ends exactly on the fade
-            // start/end.
+            // C parity: output.c:178-180, 212-214, the chunk ends exactly on
+            // the fade start/end.
             let max_bytes = usize::try_from(max_frames)
                 .unwrap_or(usize::MAX)
                 .saturating_mul(OUTPUT_FRAME_BYTES);
@@ -811,25 +823,18 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         if bytes_to_read == 0 {
             return Ok(0);
         }
+        let samples_to_read = bytes_to_read / 4;
 
-        // Non-destructive peek: frames remain in ringbuffer until sink write succeeds
-        // (LOGIC-603)
-        let bytes_read = self
-            .output_buffer
-            .peek(&mut self.write_scratch[..bytes_to_read]);
+        // Non-destructive peek: frames remain in ringbuffer until sink write
+        // succeeds (LOGIC-603).
+        let bytes_read = self.output_buffer.peek(bytemuck::cast_slice_mut(
+            &mut self.output_i32_scratch[..samples_to_read],
+        ));
         if bytes_read < OUTPUT_FRAME_BYTES {
             return Ok(0);
         }
 
         let frames_to_write = bytes_read / OUTPUT_FRAME_BYTES;
-        let samples_count = frames_to_write * 2;
-
-        for (chunk, sample) in self.write_scratch[..frames_to_write * OUTPUT_FRAME_BYTES]
-            .chunks_exact(4)
-            .zip(self.output_i32_scratch[..samples_count].iter_mut())
-        {
-            *sample = i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
 
         self.scale_chunk(frames_to_write, fade.gain);
 
@@ -839,7 +844,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         let written_frames = self
             .sink
             .write_frames(&self.output_i32_scratch[..frames_to_write * 2])?;
-        // ONLY consume the exact number of frames successfully committed to the sink
+        // ONLY consume the exact number of frames successfully committed to
+        // the sink.
         self.consume_output(written_frames);
         if written_frames > 0 {
             self.frames_played = self.frames_played.wrapping_add(written_frames as u64);
@@ -3563,5 +3569,26 @@ mod tests {
         // Staged remainder must be present in pcm_scratch as pending PCM
         assert!(p.pcm_pending_samples > 0);
         assert!(p.has_pending_pcm());
+    }
+
+    #[test]
+    fn test_process_output_step_peeks_directly_into_output_i32_scratch() {
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+        p.write_scratch.fill(0xAA);
+
+        let frames = [0x1122_3344_i32, -0x5566_7788_i32, 12_345_i32, -67_890_i32];
+        assert_eq!(
+            p.output_buffer.write(bytemuck::cast_slice(&frames)),
+            Ok(frames.len() * 4)
+        );
+
+        let written = p.process_output_step().expect("output step must succeed");
+        assert_eq!(written, 2);
+        assert_eq!(&p.sink.samples[..4], &frames[..]);
+        assert!(
+            p.write_scratch.iter().all(|&b| b == 0xAA),
+            "process_output_step must bypass write_scratch outside crossfade"
+        );
     }
 }

@@ -263,8 +263,12 @@ impl SdpSession {
             }
 
             if let Some(rest) = trimmed.strip_prefix("a=rsaaeskey:") {
+                let key_b64 = rest.trim();
+                if key_b64.len() > 512 {
+                    return Err(RtspError::MalformedSdp);
+                }
                 let decoded =
-                    base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
+                    base64_decode(key_b64).map_err(RtspError::Crypto)?;
                 session.rsaaeskey = Some(decoded);
             } else if let Some(rest) = trimmed.strip_prefix("a=aesiv:") {
                 let decoded =
@@ -388,7 +392,9 @@ impl RtspResponse {
         out.extend_from_slice(cseq_line.as_bytes());
 
         for (k, v) in &self.headers {
-            let header_line = format!("{}: {}\r\n", k, v);
+            let clean_v: String =
+                v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            let header_line = format!("{}: {}\r\n", k, clean_v);
             out.extend_from_slice(header_line.as_bytes());
         }
 
@@ -437,6 +443,7 @@ pub struct RtspServer {
     progress: Option<TrackProgress>,
     last_flush_seq: Option<u16>,
     last_flush_rtptime: Option<u32>,
+    torn_down: bool,
 }
 
 impl RtspServer {
@@ -468,6 +475,7 @@ impl RtspServer {
             progress: None,
             last_flush_seq: None,
             last_flush_rtptime: None,
+            torn_down: false,
         }
     }
 
@@ -688,6 +696,9 @@ impl RtspServer {
                 let trimmed = line.trim();
                 if let Some(val) = trimmed.strip_prefix("volume:") {
                     if let Ok(db) = val.trim().parse::<f32>() {
+                        if !db.is_finite() {
+                            continue;
+                        }
                         // -144.0 dB = mute (0.0), 0.0 dB = max (1.0)
                         if db <= -144.0 {
                             self.volume_linear = 0.0;
@@ -739,6 +750,7 @@ impl RtspServer {
 
                 self.sdp_session = Some(sdp);
                 self.state = ServerState::Announced;
+                self.torn_down = false;
                 Ok(RtspResponse::announce(req.cseq, auth_resp.as_deref()))
             }
             RtspMethod::Setup => {
@@ -746,6 +758,7 @@ impl RtspServer {
                     self.extract_client_ports(transport);
                 }
                 self.state = ServerState::Configured;
+                self.torn_down = false;
                 Ok(RtspResponse::setup(
                     req.cseq,
                     self.server_audio_port,
@@ -754,7 +767,7 @@ impl RtspServer {
                 ))
             }
             RtspMethod::Record => {
-                if self.state == ServerState::Announced {
+                if self.torn_down {
                     return Err(RtspError::InvalidSessionState);
                 }
                 if let Some(info) = req.rtp_info {
@@ -773,6 +786,7 @@ impl RtspServer {
                 self.handle_set_parameter(req)?;
                 Ok(RtspResponse::set_parameter(req.cseq))
             }
+            RtspMethod::GetParameter => Ok(RtspResponse::ok(req.cseq)),
             RtspMethod::Flush => {
                 if let Some(info) = req.rtp_info {
                     let (seq, rtptime) = parse_rtp_info(info);
@@ -787,6 +801,7 @@ impl RtspServer {
             }
             RtspMethod::Teardown => {
                 self.state = ServerState::Idle;
+                self.torn_down = true;
                 self.aes_session_key = None;
                 self.aes_iv = None;
                 self.sdp_session = None;
@@ -800,7 +815,29 @@ impl RtspServer {
                 Ok(RtspResponse::teardown(req.cseq))
             }
             RtspMethod::Unknown => Err(RtspError::UnknownMethod),
-            _ => Ok(RtspResponse::ok(req.cseq)),
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_record_rejected_after_teardown() {
+        let key = RsaPrivateKey::from_be_bytes(&[1], &[1]);
+        let mut server = RtspServer::new(key, [0; 6], [127, 0, 0, 1]);
+
+        let teardown_raw = b"TEARDOWN rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let teardown_req = RtspRequest::parse(teardown_raw).expect("parse teardown");
+        assert!(server.handle_request(&teardown_req).is_ok());
+
+        let record_raw = b"RECORD rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+        let record_req = RtspRequest::parse(record_raw).expect("parse record");
+        assert!(matches!(
+            server.handle_request(&record_req),
+            Err(RtspError::InvalidSessionState)
+        ));
+    }
+}
+

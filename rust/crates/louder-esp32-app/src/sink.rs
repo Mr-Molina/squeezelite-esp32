@@ -35,6 +35,8 @@ impl NullAudioSink {
 impl AudioOutputSink for NullAudioSink {
     type Error = OutputError;
 
+    /// Discards audio frames while recording written stereo frame count
+    /// (`frames.len() / 2`).
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
         let frame_count = frames.len() / 2;
         self.frames_written += frame_count;
@@ -90,6 +92,8 @@ impl SimulatedSink {
 impl AudioOutputSink for SimulatedSink {
     type Error = OutputError;
 
+    /// Buffers audio frames into the internal store while counting written
+    /// stereo frame pairs (`frames.len() / 2`).
     #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
         let mut stored_frames = 0;

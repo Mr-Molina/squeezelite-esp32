@@ -49,6 +49,7 @@ pub enum CydCommand {
     Next,
     Previous,
     SetVolume(u8),
+    VolumeStep { delta: i8 },
     QueryStatus,
 }
 
@@ -283,6 +284,13 @@ impl CydLinkProtocol {
                 out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
+            CydCommand::VolumeStep { delta } => {
+                out.extend_from_slice(b"CMD=VOL_STEP:").map_err(|_| LinkError::BufferOverflow)?;
+                let mut num_buf = [0u8; 5];
+                let s = format_i8(*delta, &mut num_buf);
+                out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
+                out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
+            }
         }
         Ok(())
     }
@@ -307,6 +315,20 @@ impl CydLinkProtocol {
                 let suffix = b"}\n";
                 let mut num_buf = [0u8; 3];
                 let digits = format_u8(*vol, &mut num_buf);
+                let total = prefix.len() + digits.len() + suffix.len();
+                if buf.len() < total {
+                    return Err(LinkError::BufferOverflow);
+                }
+                buf[..prefix.len()].copy_from_slice(prefix);
+                buf[prefix.len()..prefix.len() + digits.len()].copy_from_slice(digits);
+                buf[prefix.len() + digits.len()..total].copy_from_slice(suffix);
+                Ok(total)
+            }
+            CydCommand::VolumeStep { delta } => {
+                let prefix = b"{\"cmd\":\"vol_step\",\"delta\":";
+                let suffix = b"}\n";
+                let mut num_buf = [0u8; 5];
+                let digits = format_i8(*delta, &mut num_buf);
                 let total = prefix.len() + digits.len() + suffix.len();
                 if buf.len() < total {
                     return Err(LinkError::BufferOverflow);
@@ -343,6 +365,12 @@ impl CydLinkProtocol {
                         return Err(LinkError::ValueOutOfRange);
                     }
                     Ok(CydCommand::SetVolume(vol as u8))
+                }
+                other if other.starts_with(b"VOL_STEP:") || other.starts_with(b"VOL_STEP=") => {
+                    let s = core::str::from_utf8(&other[9..])
+                        .map_err(|_| LinkError::InvalidFrame)?;
+                    let delta = parse_i8(s).ok_or(LinkError::ValueOutOfRange)?;
+                    Ok(CydCommand::VolumeStep { delta })
                 }
                 _ => Err(LinkError::InvalidFrame),
             }

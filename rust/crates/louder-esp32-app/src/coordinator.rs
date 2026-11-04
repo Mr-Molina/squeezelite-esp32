@@ -163,6 +163,12 @@ impl SourceArbiter {
         self.active
     }
 
+    /// Returns the currently active audio source owning the output pipeline.
+    #[must_use]
+    pub const fn active(&self) -> AudioSource {
+        self.active
+    }
+
     /// Requests ownership of the audio output pipeline for `source`.
     ///
     /// - If `source` has priority `>= self.active`, `source` becomes active
@@ -671,7 +677,16 @@ impl PlayerCoordinator {
         self.buffer_threshold_bytes = 0;
         self.buffer_threshold_reported = true;
         self.output_underrun_reported = true;
-        self.external_playback = true;
+        if !matches!(
+            self.arbiter.active(),
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        ) {
+            let _ = self.arbiter.request_source(AudioSource::Bluetooth);
+        }
+        self.external_playback = matches!(
+            self.arbiter.active(),
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        );
         self.state = PlayerState::Playing;
     }
 
@@ -690,7 +705,17 @@ impl PlayerCoordinator {
     /// [`PlayerState::Stopped`] (or [`PlayerState::Playing`] if a suspended LMS
     /// stream is resumed).
     pub fn end_external_playback(&mut self) {
-        self.external_playback = false;
+        let active = self.arbiter.active();
+        if matches!(
+            active,
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        ) {
+            self.arbiter.release_source(active);
+        }
+        self.external_playback = matches!(
+            self.arbiter.active(),
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        );
         if self.arbiter.active_source() == AudioSource::SlimProto && self.stream == StreamLink::Open
         {
             self.state = PlayerState::Playing;
@@ -738,13 +763,22 @@ impl PlayerCoordinator {
     /// Requests audio output ownership for `source` according to the priority
     /// hierarchy (`AirPlay > Spotify > Bluetooth > SlimProto`).
     pub fn request_source(&mut self, source: AudioSource) -> bool {
-        self.arbiter.request_source(source)
+        let granted = self.arbiter.request_source(source);
+        self.external_playback = matches!(
+            self.arbiter.active(),
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        );
+        granted
     }
 
     /// Releases `source` and resumes the highest-priority suspended source (if
     /// any).
     pub fn release_source(&mut self, source: AudioSource) {
         self.arbiter.release_source(source);
+        self.external_playback = matches!(
+            self.arbiter.active(),
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        );
     }
 
     /// Sets the stream EOF indicator.
@@ -1814,6 +1848,15 @@ impl PlayerCoordinator {
             pipeline.clear_resampler();
             rate_hint
         };
+
+        if !self.arbiter.request_source(AudioSource::SlimProto) {
+            return Ok(());
+        }
+        self.external_playback = matches!(
+            self.arbiter.active(),
+            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
+        );
+
         // C slimproto.c:484-485: output.threshold and next_replay_gain for the new
         // track.
         pipeline.begin_stream(output_rate, p.replay_gain, p.output_threshold);
@@ -1842,7 +1885,6 @@ impl PlayerCoordinator {
         self.buffer_threshold_reported = false;
         self.stream_bytes_received = 0;
         self.lms_track = true;
-        let _ = self.arbiter.request_source(AudioSource::SlimProto);
         // A mute for an undecodable previous track ends with it.
         pipeline.user_muted = false;
 
@@ -2026,7 +2068,9 @@ impl PlayerCoordinator {
             }
             flushed
         };
-        self.arbiter.release_source(AudioSource::SlimProto);
+        if self.state != PlayerState::Paused {
+            self.arbiter.release_source(AudioSource::SlimProto);
+        }
         self.buffer_threshold_bytes = 0;
         self.close_stream(source);
         self.pending_track_started = false;
@@ -2395,6 +2439,7 @@ impl PlayerCoordinator {
             CydCommand::Play => {
                 self.state = PlayerState::Playing;
                 pipeline.sink.set_mute(false);
+                backend.set_mute(false);
                 Some(CydMessage::PlaybackState(PlayState::Playing))
             }
             CydCommand::Pause => {
@@ -2414,12 +2459,20 @@ impl PlayerCoordinator {
                 } else {
                     self.state = PlayerState::Playing;
                     pipeline.sink.set_mute(false);
+                    backend.set_mute(false);
                     Some(CydMessage::PlaybackState(PlayState::Playing))
                 }
             }
             CydCommand::SetVolume(vol) => {
                 // Through the single volume entry: the device policy applies and the balance
                 // LMS set is kept.
+                self.set_volume_percent(vol, backend, pipeline);
+                Some(CydMessage::Volume(vol))
+            }
+            CydCommand::VolumeStep { delta } => {
+                let (left, right) = pipeline.requested_volume_q16();
+                let current = lms_gain_to_hardware_volume_percent(left.max(right)) as i16;
+                let vol = (current + delta as i16).clamp(0, 100) as u8;
                 self.set_volume_percent(vol, backend, pipeline);
                 Some(CydMessage::Volume(vol))
             }

@@ -49,7 +49,16 @@ impl MdnsConfig {
 
     /// Fully qualified RAOP service instance name: `<MAC>@<NAME>._raop._tcp.local`.
     pub fn raop_instance_name(&self) -> String {
-        format!("{}@{}.{}", self.mac_hex(), self.player_name, "_raop._tcp.local")
+        let mut max_name = core::cmp::min(self.player_name.len(), 50);
+        while max_name > 0 && !self.player_name.is_char_boundary(max_name) {
+            max_name -= 1;
+        }
+        format!(
+            "{}@{}.{}",
+            self.mac_hex(),
+            &self.player_name[..max_name],
+            "_raop._tcp.local"
+        )
     }
 
     /// Fully qualified AirPlay service instance name: `<NAME>._airplay._tcp.local`.
@@ -203,6 +212,12 @@ impl MdnsBuilder {
     /// Builds a full mDNS announcement UDP response packet announcing RAOP
     /// and AirPlay services.
     pub fn build_announcement(config: &MdnsConfig) -> Vec<u8> {
+        let mut max_name = core::cmp::min(config.player_name.len(), 50);
+        while max_name > 0 && !config.player_name.is_char_boundary(max_name) {
+            max_name -= 1;
+        }
+        let _ = max_name;
+
         let mut answers = Vec::new();
         let ttl = 4500u32; // 75 minutes standard mDNS TTL
 

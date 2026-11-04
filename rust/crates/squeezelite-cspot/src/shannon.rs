@@ -41,35 +41,35 @@ impl Shannon {
         }
     }
 
+    #[inline(always)]
     fn sbox1(mut w: u32) -> u32 {
         w ^= w.rotate_left(5) | w.rotate_left(7);
         w ^= w.rotate_left(19) | w.rotate_left(22);
         w
     }
 
+    #[inline(always)]
     fn sbox2(mut w: u32) -> u32 {
         w ^= w.rotate_left(7) | w.rotate_left(22);
         w ^= w.rotate_left(5) | w.rotate_left(19);
         w
     }
 
+    #[inline(always)]
     fn cycle(&mut self) {
         let mut t = self.r[12] ^ self.r[13] ^ self.konst;
         t = Self::sbox1(t) ^ self.r[0].rotate_left(1);
-        for i in 1..SHANNON_N {
-            self.r[i - 1] = self.r[i];
-        }
+        self.r.copy_within(1..SHANNON_N, 0);
         self.r[SHANNON_N - 1] = t;
         let t2 = Self::sbox2(self.r[2] ^ self.r[15]);
         self.r[0] ^= t2;
         self.sbuf = t2 ^ self.r[8] ^ self.r[12];
     }
 
+    #[inline(always)]
     fn crcfunc(&mut self, i: u32) {
         let t = self.crc[0] ^ self.crc[2] ^ self.crc[15] ^ i;
-        for j in 1..SHANNON_N {
-            self.crc[j - 1] = self.crc[j];
-        }
+        self.crc.copy_within(1..SHANNON_N, 0);
         self.crc[SHANNON_N - 1] = t;
     }
 

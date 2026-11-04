@@ -528,13 +528,11 @@ fn lpc_predict(buf: &mut [i32], bps: u8, lpc_coefs: &mut [i16], lpc_quant: u32) 
         // prediction.
         let mean = buf[i - lpc_order - 1];
 
-        // The previous lpc_order samples are used to predict this sample.
-        let buf = &mut buf[i - lpc_order..i + 1];
-
-        // Predict the next sample using linear predictive coding.
+        // Predict the next sample using linear predictive coding from the previous lpc_order
+        // samples.
         let mut predicted = 0;
-        for (x, coef) in buf.iter().zip(lpc_coefs.iter()) {
-            predicted += (x - mean) * (*coef as i32);
+        for j in 0..lpc_order {
+            predicted += (buf[i - lpc_order + j] - mean) * (lpc_coefs[j] as i32);
         }
 
         // Round up to and then truncate by lpc_quant bits.
@@ -546,9 +544,9 @@ fn lpc_predict(buf: &mut [i32], bps: u8, lpc_coefs: &mut [i16], lpc_quant: u32) 
         };
 
         // Store the sample for output and to be used in the next prediction.
-        let prediction_error = buf[lpc_order];
+        let prediction_error = buf[i];
         let sample = predicted + mean + prediction_error;
-        buf[lpc_order] = sign_extend(sample, bps);
+        buf[i] = sign_extend(sample, bps);
 
         if prediction_error != 0 {
             // The prediction was not exact so adjust LPC coefficients to try to reduce the size
@@ -560,7 +558,7 @@ fn lpc_predict(buf: &mut [i32], bps: u8, lpc_coefs: &mut [i16], lpc_quant: u32) 
             let mut prediction_error = error_sign * prediction_error;
 
             for j in 0..lpc_order {
-                let predicted = buf[j] - mean;
+                let predicted = buf[i - lpc_order + j] - mean;
                 let sign = predicted.signum() * error_sign;
                 lpc_coefs[j] += sign as i16;
                 // Update the prediction error now we have changed a coefficient.

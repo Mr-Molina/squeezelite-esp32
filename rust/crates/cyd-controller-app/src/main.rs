@@ -23,7 +23,12 @@ use squeezelite_cyd_link::PlayState;
 
 #[cfg(target_arch = "xtensa")]
 mod xtensa_hw {
-    use super::*;
+    use super::{
+        CYD_TFT_BL, CYD_TFT_CS, CYD_TFT_DC, CYD_TFT_MISO, CYD_TFT_MOSI, CYD_TFT_RST,
+        CYD_TFT_SCLK, CYD_TOUCH_CS, CYD_TOUCH_IRQ, CYD_TOUCH_MISO, CYD_TOUCH_MOSI,
+        CYD_TOUCH_SCLK, CYD_UART_BAUD, CYD_UART_RX_PIN, CYD_UART_TX_PIN, CydDisplayLink,
+        Ili9341Display, NowPlayingUi, PlayState, Xpt2046Touch,
+    };
     use cyd_controller_app::drivers::{SpiDisplayBus, TouchSpiBus};
     use embedded_hal::spi::SpiBus;
     use esp_backtrace as _;
@@ -201,7 +206,7 @@ mod xtensa_hw {
                 .with_frequency(Rate::from_mhz(40))
                 .with_mode(Mode::_0),
         )
-        .expect("Failed to init SPI2")
+        .unwrap_or_else(|_| esp_hal::system::software_reset())
         .with_sck(peripherals.GPIO14)
         .with_mosi(peripherals.GPIO13)
         .with_miso(peripherals.GPIO12);
@@ -237,7 +242,7 @@ mod xtensa_hw {
         );
         let uart2_cfg = esp_hal::uart::Config::default().with_baudrate(CYD_UART_BAUD);
         let mut uart2 = esp_hal::uart::Uart::new(peripherals.UART2, uart2_cfg)
-            .expect("Failed to init UART2")
+            .unwrap_or_else(|_| esp_hal::system::software_reset())
             .with_tx(peripherals.GPIO27)
             .with_rx(uart2_rx_pin);
         delay_ms(20);
@@ -581,7 +586,7 @@ fn main() {
     // 4. Transmit Initial Status Query
     let status_frame = link
         .send_command(CydCommand::QueryStatus)
-        .expect("Failed to encode status command");
+        .unwrap_or_default();
 
     println!("CYD Initialization Status:");
     println!("  - Display Initialized: {}", display.is_initialized());
