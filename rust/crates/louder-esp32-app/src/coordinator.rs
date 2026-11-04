@@ -408,7 +408,7 @@ pub struct PlayerCoordinator {
     /// The decoder failed on the current track (C `DECODE_ERROR`).
     decode_failed: bool,
     /// Another source (Bluetooth) feeds the pipeline: no LMS output logic runs.
-    external_playback: bool,
+    pub external_playback: bool,
     /// A `strm s` track is loaded (cleared by `strm q` and external playback).
     /// Without one (e.g. a CYD Play with nothing streamed) no LMS
     /// end-of-track event is reported.

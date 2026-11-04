@@ -1731,6 +1731,10 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).resampler).write(None);
             core::ptr::addr_of_mut!((*ptr).output_threshold_frames).write(4_096);
             core::ptr::addr_of_mut!((*ptr).threshold_satisfied).write(false);
+            core::ptr::addr_of_mut!((*ptr).resample_tail).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*ptr).resample_tail_offset).write(0);
+            core::ptr::addr_of_mut!((*ptr).resample_tail_samples).write(0);
+            core::ptr::addr_of_mut!((*ptr).resample_input_pending).write(0);
 
             let http_resp_buf: &'static mut [u8; 1536] =
                 alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 1536]));
@@ -3077,7 +3081,9 @@ mod xtensa_hw {
         let dhcp_event = s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp_handle).poll();
         match dhcp_event {
             Some(dhcpv4::Event::Configured(config)) => {
-                let ip_octets = config.address.address().octets();
+                let cfg_address = config.address;
+                let cfg_router = config.router;
+                let ip_octets = cfg_address.address().octets();
                 let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
@@ -3100,20 +3106,20 @@ mod xtensa_hw {
                 let _ = s
                     .smol_iface
                     .join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
-                let prefix_len = config.address.prefix_len();
+                let prefix_len = cfg_address.prefix_len();
                 let mask_u32 = if prefix_len == 0 {
                     0
                 } else {
                     !0u32 << (32 - prefix_len)
                 };
                 s.assigned_mask = mask_u32.to_be_bytes();
-                if let Some(router) = config.router {
+                if let Some(router) = cfg_router {
                     s.assigned_gw = router.octets();
                     let _ = s.smol_iface.routes_mut().add_default_ipv4_route(router);
                 }
                 s.smol_iface.update_ip_addrs(|addrs| {
                     addrs.clear();
-                    let _ = addrs.push(IpCidr::Ipv4(config.address));
+                    let _ = addrs.push(IpCidr::Ipv4(cfg_address));
                 });
                 println!(
                     "[DHCPv4] Acquired IP {}.{}.{}.{}/{}",

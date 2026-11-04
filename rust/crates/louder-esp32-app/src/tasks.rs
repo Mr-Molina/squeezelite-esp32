@@ -308,7 +308,7 @@ mod device {
         TcpPhase, TcpSocketOps,
     };
     use louder_esp32_app::ota_safety::{
-        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET,
+        OtaSelectEntry, WifiStaCredentials,
         OTADATA_PARTITION_OFFSET as OTADATA_SECTOR_0_OFFSET, SETTINGS_JOURNAL_OFFSET,
     };
     use louder_esp32_app::pipeline::ActiveDecoder;
@@ -984,10 +984,20 @@ mod device {
         }
 
         // Process DHCPv4 events
-        let dhcp_event = s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp_handle).poll();
-        match dhcp_event {
+        let dhcp_event = match s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp_handle).poll() {
             Some(dhcpv4::Event::Configured(config)) => {
-                let ip_octets = config.address.address().octets();
+                let addr = config.address.address();
+                let prefix_len = config.address.prefix_len();
+                let router = config.router;
+                let cidr = config.address;
+                Some(Ok((addr, prefix_len, router, cidr)))
+            }
+            Some(dhcpv4::Event::Deconfigured) => Some(Err(())),
+            None => None,
+        };
+        match dhcp_event {
+            Some(Ok((addr, prefix_len, router, cidr))) => {
+                let ip_octets = addr.octets();
                 let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
@@ -998,27 +1008,26 @@ mod device {
                     s.pending_http_closing = false;
                 }
                 s.assigned_ip = Some(ip_octets);
-                let prefix_len = config.address.prefix_len();
                 let mask_u32 = if prefix_len == 0 {
                     0
                 } else {
                     !0u32 << (32 - prefix_len)
                 };
                 s.assigned_mask = mask_u32.to_be_bytes();
-                if let Some(router) = config.router {
+                if let Some(router) = router {
                     s.assigned_gw = router.octets();
                     let _ = s.smol_iface.routes_mut().add_default_ipv4_route(router);
                 }
                 s.smol_iface.update_ip_addrs(|addrs| {
                     addrs.clear();
-                    let _ = addrs.push(IpCidr::Ipv4(config.address));
+                    let _ = addrs.push(IpCidr::Ipv4(cidr));
                 });
                 println!(
                     "[DHCPv4] Acquired IP {}.{}.{}.{}/{}",
                     ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3], prefix_len
                 );
             }
-            Some(dhcpv4::Event::Deconfigured) => {
+            Some(Err(())) => {
                 // Every connection is gone with the address; the coordinator sees the audio
                 // stream fail on its next poll.
                 s.assigned_ip = None;
