@@ -92,11 +92,7 @@ pub enum SpiAccessMode {
 /// in Variable Data Length Mode (`OM = 0b00`).
 #[inline(always)]
 #[must_use]
-pub const fn encode_spi_header(
-    offset: u16,
-    block_select: u8,
-    mode: SpiAccessMode,
-) -> [u8; 3] {
+pub const fn encode_spi_header(offset: u16, block_select: u8, mode: SpiAccessMode) -> [u8; 3] {
     let rwb_bit = match mode {
         SpiAccessMode::Read => 0u8,
         SpiAccessMode::Write => 1u8 << 2,
@@ -264,11 +260,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
     }
 
     #[inline(always)]
-    fn read_u8(
-        &mut self,
-        offset: u16,
-        block_select: u8,
-    ) -> Result<u8, W5500Error<SPI::Error>> {
+    fn read_u8(&mut self, offset: u16, block_select: u8) -> Result<u8, W5500Error<SPI::Error>> {
         let mut buf = [0u8; 1];
         self.read_block(offset, block_select, &mut buf)?;
         Ok(buf[0])
@@ -394,10 +386,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
     /// Reads the next complete Ethernet frame from Socket 0's `MACRAW` RX
     /// buffer into `out_frame`, returning the frame length in bytes (`0` if
     /// no frame is waiting).
-    pub fn read_frame(
-        &mut self,
-        out_frame: &mut [u8],
-    ) -> Result<usize, W5500Error<SPI::Error>> {
+    pub fn read_frame(&mut self, out_frame: &mut [u8]) -> Result<usize, W5500Error<SPI::Error>> {
         let rsr = self.rx_available()?;
         if rsr < 2 {
             return Ok(0);
@@ -456,10 +445,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
     }
 
     /// Receives a UDP or raw frame, un-wedging the RX ring buffer even on errors.
-    pub fn recv_udp_frame(
-        &mut self,
-        buf: &mut [u8],
-    ) -> Result<usize, W5500Error<SPI::Error>> {
+    pub fn recv_udp_frame(&mut self, buf: &mut [u8]) -> Result<usize, W5500Error<SPI::Error>> {
         self.read_frame(buf)
     }
 

@@ -91,10 +91,7 @@ impl CydLinkProtocol {
 
     /// Encodes a telemetry message into a delimited frame (`\n` terminated).
     /// Sanitizes metadata strings to prevent delimiter injection.
-    pub fn encode_message(
-        msg: &CydMessage,
-        out: &mut Vec<u8, 256>,
-    ) -> Result<(), LinkError> {
+    pub fn encode_message(msg: &CydMessage, out: &mut Vec<u8, 256>) -> Result<(), LinkError> {
         out.clear();
         match msg {
             CydMessage::PlaybackState(state) => {
@@ -103,22 +100,30 @@ impl CydLinkProtocol {
                     PlayState::Paused => b'A',
                     PlayState::Stopped => b'S',
                 };
-                out.extend_from_slice(b"STATE=").map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(b"STATE=")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(code).map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
             CydMessage::Volume(vol) => {
-                out.extend_from_slice(b"VOL=").map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(b"VOL=")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 3];
                 let s = format_u8(*vol, &mut num_buf);
-                out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(s)
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
             CydMessage::TrackMetadata { artist, title } => {
-                out.extend_from_slice(b"META=").map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(b"META=")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 // Sanitize delimiters (\r, \n, ;) to prevent delimiter injection (CYD-001)
                 for &b in artist.as_bytes() {
-                    let c = if b == b'\n' || b == b'\r' || b == b';' { b' ' } else { b };
+                    let c = if b == b'\n' || b == b'\r' || b == b';' {
+                        b' '
+                    } else {
+                        b
+                    };
                     out.push(c).map_err(|_| LinkError::BufferOverflow)?;
                 }
                 out.push(b';').map_err(|_| LinkError::BufferOverflow)?;
@@ -129,25 +134,33 @@ impl CydLinkProtocol {
                 }
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
-            CydMessage::Progress { elapsed_secs, duration_secs } => {
-                out.extend_from_slice(b"TIME=").map_err(|_| LinkError::BufferOverflow)?;
+            CydMessage::Progress {
+                elapsed_secs,
+                duration_secs,
+            } => {
+                out.extend_from_slice(b"TIME=")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 10];
                 let s1 = format_u32(*elapsed_secs, &mut num_buf);
-                out.extend_from_slice(s1).map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(s1)
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'/').map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf2 = [0u8; 10];
                 let s2 = format_u32(*duration_secs, &mut num_buf2);
-                out.extend_from_slice(s2).map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(s2)
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
             CydMessage::WifiStatus { connected, rssi } => {
-                out.extend_from_slice(b"WIFI=").map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(b"WIFI=")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 let conn_byte = if *connected { b'1' } else { b'0' };
                 out.push(conn_byte).map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b';').map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 5];
                 let s = format_i8(*rssi, &mut num_buf);
-                out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(s)
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
         }
@@ -197,28 +210,35 @@ impl CydLinkProtocol {
             let mut parts = rest.splitn(2, |&b| b == b';');
             let artist_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
             let title_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
-            let artist_str = core::str::from_utf8(artist_bytes)
-                .map_err(|_| LinkError::InvalidFrame)?;
-            let title_str = core::str::from_utf8(title_bytes)
-                .map_err(|_| LinkError::InvalidFrame)?;
+            let artist_str =
+                core::str::from_utf8(artist_bytes).map_err(|_| LinkError::InvalidFrame)?;
+            let title_str =
+                core::str::from_utf8(title_bytes).map_err(|_| LinkError::InvalidFrame)?;
             let artist_trunc = truncate_utf8(artist_str, 64);
             let title_trunc = truncate_utf8(title_str, 64);
             let mut artist = String::new();
-            artist.push_str(artist_trunc).map_err(|_| LinkError::BufferOverflow)?;
+            artist
+                .push_str(artist_trunc)
+                .map_err(|_| LinkError::BufferOverflow)?;
             let mut title = String::new();
-            title.push_str(title_trunc).map_err(|_| LinkError::BufferOverflow)?;
+            title
+                .push_str(title_trunc)
+                .map_err(|_| LinkError::BufferOverflow)?;
             Ok(CydMessage::TrackMetadata { artist, title })
         } else if let Some(rest) = trimmed.strip_prefix(b"TIME=") {
             let mut parts = rest.splitn(2, |&b| b == b'/');
             let elapsed_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
             let duration_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
-            let elapsed_str = core::str::from_utf8(elapsed_bytes)
-                .map_err(|_| LinkError::InvalidFrame)?;
-            let duration_str = core::str::from_utf8(duration_bytes)
-                .map_err(|_| LinkError::InvalidFrame)?;
+            let elapsed_str =
+                core::str::from_utf8(elapsed_bytes).map_err(|_| LinkError::InvalidFrame)?;
+            let duration_str =
+                core::str::from_utf8(duration_bytes).map_err(|_| LinkError::InvalidFrame)?;
             let elapsed: u32 = parse_u32(elapsed_str).ok_or(LinkError::InvalidFrame)?;
             let duration: u32 = parse_u32(duration_str).ok_or(LinkError::InvalidFrame)?;
-            Ok(CydMessage::Progress { elapsed_secs: elapsed, duration_secs: duration })
+            Ok(CydMessage::Progress {
+                elapsed_secs: elapsed,
+                duration_secs: duration,
+            })
         } else if let Some(rest) = trimmed.strip_prefix(b"WIFI=") {
             let mut parts = rest.splitn(2, |&b| b == b';');
             let conn_bytes = parts.next().ok_or(LinkError::InvalidFrame)?;
@@ -244,51 +264,46 @@ impl CydLinkProtocol {
     }
 
     /// Encodes an interactive touch command into a delimited frame (`\n`).
-    pub fn encode_command(
-        cmd: &CydCommand,
-        out: &mut Vec<u8, 64>,
-    ) -> Result<(), LinkError> {
+    pub fn encode_command(cmd: &CydCommand, out: &mut Vec<u8, 64>) -> Result<(), LinkError> {
         out.clear();
         match cmd {
-            CydCommand::Play => {
-                out.extend_from_slice(b"CMD=PLAY\n")
-                    .map_err(|_| LinkError::BufferOverflow)?
-            }
-            CydCommand::Pause => {
-                out.extend_from_slice(b"CMD=PAUSE\n")
-                    .map_err(|_| LinkError::BufferOverflow)?
-            }
-            CydCommand::Toggle => {
-                out.extend_from_slice(b"CMD=TOGGLE\n")
-                    .map_err(|_| LinkError::BufferOverflow)?
-            }
-            CydCommand::Next => {
-                out.extend_from_slice(b"CMD=NEXT\n")
-                    .map_err(|_| LinkError::BufferOverflow)?
-            }
-            CydCommand::Previous => {
-                out.extend_from_slice(b"CMD=PREV\n")
-                    .map_err(|_| LinkError::BufferOverflow)?
-            }
-            CydCommand::QueryStatus => {
-                out.extend_from_slice(b"CMD=STATUS\n")
-                    .map_err(|_| LinkError::BufferOverflow)?
-            }
+            CydCommand::Play => out
+                .extend_from_slice(b"CMD=PLAY\n")
+                .map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Pause => out
+                .extend_from_slice(b"CMD=PAUSE\n")
+                .map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Toggle => out
+                .extend_from_slice(b"CMD=TOGGLE\n")
+                .map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Next => out
+                .extend_from_slice(b"CMD=NEXT\n")
+                .map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::Previous => out
+                .extend_from_slice(b"CMD=PREV\n")
+                .map_err(|_| LinkError::BufferOverflow)?,
+            CydCommand::QueryStatus => out
+                .extend_from_slice(b"CMD=STATUS\n")
+                .map_err(|_| LinkError::BufferOverflow)?,
             CydCommand::SetVolume(vol) => {
                 if *vol > 100 {
                     return Err(LinkError::ValueOutOfRange);
                 }
-                out.extend_from_slice(b"CMD=VOL:").map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(b"CMD=VOL:")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 3];
                 let s = format_u8(*vol, &mut num_buf);
-                out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(s)
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
             CydCommand::VolumeStep { delta } => {
-                out.extend_from_slice(b"CMD=VOL_STEP:").map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(b"CMD=VOL_STEP:")
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 let mut num_buf = [0u8; 5];
                 let s = format_i8(*delta, &mut num_buf);
-                out.extend_from_slice(s).map_err(|_| LinkError::BufferOverflow)?;
+                out.extend_from_slice(s)
+                    .map_err(|_| LinkError::BufferOverflow)?;
                 out.push(b'\n').map_err(|_| LinkError::BufferOverflow)?;
             }
         }
@@ -296,10 +311,7 @@ impl CydLinkProtocol {
     }
 
     /// Encodes an interactive touch command into NDJSON (`\n` terminated).
-    pub fn encode_json_command(
-        cmd: &CydCommand,
-        buf: &mut [u8],
-    ) -> Result<usize, LinkError> {
+    pub fn encode_json_command(cmd: &CydCommand, buf: &mut [u8]) -> Result<usize, LinkError> {
         match cmd {
             CydCommand::Toggle => copy_slice(b"{\"cmd\":\"toggle\"}\n", buf),
             CydCommand::Play => copy_slice(b"{\"cmd\":\"play\"}\n", buf),
@@ -356,7 +368,8 @@ impl CydLinkProtocol {
                 b"PREV" => Ok(CydCommand::Previous),
                 b"STATUS" => Ok(CydCommand::QueryStatus),
                 other if other.starts_with(b"VOL:") || other.starts_with(b"VOL=") => {
-                    let s = core::str::from_utf8(&other[4..]).map_err(|_| LinkError::InvalidFrame)?;
+                    let s =
+                        core::str::from_utf8(&other[4..]).map_err(|_| LinkError::InvalidFrame)?;
                     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(LinkError::InvalidFrame);
                     }
@@ -367,8 +380,8 @@ impl CydLinkProtocol {
                     Ok(CydCommand::SetVolume(vol as u8))
                 }
                 other if other.starts_with(b"VOL_STEP:") || other.starts_with(b"VOL_STEP=") => {
-                    let s = core::str::from_utf8(&other[9..])
-                        .map_err(|_| LinkError::InvalidFrame)?;
+                    let s =
+                        core::str::from_utf8(&other[9..]).map_err(|_| LinkError::InvalidFrame)?;
                     let delta = parse_i8(s).ok_or(LinkError::ValueOutOfRange)?;
                     Ok(CydCommand::VolumeStep { delta })
                 }
@@ -647,10 +660,8 @@ fn parse_json_message(json: &str) -> Result<CydMessage, LinkError> {
             let has_wifi = find_json_field(json, "wifi").is_some();
 
             // Compound telemetry frames cannot map to a single CydMessage variant
-            let field_types = (has_state as u8)
-                + (has_vol as u8)
-                + (has_progress as u8)
-                + (has_wifi as u8);
+            let field_types =
+                (has_state as u8) + (has_vol as u8) + (has_progress as u8) + (has_wifi as u8);
             if field_types != 1 {
                 return Err(LinkError::InvalidFrame);
             }
@@ -731,7 +742,10 @@ mod tests {
         assert_eq!(parsed, CydMessage::PlaybackState(PlayState::Playing));
 
         // Exact match test: STATE=PAUSE must NOT parse as Playing
-        assert_eq!(CydLinkProtocol::parse_line(b"STATE=PAUSE\n"), Err(LinkError::InvalidFrame));
+        assert_eq!(
+            CydLinkProtocol::parse_line(b"STATE=PAUSE\n"),
+            Err(LinkError::InvalidFrame)
+        );
     }
 
     #[test]
@@ -816,9 +830,15 @@ mod tests {
 
         CydLinkProtocol::encode_command(&CydCommand::Play, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=PLAY\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Play);
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::Play
+        );
         // CRLF tolerance test
-        assert_eq!(CydLinkProtocol::parse_command(b"CMD=PLAY\r\n").unwrap(), CydCommand::Play);
+        assert_eq!(
+            CydLinkProtocol::parse_command(b"CMD=PLAY\r\n").unwrap(),
+            CydCommand::Play
+        );
         assert_eq!(
             CydLinkProtocol::parse_command(b"CMD=VOL:80\r\n").unwrap(),
             CydCommand::SetVolume(80)
@@ -834,23 +854,38 @@ mod tests {
 
         CydLinkProtocol::encode_command(&CydCommand::Pause, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=PAUSE\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Pause);
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::Pause
+        );
 
         CydLinkProtocol::encode_command(&CydCommand::Toggle, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=TOGGLE\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Toggle);
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::Toggle
+        );
 
         CydLinkProtocol::encode_command(&CydCommand::Next, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=NEXT\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Next);
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::Next
+        );
 
         CydLinkProtocol::encode_command(&CydCommand::Previous, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=PREV\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::Previous);
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::Previous
+        );
 
         CydLinkProtocol::encode_command(&CydCommand::SetVolume(75), &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=VOL:75\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::SetVolume(75));
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::SetVolume(75)
+        );
 
         // Volume out of range (>100) validations
         assert_eq!(
@@ -872,7 +907,10 @@ mod tests {
 
         CydLinkProtocol::encode_command(&CydCommand::QueryStatus, &mut buf).unwrap();
         assert_eq!(&buf[..], b"CMD=STATUS\n");
-        assert_eq!(CydLinkProtocol::parse_command(&buf).unwrap(), CydCommand::QueryStatus);
+        assert_eq!(
+            CydLinkProtocol::parse_command(&buf).unwrap(),
+            CydCommand::QueryStatus
+        );
     }
 
     #[test]
@@ -895,7 +933,10 @@ mod tests {
 
         let parsed = CydLinkProtocol::parse_line(&buf).unwrap();
         match parsed {
-            CydMessage::TrackMetadata { artist: a, title: t } => {
+            CydMessage::TrackMetadata {
+                artist: a,
+                title: t,
+            } => {
                 assert_eq!(a.as_str(), "AC DC Injected");
                 assert_eq!(t.as_str(), "Track; Part 2 CMD=VOL:100");
             }
@@ -934,11 +975,17 @@ mod tests {
     #[test]
     fn test_progress_and_wifi_roundtrip() {
         let mut buf = Vec::new();
-        let p_msg = CydMessage::Progress { elapsed_secs: 125, duration_secs: 300 };
+        let p_msg = CydMessage::Progress {
+            elapsed_secs: 125,
+            duration_secs: 300,
+        };
         CydLinkProtocol::encode_message(&p_msg, &mut buf).unwrap();
         assert_eq!(CydLinkProtocol::parse_line(&buf).unwrap(), p_msg);
 
-        let w_msg = CydMessage::WifiStatus { connected: true, rssi: -65 };
+        let w_msg = CydMessage::WifiStatus {
+            connected: true,
+            rssi: -65,
+        };
         CydLinkProtocol::encode_message(&w_msg, &mut buf).unwrap();
         assert_eq!(CydLinkProtocol::parse_line(&buf).unwrap(), w_msg);
     }
@@ -1024,10 +1071,7 @@ mod tests {
             "{\"title\":\"Song with \\\"cmd\\\": \\\"pause\\\" in title\",",
             "\"cmd\":\"play\"}\n"
         );
-        assert_eq!(
-            CydLinkProtocol::parse_command(tricky),
-            Ok(CydCommand::Play)
-        );
+        assert_eq!(CydLinkProtocol::parse_command(tricky), Ok(CydCommand::Play));
 
         // Encode NDJSON commands and roundtrip
         let mut raw = [0u8; 64];
@@ -1038,7 +1082,10 @@ mod tests {
             (CydCommand::Next, &b"{\"cmd\":\"next\"}\n"[..]),
             (CydCommand::Previous, &b"{\"cmd\":\"prev\"}\n"[..]),
             (CydCommand::QueryStatus, &b"{\"cmd\":\"sync\"}\n"[..]),
-            (CydCommand::SetVolume(80), &b"{\"cmd\":\"vol\",\"val\":80}\n"[..]),
+            (
+                CydCommand::SetVolume(80),
+                &b"{\"cmd\":\"vol\",\"val\":80}\n"[..],
+            ),
         ];
         for (cmd, expected) in cases {
             let n = CydLinkProtocol::encode_json_command(&cmd, &mut raw).unwrap();

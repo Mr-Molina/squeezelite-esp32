@@ -157,20 +157,17 @@ impl<'a> RtspRequest<'a> {
             .position(|w| w == b"\r\n\r\n")
             .ok_or(RtspError::MalformedHeader)?;
 
-        let header_str = core::str::from_utf8(&buffer[..sep])
-            .map_err(|_| RtspError::MalformedHeader)?;
+        let header_str =
+            core::str::from_utf8(&buffer[..sep]).map_err(|_| RtspError::MalformedHeader)?;
         let body = &buffer[sep + 4..];
 
         let mut lines = header_str.lines();
-        let request_line =
-            lines.next().ok_or(RtspError::MalformedRequestLine)?;
+        let request_line = lines.next().ok_or(RtspError::MalformedRequestLine)?;
 
         let mut req_parts = request_line.split_whitespace();
-        let method_str =
-            req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
+        let method_str = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
         let uri = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
-        let version =
-            req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
+        let version = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
 
         if !version.starts_with("RTSP/1.") {
             return Err(RtspError::MalformedRequestLine);
@@ -192,8 +189,7 @@ impl<'a> RtspRequest<'a> {
             if trimmed.is_empty() {
                 continue;
             }
-            let colon_idx =
-                trimmed.find(':').ok_or(RtspError::MalformedHeader)?;
+            let colon_idx = trimmed.find(':').ok_or(RtspError::MalformedHeader)?;
             let key = trimmed[..colon_idx].trim();
             let value = trimmed[colon_idx + 1..].trim();
 
@@ -267,12 +263,10 @@ impl SdpSession {
                 if key_b64.len() > 512 {
                     return Err(RtspError::MalformedSdp);
                 }
-                let decoded =
-                    base64_decode(key_b64).map_err(RtspError::Crypto)?;
+                let decoded = base64_decode(key_b64).map_err(RtspError::Crypto)?;
                 session.rsaaeskey = Some(decoded);
             } else if let Some(rest) = trimmed.strip_prefix("a=aesiv:") {
-                let decoded =
-                    base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
+                let decoded = base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
                 if decoded.len() != 16 {
                     return Err(RtspError::MalformedSdp);
                 }
@@ -338,12 +332,7 @@ impl RtspResponse {
     }
 
     /// Builds standard SETUP response with ports and session ID.
-    pub fn setup(
-        cseq: u32,
-        server_port: u16,
-        control_port: u16,
-        timing_port: u16,
-    ) -> Self {
+    pub fn setup(cseq: u32, server_port: u16, control_port: u16, timing_port: u16) -> Self {
         let mut resp = Self::ok(cseq);
         let transport = format!(
             "RTP/AVP/UDP;unicast;mode=record;\
@@ -384,16 +373,14 @@ impl RtspResponse {
     /// Serializes response to standard RTSP 1.0 byte stream.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let status_line =
-            format!("RTSP/1.0 {} {}\r\n", self.status_code, self.status_text);
+        let status_line = format!("RTSP/1.0 {} {}\r\n", self.status_code, self.status_text);
         out.extend_from_slice(status_line.as_bytes());
 
         let cseq_line = format!("CSeq: {}\r\n", self.cseq);
         out.extend_from_slice(cseq_line.as_bytes());
 
         for (k, v) in &self.headers {
-            let clean_v: String =
-                v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            let clean_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
             let header_line = format!("{}: {}\r\n", k, clean_v);
             out.extend_from_slice(header_line.as_bytes());
         }
@@ -448,11 +435,7 @@ pub struct RtspServer {
 
 impl RtspServer {
     /// Creates a new RTSP server state engine.
-    pub fn new(
-        rsa_key: RsaPrivateKey,
-        mac_address: [u8; 6],
-        ip_address: [u8; 4],
-    ) -> Self {
+    pub fn new(rsa_key: RsaPrivateKey, mac_address: [u8; 6], ip_address: [u8; 4]) -> Self {
         Self {
             state: ServerState::Idle,
             rsa_key,
@@ -641,12 +624,8 @@ impl RtspServer {
     }
 
     /// Generates Apple-Response from Apple-Challenge header value.
-    fn generate_apple_response(
-        &self,
-        challenge_b64: &str,
-    ) -> Result<String, RtspError> {
-        let raw_chal =
-            base64_decode(challenge_b64).map_err(RtspError::Crypto)?;
+    fn generate_apple_response(&self, challenge_b64: &str) -> Result<String, RtspError> {
+        let raw_chal = base64_decode(challenge_b64).map_err(RtspError::Crypto)?;
         let mut buf = [0u8; 32];
         let copy_len = core::cmp::min(raw_chal.len(), 16);
         buf[..copy_len].copy_from_slice(&raw_chal[..copy_len]);
@@ -666,10 +645,7 @@ impl RtspServer {
         Ok(trimmed_b64)
     }
 
-    fn handle_set_parameter(
-        &mut self,
-        req: &RtspRequest<'_>,
-    ) -> Result<(), RtspError> {
+    fn handle_set_parameter(&mut self, req: &RtspRequest<'_>) -> Result<(), RtspError> {
         let is_dmap = req.content_type.is_some_and(|ct| {
             let media = ct.split(';').next().unwrap_or(ct).trim();
             media.eq_ignore_ascii_case("application/x-dmap-tagged")
@@ -681,13 +657,17 @@ impl RtspServer {
             return Ok(());
         }
 
-        if let Some(mime) =
-            req.content_type.and_then(ArtworkMimeType::from_content_type)
+        if let Some(mime) = req
+            .content_type
+            .and_then(ArtworkMimeType::from_content_type)
         {
             let rtp_ts = req.rtp_info.and_then(|info| parse_rtp_info(info).1);
             let copy_len = core::cmp::min(req.body.len(), 65_536);
-            self.artwork =
-                Some(CoverArtwork::new(mime, req.body[..copy_len].to_vec(), rtp_ts));
+            self.artwork = Some(CoverArtwork::new(
+                mime,
+                req.body[..copy_len].to_vec(),
+                rtp_ts,
+            ));
             return Ok(());
         }
 
@@ -718,17 +698,14 @@ impl RtspServer {
     }
 
     /// Processes an incoming RTSP request and produces a conforming response.
-    pub fn handle_request(
-        &mut self,
-        req: &RtspRequest<'_>,
-    ) -> Result<RtspResponse, RtspError> {
+    pub fn handle_request(&mut self, req: &RtspRequest<'_>) -> Result<RtspResponse, RtspError> {
         self.capture_dacp_headers(req);
 
         match req.method {
             RtspMethod::Options => Ok(RtspResponse::options(req.cseq)),
             RtspMethod::Announce => {
-                let sdp_str = core::str::from_utf8(req.body)
-                    .map_err(|_| RtspError::MalformedSdp)?;
+                let sdp_str =
+                    core::str::from_utf8(req.body).map_err(|_| RtspError::MalformedSdp)?;
                 let sdp = SdpSession::parse(sdp_str)?;
 
                 if let Some(ref enc_key) = sdp.rsaaeskey {
@@ -840,4 +817,3 @@ mod tests {
         ));
     }
 }
-

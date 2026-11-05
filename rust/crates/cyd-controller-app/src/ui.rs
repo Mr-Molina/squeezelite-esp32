@@ -145,6 +145,21 @@ pub const FONT_8X8: [[u8; 8]; 95] = [
     [0x76, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x7E '~'
 ];
 
+/// Returns the 8-pixel bitmask for row `gy` (`0..8`) of character `ch`.
+/// Non-ASCII or non-printable characters outside `0x20..=0x7E` map to `'?'`.
+#[inline(always)]
+fn glyph_row_bits(ch: u8, gy: usize) -> u8 {
+    if gy >= 8 {
+        return 0;
+    }
+    let idx = if (0x20..=0x7E).contains(&ch) {
+        (ch - 0x20) as usize
+    } else {
+        (b'?' - 0x20) as usize
+    };
+    FONT_8X8[idx][gy]
+}
+
 /// Look up whether pixel `(gx, gy)` (`0..8`) is set for character `ch`.
 /// Non-ASCII or non-printable characters outside `0x20..=0x7E` map to `'?'`.
 pub const fn glyph_pixel(ch: char, gx: usize, gy: usize) -> bool {
@@ -226,10 +241,15 @@ pub fn draw_text_box<B: SpiDisplayBus>(
             if y >= text_y0 && y < text_y0 + glyph_h {
                 let gy = ((y - text_y0) / scale) as usize;
                 for (ch_idx, &ch) in chars[..char_count].iter().enumerate() {
+                    let ch_byte = if (ch as u32) <= 0x7F { ch as u8 } else { b'?' };
+                    let row_bits = glyph_row_bits(ch_byte, gy);
+                    if row_bits == 0 {
+                        continue;
+                    }
                     let ch_x0 = start_x + (ch_idx as i32) * glyph_w;
                     for gx in 0..8 {
-                        if glyph_pixel(ch, gx, gy) {
-                            let px_start = ch_x0 + (gx as i32) * scale;
+                        if (row_bits & (0x80 >> gx)) != 0 {
+                            let px_start = ch_x0 + gx * scale;
                             for sx in 0..scale {
                                 let rx = px_start + sx;
                                 if rx >= 0 && (rx as usize) < width {
@@ -386,7 +406,9 @@ impl NowPlayingUi {
         if self.cached_state.link_active != active {
             self.cached_state.link_active = active;
             self.link_badge.clear();
-            let _ = self.link_badge.push_str(if active { "ONLINE" } else { "OFFLINE" });
+            let _ = self
+                .link_badge
+                .push_str(if active { "ONLINE" } else { "OFFLINE" });
             self.dirty_flags |= DIRTY_HEADER | DIRTY_TRACK | DIRTY_PROGRESS;
         }
     }
@@ -551,11 +573,13 @@ impl NowPlayingUi {
                 link.state_mut().state = next_state;
                 self.cached_state.state = next_state;
                 self.play_pause_icon.clear();
-                let _ = self.play_pause_icon.push_str(if next_state == PlayState::Playing {
-                    "PAUSE"
-                } else {
-                    "PLAY"
-                });
+                let _ = self
+                    .play_pause_icon
+                    .push_str(if next_state == PlayState::Playing {
+                        "PAUSE"
+                    } else {
+                        "PLAY"
+                    });
                 self.dirty_flags |= DIRTY_TRANSPORT | DIRTY_TRACK;
                 link.send_command(CydCommand::Toggle)
             }
@@ -624,11 +648,7 @@ impl NowPlayingUi {
         now_ms: u32,
         link: &mut CydDisplayLink,
     ) -> Option<Vec<u8, 64>> {
-        let effective_y = if self.mirrored_y_panel {
-            239 - y
-        } else {
-            y
-        };
+        let effective_y = if self.mirrored_y_panel { 239 - y } else { y };
         if (12..=56).contains(&x) && (184..=228).contains(&effective_y) {
             if released {
                 self.click_button(UiButtonId::Prev, link).ok()
@@ -729,7 +749,11 @@ impl NowPlayingUi {
         } else {
             (self.title_label(), UI_COLOR_TEXT_PRIMARY_565)
         };
-        let title_scale = if title_text.chars().count() <= 13 { 2 } else { 1 };
+        let title_scale = if title_text.chars().count() <= 13 {
+            2
+        } else {
+            1
+        };
         draw_text_box(
             display,
             98,
@@ -822,8 +846,11 @@ impl NowPlayingUi {
     }
 
     fn render_transport_buttons<B: SpiDisplayBus>(&self, display: &mut Ili9341Display<B>) {
-        // Also ensure on-screen audio status pill updates on Play/Pause transitions
-        self.render_audio_status_pill(display);
+        // Also ensure on-screen audio status pill updates on Play/Pause
+        // transitions (skip if track panel already rendered it)
+        if (self.dirty_flags & DIRTY_TRACK) == 0 {
+            self.render_audio_status_pill(display);
+        }
 
         // Prev Button (x: 12..56, y: 184..228)
         draw_text_box(
@@ -860,7 +887,7 @@ impl NowPlayingUi {
             184,
             164,
             228,
-            ">>|" ,
+            ">>|",
             UI_COLOR_TEXT_PRIMARY_565,
             UI_COLOR_SURFACE_565,
             1,
@@ -1148,7 +1175,9 @@ mod tests {
         let mut link = CydDisplayLink::new();
 
         // Prev Button hit-box: x=30, y=200
-        assert!(ui.handle_touch_point(30, 200, false, 0, &mut link).is_none());
+        assert!(ui
+            .handle_touch_point(30, 200, false, 0, &mut link)
+            .is_none());
         let res = ui.handle_touch_point(30, 200, true, 0, &mut link);
         assert_eq!(res.as_deref(), Some(&b"CMD=PREV\n"[..]));
 
@@ -1279,7 +1308,9 @@ mod tests {
 
         // Non-mirrored touches in top header band (9..=58) do not trigger
         // bottom buttons
-        assert!(ui.handle_touch_point(80, 39, true, 600, &mut link).is_none());
+        assert!(ui
+            .handle_touch_point(80, 39, true, 600, &mut link)
+            .is_none());
         assert!(ui.handle_touch_point(80, 9, true, 650, &mut link).is_none());
 
         // Configure mirrored-Y panel for inverted touch coordinates
@@ -1319,5 +1350,25 @@ mod tests {
         );
         assert_eq!(ui.link_badge(), "OFFLINE");
     }
-}
 
+    #[test]
+    fn test_glyph_row_bits_and_pixel_matching() {
+        // Space character (0x20) is all zeros for all rows
+        for gy in 0..8 {
+            assert_eq!(glyph_row_bits(b' ', gy), 0);
+        }
+
+        // Test character 'A' (0x41)
+        for gy in 0..8 {
+            let row = glyph_row_bits(b'A', gy);
+            for gx in 0..8 {
+                let pixel = glyph_pixel('A', gx, gy);
+                assert_eq!((row & (0x80 >> gx)) != 0, pixel);
+            }
+        }
+
+        // Out of bounds row returns 0
+        assert_eq!(glyph_row_bits(b'A', 8), 0);
+        assert_eq!(glyph_row_bits(b'A', 99), 0);
+    }
+}

@@ -561,10 +561,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
 
         let max_scratch_samples = self.max_decode_scratch_samples();
-        let (consumed, frames_produced) = match self
-            .decoder
-            .decode(&self.read_scratch[..peeked], &mut self.pcm_scratch[..max_scratch_samples])
-        {
+        let (consumed, frames_produced) = match self.decoder.decode(
+            &self.read_scratch[..peeked],
+            &mut self.pcm_scratch[..max_scratch_samples],
+        ) {
             Ok(res) => res,
             Err(DecoderError::NeedMoreData) => return Err(DecoderError::NeedMoreData),
             Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
@@ -682,19 +682,17 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             let mut chunk_out = [0i32; 256];
 
             while in_pos < in_end {
-                let (consumed, produced) = resampler.process(
-                    &self.pcm_scratch[in_pos..in_end],
-                    &mut chunk_out,
-                );
+                let (consumed, produced) =
+                    resampler.process(&self.pcm_scratch[in_pos..in_end], &mut chunk_out);
                 in_pos += consumed;
                 if produced > 0 {
-                    self.equalizer.process_interleaved(&mut chunk_out[..produced]);
+                    self.equalizer
+                        .process_interleaved(&mut chunk_out[..produced]);
                     let avail_frames = self.output_buffer.available_write() / 8;
                     let frames_to_write = (produced / 2).min(avail_frames);
                     let samples_to_write = frames_to_write * 2;
                     let frames_written = if frames_to_write > 0 {
-                        let pcm_bytes: &[u8] =
-                            bytemuck::cast_slice(&chunk_out[..samples_to_write]);
+                        let pcm_bytes: &[u8] = bytemuck::cast_slice(&chunk_out[..samples_to_write]);
                         debug_assert_eq!(pcm_bytes.len() % 8, 0);
                         let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
                         written / 8
@@ -777,12 +775,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
         // Pre-buffer cushion gating (PROT-504)
         if self.output_threshold_frames > 0 && !self.threshold_satisfied {
-            let avail_frames =
-                (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u32;
+            let avail_frames = (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u32;
             let max_possible = (self.output_buffer.capacity() / OUTPUT_FRAME_BYTES) as u32;
             let target_frames = self.output_threshold_frames.min(max_possible);
-            let eof = !self.decoder.has_pending_pcm()
-                && self.stream_buffer.available_read() == 0;
+            let eof = !self.decoder.has_pending_pcm() && self.stream_buffer.available_read() == 0;
             if avail_frames >= target_frames || eof {
                 self.threshold_satisfied = true;
             } else {
@@ -801,10 +797,14 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             }
         }
 
+        if self.output_buffer.available_read() < OUTPUT_FRAME_BYTES {
+            return Ok(0);
+        }
+
         // C parity: output.c:174-252, after the track start (output.c:126-166).
         let fade = self.prepare_fade();
         let bytes_avail = self.output_buffer.available_read();
-        let max_output_bytes = self.output_i32_scratch.len() * 4;
+        let max_output_bytes = (self.output_i32_scratch.len() * 4).min(self.write_scratch.len());
         let mut to_read = core::cmp::min(max_output_bytes, bytes_avail);
         if let Some(marker) = self.boundary.marker {
             // C parity: output.c:163-166, the chunk ends exactly on the track
@@ -862,7 +862,10 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     fn prepare_fade(&mut self) -> FadeStep {
         let used = (self.output_buffer.available_read() / OUTPUT_FRAME_BYTES) as u64;
         // C `size`: the frames this call wants to write.
-        let size = used.min((self.write_scratch.len() / OUTPUT_FRAME_BYTES) as u64);
+        let max_chunk_frames = (self.output_i32_scratch.len() / 2)
+            .min(self.write_scratch.len() / OUTPUT_FRAME_BYTES)
+            as u64;
+        let size = used.min(max_chunk_frames);
         let step = self.fade.prepare(
             used,
             size,
@@ -922,17 +925,13 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 .saturating_mul(OUTPUT_FRAME_BYTES);
             // `prepare` checked that the new frames follow (output.c:231): the old samples
             // are already converted, so the byte scratch is free for them.
-            let got = self.output_buffer.peek_at(
-                offset,
-                &mut self.write_scratch[..frames * OUTPUT_FRAME_BYTES],
-            );
+            let to_process = (frames * OUTPUT_FRAME_BYTES).min(self.write_scratch.len());
+            let got = self
+                .output_buffer
+                .peek_at(offset, &mut self.write_scratch[..to_process]);
             // `prepare` guarantees used > dur_f + size, so the whole chunk of new frames is
             // there; a short read would mix only part of the chunk.
-            debug_assert_eq!(
-                got,
-                frames * OUTPUT_FRAME_BYTES,
-                "crossfade new-track frames missing"
-            );
+            debug_assert_eq!(got, to_process, "crossfade new-track frames missing");
             for (sample, new) in samples
                 .iter_mut()
                 .zip(self.write_scratch[..got].chunks_exact(4))
@@ -1190,8 +1189,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.boundary.stream_rate_hint = rate_hint;
         self.boundary.next_replay_gain = replay_gain;
         self.boundary.output_threshold = output_threshold;
-        let thresh_frames =
-            (u64::from(output_threshold) * u64::from(rate_hint) / 10) as u32;
+        let thresh_frames = (u64::from(output_threshold) * u64::from(rate_hint) / 10) as u32;
         self.output_threshold_frames = thresh_frames;
         self.threshold_satisfied = thresh_frames == 0;
         if let Some(marker) = self.boundary.marker.as_mut() {
@@ -1514,12 +1512,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 return true;
             }
         }
-        let resampler = Resampler::new(
-            in_rate,
-            out_rate,
-            quality,
-            InterpolationMode::LinearPhase,
-        );
+        let resampler = Resampler::new(in_rate, out_rate, quality, InterpolationMode::LinearPhase);
         self.resampler = Some(Box::new(resampler));
         true
     }
@@ -1538,7 +1531,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             if produced == 0 {
                 break;
             }
-            self.equalizer.process_interleaved(&mut tail_buf[..produced]);
+            self.equalizer
+                .process_interleaved(&mut tail_buf[..produced]);
             let avail_frames = self.output_buffer.available_write() / 8;
             let frames_to_write = (produced / 2).min(avail_frames);
             let samples_to_write = frames_to_write * 2;
@@ -1558,8 +1552,7 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                     0
                 } else if self.pcm_pending_offset > 0 {
                     self.pcm_scratch.copy_within(
-                        self.pcm_pending_offset
-                            ..self.pcm_pending_offset + self.pcm_pending_samples,
+                        self.pcm_pending_offset..self.pcm_pending_offset + self.pcm_pending_samples,
                         0,
                     );
                     self.pcm_pending_offset = 0;

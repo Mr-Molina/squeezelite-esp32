@@ -308,8 +308,8 @@ mod device {
         TcpPhase, TcpSocketOps,
     };
     use louder_esp32_app::ota_safety::{
-        OtaSelectEntry, WifiStaCredentials,
-        OTADATA_PARTITION_OFFSET as OTADATA_SECTOR_0_OFFSET, SETTINGS_JOURNAL_OFFSET,
+        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_OFFSET as OTADATA_SECTOR_0_OFFSET,
+        SETTINGS_JOURNAL_OFFSET,
     };
     use louder_esp32_app::pipeline::ActiveDecoder;
     use louder_esp32_app::{AmpManager, CydUartBridge, PlayerCoordinator, PlayerState};
@@ -664,43 +664,23 @@ mod device {
         static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
         EXECUTOR0.init(Executor::new()).run(|spawner| {
             spawner.spawn(
-                watchdog_lease(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+                watchdog_lease(shared).unwrap_or_else(|_| esp_hal::system::software_reset()),
             );
+            spawner.spawn(bt_a2dp(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner.spawn(net_stack(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner
+                .spawn(http_control(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
             spawner.spawn(
-                bt_a2dp(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+                slimproto_session(shared).unwrap_or_else(|_| esp_hal::system::software_reset()),
             );
-            spawner.spawn(
-                net_stack(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                http_control(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                slimproto_session(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                cyd_bridge(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
+            spawner.spawn(cyd_bridge(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
             // Core-0 placement of the audio tasks: see "Core placement" in the
             // module docs.
-            spawner.spawn(
-                decode_pump(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                i2s_feed(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                config_writer(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
+            spawner
+                .spawn(decode_pump(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner.spawn(i2s_feed(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner
+                .spawn(config_writer(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
             let first = PHASE_ORDER[0];
             TURN[first.owner().index()].signal(first);
         })
@@ -725,10 +705,7 @@ mod device {
     pub(crate) fn run_core1_executor() -> ! {
         static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
         EXECUTOR1.init(Executor::new()).run(|spawner| {
-            spawner.spawn(
-                core1_heartbeat()
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
+            spawner.spawn(core1_heartbeat().unwrap_or_else(|_| esp_hal::system::software_reset()));
         })
     }
 
@@ -884,7 +861,9 @@ mod device {
         if let Some(ref mut transport) = s.bt_transport {
             s.bt_sink
                 .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                    if s.coordinator.request_source(louder_esp32_app::AudioSource::Bluetooth) {
+                    if s.coordinator
+                        .request_source(louder_esp32_app::AudioSource::Bluetooth)
+                    {
                         if s.coordinator.current_sample_rate != sample_rate_hz
                             || s.pipeline.sample_rate != sample_rate_hz
                         {
@@ -900,7 +879,8 @@ mod device {
                             // `current_replay_gain` set, decode_external.c:147-154).
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
+                            s.coordinator
+                                .begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -922,7 +902,8 @@ mod device {
                     if s.pipeline.stream_buffer.available_read() > 0 {
                         s.pipeline.stream_buffer.flush();
                     }
-                    s.coordinator.release_source(louder_esp32_app::AudioSource::Bluetooth);
+                    s.coordinator
+                        .release_source(louder_esp32_app::AudioSource::Bluetooth);
                     s.coordinator.end_external_playback_and_restore(s.pipeline);
                     s.bt_audio_active = false;
                 }
@@ -1320,7 +1301,10 @@ mod device {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    if s.flash.write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes).is_ok() {
+                    if s.flash
+                        .write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes)
+                        .is_ok()
+                    {
                         println!(
                             "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
                              wrote ota_0 select entry & resetting"

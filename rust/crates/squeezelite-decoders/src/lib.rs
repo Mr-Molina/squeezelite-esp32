@@ -73,7 +73,10 @@ pub enum DecoderError {
     CorruptedFrame,
     #[cfg_attr(feature = "std", error("Unsupported sample depth or channels"))]
     UnsupportedSampleFormat,
-    #[cfg_attr(feature = "std", error("Target PCM buffer too small for decoded frame"))]
+    #[cfg_attr(
+        feature = "std",
+        error("Target PCM buffer too small for decoded frame")
+    )]
     BufferOverflow,
 }
 
@@ -120,8 +123,7 @@ pub trait AudioDecoder {
 const fn parse_aiff_extended_float(bytes: &[u8; 10]) -> u32 {
     let exponent = ((u16::from_be_bytes([bytes[0], bytes[1]]) & 0x7FFF) as i32) - 16383;
     let mantissa = u64::from_be_bytes([
-        bytes[2], bytes[3], bytes[4], bytes[5],
-        bytes[6], bytes[7], bytes[8], bytes[9],
+        bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
     ]);
     if exponent >= 0 && exponent <= 31 {
         (mantissa >> (63 - exponent)) as u32
@@ -471,16 +473,17 @@ impl AudioDecoder for PcmDecoder {
             }
             // 24-bit Stereo Big-Endian
             (24, true, 2) => {
-                for i in 0..frames_to_decode {
-                    let off = i * 6;
-                    let l = ((pcm_in[off] as i32) << 24)
-                        | ((pcm_in[off + 1] as i32) << 16)
-                        | ((pcm_in[off + 2] as i32) << 8);
-                    let r = ((pcm_in[off + 3] as i32) << 24)
-                        | ((pcm_in[off + 4] as i32) << 16)
-                        | ((pcm_in[off + 5] as i32) << 8);
-                    pcm_out[i * 2] = l;
-                    pcm_out[i * 2 + 1] = r;
+                for (src, dst) in pcm_in
+                    .chunks_exact(6)
+                    .zip(pcm_out.chunks_exact_mut(2))
+                    .take(frames_to_decode)
+                {
+                    let l =
+                        ((src[0] as i32) << 24) | ((src[1] as i32) << 16) | ((src[2] as i32) << 8);
+                    let r =
+                        ((src[3] as i32) << 24) | ((src[4] as i32) << 16) | ((src[5] as i32) << 8);
+                    dst[0] = l;
+                    dst[1] = r;
                 }
             }
             // 24-bit Mono Big-Endian (DEC-010)
@@ -496,16 +499,17 @@ impl AudioDecoder for PcmDecoder {
             }
             // 24-bit Stereo Little-Endian
             (24, false, 2) => {
-                for i in 0..frames_to_decode {
-                    let off = i * 6;
-                    let l = ((pcm_in[off] as i32) << 8)
-                        | ((pcm_in[off + 1] as i32) << 16)
-                        | ((pcm_in[off + 2] as i32) << 24);
-                    let r = ((pcm_in[off + 3] as i32) << 8)
-                        | ((pcm_in[off + 4] as i32) << 16)
-                        | ((pcm_in[off + 5] as i32) << 24);
-                    pcm_out[i * 2] = l;
-                    pcm_out[i * 2 + 1] = r;
+                for (src, dst) in pcm_in
+                    .chunks_exact(6)
+                    .zip(pcm_out.chunks_exact_mut(2))
+                    .take(frames_to_decode)
+                {
+                    let l =
+                        ((src[0] as i32) << 8) | ((src[1] as i32) << 16) | ((src[2] as i32) << 24);
+                    let r =
+                        ((src[3] as i32) << 8) | ((src[4] as i32) << 16) | ((src[5] as i32) << 24);
+                    dst[0] = l;
+                    dst[1] = r;
                 }
             }
             // 24-bit Mono Little-Endian (DEC-010)
@@ -521,22 +525,15 @@ impl AudioDecoder for PcmDecoder {
             }
             // 32-bit Stereo Big-Endian
             (32, true, 2) => {
-                for i in 0..frames_to_decode {
-                    let off = i * 8;
-                    let l = i32::from_be_bytes([
-                        pcm_in[off],
-                        pcm_in[off + 1],
-                        pcm_in[off + 2],
-                        pcm_in[off + 3],
-                    ]);
-                    let r = i32::from_be_bytes([
-                        pcm_in[off + 4],
-                        pcm_in[off + 5],
-                        pcm_in[off + 6],
-                        pcm_in[off + 7],
-                    ]);
-                    pcm_out[i * 2] = l;
-                    pcm_out[i * 2 + 1] = r;
+                for (src, dst) in pcm_in
+                    .chunks_exact(8)
+                    .zip(pcm_out.chunks_exact_mut(2))
+                    .take(frames_to_decode)
+                {
+                    let l = i32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+                    let r = i32::from_be_bytes([src[4], src[5], src[6], src[7]]);
+                    dst[0] = l;
+                    dst[1] = r;
                 }
             }
             // 32-bit Mono Big-Endian (DEC-010)
@@ -555,22 +552,15 @@ impl AudioDecoder for PcmDecoder {
             }
             // 32-bit Stereo Little-Endian
             (32, false, 2) => {
-                for i in 0..frames_to_decode {
-                    let off = i * 8;
-                    let l = i32::from_le_bytes([
-                        pcm_in[off],
-                        pcm_in[off + 1],
-                        pcm_in[off + 2],
-                        pcm_in[off + 3],
-                    ]);
-                    let r = i32::from_le_bytes([
-                        pcm_in[off + 4],
-                        pcm_in[off + 5],
-                        pcm_in[off + 6],
-                        pcm_in[off + 7],
-                    ]);
-                    pcm_out[i * 2] = l;
-                    pcm_out[i * 2 + 1] = r;
+                for (src, dst) in pcm_in
+                    .chunks_exact(8)
+                    .zip(pcm_out.chunks_exact_mut(2))
+                    .take(frames_to_decode)
+                {
+                    let l = i32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                    let r = i32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                    dst[0] = l;
+                    dst[1] = r;
                 }
             }
             // 32-bit Mono Little-Endian (DEC-010)
@@ -590,7 +580,10 @@ impl AudioDecoder for PcmDecoder {
             _ => return Err(DecoderError::UnsupportedSampleFormat),
         }
 
-        Ok((header_len + frames_to_decode * bytes_per_frame, frames_to_decode))
+        Ok((
+            header_len + frames_to_decode * bytes_per_frame,
+            frames_to_decode,
+        ))
     }
 
     fn flush(&mut self) {
@@ -635,7 +628,11 @@ pub fn parse_xing_lame_header(frame: &[u8]) -> Option<XingLameInfo> {
     let channel_mode = (frame[3] >> 6) & 0x03;
     let is_mono = channel_mode == 3;
     let side_info_len = if version_id == 3 {
-        if is_mono { 17 } else { 32 }
+        if is_mono {
+            17
+        } else {
+            32
+        }
     } else if is_mono {
         9
     } else {
@@ -670,12 +667,7 @@ pub fn parse_xing_lame_header(frame: &[u8]) -> Option<XingLameInfo> {
         if pos + 4 > frame.len() {
             return None;
         }
-        let tf = u32::from_be_bytes([
-            frame[pos],
-            frame[pos + 1],
-            frame[pos + 2],
-            frame[pos + 3],
-        ]);
+        let tf = u32::from_be_bytes([frame[pos], frame[pos + 1], frame[pos + 2], frame[pos + 3]]);
         if tf > 0 {
             total_frames = Some(tf);
         }
@@ -1343,51 +1335,47 @@ impl<'a> std::io::Read for FlacByteReader<'a> {
 }
 
 const CRC8_TABLE: [u8; 256] = [
-    0x00, 0x07, 0x0e, 0x09, 0x1c, 0x1b, 0x12, 0x15, 0x38, 0x3f, 0x36, 0x31, 0x24, 0x23, 0x2a,
-    0x2d, 0x70, 0x77, 0x7e, 0x79, 0x6c, 0x6b, 0x62, 0x65, 0x48, 0x4f, 0x46, 0x41, 0x54, 0x53,
-    0x5a, 0x5d, 0xe0, 0xe7, 0xee, 0xe9, 0xfc, 0xfb, 0xf2, 0xf5, 0xd8, 0xdf, 0xd6, 0xd1, 0xc4,
-    0xc3, 0xca, 0xcd, 0x90, 0x97, 0x9e, 0x99, 0x8c, 0x8b, 0x82, 0x85, 0xa8, 0xaf, 0xa6, 0xa1,
-    0xb4, 0xb3, 0xba, 0xbd, 0xc7, 0xc0, 0xc9, 0xce, 0xdb, 0xdc, 0xd5, 0xd2, 0xff, 0xf8, 0xf1,
-    0xf6, 0xe3, 0xe4, 0xed, 0xea, 0xb7, 0xb0, 0xb9, 0xbe, 0xab, 0xac, 0xa5, 0xa2, 0x8f, 0x88,
-    0x81, 0x86, 0x93, 0x94, 0x9d, 0x9a, 0x27, 0x20, 0x29, 0x2e, 0x3b, 0x3c, 0x35, 0x32, 0x1f,
-    0x18, 0x11, 0x16, 0x03, 0x04, 0x0d, 0x0a, 0x57, 0x50, 0x59, 0x5e, 0x4b, 0x4c, 0x45, 0x42,
-    0x6f, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7d, 0x7a, 0x89, 0x8e, 0x87, 0x80, 0x95, 0x92, 0x9b,
-    0x9c, 0xb1, 0xb6, 0xbf, 0xb8, 0xad, 0xaa, 0xa3, 0xa4, 0xf9, 0xfe, 0xf7, 0xf0, 0xe5, 0xe2,
-    0xeb, 0xec, 0xc1, 0xc6, 0xcf, 0xc8, 0xdd, 0xda, 0xd3, 0xd4, 0x69, 0x6e, 0x67, 0x60, 0x75,
-    0x72, 0x7b, 0x7c, 0x51, 0x56, 0x5f, 0x58, 0x4d, 0x4a, 0x43, 0x44, 0x19, 0x1e, 0x17, 0x10,
-    0x05, 0x02, 0x0b, 0x0c, 0x21, 0x26, 0x2f, 0x28, 0x3d, 0x3a, 0x33, 0x34, 0x4e, 0x49, 0x40,
-    0x47, 0x52, 0x55, 0x5c, 0x5b, 0x76, 0x71, 0x78, 0x7f, 0x6a, 0x6d, 0x64, 0x63, 0x3e, 0x39,
-    0x30, 0x37, 0x22, 0x25, 0x2c, 0x2b, 0x06, 0x01, 0x08, 0x0f, 0x1a, 0x1d, 0x14, 0x13, 0xae,
-    0xa9, 0xa0, 0xa7, 0xb2, 0xb5, 0xbc, 0xbb, 0x96, 0x91, 0x98, 0x9f, 0x8a, 0x8d, 0x84, 0x83,
-    0xde, 0xd9, 0xd0, 0xd7, 0xc2, 0xc5, 0xcc, 0xcb, 0xe6, 0xe1, 0xe8, 0xef, 0xfa, 0xfd, 0xf4,
-    0xf3,
+    0x00, 0x07, 0x0e, 0x09, 0x1c, 0x1b, 0x12, 0x15, 0x38, 0x3f, 0x36, 0x31, 0x24, 0x23, 0x2a, 0x2d,
+    0x70, 0x77, 0x7e, 0x79, 0x6c, 0x6b, 0x62, 0x65, 0x48, 0x4f, 0x46, 0x41, 0x54, 0x53, 0x5a, 0x5d,
+    0xe0, 0xe7, 0xee, 0xe9, 0xfc, 0xfb, 0xf2, 0xf5, 0xd8, 0xdf, 0xd6, 0xd1, 0xc4, 0xc3, 0xca, 0xcd,
+    0x90, 0x97, 0x9e, 0x99, 0x8c, 0x8b, 0x82, 0x85, 0xa8, 0xaf, 0xa6, 0xa1, 0xb4, 0xb3, 0xba, 0xbd,
+    0xc7, 0xc0, 0xc9, 0xce, 0xdb, 0xdc, 0xd5, 0xd2, 0xff, 0xf8, 0xf1, 0xf6, 0xe3, 0xe4, 0xed, 0xea,
+    0xb7, 0xb0, 0xb9, 0xbe, 0xab, 0xac, 0xa5, 0xa2, 0x8f, 0x88, 0x81, 0x86, 0x93, 0x94, 0x9d, 0x9a,
+    0x27, 0x20, 0x29, 0x2e, 0x3b, 0x3c, 0x35, 0x32, 0x1f, 0x18, 0x11, 0x16, 0x03, 0x04, 0x0d, 0x0a,
+    0x57, 0x50, 0x59, 0x5e, 0x4b, 0x4c, 0x45, 0x42, 0x6f, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7d, 0x7a,
+    0x89, 0x8e, 0x87, 0x80, 0x95, 0x92, 0x9b, 0x9c, 0xb1, 0xb6, 0xbf, 0xb8, 0xad, 0xaa, 0xa3, 0xa4,
+    0xf9, 0xfe, 0xf7, 0xf0, 0xe5, 0xe2, 0xeb, 0xec, 0xc1, 0xc6, 0xcf, 0xc8, 0xdd, 0xda, 0xd3, 0xd4,
+    0x69, 0x6e, 0x67, 0x60, 0x75, 0x72, 0x7b, 0x7c, 0x51, 0x56, 0x5f, 0x58, 0x4d, 0x4a, 0x43, 0x44,
+    0x19, 0x1e, 0x17, 0x10, 0x05, 0x02, 0x0b, 0x0c, 0x21, 0x26, 0x2f, 0x28, 0x3d, 0x3a, 0x33, 0x34,
+    0x4e, 0x49, 0x40, 0x47, 0x52, 0x55, 0x5c, 0x5b, 0x76, 0x71, 0x78, 0x7f, 0x6a, 0x6d, 0x64, 0x63,
+    0x3e, 0x39, 0x30, 0x37, 0x22, 0x25, 0x2c, 0x2b, 0x06, 0x01, 0x08, 0x0f, 0x1a, 0x1d, 0x14, 0x13,
+    0xae, 0xa9, 0xa0, 0xa7, 0xb2, 0xb5, 0xbc, 0xbb, 0x96, 0x91, 0x98, 0x9f, 0x8a, 0x8d, 0x84, 0x83,
+    0xde, 0xd9, 0xd0, 0xd7, 0xc2, 0xc5, 0xcc, 0xcb, 0xe6, 0xe1, 0xe8, 0xef, 0xfa, 0xfd, 0xf4, 0xf3,
 ];
 
 const CRC16_TABLE: [u16; 256] = [
-    0x0000, 0x8005, 0x800f, 0x000a, 0x801b, 0x001e, 0x0014, 0x8011, 0x8033, 0x0036, 0x003c,
-    0x8039, 0x0028, 0x802d, 0x8027, 0x0022, 0x8063, 0x0066, 0x006c, 0x8069, 0x0078, 0x807d,
-    0x8077, 0x0072, 0x0050, 0x8055, 0x805f, 0x005a, 0x804b, 0x004e, 0x0044, 0x8041, 0x80c3,
-    0x00c6, 0x00cc, 0x80c9, 0x00d8, 0x80dd, 0x80d7, 0x00d2, 0x00f0, 0x80f5, 0x80ff, 0x00fa,
-    0x80eb, 0x00ee, 0x00e4, 0x80e1, 0x00a0, 0x80a5, 0x80af, 0x00aa, 0x80bb, 0x00be, 0x00b4,
-    0x80b1, 0x8093, 0x0096, 0x009c, 0x8099, 0x0088, 0x808d, 0x8087, 0x0082, 0x8183, 0x0186,
-    0x018c, 0x8189, 0x0198, 0x819d, 0x8197, 0x0192, 0x01b0, 0x81b5, 0x81bf, 0x01ba, 0x81ab,
-    0x01ae, 0x01a4, 0x81a1, 0x01e0, 0x81e5, 0x81ef, 0x01ea, 0x81fb, 0x01fe, 0x01f4, 0x81f1,
-    0x81d3, 0x01d6, 0x01dc, 0x81d9, 0x01c8, 0x81cd, 0x81c7, 0x01c2, 0x0140, 0x8145, 0x814f,
-    0x014a, 0x815b, 0x015e, 0x0154, 0x8151, 0x8173, 0x0176, 0x017c, 0x8179, 0x0168, 0x816d,
-    0x8167, 0x0162, 0x8123, 0x0126, 0x012c, 0x8129, 0x0138, 0x813d, 0x8137, 0x0132, 0x0110,
-    0x8115, 0x811f, 0x011a, 0x810b, 0x010e, 0x0104, 0x8101, 0x8303, 0x0306, 0x030c, 0x8309,
-    0x0318, 0x831d, 0x8317, 0x0312, 0x0330, 0x8335, 0x833f, 0x033a, 0x832b, 0x032e, 0x0324,
-    0x8321, 0x0360, 0x8365, 0x836f, 0x036a, 0x837b, 0x037e, 0x0374, 0x8371, 0x8353, 0x0356,
-    0x035c, 0x8359, 0x0348, 0x834d, 0x8347, 0x0342, 0x03c0, 0x83c5, 0x83cf, 0x03ca, 0x83db,
-    0x03de, 0x03d4, 0x83d1, 0x83f3, 0x03f6, 0x03fc, 0x83f9, 0x03e8, 0x83ed, 0x83e7, 0x03e2,
-    0x83a3, 0x03a6, 0x03ac, 0x83a9, 0x03b8, 0x83bd, 0x83b7, 0x03b2, 0x0390, 0x8395, 0x839f,
-    0x039a, 0x838b, 0x038e, 0x0384, 0x8381, 0x0280, 0x8285, 0x828f, 0x028a, 0x829b, 0x029e,
-    0x0294, 0x8291, 0x82b3, 0x02b6, 0x02bc, 0x82b9, 0x02a8, 0x82ad, 0x82a7, 0x02a2, 0x82e3,
-    0x02e6, 0x02ec, 0x82e9, 0x02f8, 0x82fd, 0x82f7, 0x02f2, 0x02d0, 0x82d5, 0x82df, 0x02da,
-    0x82cb, 0x02ce, 0x02c4, 0x82c1, 0x8243, 0x0246, 0x024c, 0x8249, 0x0258, 0x825d, 0x8257,
-    0x0252, 0x0270, 0x8275, 0x827f, 0x027a, 0x826b, 0x026e, 0x0264, 0x8261, 0x0220, 0x8225,
-    0x822f, 0x022a, 0x823b, 0x023e, 0x0234, 0x8231, 0x8213, 0x0216, 0x021c, 0x8219, 0x0208,
-    0x820d, 0x8207, 0x0202,
+    0x0000, 0x8005, 0x800f, 0x000a, 0x801b, 0x001e, 0x0014, 0x8011, 0x8033, 0x0036, 0x003c, 0x8039,
+    0x0028, 0x802d, 0x8027, 0x0022, 0x8063, 0x0066, 0x006c, 0x8069, 0x0078, 0x807d, 0x8077, 0x0072,
+    0x0050, 0x8055, 0x805f, 0x005a, 0x804b, 0x004e, 0x0044, 0x8041, 0x80c3, 0x00c6, 0x00cc, 0x80c9,
+    0x00d8, 0x80dd, 0x80d7, 0x00d2, 0x00f0, 0x80f5, 0x80ff, 0x00fa, 0x80eb, 0x00ee, 0x00e4, 0x80e1,
+    0x00a0, 0x80a5, 0x80af, 0x00aa, 0x80bb, 0x00be, 0x00b4, 0x80b1, 0x8093, 0x0096, 0x009c, 0x8099,
+    0x0088, 0x808d, 0x8087, 0x0082, 0x8183, 0x0186, 0x018c, 0x8189, 0x0198, 0x819d, 0x8197, 0x0192,
+    0x01b0, 0x81b5, 0x81bf, 0x01ba, 0x81ab, 0x01ae, 0x01a4, 0x81a1, 0x01e0, 0x81e5, 0x81ef, 0x01ea,
+    0x81fb, 0x01fe, 0x01f4, 0x81f1, 0x81d3, 0x01d6, 0x01dc, 0x81d9, 0x01c8, 0x81cd, 0x81c7, 0x01c2,
+    0x0140, 0x8145, 0x814f, 0x014a, 0x815b, 0x015e, 0x0154, 0x8151, 0x8173, 0x0176, 0x017c, 0x8179,
+    0x0168, 0x816d, 0x8167, 0x0162, 0x8123, 0x0126, 0x012c, 0x8129, 0x0138, 0x813d, 0x8137, 0x0132,
+    0x0110, 0x8115, 0x811f, 0x011a, 0x810b, 0x010e, 0x0104, 0x8101, 0x8303, 0x0306, 0x030c, 0x8309,
+    0x0318, 0x831d, 0x8317, 0x0312, 0x0330, 0x8335, 0x833f, 0x033a, 0x832b, 0x032e, 0x0324, 0x8321,
+    0x0360, 0x8365, 0x836f, 0x036a, 0x837b, 0x037e, 0x0374, 0x8371, 0x8353, 0x0356, 0x035c, 0x8359,
+    0x0348, 0x834d, 0x8347, 0x0342, 0x03c0, 0x83c5, 0x83cf, 0x03ca, 0x83db, 0x03de, 0x03d4, 0x83d1,
+    0x83f3, 0x03f6, 0x03fc, 0x83f9, 0x03e8, 0x83ed, 0x83e7, 0x03e2, 0x83a3, 0x03a6, 0x03ac, 0x83a9,
+    0x03b8, 0x83bd, 0x83b7, 0x03b2, 0x0390, 0x8395, 0x839f, 0x039a, 0x838b, 0x038e, 0x0384, 0x8381,
+    0x0280, 0x8285, 0x828f, 0x028a, 0x829b, 0x029e, 0x0294, 0x8291, 0x82b3, 0x02b6, 0x02bc, 0x82b9,
+    0x02a8, 0x82ad, 0x82a7, 0x02a2, 0x82e3, 0x02e6, 0x02ec, 0x82e9, 0x02f8, 0x82fd, 0x82f7, 0x02f2,
+    0x02d0, 0x82d5, 0x82df, 0x02da, 0x82cb, 0x02ce, 0x02c4, 0x82c1, 0x8243, 0x0246, 0x024c, 0x8249,
+    0x0258, 0x825d, 0x8257, 0x0252, 0x0270, 0x8275, 0x827f, 0x027a, 0x826b, 0x026e, 0x0264, 0x8261,
+    0x0220, 0x8225, 0x822f, 0x022a, 0x823b, 0x023e, 0x0234, 0x8231, 0x8213, 0x0216, 0x021c, 0x8219,
+    0x0208, 0x820d, 0x8207, 0x0202,
 ];
 
 #[inline(always)]
@@ -1448,6 +1436,12 @@ impl<'a> BitReader<'a> {
             if self.byte_pos >= self.bytes.len() {
                 return Err(());
             }
+            if self.bit_pos == 0 && n >= 8 {
+                val = (val << 8) | (self.bytes[self.byte_pos] as u32);
+                self.byte_pos += 1;
+                n -= 8;
+                continue;
+            }
             let avail = 8 - self.bit_pos as usize;
             let take = n.min(avail);
             let shift = avail - take;
@@ -1465,11 +1459,52 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline(always)]
+    fn read_bits_u64(&mut self, mut n: usize) -> Result<u64, ()> {
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > 64 {
+            return Err(());
+        }
+        let mut val = 0u64;
+        while n > 0 {
+            if self.byte_pos >= self.bytes.len() {
+                return Err(());
+            }
+            if self.bit_pos == 0 && n >= 8 {
+                val = (val << 8) | (self.bytes[self.byte_pos] as u64);
+                self.byte_pos += 1;
+                n -= 8;
+                continue;
+            }
+            let avail = 8 - self.bit_pos as usize;
+            let take = n.min(avail);
+            let shift = avail - take;
+            let mask = ((1u32 << take) - 1) as u8;
+            let bits = (self.bytes[self.byte_pos] >> shift) & mask;
+            val = (val << take) | (bits as u64);
+            self.bit_pos += take as u8;
+            if self.bit_pos == 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+            n -= take;
+        }
+        Ok(val)
+    }
+
+    #[inline(always)]
     fn read_signed(&mut self, n: usize) -> Result<i64, ()> {
         if n == 0 {
             return Ok(0);
         }
-        let u = self.read_bits(n)? as u64;
+        if n > 64 {
+            return Err(());
+        }
+        let u = self.read_bits_u64(n)?;
+        if n == 64 {
+            return Ok(u as i64);
+        }
         let sign_bit = 1u64 << (n - 1);
         if (u & sign_bit) != 0 {
             let mask = !((1u64 << n) - 1);
@@ -1525,21 +1560,31 @@ fn read_utf8_number(buf: &[u8], idx: usize) -> Result<(u64, usize), ()> {
         return Ok((u0 as u64, idx + 1));
     }
     if (u0 & 0xE0) == 0xC0 {
-        if idx + 2 > buf.len() { return Err(()); }
+        if idx + 2 > buf.len() {
+            return Err(());
+        }
         let u1 = buf[idx + 1];
-        if (u1 & 0xC0) != 0x80 { return Err(()); }
+        if (u1 & 0xC0) != 0x80 {
+            return Err(());
+        }
         let val = ((u0 as u64 & 0x1F) << 6) | (u1 as u64 & 0x3F);
         return Ok((val, idx + 2));
     }
     if (u0 & 0xF0) == 0xE0 {
-        if idx + 3 > buf.len() { return Err(()); }
+        if idx + 3 > buf.len() {
+            return Err(());
+        }
         let (u1, u2) = (buf[idx + 1], buf[idx + 2]);
-        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 { return Err(()); }
+        if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 {
+            return Err(());
+        }
         let val = ((u0 as u64 & 0x0F) << 12) | ((u1 as u64 & 0x3F) << 6) | (u2 as u64 & 0x3F);
         return Ok((val, idx + 3));
     }
     if (u0 & 0xF8) == 0xF0 {
-        if idx + 4 > buf.len() { return Err(()); }
+        if idx + 4 > buf.len() {
+            return Err(());
+        }
         let (u1, u2, u3) = (buf[idx + 1], buf[idx + 2], buf[idx + 3]);
         if (u1 & 0xC0) != 0x80 || (u2 & 0xC0) != 0x80 || (u3 & 0xC0) != 0x80 {
             return Err(());
@@ -1551,13 +1596,10 @@ fn read_utf8_number(buf: &[u8], idx: usize) -> Result<(u64, usize), ()> {
         return Ok((val, idx + 4));
     }
     if (u0 & 0xFC) == 0xF8 {
-        if idx + 5 > buf.len() { return Err(()); }
-        let (u1, u2, u3, u4) = (
-            buf[idx + 1],
-            buf[idx + 2],
-            buf[idx + 3],
-            buf[idx + 4],
-        );
+        if idx + 5 > buf.len() {
+            return Err(());
+        }
+        let (u1, u2, u3, u4) = (buf[idx + 1], buf[idx + 2], buf[idx + 3], buf[idx + 4]);
         let valid = (u1 & 0xC0) == 0x80
             && (u2 & 0xC0) == 0x80
             && (u3 & 0xC0) == 0x80
@@ -1573,7 +1615,9 @@ fn read_utf8_number(buf: &[u8], idx: usize) -> Result<(u64, usize), ()> {
         return Ok((val, idx + 5));
     }
     if (u0 & 0xFE) == 0xFC {
-        if idx + 6 > buf.len() { return Err(()); }
+        if idx + 6 > buf.len() {
+            return Err(());
+        }
         let (u1, u2, u3, u4, u5) = (
             buf[idx + 1],
             buf[idx + 2],
@@ -1598,7 +1642,9 @@ fn read_utf8_number(buf: &[u8], idx: usize) -> Result<(u64, usize), ()> {
         return Ok((val, idx + 6));
     }
     if u0 == 0xFE {
-        if idx + 7 > buf.len() { return Err(()); }
+        if idx + 7 > buf.len() {
+            return Err(());
+        }
         let (u1, u2, u3, u4, u5, u6) = (
             buf[idx + 1],
             buf[idx + 2],
@@ -1665,25 +1711,35 @@ fn parse_frame_header(
     let (_, mut idx) = match read_utf8_number(buf, 4) {
         Ok(res) => res,
         Err(_) => {
-            if buf.len() < 12 { return Ok(None); }
+            if buf.len() < 12 {
+                return Ok(None);
+            }
             return Err(());
         }
     };
 
     let block_size = match block_size_code {
         0 => {
-            if min_bs > 0 { min_bs as usize } else { return Err(()); }
+            if min_bs > 0 {
+                min_bs as usize
+            } else {
+                return Err(());
+            }
         }
         1 => 192,
         2..=5 => 576 * (1usize << (block_size_code - 2)),
         6 => {
-            if idx >= buf.len() { return Ok(None); }
+            if idx >= buf.len() {
+                return Ok(None);
+            }
             let bs = (buf[idx] as usize) + 1;
             idx += 1;
             bs
         }
         7 => {
-            if idx + 2 > buf.len() { return Ok(None); }
+            if idx + 2 > buf.len() {
+                return Ok(None);
+            }
             let bs = (u16::from_be_bytes([buf[idx], buf[idx + 1]]) as usize) + 1;
             idx += 2;
             bs
@@ -1709,19 +1765,25 @@ fn parse_frame_header(
         10 => 48000,
         11 => 96000,
         12 => {
-            if idx >= buf.len() { return Ok(None); }
+            if idx >= buf.len() {
+                return Ok(None);
+            }
             let sr = (buf[idx] as u32) * 1000;
             idx += 1;
             sr
         }
         13 => {
-            if idx + 2 > buf.len() { return Ok(None); }
+            if idx + 2 > buf.len() {
+                return Ok(None);
+            }
             let sr = u16::from_be_bytes([buf[idx], buf[idx + 1]]) as u32;
             idx += 2;
             sr
         }
         14 => {
-            if idx + 2 > buf.len() { return Ok(None); }
+            if idx + 2 > buf.len() {
+                return Ok(None);
+            }
             let sr = (u16::from_be_bytes([buf[idx], buf[idx + 1]]) as u32) * 10;
             idx += 2;
             sr
@@ -1863,9 +1925,8 @@ fn decode_subframe(
                 for i in order..block_size {
                     let mut sum: i32 = 0;
                     for j in 0..order {
-                        sum = sum.wrapping_add(
-                            (coeffs[j] as i32).wrapping_mul(out[i - 1 - j] as i32),
-                        );
+                        sum = sum
+                            .wrapping_add((coeffs[j] as i32).wrapping_mul(out[i - 1 - j] as i32));
                     }
                     let predicted = (sum >> qlp_shift) as i64;
                     out[i] = out[i].wrapping_add(predicted);
@@ -2018,6 +2079,28 @@ fn decorrelate_samples(
     }
 }
 
+const fn make_ogg_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut r = (i as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            if (r & 0x8000_0000) != 0 {
+                r = (r << 1) ^ 0x04C1_1DB7;
+            } else {
+                r <<= 1;
+            }
+            bit += 1;
+        }
+        table[i] = r;
+        i += 1;
+    }
+    table
+}
+
+pub const OGG_CRC32_TABLE: [u32; 256] = make_ogg_crc32_table();
+
 /// Computes the RFC 3533 Ogg page CRC-32 checksum (direct polynomial
 /// `0x04C11DB7`, zeroing the checksum field at bytes `22..26`).
 #[must_use]
@@ -2025,17 +2108,13 @@ pub const fn ogg_crc32(page: &[u8]) -> u32 {
     let mut crc = 0u32;
     let mut idx = 0usize;
     while idx < page.len() {
-        let b = if idx >= 22 && idx < 26 { 0u8 } else { page[idx] };
-        crc ^= (b as u32) << 24;
-        let mut bit = 0;
-        while bit < 8 {
-            if (crc & 0x8000_0000) != 0 {
-                crc = (crc << 1) ^ 0x04C1_1DB7;
-            } else {
-                crc <<= 1;
-            }
-            bit += 1;
-        }
+        let b = if idx >= 22 && idx < 26 {
+            0u8
+        } else {
+            page[idx]
+        };
+        let table_idx = (((crc >> 24) as u8) ^ b) as usize;
+        crc = (crc << 8) ^ OGG_CRC32_TABLE[table_idx];
         idx += 1;
     }
     crc
@@ -2102,8 +2181,8 @@ impl FlacDecoder {
             max_block_size: 0,
             need_more_input: true,
             is_ogg_flac: None,
-            ogg_raw_buf: vec::Vec::new(),
-            ogg_partial_pkt: vec::Vec::new(),
+            ogg_raw_buf: vec::Vec::with_capacity(4096),
+            ogg_partial_pkt: vec::Vec::with_capacity(4096),
         }
     }
 
@@ -2296,8 +2375,7 @@ impl AudioDecoder for FlacDecoder {
         }
 
         if self.is_ogg_flac.is_none() {
-            let total_avail =
-                self.ogg_raw_buf.len() + self.stream_buf.len() + encoded_in.len();
+            let total_avail = self.ogg_raw_buf.len() + self.stream_buf.len() + encoded_in.len();
             if total_avail < 4 {
                 return Err(DecoderError::NeedMoreData);
             }
@@ -2431,7 +2509,8 @@ impl AudioDecoder for FlacDecoder {
             let total_block_bytes = 4 + block_len;
             let avail = self.stream_buf.len() - self.header_len;
             if avail >= total_block_bytes {
-                self.stream_buf.drain(self.header_len..self.header_len + total_block_bytes);
+                self.stream_buf
+                    .drain(self.header_len..self.header_len + total_block_bytes);
                 if is_last {
                     self.in_metadata = false;
                 }
@@ -2475,7 +2554,8 @@ impl AudioDecoder for FlacDecoder {
             };
 
             if sync_idx > 0 {
-                self.stream_buf.drain(self.header_len..self.header_len + sync_idx);
+                self.stream_buf
+                    .drain(self.header_len..self.header_len + sync_idx);
             }
 
             let frame_buf = &self.stream_buf[self.header_len..];
@@ -2564,29 +2644,23 @@ impl AudioDecoder for FlacDecoder {
             let to_write = core::cmp::min(block_size, available_space);
 
             for i in 0..to_write {
-                let (l, r) = decorrelate_samples(
-                    &self.subframe_scratch,
-                    i,
-                    hdr.channel_assignment,
-                    shift,
-                );
+                let (l, r) =
+                    decorrelate_samples(&self.subframe_scratch, i, hdr.channel_assignment, shift);
                 pcm_out[(frames_out + i) * 2] = l;
                 pcm_out[(frames_out + i) * 2 + 1] = r;
             }
             frames_out += to_write;
 
+            self.pending_pcm.reserve((block_size - to_write) * 2);
             for i in to_write..block_size {
-                let (l, r) = decorrelate_samples(
-                    &self.subframe_scratch,
-                    i,
-                    hdr.channel_assignment,
-                    shift,
-                );
+                let (l, r) =
+                    decorrelate_samples(&self.subframe_scratch, i, hdr.channel_assignment, shift);
                 self.pending_pcm.push(l);
                 self.pending_pcm.push(r);
             }
 
-            self.stream_buf.drain(self.header_len..self.header_len + total_frame_bytes);
+            self.stream_buf
+                .drain(self.header_len..self.header_len + total_frame_bytes);
             self.need_more_input = false;
 
             if !self.pending_pcm.is_empty() {
@@ -2719,9 +2793,7 @@ fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> 
     if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
         return Err(DecoderError::UnsupportedFeature);
     }
-    let channel_configuration = reader
-        .read_bits(4)
-        .ok_or(DecoderError::InvalidHeader)? as u8;
+    let channel_configuration = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)? as u8;
     if channel_configuration != 1 && channel_configuration != 2 {
         return Err(DecoderError::UnsupportedFeature);
     }
@@ -2786,11 +2858,7 @@ pub fn parse_esds_audio_specific_config(
                     return Err(DecoderError::InvalidHeader);
                 }
                 let obj_type = esds_payload[idx];
-                if obj_type != 0x40
-                    && obj_type != 0x66
-                    && obj_type != 0x67
-                    && obj_type != 0x68
-                {
+                if obj_type != 0x40 && obj_type != 0x66 && obj_type != 0x67 && obj_type != 0x68 {
                     return Err(DecoderError::UnsupportedFeature);
                 }
                 idx += 13;
@@ -2919,6 +2987,7 @@ pub struct AacDecoder {
     pub sample_rate: u32,
     pub channels: u32,
     pending_pcm: vec::Vec<i32>,
+    pending_offset: usize,
     is_mp4: Option<bool>,
     mp4: Option<Box<AacMp4Demuxer>>,
 }
@@ -2938,13 +3007,14 @@ impl AacDecoder {
             sample_rate: 44100,
             channels: 2,
             pending_pcm: vec::Vec::new(),
+            pending_offset: 0,
             is_mp4: None,
             mp4: None,
         }
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        if !self.pending_pcm.is_empty() {
+        if self.pending_offset < self.pending_pcm.len() {
             return true;
         }
         if let Some(ref demux) = self.mp4 {
@@ -2969,6 +3039,7 @@ impl AacDecoder {
     pub fn flush(&mut self) {
         self.decoder.reset();
         self.pending_pcm.clear();
+        self.pending_offset = 0;
         self.is_mp4 = None;
         self.mp4 = None;
     }
@@ -3069,10 +3140,7 @@ impl AacDecoder {
                     if demux.stream_buf.len() < 36 {
                         break;
                     }
-                    let version = u16::from_be_bytes([
-                        demux.stream_buf[16],
-                        demux.stream_buf[17],
-                    ]);
+                    let version = u16::from_be_bytes([demux.stream_buf[16], demux.stream_buf[17]]);
                     let hdr_size = match version {
                         1 if len > 52 => 52,
                         2 if len > 72 => 72,
@@ -3420,15 +3488,18 @@ impl AudioDecoder for AacDecoder {
         }
 
         let mut frames_out = 0;
-        if !self.pending_pcm.is_empty() {
-            let pending_frames = self.pending_pcm.len() / 2;
+        if self.pending_offset < self.pending_pcm.len() {
+            let pending_samples = self.pending_pcm.len() - self.pending_offset;
+            let pending_frames = pending_samples / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
             let samples = to_copy * 2;
-            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
-            if samples == self.pending_pcm.len() {
+            pcm_out[..samples].copy_from_slice(
+                &self.pending_pcm[self.pending_offset..self.pending_offset + samples],
+            );
+            self.pending_offset += samples;
+            if self.pending_offset >= self.pending_pcm.len() {
                 self.pending_pcm.clear();
-            } else {
-                self.pending_pcm.drain(..samples);
+                self.pending_offset = 0;
             }
             frames_out += to_copy;
             if frames_out >= max_frames {
@@ -3437,10 +3508,7 @@ impl AudioDecoder for AacDecoder {
         }
 
         if self.is_mp4.is_none() {
-            if encoded_in.len() >= 2
-                && encoded_in[0] == 0xFF
-                && (encoded_in[1] & 0xF0) == 0xF0
-            {
+            if encoded_in.len() >= 2 && encoded_in[0] == 0xFF && (encoded_in[1] & 0xF0) == 0xF0 {
                 self.is_mp4 = Some(false);
             } else if encoded_in.len() >= 8 {
                 let fourcc = &encoded_in[4..8];
@@ -3503,17 +3571,26 @@ impl AudioDecoder for AacDecoder {
             };
 
             let samples = core::cmp::min(left.len(), right.len());
-            for i in 0..samples {
+            let direct_count = core::cmp::min(samples, max_frames - frames_out);
+            for i in 0..direct_count {
                 let l_f = left[i].clamp(-1.0, 1.0);
                 let r_f = right[i].clamp(-1.0, 1.0);
                 // Clamping boundary to avoid overflow (DSP-003)
                 let l = (l_f * 2147483520.0) as i32;
                 let r = (r_f * 2147483520.0) as i32;
-                if frames_out < max_frames {
-                    pcm_out[frames_out * 2] = l;
-                    pcm_out[frames_out * 2 + 1] = r;
-                    frames_out += 1;
-                } else {
+                pcm_out[(frames_out + i) * 2] = l;
+                pcm_out[(frames_out + i) * 2 + 1] = r;
+            }
+            frames_out += direct_count;
+
+            if direct_count < samples {
+                pending_pcm.reserve((samples - direct_count) * 2);
+                for i in direct_count..samples {
+                    let l_f = left[i].clamp(-1.0, 1.0);
+                    let r_f = right[i].clamp(-1.0, 1.0);
+                    // Clamping boundary to avoid overflow (DSP-003)
+                    let l = (l_f * 2147483520.0) as i32;
+                    let r = (r_f * 2147483520.0) as i32;
                     pending_pcm.push(l);
                     pending_pcm.push(r);
                 }
@@ -3580,6 +3657,7 @@ pub struct VorbisDecoder {
     partial_packet: Vec<u8>,
     packet_queue: VecDeque<Vec<u8>>,
     pending_pcm: Vec<i32>,
+    pending_offset: usize,
     state: VorbisState,
 }
 
@@ -3601,18 +3679,20 @@ impl VorbisDecoder {
             partial_packet: Vec::new(),
             packet_queue: VecDeque::new(),
             pending_pcm: Vec::new(),
+            pending_offset: 0,
             state: VorbisState::WaitingIdent,
         }
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        !self.pending_pcm.is_empty()
+        self.pending_offset < self.pending_pcm.len()
             || !self.packet_queue.is_empty()
             || self.stream_buf.len() >= 27
     }
 
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
+        self.pending_offset = 0;
         self.packet_queue.clear();
         self.partial_packet.clear();
         self.stream_buf.clear();
@@ -3698,8 +3778,12 @@ impl VorbisDecoder {
         // Audio packet (LSB 0)
         let state = core::mem::replace(&mut self.state, VorbisState::Poisoned);
         match state {
-            VorbisState::Ready { ident, setup, mut pwr } => {
-                let decode_res: Result<lewton::samples::InterleavedSamples<i16>, _> =
+            VorbisState::Ready {
+                ident,
+                setup,
+                mut pwr,
+            } => {
+                let decode_res: Result<lewton::samples::InterleavedSamples<f32>, _> =
                     lewton::audio::read_audio_packet_generic(&ident, &setup, packet, &mut pwr);
                 self.state = VorbisState::Ready { ident, setup, pwr };
 
@@ -3717,31 +3801,36 @@ impl VorbisDecoder {
 
                         let available = max_frames.saturating_sub(*frames_out);
                         let to_copy = core::cmp::min(packet_frames, available);
+                        let to_i32 = |s: f32| {
+                            let scaled = s.clamp(-1.0, 1.0) * 2147483520.0;
+                            if scaled >= 0.0 {
+                                (scaled + 0.5) as i32
+                            } else {
+                                (scaled - 0.5) as i32
+                            }
+                        };
 
                         if ch == 2 {
                             for i in 0..to_copy {
-                                pcm_out[(*frames_out + i) * 2] =
-                                    (decoded.samples[i * 2] as i32) << 16;
+                                pcm_out[(*frames_out + i) * 2] = to_i32(decoded.samples[i * 2]);
                                 pcm_out[(*frames_out + i) * 2 + 1] =
-                                    (decoded.samples[i * 2 + 1] as i32) << 16;
+                                    to_i32(decoded.samples[i * 2 + 1]);
                             }
                             if to_copy < packet_frames {
                                 for i in to_copy..packet_frames {
-                                    self.pending_pcm
-                                        .push((decoded.samples[i * 2] as i32) << 16);
-                                    self.pending_pcm
-                                        .push((decoded.samples[i * 2 + 1] as i32) << 16);
+                                    self.pending_pcm.push(to_i32(decoded.samples[i * 2]));
+                                    self.pending_pcm.push(to_i32(decoded.samples[i * 2 + 1]));
                                 }
                             }
                         } else {
                             for i in 0..to_copy {
-                                let s = (decoded.samples[i] as i32) << 16;
+                                let s = to_i32(decoded.samples[i]);
                                 pcm_out[(*frames_out + i) * 2] = s;
                                 pcm_out[(*frames_out + i) * 2 + 1] = s;
                             }
                             if to_copy < packet_frames {
                                 for i in to_copy..packet_frames {
-                                    let s = (decoded.samples[i] as i32) << 16;
+                                    let s = to_i32(decoded.samples[i]);
                                     self.pending_pcm.push(s);
                                     self.pending_pcm.push(s);
                                 }
@@ -3779,15 +3868,18 @@ impl AudioDecoder for VorbisDecoder {
         let mut frames_out = 0;
 
         // 1. Copy pending PCM from prior decode
-        if !self.pending_pcm.is_empty() {
-            let pending_frames = self.pending_pcm.len() / 2;
+        if self.pending_offset < self.pending_pcm.len() {
+            let pending_samples = self.pending_pcm.len() - self.pending_offset;
+            let pending_frames = pending_samples / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
             let samples = to_copy * 2;
-            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
-            if samples == self.pending_pcm.len() {
+            pcm_out[..samples].copy_from_slice(
+                &self.pending_pcm[self.pending_offset..self.pending_offset + samples],
+            );
+            self.pending_offset += samples;
+            if self.pending_offset >= self.pending_pcm.len() {
                 self.pending_pcm.clear();
-            } else {
-                self.pending_pcm.drain(..samples);
+                self.pending_offset = 0;
             }
             frames_out += to_copy;
             if frames_out >= max_frames {
@@ -3797,7 +3889,9 @@ impl AudioDecoder for VorbisDecoder {
 
         // 2. Process queued complete packets
         while frames_out < max_frames && !self.packet_queue.is_empty() {
-            let Some(packet) = self.packet_queue.pop_front() else { break; };
+            let Some(packet) = self.packet_queue.pop_front() else {
+                break;
+            };
             self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -3910,12 +4004,7 @@ impl AudioDecoder for VorbisDecoder {
 
             for packet in page_packets {
                 if frames_out < max_frames && self.packet_queue.is_empty() {
-                    self.decode_single_packet(
-                        &packet,
-                        pcm_out,
-                        &mut frames_out,
-                        max_frames,
-                    )?;
+                    self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
                 } else if self.packet_queue.len() < MAX_PACKET_QUEUE {
                     self.packet_queue.push_back(packet);
                 }
@@ -3960,6 +4049,7 @@ pub struct AlacDecoder {
     sample_idx: usize,
     packet_out_buf: Vec<i32>,
     pending_pcm: Vec<i32>,
+    pending_offset: usize,
     state: AlacState,
     bytes_to_skip: usize,
     first_chunk_offset: Option<usize>,
@@ -3987,6 +4077,7 @@ impl AlacDecoder {
             sample_idx: 0,
             packet_out_buf: Vec::new(),
             pending_pcm: Vec::new(),
+            pending_offset: 0,
             state: AlacState::SearchingAtoms,
             bytes_to_skip: 0,
             first_chunk_offset: None,
@@ -3995,7 +4086,7 @@ impl AlacDecoder {
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        !self.pending_pcm.is_empty()
+        self.pending_offset < self.pending_pcm.len()
             || (self.state == AlacState::ReadingMdat
                 && self.sample_idx < self.sample_sizes.len()
                 && self.stream_buf.len() >= self.sample_sizes[self.sample_idx])
@@ -4003,6 +4094,7 @@ impl AlacDecoder {
 
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
+        self.pending_offset = 0;
         self.stream_buf.clear();
         self.sample_sizes.clear();
         self.sample_idx = 0;
@@ -4030,15 +4122,18 @@ impl AudioDecoder for AlacDecoder {
         let mut frames_out = 0;
 
         // 1. Copy pending PCM from prior decode
-        if !self.pending_pcm.is_empty() {
-            let pending_frames = self.pending_pcm.len() / 2;
+        if self.pending_offset < self.pending_pcm.len() {
+            let pending_samples = self.pending_pcm.len() - self.pending_offset;
+            let pending_frames = pending_samples / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
             let samples = to_copy * 2;
-            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
-            if samples == self.pending_pcm.len() {
+            pcm_out[..samples].copy_from_slice(
+                &self.pending_pcm[self.pending_offset..self.pending_offset + samples],
+            );
+            self.pending_offset += samples;
+            if self.pending_offset >= self.pending_pcm.len() {
                 self.pending_pcm.clear();
-            } else {
-                self.pending_pcm.drain(..samples);
+                self.pending_offset = 0;
             }
             frames_out += to_copy;
             if frames_out >= max_frames {
@@ -4335,15 +4430,11 @@ impl AudioDecoder for AlacDecoder {
                             let available = max_frames.saturating_sub(frames_out);
                             let to_copy = core::cmp::min(packet_frames, available);
                             if ch == 2 {
-                                for i in 0..to_copy {
-                                    pcm_out[(frames_out + i) * 2] = samples[i * 2];
-                                    pcm_out[(frames_out + i) * 2 + 1] = samples[i * 2 + 1];
-                                }
+                                pcm_out[(frames_out * 2)..((frames_out + to_copy) * 2)]
+                                    .copy_from_slice(&samples[..to_copy * 2]);
                                 if to_copy < packet_frames {
-                                    for i in to_copy..packet_frames {
-                                        self.pending_pcm.push(samples[i * 2]);
-                                        self.pending_pcm.push(samples[i * 2 + 1]);
-                                    }
+                                    let rem = &samples[to_copy * 2..packet_frames * 2];
+                                    self.pending_pcm.extend_from_slice(rem);
                                 }
                             } else {
                                 for (i, &s) in samples[..to_copy].iter().enumerate() {
@@ -4351,6 +4442,7 @@ impl AudioDecoder for AlacDecoder {
                                     pcm_out[(frames_out + i) * 2 + 1] = s;
                                 }
                                 if to_copy < packet_frames {
+                                    self.pending_pcm.reserve((packet_frames - to_copy) * 2);
                                     for &s in &samples[to_copy..packet_frames] {
                                         self.pending_pcm.push(s);
                                         self.pending_pcm.push(s);
@@ -4416,6 +4508,7 @@ pub struct OpusDecoder {
     partial_packet: Vec<u8>,
     packet_queue: VecDeque<Vec<u8>>,
     pending_pcm: Vec<i32>,
+    pending_offset: usize,
     state: OpusState,
     float_buf: Vec<f32>,
 }
@@ -4438,19 +4531,21 @@ impl OpusDecoder {
             partial_packet: Vec::new(),
             packet_queue: VecDeque::new(),
             pending_pcm: Vec::new(),
+            pending_offset: 0,
             state: OpusState::WaitingHead,
             float_buf: vec![0.0f32; 11520],
         }
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        !self.pending_pcm.is_empty()
+        self.pending_offset < self.pending_pcm.len()
             || !self.packet_queue.is_empty()
             || self.stream_buf.len() >= 27
     }
 
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
+        self.pending_offset = 0;
         self.packet_queue.clear();
         self.partial_packet.clear();
         self.stream_buf.clear();
@@ -4483,10 +4578,7 @@ impl OpusDecoder {
                 .map_err(|_| DecoderError::InvalidHeader)?;
             self.sample_rate = 48000;
             self.channels = channels as u32;
-            self.state = OpusState::WaitingTags {
-                decoder,
-                pre_skip,
-            };
+            self.state = OpusState::WaitingTags { decoder, pre_skip };
             return Ok(());
         }
 
@@ -4553,19 +4645,28 @@ impl OpusDecoder {
         let to_copy = core::cmp::min(packet_frames, available);
         let ch = self.channels as usize;
 
+        let to_i32 = |s: f32| {
+            let scaled = s.clamp(-1.0, 1.0) * 2147483520.0;
+            if scaled >= 0.0 {
+                (scaled + 0.5) as i32
+            } else {
+                (scaled - 0.5) as i32
+            }
+        };
+
         if ch == 2 {
             for i in 0..to_copy {
                 let idx = (start_frame + i) * 2;
-                let l = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
-                let r = (self.float_buf[idx + 1].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                let l = to_i32(self.float_buf[idx]);
+                let r = to_i32(self.float_buf[idx + 1]);
                 pcm_out[(*frames_out + i) * 2] = l;
                 pcm_out[(*frames_out + i) * 2 + 1] = r;
             }
             if to_copy < packet_frames {
                 for i in to_copy..packet_frames {
                     let idx = (start_frame + i) * 2;
-                    let l = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
-                    let r = (self.float_buf[idx + 1].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                    let l = to_i32(self.float_buf[idx]);
+                    let r = to_i32(self.float_buf[idx + 1]);
                     self.pending_pcm.push(l);
                     self.pending_pcm.push(r);
                 }
@@ -4573,14 +4674,14 @@ impl OpusDecoder {
         } else {
             for i in 0..to_copy {
                 let idx = start_frame + i;
-                let s = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                let s = to_i32(self.float_buf[idx]);
                 pcm_out[(*frames_out + i) * 2] = s;
                 pcm_out[(*frames_out + i) * 2 + 1] = s;
             }
             if to_copy < packet_frames {
                 for i in to_copy..packet_frames {
                     let idx = start_frame + i;
-                    let s = (self.float_buf[idx].clamp(-1.0, 1.0) * 2147483520.0) as i32;
+                    let s = to_i32(self.float_buf[idx]);
                     self.pending_pcm.push(s);
                     self.pending_pcm.push(s);
                 }
@@ -4606,15 +4707,18 @@ impl AudioDecoder for OpusDecoder {
         let mut frames_out = 0;
 
         // 1. Copy pending PCM from prior decode
-        if !self.pending_pcm.is_empty() {
-            let pending_frames = self.pending_pcm.len() / 2;
+        if self.pending_offset < self.pending_pcm.len() {
+            let pending_samples = self.pending_pcm.len() - self.pending_offset;
+            let pending_frames = pending_samples / 2;
             let to_copy = core::cmp::min(pending_frames, max_frames);
             let samples = to_copy * 2;
-            pcm_out[..samples].copy_from_slice(&self.pending_pcm[..samples]);
-            if samples == self.pending_pcm.len() {
+            pcm_out[..samples].copy_from_slice(
+                &self.pending_pcm[self.pending_offset..self.pending_offset + samples],
+            );
+            self.pending_offset += samples;
+            if self.pending_offset >= self.pending_pcm.len() {
                 self.pending_pcm.clear();
-            } else {
-                self.pending_pcm.drain(..samples);
+                self.pending_offset = 0;
             }
             frames_out += to_copy;
             if frames_out >= max_frames {
@@ -4624,7 +4728,9 @@ impl AudioDecoder for OpusDecoder {
 
         // 2. Process queued complete packets
         while frames_out < max_frames && !self.packet_queue.is_empty() {
-            let Some(packet) = self.packet_queue.pop_front() else { break; };
+            let Some(packet) = self.packet_queue.pop_front() else {
+                break;
+            };
             self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
@@ -4737,12 +4843,7 @@ impl AudioDecoder for OpusDecoder {
 
             for packet in page_packets {
                 if frames_out < max_frames && self.packet_queue.is_empty() {
-                    self.decode_single_packet(
-                        &packet,
-                        pcm_out,
-                        &mut frames_out,
-                        max_frames,
-                    )?;
+                    self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
                 } else if self.packet_queue.len() < MAX_PACKET_QUEUE {
                     self.packet_queue.push_back(packet);
                 }
@@ -4780,8 +4881,7 @@ mod tests {
         let f2_r = (-2000i16).to_be_bytes();
 
         let encoded = [
-            f1_l[0], f1_l[1], f1_r[0], f1_r[1],
-            f2_l[0], f2_l[1], f2_r[0], f2_r[1],
+            f1_l[0], f1_l[1], f1_r[0], f1_r[1], f2_l[0], f2_l[1], f2_r[0], f2_r[1],
         ];
 
         let mut pcm_out = [0i32; 4];
@@ -4820,7 +4920,10 @@ mod tests {
         let mut decoder = PcmDecoder::new(16, 2, true);
         let encoded = [0u8; 8];
         let mut pcm_out = [0i32; 1]; // Less than 1 stereo frame (2 samples)
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::BufferOverflow));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::BufferOverflow)
+        );
     }
 
     #[test]
@@ -4828,7 +4931,10 @@ mod tests {
         let mut decoder = PcmDecoder::new(16, 2, true);
         let encoded = [0u8; 3]; // 3 bytes is less than 1 frame (4 bytes)
         let mut pcm_out = [0i32; 4];
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
     }
 
     #[test]
@@ -4836,10 +4942,16 @@ mod tests {
         let mut decoder = Mp3Decoder::new();
         let encoded = [0u8; 3];
         let mut pcm_out = vec![0i32; nanomp3_core::MAX_SAMPLES_PER_FRAME];
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
 
         let mut small_pcm = [0i32; 32];
-        assert_eq!(decoder.decode(&encoded, &mut small_pcm), Err(DecoderError::BufferOverflow));
+        assert_eq!(
+            decoder.decode(&encoded, &mut small_pcm),
+            Err(DecoderError::BufferOverflow)
+        );
     }
 
     #[test]
@@ -4896,7 +5008,10 @@ mod tests {
         let mut decoder = FlacDecoder::new();
         let encoded = [0u8; 3];
         let mut pcm_out = [0i32; 32];
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
     }
 
     #[test]
@@ -4905,13 +5020,19 @@ mod tests {
         let mut decoder = AacDecoder::new();
         let encoded = [0u8; 5];
         let mut pcm_out = [0i32; 32];
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
         assert_eq!(decoder.is_mp4, None);
 
         // 7 non-ADTS bytes (e.g. initial MP4 box fragment) must return
         // NeedMoreData without locking is_mp4
         let encoded7 = [0u8; 7];
-        assert_eq!(decoder.decode(&encoded7, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded7, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
         assert_eq!(decoder.is_mp4, None);
 
         // 7-byte valid ADTS header locks is_mp4 to Some(false)
@@ -4995,10 +5116,7 @@ mod tests {
     #[test]
     fn test_pcm_32bit_stereo_and_mono() {
         let mut dec_stereo = PcmDecoder::new(32, 2, true);
-        let encoded_stereo = [
-            0x10, 0x20, 0x30, 0x40,
-            0x50, 0x60, 0x70, 0x80,
-        ];
+        let encoded_stereo = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
         let mut pcm_out = [0i32; 2];
         let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
         assert_eq!(consumed, 8);
@@ -5043,7 +5161,9 @@ mod tests {
             assert!(aac.pending_pcm.is_empty());
 
             let mut vorbis = VorbisDecoder::new();
-            vorbis.pending_pcm.extend_from_slice(&[10 << 16, (-10) << 16, 20 << 16, (-20) << 16]);
+            vorbis
+                .pending_pcm
+                .extend_from_slice(&[10 << 16, (-10) << 16, 20 << 16, (-20) << 16]);
             let mut v_out = [0i32; 2];
             assert_eq!(vorbis.decode(&[], &mut v_out), Ok((0, 1)));
             assert_eq!(v_out, [10 << 16, (-10) << 16]);
@@ -5053,7 +5173,8 @@ mod tests {
             assert!(!vorbis.has_pending_pcm());
 
             let mut alac = AlacDecoder::new();
-            alac.pending_pcm.extend_from_slice(&[10 << 16, (-10) << 16, 20 << 16, (-20) << 16]);
+            alac.pending_pcm
+                .extend_from_slice(&[10 << 16, (-10) << 16, 20 << 16, (-20) << 16]);
             let mut a_out = [0i32; 2];
             assert_eq!(alac.decode(&[], &mut a_out), Ok((0, 1)));
             assert_eq!(a_out, [10 << 16, (-10) << 16]);
@@ -5118,10 +5239,7 @@ mod tests {
     #[test]
     fn test_pcm_32bit_le_stereo_and_mono() {
         let mut dec_stereo = PcmDecoder::new(32, 2, false);
-        let encoded_stereo = [
-            0x40, 0x30, 0x20, 0x10,
-            0x80, 0x70, 0x60, 0x50,
-        ];
+        let encoded_stereo = [0x40, 0x30, 0x20, 0x10, 0x80, 0x70, 0x60, 0x50];
         let mut pcm_out = [0i32; 2];
         let (consumed, frames) = dec_stereo.decode(&encoded_stereo, &mut pcm_out).unwrap();
         assert_eq!(consumed, 8);
@@ -5167,7 +5285,10 @@ mod tests {
         let mut decoder = VorbisDecoder::new();
         let encoded = [0u8; 3];
         let mut pcm_out = [0i32; 32];
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
     }
 
     #[test]
@@ -5198,7 +5319,10 @@ mod tests {
         let mut decoder = AlacDecoder::new();
         let encoded = [0u8; 3];
         let mut pcm_out = [0i32; 32];
-        assert_eq!(decoder.decode(&encoded, &mut pcm_out), Err(DecoderError::NeedMoreData));
+        assert_eq!(
+            decoder.decode(&encoded, &mut pcm_out),
+            Err(DecoderError::NeedMoreData)
+        );
     }
 
     #[test]
@@ -5261,8 +5385,7 @@ mod tests {
         let f2_l = (2000i16).to_le_bytes();
         let f2_r = (-2000i16).to_le_bytes();
         let pcm_data = [
-            f1_l[0], f1_l[1], f1_r[0], f1_r[1],
-            f2_l[0], f2_l[1], f2_r[0], f2_r[1],
+            f1_l[0], f1_l[1], f1_r[0], f1_r[1], f2_l[0], f2_l[1], f2_r[0], f2_r[1],
         ];
 
         let mut payload = [0u8; 52];
@@ -5299,9 +5422,8 @@ mod tests {
         header[22..26].copy_from_slice(&1u32.to_be_bytes());
         header[26..28].copy_from_slice(&16i16.to_be_bytes());
         // 44100 Hz in IEEE 754 80-bit extended:
-        header[28..38].copy_from_slice(&[
-            0x40, 0x0E, 0xAC, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ]);
+        header[28..38]
+            .copy_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         header[38..42].copy_from_slice(b"SSND");
         header[42..46].copy_from_slice(&12u32.to_be_bytes());
         header[46..50].copy_from_slice(&0u32.to_be_bytes());
@@ -5432,7 +5554,11 @@ mod tests {
         let res = dec.decode(&corrupted_frame, &mut pcm_out);
         assert!(res.is_ok(), "Expected Ok but got {:?}", res);
         let (consumed, frames) = res.unwrap();
-        assert!(consumed >= 417, "Expected at least 417 bytes consumed, got {}", consumed);
+        assert!(
+            consumed >= 417,
+            "Expected at least 417 bytes consumed, got {}",
+            consumed
+        );
         assert_eq!(frames, 0);
 
         // 2. Unmatched second header: first header matches sync, but byte at
@@ -5456,9 +5582,18 @@ mod tests {
     #[test]
     fn test_flac_cross_validation_all_fixtures() {
         let fixtures: &[(&str, &[u8])] = &[
-            ("mono_16bit.flac", include_bytes!("../tests/fixtures/mono_16bit.flac")),
-            ("stereo_16bit.flac", include_bytes!("../tests/fixtures/stereo_16bit.flac")),
-            ("stereo_24bit.flac", include_bytes!("../tests/fixtures/stereo_24bit.flac")),
+            (
+                "mono_16bit.flac",
+                include_bytes!("../tests/fixtures/mono_16bit.flac"),
+            ),
+            (
+                "stereo_16bit.flac",
+                include_bytes!("../tests/fixtures/stereo_16bit.flac"),
+            ),
+            (
+                "stereo_24bit.flac",
+                include_bytes!("../tests/fixtures/stereo_24bit.flac"),
+            ),
             ("fixed.flac", include_bytes!("../tests/fixtures/fixed.flac")),
             ("lpc.flac", include_bytes!("../tests/fixtures/lpc.flac")),
         ];
@@ -5679,7 +5814,9 @@ mod tests {
         let chunk1_end = 1024.min(flac_48k.len());
         decoder.flush();
         // First feed up to chunk1_end
-        let (_c_part1, _f_part1) = decoder.decode(&flac_48k[..chunk1_end], &mut pcm_out).unwrap();
+        let (_c_part1, _f_part1) = decoder
+            .decode(&flac_48k[..chunk1_end], &mut pcm_out)
+            .unwrap();
         assert_eq!(decoder.sample_rate, 48000);
 
         // Now flush mid-stream and feed next chunk without fLaC header
@@ -5849,7 +5986,11 @@ mod tests {
         let mut pos = 0usize;
         while pos < audio_bytes.len() {
             let chunk_end = (pos + 2048).min(audio_bytes.len());
-            let hdr_type = if chunk_end == audio_bytes.len() { 0x04 } else { 0x00 };
+            let hdr_type = if chunk_end == audio_bytes.len() {
+                0x04
+            } else {
+                0x00
+            };
             let page = build_ogg_page(
                 hdr_type,
                 (seq as u64) * 1024,
@@ -5946,8 +6087,7 @@ mod tests {
     #[test]
     fn test_aac_mp4_m4a_esds_demux_and_adts_synthesis_parity() {
         warm_up_decoders();
-        let adts_fixture =
-            include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+        let adts_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
 
         // 1. Extract raw AAC access units from the ADTS fixture (first 12 frames)
         let mut raw_aus: std::vec::Vec<&[u8]> = std::vec::Vec::new();
@@ -5989,8 +6129,8 @@ mod tests {
         let esds_payload: &[u8] = &[
             0x00, 0x00, 0x00, 0x00, // version + flags
             0x03, 23, 0x00, 0x01, 0x00, // ES_Descriptor
-            0x04, 15, 0x40, 0x15, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x01,
-            0xF4, 0x00, // DecoderConfigDescriptor (objectType = 0x40)
+            0x04, 15, 0x40, 0x15, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x01, 0xF4,
+            0x00, // DecoderConfigDescriptor (objectType = 0x40)
             0x05, 2, 0x12, 0x10, // DecoderSpecificInfo (AudioSpecificConfig)
         ];
         let esds_box = make_mp4_box(b"esds", esds_payload);
@@ -6135,8 +6275,7 @@ mod tests {
         let mut stsz_oversized = std::vec![0u8; 12];
         stsz_oversized[0..4].copy_from_slice(&0u32.to_be_bytes());
         stsz_oversized[4..8].copy_from_slice(&256u32.to_be_bytes()); // default_sz = 256
-        stsz_oversized[8..12]
-            .copy_from_slice(&((MAX_MP4_SAMPLES as u32) + 1).to_be_bytes());
+        stsz_oversized[8..12].copy_from_slice(&((MAX_MP4_SAMPLES as u32) + 1).to_be_bytes());
         let stsz_box = make_mp4_box(b"stsz", &stsz_oversized);
         let moov_box = make_mp4_box(b"moov", &stsz_box);
         let mut bad_m4a = std::vec::Vec::new();
@@ -6148,5 +6287,34 @@ mod tests {
             aac_dec.decode(&bad_m4a, &mut pcm_out),
             Err(DecodeError::UnsupportedFeature)
         );
+    }
+
+    #[test]
+    fn test_bitreader_u64_and_signed() {
+        // Test 33-bit and 64-bit signed and unsigned reading
+        let data = [
+            0x80, 0x00, 0x00, 0x00,
+            0x01, // 40 bits; first 33 bits: bit 32 is 1 (sign bit), bit 0 is 0
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 64 bits of 1s: -1i64
+        ];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_bits_u64(0), Ok(0));
+        assert_eq!(br.read_signed(0), Ok(0));
+
+        // Read 33 bits: 0x80, 0x00, 0x00, 0x00, high bit of 0x01 = 0
+        // Value: 1u64 << 32
+        let val33 = br.read_signed(33).expect("read 33 bits signed");
+        // bit 32 is sign bit, so this is negative: -(1i64 << 32)
+        assert_eq!(val33, -(1i64 << 32));
+
+        // Read remaining 7 bits of byte 4 + 57 bits of next bytes = 64 bits
+        let mut br2 = BitReader::new(&data[5..]);
+        let val64 = br2.read_signed(64).expect("read 64 bits signed");
+        assert_eq!(val64, -1i64);
+
+        let mut br3 = BitReader::new(&[0x01, 0x00, 0x00, 0x00, 0x00]);
+        // 33 bits where sign bit (bit 32) is 0: 0x0100000000 >> 7 = 0x02000000
+        let pos33 = br3.read_signed(33).expect("read positive 33 bits");
+        assert!(pos33 > 0);
     }
 }

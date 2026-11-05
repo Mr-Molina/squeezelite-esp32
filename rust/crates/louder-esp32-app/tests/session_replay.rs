@@ -149,7 +149,10 @@ fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
                 return stream;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(start.elapsed() < DEADLINE, "timed out waiting for connection");
+                assert!(
+                    start.elapsed() < DEADLINE,
+                    "timed out waiting for connection"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(e) => panic!("accept failed: {e}"),
@@ -212,7 +215,13 @@ struct Player<'a> {
 impl Player<'_> {
     fn tick(&mut self, now_ms: u32) {
         self.coordinator
-            .tick(&mut self.lms, &mut self.stream, &mut self.backend, &mut self.pipeline, now_ms)
+            .tick(
+                &mut self.lms,
+                &mut self.stream,
+                &mut self.backend,
+                &mut self.pipeline,
+                now_ms,
+            )
             .expect("coordinator tick");
     }
 }
@@ -285,7 +294,10 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
             NullAudioSink::new(44100),
             44100,
         ),
-        lms: Lms { client, frames_delivered: 0 },
+        lms: Lms {
+            client,
+            frames_delivered: 0,
+        },
         stream: HttpAudioStream::new(),
         backend: MockBackend::new(),
     };
@@ -331,8 +343,14 @@ fn run_scripted_session(script: &[ScriptStep]) -> Vec<ClientMessage> {
                 quiesce(&mut player, now_ms);
             }
             ScriptStep::StreamEof => {
-                drop(http_conn.take().expect("StreamEof before a stream was started"));
-                tick_until(&mut player, now_ms, "stream EOF", |p| p.coordinator.is_stream_eof());
+                drop(
+                    http_conn
+                        .take()
+                        .expect("StreamEof before a stream was started"),
+                );
+                tick_until(&mut player, now_ms, "stream EOF", |p| {
+                    p.coordinator.is_stream_eof()
+                });
                 quiesce(&mut player, now_ms);
             }
             ScriptStep::AdvanceMs(ms) => {

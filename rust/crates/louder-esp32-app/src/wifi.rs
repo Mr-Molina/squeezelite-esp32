@@ -91,7 +91,8 @@ impl SoftApConfig {
             return Err(StorageError::InvalidFormat);
         }
         let mut s = String::new();
-        s.push_str(ssid).map_err(|()| StorageError::CapacityExceeded)?;
+        s.push_str(ssid)
+            .map_err(|()| StorageError::CapacityExceeded)?;
         Ok(Self {
             ssid: s,
             password: String::new(),
@@ -367,7 +368,8 @@ impl ScannedAp {
             return Err(StorageError::InvalidFormat);
         }
         let mut s = String::new();
-        s.push_str(ssid).map_err(|()| StorageError::CapacityExceeded)?;
+        s.push_str(ssid)
+            .map_err(|()| StorageError::CapacityExceeded)?;
         Ok(Self {
             ssid: s,
             bssid,
@@ -492,7 +494,8 @@ impl KnownApEntry {
             return Err(StorageError::InvalidFormat);
         }
         let mut s = String::new();
-        s.push_str(ssid).map_err(|()| StorageError::CapacityExceeded)?;
+        s.push_str(ssid)
+            .map_err(|()| StorageError::CapacityExceeded)?;
         let mut p = String::new();
         p.push_str(password)
             .map_err(|()| StorageError::CapacityExceeded)?;
@@ -705,8 +708,8 @@ impl WifiCountryCode {
         }
         let c0 = bytes[0].to_ascii_uppercase();
         let c1 = bytes[1].to_ascii_uppercase();
-        let valid_chars = (c0.is_ascii_uppercase() && c1.is_ascii_uppercase())
-            || (c0 == b'0' && c1 == b'1');
+        let valid_chars =
+            (c0.is_ascii_uppercase() && c1.is_ascii_uppercase()) || (c0 == b'0' && c1 == b'1');
         if !valid_chars {
             return Err(StorageError::InvalidFormat);
         }
@@ -883,9 +886,15 @@ impl<S: KeyValueStorage> WifiManager<S> {
         self.retry_count = 0;
 
         self.config.ssid.clear();
-        self.config.ssid.push_str(ssid).map_err(|_| StorageError::CapacityExceeded)?;
+        self.config
+            .ssid
+            .push_str(ssid)
+            .map_err(|_| StorageError::CapacityExceeded)?;
         self.config.password.clear();
-        self.config.password.push_str(password).map_err(|_| StorageError::CapacityExceeded)?;
+        self.config
+            .password
+            .push_str(password)
+            .map_err(|_| StorageError::CapacityExceeded)?;
 
         // Persist to storage, preserving static IP settings if present
         // (CODE-CFG-001)
@@ -1136,19 +1145,34 @@ mod tests {
         let mut wifi = WifiManager::new();
 
         // Empty SSID fails
-        assert_eq!(wifi.connect("", "ValidPass123"), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            wifi.connect("", "ValidPass123"),
+            Err(StorageError::InvalidFormat)
+        );
 
         // SSID > 32 bytes fails
         let long_ssid = "This_SSID_Is_Way_Too_Long_Because_It_Exceeds_32_Bytes!";
-        assert_eq!(wifi.connect(long_ssid, "ValidPass123"), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            wifi.connect(long_ssid, "ValidPass123"),
+            Err(StorageError::InvalidFormat)
+        );
 
         // Short WPA2 passphrase (1..=7 bytes) fails
-        assert_eq!(wifi.connect("ValidSSID", "short"), Err(StorageError::InvalidFormat));
-        assert_eq!(wifi.connect("ValidSSID", "1234567"), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            wifi.connect("ValidSSID", "short"),
+            Err(StorageError::InvalidFormat)
+        );
+        assert_eq!(
+            wifi.connect("ValidSSID", "1234567"),
+            Err(StorageError::InvalidFormat)
+        );
 
         // Long WPA2 passphrase (> 63 bytes and not 64-hex raw PSK) fails
         let long_pass = "123456789012345678901234567890123456789012345678901234567890123z";
-        assert_eq!(wifi.connect("ValidSSID", long_pass), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            wifi.connect("ValidSSID", long_pass),
+            Err(StorageError::InvalidFormat)
+        );
 
         // 64-byte valid ASCII hex raw PSK succeeds
         let hex_psk = "1234567890123456789012345678901234567890123456789012345678901234";
@@ -1221,7 +1245,9 @@ mod tests {
         assert_eq!(wifi.current_backoff_ms(), 0);
 
         // Verify stored credentials contain new SSID/pass but preserved IP
-        let stored = WifiCredentials::load_from(wifi.store()).unwrap().expect("creds present");
+        let stored = WifiCredentials::load_from(wifi.store())
+            .unwrap()
+            .expect("creds present");
         assert_eq!(stored.ssid.as_str(), "NewSSID");
         assert_eq!(stored.passphrase.as_str(), "NewPassword456");
         assert_eq!(stored.static_ip, Some([192, 168, 1, 150]));
@@ -1242,14 +1268,16 @@ mod tests {
             0x00, 0x00, // NSCOUNT = 0
             0x00, 0x00, // ARCOUNT = 0
             // QNAME: 17 "connectivitycheck" 7 "gstatic" 3 "com" 0
-            17, b'c', b'o', b'n', b'n', b'e', b'c', b't', b'i', b'v', b'i', b't', b'y', b'c',
-            b'h', b'e', b'c', b'k', 7, b'g', b's', b't', b'a', b't', b'i', b'c', 3, b'c', b'o',
-            b'm', 0, // root label
+            17, b'c', b'o', b'n', b'n', b'e', b'c', b't', b'i', b'v', b'i', b't', b'y', b'c', b'h',
+            b'e', b'c', b'k', 7, b'g', b's', b't', b'a', b't', b'i', b'c', 3, b'c', b'o', b'm',
+            0, // root label
             0x00, 0x01, // QTYPE = A
             0x00, 0x01, // QCLASS = IN
         ];
         let mut resp = [0u8; 128];
-        let len = dns.build_response(&query, &mut resp).expect("valid dns hijack");
+        let len = dns
+            .build_response(&query, &mut resp)
+            .expect("valid dns hijack");
         assert_eq!(len, query.len() + 16);
         assert_eq!(&resp[0..2], &[0x12, 0x34]);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1); // ANCOUNT = 1
@@ -1292,7 +1320,7 @@ mod tests {
             0x08, 0x00, // Flags: Opcode = 1
             0x00, 0x01, // QDCOUNT = 1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR
-            0x00,       // root label
+            0x00, // root label
             0x00, 0x01, // QTYPE = A
             0x00, 0x01, // QCLASS = IN
         ];
@@ -1317,21 +1345,16 @@ mod tests {
     #[test]
     fn test_scan_table_and_4slot_known_ap_auto_pick() {
         let mut scan = WifiScanTable::new();
-        scan.upsert(
-            ScannedAp::new("Guest", [1; 6], -75, 1, WifiAuthMode::Open).expect("valid ap"),
-        );
+        scan.upsert(ScannedAp::new("Guest", [1; 6], -75, 1, WifiAuthMode::Open).expect("valid ap"));
         scan.upsert(
             ScannedAp::new("IoT_Basement", [2; 6], -52, 6, WifiAuthMode::Wpa2Psk)
                 .expect("valid ap"),
         );
         scan.upsert(
-            ScannedAp::new("Attic_Mesh", [3; 6], -60, 11, WifiAuthMode::Wpa2Psk)
-                .expect("valid ap"),
+            ScannedAp::new("Attic_Mesh", [3; 6], -60, 11, WifiAuthMode::Wpa2Psk).expect("valid ap"),
         );
         // Stronger duplicate updates existing SSID
-        scan.upsert(
-            ScannedAp::new("Guest", [1; 6], -68, 1, WifiAuthMode::Open).expect("valid ap"),
-        );
+        scan.upsert(ScannedAp::new("Guest", [1; 6], -68, 1, WifiAuthMode::Open).expect("valid ap"));
 
         assert_eq!(scan.len(), 3);
         assert_eq!(scan.entries()[0].ssid.as_str(), "IoT_Basement");
@@ -1340,14 +1363,24 @@ mod tests {
         assert_eq!(scan.entries()[2].rssi, -68);
 
         let mut known = KnownApList::new();
-        known.upsert("Attic_Mesh", "AtticPass123", 10).expect("slot 0");
-        known.upsert("IoT_Basement", "BasementPass123", 20).expect("slot 1");
-        known.upsert("Office_Net", "OfficePass123", 5).expect("slot 2");
-        known.upsert("Backup_Net", "BackupPass123", 1).expect("slot 3");
+        known
+            .upsert("Attic_Mesh", "AtticPass123", 10)
+            .expect("slot 0");
+        known
+            .upsert("IoT_Basement", "BasementPass123", 20)
+            .expect("slot 1");
+        known
+            .upsert("Office_Net", "OfficePass123", 5)
+            .expect("slot 2");
+        known
+            .upsert("Backup_Net", "BackupPass123", 1)
+            .expect("slot 3");
         assert_eq!(known.len(), 4);
 
         // 5th insert evicts lowest-priority slot ("Backup_Net" with priority 1)
-        known.upsert("HighPrio_Net", "HighPrioPass123", 50).expect("evict lowest");
+        known
+            .upsert("HighPrio_Net", "HighPrioPass123", 50)
+            .expect("evict lowest");
         assert_eq!(known.len(), 4);
         assert!((0..4).all(|i| known.slot(i).unwrap().ssid.as_str() != "Backup_Net"));
 
@@ -1367,8 +1400,10 @@ mod tests {
         .expect("valid static ip");
         assert!(static_ip.is_same_subnet([172, 22, 1, 200]));
         assert!(!static_ip.is_same_subnet([172, 22, 2, 1]));
-        assert!(StaticIpConfig::new([0, 0, 0, 0], [1, 1, 1, 1], [255, 255, 255, 0], [8, 8, 8, 8])
-            .is_err());
+        assert!(
+            StaticIpConfig::new([0, 0, 0, 0], [1, 1, 1, 1], [255, 255, 255, 0], [8, 8, 8, 8])
+                .is_err()
+        );
 
         let us = WifiCountryCode::parse("US").expect("US");
         assert_eq!(us.as_str(), "US");

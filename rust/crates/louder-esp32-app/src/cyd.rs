@@ -161,7 +161,9 @@ mod tests {
         let mut commands = std::vec::Vec::new();
 
         let stream = b"CMD=PLAY\nCMD=VOL:50\nCMD=NEXT\n";
-        controller.feed_all(stream, |cmd| commands.push(cmd)).unwrap();
+        controller
+            .feed_all(stream, |cmd| commands.push(cmd))
+            .unwrap();
 
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[0], CydCommand::Play);
@@ -196,7 +198,9 @@ mod tests {
         let mut controller = CydController::new();
 
         // Feed multiple commands in a single byte buffer (LOGIC-401)
-        let first = controller.feed_bytes(b"CMD=PLAY\nCMD=VOL:50\nCMD=PAUSE\n").unwrap();
+        let first = controller
+            .feed_bytes(b"CMD=PLAY\nCMD=VOL:50\nCMD=PAUSE\n")
+            .unwrap();
         assert_eq!(first, Some(CydCommand::Play));
 
         // Subsequent call with empty slice pops the next command from queue
@@ -221,7 +225,9 @@ mod tests {
         controller.feed_bytes(b"INVALID_CMD\n").unwrap();
         assert_eq!(controller.invalid_frame_count(), 1);
 
-        let cmd = controller.feed_bytes(b"CMD=UNKNOWN\nCMD=PLAY\nCMD=BAD\n").unwrap();
+        let cmd = controller
+            .feed_bytes(b"CMD=UNKNOWN\nCMD=PLAY\nCMD=BAD\n")
+            .unwrap();
         // 2 more invalid frames: UNKNOWN and BAD (total 3)
         assert_eq!(controller.invalid_frame_count(), 3);
         // Valid command PLAY was returned
@@ -236,7 +242,9 @@ mod tests {
         assert_eq!(controller.last_volume(), None);
 
         // State and volume updated after successful encode (LOGIC-402)
-        controller.format_message(&CydMessage::PlaybackState(PlayState::Playing)).unwrap();
+        controller
+            .format_message(&CydMessage::PlaybackState(PlayState::Playing))
+            .unwrap();
         assert_eq!(controller.last_state(), Some(PlayState::Playing));
 
         controller.format_message(&CydMessage::Volume(65)).unwrap();
@@ -260,7 +268,9 @@ mod tests {
         assert_eq!(controller.invalid_frame_count(), 0);
 
         // Feed CRLF and multiple empty lines - invalid_frame_count must not increment
-        let cmd = controller.feed_bytes(b"\r\n\n\r\nCMD=PLAY\r\n\r\n").unwrap();
+        let cmd = controller
+            .feed_bytes(b"\r\n\n\r\nCMD=PLAY\r\n\r\n")
+            .unwrap();
         assert_eq!(cmd, Some(CydCommand::Play));
         assert_eq!(controller.invalid_frame_count(), 0);
     }

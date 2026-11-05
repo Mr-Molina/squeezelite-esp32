@@ -52,6 +52,15 @@ opt-level = 2
 [profile.dev.package.lewton]
 opt-level = 2
 
+[profile.dev.package.squeezelite-tas58xx]
+opt-level = 2
+
+[profile.dev.package.squeezelite-cyd-link]
+opt-level = 2
+
+[profile.dev.package.cyd-controller-app]
+opt-level = 2
+
 [profile.release]
 opt-level = 2
 lto = false
@@ -83,6 +92,15 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.squeezelite-cspot]
+opt-level = 3
+
+[profile.release.package.squeezelite-tas58xx]
+opt-level = 3
+
+[profile.release.package.squeezelite-cyd-link]
+opt-level = 3
+
+[profile.release.package.cyd-controller-app]
 opt-level = 3
 
 [patch.crates-io]

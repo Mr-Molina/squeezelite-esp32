@@ -83,6 +83,9 @@ mod sealed {
 /// misrounds 0.49999997 (the sum rounds up to 1.0).
 #[inline(always)]
 fn round_i32(x: f32) -> i32 {
+    if !(x > -16_777_216.0 && x < 16_777_216.0) {
+        return x as i32;
+    }
     let t = x as i32; // truncates toward zero and saturates
     let frac = x - t as f32; // exact: |x| < 2^24 or x is integral
     if frac >= 0.5 {
@@ -666,6 +669,28 @@ impl BitCache<'_> {
 
     #[inline(always)]
     fn check(&mut self) {
+        if self.sh >= 0 && self.next + 4 <= self.buf.len() {
+            if let Ok(chunk) = <&[u8; 4]>::try_from(&self.buf[self.next..self.next + 4]) {
+                self.cache |= u32::from(chunk[0]) << self.sh;
+                self.next += 1;
+                self.sh -= 8;
+                if self.sh >= 0 {
+                    self.cache |= u32::from(chunk[1]) << self.sh;
+                    self.next += 1;
+                    self.sh -= 8;
+                    if self.sh >= 0 {
+                        self.cache |= u32::from(chunk[2]) << self.sh;
+                        self.next += 1;
+                        self.sh -= 8;
+                        if self.sh >= 0 {
+                            self.cache |= u32::from(chunk[3]) << self.sh;
+                            self.next += 1;
+                            self.sh -= 8;
+                        }
+                    }
+                }
+            }
+        }
         while self.sh >= 0 {
             self.cache |= self.byte(self.next) << self.sh;
             self.next += 1;
@@ -1324,6 +1349,12 @@ fn mp3d_synth<S: Sample, const NCH: usize>(
     pair(0, 15, 0);
     pair(32 * NCH, 31, 0);
 
+    let Ok(win_table): Result<&[[f32; 16]; 15], _> =
+        MP3D_SYNTH_G_WIN.as_chunks::<16>().0.try_into()
+    else {
+        return;
+    };
+
     for i in (0..15).rev() {
         lins[ZLIN + i] = [
             xl[18 * (31 - i)],
@@ -1336,13 +1367,7 @@ fn mp3d_synth<S: Sample, const NCH: usize>(
         lins[ZLIN - 16 + i][2] = xl[18 * (1 + i)];
         lins[ZLIN - 16 + i][3] = xr[18 * (1 + i)];
 
-        let w: &[f32; 16] = match MP3D_SYNTH_G_WIN.get((14 - i) * 16..(14 - i) * 16 + 16) {
-            Some(slice) => match slice.try_into() {
-                Ok(arr) => arr,
-                Err(_) => &[0.0; 16],
-            },
-            None => &[0.0; 16],
-        };
+        let w: &[f32; 16] = &win_table[14 - i];
         let vz = |k: usize| F4::load(&lins[ZLIN + i - 16 * k]);
         let vy = |k: usize| F4::load(&lins[i + 16 * k]);
         let w0 = |k: usize| F4::splat(w[2 * k]);

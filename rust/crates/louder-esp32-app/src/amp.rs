@@ -7,8 +7,8 @@
 use embedded_hal::i2c::I2c;
 pub use squeezelite_tas58xx::Tas5805mTelemetry;
 use squeezelite_tas58xx::{
-    DriverError, FaultStatus, Play, PowerDown, Standby, Tas58xx,
-    VOL_DEFAULT_M20DB, VOL_MUTE, VOL_UNITY_0DB,
+    DriverError, FaultStatus, Play, PowerDown, Standby, Tas58xx, VOL_DEFAULT_M20DB, VOL_MUTE,
+    VOL_UNITY_0DB,
 };
 
 /// Maps LMS logarithmic mixer gain (`0..=65536`) to perceptual hardware
@@ -288,8 +288,7 @@ where
                         self.inner = Some(AmpInner::Standby(standby));
                         return Err(e);
                     }
-                    if let Err(e) =
-                        standby.configure_silicon_maximization(self.current_again_code)
+                    if let Err(e) = standby.configure_silicon_maximization(self.current_again_code)
                     {
                         self.inner = Some(AmpInner::Standby(standby));
                         return Err(e);
@@ -595,17 +594,11 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // set_volume(0x40)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x40]),
             // stop_playback
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -658,14 +651,8 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume(0x50) in Standby
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x50]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x50]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -712,9 +699,6 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume(0x10) clamped to VOL_UNITY_0DB (0x30)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -754,22 +738,13 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // clear_faults in Standby
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
             // start_playback (program volume in Standby BEFORE unmuting to Play)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // clear_faults in Play
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -840,14 +815,8 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume_percent(0) -> 0xFF
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_MUTE]),
             // set_volume_percent(100) -> 0x30
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -870,8 +839,7 @@ mod tests {
         let addr = crate::board::pins::TAS58XX_I2C_ADDR;
         let expectations = [
             // First initialize attempt fails on first I2C write
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00])
-                .with_error(ErrorKind::Bus),
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]).with_error(ErrorKind::Bus),
             // Second initialize attempt succeeds because inner was preserved
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
@@ -946,7 +914,10 @@ mod tests {
         amp.stage_hiz().unwrap();
         amp.select_book_page(0x01, 0x02).unwrap();
 
-        assert_eq!(crate::board::BoardModel::LouderEsp32Wrover.cyd_uart_pins(), (4, 36));
+        assert_eq!(
+            crate::board::BoardModel::LouderEsp32Wrover.cyd_uart_pins(),
+            (4, 36)
+        );
 
         i2c.done();
     }
@@ -978,9 +949,6 @@ mod tests {
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback_via_hiz:
             // 1) set_digital_volume(0x58)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             // 2) try_start_playback_via_hiz sequence:
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x02]),
@@ -1011,7 +979,10 @@ mod tests {
         amp.set_analog_gain(0x0C).expect("set_analog_gain ok");
         assert_eq!(amp.analog_gain_code(), 0x0C);
 
-        let telem = amp.read_telemetry().expect("telemetry ok").expect("some telemetry");
+        let telem = amp
+            .read_telemetry()
+            .expect("telemetry ok")
+            .expect("some telemetry");
         assert_eq!(telem.detected_sample_rate_hz(), 44_100);
         assert_eq!(telem.bck_ratio(), 64);
         assert!(telem.is_pll_locked());

@@ -131,8 +131,8 @@ impl TrackMetadata {
             }
             if let Some(hex_id) = &self.artwork_image_id {
                 if !hex_id.is_empty() {
-                    let file_id_bytes = Self::decode_hex(hex_id)
-                        .unwrap_or_else(|| hex_id.as_bytes().to_vec());
+                    let file_id_bytes =
+                        Self::decode_hex(hex_id).unwrap_or_else(|| hex_id.as_bytes().to_vec());
                     let mut image_buf = Vec::new();
                     encode_varint(&mut image_buf, (1 << 3) | 2);
                     encode_varint(&mut image_buf, file_id_bytes.len() as u64);
@@ -145,10 +145,7 @@ impl TrackMetadata {
 
                     // Album field 17 (0x11): cover_group
                     encode_varint(&mut album_buf, (0x11 << 3) | 2);
-                    encode_varint(
-                        &mut album_buf,
-                        cover_group_buf.len() as u64,
-                    );
+                    encode_varint(&mut album_buf, cover_group_buf.len() as u64);
                     album_buf.extend_from_slice(&cover_group_buf);
                 }
             }
@@ -216,16 +213,12 @@ impl TrackMetadata {
 
                     match field_num {
                         2 => {
-                            let s = core::str::from_utf8(sub)
-                                .map_err(|_| SpircError::InvalidUtf8)?;
+                            let s =
+                                core::str::from_utf8(sub).map_err(|_| SpircError::InvalidUtf8)?;
                             title = s.to_string();
                         }
                         3 => {
-                            Self::parse_album_submessage(
-                                sub,
-                                &mut album,
-                                &mut artwork_image_id,
-                            )?;
+                            Self::parse_album_submessage(sub, &mut album, &mut artwork_image_id)?;
                         }
                         4 if artist.is_empty() => {
                             Self::parse_artist_submessage(sub, &mut artist)?;
@@ -252,10 +245,7 @@ impl TrackMetadata {
         })
     }
 
-    fn parse_artist_submessage(
-        data: &[u8],
-        artist_out: &mut String,
-    ) -> Result<(), SpircError> {
+    fn parse_artist_submessage(data: &[u8], artist_out: &mut String) -> Result<(), SpircError> {
         let mut pos = 0usize;
         while pos < data.len() {
             let key = decode_varint(data, &mut pos)?;
@@ -324,8 +314,7 @@ impl TrackMetadata {
                     pos += len;
 
                     if field_num == 2 {
-                        let s = core::str::from_utf8(sub)
-                            .map_err(|_| SpircError::InvalidUtf8)?;
+                        let s = core::str::from_utf8(sub).map_err(|_| SpircError::InvalidUtf8)?;
                         *album_out = s.to_string();
                     } else if field_num == 0x11 {
                         Self::parse_cover_group(sub, artwork_out)?;
@@ -343,10 +332,7 @@ impl TrackMetadata {
         Ok(())
     }
 
-    fn parse_cover_group(
-        data: &[u8],
-        artwork_out: &mut Option<String>,
-    ) -> Result<(), SpircError> {
+    fn parse_cover_group(data: &[u8], artwork_out: &mut Option<String>) -> Result<(), SpircError> {
         let mut pos = 0usize;
         while pos < data.len() {
             let key = decode_varint(data, &mut pos)?;
@@ -412,8 +398,8 @@ impl TrackMetadata {
                     let raw = &data[pos..pos + len];
                     pos += len;
                     if field_num == 1 && !raw.is_empty() {
-                        let is_ascii_hex = raw.len() >= 32
-                            && raw.iter().all(|b| b.is_ascii_hexdigit());
+                        let is_ascii_hex =
+                            raw.len() >= 32 && raw.iter().all(|b| b.is_ascii_hexdigit());
                         if is_ascii_hex {
                             if let Ok(s) = core::str::from_utf8(raw) {
                                 *artwork_out = Some(s.to_ascii_lowercase());
@@ -623,11 +609,7 @@ pub fn encode_varint(buf: &mut Vec<u8>, mut val: u64) {
 }
 
 /// Skips an unknown protobuf field according to its wire type.
-pub fn skip_unknown_field(
-    wire_type: u8,
-    data: &[u8],
-    pos: &mut usize,
-) -> Result<(), SpircError> {
+pub fn skip_unknown_field(wire_type: u8, data: &[u8], pos: &mut usize) -> Result<(), SpircError> {
     match wire_type {
         0 => {
             let _ = decode_varint(data, pos)?;
@@ -833,8 +815,7 @@ impl SpircFrame {
                                 }
                                 sub_pos += 8;
                             } else if wt_sub == 2 {
-                                let l =
-                                    decode_varint(sub_data, &mut sub_pos)? as usize;
+                                let l = decode_varint(sub_data, &mut sub_pos)? as usize;
                                 if sub_pos + l > sub_data.len() {
                                     break;
                                 }
@@ -863,50 +844,33 @@ impl SpircFrame {
                                 }
                                 sub_pos += 8;
                             } else if wt_sub == 2 {
-                                let l =
-                                    decode_varint(sub_data, &mut sub_pos)? as usize;
+                                let l = decode_varint(sub_data, &mut sub_pos)? as usize;
                                 if sub_pos + l > sub_data.len() {
                                     break;
                                 }
                                 if fn_sub == 27 {
                                     // TrackRef submessage
-                                    let track_slice =
-                                        &sub_data[sub_pos..sub_pos + l];
+                                    let track_slice = &sub_data[sub_pos..sub_pos + l];
                                     let mut t_pos = 0;
                                     while t_pos < track_slice.len() {
-                                        let tk = decode_varint(
-                                            track_slice,
-                                            &mut t_pos,
-                                        )?;
+                                        let tk = decode_varint(track_slice, &mut t_pos)?;
                                         let t_fn = (tk >> 3) as u32;
                                         let t_wt = (tk & 0x07) as u8;
                                         if t_wt == 2 {
-                                            let tl = decode_varint(
-                                                track_slice,
-                                                &mut t_pos,
-                                            )?
-                                                as usize;
+                                            let tl =
+                                                decode_varint(track_slice, &mut t_pos)? as usize;
                                             if t_pos + tl > track_slice.len() {
                                                 break;
                                             }
                                             if t_fn == 2 {
-                                                let str_bytes = &track_slice
-                                                    [t_pos..t_pos + tl];
-                                                if let Ok(uri) =
-                                                    core::str::from_utf8(
-                                                        str_bytes,
-                                                    )
-                                                {
-                                                    track_uri =
-                                                        Some(uri.to_string());
+                                                let str_bytes = &track_slice[t_pos..t_pos + tl];
+                                                if let Ok(uri) = core::str::from_utf8(str_bytes) {
+                                                    track_uri = Some(uri.to_string());
                                                 }
                                             }
                                             t_pos += tl;
                                         } else if t_wt == 0 {
-                                            let _ = decode_varint(
-                                                track_slice,
-                                                &mut t_pos,
-                                            )?;
+                                            let _ = decode_varint(track_slice, &mut t_pos)?;
                                         } else if t_wt == 1 {
                                             if t_pos + 8 > track_slice.len() {
                                                 break;
@@ -1036,10 +1000,8 @@ impl SpircStateMachine {
             self.playing_track_index = 0;
             self.current_track = None;
         } else {
-            self.playing_track_index =
-                core::cmp::min(start_index, self.track_queue.len() - 1);
-            self.current_track =
-                Some(self.track_queue[self.playing_track_index].clone());
+            self.playing_track_index = core::cmp::min(start_index, self.track_queue.len() - 1);
+            self.current_track = Some(self.track_queue[self.playing_track_index].clone());
         }
     }
 
@@ -1063,9 +1025,7 @@ impl SpircStateMachine {
     /// and emits `Seek`.
     pub fn seek(&mut self, position_ms: u32) -> SpircEvent {
         let clamped = match &self.metadata {
-            Some(meta) if meta.duration_ms > 0 => {
-                core::cmp::min(position_ms, meta.duration_ms)
-            }
+            Some(meta) if meta.duration_ms > 0 => core::cmp::min(position_ms, meta.duration_ms),
             _ => position_ms,
         };
         self.position_ms = clamped;
@@ -1096,12 +1056,9 @@ impl SpircStateMachine {
     /// returns `TrackEnded`.
     pub fn notify_track_ended(&mut self) -> SpircEvent {
         self.position_ms = 0;
-        if !self.track_queue.is_empty()
-            && self.playing_track_index + 1 < self.track_queue.len()
-        {
+        if !self.track_queue.is_empty() && self.playing_track_index + 1 < self.track_queue.len() {
             self.playing_track_index += 1;
-            self.current_track =
-                Some(self.track_queue[self.playing_track_index].clone());
+            self.current_track = Some(self.track_queue[self.playing_track_index].clone());
             self.status = PlayStatus::Play;
         } else {
             self.status = PlayStatus::Stop;
@@ -1138,9 +1095,7 @@ impl SpircStateMachine {
                     && self.playing_track_index + 1 < self.track_queue.len()
                 {
                     self.playing_track_index += 1;
-                    self.current_track = Some(
-                        self.track_queue[self.playing_track_index].clone(),
-                    );
+                    self.current_track = Some(self.track_queue[self.playing_track_index].clone());
                 } else {
                     self.status = PlayStatus::Stop;
                     self.position_ms = 0;
@@ -1153,15 +1108,11 @@ impl SpircStateMachine {
                 self.metadata = None;
                 if !self.track_queue.is_empty() && self.playing_track_index > 0 {
                     self.playing_track_index -= 1;
-                    self.current_track = Some(
-                        self.track_queue[self.playing_track_index].clone(),
-                    );
+                    self.current_track = Some(self.track_queue[self.playing_track_index].clone());
                 }
                 Some(SpircEvent::Prev)
             }
-            SpircMessageType::Seek => {
-                frame.position_ms.map(|pos| self.seek(pos))
-            }
+            SpircMessageType::Seek => frame.position_ms.map(|pos| self.seek(pos)),
             SpircMessageType::Volume => {
                 if let Some(vol) = frame.volume {
                     self.set_volume(vol);
@@ -1199,9 +1150,7 @@ impl SpircStateMachine {
                 self.is_active = false;
                 None
             }
-            SpircMessageType::Shuffle | SpircMessageType::Repeat => {
-                Some(SpircEvent::Notify)
-            }
+            SpircMessageType::Shuffle | SpircMessageType::Repeat => Some(SpircEvent::Notify),
             SpircMessageType::Notify => Some(SpircEvent::Notify),
             _ => None,
         }

@@ -433,11 +433,11 @@ impl<S: TcpSocketOps, St: BorrowMut<HttpStreamState>> SmoltcpStreamSource<S, St>
                         parsed
                     } else {
                         // Reuse initial stream's IP if host matches, with updated port.
-                        let (host_part, port_part) =
-                            match authority.iter().position(|&b| b == b':') {
-                                Some(idx) => (&authority[..idx], Some(&authority[idx + 1..])),
-                                None => (authority, None),
-                            };
+                        let (host_part, port_part) = match authority.iter().position(|&b| b == b':')
+                        {
+                            Some(idx) => (&authority[..idx], Some(&authority[idx + 1..])),
+                            None => (authority, None),
+                        };
                         let initial_host_part = match st.host.iter().position(|&b| b == b':') {
                             Some(idx) => &st.host[..idx],
                             None => &st.host[..],

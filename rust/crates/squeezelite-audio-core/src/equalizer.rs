@@ -14,8 +14,7 @@ pub const EQ_BANDS_HZ: [f32; 10] = [
 pub const DEFAULT_EQ_Q: f32 = core::f32::consts::SQRT_2;
 
 /// Fletcher-Munson reference boost (in dB) at maximum loudness compensation.
-const LOUDNESS_REFERENCE_CONTOUR_DB: [f32; 10] =
-    [9.0, 7.5, 5.5, 3.0, 1.0, 0.0, 0.0, 1.5, 3.0, 4.5];
+const LOUDNESS_REFERENCE_CONTOUR_DB: [f32; 10] = [9.0, 7.5, 5.5, 3.0, 1.0, 0.0, 0.0, 1.5, 3.0, 4.5];
 
 /// Filter coefficients for a second-order IIR biquad filter section:
 /// $H(z) = \frac{b_0 + b_1 z^{-1} + b_2 z^{-2}}{1 + a_1 z^{-1} + a_2 z^{-2}}$
@@ -151,8 +150,8 @@ fn sin_f64(x: f64) -> f64 {
     let c13 = 1.0 / 6_227_020_800.0;
     let c15 = -1.0 / 1_307_674_368_000.0;
 
-    let poly = 1.0
-        + u2 * (c3 + u2 * (c5 + u2 * (c7 + u2 * (c9 + u2 * (c11 + u2 * (c13 + u2 * c15))))));
+    let poly =
+        1.0 + u2 * (c3 + u2 * (c5 + u2 * (c7 + u2 * (c9 + u2 * (c11 + u2 * (c13 + u2 * c15))))));
     angle * poly
 }
 
@@ -421,6 +420,10 @@ pub enum EqualizerError {
 
 impl<const BANDS: usize> Equalizer<BANDS> {
     pub const fn new() -> Self {
+        assert!(
+            BANDS <= 16,
+            "Equalizer active_mask supports at most 16 bands"
+        );
         Self {
             filters: [BiquadCoeffs {
                 b0: 1.0,
@@ -468,8 +471,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         }
         self.filters[band] = coeffs;
         if band < 16 {
-            let gain_active =
-                self.gains_db[band].is_finite() && self.gains_db[band].abs() > 1e-4;
+            let gain_active = self.gains_db[band].is_finite() && self.gains_db[band].abs() > 1e-4;
             if gain_active || coeffs != BiquadCoeffs::BYPASS {
                 self.active_mask |= 1u16 << band;
             } else {
@@ -551,6 +553,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         const DENORM: f32 = 2147483648.0;
         const MAX_F32_I32: f32 = 2147483520.0; // Largest representable f32 <= i32::MAX
         const MIN_F32_I32: f32 = i32::MIN as f32;
+        const ANTI_DENORMAL_DC: f32 = 1e-25_f32;
 
         let loud_gain = if self.loudness_enabled {
             horner_loudness(0.5)
@@ -559,15 +562,25 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         };
         let out_scale = DENORM * loud_gain;
 
+        let mut active_indices = [0usize; BANDS];
+        let mut active_count = 0;
+        let mut mask = self.active_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if i < BANDS {
+                active_indices[active_count] = i;
+                active_count += 1;
+            }
+        }
+        let active_bands = &active_indices[..active_count];
+
         let mut chunks = samples.chunks_exact_mut(2);
         for chunk in &mut chunks {
             let mut l = chunk[0] as f32 * NORM;
             let mut r = chunk[1] as f32 * NORM;
 
-            let mut mask = self.active_mask;
-            while mask != 0 {
-                let i = mask.trailing_zeros() as usize;
-                mask &= mask - 1;
+            for &i in active_bands {
                 let f = &self.filters[i];
 
                 // Left channel biquad (Direct Form II Transposed)
@@ -579,10 +592,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
                     out_l = 0.0;
                 } else {
                     *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
-                    *z2_l = f.b2 * l - f.a2 * out_l;
-                    // Flush subnormal floats to prevent CPU traps (DSP-006)
-                    if z1_l.abs() < 1e-15 { *z1_l = 0.0; }
-                    if z2_l.abs() < 1e-15 { *z2_l = 0.0; }
+                    *z2_l = f.b2 * l - f.a2 * out_l + ANTI_DENORMAL_DC;
                 }
                 l = out_l;
 
@@ -595,9 +605,7 @@ impl<const BANDS: usize> Equalizer<BANDS> {
                     out_r = 0.0;
                 } else {
                     *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
-                    *z2_r = f.b2 * r - f.a2 * out_r;
-                    if z1_r.abs() < 1e-15 { *z1_r = 0.0; }
-                    if z2_r.abs() < 1e-15 { *z2_r = 0.0; }
+                    *z2_r = f.b2 * r - f.a2 * out_r + ANTI_DENORMAL_DC;
                 }
                 r = out_r;
             }
@@ -607,13 +615,46 @@ impl<const BANDS: usize> Equalizer<BANDS> {
             chunk[0] = if scaled_l.is_nan() {
                 0
             } else {
-                scaled_l.clamp(MIN_F32_I32, MAX_F32_I32) as i32
+                let rounded = if scaled_l >= 0.0 {
+                    scaled_l + 0.5
+                } else {
+                    scaled_l - 0.5
+                };
+                rounded.clamp(MIN_F32_I32, MAX_F32_I32) as i32
             };
             chunk[1] = if scaled_r.is_nan() {
                 0
             } else {
-                scaled_r.clamp(MIN_F32_I32, MAX_F32_I32) as i32
+                let rounded = if scaled_r >= 0.0 {
+                    scaled_r + 0.5
+                } else {
+                    scaled_r - 0.5
+                };
+                rounded.clamp(MIN_F32_I32, MAX_F32_I32) as i32
             };
+        }
+
+        // Flush subnormal floats to prevent CPU traps once per active band after
+        // sample loop (DSP-006 / AUD2-FPU-001).
+        // Bitspace check (|z| < 1e-15_f32) avoids hardware FPU float
+        // comparisons on subnormals.
+        const SUBNORMAL_THRESHOLD_BITS: u32 = 0x268D_4FDF;
+        for &i in active_bands {
+            let (z1_l, z2_l) = &mut self.hist_left[i];
+            if (z1_l.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+                *z1_l = 0.0;
+            }
+            if (z2_l.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+                *z2_l = 0.0;
+            }
+
+            let (z1_r, z2_r) = &mut self.hist_right[i];
+            if (z1_r.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+                *z1_r = 0.0;
+            }
+            if (z2_r.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+                *z2_r = 0.0;
+            }
         }
     }
 }
@@ -1183,7 +1224,10 @@ mod tests {
             .iter()
             .chain(eq.hist_right.iter())
             .any(|&(z1, z2)| z1 != 0.0 || z2 != 0.0);
-        assert!(has_active_history, "history should be populated after frame");
+        assert!(
+            has_active_history,
+            "history should be populated after frame"
+        );
 
         // Retune with new volume/loudness gains at the same sample rate
         let gains2 = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
@@ -1196,7 +1240,10 @@ mod tests {
             .iter()
             .chain(eq.hist_right.iter())
             .any(|&(z1, z2)| z1 != 0.0 || z2 != 0.0);
-        assert!(history_preserved, "history must NOT be zeroed when retuning active EQ");
+        assert!(
+            history_preserved,
+            "history must NOT be zeroed when retuning active EQ"
+        );
 
         // Transitioning to disabled (all zeros) must reset history
         let gains_zero = [0.0; 10];
@@ -1207,7 +1254,10 @@ mod tests {
             .iter()
             .chain(eq.hist_right.iter())
             .all(|&(z1, z2)| z1 == 0.0 && z2 == 0.0);
-        assert!(history_zeroed, "history must be zeroed when transitioning to disabled");
+        assert!(
+            history_zeroed,
+            "history must be zeroed when transitioning to disabled"
+        );
     }
 
     #[test]
@@ -1228,7 +1278,11 @@ mod tests {
             let theta = (n as f32) * core::f32::consts::TAU * 62.5 / 44_100.0;
             // Taylor-series / Bhaskara sine approximation for no_std test compatibility
             let x = theta % core::f32::consts::TAU;
-            let x_pi = if x > core::f32::consts::PI { x - core::f32::consts::TAU } else { x };
+            let x_pi = if x > core::f32::consts::PI {
+                x - core::f32::consts::TAU
+            } else {
+                x
+            };
             let sin_val = (16.0 * x_pi * (core::f32::consts::PI - x_pi.abs()))
                 / (5.0 * core::f32::consts::PI * core::f32::consts::PI
                     - 4.0 * x_pi.abs() * (core::f32::consts::PI - x_pi.abs()));
@@ -1238,7 +1292,10 @@ mod tests {
                 peak_out = l.abs();
             }
         }
-        assert!(peak_out > 125_000, "BassBoost should boost 62.5 Hz (peak={peak_out})");
+        assert!(
+            peak_out > 125_000,
+            "BassBoost should boost 62.5 Hz (peak={peak_out})"
+        );
 
         // Verify Flat bypasses EQ (0-cycle passthrough)
         eq.apply_preset(EqPreset::Flat);
@@ -1278,10 +1335,16 @@ mod tests {
         assert_eq!(EqPreset::from_str("flat").unwrap(), EqPreset::Flat);
         assert_eq!(EqPreset::from_str("eq_flat").unwrap(), EqPreset::Flat);
         assert_eq!(EqPreset::from_str("Bass").unwrap(), EqPreset::BassBoost);
-        assert_eq!(EqPreset::from_str("BassBoost").unwrap(), EqPreset::BassBoost);
+        assert_eq!(
+            EqPreset::from_str("BassBoost").unwrap(),
+            EqPreset::BassBoost
+        );
         assert_eq!(EqPreset::from_str("eq_bass").unwrap(), EqPreset::BassBoost);
         assert_eq!(EqPreset::from_str("Loudness").unwrap(), EqPreset::Loudness);
-        assert_eq!(EqPreset::from_str("eq_loudness").unwrap(), EqPreset::Loudness);
+        assert_eq!(
+            EqPreset::from_str("eq_loudness").unwrap(),
+            EqPreset::Loudness
+        );
         assert_eq!(EqPreset::from_str("Vocal").unwrap(), EqPreset::Vocal);
         assert_eq!(EqPreset::from_str("Voice").unwrap(), EqPreset::Vocal);
         assert_eq!(EqPreset::from_str("eq_voice").unwrap(), EqPreset::Vocal);
@@ -1354,7 +1417,10 @@ mod tests {
         let q30_tol = (1e-6_f64 * f64::from(BiquadCoeffs::ONE_Q30)) as i32 + 1;
         for (fs, expected) in cases {
             let actual = design_peaking(1000.0, 1.414, 6.0, fs);
-            assert!(actual.is_stable(), "coeffs at fs={fs} must be stable: {actual:?}");
+            assert!(
+                actual.is_stable(),
+                "coeffs at fs={fs} must be stable: {actual:?}"
+            );
             assert!(
                 (actual.b0 - expected.b0).abs() < 1e-6,
                 "b0 mismatch at fs={fs}: got {}, expected {}",
@@ -1400,18 +1466,25 @@ mod tests {
     fn test_retune_on_rate_change_keeps_stability() {
         let mut eq = Equalizer::<10>::new();
         let gains = preset_gains_db(EqPreset::Rock);
-        let rates = [22_050.0_f32, 44_100.0, 48_000.0, 88_200.0, 96_000.0, 192_000.0];
+        let rates = [
+            22_050.0_f32,
+            44_100.0,
+            48_000.0,
+            88_200.0,
+            96_000.0,
+            192_000.0,
+        ];
 
         let mut prev_b1 = 0.0_f32;
         for &fs in &rates {
             let _ = eq.process_frame(200_000, -200_000);
             eq.retune(&gains, fs);
-            assert!(eq.is_enabled(), "retune with active gains at {fs} must enable EQ");
+            assert!(
+                eq.is_enabled(),
+                "retune with active gains at {fs} must enable EQ"
+            );
             for (band_idx, c) in eq.filters().iter().enumerate() {
-                assert!(
-                    c.is_stable(),
-                    "band {band_idx} unstable at fs={fs}: {c:?}"
-                );
+                assert!(c.is_stable(), "band {band_idx} unstable at fs={fs}: {c:?}");
             }
             // At 22.05 kHz, band 9 (16 kHz >= 0.495 * 22.05 kHz) bypasses.
             if fs == 22_050.0 {
@@ -1499,5 +1572,55 @@ mod tests {
             );
             prev_vol_gains = cur;
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "Equalizer active_mask supports at most 16 bands")]
+    fn test_equalizer_bands_over_16_panics() {
+        let _ = Equalizer::<17>::new();
+    }
+
+    #[test]
+    fn test_equalizer_subnormal_flushing_bitspace() {
+        let mut eq = Equalizer::<10>::new();
+        eq.set_enabled(true);
+        // Activate band 0 with non-bypass filter so it is processed in active_bands
+        assert!(eq
+            .set_filter(
+                0,
+                BiquadCoeffs {
+                    b0: 1.0,
+                    b1: 0.0,
+                    b2: 0.0,
+                    a1: 0.0,
+                    a2: 0.0,
+                }
+            )
+            .is_ok());
+        // Force active_mask to include band 0 even if coeffs resemble bypass
+        eq.active_mask = 1;
+
+        let mut samples = [0i32; 2];
+        eq.process_interleaved(&mut samples);
+
+        // Delay registers should be zeroed (ANTI_DENORMAL_DC 1e-25 is
+        // < 1e-15 threshold).
+        assert_eq!(eq.hist_left[0], (0.0, 0.0));
+        assert_eq!(eq.hist_right[0], (0.0, 0.0));
+    }
+
+    #[test]
+    fn test_equalizer_symmetric_rounding() {
+        let mut eq = Equalizer::<1>::new();
+        eq.set_enabled(true);
+        assert!(eq.set_filter(0, BiquadCoeffs::BYPASS).is_ok());
+
+        // Pass 1 sample in and verify symmetric round-to-nearest
+        // Positive and negative non-zero input
+        let mut samples = [1000i32, -1000i32];
+        eq.process_interleaved(&mut samples);
+        // Bypass filter preserves value accurately with round-to-nearest
+        assert_eq!(samples[0], 1000);
+        assert_eq!(samples[1], -1000);
     }
 }

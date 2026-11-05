@@ -85,7 +85,10 @@ fn op() -> impl Strategy<Value = Op> {
 /// (track, index).
 fn frame_id(bytes: &[u8]) -> (i32, i32) {
     let left = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) >> 16;
-    (left / i32::from(TRACK_STRIDE), left % i32::from(TRACK_STRIDE))
+    (
+        left / i32::from(TRACK_STRIDE),
+        left % i32::from(TRACK_STRIDE),
+    )
 }
 
 fn pcm(track: i16, from: usize, frames: usize) -> Vec<u8> {
@@ -104,9 +107,16 @@ fn check_marker(
     p: &StreamPipeline<'_, LimitedSink>,
     current_track: i16,
 ) -> Result<(), TestCaseError> {
-    let Some(marker) = p.track_marker().copied() else { return Ok(()) };
+    let Some(marker) = p.track_marker().copied() else {
+        return Ok(());
+    };
     let unread = p.output_buffer_available() as u64;
-    prop_assert_eq!(marker.bytes_ahead % 8, 0, "boundary off a frame: {:?}", marker);
+    prop_assert_eq!(
+        marker.bytes_ahead % 8,
+        0,
+        "boundary off a frame: {:?}",
+        marker
+    );
     prop_assert!(
         marker.bytes_ahead <= unread,
         "boundary past the written data: {:?} unread {}",
@@ -123,7 +133,11 @@ fn check_marker(
         if at > 0 {
             // The frame just before the boundary belongs to an older track.
             let (before, _) = frame_id(&buf[at - 8..at]);
-            prop_assert!(before < track, "frame before the boundary is from track {}", before);
+            prop_assert!(
+                before < track,
+                "frame before the boundary is from track {}",
+                before
+            );
         }
     }
     Ok(())

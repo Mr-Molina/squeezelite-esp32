@@ -309,21 +309,14 @@ pub enum ServerCommand<'a> {
         preamp: u8,
     },
     /// Set audio output device setting or sample rate (`setd`).
-    SetDevice {
-        sample_rate: u32,
-    },
+    SetDevice { sample_rate: u32 },
     /// Flush playback buffer (`flsh`).
     Flush,
     /// Metadata body packet (`body`).
-    Body {
-        data: &'a [u8],
-    },
+    Body { data: &'a [u8] },
     /// Extended or unrecognized packet opcode (`setd` variable data, `aude`,
     /// `cont`, `serv`, `vers`, `dsco`, etc.).
-    Unknown {
-        opcode: [u8; 4],
-        payload: &'a [u8],
-    },
+    Unknown { opcode: [u8; 4], payload: &'a [u8] },
 }
 
 impl<'a> ServerCommand<'a> {
@@ -473,8 +466,29 @@ impl<'a> ServerCommand<'a> {
 /// Zero-allocation parser for SlimProto frame sequences.
 pub struct SlimprotoParser;
 
+pub const OPCODE_STRM: u32 = u32::from_be_bytes(*b"strm");
+pub const OPCODE_AUDG: u32 = u32::from_be_bytes(*b"audg");
+pub const OPCODE_SETD: u32 = u32::from_be_bytes(*b"setd");
+pub const OPCODE_FLSH: u32 = u32::from_be_bytes(*b"flsh");
+pub const OPCODE_BODY: u32 = u32::from_be_bytes(*b"body");
+pub const OPCODE_AUDE: u32 = u32::from_be_bytes(*b"aude");
+pub const OPCODE_CONT: u32 = u32::from_be_bytes(*b"cont");
+pub const OPCODE_SERV: u32 = u32::from_be_bytes(*b"serv");
+pub const OPCODE_VERS: u32 = u32::from_be_bytes(*b"vers");
+pub const OPCODE_DSCO: u32 = u32::from_be_bytes(*b"dsco");
+
 impl SlimprotoParser {
     pub const MAX_FRAME_LENGTH: usize = 4096;
+    pub const OP_STRM: u32 = OPCODE_STRM;
+    pub const OP_AUDG: u32 = OPCODE_AUDG;
+    pub const OP_SETD: u32 = OPCODE_SETD;
+    pub const OP_FLSH: u32 = OPCODE_FLSH;
+    pub const OP_BODY: u32 = OPCODE_BODY;
+    pub const OP_AUDE: u32 = OPCODE_AUDE;
+    pub const OP_CONT: u32 = OPCODE_CONT;
+    pub const OP_SERV: u32 = OPCODE_SERV;
+    pub const OP_VERS: u32 = OPCODE_VERS;
+    pub const OP_DSCO: u32 = OPCODE_DSCO;
 
     /// Parses a single SlimProto frame from a byte slice.
     ///
@@ -490,7 +504,10 @@ impl SlimprotoParser {
         }
 
         let (opcode, payload, total_frame_len) = if !buf[0].is_ascii_alphabetic()
-            && buf[2..6].iter().all(|b| b.is_ascii_alphanumeric() || *b == b' ')
+            && (buf[2].is_ascii_alphanumeric() || buf[2] == b' ')
+            && (buf[3].is_ascii_alphanumeric() || buf[3] == b' ')
+            && (buf[4].is_ascii_alphanumeric() || buf[4] == b' ')
+            && (buf[5].is_ascii_alphanumeric() || buf[5] == b' ')
         {
             let length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
             if length < 4 {
@@ -530,17 +547,17 @@ impl SlimprotoParser {
             (opcode, payload, total_frame_len)
         };
 
-        let cmd = match &opcode {
-            b"strm" => Self::parse_strm(payload)?,
-            b"audg" => Self::parse_audg(payload)?,
-            b"setd" => Self::parse_setd(payload)?,
-            b"flsh" => ServerCommand::Flush,
-            b"body" => ServerCommand::Body { data: payload },
-            b"aude" => Self::parse_aude(payload)?,
-            b"cont" => Self::parse_cont(payload)?,
-            b"serv" => Self::parse_serv(payload)?,
-            b"vers" => Self::parse_vers(payload)?,
-            b"dsco" => Self::parse_dsco(payload)?,
+        let cmd = match u32::from_be_bytes(opcode) {
+            OPCODE_STRM => Self::parse_strm(payload)?,
+            OPCODE_AUDG => Self::parse_audg(payload)?,
+            OPCODE_SETD => Self::parse_setd(payload)?,
+            OPCODE_FLSH => ServerCommand::Flush,
+            OPCODE_BODY => ServerCommand::Body { data: payload },
+            OPCODE_AUDE => Self::parse_aude(payload)?,
+            OPCODE_CONT => Self::parse_cont(payload)?,
+            OPCODE_SERV => Self::parse_serv(payload)?,
+            OPCODE_VERS => Self::parse_vers(payload)?,
+            OPCODE_DSCO => Self::parse_dsco(payload)?,
             _ => ServerCommand::Unknown { opcode, payload },
         };
 
@@ -575,7 +592,11 @@ impl SlimprotoParser {
         let replay_gain = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
         let server_port = u16::from_be_bytes([payload[18], payload[19]]);
         let server_ip = [payload[20], payload[21], payload[22], payload[23]];
-        let http_headers = if payload.len() > 24 { &payload[24..] } else { &[] };
+        let http_headers = if payload.len() > 24 {
+            &payload[24..]
+        } else {
+            &[]
+        };
 
         Ok(ServerCommand::Stream {
             command,
@@ -602,20 +623,12 @@ impl SlimprotoParser {
         if payload.len() < 18 {
             return Err(ParseError::InvalidFormat);
         }
-        let old_left = i32::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3],
-        ]);
-        let old_right = i32::from_be_bytes([
-            payload[4], payload[5], payload[6], payload[7],
-        ]);
+        let old_left = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let old_right = i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let digital_atten = payload[8];
         let preamp = payload[9];
-        let raw_left = u32::from_be_bytes([
-            payload[10], payload[11], payload[12], payload[13],
-        ]);
-        let raw_right = u32::from_be_bytes([
-            payload[14], payload[15], payload[16], payload[17],
-        ]);
+        let raw_left = u32::from_be_bytes([payload[10], payload[11], payload[12], payload[13]]);
+        let raw_right = u32::from_be_bytes([payload[14], payload[15], payload[16], payload[17]]);
 
         // Legacy negative dB value in old_left/old_right indicates mute when
         // 16.16 fixed-point gain is zero (LOGIC-503).
@@ -940,7 +953,7 @@ impl SlimprotoBuilder {
 
         // Payload (Standard 36-byte prefix before capabilities)
         out[8] = device_id; // Device ID (e.g. 12 = Squeezelite)
-        out[9] = 0;         // Firmware revision
+        out[9] = 0; // Firmware revision
         out[10..16].copy_from_slice(mac);
         // Fill UUID (16 bytes) with zero
         out[16..32].fill(0);
@@ -1199,7 +1212,10 @@ pub fn build_capabilities<W: fmt::Write>(
             "Model=squeezeesp32,AccuratePlayPoints=1,\
              HasPolarityInversion=1,Balance=1,Depth=32,Firmware={firmware}"
         )?;
-        write!(out, ",ModelName={model_name},MaxSampleRate={max_rate},{codecs}")?;
+        write!(
+            out,
+            ",ModelName={model_name},MaxSampleRate={max_rate},{codecs}"
+        )?;
         if let Some(id) = syncgroup {
             write!(out, ",SyncgroupID={id}")?;
         }
@@ -1219,7 +1235,11 @@ pub fn build_capabilities<W: fmt::Write>(
 /// a `serv` switch, `slimproto.c:1103`.)
 pub fn next_backoff_ms(attempt: u32, seed: u32) -> u32 {
     const CAP_S: u32 = 30;
-    let base_s = if attempt >= 5 { CAP_S } else { (1u32 << attempt).min(CAP_S) };
+    let base_s = if attempt >= 5 {
+        CAP_S
+    } else {
+        (1u32 << attempt).min(CAP_S)
+    };
     base_s * 1000 + seed % 1000
 }
 
@@ -1362,7 +1382,10 @@ impl DiscoveryParser {
         }
 
         if tag_found {
-            Some(DiscoveredServer { json_port, cli_port })
+            Some(DiscoveredServer {
+                json_port,
+                cli_port,
+            })
         } else {
             None
         }
@@ -1416,9 +1439,9 @@ mod tests {
         let mut frame = [0u8; 26]; // 8 header + 18 payload
         frame[0..4].copy_from_slice(b"audg");
         frame[4..8].copy_from_slice(&18u32.to_be_bytes()); // length = 18
-        // 8..16 legacy old_gain
+                                                           // 8..16 legacy old_gain
         frame[16] = 255; // atten
-        frame[17] = 0;   // preamp
+        frame[17] = 0; // preamp
         frame[18..22].copy_from_slice(&0x00010000u32.to_be_bytes()); // gain L (active)
         frame[22..26].copy_from_slice(&0x00010000u32.to_be_bytes()); // gain R (active)
 
@@ -1445,7 +1468,7 @@ mod tests {
         frame[10] = b'f'; // flac
         frame[11] = 16; // sample size
         frame[12] = 44; // 44.1k
-        frame[13] = 2;  // stereo
+        frame[13] = 2; // stereo
         frame[14] = b'1'; // little endian
         frame[15] = 200; // 200KB threshold (1 byte)
         frame[16] = 0; // spdif
@@ -1483,8 +1506,8 @@ mod tests {
     fn test_build_helo_packet() {
         let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
         let mut buf = [0u8; 128];
-        let len = SlimprotoBuilder::build_helo(&mac, 12, "Model=LouderESP32Plus", &mut buf)
-            .unwrap();
+        let len =
+            SlimprotoBuilder::build_helo(&mac, 12, "Model=LouderESP32Plus", &mut buf).unwrap();
 
         assert_eq!(&buf[0..4], b"HELO");
         assert_eq!(buf[8], 12);
@@ -1513,17 +1536,38 @@ mod tests {
         assert_eq!(buf[12], 0); // num_crlf
         assert_eq!(buf[13], 0); // mas_initialized
         assert_eq!(buf[14], 0); // mas_mode
-        assert_eq!(u32::from_be_bytes([buf[15], buf[16], buf[17], buf[18]]), 65536);
-        assert_eq!(u32::from_be_bytes([buf[19], buf[20], buf[21], buf[22]]), 128000);
+        assert_eq!(
+            u32::from_be_bytes([buf[15], buf[16], buf[17], buf[18]]),
+            65536
+        );
+        assert_eq!(
+            u32::from_be_bytes([buf[19], buf[20], buf[21], buf[22]]),
+            128000
+        );
         assert_eq!(u32::from_be_bytes([buf[23], buf[24], buf[25], buf[26]]), 0);
-        assert_eq!(u32::from_be_bytes([buf[27], buf[28], buf[29], buf[30]]), 44100);
+        assert_eq!(
+            u32::from_be_bytes([buf[27], buf[28], buf[29], buf[30]]),
+            44100
+        );
         assert_eq!(u16::from_be_bytes([buf[31], buf[32]]), 0xFFFF);
-        assert_eq!(u32::from_be_bytes([buf[33], buf[34], buf[35], buf[36]]), 5000);
-        assert_eq!(u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]), 65536);
-        assert_eq!(u32::from_be_bytes([buf[41], buf[42], buf[43], buf[44]]), 64000);
+        assert_eq!(
+            u32::from_be_bytes([buf[33], buf[34], buf[35], buf[36]]),
+            5000
+        );
+        assert_eq!(
+            u32::from_be_bytes([buf[37], buf[38], buf[39], buf[40]]),
+            65536
+        );
+        assert_eq!(
+            u32::from_be_bytes([buf[41], buf[42], buf[43], buf[44]]),
+            64000
+        );
         assert_eq!(u32::from_be_bytes([buf[45], buf[46], buf[47], buf[48]]), 1);
         assert_eq!(u16::from_be_bytes([buf[49], buf[50]]), 0);
-        assert_eq!(u32::from_be_bytes([buf[51], buf[52], buf[53], buf[54]]), 1000);
+        assert_eq!(
+            u32::from_be_bytes([buf[51], buf[52], buf[53], buf[54]]),
+            1000
+        );
         assert_eq!(u32::from_be_bytes([buf[55], buf[56], buf[57], buf[58]]), 0);
         assert_eq!(u16::from_be_bytes([buf[59], buf[60]]), 0);
 
@@ -1561,7 +1605,9 @@ mod tests {
         let (cmd, consumed) = SlimprotoParser::parse_frame(&strm_frame).unwrap();
         assert_eq!(consumed, 30);
         match cmd {
-            ServerCommand::Stream { autostart, command, .. } => {
+            ServerCommand::Stream {
+                autostart, command, ..
+            } => {
                 assert!(autostart);
                 assert_eq!(command, StreamCommandType::Start);
             }
@@ -1578,7 +1624,12 @@ mod tests {
         frame_4b[6..10].copy_from_slice(&0x01020304u32.to_be_bytes());
         let (cmd, consumed) = SlimprotoParser::parse_frame(&frame_4b).unwrap();
         assert_eq!(consumed, 10);
-        assert_eq!(cmd, ServerCommand::SetDevice { sample_rate: 0x01020304 });
+        assert_eq!(
+            cmd,
+            ServerCommand::SetDevice {
+                sample_rate: 0x01020304
+            }
+        );
 
         // 1-byte payload (6-byte frame header)
         let mut frame_1b = [0u8; 7]; // 2 + 4 + 1
@@ -1680,8 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn test_setd_device_setting_player_name_and_dac(
-    ) {
+    fn test_setd_device_setting_player_name_and_dac() {
         // Player name update (id = 0, data = "StudioPlayer\0") must NOT be
         // parsed as sample_rate (PROTOCFG-801)
         let payload = b"\x00StudioPlayer\0";
@@ -1704,7 +1754,9 @@ mod tests {
         // Disable DAC query (1-byte id = 4)
         let frame_dac = [0x00, 0x05, b's', b'e', b't', b'd', 0x04];
         let (cmd_dac, _) = SlimprotoParser::parse_frame(&frame_dac).unwrap();
-        let dac_setting = cmd_dac.device_setting().expect("Expected 1-byte device setting");
+        let dac_setting = cmd_dac
+            .device_setting()
+            .expect("Expected 1-byte device setting");
         assert_eq!(dac_setting.id, 4);
         assert!(dac_setting.data.is_empty());
 
@@ -1719,7 +1771,9 @@ mod tests {
                 ..
             }
         ));
-        let setting_bob = cmd_bob.device_setting().expect("Expected 3-char player name");
+        let setting_bob = cmd_bob
+            .device_setting()
+            .expect("Expected 3-char player name");
         assert_eq!(setting_bob.id, 0);
         assert_eq!(setting_bob.data, b"Bob");
     }
@@ -1765,10 +1819,7 @@ mod tests {
             u64::from_be_bytes(payload[15..23].try_into().unwrap()),
             0x0000_0001_8000_0000
         );
-        assert_eq!(
-            u32::from_be_bytes(payload[37..41].try_into().unwrap()),
-            42
-        );
+        assert_eq!(u32::from_be_bytes(payload[37..41].try_into().unwrap()), 42);
         assert_eq!(
             u16::from_be_bytes(payload[41..43].try_into().unwrap()),
             3300
@@ -1785,14 +1836,19 @@ mod tests {
         // StatBuilder::build_stat estimates elapsed_seconds and elapsed_ms from
         // frames_played / 44_100
         let mut frame2 = [0u8; STAT_FRAME_SIZE];
-        StatBuilder::build_stat(StatEvent::DecodeReady, 4096, 2048, 88_200, 5000, &mut frame2)
-            .unwrap();
+        StatBuilder::build_stat(
+            StatEvent::DecodeReady,
+            4096,
+            2048,
+            88_200,
+            5000,
+            &mut frame2,
+        )
+        .unwrap();
         let payload2 = &frame2[8..];
         assert_eq!(&payload2[0..4], b"STMd");
-        assert_eq!(
-            u32::from_be_bytes(payload2[37..41].try_into().unwrap()),
-            2
-        ); // 88200 / 44100 = 2s
+        // 88200 / 44100 = 2s
+        assert_eq!(u32::from_be_bytes(payload2[37..41].try_into().unwrap()), 2);
         assert_eq!(
             u32::from_be_bytes(payload2[43..47].try_into().unwrap()),
             2000
@@ -1802,11 +1858,17 @@ mod tests {
     #[test]
     fn test_strm_timestamp_and_skip_ahead_and_extended_opcodes() {
         // PROTOCFG-803: 't' and 'a' stream commands
-        assert_eq!(StreamCommandType::from_byte(b't'), StreamCommandType::Timestamp);
+        assert_eq!(
+            StreamCommandType::from_byte(b't'),
+            StreamCommandType::Timestamp
+        );
         assert!(StreamCommandType::from_byte(b't').is_timestamp());
         assert_eq!(StreamCommandType::Timestamp.to_byte(), b't');
 
-        assert_eq!(StreamCommandType::from_byte(b'a'), StreamCommandType::SkipAhead);
+        assert_eq!(
+            StreamCommandType::from_byte(b'a'),
+            StreamCommandType::SkipAhead
+        );
         assert!(StreamCommandType::from_byte(b'a').is_skip_ahead());
         assert_eq!(StreamCommandType::SkipAhead.to_byte(), b'a');
 
@@ -2023,16 +2085,10 @@ mod tests {
             bytes_received
         );
         // elapsed_seconds at frame[45..49] (payload[37..41]) = 192000 / 96000 = 2
-        assert_eq!(
-            u32::from_be_bytes(frame[45..49].try_into().unwrap()),
-            2
-        );
+        assert_eq!(u32::from_be_bytes(frame[45..49].try_into().unwrap()), 2);
         // elapsed_ms at frame[51..55] (payload[43..47]) = 192000 * 1000 / 96000
         // = 2000
-        assert_eq!(
-            u32::from_be_bytes(frame[51..55].try_into().unwrap()),
-            2000
-        );
+        assert_eq!(u32::from_be_bytes(frame[51..55].try_into().unwrap()), 2000);
         // server_timestamp at payload offset 47..51 (frame offset 55..59)
         assert_eq!(
             u32::from_be_bytes(frame[55..59].try_into().unwrap()),
@@ -2075,7 +2131,9 @@ mod tests {
 
             let (cmd, _) = SlimprotoParser::parse_frame(&strm_frame).unwrap();
             match cmd {
-                ServerCommand::Stream { autostart, flags, .. } => {
+                ServerCommand::Stream {
+                    autostart, flags, ..
+                } => {
                     assert_eq!(flags & STRM_FLAG_CONT_WAIT, expected_cont_flag);
                     let recovered = AutostartMode::from_strm(autostart, flags);
                     assert_eq!(recovered, expected_mode);
@@ -2231,7 +2289,10 @@ mod tests {
 
     impl CapBuf {
         fn new() -> Self {
-            Self { buf: [0; 256], len: 0 }
+            Self {
+                buf: [0; 256],
+                len: 0,
+            }
         }
         fn as_str(&self) -> &str {
             core::str::from_utf8(&self.buf[..self.len]).unwrap()
@@ -2302,7 +2363,11 @@ mod tests {
         impl fmt::Write for Tiny {
             fn write_str(&mut self, s: &str) -> fmt::Result {
                 self.0 += s.len();
-                if self.0 > 16 { Err(fmt::Error) } else { Ok(()) }
+                if self.0 > 16 {
+                    Err(fmt::Error)
+                } else {
+                    Ok(())
+                }
             }
         }
         assert_eq!(
@@ -2315,9 +2380,15 @@ mod tests {
     fn test_backoff_sequence_capped_with_jitter() {
         // C parity (slimproto.c:1196-1203): delay = reconnect_delay s + rand()
         // % 1000 ms, reconnect_delay 1, 2, 4, 8, 16, then capped at 30 s.
-        let bases = [1_000u32, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
+        let bases = [
+            1_000u32, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000,
+        ];
         for (attempt, &base) in bases.iter().enumerate() {
-            assert_eq!(next_backoff_ms(attempt as u32, 0), base, "attempt {attempt}");
+            assert_eq!(
+                next_backoff_ms(attempt as u32, 0),
+                base,
+                "attempt {attempt}"
+            );
             assert_eq!(
                 next_backoff_ms(attempt as u32, 999),
                 base + 999,
@@ -2331,7 +2402,10 @@ mod tests {
             assert_eq!(next_backoff_ms(attempt as u32, 12_345), base + 345);
         }
         // Never overflows, however many attempts.
-        assert_eq!(next_backoff_ms(u32::MAX, u32::MAX), 30_000 + u32::MAX % 1000);
+        assert_eq!(
+            next_backoff_ms(u32::MAX, u32::MAX),
+            30_000 + u32::MAX % 1000
+        );
     }
 
     #[test]

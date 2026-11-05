@@ -19,13 +19,19 @@ fn offending_lines(src: &str) -> Vec<(usize, &str)> {
 #[test]
 fn coordinator_has_no_target_arch_cfg() {
     let hits = offending_lines(COORDINATOR_SRC);
-    assert!(hits.is_empty(), "src/coordinator.rs mentions target_arch: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "src/coordinator.rs mentions target_arch: {hits:?}"
+    );
 }
 
 #[test]
 fn pipeline_has_no_target_arch_cfg() {
     let hits = offending_lines(PIPELINE_SRC);
-    assert!(hits.is_empty(), "src/pipeline.rs mentions target_arch: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "src/pipeline.rs mentions target_arch: {hits:?}"
+    );
 }
 
 /// Task 10: the persistence logic is platform-free and fully host-tested; the
@@ -41,7 +47,10 @@ fn config_handle_has_no_platform_or_feature_cfg() {
         .filter(|(_, line)| line.contains("target_arch") || line.contains("feature ="))
         .map(|(i, line)| (i + 1, line.trim()))
         .collect();
-    assert!(hits.is_empty(), "src/config_handle.rs has platform/feature gating: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "src/config_handle.rs has platform/feature gating: {hits:?}"
+    );
 }
 
 #[test]

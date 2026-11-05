@@ -44,8 +44,7 @@ fn test_max_size_icy_block_reaches_lms_untruncated() {
     assert_eq!(meta.len(), 255 * 16);
 
     let mut response =
-        b"HTTP/1.0 200 OK\r\nContent-Type: audio/L16\r\nicy-metaint: 16\r\n\r\n"
-            .to_vec();
+        b"HTTP/1.0 200 OK\r\nContent-Type: audio/L16\r\nicy-metaint: 16\r\n\r\n".to_vec();
     response.extend_from_slice(&[0u8; 16]);
     response.push(255);
     response.extend_from_slice(&meta);
@@ -97,6 +96,10 @@ fn test_max_size_icy_block_reaches_lms_untruncated() {
     let frame = meta_frame.unwrap();
     let len = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
     assert_eq!(len, 4080);
-    assert_eq!(&frame[8..], &meta[..], "META payload is the whole ICY block");
+    assert_eq!(
+        &frame[8..],
+        &meta[..],
+        "META payload is the whole ICY block"
+    );
     server.join().unwrap();
 }

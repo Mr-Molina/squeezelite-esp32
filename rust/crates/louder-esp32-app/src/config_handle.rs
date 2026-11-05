@@ -199,7 +199,8 @@ impl ConfigHandle {
                 cfg.analog_gain_code,
                 cfg.loudness_enabled,
                 cfg.max_sample_rate
-            ).map_err(|_| squeezelite_config::StorageError::CapacityExceeded)
+            )
+            .map_err(|_| squeezelite_config::StorageError::CapacityExceeded)
         })?;
         Ok(json)
     }
@@ -222,7 +223,8 @@ impl ConfigHandle {
                 cfg.loudness_enabled,
                 cfg.max_sample_rate,
                 KEY_WIFI_PASS
-            ).map_err(|_| squeezelite_config::StorageError::CapacityExceeded)
+            )
+            .map_err(|_| squeezelite_config::StorageError::CapacityExceeded)
         })?;
         Ok(json)
     }
@@ -491,11 +493,7 @@ impl ConfigJournal for RamJournal<'_> {
             has_wifi = !preserved_ssid.is_empty();
         } else if squeezelite_config::FlashJournal::validate_sector(&self.image.0).is_ok() {
             let mut store = squeezelite_config::MemConfigStore::<16>::new();
-            if squeezelite_config::FlashJournal::load_from_sector(
-                &self.image.0,
-                &mut store,
-            )
-            .is_ok()
+            if squeezelite_config::FlashJournal::load_from_sector(&self.image.0, &mut store).is_ok()
             {
                 if let Ok(Some(s)) = store.get_str::<32>("wifi.ssid") {
                     if !s.is_empty() {
@@ -778,7 +776,9 @@ mod tests {
 
         let mut store = MemConfigStore::<16>::new();
         store.set_str("wifi.ssid", "JournalAP").expect("set ssid");
-        store.set_str("wifi.pass", "JournalSecret").expect("set pass");
+        store
+            .set_str("wifi.pass", "JournalSecret")
+            .expect("set pass");
 
         let nvs_creds = WifiStaCredentials {
             ssid: "NvsAP".try_into().unwrap(),
@@ -821,11 +821,9 @@ mod tests {
         assert_eq!(res_creds.ssid.as_str(), "DefAP");
 
         // 4. Backward compatibility check for resolve_boot_wifi
-        let (res_creds, src) = resolve_boot_wifi(
-            || Some(nvs_creds.clone()),
-            || Some(def_creds.clone()),
-        )
-        .expect("resolved with resolve_boot_wifi");
+        let (res_creds, src) =
+            resolve_boot_wifi(|| Some(nvs_creds.clone()), || Some(def_creds.clone()))
+                .expect("resolved with resolve_boot_wifi");
         assert_eq!(src, ConfigSource::Nvs);
         assert_eq!(res_creds.ssid.as_str(), "NvsAP");
     }
@@ -836,15 +834,17 @@ mod tests {
 
         let mut image = JournalSector::erased();
         let mut initial_store = MemConfigStore::<16>::new();
-        initial_store.set_str("wifi.ssid", "StationAP").expect("ssid");
-        initial_store.set_str("wifi.pass", "StationKey").expect("pass");
-        initial_store.set_str(AudioConfig::KEY_NAME, "MyPlayer").expect("name");
-        squeezelite_config::FlashJournal::save_to_sector_with_seq(
-            &initial_store,
-            &mut image.0,
-            1,
-        )
-        .expect("initial save");
+        initial_store
+            .set_str("wifi.ssid", "StationAP")
+            .expect("ssid");
+        initial_store
+            .set_str("wifi.pass", "StationKey")
+            .expect("pass");
+        initial_store
+            .set_str(AudioConfig::KEY_NAME, "MyPlayer")
+            .expect("name");
+        squeezelite_config::FlashJournal::save_to_sector_with_seq(&initial_store, &mut image.0, 1)
+            .expect("initial save");
 
         let mut ram = RamJournal::new(
             &mut image,
@@ -861,17 +861,20 @@ mod tests {
 
         // Verify that wifi.ssid and wifi.pass were preserved in the serialized sector
         let mut verified_store = MemConfigStore::<16>::new();
-        squeezelite_config::FlashJournal::load_from_sector(
-            &ram.image.0,
-            &mut verified_store,
-        )
-        .expect("load sector");
+        squeezelite_config::FlashJournal::load_from_sector(&ram.image.0, &mut verified_store)
+            .expect("load sector");
         assert_eq!(
-            verified_store.get_str::<32>("wifi.ssid").unwrap().as_deref(),
+            verified_store
+                .get_str::<32>("wifi.ssid")
+                .unwrap()
+                .as_deref(),
             Some("StationAP")
         );
         assert_eq!(
-            verified_store.get_str::<64>("wifi.pass").unwrap().as_deref(),
+            verified_store
+                .get_str::<64>("wifi.pass")
+                .unwrap()
+                .as_deref(),
             Some("StationKey")
         );
         assert_eq!(

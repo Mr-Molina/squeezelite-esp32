@@ -48,18 +48,8 @@ const INIT_TAS57XX: &[(u8, u8)] = &[
     (0x28, 0x00),
     (0x02, 0x00),
 ];
-const INIT_TAS5713: &[(u8, u8)] = &[
-    (0x1B, 0x00),
-    (0x06, 0x00),
-    (0x05, 0x00),
-    (0x07, 0x30),
-];
-const INIT_AC101: &[(u8, u8)] = &[
-    (0x00, 0x12),
-    (0x10, 0x03),
-    (0x40, 0x00),
-    (0x50, 0x01),
-];
+const INIT_TAS5713: &[(u8, u8)] = &[(0x1B, 0x00), (0x06, 0x00), (0x05, 0x00), (0x07, 0x30)];
+const INIT_AC101: &[(u8, u8)] = &[(0x00, 0x12), (0x10, 0x03), (0x40, 0x00), (0x50, 0x01)];
 const INIT_WM8978: &[(u8, u8)] = &[
     (0x00, 0x00),
     (0x01, 0x1B),
@@ -112,9 +102,7 @@ impl DacModel {
             Some(Self::Es8311)
         } else if trimmed.eq_ignore_ascii_case("GENERIC") {
             Some(Self::GenericI2c)
-        } else if trimmed.eq_ignore_ascii_case("I2S")
-            || trimmed.eq_ignore_ascii_case("PCM5102")
-        {
+        } else if trimmed.eq_ignore_ascii_case("I2S") || trimmed.eq_ignore_ascii_case("PCM5102") {
             Some(Self::I2sPassthrough)
         } else if trimmed.eq_ignore_ascii_case("SPDIF") {
             Some(Self::SpdifOut)

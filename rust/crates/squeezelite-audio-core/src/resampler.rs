@@ -299,8 +299,7 @@ impl Resampler {
         let hist_slice = &self.history[pos..pos + taps];
         let h = &hist_slice[..taps];
 
-        let scaled_phase =
-            ((self.phase_num * (NUM_PHASES as u64)) << 16) / u64::from(self.to_hz);
+        let scaled_phase = ((self.phase_num * (NUM_PHASES as u64)) << 16) / u64::from(self.to_hz);
         let phase_idx = ((scaled_phase >> 16) as usize).min(NUM_PHASES - 1);
         let frac_q16 = (scaled_phase & 0xFFFF) as i64;
 
@@ -328,21 +327,34 @@ impl Resampler {
                 let row1 = &self.coeffs_q30[phase_idx + 1];
                 let r0 = &row0[..taps];
                 let r1 = &row1[..taps];
-                for k in 0..taps {
-                    let c0 = i64::from(r0[k]);
-                    let c1 = i64::from(r1[k]);
-                    let c = c0 + (((c1 - c0) * frac_q16 + 32_768) >> 16);
-                    let frame = h[k];
-                    acc_l += i64::from(frame[0]) * c;
-                    acc_r += i64::from(frame[1]) * c;
+                let mut dot0_l = 0_i64;
+                let mut dot0_r = 0_i64;
+                let mut dot1_l = 0_i64;
+                let mut dot1_r = 0_i64;
+                for (&frame, (&c0, &c1)) in h.iter().zip(r0.iter().zip(r1.iter())) {
+                    let c0 = i64::from(c0);
+                    let c1 = i64::from(c1);
+                    let fl = i64::from(frame[0]);
+                    let fr = i64::from(frame[1]);
+                    dot0_l += fl * c0;
+                    dot0_r += fr * c0;
+                    dot1_l += fl * c1;
+                    dot1_r += fr * c1;
                 }
+                let diff_l = dot1_l - dot0_l;
+                let diff_r = dot1_r - dot0_r;
+                let frac = frac_q16;
+                let delta_l = (diff_l >> 16) * frac + (((diff_l & 0xFFFF) * frac + 32_768) >> 16);
+                let delta_r = (diff_r >> 16) * frac + (((diff_r & 0xFFFF) * frac + 32_768) >> 16);
+                acc_l = dot0_l + delta_l;
+                acc_r = dot0_r + delta_r;
             }
         }
 
-        let out_l = (acc_l.saturating_add(HALF_Q30) >> 30)
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
-        let out_r = (acc_r.saturating_add(HALF_Q30) >> 30)
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        let out_l =
+            (acc_l.saturating_add(HALF_Q30) >> 30).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        let out_r =
+            (acc_r.saturating_add(HALF_Q30) >> 30).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
         (out_l as i32, out_r as i32)
     }
 }
@@ -490,8 +502,8 @@ fn sin_f64(x: f64) -> f64 {
     let c13 = 1.0 / 6_227_020_800.0;
     let c15 = -1.0 / 1_307_674_368_000.0;
 
-    let poly = 1.0
-        + u2 * (c3 + u2 * (c5 + u2 * (c7 + u2 * (c9 + u2 * (c11 + u2 * (c13 + u2 * c15))))));
+    let poly =
+        1.0 + u2 * (c3 + u2 * (c5 + u2 * (c7 + u2 * (c9 + u2 * (c11 + u2 * (c13 + u2 * c15))))));
     angle * poly
 }
 

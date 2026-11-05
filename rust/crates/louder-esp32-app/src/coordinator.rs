@@ -1819,11 +1819,8 @@ impl PlayerCoordinator {
         let capped_rate = self.max_sample_rate > 0 && rate_hint > self.max_sample_rate;
         let unverified_rate = !crate::clock_table::VERIFIED_RATES.contains(&rate_hint);
         let output_rate = if capped_rate {
-            if pipeline.configure_resampler(
-                rate_hint,
-                self.max_sample_rate,
-                self.resampler_quality,
-            ) {
+            if pipeline.configure_resampler(rate_hint, self.max_sample_rate, self.resampler_quality)
+            {
                 self.max_sample_rate
             } else {
                 rate_hint
@@ -6405,10 +6402,7 @@ mod tests {
     }
 
     impl AudioBackend for DmaTrackingBackend {
-        fn set_sample_rate(
-            &mut self,
-            rate_hz: u32,
-        ) -> Result<(), crate::io_traits::ClockError> {
+        fn set_sample_rate(&mut self, rate_hz: u32) -> Result<(), crate::io_traits::ClockError> {
             self.rate_calls += 1;
             self.inner.set_sample_rate(rate_hz)
         }
@@ -6513,9 +6507,7 @@ mod tests {
         // Rate code `b'>'` = 384_000 Hz, which is not in `VERIFIED_RATES`.
         // With resampler disabled (default), `strm 's'` must refuse with `STMn`
         // without calling `backend.set_sample_rate`.
-        rig.lms
-            .inject_frame(&strm_start(1, b'>', true))
-            .unwrap();
+        rig.lms.inject_frame(&strm_start(1, b'>', true)).unwrap();
         rig.coord
             .tick(&mut rig.lms, &mut rig.src, &mut backend, &mut pipeline, 10)
             .unwrap();
@@ -6567,11 +6559,7 @@ mod tests {
 
     #[test]
     fn test_engages_only_for_unverified_or_capped_rates() {
-        let mut rig = gapless_rig(&[
-            track_bytes(1, 32),
-            track_bytes(2, 32),
-            track_bytes(3, 32),
-        ]);
+        let mut rig = gapless_rig(&[track_bytes(1, 32), track_bytes(2, 32), track_bytes(3, 32)]);
         let mut stream_storage = [0u8; 4096];
         let mut output_storage = [0u8; 4096];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
@@ -6634,7 +6622,8 @@ mod tests {
         assert_eq!(pipeline.stream_buffer.available_read(), 64);
 
         // Begin external playback flushes stream buffer (LOGIC-206)
-        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
         assert_eq!(pipeline.stream_buffer.available_read(), 0);
         assert!(rig.coord.external_playback);
 
@@ -6664,7 +6653,8 @@ mod tests {
         rig.coord.stream = StreamLink::Open;
 
         // Begin external playback
-        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
         assert!(rig.coord.external_playback);
 
         // Ingest external PCM bytes
@@ -6693,7 +6683,8 @@ mod tests {
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
         // Active external playback owns arbiter
-        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
         assert!(rig.coord.external_playback);
         assert_eq!(rig.coord.state, PlayerState::Playing);
 

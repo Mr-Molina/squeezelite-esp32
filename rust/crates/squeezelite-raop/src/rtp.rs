@@ -210,14 +210,10 @@ impl RtpSyncPacket {
         }
         let is_first_sync = (buf[0] & 0x10) != 0;
         let flags = u16::from_be_bytes([buf[2], buf[3]]);
-        let rtp_timestamp_latency =
-            u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let ntp_seconds =
-            u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let ntp_fraction =
-            u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let rtp_timestamp_now =
-            u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let rtp_timestamp_latency = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let ntp_seconds = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let ntp_fraction = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let rtp_timestamp_now = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
 
         Ok(Self {
             is_first_sync,
@@ -264,9 +260,7 @@ impl RtpSyncPacket {
 
 /// Unwraps a 4-byte RTP control retransmit reply (`PT = 0x56` / `0xD6`),
 /// returning `(control_seq, embedded_rtp_audio_packet)` at offset `+4`.
-pub fn unwrap_retransmit_packet(
-    buf: &[u8],
-) -> Result<(u16, &[u8]), RtpReceiverError> {
+pub fn unwrap_retransmit_packet(buf: &[u8]) -> Result<(u16, &[u8]), RtpReceiverError> {
     if buf.len() < 16 {
         return Err(RtpReceiverError::PacketTooShort);
     }
@@ -314,8 +308,7 @@ impl<'a> RtpControlPacket<'a> {
         match pt {
             RTP_PT_SYNC => Ok(Self::Sync(RtpSyncPacket::parse(buf)?)),
             RTP_PT_RETRANSMIT_REPLY => {
-                let (control_seq, inner_packet) =
-                    unwrap_retransmit_packet(buf)?;
+                let (control_seq, inner_packet) = unwrap_retransmit_packet(buf)?;
                 Ok(Self::Retransmit {
                     control_seq,
                     inner_packet,
@@ -344,11 +337,7 @@ pub struct RtpResendRequest {
 impl RtpResendRequest {
     /// Creates a new `RtpResendRequest`.
     #[must_use]
-    pub const fn new(
-        request_seq: u16,
-        missed_seq_start: u16,
-        missed_count: u16,
-    ) -> Self {
+    pub const fn new(request_seq: u16, missed_seq_start: u16, missed_count: u16) -> Self {
         Self {
             request_seq,
             missed_seq_start,
@@ -445,11 +434,7 @@ impl NtpTimingPacket {
 
     /// Creates a 32-byte NTP timing response (`PT = 0x53`).
     #[must_use]
-    pub const fn new_response(
-        reference_ntp: u64,
-        receive_ntp: u64,
-        transmit_ntp: u64,
-    ) -> Self {
+    pub const fn new_response(reference_ntp: u64, receive_ntp: u64, transmit_ntp: u64) -> Self {
         Self {
             payload_type: RTP_PT_TIMING_RESPONSE,
             reference_ntp,
@@ -484,16 +469,13 @@ impl NtpTimingPacket {
             return Err(RtpReceiverError::UnexpectedPayloadType(pt));
         }
         let reference_ntp = u64::from_be_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14],
-            buf[15],
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
         let receive_ntp = u64::from_be_bytes([
-            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22],
-            buf[23],
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
         ]);
         let transmit_ntp = u64::from_be_bytes([
-            buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30],
-            buf[31],
+            buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
         ]);
         Ok(Self {
             payload_type: pt,
@@ -699,9 +681,7 @@ impl RtpJitterBuffer {
         &mut self,
         packet: &[u8],
     ) -> Result<Option<RtpResendRequest>, RtpReceiverError> {
-        let inner = if packet.len() >= 16
-            && (packet[1] & 0x7F) == RTP_PT_RETRANSMIT_REPLY
-        {
+        let inner = if packet.len() >= 16 && (packet[1] & 0x7F) == RTP_PT_RETRANSMIT_REPLY {
             let (_ctrl_seq, unwrapped) = unwrap_retransmit_packet(packet)?;
             unwrapped
         } else {
@@ -719,11 +699,7 @@ impl RtpJitterBuffer {
 
     /// Pushes pre-decoded stereo PCM samples and their `RtpHeader` into the
     /// reorder ring.
-    pub fn push_pcm(
-        &mut self,
-        header: RtpHeader,
-        pcm: &[i16],
-    ) -> Option<RtpResendRequest> {
+    pub fn push_pcm(&mut self, header: RtpHeader, pcm: &[i16]) -> Option<RtpResendRequest> {
         let entry = JitterEntry::new(header, Vec::new(), pcm.to_vec());
         self.insert_entry(entry)
     }
@@ -757,8 +733,7 @@ impl RtpJitterBuffer {
             self.min_allowed_seq = None;
         }
 
-        let (Some(last_w), Some(cur_r)) = (self.write_seq, self.read_seq)
-        else {
+        let (Some(last_w), Some(cur_r)) = (self.write_seq, self.read_seq) else {
             let idx = self.slot_index(seq);
             self.put_slot(idx, entry);
             self.read_seq = Some(seq);
@@ -774,8 +749,7 @@ impl RtpJitterBuffer {
             self.write_seq = Some(seq);
             let d = seq_diff(seq, cur_r);
             if d > 0 && (d as usize) >= self.capacity {
-                let new_r =
-                    seq.wrapping_sub((self.capacity.saturating_sub(1)) as u16);
+                let new_r = seq.wrapping_sub((self.capacity.saturating_sub(1)) as u16);
                 self.read_seq = Some(new_r);
             }
             None
@@ -807,16 +781,14 @@ impl RtpJitterBuffer {
 
             let d = seq_diff(seq, cur_r);
             if d > 0 && (d as usize) >= self.capacity {
-                let new_r =
-                    seq.wrapping_sub((self.capacity.saturating_sub(1)) as u16);
+                let new_r = seq.wrapping_sub((self.capacity.saturating_sub(1)) as u16);
                 self.read_seq = Some(new_r);
             }
 
             let req_seq = self.resend_seq_counter;
             self.resend_seq_counter = self.resend_seq_counter.wrapping_add(1);
             let missed_start = last_w.wrapping_add(1);
-            self.resent_requests =
-                self.resent_requests.saturating_add(u32::from(gap));
+            self.resent_requests = self.resent_requests.saturating_add(u32::from(gap));
             Some(RtpResendRequest::new(req_seq, missed_start, gap))
         } else {
             // Out-of-order or retransmitted packet (`seq <= last_w`)
@@ -826,8 +798,7 @@ impl RtpJitterBuffer {
                     .as_ref()
                     .is_some_and(|e| e.header.sequence_number == seq);
                 if !already_present {
-                    self.recovered_packets =
-                        self.recovered_packets.saturating_add(1);
+                    self.recovered_packets = self.recovered_packets.saturating_add(1);
                 }
                 self.put_slot(idx, entry);
             } else {
@@ -974,8 +945,7 @@ impl SyncDriftTracker {
     #[must_use]
     pub fn new(sample_rate_hz: u32, drift_window_ms: u32) -> Self {
         let rate = sample_rate_hz.max(1);
-        let win_frames = ((u64::from(rate) * u64::from(drift_window_ms)) / 1000)
-            .max(1) as i32;
+        let win_frames = ((u64::from(rate) * u64::from(drift_window_ms)) / 1000).max(1) as i32;
         Self {
             sample_rate_hz: rate,
             drift_window_ms,
@@ -1030,11 +1000,7 @@ impl SyncDriftTracker {
 
     /// Processes an incoming `NtpTimingPacket` (`0x53`), updating the NTP clock
     /// anchor if the round-trip time is `<= 100` ms.
-    pub fn record_ntp_timing(
-        &mut self,
-        timing: &NtpTimingPacket,
-        local_now_ms: u32,
-    ) -> bool {
+    pub fn record_ntp_timing(&mut self, timing: &NtpTimingPacket, local_now_ms: u32) -> bool {
         let rtt = timing.roundtrip_ms(local_now_ms);
         if rtt > 100 {
             return false;
@@ -1046,11 +1012,7 @@ impl SyncDriftTracker {
 
     /// Processes an incoming `RtpSyncPacket` (`0x54`/`0xD4`), updating the RTP
     /// playback anchor.
-    pub fn record_rtp_sync(
-        &mut self,
-        sync: &RtpSyncPacket,
-        fallback_local_ms: u64,
-    ) -> bool {
+    pub fn record_rtp_sync(&mut self, sync: &RtpSyncPacket, fallback_local_ms: u64) -> bool {
         let local_anchor = if let (Some(loc_ms), Some(rem_ntp)) =
             (self.ntp_local_anchor_ms, self.ntp_remote_anchor)
         {
@@ -1088,8 +1050,7 @@ impl SyncDriftTracker {
         let rtp_anchor = self.sync_rtp_anchor?;
         let local_anchor_ms = self.sync_local_anchor_ms?;
         let delta_frames = rtp_timestamp.wrapping_sub(rtp_anchor) as i32;
-        let delta_ms = (i64::from(delta_frames) * 1000)
-            / i64::from(self.sample_rate_hz);
+        let delta_ms = (i64::from(delta_frames) * 1000) / i64::from(self.sample_rate_hz);
         if delta_ms >= 0 {
             Some(local_anchor_ms.wrapping_add(delta_ms as u64))
         } else {
@@ -1107,13 +1068,8 @@ impl SyncDriftTracker {
     /// - When `actual_dac_rtp_ts > expected_rtp_ts` by more than `window_frames`
     ///   (DAC playback is ahead of the sender clock), returns `+1` to duplicate
     ///   one frame and slow down.
-    pub fn compute_frame_adjustment(
-        &mut self,
-        expected_rtp_ts: u32,
-        actual_dac_rtp_ts: u32,
-    ) -> i8 {
-        let drift_frames =
-            expected_rtp_ts.wrapping_sub(actual_dac_rtp_ts) as i32;
+    pub fn compute_frame_adjustment(&mut self, expected_rtp_ts: u32, actual_dac_rtp_ts: u32) -> i8 {
+        let drift_frames = expected_rtp_ts.wrapping_sub(actual_dac_rtp_ts) as i32;
         if drift_frames > self.drift_window_frames {
             self.frames_dropped = self.frames_dropped.saturating_add(1);
             -1
@@ -1127,15 +1083,14 @@ impl SyncDriftTracker {
 
     /// Computes `-1`, `0`, or `+1` stereo frame adjustment by comparing a
     /// packet's scheduled playtime against `local_now_ms`.
-    pub fn compute_time_adjustment(
-        &mut self,
-        packet_rtp_ts: u32,
-        local_now_ms: u64,
-    ) -> i8 {
+    pub fn compute_time_adjustment(&mut self, packet_rtp_ts: u32, local_now_ms: u64) -> i8 {
         let Some(expected_ms) = self.expected_playtime_ms(packet_rtp_ts) else {
             return 0;
         };
         let drift_ms = (local_now_ms as i64) - (expected_ms as i64);
+        if !(-100_000..=100_000).contains(&drift_ms) {
+            return 0;
+        }
         let win = i64::from(self.drift_window_ms);
         if drift_ms > win {
             self.frames_dropped = self.frames_dropped.saturating_add(1);
@@ -1150,11 +1105,7 @@ impl SyncDriftTracker {
 
     /// Applies a `-1` (drop), `0` (pass-through), or `+1` (stuff) adjustment to
     /// an interleaved stereo `i16` PCM slice (`[L, R, L, R, ...]`).
-    pub fn apply_stereo_adjustment(
-        adjustment: i8,
-        input_pcm: &[i16],
-        out_pcm: &mut Vec<i16>,
-    ) {
+    pub fn apply_stereo_adjustment(adjustment: i8, input_pcm: &[i16], out_pcm: &mut Vec<i16>) {
         let even_len = input_pcm.len() & !1;
         let input_pcm = &input_pcm[..even_len];
         out_pcm.clear();
@@ -1166,8 +1117,7 @@ impl SyncDriftTracker {
             core::cmp::Ordering::Less => {
                 // Drop 1 stereo frame (2 i16 samples) if at least 2 frames exist
                 if input_pcm.len() >= 4 {
-                    out_pcm
-                        .extend_from_slice(&input_pcm[..input_pcm.len() - 2]);
+                    out_pcm.extend_from_slice(&input_pcm[..input_pcm.len() - 2]);
                 } else {
                     out_pcm.extend_from_slice(input_pcm);
                 }
@@ -1189,11 +1139,7 @@ impl SyncDriftTracker {
 
     /// Applies drift adjustment by ensuring samples are stereo-aligned
     /// (even length).
-    pub fn apply_drift_adjustment(
-        adjustment: i8,
-        samples: &[i16],
-        out_pcm: &mut Vec<i16>,
-    ) {
+    pub fn apply_drift_adjustment(adjustment: i8, samples: &[i16], out_pcm: &mut Vec<i16>) {
         let even_len = samples.len() & !1;
         Self::apply_stereo_adjustment(adjustment, &samples[..even_len], out_pcm);
     }
@@ -1292,9 +1238,7 @@ impl RtpAudioReceiver {
         &'a mut self,
         packet: &[u8],
     ) -> Result<(&'a [i16], RtpHeader), RtpReceiverError> {
-        let raw_rtp = if packet.len() >= 16
-            && (packet[1] & 0x7F) == RTP_PT_RETRANSMIT_REPLY
-        {
+        let raw_rtp = if packet.len() >= 16 && (packet[1] & 0x7F) == RTP_PT_RETRANSMIT_REPLY {
             let (_ctrl_seq, inner) = unwrap_retransmit_packet(packet)?;
             inner
         } else {

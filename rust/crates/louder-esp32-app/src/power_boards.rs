@@ -254,9 +254,7 @@ impl BoardProfile {
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         let t = name.trim();
-        if t.eq_ignore_ascii_case("LOUDER-ESP32")
-            || t.eq_ignore_ascii_case("LOUDER_ESP32")
-        {
+        if t.eq_ignore_ascii_case("LOUDER-ESP32") || t.eq_ignore_ascii_case("LOUDER_ESP32") {
             Some(Self::LouderEsp32)
         } else if t.eq_ignore_ascii_case("LOUDER-ESP32-S3")
             || t.eq_ignore_ascii_case("LOUDER_ESP32_S3")
@@ -267,9 +265,7 @@ impl BoardProfile {
             Some(Self::SqueezeAmp)
         } else if t.eq_ignore_ascii_case("MUSE") || t.eq_ignore_ascii_case("ESP-MUSE") {
             Some(Self::MuseProto)
-        } else if t.eq_ignore_ascii_case("TWATCH2020")
-            || t.eq_ignore_ascii_case("T-WATCH2020")
-        {
+        } else if t.eq_ignore_ascii_case("TWATCH2020") || t.eq_ignore_ascii_case("T-WATCH2020") {
             Some(Self::TWatch2020)
         } else if t.eq_ignore_ascii_case("GENERIC") || t.eq_ignore_ascii_case("GENERIC-I2S") {
             Some(Self::GenericI2s)
@@ -301,15 +297,9 @@ impl BoardProfile {
     #[must_use]
     pub const fn default_dac_config(self) -> &'static str {
         match self {
-            Self::LouderEsp32 => {
-                "model=TAS5805M,bck=26,ws=25,do=22,sda=21,scl=27,mute=33:0,i2c=45"
-            }
-            Self::LouderEsp32S3 => {
-                "model=TAS5805M,bck=14,ws=15,do=16,sda=8,scl=9,mute=17:0,i2c=76"
-            }
-            Self::SqueezeAmp => {
-                "model=TAS5713,bck=26,ws=25,do=22,sda=21,scl=27,mute=19:0,i2c=27"
-            }
+            Self::LouderEsp32 => "model=TAS5805M,bck=26,ws=25,do=22,sda=21,scl=27,mute=33:0,i2c=45",
+            Self::LouderEsp32S3 => "model=TAS5805M,bck=14,ws=15,do=16,sda=8,scl=9,mute=17:0,i2c=76",
+            Self::SqueezeAmp => "model=TAS5713,bck=26,ws=25,do=22,sda=21,scl=27,mute=19:0,i2c=27",
             Self::MuseProto => {
                 "model=ES8388,bck=5,ws=25,do=26,mck=0,sda=18,scl=23,mute=21:1,i2c=16"
             }

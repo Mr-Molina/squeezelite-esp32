@@ -53,7 +53,11 @@ fn decode_fixture(chunk: usize) -> Decoded {
             Ok((consumed, frames)) => {
                 pos += consumed;
                 pcm.extend_from_slice(&out[..frames * 2]);
-                stalls = if consumed == 0 && frames == 0 { stalls + 1 } else { 0 };
+                stalls = if consumed == 0 && frames == 0 {
+                    stalls + 1
+                } else {
+                    0
+                };
             }
             Err(DecoderError::NeedMoreData) | Err(DecoderError::CorruptedFrame) => {
                 stalls += 1;
@@ -61,7 +65,11 @@ fn decode_fixture(chunk: usize) -> Decoded {
             Err(e) => panic!("unexpected decoder error: {e:?}"),
         }
     }
-    Decoded { pcm, sample_rate: dec.sample_rate, channels: dec.channels }
+    Decoded {
+        pcm,
+        sample_rate: dec.sample_rate,
+        channels: dec.channels,
+    }
 }
 
 #[test]
@@ -107,7 +115,10 @@ fn test_stereo_15s_44k1_decodes_cleanly() {
                 }
             }
         }
-        println!("Total decoded frames: {total_frames}, pos: {pos}/{}", data.len());
+        println!(
+            "Total decoded frames: {total_frames}, pos: {pos}/{}",
+            data.len()
+        );
         assert!(total_frames > 0);
     }
 }
@@ -120,7 +131,10 @@ fn adts_lc_fixture_decodes_to_golden_pcm() {
     assert_eq!(d.pcm.len() % 2, 0);
     let frames = d.pcm.len() / 2;
     let digest = fnv1a64(&d.pcm);
-    println!("std={} frames={frames} fnv1a64={digest:#018x}", syom::STD_ENABLED);
+    println!(
+        "std={} frames={frames} fnv1a64={digest:#018x}",
+        syom::STD_ENABLED
+    );
     assert_eq!(frames, GOLDEN_FRAMES);
     assert_eq!(digest, GOLDEN_PCM_FNV1A64);
 }

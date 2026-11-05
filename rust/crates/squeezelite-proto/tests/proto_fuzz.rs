@@ -8,6 +8,7 @@ use proptest::prelude::prop_assert;
 use proptest::prelude::prop_assert_eq;
 use proptest::prelude::ProptestConfig;
 use proptest::proptest;
+use squeezelite_proto::sample_rate_from_index;
 use squeezelite_proto::AudioFormat;
 use squeezelite_proto::DiscoveryParser;
 use squeezelite_proto::ParseError;
@@ -16,7 +17,6 @@ use squeezelite_proto::SlimprotoBuilder;
 use squeezelite_proto::SlimprotoParser;
 use squeezelite_proto::StatEvent;
 use squeezelite_proto::StreamCommandType;
-use squeezelite_proto::sample_rate_from_index;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]

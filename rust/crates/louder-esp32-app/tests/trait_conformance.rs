@@ -26,9 +26,15 @@ fn test_loopback_roundtrip_frames() {
     t.send(b"STAT-and-more").expect("send");
     t.send(&[]).expect("send");
 
-    let n = t.poll_frame(&mut buf).expect("poll frame").expect("frame ready");
+    let n = t
+        .poll_frame(&mut buf)
+        .expect("poll frame")
+        .expect("frame ready");
     assert_eq!(&buf[..n], b"HELO");
-    let n = t.poll_frame(&mut buf).expect("poll frame").expect("frame ready");
+    let n = t
+        .poll_frame(&mut buf)
+        .expect("poll frame")
+        .expect("frame ready");
     assert_eq!(&buf[..n], b"STAT-and-more");
     // Zero-length frames are real frames, not "nothing available".
     assert_eq!(t.poll_frame(&mut buf), Ok(Some(0)));
@@ -41,7 +47,10 @@ fn test_loopback_injected_and_sent_are_independent() {
     t.inject_frame(b"strm").expect("inject");
     t.send(b"HELO").expect("send");
     let mut buf = [0u8; 16];
-    let n = t.poll_frame(&mut buf).expect("poll frame").expect("frame ready");
+    let n = t
+        .poll_frame(&mut buf)
+        .expect("poll frame")
+        .expect("frame ready");
     assert_eq!(&buf[..n], b"strm");
     assert_eq!(t.poll_frame(&mut buf), Ok(None));
     let sent = t.pop_sent().expect("sent frame");
@@ -57,7 +66,10 @@ fn test_loopback_disconnect_semantics() {
     assert!(!t.connected());
     let mut buf = [0u8; 16];
     // Frames already queued are still delivered, then Disconnected.
-    let n = t.poll_frame(&mut buf).expect("poll frame").expect("frame ready");
+    let n = t
+        .poll_frame(&mut buf)
+        .expect("poll frame")
+        .expect("frame ready");
     assert_eq!(&buf[..n], b"last");
     assert_eq!(t.poll_frame(&mut buf), Err(TransportError::Disconnected));
     assert_eq!(t.send(b"x"), Err(TransportError::Disconnected));
@@ -80,11 +92,18 @@ fn test_fake_source_passes_conformance() {
 fn test_fake_source_connect_failure_and_abort() {
     let mut s = FakeStreamSource::with_conformance_routes();
     s.fail_connect = true;
-    let addr = NetAddr { ip: [10, 0, 0, 1], port: 9000 };
-    assert_eq!(s.connect(addr, b"GET /plain HTTP/1.0\r\n\r\n"), Err(StreamError::ConnectFailed));
+    let addr = NetAddr {
+        ip: [10, 0, 0, 1],
+        port: 9000,
+    };
+    assert_eq!(
+        s.connect(addr, b"GET /plain HTTP/1.0\r\n\r\n"),
+        Err(StreamError::ConnectFailed)
+    );
 
     let mut s = FakeStreamSource::with_conformance_routes();
-    s.connect(addr, b"GET /plain HTTP/1.0\r\n\r\n").expect("connect");
+    s.connect(addr, b"GET /plain HTTP/1.0\r\n\r\n")
+        .expect("connect");
     s.abort();
     let mut out = [0u8; 8];
     assert_eq!(s.poll_bytes(&mut out), Err(StreamError::Disconnected));
@@ -94,8 +113,14 @@ fn test_fake_source_connect_failure_and_abort() {
 #[test]
 fn test_fake_source_unknown_path_is_bad_response() {
     let mut s = FakeStreamSource::with_conformance_routes();
-    let addr = NetAddr { ip: [10, 0, 0, 1], port: 9000 };
-    assert_eq!(s.connect(addr, b"GET /nope HTTP/1.0\r\n\r\n"), Err(StreamError::BadResponse));
+    let addr = NetAddr {
+        ip: [10, 0, 0, 1],
+        port: 9000,
+    };
+    assert_eq!(
+        s.connect(addr, b"GET /nope HTTP/1.0\r\n\r\n"),
+        Err(StreamError::BadResponse)
+    );
 }
 
 #[test]
@@ -103,7 +128,10 @@ fn test_mock_backend_records_and_rejects_unsupported_rate() {
     let mut b = MockBackend::default();
     assert_eq!(b.set_sample_rate(44_100), Ok(()));
     assert_eq!(b.rate, 44_100);
-    assert_eq!(b.set_sample_rate(12_345), Err(ClockError::UnsupportedRate(12_345)));
+    assert_eq!(
+        b.set_sample_rate(12_345),
+        Err(ClockError::UnsupportedRate(12_345))
+    );
     assert_eq!(b.rate, 44_100);
     b.set_hw_volume(3, 4);
     b.set_mute(true);
@@ -119,7 +147,10 @@ fn test_mock_backend_records_and_rejects_unsupported_rate() {
 
 fn net_addr(a: SocketAddr) -> NetAddr {
     match a {
-        SocketAddr::V4(v4) => NetAddr { ip: v4.ip().octets(), port: v4.port() },
+        SocketAddr::V4(v4) => NetAddr {
+            ip: v4.ip().octets(),
+            port: v4.port(),
+        },
         SocketAddr::V6(_) => panic!("IPv4 only"),
     }
 }
@@ -164,7 +195,9 @@ fn spawn_conformance_server() -> SocketAddr {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
             std::thread::spawn(move || {
-                let Some(path) = read_request_path(&mut conn) else { return };
+                let Some(path) = read_request_path(&mut conn) else {
+                    return;
+                };
                 match ROUTES.iter().find(|(p, _)| *p == &path[..]) {
                     Some((_, segments)) => write_segments(&mut conn, segments),
                     None => write_segments(&mut conn, &[b"HTTP/1.0 404 Not Found\r\n\r\n"]),
@@ -215,7 +248,10 @@ impl StreamSource for ToMock {
 #[test]
 fn test_http_audio_stream_passes_conformance() {
     let mock = net_addr(spawn_conformance_server());
-    run_stream_source_conformance(|| ToMock { inner: HttpAudioStream::new(), mock });
+    run_stream_source_conformance(|| ToMock {
+        inner: HttpAudioStream::new(),
+        mock,
+    });
 }
 
 /// One-shot server: replies with `segments` (then closes unless `hold` is
@@ -224,7 +260,9 @@ fn spawn_scripted_server(segments: Vec<Vec<u8>>, hold: bool) -> NetAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
     let addr = net_addr(listener.local_addr().expect("local addr"));
     std::thread::spawn(move || {
-        let Ok((mut conn, _)) = listener.accept() else { return; };
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
         if read_request_path(&mut conn).is_none() {
             return;
         }
@@ -277,9 +315,15 @@ fn test_http_audio_stream_truncated_chunked_is_disconnected_not_eof() {
     let mut s = HttpAudioStream::new();
     connect_blocking(&mut s, addr).expect("connect");
     let (body, err) = read_to_end(&mut s).expect_err("stream truncated");
-    assert_eq!(body, b"hello", "bytes received before the drop are still delivered");
+    assert_eq!(
+        body, b"hello",
+        "bytes received before the drop are still delivered"
+    );
     assert_eq!(err, StreamError::Disconnected);
-    assert!(!StreamSource::is_eof(&s), "a truncated stream must never report EOF");
+    assert!(
+        !StreamSource::is_eof(&s),
+        "a truncated stream must never report EOF"
+    );
     // The error is sticky.
     let mut out = [0u8; 8];
     assert_eq!(s.poll_bytes(&mut out), Err(StreamError::Disconnected));
@@ -310,7 +354,10 @@ fn test_http_audio_stream_short_content_length_is_disconnected() {
 fn test_http_audio_stream_drop_during_headers_is_disconnected() {
     let addr = spawn_scripted_server(vec![b"HTTP/1.0 200 OK\r\nContent-Ty".to_vec()], false);
     let mut s = HttpAudioStream::new();
-    assert_eq!(connect_blocking(&mut s, addr), Err(StreamError::Disconnected));
+    assert_eq!(
+        connect_blocking(&mut s, addr),
+        Err(StreamError::Disconnected)
+    );
     let mut out = [0u8; 8];
     assert_eq!(s.poll_bytes(&mut out), Err(StreamError::Disconnected));
     assert!(!StreamSource::is_eof(&s));
@@ -320,7 +367,10 @@ fn test_http_audio_stream_drop_during_headers_is_disconnected() {
 fn test_http_audio_stream_clean_close_is_eof() {
     // Close-delimited body (no length, not chunked) and an exact
     // Content-Length both end cleanly.
-    for head in [&b"HTTP/1.0 200 OK\r\n\r\n"[..], b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n"] {
+    for head in [
+        &b"HTTP/1.0 200 OK\r\n\r\n"[..],
+        b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n",
+    ] {
         let mut seg = head.to_vec();
         seg.extend_from_slice(b"hello");
         let addr = spawn_scripted_server(vec![seg], false);
@@ -348,7 +398,10 @@ fn test_http_audio_stream_abort_errors_until_reconnect() {
     for _ in 0..3 {
         assert_eq!(s.poll_bytes(&mut out), Err(StreamError::Disconnected));
     }
-    assert!(!StreamSource::is_eof(&s), "abort is not a clean end of stream");
+    assert!(
+        !StreamSource::is_eof(&s),
+        "abort is not a clean end of stream"
+    );
 
     // The next connect brings the source back to life.
     let addr = spawn_scripted_server(vec![seg], false);
@@ -372,7 +425,10 @@ fn test_http_audio_stream_connect_refused() {
     let addr = net_addr(l.local_addr().expect("local addr"));
     drop(l);
     let mut s = HttpAudioStream::new();
-    assert_eq!(connect_blocking(&mut s, addr), Err(StreamError::ConnectFailed));
+    assert_eq!(
+        connect_blocking(&mut s, addr),
+        Err(StreamError::ConnectFailed)
+    );
 }
 
 #[test]
@@ -422,7 +478,9 @@ fn slim_pair() -> (SlimprotoClient, TcpStream) {
     let addr = listener.local_addr().expect("local addr");
     let client = SlimprotoClient::connect(addr, MAC, "TestModel").expect("connect");
     let (mut server, _) = listener.accept().expect("accept");
-    server.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
     // The connect handshake already sent a HELO.
     let mut helo = [0u8; 8];
     server.read_exact(&mut helo).expect("read helo");
@@ -488,7 +546,10 @@ fn test_slimproto_transport_split_and_coalesced_frames() {
     server.write_all(&both).expect("write");
     let n = poll_until_frame(&mut client, &mut buf).expect("frame");
     assert_eq!(&buf[..n], &flsh[..]);
-    assert_eq!(SlimTransport::poll_frame(&mut client, &mut buf), Ok(Some(frame.len())));
+    assert_eq!(
+        SlimTransport::poll_frame(&mut client, &mut buf),
+        Ok(Some(frame.len()))
+    );
     assert_eq!(&buf[..frame.len()], &frame[..]);
     assert_eq!(SlimTransport::poll_frame(&mut client, &mut buf), Ok(None));
 }
@@ -515,8 +576,14 @@ fn test_slimproto_transport_small_buffer_drops_frame_then_recovers() {
         }
     };
     assert_eq!(err, Err(TransportError::Io));
-    assert!(SlimTransport::connected(&client), "an oversized frame is not a disconnect");
-    assert_eq!(SlimTransport::poll_frame(&mut client, &mut small), Ok(Some(flsh.len())));
+    assert!(
+        SlimTransport::connected(&client),
+        "an oversized frame is not a disconnect"
+    );
+    assert_eq!(
+        SlimTransport::poll_frame(&mut client, &mut small),
+        Ok(Some(flsh.len()))
+    );
     assert_eq!(&small[..flsh.len()], &flsh[..]);
 }
 
@@ -548,7 +615,10 @@ fn test_slimproto_transport_disconnect_drains_then_errors() {
         }
     }
     assert!(!SlimTransport::connected(&client));
-    assert_eq!(SlimTransport::send(&mut client, b"HELO"), Err(TransportError::Disconnected));
+    assert_eq!(
+        SlimTransport::send(&mut client, b"HELO"),
+        Err(TransportError::Disconnected)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -709,7 +779,11 @@ impl ShimSocket {
     }
 
     fn route(mut self, path: &[u8], segments: &[&[u8]], end: ShimEnd) -> Self {
-        self.extra.push((path.to_vec(), segments.iter().map(|s| s.to_vec()).collect(), end));
+        self.extra.push((
+            path.to_vec(),
+            segments.iter().map(|s| s.to_vec()).collect(),
+            end,
+        ));
         self
     }
 
@@ -772,7 +846,11 @@ impl TcpSocketOps for ShimSocket {
     fn phase(&self) -> TcpPhase {
         if self.phase.get() == TcpPhase::Connecting {
             if self.polls_left.get() == 0 {
-                self.phase.set(if self.refuse { TcpPhase::Closed } else { TcpPhase::Established });
+                self.phase.set(if self.refuse {
+                    TcpPhase::Closed
+                } else {
+                    TcpPhase::Established
+                });
             } else {
                 self.polls_left.set(self.polls_left.get() - 1);
             }
@@ -865,7 +943,10 @@ fn test_device_stream_source_conformance_over_keepalive_and_byte_writes() {
     });
 }
 
-const DEV_ADDR: NetAddr = NetAddr { ip: [10, 0, 0, 9], port: 9000 };
+const DEV_ADDR: NetAddr = NetAddr {
+    ip: [10, 0, 0, 9],
+    port: 9000,
+};
 
 fn dev_connect(s: &mut DeviceSource, request: &[u8]) -> Result<(), StreamError> {
     for _ in 0..64 {
@@ -895,13 +976,22 @@ fn dev_read_to_end(s: &mut DeviceSource) -> Result<Vec<u8>, (Vec<u8>, StreamErro
 #[test]
 fn test_device_stream_connect_is_nonblocking_until_the_head_is_parsed() {
     let mut s = device_source(ShimSocket::server());
-    assert_eq!(s.connect(DEV_ADDR, b"GET /plain HTTP/1.0\r\n\r\n"), Err(StreamError::WouldBlock));
+    assert_eq!(
+        s.connect(DEV_ADDR, b"GET /plain HTTP/1.0\r\n\r\n"),
+        Err(StreamError::WouldBlock)
+    );
     assert_eq!(s.socket().connects, vec![DEV_ADDR]);
     // Repeating the call resumes the same request (no second TCP connect).
     dev_connect(&mut s, b"GET /plain HTTP/1.0\r\n\r\n").expect("connect");
     assert_eq!(s.socket().connects.len(), 1);
-    assert_eq!(s.socket().requests, vec![b"GET /plain HTTP/1.0\r\n\r\n".to_vec()]);
-    assert_eq!(dev_read_to_end(&mut s).expect("read to end"), conformance::PLAIN_BODY);
+    assert_eq!(
+        s.socket().requests,
+        vec![b"GET /plain HTTP/1.0\r\n\r\n".to_vec()]
+    );
+    assert_eq!(
+        dev_read_to_end(&mut s).expect("read to end"),
+        conformance::PLAIN_BODY
+    );
 }
 
 #[test]
@@ -921,13 +1011,19 @@ fn test_device_stream_refused_connect_is_connect_failed() {
 fn test_device_stream_drop_mid_chunked_body_is_disconnected_after_buffered_bytes() {
     let sock = ShimSocket::server().route(
         b"/t",
-        &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcd", b"ef"],
+        &[
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcd",
+            b"ef",
+        ],
         ShimEnd::Fin,
     );
     let mut s = device_source(sock);
     dev_connect(&mut s, b"GET /t HTTP/1.1\r\n\r\n").expect("connect");
     let (body, err) = dev_read_to_end(&mut s).expect_err("disconnected");
-    assert_eq!(body, b"abcdef", "bytes received before the drop are delivered first");
+    assert_eq!(
+        body, b"abcdef",
+        "bytes received before the drop are delivered first"
+    );
     assert_eq!(err, StreamError::Disconnected);
     assert!(!s.is_eof(), "an early drop is never EOF");
 }
@@ -942,7 +1038,10 @@ fn test_device_stream_short_content_length_is_disconnected() {
     let mut s = device_source(sock);
     dev_connect(&mut s, b"GET /cl HTTP/1.0\r\n\r\n").expect("connect");
     let (body, err) = dev_read_to_end(&mut s).expect_err("disconnected");
-    assert_eq!((body.as_slice(), err), (&b"012345"[..], StreamError::Disconnected));
+    assert_eq!(
+        (body.as_slice(), err),
+        (&b"012345"[..], StreamError::Disconnected)
+    );
 }
 
 #[test]
@@ -951,7 +1050,10 @@ fn test_device_stream_reset_mid_close_delimited_body_is_disconnected() {
     let mut s = device_source(sock);
     dev_connect(&mut s, b"GET /rst HTTP/1.0\r\n\r\n").expect("connect");
     let (body, err) = dev_read_to_end(&mut s).expect_err("disconnected");
-    assert_eq!((body.as_slice(), err), (&b"abc"[..], StreamError::Disconnected));
+    assert_eq!(
+        (body.as_slice(), err),
+        (&b"abc"[..], StreamError::Disconnected)
+    );
 }
 
 #[test]
@@ -972,7 +1074,10 @@ fn test_device_stream_content_length_reached_is_eof_without_close() {
 fn test_device_stream_drop_during_head_is_disconnected() {
     let sock = ShimSocket::server().route(b"/h", &[b"HTTP/1.0 200 OK\r\nConte"], ShimEnd::Fin);
     let mut s = device_source(sock);
-    assert_eq!(dev_connect(&mut s, b"GET /h HTTP/1.0\r\n\r\n"), Err(StreamError::Disconnected));
+    assert_eq!(
+        dev_connect(&mut s, b"GET /h HTTP/1.0\r\n\r\n"),
+        Err(StreamError::Disconnected)
+    );
 }
 
 #[test]
@@ -988,7 +1093,10 @@ fn test_device_stream_abort_errors_until_reconnect() {
     }
     assert!(s.take_response_headers().is_none());
     dev_connect(&mut s, b"GET /plain HTTP/1.0\r\n\r\n").expect("connect");
-    assert_eq!(dev_read_to_end(&mut s).expect("read to end"), conformance::PLAIN_BODY);
+    assert_eq!(
+        dev_read_to_end(&mut s).expect("read to end"),
+        conformance::PLAIN_BODY
+    );
 }
 
 #[test]
@@ -1011,21 +1119,34 @@ fn test_device_stream_redirects_rewrite_request_and_follow_absolute_ipv4() {
         s.socket().requests.last().expect("last request"),
         b"GET /plain HTTP/1.0\r\nHost: 10.0.0.9:9000\r\nIcy-MetaData: 1\r\n\r\n"
     );
-    assert_eq!(s.socket().connects, vec![DEV_ADDR, DEV_ADDR], "same-origin hop reconnects");
+    assert_eq!(
+        s.socket().connects,
+        vec![DEV_ADDR, DEV_ADDR],
+        "same-origin hop reconnects"
+    );
 
     dev_connect(&mut s, b"GET /abs HTTP/1.0\r\n\r\n").expect("connect");
     assert_eq!(
         *s.socket().connects.last().expect("last connect"),
-        NetAddr { ip: [10, 0, 0, 7], port: 8000 }
+        NetAddr {
+            ip: [10, 0, 0, 7],
+            port: 8000
+        }
     );
     assert_eq!(
         s.socket().requests.last().expect("last request"),
         b"GET /plain HTTP/1.0\r\nHost: 10.0.0.7:8000\r\n\r\n"
     );
-    assert_eq!(dev_read_to_end(&mut s).expect("read to end"), conformance::PLAIN_BODY);
+    assert_eq!(
+        dev_read_to_end(&mut s).expect("read to end"),
+        conformance::PLAIN_BODY
+    );
 
     // No resolver on the device: a host-name Location cannot be followed.
-    assert_eq!(dev_connect(&mut s, b"GET /host HTTP/1.0\r\n\r\n"), Err(StreamError::ConnectFailed));
+    assert_eq!(
+        dev_connect(&mut s, b"GET /host HTTP/1.0\r\n\r\n"),
+        Err(StreamError::ConnectFailed)
+    );
 }
 
 #[test]
@@ -1047,12 +1168,18 @@ fn test_device_stream_side_data_by_callback_and_head_cap() {
 
     // A head over MAX_RESPONSE_HEAD is a bad response.
     let big: &'static [u8] = Box::leak(
-        [b"HTTP/1.0 200 OK\r\n".as_slice(), &[b'x'; MAX_RESPONSE_HEAD]]
-            .concat()
-            .into_boxed_slice(),
+        [
+            b"HTTP/1.0 200 OK\r\n".as_slice(),
+            &[b'x'; MAX_RESPONSE_HEAD],
+        ]
+        .concat()
+        .into_boxed_slice(),
     );
     let mut s = device_source(ShimSocket::server().route(b"/big", &[big], ShimEnd::Hold));
-    assert_eq!(dev_connect(&mut s, b"GET /big HTTP/1.0\r\n\r\n"), Err(StreamError::BadResponse));
+    assert_eq!(
+        dev_connect(&mut s, b"GET /big HTTP/1.0\r\n\r\n"),
+        Err(StreamError::BadResponse)
+    );
 }
 
 fn slim_frame(opcode: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -1104,7 +1231,11 @@ fn test_device_slim_transport_oversized_frame_dropped_then_recovers() {
     t.socket_mut().push_rx(&big[200..]);
     t.socket_mut().push_rx(&next);
     let mut small = [0u8; 64];
-    assert_eq!(t.poll_frame(&mut small), Err(TransportError::Io), "too big for the caller");
+    assert_eq!(
+        t.poll_frame(&mut small),
+        Err(TransportError::Io),
+        "too big for the caller"
+    );
     let mut got = None;
     for _ in 0..8 {
         if let Some(n) = t.poll_frame(&mut small).expect("poll frame") {
@@ -1112,7 +1243,11 @@ fn test_device_slim_transport_oversized_frame_dropped_then_recovers() {
             break;
         }
     }
-    assert_eq!(got.expect("got next frame"), next, "the stream resynchronises on the next frame");
+    assert_eq!(
+        got.expect("got next frame"),
+        next,
+        "the stream resynchronises on the next frame"
+    );
 
     // A frame larger than the socket's receive buffer can never complete:
     // dropped too.
@@ -1144,10 +1279,18 @@ fn test_device_slim_transport_send_is_whole_frame() {
     t.send(b"STAT0123").expect("send");
     assert_eq!(t.socket().sent, b"STAT0123");
     t.socket_mut().tx_cap = 4;
-    assert_eq!(t.send(b"STAT0123"), Err(TransportError::Io), "can never fit the tx buffer");
+    assert_eq!(
+        t.send(b"STAT0123"),
+        Err(TransportError::Io),
+        "can never fit the tx buffer"
+    );
     t.socket_mut().tx_cap = 16;
     t.socket_mut().sent.clear();
     t.socket_mut().queued = 12;
-    assert_eq!(t.send(b"STAT0123"), Err(TransportError::WouldBlock), "no partial frames");
+    assert_eq!(
+        t.send(b"STAT0123"),
+        Err(TransportError::WouldBlock),
+        "no partial frames"
+    );
     assert!(t.socket().sent.is_empty());
 }

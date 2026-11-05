@@ -190,12 +190,8 @@ fn test_dual_sector_sequence_wraparound() {
     // Save to dual sectors: since sector A is u32::MAX and sector B is
     // unwritten (0s), save_to_dual_sectors writes to sector B with seq 0
     store.set_str("k", "v_zero").unwrap();
-    let (wrote_b, bytes_b) = FlashJournal::save_to_dual_sectors(
-        &store,
-        &mut sector_a,
-        &mut sector_b,
-    )
-    .unwrap();
+    let (wrote_b, bytes_b) =
+        FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
     assert!(wrote_b);
     assert!(bytes_b > FlashJournal::HEADER_SIZE);
 
@@ -211,12 +207,8 @@ fn test_dual_sector_sequence_wraparound() {
 
     // Next save writes to sector A with seq 0.wrapping_add(1) = 1
     store.set_str("k", "v_one").unwrap();
-    let (wrote_b2, _) = FlashJournal::save_to_dual_sectors(
-        &store,
-        &mut sector_a,
-        &mut sector_b,
-    )
-    .unwrap();
+    let (wrote_b2, _) =
+        FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
     assert!(!wrote_b2);
     let (seq_a2, _, _) = FlashJournal::read_sector_meta(&sector_a).unwrap();
     assert_eq!(seq_a2, 1);
@@ -263,12 +255,7 @@ fn test_dual_sector_fallback_on_entry_corruption_in_newer_sector() {
 
     // Dual sector load must automatically fall back to intact sector A
     let mut recovered = MemConfigStore::<16>::new();
-    let count = FlashJournal::load_from_dual_sectors(
-        &sector_a,
-        &sector_b,
-        &mut recovered,
-    )
-    .unwrap();
+    let count = FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut recovered).unwrap();
     assert_eq!(count, 1);
     let mut buf = [0u8; 16];
     let len = recovered.get("k", &mut buf).unwrap();

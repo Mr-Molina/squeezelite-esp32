@@ -43,8 +43,7 @@ use squeezelite_cspot::zeroconf::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS;
 // --- Shannon Golden Vector Tests ---
 
 const SHANNON_TEST_KEY: [u8; 16] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
 ];
 
 const SHANNON_TEST_NONCE: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
@@ -52,10 +51,8 @@ const SHANNON_TEST_NONCE: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
 const SHANNON_PLAINTEXT: &[u8] = b"Hello, Spotify Shannon Stream Cipher!";
 
 const SHANNON_GOLDEN_CIPHERTEXT: [u8; 37] = [
-    0x91, 0xC8, 0xCE, 0x69, 0x83, 0xB4, 0xFB, 0x97,
-    0xB3, 0xDF, 0xDC, 0x9A, 0x27, 0x9F, 0x2B, 0xF9,
-    0x4E, 0x43, 0x49, 0x31, 0x65, 0x22, 0x42, 0x1F,
-    0xC8, 0x87, 0xCB, 0xB3, 0xBA, 0x8A, 0xF4, 0xB7,
+    0x91, 0xC8, 0xCE, 0x69, 0x83, 0xB4, 0xFB, 0x97, 0xB3, 0xDF, 0xDC, 0x9A, 0x27, 0x9F, 0x2B, 0xF9,
+    0x4E, 0x43, 0x49, 0x31, 0x65, 0x22, 0x42, 0x1F, 0xC8, 0x87, 0xCB, 0xB3, 0xBA, 0x8A, 0xF4, 0xB7,
     0xDC, 0x06, 0xC9, 0x07, 0x88,
 ];
 
@@ -144,8 +141,12 @@ fn test_oakley_group_1_dh_shared_agreement() {
     let alice = OakleyGroup1Dh::from_private_key(alice_priv).expect("alice dh init");
     let bob = OakleyGroup1Dh::from_private_key(bob_priv).expect("bob dh init");
 
-    let alice_shared = alice.calculate_shared(bob.public_key()).expect("alice shared");
-    let bob_shared = bob.calculate_shared(alice.public_key()).expect("bob shared");
+    let alice_shared = alice
+        .calculate_shared(bob.public_key())
+        .expect("alice shared");
+    let bob_shared = bob
+        .calculate_shared(alice.public_key())
+        .expect("bob shared");
 
     assert_eq!(alice_shared, bob_shared);
 }
@@ -230,14 +231,9 @@ fn test_zeroconf_get_info() {
     let remote_name = "BASEMENT";
 
     let mut server = ZeroConfServer::new();
-    let resp = server.handle_request(
-        "/?action=getInfo",
-        "",
-        &dh,
-        device_id,
-        remote_name,
-    )
-    .expect("handle getInfo");
+    let resp = server
+        .handle_request("/?action=getInfo", "", &dh, device_id, remote_name)
+        .expect("handle getInfo");
 
     assert_eq!(resp.status_code, 200);
     let body_str = String::from_utf8(resp.body).expect("utf8 json");
@@ -347,12 +343,8 @@ fn test_spirc_notify_frame_build() {
 #[test]
 fn test_mercury_request_builder() {
     let payload = b"{\"context\":\"spotify:album:123\"}";
-    let packet = MercuryPacketBuilder::build_request(
-        1001,
-        "SUB",
-        "hm://remote/user/spotify",
-        &[payload],
-    );
+    let packet =
+        MercuryPacketBuilder::build_request(1001, "SUB", "hm://remote/user/spotify", &[payload]);
 
     assert!(packet.len() > 30);
     // Sequence length is 8 bytes
@@ -446,10 +438,7 @@ fn test_reusable_credentials_ap_welcome_and_encrypted_persistence() {
         "spotify_user_canonical",
         vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04],
     );
-    assert_eq!(
-        creds.auth_type,
-        AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS
-    );
+    assert_eq!(creds.auth_type, AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS);
 
     // Encode APWelcome (0xAC) and parse back
     let welcome_bytes = creds.encode_ap_welcome();
@@ -459,10 +448,8 @@ fn test_reusable_credentials_ap_welcome_and_encrypted_persistence() {
     assert_eq!(parsed_welcome, creds);
 
     // Reject non-0xAC command (e.g., 0xAD declined)
-    let declined = ReusableCredentials::from_ap_welcome_packet(
-        AP_AUTH_DECLINED_CMD,
-        &welcome_bytes,
-    );
+    let declined =
+        ReusableCredentials::from_ap_welcome_packet(AP_AUTH_DECLINED_CMD, &welcome_bytes);
     assert_eq!(declined, Err(CryptoError::DecryptionFailed));
 
     // Encrypt for FlashJournal with AES-128-CTR + HMAC-SHA1
@@ -471,14 +458,14 @@ fn test_reusable_credentials_ap_welcome_and_encrypted_persistence() {
     let encrypted = creds.encrypt(secret, iv);
     assert!(encrypted.len() > 36);
 
-    let decrypted = ReusableCredentials::decrypt(&encrypted, secret)
-        .expect("decrypt valid credentials");
+    let decrypted =
+        ReusableCredentials::decrypt(&encrypted, secret).expect("decrypt valid credentials");
     assert_eq!(decrypted, creds);
 
     // Base64 FlashJournal roundtrip
     let b64 = creds.encrypt_base64(secret, iv);
-    let from_b64 = ReusableCredentials::decrypt_base64(&b64, secret)
-        .expect("decrypt base64 credentials");
+    let from_b64 =
+        ReusableCredentials::decrypt_base64(&b64, secret).expect("decrypt base64 credentials");
     assert_eq!(from_b64, creds);
 
     // Tamper with ciphertext byte -> must fail HMAC-SHA1 check
@@ -512,8 +499,7 @@ fn test_mercury_header_and_multipart_packet_framing() {
         .with_content_type("application/x-protobuf");
 
     let encoded_hdr = header.encode();
-    let decoded_hdr =
-        MercuryHeader::decode(&encoded_hdr).expect("decode mercury header");
+    let decoded_hdr = MercuryHeader::decode(&encoded_hdr).expect("decode mercury header");
     assert_eq!(decoded_hdr, header);
 
     // Full MercuryPacket roundtrip for 0xB2..0xB5
@@ -531,8 +517,7 @@ fn test_mercury_header_and_multipart_packet_framing() {
         );
         assert_eq!(pkt.cmd, expected_cmd);
         let (cmd_byte, body) = pkt.encode_ap_frame();
-        let decoded =
-            MercuryPacket::decode(cmd_byte, &body).expect("decode mercury pkt");
+        let decoded = MercuryPacket::decode(cmd_byte, &body).expect("decode mercury pkt");
         assert_eq!(decoded.cmd, expected_cmd);
         assert_eq!(decoded.seq_id, 4242);
         assert_eq!(decoded.header.uri, "hm://metadata/4/track/abcdef");
@@ -543,8 +528,7 @@ fn test_mercury_header_and_multipart_packet_framing() {
     }
 
     // Multipart assembly across two fragments (0xB5 MercuryEvent)
-    let event_hdr = MercuryHeader::new("hm://remote/user/spotify/", "SEND")
-        .with_status_code(200);
+    let event_hdr = MercuryHeader::new("hm://remote/user/spotify/", "SEND").with_status_code(200);
     let hdr_bytes = event_hdr.encode();
 
     let mut frag1 = Vec::new();
@@ -565,11 +549,9 @@ fn test_mercury_header_and_multipart_packet_framing() {
     frag2.extend_from_slice(&6u16.to_be_bytes());
     frag2.extend_from_slice(b"chunkB");
 
-    let assembled = MercuryPacket::assemble_multipart(
-        MercuryType::MercuryEvent as u8,
-        &[&frag1, &frag2],
-    )
-    .expect("assemble multipart");
+    let assembled =
+        MercuryPacket::assemble_multipart(MercuryType::MercuryEvent as u8, &[&frag1, &frag2])
+            .expect("assemble multipart");
     assert_eq!(assembled.cmd, MercuryType::MercuryEvent);
     assert_eq!(assembled.seq_id, 99);
     assert_eq!(assembled.flags, 0x01);
@@ -692,8 +674,7 @@ fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
         Some("ab67616d0000b2730123456789abcdef01234567".to_string()),
     );
     let meta_bytes = meta.encode_protobuf();
-    let decoded_meta =
-        TrackMetadata::decode_protobuf(&meta_bytes).expect("decode track proto");
+    let decoded_meta = TrackMetadata::decode_protobuf(&meta_bytes).expect("decode track proto");
     assert_eq!(decoded_meta, meta);
     assert_eq!(
         decoded_meta.artwork_url().as_deref(),
@@ -709,10 +690,12 @@ fn test_spirc_extended_seek_volume_queue_metadata_and_track_ended() {
 
     // Seek frame roundtrip & state update
     let seek_frame = SpircFrame::seek(10, 90_000);
-    let seek_parsed =
-        SpircFrame::parse(&seek_frame.encode()).expect("parse seek frame");
+    let seek_parsed = SpircFrame::parse(&seek_frame.encode()).expect("parse seek frame");
     assert_eq!(seek_parsed, seek_frame);
-    assert_eq!(sm.handle_frame(&seek_parsed), Some(SpircEvent::Seek(90_000)));
+    assert_eq!(
+        sm.handle_frame(&seek_parsed),
+        Some(SpircEvent::Seek(90_000))
+    );
     assert_eq!(sm.position_ms(), 90_000);
 
     // Volume clamping to 0..=65535
@@ -789,5 +772,3 @@ fn test_wo253_spirc_protobuf_wire_types_1_and_5() {
     let meta = TrackMetadata::decode_protobuf(&data).expect("decode with fixed32/fixed64");
     assert_eq!(meta.title, "Test Song");
 }
-
-

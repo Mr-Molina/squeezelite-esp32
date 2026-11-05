@@ -45,9 +45,9 @@ pub use console::{
     TELNET_PORT, TELNET_PROMPT,
 };
 pub use controls::{
-    ActrlsEntry, ActrlsMap, BatteryMonitor, ButtonDebouncer, ButtonGesture, ControlAction,
-    EncoderMode, GpioExpanderKind, IrDecoder, IrFrame, IrProtocol, LedStripVisualizer,
-    RotaryEncoder, RotaryEvent, StatusLedState, build_butn_frame, build_ir_frame,
+    build_butn_frame, build_ir_frame, ActrlsEntry, ActrlsMap, BatteryMonitor, ButtonDebouncer,
+    ButtonGesture, ControlAction, EncoderMode, GpioExpanderKind, IrDecoder, IrFrame, IrProtocol,
+    LedStripVisualizer, RotaryEncoder, RotaryEvent, StatusLedState,
 };
 pub use coordinator::{AudioSource, PlayerCoordinator, PlayerState, SourceArbiter};
 pub use cyd::CydController;
@@ -55,12 +55,12 @@ pub use dac_platform::{
     AudioOutputPolicy, DacConfigSpec, DacModel, SpdifBmcEncoder, SpdifConfigSpec, SpdifPreamble,
 };
 pub use display_gds::{
-    DisplayBusArbiter, DisplayColorMode, DisplayDriverKind, ExternalMetadataScreen,
-    ExternalSourceTag, GdsDisplayEngine, GdsFramebuffer, LmsDisplayCommand, TextScroller,
-    VisualizerMode, build_anic_frame, build_setd_display_size_frame,
+    build_anic_frame, build_setd_display_size_frame, DisplayBusArbiter, DisplayColorMode,
+    DisplayDriverKind, ExternalMetadataScreen, ExternalSourceTag, GdsDisplayEngine, GdsFramebuffer,
+    LmsDisplayCommand, TextScroller, VisualizerMode,
 };
 pub use eth_w5500::{
-    EthDuplex, EthLinkSpeed, PhyStatus, SpiAccessMode, W5500Driver, W5500Error, encode_spi_header,
+    encode_spi_header, EthDuplex, EthLinkSpeed, PhyStatus, SpiAccessMode, W5500Driver, W5500Error,
     MAX_ETHERNET_FRAME_BYTES, W5500_CHIP_VERSION,
 };
 pub use hal::{
@@ -73,13 +73,12 @@ pub use power_boards::{BoardProfile, SleepManager, SleepState};
 pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
 
+#[cfg(not(target_arch = "xtensa"))]
+pub use network::{HttpAudioStream, LmsDiscovery, RaopStreamClient, SlimprotoClient};
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
 pub use squeezelite_config::{
     AudioConfig, FlashJournal, KeyValueStorage, MemConfigStore, StorageError, WifiCredentials,
 };
-#[cfg(not(target_arch = "xtensa"))]
-pub use network::{HttpAudioStream, LmsDiscovery, RaopStreamClient, SlimprotoClient};
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};
 pub use squeezelite_tas58xx::{Play, PowerDown, Standby, Tas58xx};
-

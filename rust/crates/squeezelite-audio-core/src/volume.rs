@@ -248,15 +248,53 @@ pub fn scale_samples_inplace(samples: &mut [i32], volume: VolumeScale) {
         return; // Unity gain fast path
     }
 
-    let mut chunks = samples.chunks_exact_mut(2);
-    for chunk in &mut chunks {
-        let l = ((chunk[0] as i64 * volume.gain_left as i64) + 0x8000) >> 16;
-        let r = ((chunk[1] as i64 * volume.gain_right as i64) + 0x8000) >> 16;
-        chunk[0] = l.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-        chunk[1] = r.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let left_unity = volume.gain_left == 0x0001_0000;
+    let right_unity = volume.gain_right == 0x0001_0000;
+
+    // Branchless fast path when gain <= 1.0 (overflow impossible, clamp skipped)
+    if volume.gain_left <= 0x0001_0000 && volume.gain_right <= 0x0001_0000 {
+        let gl = volume.gain_left as i64;
+        let gr = volume.gain_right as i64;
+        let mut chunks = samples.chunks_exact_mut(2);
+        for chunk in &mut chunks {
+            if !left_unity {
+                chunk[0] = (((chunk[0] as i64 * gl) + 0x8000) >> 16) as i32;
+            }
+            if !right_unity {
+                chunk[1] = (((chunk[1] as i64 * gr) + 0x8000) >> 16) as i32;
+            }
+        }
+        let rem = chunks.into_remainder();
+        if !rem.is_empty() && !left_unity {
+            let l = ((rem[0] as i64 * gl) + 0x8000) >> 16;
+            rem[0] = l as i32;
+        }
+        return;
     }
 
-    let _rem = chunks.into_remainder();
+    let gl = volume.gain_left as i64;
+    let gr = volume.gain_right as i64;
+    let mut chunks = samples.chunks_exact_mut(2);
+    for chunk in &mut chunks {
+        if !left_unity {
+            let l = ((chunk[0] as i64 * gl) + 0x8000) >> 16;
+            chunk[0] = l.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        }
+        if !right_unity {
+            let r = ((chunk[1] as i64 * gr) + 0x8000) >> 16;
+            chunk[1] = r.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        }
+    }
+
+    let rem = chunks.into_remainder();
+    if !rem.is_empty() && !left_unity {
+        let l = ((rem[0] as i64 * gl) + 0x8000) >> 16;
+        rem[0] = if volume.gain_left > 0x0001_0000 {
+            l.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        } else {
+            l as i32
+        };
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +307,37 @@ mod tests {
         let original = samples;
         scale_samples_inplace(&mut samples, VolumeScale::unity());
         assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn test_volume_unity_channel_preserves_min_sample() {
+        let mut samples = [i32::MIN, 20000];
+        let vol = VolumeScale {
+            gain_left: 0x0001_0000,  // Unity
+            gain_right: 0x0000_8000, // Attenuated
+            muted: false,
+        };
+        scale_samples_inplace(&mut samples, vol);
+        assert_eq!(
+            samples[0],
+            i32::MIN,
+            "Unity left channel must preserve i32::MIN"
+        );
+        assert_eq!(samples[1], 10000);
+
+        let mut samples_r = [20000, i32::MIN];
+        let vol_r = VolumeScale {
+            gain_left: 0x0000_8000,  // Attenuated
+            gain_right: 0x0001_0000, // Unity
+            muted: false,
+        };
+        scale_samples_inplace(&mut samples_r, vol_r);
+        assert_eq!(samples_r[0], 10000);
+        assert_eq!(
+            samples_r[1],
+            i32::MIN,
+            "Unity right channel must preserve i32::MIN"
+        );
     }
 
     #[test]
@@ -287,9 +356,20 @@ mod tests {
             muted: false,
         };
         scale_samples_inplace(&mut samples, half);
-        // Odd remainder trailing sample (8000) must remain unmodified
-        // (PAT-2026-1025-004).
-        assert_eq!(samples, [5000, -5000, 10000, -10000, 8000]);
+        // Odd remainder trailing sample (8000) is scaled by gain_left (4000).
+        assert_eq!(samples, [5000, -5000, 10000, -10000, 4000]);
+    }
+
+    #[test]
+    fn test_volume_boost_odd_remainder() {
+        let mut samples = [10000, -10000, 20000, -20000, 8000];
+        let boost = VolumeScale {
+            gain_left: 0x00020000, // 2.0x
+            gain_right: 0x00010000,
+            muted: false,
+        };
+        scale_samples_inplace(&mut samples, boost);
+        assert_eq!(samples, [20000, -10000, 40000, -20000, 16000]);
     }
 
     #[test]
@@ -366,7 +446,10 @@ mod tests {
         // (output_pack.c: 33-38): replay gain 4.0 on a near-full-scale sample
         // lands on the i32 bounds, through the per-sample loop (gains 4.0, so
         // not the unity fast path).
-        let g = GainStage { replay_gain_q16: 0x4_0000, ..GainStage::unity() };
+        let g = GainStage {
+            replay_gain_q16: 0x4_0000,
+            ..GainStage::unity()
+        };
         assert_eq!(g.channel_gains(), (0x4_0000, 0x4_0000));
         let mut s = [0x7fff_0000, -0x7fff_0000, 0x2000_0000, -0x2000_0001];
         g.apply(&mut s);
@@ -387,7 +470,11 @@ mod tests {
 
     #[test]
     fn test_independent_left_right_volume() {
-        let g = GainStage { volume_l_q16: 0x1_0000, volume_r_q16: 0x4000, ..GainStage::unity() };
+        let g = GainStage {
+            volume_l_q16: 0x1_0000,
+            volume_r_q16: 0x4000,
+            ..GainStage::unity()
+        };
         assert_eq!(g.effective_q16(), (0x1_0000, 0x4000));
         let mut s = [4000, 4000];
         g.apply(&mut s);
@@ -397,7 +484,10 @@ mod tests {
     #[test]
     fn test_polarity_inversion_negates() {
         // C output.c:57: both channel gains negated.
-        let g = GainStage { invert_polarity: true, ..GainStage::unity() };
+        let g = GainStage {
+            invert_polarity: true,
+            ..GainStage::unity()
+        };
         assert_eq!(g.channel_gains(), (-0x1_0000, -0x1_0000));
         let mut s = [1000, -2000, i32::MAX, i32::MIN];
         g.apply(&mut s);
@@ -410,8 +500,15 @@ mod tests {
         // Declared divergence (ruled): C negates a second time under a fade
         // (output.c:57 then :229), which cancels the inversion; here the fade
         // multiplies the inverted gain once.
-        let g = GainStage { invert_polarity: true, fade_q16: 0x8000, ..GainStage::unity() };
-        assert_eq!(g.channel_gains(), (gain(-0x1_0000, 0x8000), gain(-0x1_0000, 0x8000)));
+        let g = GainStage {
+            invert_polarity: true,
+            fade_q16: 0x8000,
+            ..GainStage::unity()
+        };
+        assert_eq!(
+            g.channel_gains(),
+            (gain(-0x1_0000, 0x8000), gain(-0x1_0000, 0x8000))
+        );
         let mut s = [1000, -1000];
         g.apply(&mut s);
         assert_eq!(s, [-500, 500]);
@@ -457,7 +554,10 @@ mod tests {
         g.apply(&mut s);
         assert_eq!(s, [500, 500, -32, -32]);
         // At unity too (C's fast path excludes MONO flags, output_pack.c:384).
-        let g = GainStage { channel_mode: ChannelMode::LeftOnly, ..GainStage::unity() };
+        let g = GainStage {
+            channel_mode: ChannelMode::LeftOnly,
+            ..GainStage::unity()
+        };
         let mut s = [1, 2];
         g.apply(&mut s);
         assert_eq!(s, [1, 1]);
@@ -481,7 +581,10 @@ mod tests {
     fn test_channel_select_mono_mix_c_average() {
         // C output_pack.c:386-392: L = R = (gain(gainL, L) + gain(gainR, R)) /
         // 2, C integer division (truncates toward zero).
-        let g = GainStage { channel_mode: ChannelMode::MonoMix, ..GainStage::unity() };
+        let g = GainStage {
+            channel_mode: ChannelMode::MonoMix,
+            ..GainStage::unity()
+        };
         let mut s = [1000, 3001, -1000, -3001, 3, -4, i32::MAX, i32::MAX];
         g.apply(&mut s);
         assert_eq!(s, [2000, 2000, -2000, -2000, 0, 0, i32::MAX, i32::MAX]);

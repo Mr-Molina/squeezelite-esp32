@@ -57,32 +57,31 @@ pub enum DisplayColorMode {
 }
 
 const INIT_SSD1306: &[u8] = &[
-    0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA,
-    0x12, 0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF,
+    0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12,
+    0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF,
 ];
 const INIT_SH1106: &[u8] = &[
-    0xAE, 0x02, 0x10, 0x40, 0x81, 0x80, 0xA1, 0xC8, 0xA6, 0xA8, 0x3F, 0xD3, 0x00, 0xD5, 0x80,
-    0xD9, 0xF1, 0xDA, 0x12, 0xDB, 0x40, 0xAF,
+    0xAE, 0x02, 0x10, 0x40, 0x81, 0x80, 0xA1, 0xC8, 0xA6, 0xA8, 0x3F, 0xD3, 0x00, 0xD5, 0x80, 0xD9,
+    0xF1, 0xDA, 0x12, 0xDB, 0x40, 0xAF,
 ];
 const INIT_SH1122: &[u8] = &[
-    0xAE, 0x40, 0xA0, 0xC0, 0x81, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0xD5, 0x50, 0xD9, 0x22, 0xDB,
-    0x35, 0xDC, 0x35, 0x30, 0xAF,
+    0xAE, 0x40, 0xA0, 0xC0, 0x81, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0xD5, 0x50, 0xD9, 0x22, 0xDB, 0x35,
+    0xDC, 0x35, 0x30, 0xAF,
 ];
 const INIT_SSD1322: &[u8] = &[
-    0xFD, 0x12, 0xAE, 0xB3, 0x91, 0xCA, 0x3F, 0xA2, 0x00, 0xA1, 0x00, 0xA0, 0x14, 0x11, 0xC1,
-    0x9F, 0xC7, 0x0F, 0xB9, 0xAF,
+    0xFD, 0x12, 0xAE, 0xB3, 0x91, 0xCA, 0x3F, 0xA2, 0x00, 0xA1, 0x00, 0xA0, 0x14, 0x11, 0xC1, 0x9F,
+    0xC7, 0x0F, 0xB9, 0xAF,
 ];
 const INIT_SSD1327: &[u8] = &[
-    0xAE, 0x15, 0x00, 0x7F, 0x75, 0x00, 0x7F, 0x81, 0x80, 0xA0, 0x51, 0xA1, 0x00, 0xA2, 0x00,
-    0xA4, 0xA8, 0x7F, 0xAB, 0x01, 0xAF,
+    0xAE, 0x15, 0x00, 0x7F, 0x75, 0x00, 0x7F, 0x81, 0x80, 0xA0, 0x51, 0xA1, 0x00, 0xA2, 0x00, 0xA4,
+    0xA8, 0x7F, 0xAB, 0x01, 0xAF,
 ];
 const INIT_SSD1351: &[u8] = &[
-    0xFD, 0x12, 0xFD, 0xB1, 0xAE, 0xB3, 0xF1, 0xCA, 0x7F, 0xA0, 0x74, 0xA1, 0x00, 0xA2, 0x00,
-    0xAB, 0x01, 0xAF,
+    0xFD, 0x12, 0xFD, 0xB1, 0xAE, 0xB3, 0xF1, 0xCA, 0x7F, 0xA0, 0x74, 0xA1, 0x00, 0xA2, 0x00, 0xAB,
+    0x01, 0xAF,
 ];
 const INIT_SSD1675: &[u8] = &[
-    0x12, 0x01, 0x27, 0x01, 0x00, 0x11, 0x03, 0x44, 0x00, 0x0F, 0x45, 0x00, 0x00, 0x27, 0x01,
-    0x20,
+    0x12, 0x01, 0x27, 0x01, 0x00, 0x11, 0x03, 0x44, 0x00, 0x0F, 0x45, 0x00, 0x00, 0x27, 0x01, 0x20,
 ];
 const INIT_ST7735: &[u8] = &[0x01, 0x11, 0x3A, 0x05, 0x36, 0x60, 0x13, 0x29];
 const INIT_ST7789: &[u8] = &[0x01, 0x11, 0x3A, 0x55, 0x36, 0x00, 0x21, 0x13, 0x29];
@@ -99,8 +98,7 @@ impl DisplayDriverKind {
             Some(Self::Sh1106)
         } else if trimmed.eq_ignore_ascii_case("SH1122") {
             Some(Self::Sh1122)
-        } else if trimmed.eq_ignore_ascii_case("SSD1322")
-            || trimmed.eq_ignore_ascii_case("SSD132X")
+        } else if trimmed.eq_ignore_ascii_case("SSD1322") || trimmed.eq_ignore_ascii_case("SSD132X")
         {
             Some(Self::Ssd1322)
         } else if trimmed.eq_ignore_ascii_case("SSD1327") {
@@ -143,9 +141,7 @@ impl DisplayDriverKind {
         match self {
             Self::Ssd1306 | Self::Sh1106 | Self::Ssd1675 => DisplayColorMode::Monochrome1Bpp,
             Self::Sh1122 | Self::Ssd1322 | Self::Ssd1327 => DisplayColorMode::Grayscale4Bpp,
-            Self::Ssd1351 | Self::St7735 | Self::St7789 | Self::Ili9341 => {
-                DisplayColorMode::Rgb565
-            }
+            Self::Ssd1351 | Self::St7735 | Self::St7789 | Self::Ili9341 => DisplayColorMode::Rgb565,
         }
     }
 
@@ -481,8 +477,9 @@ impl GdsFramebuffer {
     /// Exports a rectangular tile `[x..x+w, y..y+h)` as big-endian RGB565
     /// bytes for ST7735/ST7789/ILI9341/SSD1351 SPI burst transfers.
     pub fn export_rgb565_tile(&self, x: u16, y: u16, w: u16, h: u16, out: &mut [u8]) -> usize {
-        let Some(required) =
-            (w as usize).checked_mul(h as usize).and_then(|px| px.checked_mul(2))
+        let Some(required) = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(2))
         else {
             return 0;
         };
@@ -1034,16 +1031,56 @@ mod tests {
     #[test]
     fn test_driver_lookup_and_init_tables() {
         let all = [
-            ("ssd1306", DisplayDriverKind::Ssd1306, DisplayColorMode::Monochrome1Bpp),
-            ("SH1106", DisplayDriverKind::Sh1106, DisplayColorMode::Monochrome1Bpp),
-            ("SH1122", DisplayDriverKind::Sh1122, DisplayColorMode::Grayscale4Bpp),
-            ("SSD1322", DisplayDriverKind::Ssd1322, DisplayColorMode::Grayscale4Bpp),
-            ("SSD1327", DisplayDriverKind::Ssd1327, DisplayColorMode::Grayscale4Bpp),
-            ("SSD1351", DisplayDriverKind::Ssd1351, DisplayColorMode::Rgb565),
-            ("SSD1675", DisplayDriverKind::Ssd1675, DisplayColorMode::Monochrome1Bpp),
-            ("ST7735", DisplayDriverKind::St7735, DisplayColorMode::Rgb565),
-            ("ST7789", DisplayDriverKind::St7789, DisplayColorMode::Rgb565),
-            ("ILI9341", DisplayDriverKind::Ili9341, DisplayColorMode::Rgb565),
+            (
+                "ssd1306",
+                DisplayDriverKind::Ssd1306,
+                DisplayColorMode::Monochrome1Bpp,
+            ),
+            (
+                "SH1106",
+                DisplayDriverKind::Sh1106,
+                DisplayColorMode::Monochrome1Bpp,
+            ),
+            (
+                "SH1122",
+                DisplayDriverKind::Sh1122,
+                DisplayColorMode::Grayscale4Bpp,
+            ),
+            (
+                "SSD1322",
+                DisplayDriverKind::Ssd1322,
+                DisplayColorMode::Grayscale4Bpp,
+            ),
+            (
+                "SSD1327",
+                DisplayDriverKind::Ssd1327,
+                DisplayColorMode::Grayscale4Bpp,
+            ),
+            (
+                "SSD1351",
+                DisplayDriverKind::Ssd1351,
+                DisplayColorMode::Rgb565,
+            ),
+            (
+                "SSD1675",
+                DisplayDriverKind::Ssd1675,
+                DisplayColorMode::Monochrome1Bpp,
+            ),
+            (
+                "ST7735",
+                DisplayDriverKind::St7735,
+                DisplayColorMode::Rgb565,
+            ),
+            (
+                "ST7789",
+                DisplayDriverKind::St7789,
+                DisplayColorMode::Rgb565,
+            ),
+            (
+                "ILI9341",
+                DisplayDriverKind::Ili9341,
+                DisplayColorMode::Rgb565,
+            ),
         ];
         for (name, expected, mode) in all {
             let parsed = DisplayDriverKind::from_name(name).unwrap();
@@ -1114,10 +1151,7 @@ mod tests {
 
         let visu_cmd = LmsDisplayCommand::parse(b"visu", &[2, 16]).unwrap();
         engine.handle_command(visu_cmd);
-        assert_eq!(
-            engine.visualizer(),
-            VisualizerMode::Spectrum { bands: 16 }
-        );
+        assert_eq!(engine.visualizer(), VisualizerMode::Spectrum { bands: 16 });
     }
 
     #[test]

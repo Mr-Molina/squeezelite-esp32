@@ -29,7 +29,7 @@ pub const FIXED_ONE: i32 = 0x1_0000;
 /// C `gain()` (`output_pack.c:31-37`): `gain * sample` in 64 bits, clamped to
 /// ±`0x7fff_ffff_ffff`, then shifted right 16 (so the result saturates at the
 /// `i32` range).
-#[inline]
+#[inline(always)]
 #[must_use]
 pub fn gain(gain: i32, sample: i32) -> i32 {
     const MAX_SCALESAMPLE: i64 = 0x7fff_ffff_ffff;
@@ -90,9 +90,26 @@ pub fn cross_sample(old: i32, new: i32, gain_out: i32, gain_in: i32) -> i32 {
 /// samples.
 #[inline]
 pub fn mix_crossfade(old_tail: &mut [i32], new_head: &[i32], gain_out: i32, gain_in: i32) {
+    if gain_out >= 0
+        && gain_in >= 0
+        && i64::from(gain_out) + i64::from(gain_in) <= i64::from(FIXED_ONE)
+    {
+        let gout = gain_out as i64;
+        let gin = gain_in as i64;
+        for (old, &new) in old_tail.iter_mut().zip(new_head) {
+            *old = (((*old as i64 * gout) >> 16) as i32) + (((new as i64 * gin) >> 16) as i32);
+        }
+        return;
+    }
     for (old, &new) in old_tail.iter_mut().zip(new_head) {
         *old = cross_sample(*old, new, gain_out, gain_in);
     }
+}
+
+/// Applies crossfade mixing in-place (alias for [`mix_crossfade`]).
+#[inline(always)]
+pub fn apply_crossfade(old_tail: &mut [i32], new_head: &[i32], gain_out: i32, gain_in: i32) {
+    mix_crossfade(old_tail, new_head, gain_out, gain_in);
 }
 
 /// Transition type from `strm s` (C `fade_mode`, `squeezelite.h:661`, set by
@@ -143,7 +160,11 @@ pub enum ChunkGain {
     /// is mixed with the new track's sample `new_ahead` frames further on (C
     /// `cross_ptr = fade_end + cur_f`). Each weight already includes its
     /// track's replay gain.
-    Cross { gain_in: i32, gain_out: i32, new_ahead: u64 },
+    Cross {
+        gain_in: i32,
+        gain_out: i32,
+        new_ahead: u64,
+    },
 }
 
 /// What [`FadeEngine::prepare`] decided for the next output chunk.
@@ -288,8 +309,7 @@ impl FadeEngine {
         // C output.c:298-309: fade in (or in-out from an empty buffer) from
         // the write position.
         if start
-            && (self.mode == FadeMode::In
-                || (self.mode == FadeMode::InOut && used_frames == 0))
+            && (self.mode == FadeMode::In || (self.mode == FadeMode::InOut && used_frames == 0))
         {
             // C output.c:299: shorter than the full buffer, otherwise start and end align.
             frames = frames.min(size_frames.saturating_sub(1));
@@ -396,7 +416,11 @@ impl FadeEngine {
         match self.dir {
             FadeDir::Up | FadeDir::Down => {
                 // C output.c:216-226: linear in amplitude; down uses dur_f - cur_f.
-                let num = if self.dir == FadeDir::Down { dur - cur } else { cur };
+                let num = if self.dir == FadeDir::Down {
+                    dur - cur
+                } else {
+                    cur
+                };
                 let g = ratio_gain(num, dur);
                 self.gain = g as u32;
                 step.gain = ChunkGain::Fade(g);
@@ -417,7 +441,11 @@ impl FadeEngine {
                         gain_in = gain(gain_in, g);
                     }
                     // C output.c:245: cross_ptr = fade_end + cur_f = read position + dur_f.
-                    step.gain = ChunkGain::Cross { gain_in, gain_out, new_ahead: dur };
+                    step.gain = ChunkGain::Cross {
+                        gain_in,
+                        gain_out,
+                        new_ahead: dur,
+                    };
                 } else {
                     // C output.c:247-249: "unable to continue crossfade - too few samples". C
                     // leaves current_replay_gain alone here (only completion switches it).
@@ -549,7 +577,9 @@ mod tests {
         for _ in 0..100 {
             let step = e.prepare(1_000, 1, 0, 0);
             assert_eq!(step.max_frames, Some(100 - gains.len() as u64));
-            let ChunkGain::Fade(g) = step.gain else { panic!("{step:?}") };
+            let ChunkGain::Fade(g) = step.gain else {
+                panic!("{step:?}")
+            };
             assert_eq!(e.gain_q16(), g as u32);
             gains.push(g);
             e.advance(1);
@@ -584,7 +614,9 @@ mod tests {
         e.advance(200);
         let mut gains = std::vec::Vec::new();
         for _ in 0..100 {
-            let ChunkGain::Fade(g) = e.prepare(100, 1, 0, 0).gain else { panic!() };
+            let ChunkGain::Fade(g) = e.prepare(100, 1, 0, 0).gain else {
+                panic!()
+            };
             gains.push(g);
             e.advance(1);
         }
@@ -593,7 +625,11 @@ mod tests {
             assert_eq!(*g, to_gain((100 - cur) as f32 / 100.0));
         }
         assert_eq!(gains[0], FIXED_ONE);
-        assert_eq!(gains[99], to_gain(0.01), "last frame of the track at 1 % amplitude");
+        assert_eq!(
+            gains[99],
+            to_gain(0.01),
+            "last frame of the track at 1 % amplitude"
+        );
         assert!(gains.windows(2).all(|w| w[0] > w[1]));
         // fade_end is the end of the track's data: nothing of it plays after the ramp.
         assert_eq!(e.prepare(0, 0, 0, 0).gain, ChunkGain::Unity);
@@ -612,7 +648,10 @@ mod tests {
             let mut mixed = old;
             mix_crossfade(&mut mixed, &new, gout, gin);
             for i in 0..old.len() {
-                assert_eq!(mixed[i], gain(gout, old[i]).saturating_add(gain(gin, new[i])));
+                assert_eq!(
+                    mixed[i],
+                    gain(gout, old[i]).saturating_add(gain(gin, new[i]))
+                );
             }
             // Endpoints are exact.
             if cur == 0 {
@@ -622,6 +661,18 @@ mod tests {
                 assert_eq!(mixed, new);
             }
         }
+    }
+
+    #[test]
+    fn test_crossfade_large_gain_overflow() {
+        let mut old = [1000, -1000];
+        let new = [2000, -2000];
+        let gain_out = 0x4000_0000;
+        let gain_in = 0x4000_0000;
+        mix_crossfade(&mut old, &new, gain_out, gain_in);
+        // Ensure no panic from arithmetic overflow and saturation is applied
+        assert_eq!(old[0], cross_sample(1000, 2000, gain_out, gain_in));
+        assert_eq!(old[1], cross_sample(-1000, -2000, gain_out, gain_in));
     }
 
     #[test]
@@ -641,7 +692,14 @@ mod tests {
         assert_eq!(step.max_frames, Some(100));
         assert_eq!(e.state(), FadeState::Active);
         // cur 0: in = 0, out = unity x current replay gain (output.c:232-239).
-        assert_eq!(step.gain, ChunkGain::Cross { gain_in: 0, gain_out: 0x2_0000, new_ahead: 100 });
+        assert_eq!(
+            step.gain,
+            ChunkGain::Cross {
+                gain_in: 0,
+                gain_out: 0x2_0000,
+                new_ahead: 100
+            }
+        );
         assert_eq!(e.gain_q16(), FIXED_ONE as u32);
         e.advance(64);
         let step = e.prepare(436, 36, 0x2_0000, 0x8000);
@@ -671,7 +729,11 @@ mod tests {
         let mut e = FadeEngine::new();
         e.configure(FadeMode::Cross, 10_000);
         assert_eq!(e.check_fade(true, 1_000, 1_024, 1, 1), Some(79));
-        assert_eq!(e.duration_frames(), 921, "0.9 x 1024 frames, floored (output.c:330)");
+        assert_eq!(
+            e.duration_frames(),
+            921,
+            "0.9 x 1024 frames, floored (output.c:330)"
+        );
         let mut e = FadeEngine::new();
         e.configure(FadeMode::Cross, 10_000);
         assert_eq!(e.check_fade(true, 300, 1_024, 1, 1), Some(0));
@@ -700,7 +762,10 @@ mod tests {
         let step = e.prepare(164, 64, 0, 0);
         assert_eq!(step.gain, ChunkGain::Unity);
         assert_eq!(e.state(), FadeState::Inactive);
-        assert!(!step.crossfade_done, "an aborted crossfade keeps the current replay gain (C)");
+        assert!(
+            !step.crossfade_done,
+            "an aborted crossfade keeps the current replay gain (C)"
+        );
     }
 
     #[test]
@@ -709,7 +774,11 @@ mod tests {
         e.configure(FadeMode::InOut, 3);
         // 44.1 kHz x 3 s / 2 = 66150 frames (output.c:292-296).
         assert_eq!(e.check_fade(true, 10, 1 << 20, 44_100, 44_100), None);
-        assert_eq!(e.state(), FadeState::Inactive, "INOUT fades up only from an empty buffer");
+        assert_eq!(
+            e.state(),
+            FadeState::Inactive,
+            "INOUT fades up only from an empty buffer"
+        );
         assert_eq!(e.check_fade(true, 0, 1 << 20, 44_100, 44_100), None);
         assert_eq!(
             (e.state(), e.dir(), e.duration_frames()),
@@ -762,7 +831,10 @@ mod tests {
         // A skip over the fade start (strm a) lands inside the fade, not before it.
         e.advance(90);
         assert_eq!(e.state(), FadeState::Active);
-        assert_eq!(e.prepare(1_000, 1, 0, 0).gain, ChunkGain::Fade(to_gain(10.0 / 50.0)));
+        assert_eq!(
+            e.prepare(1_000, 1, 0, 0).gain,
+            ChunkGain::Fade(to_gain(10.0 / 50.0))
+        );
         e.retreat(15);
         assert_eq!((e.state(), e.start_ahead()), (FadeState::Due, 5));
         // strm f dropping the fade's region drops the fade.

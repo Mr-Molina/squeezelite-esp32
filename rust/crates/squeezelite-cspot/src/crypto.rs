@@ -3,7 +3,11 @@
 //! Includes Oakley Group 1 Diffie-Hellman (RFC 2409), pure-Rust SHA-1,
 //! HMAC-SHA1, PBKDF2-HMAC-SHA1, AES-128-CTR, AES-192-ECB, and Base64.
 
-#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks, clippy::manual_div_ceil)]
+#![allow(
+    unknown_lints,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::manual_div_ceil
+)]
 
 extern crate alloc;
 
@@ -116,7 +120,10 @@ impl BigUint {
         for &limb in self.limbs.iter().rev() {
             bytes.extend_from_slice(&limb.to_be_bytes());
         }
-        let first_non_zero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let first_non_zero = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
         bytes[first_non_zero..].to_vec()
     }
 
@@ -265,9 +272,7 @@ fn mont_reduce(t: &mut [u32], n: &[u32], n_prime: u32) -> Vec<u32> {
     };
     res.normalize();
 
-    let n_big = BigUint {
-        limbs: n.to_vec(),
-    };
+    let n_big = BigUint { limbs: n.to_vec() };
     while res >= n_big {
         res = res.sub(&n_big);
     }
@@ -356,7 +361,11 @@ pub fn montgomery_mod_pow(
         if is_ge {
             let mut borrow = 0u64;
             for i in 0..r_len {
-                let m = if i < mod_limbs.len() { mod_limbs[i] as u64 } else { 0 };
+                let m = if i < mod_limbs.len() {
+                    mod_limbs[i] as u64
+                } else {
+                    0
+                };
                 let diff = (r_limbs[i] as u64).wrapping_sub(m).wrapping_sub(borrow);
                 r_limbs[i] = diff as u32;
                 borrow = (diff >> 63) & 1;
@@ -367,7 +376,9 @@ pub fn montgomery_mod_pow(
         }
     }
 
-    let r = BigUint { limbs: r_limbs[..r_len].to_vec() };
+    let r = BigUint {
+        limbs: r_limbs[..r_len].to_vec(),
+    };
 
     let mut base_padded = base.limbs.clone();
     base_padded.resize(k, 0);
@@ -398,8 +409,7 @@ pub fn montgomery_mod_pow(
         for i in 0..res_bar.len() {
             res_bar[i] = (next[i] & mask) | (res_bar[i] & !mask);
         }
-        current_base_bar =
-            mont_mul(&current_base_bar, &current_base_bar, &n_limbs, n_prime);
+        current_base_bar = mont_mul(&current_base_bar, &current_base_bar, &n_limbs, n_prime);
     }
 
     let mut final_prod = vec![0u32; 2 * k + 4];
@@ -417,14 +427,12 @@ pub fn montgomery_mod_pow(
 /// legacy/weak by modern standards, but is strictly protocol-mandated by
 /// Spotify's proprietary Shannon authentication and key exchange wire format.
 pub const DH_PRIME: [u8; 96] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2,
-    0x21, 0x68, 0xc2, 0x34, 0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1,
-    0x29, 0x02, 0x4e, 0x08, 0x8a, 0x67, 0xcc, 0x74, 0x02, 0x0b, 0xbe, 0xa6,
-    0x3b, 0x13, 0x9b, 0x22, 0x51, 0x4a, 0x08, 0x79, 0x8e, 0x34, 0x04, 0xdd,
-    0xef, 0x95, 0x19, 0xb3, 0xcd, 0x3a, 0x43, 0x1b, 0x30, 0x2b, 0x0a, 0x6d,
-    0xf2, 0x5f, 0x14, 0x37, 0x4f, 0xe1, 0x35, 0x6d, 0x6d, 0x51, 0xc2, 0x45,
-    0xe4, 0x85, 0xb5, 0x76, 0x62, 0x5e, 0x7e, 0xc6, 0xf4, 0x4c, 0x42, 0xe9,
-    0xa6, 0x3a, 0x36, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2, 0x21, 0x68, 0xc2, 0x34,
+    0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1, 0x29, 0x02, 0x4e, 0x08, 0x8a, 0x67, 0xcc, 0x74,
+    0x02, 0x0b, 0xbe, 0xa6, 0x3b, 0x13, 0x9b, 0x22, 0x51, 0x4a, 0x08, 0x79, 0x8e, 0x34, 0x04, 0xdd,
+    0xef, 0x95, 0x19, 0xb3, 0xcd, 0x3a, 0x43, 0x1b, 0x30, 0x2b, 0x0a, 0x6d, 0xf2, 0x5f, 0x14, 0x37,
+    0x4f, 0xe1, 0x35, 0x6d, 0x6d, 0x51, 0xc2, 0x45, 0xe4, 0x85, 0xb5, 0x76, 0x62, 0x5e, 0x7e, 0xc6,
+    0xf4, 0x4c, 0x42, 0xe9, 0xa6, 0x3a, 0x36, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
 
 /// Oakley Group 1 Diffie-Hellman implementation (768-bit MODP, generator 2).
@@ -639,12 +647,7 @@ pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
 }
 
 /// PBKDF2 with PRF HMAC-SHA1.
-pub fn pbkdf2_hmac_sha1(
-    password: &[u8],
-    salt: &[u8],
-    iterations: u32,
-    out_len: usize,
-) -> Vec<u8> {
+pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, out_len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(out_len);
     let mut block_idx = 1u32;
 
@@ -711,8 +714,8 @@ const INV_S_BOX: [u8; 256] = [
 ];
 
 const RCON: [u32; 10] = [
-    0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000,
-    0x80000000, 0x1b000000, 0x36000000,
+    0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000, 0x80000000,
+    0x1b000000, 0x36000000,
 ];
 
 fn sub_word(w: u32) -> u32 {
@@ -752,12 +755,8 @@ impl Aes128Ctr {
     pub fn new(key: &[u8; 16], iv: [u8; 16]) -> Self {
         let mut rk = [0u32; 44];
         for i in 0..4 {
-            rk[i] = u32::from_be_bytes([
-                key[i * 4],
-                key[i * 4 + 1],
-                key[i * 4 + 2],
-                key[i * 4 + 3],
-            ]);
+            rk[i] =
+                u32::from_be_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
         }
         for i in 4..44 {
             let mut temp = rk[i - 1];
@@ -766,10 +765,7 @@ impl Aes128Ctr {
             }
             rk[i] = rk[i - 4] ^ temp;
         }
-        Self {
-            round_keys: rk,
-            iv,
-        }
+        Self { round_keys: rk, iv }
     }
 
     fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
@@ -873,25 +869,49 @@ impl Aes128Ctr {
     }
 
     fn increment_iv(iv: &mut [u8; 16]) {
-        for b in iv.iter_mut().rev() {
-            *b = b.wrapping_add(1);
-            if *b != 0 {
-                break;
-            }
+        let low =
+            u64::from_be_bytes([iv[8], iv[9], iv[10], iv[11], iv[12], iv[13], iv[14], iv[15]]);
+        let (new_low, carry) = low.overflowing_add(1);
+        iv[8..16].copy_from_slice(&new_low.to_be_bytes());
+        if carry {
+            let high = u64::from_be_bytes([iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7]]);
+            iv[0..8].copy_from_slice(&high.wrapping_add(1).to_be_bytes());
         }
     }
 
     /// Encrypts or decrypts bytes in-place using CTR keystream.
     pub fn process(&mut self, data: &mut [u8]) {
         let mut pos = 0;
-        while pos < data.len() {
+        let full_blocks_len = data.len() / 16 * 16;
+        while pos < full_blocks_len {
             let keystream = self.encrypt_block(&self.iv);
             Self::increment_iv(&mut self.iv);
-            let take = core::cmp::min(16, data.len() - pos);
+            for j in 0..4 {
+                let offset = pos + j * 4;
+                let d_word = u32::from_ne_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                let k_word = u32::from_ne_bytes([
+                    keystream[j * 4],
+                    keystream[j * 4 + 1],
+                    keystream[j * 4 + 2],
+                    keystream[j * 4 + 3],
+                ]);
+                data[offset..offset + 4].copy_from_slice(&(d_word ^ k_word).to_ne_bytes());
+            }
+            pos += 16;
+        }
+
+        if pos < data.len() {
+            let keystream = self.encrypt_block(&self.iv);
+            Self::increment_iv(&mut self.iv);
+            let take = data.len() - pos;
             for i in 0..take {
                 data[pos + i] ^= keystream[i];
             }
-            pos += take;
         }
     }
 }
@@ -907,12 +927,8 @@ impl Aes192Ecb {
     pub fn new(key: &[u8; 24]) -> Self {
         let mut rk = [0u32; 52];
         for i in 0..6 {
-            rk[i] = u32::from_be_bytes([
-                key[i * 4],
-                key[i * 4 + 1],
-                key[i * 4 + 2],
-                key[i * 4 + 3],
-            ]);
+            rk[i] =
+                u32::from_be_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
         }
         for i in 6..52 {
             let mut temp = rk[i - 1];
@@ -1070,8 +1086,7 @@ pub fn big_num_add(num: &[u8], mut carry: usize) -> Vec<u8> {
     result
 }
 
-const B64_CHARS: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encodes binary slice into standard Base64 string (RFC 4648).
 pub fn base64_encode(data: &[u8]) -> String {

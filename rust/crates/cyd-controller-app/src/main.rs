@@ -10,9 +10,7 @@
 #![forbid(unsafe_code)]
 #![allow(unknown_lints)]
 
-use cyd_controller_app::comms::{
-    CydDisplayLink, CYD_UART_BAUD, CYD_UART_RX_PIN, CYD_UART_TX_PIN,
-};
+use cyd_controller_app::comms::{CydDisplayLink, CYD_UART_BAUD, CYD_UART_RX_PIN, CYD_UART_TX_PIN};
 use cyd_controller_app::drivers::{
     Ili9341Display, Xpt2046Touch, CYD_TFT_BL, CYD_TFT_CS, CYD_TFT_DC, CYD_TFT_MISO, CYD_TFT_MOSI,
     CYD_TFT_RST, CYD_TFT_SCLK, CYD_TOUCH_CS, CYD_TOUCH_IRQ, CYD_TOUCH_MISO, CYD_TOUCH_MOSI,
@@ -24,21 +22,21 @@ use squeezelite_cyd_link::PlayState;
 #[cfg(target_arch = "xtensa")]
 mod xtensa_hw {
     use super::{
-        CYD_TFT_BL, CYD_TFT_CS, CYD_TFT_DC, CYD_TFT_MISO, CYD_TFT_MOSI, CYD_TFT_RST,
-        CYD_TFT_SCLK, CYD_TOUCH_CS, CYD_TOUCH_IRQ, CYD_TOUCH_MISO, CYD_TOUCH_MOSI,
-        CYD_TOUCH_SCLK, CYD_UART_BAUD, CYD_UART_RX_PIN, CYD_UART_TX_PIN, CydDisplayLink,
-        Ili9341Display, NowPlayingUi, PlayState, Xpt2046Touch,
+        CydDisplayLink, Ili9341Display, NowPlayingUi, PlayState, Xpt2046Touch, CYD_TFT_BL,
+        CYD_TFT_CS, CYD_TFT_DC, CYD_TFT_MISO, CYD_TFT_MOSI, CYD_TFT_RST, CYD_TFT_SCLK,
+        CYD_TOUCH_CS, CYD_TOUCH_IRQ, CYD_TOUCH_MISO, CYD_TOUCH_MOSI, CYD_TOUCH_SCLK, CYD_UART_BAUD,
+        CYD_UART_RX_PIN, CYD_UART_TX_PIN,
     };
     use cyd_controller_app::drivers::{SpiDisplayBus, TouchSpiBus};
     use embedded_hal::spi::SpiBus;
     use esp_backtrace as _;
-    use esp_hal::Blocking;
     use esp_hal::clock::CpuClock;
     use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-    use esp_hal::spi::Mode;
     use esp_hal::spi::master::{Config as SpiConfig, Spi};
+    use esp_hal::spi::Mode;
     use esp_hal::time::{Duration, Instant, Rate};
     use esp_hal::timer::timg::{MwdtStage, TimerGroup};
+    use esp_hal::Blocking;
     use esp_println::println;
 
     esp_bootloader_esp_idf::esp_app_desc!();
@@ -61,12 +59,7 @@ mod xtensa_hw {
     }
 
     impl<'d> Esp32SpiDisplayBus<'d> {
-        pub fn new(
-            spi: Spi<'d, Blocking>,
-            cs: Output<'d>,
-            dc: Output<'d>,
-            bl: Output<'d>,
-        ) -> Self {
+        pub fn new(spi: Spi<'d, Blocking>, cs: Output<'d>, dc: Output<'d>, bl: Output<'d>) -> Self {
             Self {
                 spi,
                 cs,
@@ -441,9 +434,7 @@ mod xtensa_hw {
         wdt0.enable();
         wdt0.feed();
 
-        println!(
-            "[READY] CYD Reset to STANDBY/OFFLINE — Entering UART2 & Touch Loop"
-        );
+        println!("[READY] CYD Reset to STANDBY/OFFLINE — Entering UART2 & Touch Loop");
         delay_ms(20);
 
         let delay = esp_hal::delay::Delay::new();
@@ -483,8 +474,7 @@ mod xtensa_hw {
 
                 // Touch Press & Release Router with Dirty-Region Redraw
                 if let Some((tx, ty)) = touch.read() {
-                    if let Some(cmd_bytes) =
-                        ui.handle_touch_point(tx, ty, false, now_ms, &mut link)
+                    if let Some(cmd_bytes) = ui.handle_touch_point(tx, ty, false, now_ms, &mut link)
                     {
                         if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
                             println!("[TOUCH DRAG] ({}, {}) -> {}", tx, ty, s.trim());
@@ -494,8 +484,7 @@ mod xtensa_hw {
                     }
                     last_touch = Some((tx, ty));
                 } else if let Some((rx, ry)) = last_touch.take() {
-                    if let Some(cmd_bytes) =
-                        ui.handle_touch_point(rx, ry, true, now_ms, &mut link)
+                    if let Some(cmd_bytes) = ui.handle_touch_point(rx, ry, true, now_ms, &mut link)
                     {
                         if let Ok(s) = core::str::from_utf8(&cmd_bytes) {
                             println!("[TOUCH RELEASE] ({}, {}) -> {}", rx, ry, s.trim());
@@ -546,13 +535,7 @@ fn main() {
     println!("Hardware Pin Configuration:");
     println!(
         "  - ILI9341 TFT (HSPI): MOSI={}, MISO={}, SCLK={}, CS={}, DC={}, RST={}, BL={}",
-        CYD_TFT_MOSI,
-        CYD_TFT_MISO,
-        CYD_TFT_SCLK,
-        CYD_TFT_CS,
-        CYD_TFT_DC,
-        CYD_TFT_RST,
-        CYD_TFT_BL
+        CYD_TFT_MOSI, CYD_TFT_MISO, CYD_TFT_SCLK, CYD_TFT_CS, CYD_TFT_DC, CYD_TFT_RST, CYD_TFT_BL
     );
     println!(
         "  - XPT2046 Touch (VSPI): MOSI={}, MISO={}, SCLK={}, CS={}, IRQ={}",
@@ -600,4 +583,3 @@ fn main() {
     println!("--------------------------------------------------------");
     println!("CYD Display Controller ready. Listening on UART...");
 }
-
