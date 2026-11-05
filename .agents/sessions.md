@@ -2,6 +2,30 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-05 11:34 | Antigravity Orchestrator | `[squeezelite-esp32]` Bare-Metal `xtensa-esp32-none-elf` OTA Image Staging (`27b64b17`, `1,904,368` B), Live `"BASEMENT"` (`172.22.1.15`) 6-Gate + 4-Benchmark Certification, & `origin/MK5-Rust` Sync (`b6fef51e`)
+**Agent**: Antigravity Orchestrator (`a13abc13-a35b-4ff9-935f-36176c47169e`)
+**Host OS**: Linux (`x86_64`)
+**Branch**: `MK5-Rust` (synced with `origin/MK5-Rust`)
+**Hardware Targets**: `"BASEMENT"` (`172.22.1.15`, Wi-Fi MAC `c8:2e:18:be:b8:34`, BT MAC `CA:2E:18:BE:B8:35`, **Sonocotta Louder-ESP32** with TI `TAS5805M` at `I2C0 0x2D`) & Lyrion Music Server (`10.0.0.10:9000` / `3483`)
+**Verification Suite**: `432/432` `louder-esp32-app` tests passing (`743/743` workspace) + `0` Clippy Warnings + `0` `google_rust_audit.py --strict` Errors/Warnings + Bare-Metal `xtensa-esp32-none-elf` Release Build (`.stack = 37,288` B, `.iram0.text = 126,944` B, `.dram2_uninit = 97,560` B, `1,904,368` B OTA binary SHA-256 `27b64b1745c0259772b676d983a55d4e076e6313ea49aec927e39b7f40b31219`) + Live 6-Gate & 4-Benchmark Certification on `172.22.1.15`
+**Code Hygiene Gates**: UNCONDITIONAL PASS (`goodbye_preflight.py`: `"status": "clean"`, `0` secrets, `0` scratch artifacts)
+
+### Completed This Session
+- **Bare-Metal `xtensa-esp32-none-elf` Alignment & `--stage-only` Packaging (`b6fef51e`)**:
+  - Added Invariant 48 `StreamPipeline` `resample_tail*` field initializers to `init_static_pipeline()` in `main.rs`, exposed `pub external_playback: bool` on `PlayerCoordinator` in `coordinator.rs` for `--bin louder-esp32-app`, and extracted `config.address` / `config.router` prior to socket aborts in `dhcpv4::Event::Configured` across `tasks.rs` and `main.rs`.
+  - Built `target/xtensa-esp32-none-elf/release/louder-esp32-app`, verified ELF section bounds (`.stack = 37,288` B `>= 36,000` B, `.iram0.text = 126,944` B `<= 131,072` B, `.dram2_uninit = 97,560` B `<= 98,768` B), and staged `louder-esp32-app-basement-ota-remediated.bin` (`1,904,368` B, `70.87%` of `ota_0`, SHA-256 `27b64b17...`).
+- **Live 6-Gate Hardware & 4-Benchmark Performance Certification on `"BASEMENT"` (`172.22.1.15`)**:
+  - Flashed `27b64b17...` via single-shot Factory recovery (`POST /recovery.json` -> `POST /flash.json`) and certified:
+    - **Gate 1**: `recovery: 0`, `rust_engine: true`, `otadata_prearmed_factory: true`, `uptime_ms > 669,000` ms, PSRAM `1,445,416 + 2,748,888 = 4,194,304` B, `core1_active: true`, `tas_pll_locked: true`, `i2c_nacks: 0`.
+    - **Gate 2**: `HTTP 200 OK` across `/`, `/config.json`, `/scan.json`, `/messages.json`, `/commands.json`, and `/cmd.json?act=vol51`.
+    - **Gate 3 & Benchmarks 1–2**: Native FLAC (`+79,104` frames) & 15.046s steady-state MP3 streaming at **`44,101.56` frames/sec** (`100.0035%` of 44.1 kHz), **`2.79` I2C ACKs/sec** (`<= 3.05` target, `0` NACKs), and LMS `10.0.0.10` `snd_wnd:65536` (`:9000`) / `snd_wnd:8192` (`:3483`) with `0` `lame|SqueezeDSP` processes.
+    - **Gate 4**: AirPlay 1 RTSP `:5000` + UDP `:6000` preemption (`codec: "AirPlay"`) and automatic `TEARDOWN` restoration (`codec: "MP3"`, `amp_mode: "Play"`).
+    - **Gate 5 & Benchmark 3**: Spotify Connect `GET /?action=getInfo` cached DH TTFB **`57.76 ms` / `60.67 ms`** (`< 100 ms` target) and `spotify_play` / `spotify_stop` arbitration.
+    - **Gate 6 & Benchmark 4**: `PowerSaveMode::None` ping RTT min **`3.036 ms`** / avg **`18.255 ms`**, Bluetooth `l2ping CA:2E:18:BE:B8:35` `0%` loss (`3/3`), LMS UPnP `HTTP 200` (`3,105` B), and `squeeze2cast` `PID 64320`.
+
+### Next-Session Handoff Notes
+- **Live `"BASEMENT"` (`172.22.1.15`) State**: Actively running the latest remediated firmware (`27b64b17...`, commit `b6fef51e`) in `ota_0` (`recovery: 0`, `rust_engine: true`, `otadata_prearmed_factory: true`). Never call `POST /reboot_ota.json` and **never touch `/dev/ttyUSB0`** (separate CYD board).
+
 ## 2026-11-04 15:12 | Antigravity Orchestrator | `[squeezelite-esp32]` Full 88-Finding `/deep-code-audit` Remediation (`MA-01`..`MA-22`, `REM-01`..`REM-32`, `IPV-01`..`IPV-08`) & 10-Point Embedded Performance Tuning Sprint (`OPT-01`..`OPT-08`, `MK5-Rust`)
 **Agent**: Antigravity Orchestrator (`81d81b4e-ee39-48f7-976b-a792cedd098a`)
 **Host OS**: Windows 11 (`pwsh`)
