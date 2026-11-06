@@ -79,12 +79,39 @@ pub enum HttpControlAction {
     TriggerWifiScan,
     /// Initiates Wi-Fi station association with new credentials (`/connect.json`).
     ConnectWifi,
+    /// Disconnects from active Wi-Fi AP (`DELETE /connect.json`).
+    DisconnectWifi,
     /// Applies a key-value configuration mutation (`/config.json`).
     UpdateConfig,
     /// Dispatches a console CLI command (`/commands.json`).
     ExecuteCliCommand,
     /// Initiates streaming OTA firmware update (`/flash.json`).
     StartOtaFlash,
+}
+
+/// Standard HTTP request methods recognized by the Port 80 HTTP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    /// GET method
+    Get,
+    /// POST method
+    Post,
+    /// DELETE method
+    Delete,
+    /// Other / unsupported HTTP method
+    Other,
+}
+
+/// Parses an HTTP method string into [`HttpMethod`].
+#[must_use]
+pub fn parse_http_method(method: &str) -> HttpMethod {
+    let verb = method.split_whitespace().next().unwrap_or(method);
+    match verb {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        "DELETE" => HttpMethod::Delete,
+        _ => HttpMethod::Other,
+    }
 }
 
 /// Amp I2C NACK count per operation class (spec §4.8): the bus wrapper still
@@ -601,6 +628,75 @@ impl<'a> ScanApView<'a> {
     }
 }
 
+/// Scanned 802.11 access point entry for C-compatible `/ap.json` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScannedApEntry {
+    /// Broadcast SSID raw bytes.
+    pub ssid: [u8; 32],
+    /// Valid SSID byte length (`0..=32`).
+    pub ssid_len: u8,
+    /// 2.4 GHz channel (`1..=14`).
+    pub chan: u8,
+    /// Signal strength in dBm.
+    pub rssi: i8,
+    /// Authentication mode code (e.g. `0` = Open, `3` = WPA2_PSK).
+    pub auth: u8,
+    /// Whether this access point is a pre-configured known network.
+    pub known: bool,
+}
+
+/// Formats the C-compatible AP list JSON array into `out`.
+pub fn format_ap_list_json(
+    aps: &[ScannedApEntry],
+    current_ssid: &str,
+    current_rssi: i8,
+    out: &mut [u8],
+) -> usize {
+    let mut writer = BufferWriter::new(out);
+    let _ = writer.write_str("[");
+    let mut first = true;
+    let mut current_found = false;
+
+    for ap in aps {
+        let ssid_len = (ap.ssid_len as usize).min(ap.ssid.len());
+        let ssid_str = match core::str::from_utf8(&ap.ssid[..ssid_len]) {
+            Ok(s) => s,
+            Err(_) => "",
+        };
+        if ssid_str == current_ssid {
+            current_found = true;
+        }
+        if !first {
+            let _ = writer.write_str(",");
+        }
+        first = false;
+        let _ = write!(
+            writer,
+            "{{\"ssid\":\"{}\",\"chan\":{},\"rssi\":{},\"auth\":{},\"known\":{}}}",
+            JsonEscaped(ssid_str),
+            ap.chan,
+            ap.rssi,
+            ap.auth,
+            ap.known,
+        );
+    }
+
+    if !current_found && !current_ssid.is_empty() {
+        if !first {
+            let _ = writer.write_str(",");
+        }
+        let _ = write!(
+            writer,
+            "{{\"ssid\":\"{}\",\"chan\":6,\"rssi\":{},\"auth\":3,\"known\":true}}",
+            JsonEscaped(current_ssid),
+            current_rssi,
+        );
+    }
+
+    let _ = writer.write_str("]");
+    writer.written_len()
+}
+
 /// Formats a slice of [`ScanApView`] entries as the `/scan.json` JSON array.
 pub fn write_scan_json(aps: &[ScanApView<'_>], out_buf: &mut [u8]) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
@@ -673,6 +769,8 @@ pub struct ConnectRequest<'a> {
     pub password: &'a str,
     /// Optional static IPv4 string.
     pub static_ip: Option<&'a str>,
+    /// Optional device hostname override.
+    pub host_name: Option<&'a str>,
 }
 
 /// Parses a `/connect.json` form or JSON request body/query.
@@ -687,10 +785,13 @@ pub fn parse_connect_request(input: &str) -> Option<ConnectRequest<'_>> {
         .or_else(|| extract_param_or_json_field(input, "pwd"))
         .unwrap_or("");
     let static_ip = extract_param_or_json_field(input, "ip");
+    let host_name = extract_param_or_json_field(input, "host_name")
+        .or_else(|| extract_param_or_json_field(input, "hostname"));
     Some(ConnectRequest {
         ssid,
         password,
         static_ip,
+        host_name,
     })
 }
 
@@ -1297,7 +1398,10 @@ pub fn handle_http_request_streaming_impl(
     let raw_path = parts.next().unwrap_or("");
     let path = raw_path.split('?').next().unwrap_or(raw_path);
 
-    if method == "POST" && !is_permitted_origin(req_bytes) {
+    let parsed_method = parse_http_method(method);
+    if (parsed_method == HttpMethod::Post || parsed_method == HttpMethod::Delete)
+        && !is_permitted_origin(req_bytes)
+    {
         const BODY: &str = "{\"error\":\"forbidden_cross_origin\"}";
         let mut response: String<256> = String::new();
         let _ = write!(
@@ -1316,6 +1420,46 @@ pub fn handle_http_request_streaming_impl(
         }
         out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
         return Some((resp_bytes.len(), &[], HttpControlAction::None));
+    }
+
+    // Captive portal probes:
+    // Android / Samsung status probes expect 200 OK
+    // Others expect 302 Found redirect to device IP
+    match (method, path) {
+        ("GET", "/generate_204") | ("GET", "/mobile/status.php") => {
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                Content-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            return Some((resp_bytes.len(), &[], HttpControlAction::None));
+        }
+        ("GET", "/gen_204")
+        | ("GET", "/hotspot-detect.html")
+        | ("GET", "/hotspotdetect.html")
+        | ("GET", "/library/test/success.html")
+        | ("GET", "/success.txt") => {
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 302 Found\r\nLocation: http://{}.{}.{}.{}/\r\n\
+                Content-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+                snapshot.ip[0], snapshot.ip[1], snapshot.ip[2], snapshot.ip[3]
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            return Some((resp_bytes.len(), &[], HttpControlAction::None));
+        }
+        _ => {}
     }
 
     // Spotify Connect ZeroConf HTTP handling
@@ -1748,6 +1892,34 @@ pub fn handle_http_request_streaming_impl(
                 HttpControlAction::None
             };
             Some((total_len, &[], action))
+        }
+        ("GET", "/ap.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let rssi_i8 = snapshot.rssi.clamp(-127, 0) as i8;
+            let body_len = format_ap_list_json(&[], snapshot.ssid, rssi_i8, &mut out_buf[HEADER_ROOM..]);
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::None))
+        }
+        ("DELETE", "/connect.json") => {
+            const BODY: &str = "{}";
+            let mut response: String<256> = String::new();
+            let _ = write!(
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                BODY.len(),
+                BODY
+            );
+            let resp_bytes = response.as_bytes();
+            if resp_bytes.len() > out_buf.len() {
+                return None;
+            }
+            out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
+            Some((resp_bytes.len(), &[], HttpControlAction::DisconnectWifi))
         }
         ("GET", "/connect.json") => {
             const HEADER_ROOM: usize = 160;
@@ -2833,5 +3005,82 @@ mod tests {
         assert_eq!(act2, HttpControlAction::ExecuteCliCommand);
         let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
         assert!(resp2.contains("\"cmd\":\"config set wifi.pass ***\""));
+    }
+
+    fn sample_snapshot() -> HttpStatusSnapshot<'static> {
+        HttpStatusSnapshot::default()
+    }
+
+    fn handle_request_bytes(
+        req: &[u8],
+        snap: &HttpStatusSnapshot<'_>,
+        router_opt: Option<&HttpControlRouter>,
+    ) -> (std::string::String, HttpControlAction) {
+        let mut buf = [0u8; 4096];
+        let res = if let Some(r) = router_opt {
+            r.handle_request(req, snap, &mut buf)
+        } else {
+            handle_http_control_request(req, snap, &mut buf)
+        };
+        if let Some((len, action)) = res {
+            let resp = core::str::from_utf8(&buf[..len]).unwrap_or("").into();
+            (resp, action)
+        } else {
+            ("".into(), HttpControlAction::None)
+        }
+    }
+
+    fn extract_http_body(resp: &str) -> &str {
+        if let Some((_, body)) = resp.split_once("\r\n\r\n") {
+            body
+        } else if let Some((_, body)) = resp.split_once("\n\n") {
+            body
+        } else {
+            ""
+        }
+    }
+
+    #[test]
+    fn test_get_ap_json_returns_c_compatible_array() {
+        let snap = sample_snapshot();
+        let req = b"GET /ap.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, action) = handle_request_bytes(req, &snap, None);
+        assert_eq!(action, HttpControlAction::None);
+        let body = extract_http_body(&resp);
+        assert!(body.starts_with('[') && body.ends_with(']'));
+        assert!(body.contains("\"ssid\":\"iot\""));
+        assert!(body.contains("\"chan\":"));
+        assert!(body.contains("\"rssi\":-50"));
+        assert!(body.contains("\"auth\":"));
+        assert!(body.contains("\"known\":true"));
+    }
+
+    #[test]
+    fn test_delete_connect_json_emits_disconnect_wifi_and_enforces_origin() {
+        let snap = sample_snapshot();
+        let req = b"DELETE /connect.json HTTP/1.1\r\nHost: 172.22.1.15\r\nOrigin: http://172.22.1.15\r\n\r\n";
+        let (resp, action) = handle_request_bytes(req, &snap, None);
+        assert_eq!(action, HttpControlAction::DisconnectWifi);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+
+        let bad_req = b"DELETE /connect.json HTTP/1.1\r\nHost: 172.22.1.15\r\nOrigin: http://evil.example.com\r\n\r\n";
+        let (bad_resp, bad_action) = handle_request_bytes(bad_req, &snap, None);
+        assert_eq!(bad_action, HttpControlAction::None);
+        assert!(bad_resp.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn test_captive_portal_probes_return_200_or_302() {
+        let snap = sample_snapshot();
+        for path in ["/generate_204", "/mobile/status.php"] {
+            let req = format!("GET {} HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n", path);
+            let (resp, _) = handle_request_bytes(req.as_bytes(), &snap, None);
+            assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        }
+        for path in ["/gen_204", "/hotspot-detect.html", "/hotspotdetect.html", "/library/test/success.html", "/success.txt"] {
+            let req = format!("GET {} HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n", path);
+            let (resp, _) = handle_request_bytes(req.as_bytes(), &snap, None);
+            assert!(resp.starts_with("HTTP/1.1 302 Found"));
+        }
     }
 }

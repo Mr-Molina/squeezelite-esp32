@@ -3440,6 +3440,7 @@ mod xtensa_hw {
                             HttpControlAction::ExecuteCliCommand
                             | HttpControlAction::TriggerWifiScan
                             | HttpControlAction::ConnectWifi
+                            | HttpControlAction::DisconnectWifi
                             | HttpControlAction::StartOtaFlash => {}
                             _ => {}
                         }

@@ -1293,6 +1293,7 @@ mod device {
                             HttpControlAction::ExecuteCliCommand
                             | HttpControlAction::TriggerWifiScan
                             | HttpControlAction::ConnectWifi
+                            | HttpControlAction::DisconnectWifi
                             | HttpControlAction::StartOtaFlash => {}
                             _ => {}
                         }
