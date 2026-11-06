@@ -1051,6 +1051,188 @@ impl<'a> SyslogMessageView<'a> {
     }
 }
 
+/// Fixed-capacity entry stored in [`SyslogRingBuffer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyslogRingEntry {
+    /// Monotonic message sequence number.
+    pub seq: u32,
+    /// Uptime timestamp in milliseconds.
+    pub uptime_ms: u64,
+    /// Severity label (`"INFO"`, `"WARN"`, `"ERROR"`).
+    pub level: String<16>,
+    /// C-compatible messaging class (`"MESSAGING_CLASS_SYSTEM"`, `"MESSAGING_CLASS_STATS"`).
+    pub msg_class: String<32>,
+    /// Log message text.
+    pub msg: String<128>,
+}
+
+/// Fixed-capacity 16-entry ring buffer storing `seq`, `uptime_ms`, `level`,
+/// `msg_class`, and `msg` for `/messages.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyslogRingBuffer {
+    entries: [Option<SyslogRingEntry>; 16],
+    head: usize,
+    len: usize,
+    next_seq: u32,
+}
+
+impl Default for SyslogRingBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyslogRingBuffer {
+    /// Fixed ring capacity (16 entries).
+    pub const CAPACITY: usize = 16;
+
+    /// Creates an empty [`SyslogRingBuffer`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [const { None }; 16],
+            head: 0,
+            len: 0,
+            next_seq: 1,
+        }
+    }
+
+    /// Appends a message to the ring buffer, overwriting the oldest entry when full.
+    pub fn push(&mut self, uptime_ms: u64, level: &str, msg_class: &str, msg: &str) {
+        let mut lvl = String::new();
+        let _ = lvl.push_str(level);
+        let mut cls = String::new();
+        let _ = cls.push_str(msg_class);
+        let mut text = String::new();
+        let _ = text.push_str(msg);
+        let entry = SyslogRingEntry {
+            seq: self.next_seq,
+            uptime_ms,
+            level: lvl,
+            msg_class: cls,
+            msg: text,
+        };
+        self.next_seq = self.next_seq.saturating_add(1);
+        if self.len < Self::CAPACITY {
+            let write_idx = (self.head + self.len) % Self::CAPACITY;
+            self.entries[write_idx] = Some(entry);
+            self.len += 1;
+        } else {
+            self.entries[self.head] = Some(entry);
+            self.head = (self.head + 1) % Self::CAPACITY;
+        }
+    }
+
+    /// Returns the number of stored entries (`0..=16`).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the ring buffer contains no entries.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Retrieves an entry in chronological order (`0..self.len()`).
+    #[must_use]
+    pub fn entry(&self, idx: usize) -> Option<&SyslogRingEntry> {
+        if idx >= self.len {
+            return None;
+        }
+        let pos = (self.head + idx) % Self::CAPACITY;
+        self.entries[pos].as_ref()
+    }
+}
+
+/// Maps a severity label to the C web UI `MESSAGING_*` constant.
+#[must_use]
+pub fn messaging_type_for_level(level: &str) -> &'static str {
+    if level.eq_ignore_ascii_case("ERROR") || level.eq_ignore_ascii_case("ERR") {
+        "MESSAGING_ERROR"
+    } else if level.eq_ignore_ascii_case("WARN") || level.eq_ignore_ascii_case("WARNING") {
+        "MESSAGING_WARNING"
+    } else {
+        "MESSAGING_INFO"
+    }
+}
+
+/// Formats `/messages.json` with both `"messages": [...]` and C-compatible
+/// `type` (`MESSAGING_INFO`/`MESSAGING_WARNING`/`MESSAGING_ERROR`), `class`
+/// (`MESSAGING_CLASS_SYSTEM`/`MESSAGING_CLASS_STATS`), `sent_time`,
+/// `current_time`, and embedded task/heap telemetry.
+pub fn format_messages_json(
+    snapshot: &HttpStatusSnapshot<'_>,
+    ring: Option<&SyslogRingBuffer>,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    let mut writer = BufferWriter::new(out_buf);
+    writer.write_str("{\"messages\":[").ok()?;
+    let mut written_count = 0usize;
+    if let Some(r) = ring {
+        for idx in 0..r.len() {
+            let Some(entry) = r.entry(idx) else {
+                continue;
+            };
+            if written_count > 0 {
+                writer.write_str(",").ok()?;
+            }
+            let msg_type = messaging_type_for_level(entry.level.as_str());
+            write!(
+                writer,
+                "{{\"seq\":{},\"uptime_ms\":{},\"level\":\"{}\",\"msg\":\"{}\",\
+                 \"type\":\"{}\",\"class\":\"{}\",\"sent_time\":{},\"current_time\":{}}}",
+                entry.seq,
+                entry.uptime_ms,
+                JsonEscaped(entry.level.as_str()),
+                JsonEscaped(entry.msg.as_str()),
+                msg_type,
+                JsonEscaped(entry.msg_class.as_str()),
+                entry.uptime_ms,
+                snapshot.uptime_ms,
+            )
+            .ok()?;
+            written_count += 1;
+        }
+    }
+    if written_count == 0 {
+        write!(
+            writer,
+            "{{\"seq\":{},\"uptime_ms\":{},\"level\":\"INFO\",\"msg\":\"{}\",\
+             \"type\":\"MESSAGING_INFO\",\"class\":\"MESSAGING_CLASS_SYSTEM\",\
+             \"sent_time\":{},\"current_time\":{}}}",
+            snapshot.settings_seq,
+            snapshot.uptime_ms,
+            JsonEscaped(snapshot.amp_mode),
+            snapshot.uptime_ms,
+            snapshot.uptime_ms,
+        )
+        .ok()?;
+    }
+    let stats_seq = snapshot.settings_seq.saturating_add(1);
+    write!(
+        writer,
+        ",{{\"seq\":{},\"uptime_ms\":{},\"level\":\"INFO\",\
+         \"type\":\"MESSAGING_INFO\",\"class\":\"MESSAGING_CLASS_STATS\",\
+         \"sent_time\":{},\"current_time\":{},\
+         \"msg\":\"psram_free={} psram_used={} core1_active={} core1_loops={} \
+         decode_us_max={}\"}}],\"current_time\":{}}}",
+        stats_seq,
+        snapshot.uptime_ms,
+        snapshot.uptime_ms,
+        snapshot.uptime_ms,
+        snapshot.psram_free_bytes,
+        snapshot.psram_used_bytes,
+        snapshot.core1_active,
+        snapshot.core1_loops,
+        snapshot.decode_us_max,
+        snapshot.uptime_ms,
+    )
+    .ok()?;
+    Some(writer.written_len())
+}
+
 /// Formats a slice of [`SyslogMessageView`] entries into `out_buf` for
 /// `GET /messages.json`.
 pub fn write_messages_json(
@@ -1063,13 +1245,19 @@ pub fn write_messages_json(
         if idx > 0 {
             writer.write_str(",").ok()?;
         }
+        let msg_type = messaging_type_for_level(msg.level);
         write!(
             writer,
-            "{{\"seq\":{},\"uptime_ms\":{},\"level\":\"{}\",\"msg\":\"{}\"}}",
+            "{{\"seq\":{},\"uptime_ms\":{},\"level\":\"{}\",\"msg\":\"{}\",\
+             \"type\":\"{}\",\"class\":\"MESSAGING_CLASS_SYSTEM\",\
+             \"sent_time\":{},\"current_time\":{}}}",
             msg.seq,
             msg.uptime_ms,
             JsonEscaped(msg.level),
             JsonEscaped(msg.message),
+            msg_type,
+            msg.uptime_ms,
+            msg.uptime_ms,
         )
         .ok()?;
     }
@@ -1155,6 +1343,66 @@ pub const DEFAULT_COMMAND_CATALOG: &[CommandCatalogEntry<'static>] = &[
     CommandCatalogEntry::new("help", "help", "List available console commands"),
 ];
 
+/// Static `.rodata` full `/commands.json` catalog including `argtable` and
+/// `values` for C web UI configuration forms and diagnostic CLI commands.
+pub const COMMANDS_JSON_CATALOG: &str = concat!(
+    "{\"commands\":[",
+    "{\"name\":\"system\",\"usage\":\"system <info|heap|reboot|recovery>\",",
+    "\"desc\":\"System diagnostics\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"i2c\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"config\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"join\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"update\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"player\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"sleep\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"help\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"free\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"heap\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"version\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"restart\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"recovery\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"restart_ota\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"i2cdetect\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"i2cget\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"i2cset\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"i2cdump\",\"argtable\":[],\"values\":{}},",
+    "{\"name\":\"cfg-audio-general\",\"argtable\":[{\"name\":\"output\"}],",
+    "\"values\":{\"output\":\"I2S\"}},",
+    "{\"name\":\"cfg-audio-tmpl\",\"argtable\":[{\"name\":\"tmpl\"}],",
+    "\"values\":{\"tmpl\":\"squeezelite -o I2S -b 500:2000\"}},",
+    "{\"name\":\"cfg-syst-services\",\"argtable\":[{\"name\":\"cspot\"},",
+    "{\"name\":\"airplay\"},{\"name\":\"bt\"}],",
+    "\"values\":{\"cspot\":\"1\",\"airplay\":\"1\",\"bt\":\"1\"}},",
+    "{\"name\":\"cfg-syst-name\",\"argtable\":[{\"name\":\"name\"}],",
+    "\"values\":{\"name\":\"BASEMENT\"}},",
+    "{\"name\":\"cfg-hw-preset\",\"argtable\":[{\"name\":\"model\"}],",
+    "\"values\":{\"model\":\"Louder-ESP32\"}},",
+    "{\"name\":\"cfg-hw-dac\",\"argtable\":[{\"name\":\"model\"}],",
+    "\"values\":{\"model\":\"TAS5805M\"}},",
+    "{\"name\":\"cfg-hw-spdif\",\"argtable\":[{\"name\":\"do\"}],",
+    "\"values\":{\"do\":\"-1\"}},",
+    "{\"name\":\"cfg-hw-rotary\",\"argtable\":[{\"name\":\"A\"}],",
+    "\"values\":{\"A\":\"-1\"}},",
+    "{\"name\":\"cfg-hw-i2c\",\"argtable\":[{\"name\":\"sda\"},{\"name\":\"scl\"}],",
+    "\"values\":{\"sda\":\"21\",\"scl\":\"22\"}},",
+    "{\"name\":\"cfg-hw-spi\",\"argtable\":[{\"name\":\"mosi\"}],",
+    "\"values\":{\"mosi\":\"-1\"}},",
+    "{\"name\":\"cfg-hw-display\",\"argtable\":[{\"name\":\"type\"}],",
+    "\"values\":{\"type\":\"none\"}}",
+    "]}"
+);
+
+/// Formats the full C-compatible `/commands.json` schema (`argtable` + `values`
+/// + CLI commands) into `out_buf`.
+pub fn format_commands_json(out_buf: &mut [u8]) -> Option<usize> {
+    let bytes = COMMANDS_JSON_CATALOG.as_bytes();
+    if bytes.len() > out_buf.len() {
+        return None;
+    }
+    out_buf[..bytes.len()].copy_from_slice(bytes);
+    Some(bytes.len())
+}
+
 /// Formats the `/commands.json` CLI catalog and optional execution output into
 /// `out_buf`.
 pub fn write_commands_json(
@@ -1162,6 +1410,9 @@ pub fn write_commands_json(
     last_output: Option<&str>,
     out_buf: &mut [u8],
 ) -> Option<usize> {
+    if last_output.is_none() && catalog.len() == DEFAULT_COMMAND_CATALOG.len() {
+        return format_commands_json(out_buf);
+    }
     let mut writer = BufferWriter::new(out_buf);
     writer.write_str("{\"commands\":[").ok()?;
     for (idx, cmd) in catalog.iter().enumerate() {
@@ -1170,7 +1421,8 @@ pub fn write_commands_json(
         }
         write!(
             writer,
-            "{{\"name\":\"{}\",\"usage\":\"{}\",\"desc\":\"{}\"}}",
+            "{{\"name\":\"{}\",\"usage\":\"{}\",\"desc\":\"{}\",\
+             \"argtable\":[],\"values\":{{}}}}",
             JsonEscaped(cmd.name),
             JsonEscaped(cmd.usage),
             JsonEscaped(cmd.description),
@@ -2182,25 +2434,28 @@ pub fn handle_http_request_streaming_impl(
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
-            let entries = [SyslogMessageView::new(
-                snapshot.settings_seq,
-                snapshot.uptime_ms,
-                "INFO",
-                snapshot.amp_mode,
-            )];
-            let body_len = write_messages_json(&entries, &mut out_buf[HEADER_ROOM..])?;
+            let body_len =
+                format_messages_json(snapshot, None, &mut out_buf[HEADER_ROOM..])?;
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], HttpControlAction::None))
         }
         ("GET", "/commands.json") => {
-            const HEADER_ROOM: usize = 160;
-            if out_buf.len() <= HEADER_ROOM {
+            let body_bytes = COMMANDS_JSON_CATALOG.as_bytes();
+            let mut header: String<160> = String::new();
+            write!(
+                header,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
+                Connection: close\r\nCache-Control: no-store\r\n\r\n",
+                body_bytes.len()
+            )
+            .ok()?;
+            let header_bytes = header.as_bytes();
+            if header_bytes.len() > out_buf.len() {
                 return None;
             }
-            let body_len =
-                write_commands_json(DEFAULT_COMMAND_CATALOG, None, &mut out_buf[HEADER_ROOM..])?;
-            let total_len = write_json_http_response(body_len, out_buf)?;
-            Some((total_len, &[], HttpControlAction::None))
+            out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
+            Some((header_bytes.len(), body_bytes, HttpControlAction::None))
         }
         ("POST", "/commands.json") => {
             const HEADER_ROOM: usize = 160;
@@ -2208,13 +2463,15 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             let payload = extract_query_or_body(raw_path, req_bytes);
-            let cmd_str = extract_param_or_json_field(payload, "cmd").unwrap_or("");
+            let cmd_str = extract_param_or_json_field(payload, "cmd")
+                .or_else(|| extract_param_or_json_field(payload, "command"))
+                .unwrap_or("");
             let (body_len, action) = if !cmd_str.is_empty() {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
                 let redacted = redact_command_password(cmd_str);
                 write!(
                     writer,
-                    "{{\"ok\":true,\"cmd\":\"{}\"}}",
+                    "{{\"ok\":true,\"cmd\":\"{}\",\"Result\":\"Success\"}}",
                     JsonEscaped(redacted.as_str()),
                 )
                 .ok()?;
@@ -3363,5 +3620,38 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
         assert!(body_contains_ok_or_result(&resp));
         assert!(matches!(action, HttpControlAction::UpdateConfig { .. }));
+    }
+
+    #[test]
+    fn test_commands_json_includes_argtable_and_values_and_accepts_c_post_body() {
+        let snap = sample_snapshot();
+        let req = b"GET /commands.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, _) = handle_request_bytes(req, &snap, None);
+        let body = extract_http_body(&resp);
+        assert!(body.contains("\"commands\":["));
+        assert!(body.contains("\"argtable\":["));
+        assert!(body.contains("\"values\":{"));
+        assert!(body.contains("\"cfg-syst-services\""));
+        assert!(body.contains("\"i2cdetect\""));
+
+        let post_req = b"POST /commands.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\
+            Origin: http://172.22.1.15\r\nContent-Type: application/json\r\n\r\n\
+            {\"command\":\"i2cdetect\"}";
+        let (post_resp, action) = handle_request_bytes(post_req, &snap, None);
+        let post_body = extract_http_body(&post_resp);
+        assert!(post_body.contains("\"Result\":\"Success\""));
+        assert!(post_body.contains("\"ok\":true"));
+        assert!(matches!(action, HttpControlAction::ExecuteCliCommand { .. }));
+    }
+
+    #[test]
+    fn test_messages_json_includes_system_and_stats_classes() {
+        let snap = sample_snapshot();
+        let req = b"GET /messages.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, _) = handle_request_bytes(req, &snap, None);
+        let body = extract_http_body(&resp);
+        assert!(body.contains("\"messages\":["));
+        assert!(body.contains("MESSAGING_CLASS_STATS"));
+        assert!(body.contains("MESSAGING_INFO"));
     }
 }
