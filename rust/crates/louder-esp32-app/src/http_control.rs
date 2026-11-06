@@ -1899,7 +1899,12 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             let rssi_i8 = snapshot.rssi.clamp(-127, 0) as i8;
-            let body_len = format_ap_list_json(&[], snapshot.ssid, rssi_i8, &mut out_buf[HEADER_ROOM..]);
+            let body_len = format_ap_list_json(
+                &[],
+                snapshot.ssid,
+                rssi_i8,
+                &mut out_buf[HEADER_ROOM..],
+            );
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], HttpControlAction::None))
         }
@@ -3058,12 +3063,14 @@ mod tests {
     #[test]
     fn test_delete_connect_json_emits_disconnect_wifi_and_enforces_origin() {
         let snap = sample_snapshot();
-        let req = b"DELETE /connect.json HTTP/1.1\r\nHost: 172.22.1.15\r\nOrigin: http://172.22.1.15\r\n\r\n";
+        let req = b"DELETE /connect.json HTTP/1.1\r\n\
+            Host: 172.22.1.15\r\nOrigin: http://172.22.1.15\r\n\r\n";
         let (resp, action) = handle_request_bytes(req, &snap, None);
         assert_eq!(action, HttpControlAction::DisconnectWifi);
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
 
-        let bad_req = b"DELETE /connect.json HTTP/1.1\r\nHost: 172.22.1.15\r\nOrigin: http://evil.example.com\r\n\r\n";
+        let bad_req = b"DELETE /connect.json HTTP/1.1\r\n\
+            Host: 172.22.1.15\r\nOrigin: http://evil.example.com\r\n\r\n";
         let (bad_resp, bad_action) = handle_request_bytes(bad_req, &snap, None);
         assert_eq!(bad_action, HttpControlAction::None);
         assert!(bad_resp.starts_with("HTTP/1.1 403 Forbidden"));
@@ -3077,7 +3084,14 @@ mod tests {
             let (resp, _) = handle_request_bytes(req.as_bytes(), &snap, None);
             assert!(resp.starts_with("HTTP/1.1 200 OK"));
         }
-        for path in ["/gen_204", "/hotspot-detect.html", "/hotspotdetect.html", "/library/test/success.html", "/success.txt"] {
+        let redirect_paths = [
+            "/gen_204",
+            "/hotspot-detect.html",
+            "/hotspotdetect.html",
+            "/library/test/success.html",
+            "/success.txt",
+        ];
+        for path in redirect_paths {
             let req = format!("GET {} HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n", path);
             let (resp, _) = handle_request_bytes(req.as_bytes(), &snap, None);
             assert!(resp.starts_with("HTTP/1.1 302 Found"));
