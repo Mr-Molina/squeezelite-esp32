@@ -1123,7 +1123,7 @@ mod device {
                 && http_sock.can_recv()
                 && http_sock.may_send()
             {
-                let mut req_buf = [0u8; 256];
+                let mut req_buf = [0u8; 1024];
                 let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
                 while http_sock.can_recv() {
                     let _ = http_sock.recv(|buf| (buf.len(), ()));

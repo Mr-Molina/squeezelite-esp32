@@ -88,7 +88,15 @@ pub const NVS_TYPE_STR: u8 = 33;
 pub fn is_secret_config_key(key: &str) -> bool {
     matches!(
         key,
-        "password" | "wifi.pass" | "wifi_pass" | "ap_pwd" | "web_pwd" | "secret"
+        "password"
+            | "pwd"
+            | "wifi.pass"
+            | "wifi_pass"
+            | "ap_pwd"
+            | "telnet_pwd"
+            | "a2dp_spin"
+            | "web_pwd"
+            | "secret"
     )
 }
 

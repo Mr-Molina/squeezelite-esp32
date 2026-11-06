@@ -303,6 +303,10 @@ impl<'a> BufferWriter<'a> {
     fn written_len(&self) -> usize {
         self.offset
     }
+
+    fn remaining_len(&self) -> usize {
+        self.buf.len().saturating_sub(self.offset)
+    }
 }
 
 impl<'a> core::fmt::Write for BufferWriter<'a> {
@@ -1484,14 +1488,22 @@ pub fn format_messages_json(
     ring: Option<&SyslogRingBuffer>,
     out_buf: &mut [u8],
 ) -> Option<usize> {
+    const STATS_RESERVE_BYTES: usize = 280;
+    const ENTRY_RESERVE_THRESHOLD: usize = 420;
     let mut writer = BufferWriter::new(out_buf);
     writer.write_str("{\"messages\":[").ok()?;
     let mut written_count = 0usize;
     if let Some(r) = ring {
-        for idx in 0..r.len() {
+        let start_idx = r.len().saturating_sub(6);
+        for idx in start_idx..r.len() {
             let Some(entry) = r.entry(idx) else {
                 continue;
             };
+            let needed = ENTRY_RESERVE_THRESHOLD
+                .max(STATS_RESERVE_BYTES + 160 + entry.msg.len());
+            if writer.remaining_len() < needed {
+                break;
+            }
             if written_count > 0 {
                 writer.write_str(",").ok()?;
             }
@@ -1970,7 +1982,9 @@ fn redact_command_password(cmd: &str) -> String<160> {
         }
     } else if parts.first() == Some(&"config")
         && parts.get(1) == Some(&"set")
-        && (parts.get(2) == Some(&"wifi.pass") || parts.get(2) == Some(&"wifi_pass"))
+        && parts
+            .get(2)
+            .is_some_and(|k| crate::config_handle::is_secret_config_key(k))
         && parts.len() >= 4
     {
         let _ = write!(
@@ -1981,6 +1995,14 @@ fn redact_command_password(cmd: &str) -> String<160> {
             parts[2],
             sep
         );
+    } else if ws_parts.first() == Some(&"config")
+        && ws_parts.get(1) == Some(&"set")
+        && ws_parts
+            .get(2)
+            .is_some_and(|k| crate::config_handle::is_secret_config_key(k))
+        && ws_parts.len() >= 4
+    {
+        let _ = write!(out, "config set {} ***", ws_parts[2]);
     } else if let Some(idx) = cmd.find("wifi.pass=") {
         let prefix = &cmd[..idx + "wifi.pass=".len()];
         let rest = &cmd[idx + "wifi.pass=".len()..];
@@ -2625,11 +2647,17 @@ pub fn handle_http_request_streaming_impl(
                 let decoded_val = percent_decode_into(upd.value, &mut decoded_val_buf)
                     .and_then(|len| core::str::from_utf8(&decoded_val_buf[..len]).ok())
                     .unwrap_or(upd.value);
+                let display_val =
+                    if crate::config_handle::is_secret_config_key(decoded_key.trim()) {
+                        "********"
+                    } else {
+                        decoded_val
+                    };
                 write!(
                     writer,
                     "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
                     JsonEscaped(decoded_key),
-                    JsonEscaped(decoded_val),
+                    JsonEscaped(display_val),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::UpdateConfig)
@@ -2751,8 +2779,11 @@ pub fn handle_http_request_streaming_impl(
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
-            let body_len =
-                format_messages_json(snapshot, None, &mut out_buf[HEADER_ROOM..])?;
+            let body_len = WEB_SYSLOG_RING.lock(|cell| {
+                let ring = cell.borrow();
+                let ring_opt = if ring.is_empty() { None } else { Some(&*ring) };
+                format_messages_json(snapshot, ring_opt, &mut out_buf[HEADER_ROOM..])
+            })?;
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], HttpControlAction::None))
         }
@@ -4035,5 +4066,82 @@ mod tests {
         ));
         assert_eq!(cfg.read(|c| c.volume), 80);
         assert!(syslog.latest_message().contains("config: vol_pct=80"));
+    }
+
+    #[test]
+    fn test_final_review_secret_redaction_and_messages_reserve_guard() {
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 1536];
+
+        // 1. Secret key matching for pwd, telnet_pwd, and a2dp_spin
+        for secret_key in ["pwd", "telnet_pwd", "a2dp_spin"] {
+            assert!(
+                crate::config_handle::is_secret_config_key(secret_key),
+                "expected {secret_key} to be classified as secret"
+            );
+            let req = format!(
+                "POST /config.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\
+                 Origin: http://172.22.1.15\r\n\r\nkey={secret_key}&value=TopSecret99"
+            );
+            let (len, act) = handle_http_control_request(req.as_bytes(), &snap, &mut buf).unwrap();
+            assert_eq!(act, HttpControlAction::UpdateConfig);
+            let resp = core::str::from_utf8(&buf[..len]).unwrap();
+            assert!(resp.contains("\"value\":\"********\""));
+            assert!(!resp.contains("TopSecret99"));
+
+            let cmd_req = format!(
+                "POST /commands.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\
+                 Origin: http://172.22.1.15\r\n\r\ncmd=config set {secret_key} TopSecret99"
+            );
+            let (clen, cact) =
+                handle_http_control_request(cmd_req.as_bytes(), &snap, &mut buf).unwrap();
+            assert_eq!(cact, HttpControlAction::ExecuteCliCommand);
+            let cresp = core::str::from_utf8(&buf[..clen]).unwrap();
+            assert!(cresp.contains(&format!("config set {secret_key} ***")));
+            assert!(!cresp.contains("TopSecret99"));
+        }
+
+        // 2. Full 16-entry SyslogRingBuffer fits inside 1376-byte body buffer
+        let mut ring = SyslogRingBuffer::new();
+        for i in 0..16 {
+            let msg = format!(
+                "diagnostic syslog ring entry #{i} with long payload padding \
+                 to verify reserve guard prevents buffer overflow on 1536B tx"
+            );
+            ring.push(1000 + i as u64, "INFO", "MESSAGING_CLASS_SYSTEM", &msg);
+        }
+        assert_eq!(ring.len(), 16);
+        let mut body_buf = [0u8; 1376];
+        let written = format_messages_json(&snap, Some(&ring), &mut body_buf)
+            .expect("full 16-entry ring must fit inside 1376-byte buffer");
+        let json_str = core::str::from_utf8(&body_buf[..written]).unwrap();
+        assert!(json_str.contains("\"MESSAGING_CLASS_STATS\""));
+        assert!(json_str.ends_with('}'));
+
+        // 3. Live WEB_SYSLOG_RING wired into GET /messages.json & real value staged
+        let mut cfg = crate::config_handle::ConfigHandle::default();
+        let mut local_syslog = SyslogRingBuffer::new();
+        assert!(apply_web_config_update(
+            "player_name",
+            "VaultRoom",
+            snap.uptime_ms,
+            &mut cfg,
+            &mut local_syslog,
+        ));
+        assert_eq!(cfg.host_name_str(), "VaultRoom");
+
+        WEB_SYSLOG_RING.lock(|cell| {
+            let mut ring = cell.borrow_mut();
+            let _ = execute_web_cli_command("version", &snap, &mut cfg, &mut ring);
+        });
+        let (mlen, _) = handle_http_control_request(
+            b"GET /messages.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("GET /messages.json fits in 1536B buffer");
+        let mresp = core::str::from_utf8(&buf[..mlen]).unwrap();
+        assert!(mresp.contains(RUST_OTA_FIRMWARE_VERSION));
+        assert!(mresp.contains("\"MESSAGING_CLASS_STATS\""));
     }
 }
