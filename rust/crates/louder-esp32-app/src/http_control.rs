@@ -862,10 +862,8 @@ pub fn format_ap_list_json(
 
     for ap in aps {
         let ssid_len = (ap.ssid_len as usize).min(ap.ssid.len());
-        let ssid_str = match core::str::from_utf8(&ap.ssid[..ssid_len]) {
-            Ok(s) => s,
-            Err(_) => "",
-        };
+        let ssid_str =
+            core::str::from_utf8(&ap.ssid[..ssid_len]).unwrap_or_default();
         if ssid_str == current_ssid {
             current_found = true;
         }
@@ -3972,7 +3970,7 @@ mod tests {
         let (resp, action) = handle_request_bytes(req, &snap, None);
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
         assert!(body_contains_ok_or_result(&resp));
-        assert!(matches!(action, HttpControlAction::UpdateConfig { .. }));
+        assert!(matches!(action, HttpControlAction::UpdateConfig));
     }
 
     #[test]
@@ -3994,7 +3992,7 @@ mod tests {
         let post_body = extract_http_body(&post_resp);
         assert!(post_body.contains("\"Result\":\"Success\""));
         assert!(post_body.contains("\"ok\":true"));
-        assert!(matches!(action, HttpControlAction::ExecuteCliCommand { .. }));
+        assert!(matches!(action, HttpControlAction::ExecuteCliCommand));
     }
 
     #[test]
