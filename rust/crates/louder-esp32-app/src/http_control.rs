@@ -1144,6 +1144,325 @@ impl SyslogRingBuffer {
         let pos = (self.head + idx) % Self::CAPACITY;
         self.entries[pos].as_ref()
     }
+
+    /// Returns the most recently pushed log message string slice, or `""` if empty.
+    #[must_use]
+    pub fn latest_message(&self) -> &str {
+        if self.len == 0 {
+            return "";
+        }
+        self.entry(self.len - 1).map_or("", |e| e.msg.as_str())
+    }
+}
+
+static WEB_SYSLOG_RING: Mutex<CriticalSectionRawMutex, RefCell<SyslogRingBuffer>> =
+    Mutex::new(RefCell::new(SyslogRingBuffer::new()));
+
+/// Applies a configuration key-value mutation from `/config.json` to
+/// [`crate::config_handle::ConfigHandle`] and logs the update to `syslog`.
+pub fn apply_web_config_update(
+    key: &str,
+    value: &str,
+    uptime_ms: u64,
+    config: &mut crate::config_handle::ConfigHandle,
+    syslog: &mut SyslogRingBuffer,
+) -> bool {
+    let mut k_buf = [0u8; 64];
+    let decoded_key = percent_decode_into(key, &mut k_buf)
+        .and_then(|n| core::str::from_utf8(&k_buf[..n]).ok())
+        .unwrap_or(key)
+        .trim();
+    if decoded_key.is_empty() {
+        return false;
+    }
+    let mut v_buf = [0u8; 128];
+    let decoded_val = percent_decode_into(value, &mut v_buf)
+        .and_then(|n| core::str::from_utf8(&v_buf[..n]).ok())
+        .unwrap_or(value)
+        .trim();
+
+    let applied = config.apply_key_value(decoded_key, decoded_val);
+    let shown = if crate::config_handle::is_secret_config_key(decoded_key) {
+        "***"
+    } else {
+        decoded_val
+    };
+    let mut msg: String<128> = String::new();
+    let _ = write!(msg, "config: {}={}", decoded_key, shown);
+    syslog.push(uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+    applied
+}
+
+/// Executes a web console CLI command (`/commands.json`), updating `config`
+/// when `cfg-*` or `config set` mutations are invoked and appending diagnostic
+/// output to `syslog`.
+pub fn execute_web_cli_command(
+    cmd: &str,
+    snap: &HttpStatusSnapshot<'_>,
+    config: &mut crate::config_handle::ConfigHandle,
+    syslog: &mut SyslogRingBuffer,
+) -> bool {
+    let mut decoded_buf = [0u8; 128];
+    let clean = percent_decode_into(cmd, &mut decoded_buf)
+        .and_then(|n| core::str::from_utf8(&decoded_buf[..n]).ok())
+        .unwrap_or(cmd)
+        .trim();
+    if clean.is_empty() {
+        return false;
+    }
+
+    let mut parts = clean.split_whitespace();
+    let verb = parts.next().unwrap_or("");
+    let mut msg: String<128> = String::new();
+
+    match verb {
+        "free" | "heap" => {
+            let _ = write!(
+                msg,
+                "PSRAM free: {} B, used: {} B",
+                snap.psram_free_bytes, snap.psram_used_bytes
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "version" => {
+            let _ = write!(
+                msg,
+                "{} {} (seq {})",
+                REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION, snap.settings_seq
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "i2cdetect" => {
+            let _ = write!(
+                msg,
+                "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
+                snap.i2c_acks, snap.i2c_nacks
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "i2cget" | "i2cset" | "i2cdump" | "i2c" => {
+            let _ = write!(
+                msg,
+                "I2C0 0x2D: mode={} again=0x{:02X} ACK={} NACK={}",
+                snap.amp_mode, snap.again_code, snap.i2c_acks, snap.i2c_nacks
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "system" | "restart" | "recovery" | "restart_ota" => {
+            let _ = write!(
+                msg,
+                "system: up={}ms ip={}.{}.{}.{} PSRAM free: {} B",
+                snap.uptime_ms,
+                snap.ip[0],
+                snap.ip[1],
+                snap.ip[2],
+                snap.ip[3],
+                snap.psram_free_bytes
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "config" => {
+            let sub = parts.next().unwrap_or("dump");
+            if sub == "set" {
+                let k = parts.next().unwrap_or("");
+                let v = parts.next().unwrap_or("");
+                if !k.is_empty() {
+                    let _ = config.apply_key_value(k, v);
+                }
+            }
+            let _ = write!(
+                msg,
+                "config: host={} seq={} vol={}% eq={}",
+                config.host_name_str(),
+                snap.settings_seq,
+                snap.vol_pct,
+                snap.eq_preset
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "join" => {
+            let target_ssid = parts.next().unwrap_or(snap.ssid);
+            let _ = write!(msg, "join: ssid={} (credentials staged)", target_ssid);
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "update" => {
+            let _ = write!(msg, "update: OTA target ota_0_0x160000 ready");
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "player" => {
+            let _ = write!(
+                msg,
+                "player: mode={} vol={}% frames={} codec={}",
+                snap.amp_mode, snap.vol_pct, snap.frames_played, snap.codec
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "sleep" => {
+            let _ = write!(msg, "sleep: standby armed (amp={})", snap.amp_mode);
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        "help" => {
+            let _ = write!(
+                msg,
+                "commands: system i2c config join update player sleep free heap version i2cdetect"
+            );
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        v if v.starts_with("cfg-") => {
+            let mut prev_flag: Option<&str> = None;
+            for tok in parts {
+                if let Some(flag) = tok.strip_prefix("--") {
+                    if let Some((k, val)) = flag.split_once('=') {
+                        let _ = config.apply_key_value(k, val);
+                        prev_flag = None;
+                    } else {
+                        prev_flag = Some(flag);
+                    }
+                } else if let Some(flag) = prev_flag.take() {
+                    let _ = config.apply_key_value(flag, tok);
+                } else if let Some((k, val)) = tok.split_once('=') {
+                    let _ = config.apply_key_value(k, val);
+                } else if v == "cfg-syst-name" {
+                    let _ = config.set_host_name(tok);
+                }
+            }
+            let _ = write!(msg, "{}: OK (host_name={})", v, config.host_name_str());
+            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            true
+        }
+        _ => {
+            let _ = write!(msg, "unknown command: {}", verb);
+            syslog.push(snap.uptime_ms, "WARN", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            false
+        }
+    }
+}
+
+fn extract_raw_path_from_req(req_bytes: &[u8]) -> &str {
+    let line_end = req_bytes
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(req_bytes.len());
+    let first_line = core::str::from_utf8(&req_bytes[..line_end]).unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let _ = parts.next();
+    parts.next().unwrap_or("")
+}
+
+/// Dispatches `UpdateConfig`, `ExecuteCliCommand`, `TriggerWifiScan`,
+/// `ConnectWifi`, `DisconnectWifi`, and `StartOtaFlash` side effects from an
+/// HTTP request, persisting changes to `config` and `journal` and recording
+/// diagnostic entries in the web syslog ring buffer.
+pub fn dispatch_web_post_action(
+    action: HttpControlAction,
+    req_bytes: &[u8],
+    snap: &HttpStatusSnapshot<'_>,
+    config: &crate::config_handle::ConfigHandle,
+    journal: &mut crate::config_handle::RamJournal<'_>,
+) -> Option<crate::ota_safety::WifiStaCredentials> {
+    let raw_path = extract_raw_path_from_req(req_bytes);
+    let payload = extract_query_or_body(raw_path, req_bytes);
+    let mut new_wifi: Option<crate::ota_safety::WifiStaCredentials> = None;
+
+    WEB_SYSLOG_RING.lock(|cell| {
+        let mut syslog = cell.borrow_mut();
+        let mut cfg_tmp = config.clone_handle();
+        match action {
+            HttpControlAction::UpdateConfig => {
+                if let Some(upd) = parse_config_update_query(payload) {
+                    let _ = apply_web_config_update(
+                        upd.key,
+                        upd.value,
+                        snap.uptime_ms,
+                        &mut cfg_tmp,
+                        &mut syslog,
+                    );
+                    let _ = config.sync_from(&cfg_tmp);
+                }
+                let _ = config.flush_now(journal);
+            }
+            HttpControlAction::ExecuteCliCommand => {
+                let cmd_str = extract_param_or_json_field(payload, "cmd")
+                    .or_else(|| extract_param_or_json_field(payload, "command"))
+                    .unwrap_or("");
+                if execute_web_cli_command(cmd_str, snap, &mut cfg_tmp, &mut syslog) {
+                    let _ = config.sync_from(&cfg_tmp);
+                    let _ = config.flush_now(journal);
+                }
+            }
+            HttpControlAction::TriggerWifiScan => {
+                let mut msg: String<128> = String::new();
+                let _ = write!(
+                    msg,
+                    "wifi scan: active ssid={} rssi={} dBm",
+                    snap.ssid, snap.rssi
+                );
+                syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            }
+            HttpControlAction::ConnectWifi => {
+                if let Some(req) = parse_connect_request(payload) {
+                    let mut s_buf = [0u8; 64];
+                    let dec_ssid = percent_decode_into(req.ssid, &mut s_buf)
+                        .and_then(|n| core::str::from_utf8(&s_buf[..n]).ok())
+                        .unwrap_or(req.ssid);
+                    let mut p_buf = [0u8; 64];
+                    let dec_pass = percent_decode_into(req.password, &mut p_buf)
+                        .and_then(|n| core::str::from_utf8(&p_buf[..n]).ok())
+                        .unwrap_or(req.password);
+                    if let Some(hn) = req.host_name {
+                        let _ = cfg_tmp.set_host_name(hn);
+                        let _ = config.sync_from(&cfg_tmp);
+                    }
+                    let mut creds = crate::ota_safety::WifiStaCredentials {
+                        ssid: String::new(),
+                        password: String::new(),
+                    };
+                    let s_len = dec_ssid.floor_char_boundary(dec_ssid.len().min(32));
+                    let p_len = dec_pass.floor_char_boundary(dec_pass.len().min(64));
+                    let _ = creds.ssid.push_str(&dec_ssid[..s_len]);
+                    let _ = creds.password.push_str(&dec_pass[..p_len]);
+                    journal.set_pending_wifi(Some(creds.clone()));
+                    let _ = config.flush_now(journal);
+                    new_wifi = Some(creds);
+                    let mut msg: String<128> = String::new();
+                    let _ = write!(msg, "wifi connect: ssid={}", &dec_ssid[..s_len]);
+                    syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+                }
+            }
+            HttpControlAction::DisconnectWifi => {
+                journal.set_pending_wifi(None);
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "wifi disconnect requested",
+                );
+            }
+            HttpControlAction::StartOtaFlash => {
+                let _ = config.flush_now(journal);
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "OTA flash started: target ota_0_0x160000",
+                );
+            }
+            _ => {}
+        }
+    });
+
+    new_wifi
 }
 
 /// Maps a severity label to the C web UI `MESSAGING_*` constant.
@@ -3653,5 +3972,36 @@ mod tests {
         assert!(body.contains("\"messages\":["));
         assert!(body.contains("MESSAGING_CLASS_STATS"));
         assert!(body.contains("MESSAGING_INFO"));
+    }
+
+    #[test]
+    fn test_execute_web_cli_command_populates_syslog_for_diagnostics_and_cfg() {
+        let snap = sample_snapshot();
+        let mut cfg = crate::config_handle::ConfigHandle::default();
+        let mut syslog = SyslogRingBuffer::new();
+
+        assert!(execute_web_cli_command("free", &snap, &mut cfg, &mut syslog));
+        assert!(syslog.latest_message().contains("PSRAM free:"));
+
+        assert!(execute_web_cli_command("i2cdetect", &snap, &mut cfg, &mut syslog));
+        assert!(syslog.latest_message().contains("0x2D"));
+
+        assert!(execute_web_cli_command(
+            "cfg-syst-name --host_name STUDIO",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert_eq!(cfg.host_name_str(), "STUDIO");
+
+        assert!(apply_web_config_update(
+            "vol_pct",
+            "80",
+            snap.uptime_ms,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert_eq!(cfg.read(|c| c.volume), 80);
+        assert!(syslog.latest_message().contains("config: vol_pct=80"));
     }
 }

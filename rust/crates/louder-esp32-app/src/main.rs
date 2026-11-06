@@ -448,8 +448,8 @@ mod xtensa_hw {
     };
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{
-        handle_http_request_streaming, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
-        LeaseHealth,
+        dispatch_web_post_action, handle_http_request_streaming, DeadManLeaseWatchdog,
+        HttpControlAction, HttpStatusSnapshot, LeaseHealth,
     };
     use louder_esp32_app::io_traits::{NetAddr, SlimTransport};
     use louder_esp32_app::net_device::{
@@ -3448,14 +3448,65 @@ mod xtensa_hw {
                                 s.pending_http_action = action;
                                 s.pending_action_deadline_ms = now_ms + 250;
                             }
-                            HttpControlAction::UpdateConfig => {
-                                s.config.flush_now(&mut *s.journal);
+                            HttpControlAction::UpdateConfig
+                            | HttpControlAction::ExecuteCliCommand
+                            | HttpControlAction::TriggerWifiScan => {
+                                let _ = dispatch_web_post_action(
+                                    action,
+                                    &req_buf[..n],
+                                    &snap,
+                                    s.config,
+                                    &mut *s.journal,
+                                );
                             }
-                            HttpControlAction::ExecuteCliCommand
-                            | HttpControlAction::TriggerWifiScan
-                            | HttpControlAction::ConnectWifi
-                            | HttpControlAction::DisconnectWifi
-                            | HttpControlAction::StartOtaFlash => {}
+                            HttpControlAction::ConnectWifi => {
+                                if let Some(creds) = dispatch_web_post_action(
+                                    action,
+                                    &req_buf[..n],
+                                    &snap,
+                                    s.config,
+                                    &mut *s.journal,
+                                ) {
+                                    if let Ok(ssid_cfg) = creds.ssid.as_str().try_into() {
+                                        let auth_cfg = if creds.password.is_empty() {
+                                            AuthenticationMethodConfig::Open
+                                        } else if let Ok(pw) = creds.password.as_str().try_into() {
+                                            AuthenticationMethodConfig::WpaWpa2Personal(pw)
+                                        } else {
+                                            AuthenticationMethodConfig::Open
+                                        };
+                                        let sta_cfg = WifiModeConfig::Station(
+                                            StationConfig::default()
+                                                .with_ssid(ssid_cfg)
+                                                .with_authentication(auth_cfg),
+                                        );
+                                        let _ = s.wifi_controller.set_config(&sta_cfg);
+                                        s.last_connect_attempt_ms = 0;
+                                    }
+                                }
+                            }
+                            HttpControlAction::DisconnectWifi => {
+                                let _ = dispatch_web_post_action(
+                                    action,
+                                    &req_buf[..n],
+                                    &snap,
+                                    s.config,
+                                    &mut *s.journal,
+                                );
+                                s.assigned_ip = None;
+                                s.last_connect_attempt_ms = now_ms;
+                            }
+                            HttpControlAction::StartOtaFlash => {
+                                let _ = dispatch_web_post_action(
+                                    action,
+                                    &req_buf[..n],
+                                    &snap,
+                                    s.config,
+                                    &mut *s.journal,
+                                );
+                                s.pending_http_action = HttpControlAction::PersistOta0AndReboot;
+                                s.pending_action_deadline_ms = now_ms + 250;
+                            }
                             _ => {}
                         }
                     } else {

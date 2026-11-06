@@ -109,14 +109,22 @@ struct HandleState {
 }
 
 /// The runtime configuration: an [`AudioConfig`] plus a dirty flag behind one
-/// mutex.
+/// mutex, with a cached `host_name` for zero-copy inspection.
 pub struct ConfigHandle {
     state: Mutex<CriticalSectionRawMutex, RefCell<HandleState>>,
+    host_name: heapless::String<32>,
+}
+
+impl Default for ConfigHandle {
+    fn default() -> Self {
+        Self::new(AudioConfig::default())
+    }
 }
 
 impl ConfigHandle {
     /// A clean handle holding `cfg` (the boot-resolved configuration).
-    pub const fn new(cfg: AudioConfig) -> Self {
+    pub fn new(cfg: AudioConfig) -> Self {
+        let host_name = cfg.player_name.clone();
         Self {
             state: Mutex::new(RefCell::new(HandleState {
                 cfg,
@@ -124,6 +132,138 @@ impl ConfigHandle {
                 generation: 0,
                 snapshot_generation: 0,
             })),
+            host_name,
+        }
+    }
+
+    /// Returns the current host / player name string slice.
+    #[must_use]
+    pub fn host_name_str(&self) -> &str {
+        self.host_name.as_str()
+    }
+
+    /// Updates both the cached `host_name` and the inner
+    /// `AudioConfig::player_name`.
+    pub fn set_host_name(&mut self, name: &str) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let max_len = trimmed.floor_char_boundary(trimmed.len().min(32));
+        let clean = &trimmed[..max_len];
+        self.host_name.clear();
+        let _ = self.host_name.push_str(clean);
+        self.update(|c| {
+            c.set_player_name(clean);
+        })
+    }
+
+    /// Creates a mutable working copy of this handle's current state.
+    #[must_use]
+    pub fn clone_handle(&self) -> Self {
+        self.state.lock(|state| {
+            let s = state.borrow();
+            let host_name = s.cfg.player_name.clone();
+            Self {
+                state: Mutex::new(RefCell::new(HandleState {
+                    cfg: s.cfg.clone(),
+                    dirty: s.dirty,
+                    generation: s.generation,
+                    snapshot_generation: s.snapshot_generation,
+                })),
+                host_name,
+            }
+        })
+    }
+
+    /// Synchronizes changes from a working copy back into this shared handle.
+    pub fn sync_from(&self, other: &Self) -> bool {
+        let next_cfg = other.read(Clone::clone);
+        self.update(|c| *c = next_cfg)
+    }
+
+    /// Applies a string key-value configuration mutation to the handle.
+    pub fn apply_key_value(&mut self, key: &str, value: &str) -> bool {
+        let k = key.trim();
+        let v = value.trim();
+        if k.is_empty() {
+            return false;
+        }
+        match k {
+            "host_name" | "player_name" | "name" => {
+                let _ = self.set_host_name(v);
+                true
+            }
+            "vol" | "vol_pct" | "volume" => {
+                if let Ok(pct) = v.parse::<u8>() {
+                    let clamped = pct.min(100);
+                    let _ = self.update(|c| c.volume = clamped);
+                    true
+                } else {
+                    false
+                }
+            }
+            "eq" | "eq_preset" | "equalizer_preset" => {
+                let preset = if let Ok(id) = v.parse::<u8>() {
+                    Some(id.min(4))
+                } else if v.eq_ignore_ascii_case("flat") {
+                    Some(0)
+                } else if v.eq_ignore_ascii_case("bass") {
+                    Some(1)
+                } else if v.eq_ignore_ascii_case("loudness") {
+                    Some(2)
+                } else if v.eq_ignore_ascii_case("vocal") {
+                    Some(3)
+                } else if v.eq_ignore_ascii_case("rock") {
+                    Some(4)
+                } else {
+                    None
+                };
+                if let Some(p) = preset {
+                    let _ = self.update(|c| c.equalizer_preset = p);
+                    true
+                } else {
+                    false
+                }
+            }
+            "again" | "again_code" | "analog_gain" => {
+                let parsed = if let Some(hex) =
+                    v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"))
+                {
+                    u8::from_str_radix(hex, 16).ok()
+                } else {
+                    v.parse::<u8>().ok()
+                };
+                if let Some(code) = parsed {
+                    let clamped = code.min(AudioConfig::MAX_ANALOG_GAIN_CODE);
+                    let _ = self.update(|c| c.analog_gain_code = clamped);
+                    true
+                } else {
+                    false
+                }
+            }
+            "loud" | "loudness" | "loudness_enabled" => {
+                let enabled = matches!(v, "1" | "true" | "TRUE" | "on" | "ON");
+                let _ = self.update(|c| c.loudness_enabled = enabled);
+                true
+            }
+            "maxrate" | "max_sample_rate" => {
+                if let Ok(rate) = v.parse::<u32>() {
+                    let _ = self.update(|c| c.set_max_sample_rate(rate));
+                    true
+                } else {
+                    false
+                }
+            }
+            "lms_port" => {
+                if let Ok(port @ 1..) = v.parse::<u16>() {
+                    let _ = self.update(|c| c.lms_server_port = Some(port));
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => true,
         }
     }
 
