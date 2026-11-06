@@ -217,17 +217,17 @@ pub struct HttpStatusSnapshot<'a> {
     pub decode_us_first: u32,
     /// Whether headphone jack is inserted (`"Jack"` in C `/status.json`).
     pub jack_inserted: bool,
-    /// Measured supply/battery voltage in millivolts (`"Voltage"` in C `/status.json`).
+    /// Supply/battery voltage in millivolts (`"Voltage"` in C `/status.json`).
     pub voltage_mv: u16,
     /// Wi-Fi station disconnect count (`"disconnect_count"` in C `/status.json`).
     pub disconnect_count: u32,
     /// Average Wi-Fi association duration in milliseconds (`"avg_conn_time"`).
     pub avg_conn_time_ms: u32,
-    /// Whether the I2C bus is locked by an active peripheral driver (`"is_i2c_locked"`).
+    /// Whether the I2C bus is locked by a peripheral (`"is_i2c_locked"`).
     pub is_i2c_locked: bool,
     /// Wi-Fi connection reason/result code (`"urc"`, `0` when connected).
     pub urc: u8,
-    /// C-compatible Bluetooth status code (`0` = idle, `1` = connected, `2` = streaming).
+    /// C Bluetooth status (`0` = idle, `1` = connected, `2` = streaming).
     pub bt_status: u8,
     /// C-compatible Bluetooth sub-status code (`"bt_sub_status"`).
     pub bt_sub_status: u8,
@@ -512,7 +512,7 @@ pub const BOARD_GPIO_MAP: &[GpioPinDescriptor] = &[
     },
 ];
 
-/// Default C-compatible NVS configuration entries exposed in `GET /config.json`.
+/// Default C-compatible NVS entries exposed in `GET /config.json`.
 pub const DEFAULT_NVS_CONFIG_ENTRIES: &[(&str, &str, u8)] = &[
     ("host_name", "BASEMENT", crate::config_handle::NVS_TYPE_STR),
     ("autoexec", "1", crate::config_handle::NVS_TYPE_U8),
@@ -769,7 +769,7 @@ fn parse_nested_c_config_update(input: &str) -> Option<ParsedConfigUpdate<'_>> {
 }
 
 /// Parses a `key=...&value=...` query/form, flat `{"key":"...","value":"..."}`,
-/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, or `{"fwurl":"..."}`
+/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, or `{"fwurl":..}`
 /// JSON body for `/config.json`.
 #[must_use]
 pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> {
@@ -1060,7 +1060,7 @@ pub struct SyslogRingEntry {
     pub uptime_ms: u64,
     /// Severity label (`"INFO"`, `"WARN"`, `"ERROR"`).
     pub level: String<16>,
-    /// C-compatible messaging class (`"MESSAGING_CLASS_SYSTEM"`, `"MESSAGING_CLASS_STATS"`).
+    /// C messaging class (`"MESSAGING_CLASS_SYSTEM"`, `"MESSAGING_CLASS_STATS"`).
     pub msg_class: String<32>,
     /// Log message text.
     pub msg: String<128>,
@@ -1097,7 +1097,7 @@ impl SyslogRingBuffer {
         }
     }
 
-    /// Appends a message to the ring buffer, overwriting the oldest entry when full.
+    /// Appends a message to the ring buffer, overwriting the oldest when full.
     pub fn push(&mut self, uptime_ms: u64, level: &str, msg_class: &str, msg: &str) {
         let mut lvl = String::new();
         let _ = lvl.push_str(level);
@@ -2864,7 +2864,7 @@ pub fn handle_http_control_request(
 }
 
 /// Static HTML dashboard embedded for `GET /` and `GET /index.html` requests.
-pub const DASHBOARD_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Louder-ESP32 Control</title><style>body{font-family:sans-serif;margin:6px;background:#111;color:#eee}h3{margin:4px 0 2px;color:#0ef}table{width:100%;border-collapse:collapse}td{padding:2px 4px;border:1px solid #333;font-size:11px}button{margin:1px;padding:3px 6px;background:#222;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer}a{color:#0ef;text-decoration:none;font-size:11px}</style></head><body><h3>Louder-ESP32 Control</h3><table><tr><td>Net/RSSI</td><td id=\"n\">-</td></tr><tr><td>LMS</td><td id=\"l\">-</td></tr><tr><td>Amp/Up</td><td id=\"s\">-</td></tr><tr><td>Audio</td><td id=\"f\">-</td></tr><tr><td>PSRAM</td><td id=\"p\">-</td></tr><tr><td>Core 1</td><td id=\"c\">-</td></tr><tr><td>TAS5805M</td><td id=\"t\">-</td></tr><tr><td>EQ / NVS</td><td id=\"e\">-</td></tr><tr><td>I2C</td><td id=\"i\">-</td></tr><tr><td>Firmware</td><td id=\"w\">-</td></tr></table><h3>Transport &amp; Volume</h3><button style=\"background:#085\" onclick=\"cmd('play')\">&#9654;Play</button><button onclick=\"cmd('pause')\">&#10074;&#10074;Pause</button><button onclick=\"cmd('stop')\">&#9632;Stop</button><button onclick=\"cmd('prev')\">&#9198;Prev</button><button onclick=\"cmd('next')\">Next&#9197;</button><br><button onclick=\"cmd('voldown')\">-5%</button><button onclick=\"cmd('vol25')\">25%</button><button onclick=\"cmd('vol40')\">40%</button><button onclick=\"cmd('vol55')\">55%</button><button onclick=\"cmd('vol70')\">70%</button><button onclick=\"cmd('vol85')\">85%</button><button onclick=\"cmd('volup')\">+5%</button><h3>Presets</h3><button style=\"background:#158\" onclick=\"cmd('preset1')\">Ibiza</button><button style=\"background:#158\" onclick=\"cmd('preset2')\">WHYY</button><button style=\"background:#158\" onclick=\"cmd('preset3')\">WDIY</button><button style=\"background:#158\" onclick=\"cmd('preset4')\">Groove</button><h3>Equalizer (10-Band)</h3><button onclick=\"cmd('eq_flat')\">Flat</button><button onclick=\"cmd('eq_bass')\">Bass Boost</button><button onclick=\"cmd('eq_loudness')\">Loudness</button><button onclick=\"cmd('eq_vocal')\">Vocal</button><button onclick=\"cmd('eq_rock')\">Rock</button><h3>Analog Gain (AGAIN)</h3><button onclick=\"cmd('again0')\">0 dB (29.5V)</button><button onclick=\"cmd('again4')\">-4 dB (20V PD)</button><button onclick=\"cmd('again6')\">-6 dB (15V)</button><button onclick=\"cmd('again8')\">-8 dB (12V)</button><br><a id=\"ll\" href=\"http://10.0.0.10:9000/\" target=\"_blank\">&rarr; Open Full Lyrion UI (10.0.0.10:9000)</a><h3>System</h3><button style=\"background:#922\" onclick=\"if(confirm('Recovery?'))fetch('/recovery.json',{method:'POST'})\">Reboot to Recovery (0x10000)</button><button style=\"background:#444\" onclick=\"if(confirm('Reboot OTA?'))fetch('/reboot_ota.json',{method:'POST'})\">Commit OTA &amp; Reboot</button><script>var pF=0,pT=0,D=document;function cmd(a){fetch('/cmd.json?act='+a).then(u).catch(()=>{});}function g(k,v){D.getElementById(k).innerText=v;}function u(){var n=Date.now();fetch('/status.json').then(r=>r.json()).then(d=>{var h=d.lms_ip+':'+d.lms_port;D.getElementById('ll').href='http://'+h+'/';g('n',d.ip+' ('+d.ssid+' '+d.rssi+'dBm)');g('l',h+' (CLI '+d.lms_cport+')');var up=d.uptime_ms/1000|0;g('s',d.amp_mode+' ('+d.vol_pct+'%) | Up '+(up/60|0)+':'+((up%60<10)?'0':'')+(up%60));var fps=(pT>0&&n>pT)?((d.frames_played-pF)*1000/(n-pT)|0):0;pF=d.frames_played;pT=n;g('f',fps+' fps ('+d.frames_played+') | '+d.codec);g('p',(d.psram_used_bytes/1024|0)+' / '+(d.psram_free_bytes/1024|0)+' KB');g('c',(d.core1_active?'Active':'Halted')+' ('+d.core1_loops+' loops)');g('t',d.tas_fs_hz+'Hz|'+d.tas_bck_ratio+'x|'+(d.tas_pll_locked?'PLL-Lock':'Unlocked')+'|-'+(d.again_code*0.5).toFixed(1)+'dB'+(d.tas_automuted?'(Muted)':''));g('e',d.eq_preset+' | Seq '+d.settings_seq);g('i','ACK:'+d.i2c_acks+'/NACK:'+d.i2c_nacks);g('w',d.version+' ('+(d.otadata_prearmed_factory?'Pre-Armed':'Normal')+')');}).catch(()=>{});}u();setInterval(u,1500);</script></body></html>";
+pub const DASHBOARD_HTML: &str = crate::web_ui::WEB_UI_HTML;
 
 /// Alias for static HTML dashboard.
 pub const INDEX_HTML: &str = DASHBOARD_HTML;
@@ -3164,7 +3164,7 @@ mod tests {
     #[test]
     fn serves_html_dashboard_on_root_and_index_html() {
         let snap = HttpStatusSnapshot::default();
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 32768];
 
         let req1 = b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
         let (len1, act1) =
@@ -3808,7 +3808,7 @@ mod tests {
         snap: &HttpStatusSnapshot<'_>,
         router_opt: Option<&HttpControlRouter>,
     ) -> (std::string::String, HttpControlAction) {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 32768];
         let res = if let Some(r) = router_opt {
             r.handle_request(req, snap, &mut buf)
         } else {
@@ -3819,6 +3819,40 @@ mod tests {
             (resp, action)
         } else {
             ("".into(), HttpControlAction::None)
+        }
+    }
+
+    #[test]
+    fn test_web_ui_contains_all_c_tabs_and_rust_dashboard_controls() {
+        let snap = sample_snapshot();
+        let req = b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, _) = handle_request_bytes(req, &snap, None);
+        let body = extract_http_body(&resp);
+        for marker in [
+            "id=\"tab-player\"",
+            "id=\"tab-wifi\"",
+            "id=\"tab-syslog\"",
+            "id=\"tab-cfg-audio\"",
+            "id=\"tab-cfg-syst\"",
+            "id=\"tab-cfg-hw\"",
+            "id=\"tab-cfg-fw\"",
+            "id=\"tab-nvs\"",
+            "id=\"tab-commands\"",
+            "id=\"tab-credits\"",
+            "id=\"navtitle\"",
+            "id=\"wifiTable\"",
+            "id=\"syslogTable\"",
+            "id=\"gpiotable\"",
+            "id=\"tasks\"",
+            "id=\"save-autoexec1\"",
+            "id=\"save-nvs\"",
+            "id=\"fwUpload\"",
+            "eq_loudness",
+            "again4",
+            "/recovery.json",
+            "/reboot_ota.json",
+        ] {
+            assert!(body.contains(marker), "missing UI element {}", marker);
         }
     }
 

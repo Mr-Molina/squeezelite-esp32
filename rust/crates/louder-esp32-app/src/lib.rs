@@ -34,6 +34,7 @@ pub mod pipeline;
 pub mod power_boards;
 pub mod sink;
 pub mod stream_codec;
+pub mod web_ui;
 pub mod wifi;
 
 pub use amp::{AmpManager, AmpMode};
