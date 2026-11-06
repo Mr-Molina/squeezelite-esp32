@@ -215,6 +215,22 @@ pub struct HttpStatusSnapshot<'a> {
     pub decode_us_max: u32,
     /// Execution duration of the very first `decode()` step in microseconds.
     pub decode_us_first: u32,
+    /// Whether headphone jack is inserted (`"Jack"` in C `/status.json`).
+    pub jack_inserted: bool,
+    /// Measured supply/battery voltage in millivolts (`"Voltage"` in C `/status.json`).
+    pub voltage_mv: u16,
+    /// Wi-Fi station disconnect count (`"disconnect_count"` in C `/status.json`).
+    pub disconnect_count: u32,
+    /// Average Wi-Fi association duration in milliseconds (`"avg_conn_time"`).
+    pub avg_conn_time_ms: u32,
+    /// Whether the I2C bus is locked by an active peripheral driver (`"is_i2c_locked"`).
+    pub is_i2c_locked: bool,
+    /// Wi-Fi connection reason/result code (`"urc"`, `0` when connected).
+    pub urc: u8,
+    /// C-compatible Bluetooth status code (`0` = idle, `1` = connected, `2` = streaming).
+    pub bt_status: u8,
+    /// C-compatible Bluetooth sub-status code (`"bt_sub_status"`).
+    pub bt_sub_status: u8,
 }
 
 /// Type alias for runtime status snapshot.
@@ -262,6 +278,14 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             bt_frames: 0,
             decode_us_max: 0,
             decode_us_first: 0,
+            jack_inserted: false,
+            voltage_mv: 0,
+            disconnect_count: 0,
+            avg_conn_time_ms: 0,
+            is_i2c_locked: false,
+            urc: 0,
+            bt_status: 0,
+            bt_sub_status: 0,
         }
     }
 }
@@ -332,6 +356,16 @@ impl<'a> core::fmt::Display for JsonEscaped<'a> {
 /// Returns the number of bytes written, or `None` if `out_buf` is too small.
 pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
+    let jack_str = if snapshot.jack_inserted { "1" } else { "0" };
+    let bt_status = if snapshot.bt_status != 0 {
+        snapshot.bt_status
+    } else if snapshot.bt_streaming {
+        2
+    } else if snapshot.bt_connected {
+        1
+    } else {
+        0
+    };
     write!(
         writer,
         "{{\"project_name\":\"{}\",\"platform_name\":\"ESP32\",\"version\":\"{}\",\
@@ -348,7 +382,10 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         \"tas_bck_ratio\":{},\"tas_pll_locked\":{},\"tas_automuted\":{},\
         \"again_code\":{},\"settings_seq\":{},\"bt_enabled\":{},\
         \"bt_connected\":{},\"bt_streaming\":{},\"bt_rx_pkts\":{},\
-        \"bt_frames\":{},\"decode_us_max\":{},\"decode_us_first\":{}}}",
+        \"bt_frames\":{},\"decode_us_max\":{},\"decode_us_first\":{},\
+        \"Jack\":\"{}\",\"Voltage\":{},\"disconnect_count\":{},\
+        \"avg_conn_time\":{},\"is_i2c_locked\":{},\"urc\":{},\
+        \"bt_status\":{},\"bt_sub_status\":{}}}",
         JsonEscaped(REQUIRED_OTA_PROJECT_NAME),
         JsonEscaped(RUST_OTA_FIRMWARE_VERSION),
         snapshot.otadata_prearmed_factory,
@@ -404,6 +441,14 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.bt_frames,
         snapshot.decode_us_max,
         snapshot.decode_us_first,
+        jack_str,
+        snapshot.voltage_mv,
+        snapshot.disconnect_count,
+        snapshot.avg_conn_time_ms,
+        snapshot.is_i2c_locked,
+        snapshot.urc,
+        bt_status,
+        snapshot.bt_sub_status,
     ).ok()?;
     Some(writer.written_len())
 }
@@ -413,6 +458,88 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
 pub fn format_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     write_status_json(snapshot, out_buf)
 }
+
+/// Fixed hardware GPIO pin descriptor exposed in `GET /config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpioPinDescriptor {
+    /// Physical ESP32 GPIO number.
+    pub gpio: u8,
+    /// Signal name (`"SDA"`, `"SCL"`, `"BCK"`, `"WS"`, `"DO"`, `"PDN"`).
+    pub name: &'static str,
+    /// Subsystem group (`"I2C"`, `"I2S"`, `"TAS"`).
+    pub group: &'static str,
+    /// Whether the pin assignment is hardware-fixed on the PCB.
+    pub fixed: bool,
+}
+
+/// Louder-ESP32 hardware GPIO map serialized in `GET /config.json`.
+pub const BOARD_GPIO_MAP: &[GpioPinDescriptor] = &[
+    GpioPinDescriptor {
+        gpio: 21,
+        name: "SDA",
+        group: "I2C",
+        fixed: true,
+    },
+    GpioPinDescriptor {
+        gpio: 22,
+        name: "SCL",
+        group: "I2C",
+        fixed: true,
+    },
+    GpioPinDescriptor {
+        gpio: 26,
+        name: "BCK",
+        group: "I2S",
+        fixed: true,
+    },
+    GpioPinDescriptor {
+        gpio: 25,
+        name: "WS",
+        group: "I2S",
+        fixed: true,
+    },
+    GpioPinDescriptor {
+        gpio: 22,
+        name: "DO",
+        group: "I2S",
+        fixed: true,
+    },
+    GpioPinDescriptor {
+        gpio: 17,
+        name: "PDN",
+        group: "TAS",
+        fixed: true,
+    },
+];
+
+/// Default C-compatible NVS configuration entries exposed in `GET /config.json`.
+pub const DEFAULT_NVS_CONFIG_ENTRIES: &[(&str, &str, u8)] = &[
+    ("host_name", "BASEMENT", crate::config_handle::NVS_TYPE_STR),
+    ("autoexec", "1", crate::config_handle::NVS_TYPE_U8),
+    (
+        "autoexec1",
+        "squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W",
+        crate::config_handle::NVS_TYPE_STR,
+    ),
+    ("enable_airplay", "1", crate::config_handle::NVS_TYPE_U8),
+    ("enable_cspot", "1", crate::config_handle::NVS_TYPE_U8),
+    ("enable_bt_sink", "1", crate::config_handle::NVS_TYPE_U8),
+    ("enable_telnet", "0", crate::config_handle::NVS_TYPE_U8),
+    (
+        "dac_config",
+        "model=TAS5805M,bck=26,ws=25,do=22,sda=21,scl=22,mute=17:0",
+        crate::config_handle::NVS_TYPE_STR,
+    ),
+    (
+        "i2c_config",
+        "sda=21,scl=22,speed=400000,port=0",
+        crate::config_handle::NVS_TYPE_STR,
+    ),
+    ("rotary_config", "", crate::config_handle::NVS_TYPE_STR),
+];
+
+/// Type alias for `/config.json` snapshot input.
+pub type HttpConfigSnapshot<'a> = HttpStatusSnapshot<'a>;
 
 /// View of a single NVS / FlashJournal configuration entry serialized in
 /// `GET /config.json`.
@@ -449,20 +576,35 @@ pub struct ParsedConfigUpdate<'a> {
     pub value: &'a str,
 }
 
-/// Formats the `/config.json` payload combining active snapshot settings and
-/// optional `extra_entries` into `out_buf`.
+/// Formats the `/config.json` payload combining active snapshot settings,
+/// `BOARD_GPIO_MAP`, C-typed NVS config entries, and optional `extra_entries`
+/// (with sensitive password keys stripped) into `out_buf`.
 pub fn write_config_json(
     snapshot: &HttpStatusSnapshot<'_>,
     extra_entries: &[ConfigEntryView<'_>],
     out_buf: &mut [u8],
 ) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
+    write!(writer, "{{\"settings_seq\":{},\"gpio\":[", snapshot.settings_seq).ok()?;
+    for (idx, pin) in BOARD_GPIO_MAP.iter().enumerate() {
+        if idx > 0 {
+            writer.write_str(",").ok()?;
+        }
+        write!(
+            writer,
+            "{{\"gpio\":{},\"name\":\"{}\",\"group\":\"{}\",\"fixed\":{}}}",
+            pin.gpio,
+            JsonEscaped(pin.name),
+            JsonEscaped(pin.group),
+            pin.fixed,
+        )
+        .ok()?;
+    }
     write!(
         writer,
-        "{{\"settings_seq\":{},\"config\":{{\"ssid\":\"{}\",\
+        "],\"config\":{{\"ssid\":\"{}\",\
          \"lms_ip\":\"{}.{}.{}.{}\",\"lms_port\":{},\"lms_cport\":{},\
          \"vol_pct\":{},\"eq_preset\":\"{}\",\"again_code\":{}",
-        snapshot.settings_seq,
         JsonEscaped(snapshot.ssid),
         snapshot.lms_ip[0],
         snapshot.lms_ip[1],
@@ -475,7 +617,23 @@ pub fn write_config_json(
         snapshot.again_code,
     )
     .ok()?;
+    for &(key, val, nvs_type) in DEFAULT_NVS_CONFIG_ENTRIES {
+        if crate::config_handle::is_secret_config_key(key) {
+            continue;
+        }
+        write!(
+            writer,
+            ",\"{}\":{{\"value\":\"{}\",\"type\":{}}}",
+            JsonEscaped(key),
+            JsonEscaped(val),
+            nvs_type,
+        )
+        .ok()?;
+    }
     for entry in extra_entries {
+        if crate::config_handle::is_secret_config_key(entry.key) {
+            continue;
+        }
         write!(
             writer,
             ",\"{}\":{{\"value\":\"{}\",\"type\":\"{}\"}}",
@@ -485,8 +643,24 @@ pub fn write_config_json(
         )
         .ok()?;
     }
-    write!(writer, "}}}}").ok()?;
+    write!(
+        writer,
+        "}},\"nvs\":{{\"host_name\":{{\"value\":\"BASEMENT\",\"type\":33}},\
+         \"autoexec\":{{\"value\":\"1\",\"type\":1}},\
+         \"autoexec1\":{{\"value\":\"squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W\",\
+         \"type\":33}}}}}}"
+    )
+    .ok()?;
     Some(writer.written_len())
+}
+
+/// Formats the `/config.json` payload into `out_buf`.
+#[inline]
+pub fn format_config_json(
+    snapshot: &HttpConfigSnapshot<'_>,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    write_config_json(snapshot, &[], out_buf)
 }
 
 /// Decodes a percent-encoded (`%XX` and `+`) URL string into `dst`, returning
@@ -578,18 +752,47 @@ fn extract_param_or_json_field<'a>(input: &'a str, name: &str) -> Option<&'a str
     None
 }
 
-/// Parses a `key=...&value=...` query/form or `{"key":"...","value":"..."}`
-/// JSON body for `/config.json`.
-#[must_use]
-pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> {
-    let key = extract_param_or_json_field(input, "key")?;
+fn parse_nested_c_config_update(input: &str) -> Option<ParsedConfigUpdate<'_>> {
+    let cfg_idx = input.find("\"config\"")?;
+    let after_cfg = input[cfg_idx + "\"config\"".len()..].trim_start();
+    let after_colon = after_cfg.strip_prefix(':')?.trim_start();
+    let inner = after_colon.strip_prefix('{')?.trim_start();
+    let after_quote = inner.strip_prefix('"')?;
+    let key_end = after_quote.find('"')?;
+    let key = &after_quote[..key_end];
     if key.is_empty() {
         return None;
     }
-    let value = extract_param_or_json_field(input, "value")
-        .or_else(|| extract_param_or_json_field(input, "val"))
-        .unwrap_or("");
+    let entry_rest = &after_quote[key_end + 1..];
+    let value = extract_param_or_json_field(entry_rest, "value").unwrap_or("");
     Some(ParsedConfigUpdate { key, value })
+}
+
+/// Parses a `key=...&value=...` query/form, flat `{"key":"...","value":"..."}`,
+/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, or `{"fwurl":"..."}`
+/// JSON body for `/config.json`.
+#[must_use]
+pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> {
+    if let Some(key) = extract_param_or_json_field(input, "key") {
+        if !key.is_empty() {
+            let value = extract_param_or_json_field(input, "value")
+                .or_else(|| extract_param_or_json_field(input, "val"))
+                .unwrap_or("");
+            return Some(ParsedConfigUpdate { key, value });
+        }
+    }
+    if let Some(nested) = parse_nested_c_config_update(input) {
+        return Some(nested);
+    }
+    if let Some(fwurl) = extract_param_or_json_field(input, "fwurl") {
+        if !fwurl.is_empty() {
+            return Some(ParsedConfigUpdate {
+                key: "fwurl",
+                value: fwurl,
+            });
+        }
+    }
+    None
 }
 
 /// View of a single scanned 802.11 access point serialized in `GET /scan.json`.
@@ -1855,7 +2058,7 @@ pub fn handle_http_request_streaming_impl(
                     .unwrap_or(upd.value);
                 write!(
                     writer,
-                    "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\"}}",
+                    "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
                     JsonEscaped(decoded_key),
                     JsonEscaped(decoded_val),
                 )
@@ -2343,7 +2546,7 @@ mod tests {
             amp_mode: "Stereo\"BTL\"",
             ..Default::default()
         };
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; 1536];
 
         // JSON escaping in write_status_json
         let len = write_status_json(&snap, &mut buf).unwrap();
@@ -2639,6 +2842,14 @@ mod tests {
             bt_frames: 0,
             decode_us_max: 0,
             decode_us_first: 0,
+            jack_inserted: false,
+            voltage_mv: 0,
+            disconnect_count: 0,
+            avg_conn_time_ms: 0,
+            is_i2c_locked: false,
+            urc: 0,
+            bt_status: 0,
+            bt_sub_status: 0,
         };
         // Task 10: `i2c_nack_by_op` pushed a typical response past 1,024 bytes;
         // the device response buffer and HTTP TX buffer are 1,536 bytes.
@@ -3096,5 +3307,61 @@ mod tests {
             let (resp, _) = handle_request_bytes(req.as_bytes(), &snap, None);
             assert!(resp.starts_with("HTTP/1.1 302 Found"));
         }
+    }
+
+    fn body_contains_ok_or_result(resp: &str) -> bool {
+        let body = extract_http_body(resp);
+        body.contains("\"ok\":true") || body.contains("\"result\":\"OK\"")
+    }
+
+    #[test]
+    fn test_status_json_includes_all_c_and_rust_fields() {
+        let snap = sample_snapshot();
+        let req = b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, _) = handle_request_bytes(req, &snap, None);
+        let body = extract_http_body(&resp);
+        for key in [
+            "\"project_name\":",
+            "\"version\":",
+            "\"recovery\":",
+            "\"Jack\":",
+            "\"Voltage\":",
+            "\"disconnect_count\":",
+            "\"avg_conn_time\":",
+            "\"is_i2c_locked\":",
+            "\"urc\":",
+            "\"bt_status\":",
+            "\"bt_sub_status\":",
+            "\"frames_played\":",
+            "\"tas_pll_locked\":",
+            "\"psram_free_bytes\":",
+        ] {
+            assert!(body.contains(key), "missing key {}", key);
+        }
+    }
+
+    #[test]
+    fn test_config_json_get_includes_gpio_and_strips_secrets() {
+        let snap = sample_snapshot();
+        let req = b"GET /config.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, _) = handle_request_bytes(req, &snap, None);
+        let body = extract_http_body(&resp);
+        assert!(body.contains("\"gpio\":["));
+        assert!(body.contains("\"name\":\"SDA\""));
+        assert!(body.contains("\"autoexec1\""));
+        assert!(!body.contains("\"password\""));
+        assert!(!body.contains("\"web_pwd\""));
+    }
+
+    #[test]
+    fn test_config_json_post_accepts_nested_c_schema_and_fwurl() {
+        let snap = sample_snapshot();
+        let req = b"POST /config.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\
+            Origin: http://172.22.1.15\r\nContent-Type: application/json\r\n\r\n\
+            {\"config\":{\"host_name\":{\"value\":\"BASEMENT\",\"type\":33}}}";
+        let (resp, action) = handle_request_bytes(req, &snap, None);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(body_contains_ok_or_result(&resp));
+        assert!(matches!(action, HttpControlAction::UpdateConfig { .. }));
     }
 }

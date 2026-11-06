@@ -70,6 +70,28 @@ pub const KEY_WIFI_PASS: &str = "wifi.pass";
 /// Default maximum sample rate (0 = unlimited / native DAC limit).
 pub const DEFAULT_MAX_SAMPLE_RATE: u32 = 0;
 
+/// ESP-IDF NVS `U8` type identifier used by the C web UI (`config.json`).
+pub const NVS_TYPE_U8: u8 = 1;
+
+/// ESP-IDF NVS `U16` type identifier used by the C web UI (`config.json`).
+pub const NVS_TYPE_U16: u8 = 2;
+
+/// ESP-IDF NVS `U32` type identifier used by the C web UI (`config.json`).
+pub const NVS_TYPE_U32: u8 = 4;
+
+/// ESP-IDF NVS `STR` type identifier used by the C web UI (`config.json`).
+pub const NVS_TYPE_STR: u8 = 33;
+
+/// Returns `true` if `key` is a sensitive credential/passphrase key that must
+/// be stripped from unauthenticated `GET /config.json` responses.
+#[must_use]
+pub fn is_secret_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "password" | "wifi.pass" | "wifi_pass" | "ap_pwd" | "web_pwd" | "secret"
+    )
+}
+
 /// Something that durably records a configuration snapshot (device:
 /// [`RamJournal`]).
 pub trait ConfigJournal {

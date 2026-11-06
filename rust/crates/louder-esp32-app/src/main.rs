@@ -3330,6 +3330,20 @@ mod xtensa_hw {
                         bt_frames: s.bt_sink.decoded_frames,
                         decode_us_max: s.pipeline.decode_us_max,
                         decode_us_first: s.pipeline.decode_us_first,
+                        jack_inserted: false,
+                        voltage_mv: 0,
+                        disconnect_count: 0,
+                        avg_conn_time_ms: 0,
+                        is_i2c_locked: false,
+                        urc: if s.assigned_ip.is_some() { 0 } else { 2 },
+                        bt_status: if s.bt_sink.is_streaming() {
+                            2
+                        } else if s.bt_sink.is_connected() {
+                            1
+                        } else {
+                            0
+                        },
+                        bt_sub_status: 0,
                     };
                     if let Some((hdr_or_resp_len, static_body, action)) =
                         handle_http_request_streaming(
