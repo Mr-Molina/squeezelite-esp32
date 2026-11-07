@@ -4073,8 +4073,8 @@ mod tests {
         let snap = sample_snapshot();
         let mut buf = [0u8; 1536];
 
-        // 1. Secret key matching for pwd, telnet_pwd, and a2dp_spin
-        for secret_key in ["pwd", "telnet_pwd", "a2dp_spin"] {
+        // 1. Secret key matching for pwd, telnet_pwd, a2dp_spin, and bt_sink_pin
+        for secret_key in ["pwd", "telnet_pwd", "a2dp_spin", "bt_sink_pin"] {
             assert!(
                 crate::config_handle::is_secret_config_key(secret_key),
                 "expected {secret_key} to be classified as secret"

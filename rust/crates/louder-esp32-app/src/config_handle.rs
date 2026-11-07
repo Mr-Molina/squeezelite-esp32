@@ -95,6 +95,7 @@ pub fn is_secret_config_key(key: &str) -> bool {
             | "ap_pwd"
             | "telnet_pwd"
             | "a2dp_spin"
+            | "bt_sink_pin"
             | "web_pwd"
             | "secret"
     )
