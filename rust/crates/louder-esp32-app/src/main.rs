@@ -448,8 +448,8 @@ mod xtensa_hw {
     };
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{
-        dispatch_web_post_action, handle_http_request_streaming, DeadManLeaseWatchdog,
-        HttpControlAction, HttpStatusSnapshot, LeaseHealth,
+        dispatch_web_post_action, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
+        LeaseHealth,
     };
     use louder_esp32_app::io_traits::{NetAddr, SlimTransport};
     use louder_esp32_app::net_device::{
@@ -1639,12 +1639,17 @@ mod xtensa_hw {
             ));
             let config =
                 (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
-            if let Some((index, _seq)) = selected {
+            if let Some((index, seq)) = selected {
                 let winning_buf = if index == 0 { sector_a } else { sector_b };
                 if let Ok(winning_arr) = <&[u8; 4096]>::try_from(&*winning_buf) {
                     if journal.restore_from_sector(winning_arr) {
                         journal.restore_into_handle(config);
                     }
+                    let _ = RamJournal::restore_sector_into(winning_arr, config);
+                } else {
+                    louder_esp32_app::config_handle::RestoreSectorTarget::finalize_restore(
+                        config, seq,
+                    );
                 }
             }
             (&*config, journal)
@@ -1739,10 +1744,10 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).resample_tail_samples).write(0);
             core::ptr::addr_of_mut!((*ptr).resample_input_pending).write(0);
 
-            let http_resp_buf: &'static mut [u8; 1536] =
-                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 1536]));
-            let http_tx_buf: &'static mut [u8; 1536] =
-                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 1536]));
+            let http_resp_buf: &'static mut [u8; 4096] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 4096]));
+            let http_tx_buf: &'static mut [u8; 4096] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 4096]));
 
             (&mut *ptr, http_resp_buf, http_tx_buf)
         }
@@ -1896,8 +1901,8 @@ mod xtensa_hw {
     /// (`init_static_pipeline`).
     type PipelineStatics = (
         &'static mut HwStreamPipeline,
-        &'static mut [u8; 1536],
-        &'static mut [u8; 1536],
+        &'static mut [u8; 4096],
+        &'static mut [u8; 4096],
     );
 
     /// Bring-up stage: I2S0 TDM-Philips TX (BCK=26, WS=25, DOUT=22) with
@@ -2011,10 +2016,9 @@ mod xtensa_hw {
             sta_mac,
             "SqueezeESP32",
         )));
-        config.read(|c| {
-            coordinator.player_name.clear();
-            let _ = coordinator.player_name.push_str(c.player_name.as_str());
-        });
+        let dev_name = config.device_name();
+        coordinator.player_name.clear();
+        let _ = coordinator.player_name.push_str(dev_name.as_str());
         coordinator.lms_ip = lms_ip;
         coordinator.config = Some(config);
         coordinator.set_frame_buffer(frame_buf);
@@ -2096,8 +2100,8 @@ mod xtensa_hw {
     ) -> u8 {
         let (percent, again_code, eq_preset, loudness) = config.read(|c| {
             (
-                c.volume,
-                c.analog_gain_code,
+                c.volume.min(100),
+                c.analog_gain_code.min(31),
                 c.equalizer_preset,
                 c.loudness_enabled,
             )
@@ -2105,8 +2109,26 @@ mod xtensa_hw {
         let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
         coordinator.set_volume_percent(percent, &mut backend, pipeline);
         let _ = amp.set_analog_gain(again_code);
-        pipeline.apply_eq_preset(EqPreset::from_u8(eq_preset));
         pipeline.set_loudness(loudness);
+        pipeline.set_loudness_level(if loudness { 5 } else { 0 });
+        let preset = EqPreset::from_u8(eq_preset);
+        if let Some(csv) = config.nvs_override("equalizer") {
+            if let Some(gains) =
+                louder_esp32_app::config_handle::parse_equalizer_bands(csv.as_str())
+            {
+                if gains.iter().any(|&g| g.abs() > 0.01) {
+                    pipeline.set_eq_gains_db(&gains);
+                } else if preset != EqPreset::Flat {
+                    pipeline.apply_eq_preset(preset);
+                } else {
+                    pipeline.set_eq_gains_db(&[0.0; 10]);
+                }
+            } else {
+                pipeline.apply_eq_preset(preset);
+            }
+        } else {
+            pipeline.apply_eq_preset(preset);
+        }
         percent
     }
 
@@ -2308,7 +2330,7 @@ mod xtensa_hw {
         coordinator: &'static mut PlayerCoordinator,
         slim_link: SlimLinkState,
         stream_state: HttpStreamState,
-        http_resp_buf: &'static mut [u8; 1536],
+        http_resp_buf: &'static mut [u8; 4096],
         config: &'static ConfigHandle,
         journal: &'static mut RamJournal<'static>,
         config_writer: ConfigWriter,
@@ -2483,12 +2505,12 @@ mod xtensa_hw {
             };
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
         };
-        let (lms_ip, lms_port) = config.read(|c| {
-            (
-                c.lms_server_ip.unwrap_or(first_boot_defaults::LMS_SERVER_IP),
-                c.lms_server_port.unwrap_or(first_boot_defaults::LMS_SERVER_PORT),
-            )
-        });
+        let (lms_ip, lms_port) = (
+            config
+                .effective_lms_server_ip()
+                .unwrap_or(first_boot_defaults::LMS_SERVER_IP),
+            config.read(|c| c.lms_server_port.unwrap_or(first_boot_defaults::LMS_SERVER_PORT)),
+        );
         ring_storage.fill(0);
         wdt.feed();
 
@@ -2755,7 +2777,7 @@ mod xtensa_hw {
         let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
         let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
 
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(DeviceRuntimeState {
+        let state = alloc::boxed::Box::leak(alloc::boxed::Box::new(DeviceRuntimeState {
             wdt,
             flash,
             core1,
@@ -2826,7 +2848,9 @@ mod xtensa_hw {
             wifi_connected_logged: false,
             last_fault_recovery_ms: 0,
             last_bt_idle_poll_ms: 0,
-        }))
+        }));
+        sync_config_to_runtime(state);
+        state
     }
 
     struct DeviceSmolTcp<'a> {
@@ -2966,7 +2990,95 @@ mod xtensa_hw {
     }
 
     #[inline(never)]
+    fn sync_config_to_runtime(s: &mut DeviceRuntimeState) {
+        if let Some(ip) = s.config.effective_lms_server_ip() {
+            if ip != [0, 0, 0, 0] && s.lms_ip != ip {
+                s.lms_ip = ip;
+                s.coordinator.lms_ip = ip;
+                s.slim_switch_to = Some(ip);
+            }
+        }
+
+        let dev_name = s
+            .config
+            .nvs_override("host_name")
+            .and_then(|h| {
+                let t = h.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    let mut out = heapless::String::<32>::new();
+                    let max_len = t.floor_char_boundary(t.len().min(32));
+                    let _ = out.push_str(&t[..max_len]);
+                    Some(out)
+                }
+            })
+            .unwrap_or_else(|| {
+                s.config.read(|c| {
+                    if !c.player_name.is_empty() {
+                        c.player_name.clone()
+                    } else {
+                        s.config.device_name()
+                    }
+                })
+            });
+        if !dev_name.is_empty() && s.coordinator.player_name.as_str() != dev_name.as_str() {
+            s.coordinator.player_name.clear();
+            let _ = s.coordinator.player_name.push_str(dev_name.as_str());
+        }
+
+        let cfg_snap = s.config.read(|c| c.clone());
+        let target_vol = cfg_snap.volume.min(100);
+        if target_vol != s.current_vol_pct {
+            s.current_vol_pct = target_vol;
+            let mut backend =
+                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            s.coordinator
+                .set_volume_percent(s.current_vol_pct, &mut backend, s.pipeline);
+            let _ = s
+                .cyd_bridge
+                .send_message(&CydMessage::Volume(s.current_vol_pct));
+        }
+
+        let target_again = cfg_snap.analog_gain_code.min(31);
+        if target_again != s.amp.analog_gain_code() {
+            let _ = s.amp.set_analog_gain(target_again);
+        }
+
+        s.pipeline.set_loudness(cfg_snap.loudness_enabled);
+        s.pipeline
+            .set_loudness_level(if cfg_snap.loudness_enabled { 5 } else { 0 });
+
+        let preset = EqPreset::from_u8(cfg_snap.equalizer_preset);
+        if let Some(csv) = s.config.nvs_override("equalizer") {
+            if let Some(gains) =
+                louder_esp32_app::config_handle::parse_equalizer_bands(csv.as_str())
+            {
+                if gains.iter().any(|&g| g.abs() > 0.01) {
+                    s.pipeline.set_eq_gains_db(&gains);
+                } else if preset != EqPreset::Flat {
+                    s.pipeline.apply_eq_preset(preset);
+                } else {
+                    s.pipeline.set_eq_gains_db(&[0.0; 10]);
+                }
+            } else if preset != s.pipeline.eq_preset() {
+                s.pipeline.apply_eq_preset(preset);
+            }
+        } else if preset != s.pipeline.eq_preset() {
+            s.pipeline.apply_eq_preset(preset);
+        }
+
+        let bt_name = s.config.effective_bt_name();
+        s.bt_sink
+            .security_policy
+            .update_device_name(bt_name.as_str());
+    }
+
+    #[inline(never)]
     fn bt_poll_phase(s: &mut DeviceRuntimeState) {
+        if !s.config.is_bt_sink_enabled() {
+            return;
+        }
         let now_ms = s.now_ms;
         if s.assigned_ip.is_some() && s.bt_transport.is_none() {
             if let Some(bt_p) = s.bt_periph.take() {
@@ -3347,6 +3459,40 @@ mod xtensa_hw {
                             )
                         }
                     };
+                    let mut eq_bands_db = [0i8; 10];
+                    for (dst, &gain) in
+                        eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
+                    {
+                        let rounded = if gain >= 0.0 {
+                            (gain + 0.5) as i8
+                        } else {
+                            (gain - 0.5) as i8
+                        };
+                        *dst = rounded.clamp(-15, 15);
+                    }
+                    let player_name_val = s
+                        .config
+                        .nvs_override("host_name")
+                        .and_then(|h| {
+                            let t = h.trim();
+                            if t.is_empty() {
+                                None
+                            } else {
+                                let mut out = heapless::String::<32>::new();
+                                let max_len = t.floor_char_boundary(t.len().min(32));
+                                let _ = out.push_str(&t[..max_len]);
+                                Some(out)
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            s.config.read(|c| {
+                                if !c.player_name.is_empty() {
+                                    c.player_name.clone()
+                                } else {
+                                    s.config.device_name()
+                                }
+                            })
+                        });
                     let snap = HttpStatusSnapshot {
                         ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
                         netmask: s.assigned_mask,
@@ -3401,6 +3547,8 @@ mod xtensa_hw {
                             0
                         },
                         bt_sub_status: 0,
+                        eq_bands_db,
+                        player_name: player_name_val.as_str(),
                     };
                     let snapshot = snap.clone();
                     let mut resp_buf = &mut s.http_resp_buf[..];
@@ -3452,10 +3600,14 @@ mod xtensa_hw {
                                 let preset = EqPreset::from_u8(preset_id);
                                 s.pipeline.apply_eq_preset(preset);
                                 s.config.update(|c| c.equalizer_preset = preset_id);
+                                let _ = s.config.set_nvs_override("equalizer", "");
+                                let _ = s.config.flush_now(&mut *s.journal);
                             }
                             HttpControlAction::SetAnalogGain(again_code) => {
-                                let _ = s.amp.set_analog_gain(again_code);
-                                s.config.update(|c| c.analog_gain_code = again_code);
+                                let clamped = again_code.min(31);
+                                let _ = s.amp.set_analog_gain(clamped);
+                                s.config.update(|c| c.analog_gain_code = clamped);
+                                let _ = s.config.flush_now(&mut *s.journal);
                             }
                             HttpControlAction::PlayerIrCommand {
                                 ir_code,
@@ -3463,16 +3615,18 @@ mod xtensa_hw {
                                 mute,
                             } => {
                                 if let Some(pct) = vol_pct {
-                                    s.current_vol_pct = pct;
+                                    let clamped = pct.min(100);
+                                    s.current_vol_pct = clamped;
                                     let mut backend = Esp32AudioBackend::new(
                                         s.amp,
                                         DeviceClockRegs,
                                         &DMA_OUTSTANDING_FRAMES,
                                     );
                                     s.coordinator
-                                        .set_volume_percent(pct, &mut backend, s.pipeline);
-                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
-                                    s.config.update(|c| c.volume = pct);
+                                        .set_volume_percent(clamped, &mut backend, s.pipeline);
+                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(clamped));
+                                    s.config.update(|c| c.volume = clamped);
+                                    let _ = s.config.flush_now(&mut *s.journal);
                                 }
                                 if let Some(m) = mute {
                                     s.pipeline.set_mute(m);
@@ -3526,22 +3680,18 @@ mod xtensa_hw {
                                 s.pending_http_action = action;
                                 s.pending_action_deadline_ms = now_ms + 250;
                             }
-                            HttpControlAction::UpdateConfig => {
+                            HttpControlAction::UpdateConfig
+                            | HttpControlAction::ExecuteCliCommand => {
                                 let _ = dispatch_web_post_action(
                                     action,
                                     &req_buf[..req_len],
-                                    &snap,
+                                    &snapshot,
                                     s.config,
                                     &mut *s.journal,
                                 );
-                                let cfg_snap = s.config.read(|cfg| cfg.clone());
-                                if let Some(ip) = cfg_snap.lms_server_ip {
-                                    s.lms_ip = ip;
-                                }
-                                s.current_vol_pct = cfg_snap.volume;
+                                sync_config_to_runtime(s);
                             }
-                            HttpControlAction::ExecuteCliCommand
-                            | HttpControlAction::TriggerWifiScan => {
+                            HttpControlAction::TriggerWifiScan => {
                                 let _ = dispatch_web_post_action(
                                     action,
                                     &req_buf[..req_len],
@@ -3680,7 +3830,7 @@ mod xtensa_hw {
             }
         }
         s.slim_was_open = open;
-        if !open && s.slim_reconnect.may_connect(now_ms) {
+        if !open && s.config.is_autoexec_enabled() && s.slim_reconnect.may_connect(now_ms) {
             s.helo_sent = false;
             s.slim_link.reset();
             let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(s.lms_ip)), s.lms_port);
@@ -3771,10 +3921,36 @@ mod xtensa_hw {
             return;
         };
         let now_ms = s.now_ms;
+        let airplay_enabled = s.config.is_airplay_enabled();
+        let cspot_enabled = s.config.is_cspot_enabled();
+        let cspot_name = s.config.effective_cspot_name();
+        let raop_name = s
+            .config
+            .nvs_override("host_name")
+            .and_then(|h| {
+                let t = h.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    let mut out = heapless::String::<32>::new();
+                    let max_len = t.floor_char_boundary(t.len().min(32));
+                    let _ = out.push_str(&t[..max_len]);
+                    Some(out)
+                }
+            })
+            .unwrap_or_else(|| {
+                s.config.read(|c| {
+                    if !c.player_name.is_empty() {
+                        c.player_name.clone()
+                    } else {
+                        s.config.device_name()
+                    }
+                })
+            });
 
         // 1. mDNS responder (`UDP 5353`) for AirPlay `_raop._tcp.local` &
         // Spotify `_spotify-connect._tcp.local`
-        {
+        if airplay_enabled || cspot_enabled {
             let mdns_sock = s.sockets.get_mut::<udp::Socket>(s.mdns_handle);
             if !s.mdns_bound {
                 if mdns_sock.bind(5353).is_ok() {
@@ -3791,21 +3967,23 @@ mod xtensa_hw {
                     || now_ms.saturating_sub(s.last_mdns_announce_ms) >= 30_000
                 {
                     s.last_mdns_announce_ms = now_ms.max(1);
-                    should_announce_raop = true;
-                    should_announce_spotify = true;
+                    should_announce_raop = airplay_enabled;
+                    should_announce_spotify = cspot_enabled;
                 }
 
                 while mdns_sock.can_recv() {
                     if let Ok((payload, meta)) = mdns_sock.recv() {
-                        if payload.windows(5).any(|w| w == b"_raop")
-                            || payload.windows(8).any(|w| w == b"_airplay")
+                        if airplay_enabled
+                            && (payload.windows(5).any(|w| w == b"_raop")
+                                || payload.windows(8).any(|w| w == b"_airplay"))
                         {
                             should_announce_raop = true;
                             if meta.endpoint.port != 5353 {
                                 raop_ep = meta.endpoint;
                             }
-                        } else if payload.windows(16).any(|w| w == b"_spotify-connect")
-                            || payload.windows(8).any(|w| w == b"_spotify")
+                        } else if cspot_enabled
+                            && (payload.windows(16).any(|w| w == b"_spotify-connect")
+                                || payload.windows(8).any(|w| w == b"_spotify"))
                         {
                             should_announce_spotify = true;
                             if meta.endpoint.port != 5353 {
@@ -3817,9 +3995,9 @@ mod xtensa_hw {
                     }
                 }
 
-                if should_announce_raop && mdns_sock.can_send() {
+                if airplay_enabled && should_announce_raop && mdns_sock.can_send() {
                     let mcfg = MdnsConfig {
-                        player_name: alloc::string::String::from("BASEMENT"),
+                        player_name: alloc::string::String::from(raop_name.as_str()),
                         mac_address: s.sta_mac,
                         ip_address: local_ip,
                         port: 5000,
@@ -3827,9 +4005,9 @@ mod xtensa_hw {
                     let rpkt = MdnsBuilder::build_announcement(&mcfg);
                     let _ = mdns_sock.send_slice(&rpkt, raop_ep);
                 }
-                if should_announce_spotify && mdns_sock.can_send() {
+                if cspot_enabled && should_announce_spotify && mdns_sock.can_send() {
                     let scfg = SpotifyMdnsConfig {
-                        player_name: alloc::string::String::from("BASEMENT"),
+                        player_name: alloc::string::String::from(cspot_name.as_str()),
                         mac_address: s.sta_mac,
                         ip_address: local_ip,
                         port: 80,
@@ -3841,7 +4019,7 @@ mod xtensa_hw {
         }
 
         // 2. AirPlay 1 RAOP RTSP Control (`TCP 5000`) & RTP Audio (`UDP 6000`)
-        {
+        if airplay_enabled {
             s.raop_rtsp.set_ip_address(local_ip);
             let rtsp_sock = s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle);
             if rtsp_sock.is_open()
@@ -3966,7 +4144,7 @@ mod xtensa_hw {
                 }
             }
         }
-        {
+        if airplay_enabled {
             let rtp_sock = s.sockets.get_mut::<udp::Socket>(s.rtp_handle);
             if !rtp_sock.is_open() {
                 let _ = rtp_sock.bind(6000);
@@ -4025,7 +4203,7 @@ mod xtensa_hw {
         }
 
         // 3. Spotify Connect ZeroConf HTTP & Spirc (`TCP 4070`)
-        {
+        if cspot_enabled {
             let spot_sock = s.sockets.get_mut::<tcp::Socket>(s.spot_handle);
             if spot_sock.is_open()
                 && matches!(
@@ -4049,10 +4227,11 @@ mod xtensa_hw {
                     if n > 0 {
                         if req_buf[..n].starts_with(b"GET ") || req_buf[..n].starts_with(b"POST ")
                         {
-                            let body = b"{\"status\":101,\"statusString\":\"OK\",\
+                            let body_prefix = b"{\"status\":101,\"statusString\":\"OK\",\
                                 \"spotifyError\":0,\"version\":\"2.9.0\",\
                                 \"deviceID\":\"c82e18beb8340000000000000000000000000000\",\
-                                \"remoteName\":\"BASEMENT\",\"activeUser\":\"\",\
+                                \"remoteName\":\"";
+                            let body_suffix = b"\",\"activeUser\":\"\",\
                                 \"publicKey\":\"\",\"deviceType\":\"SPEAKER\",\
                                 \"libraryVersion\":\"0.1.0\",\"accountReq\":\"PREMIUM\",\
                                 \"brandDisplayName\":\"Squeezelite\",\
@@ -4061,7 +4240,9 @@ mod xtensa_hw {
                                 Content-Type: application/json\r\n\
                                 Connection: close\r\n\r\n";
                             let _ = spot_sock.send_slice(hdr);
-                            let _ = spot_sock.send_slice(body);
+                            let _ = spot_sock.send_slice(body_prefix);
+                            let _ = spot_sock.send_slice(cspot_name.as_bytes());
+                            let _ = spot_sock.send_slice(body_suffix);
                             spot_sock.close();
                         } else if let Ok(frame) = SpircFrame::parse(&req_buf[..n]) {
                             if let Some(evt) = s.spot_spirc.handle_frame(&frame) {
@@ -4089,7 +4270,10 @@ mod xtensa_hw {
                                             }
                                             let notify = s
                                                 .spot_spirc
-                                                .build_notify_frame(frame.seq_nr, "BASEMENT");
+                                                .build_notify_frame(
+                                                    frame.seq_nr,
+                                                    cspot_name.as_str(),
+                                                );
                                             let _ = spot_sock.send_slice(&notify);
                                         }
                                     }

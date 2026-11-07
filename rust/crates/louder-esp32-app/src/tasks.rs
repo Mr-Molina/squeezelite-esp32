@@ -299,8 +299,8 @@ mod device {
     use louder_esp32_app::bt_a2dp::BtA2dpSink;
     use louder_esp32_app::config_handle::{ConfigHandle, ConfigWriter, RamJournal};
     use louder_esp32_app::http_control::{
-        dispatch_web_post_action, handle_http_request_streaming, DeadManLeaseWatchdog,
-        HttpControlAction, HttpStatusSnapshot, LeaseHealth,
+        dispatch_web_post_action, DeadManLeaseWatchdog, HttpControlAction, HttpStatusSnapshot,
+        LeaseHealth,
     };
     use louder_esp32_app::io_traits::{AudioBackend, NetAddr, SlimTransport};
     use louder_esp32_app::net_device::{
@@ -366,7 +366,7 @@ mod device {
         pub(crate) slim_link: SlimLinkState,
         pub(crate) stream_state: HttpStreamState,
         // --- static buffers ---
-        pub(crate) http_resp_buf: &'static mut [u8; 1536],
+        pub(crate) http_resp_buf: &'static mut [u8; 4096],
         // --- configuration (Task 10) ---
         /// Runtime configuration every settings change goes through.
         pub(crate) config: &'static ConfigHandle,
@@ -859,6 +859,87 @@ mod device {
         s.now_ms = now_millis();
     }
 
+    #[inline(never)]
+    fn sync_config_to_runtime(s: &mut FirmwareState) {
+        if let Some(ip) = s.config.effective_lms_server_ip() {
+            if ip != [0, 0, 0, 0] && s.lms_ip != ip {
+                s.lms_ip = ip;
+                s.coordinator.lms_ip = ip;
+                s.slim_switch_to = Some(ip);
+            }
+        }
+
+        let dev_name = s
+            .config
+            .nvs_override("host_name")
+            .and_then(|h| {
+                let t = h.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    let mut out = heapless::String::<32>::new();
+                    let max_len = t.floor_char_boundary(t.len().min(32));
+                    let _ = out.push_str(&t[..max_len]);
+                    Some(out)
+                }
+            })
+            .unwrap_or_else(|| {
+                s.config.read(|c| {
+                    if !c.player_name.is_empty() {
+                        c.player_name.clone()
+                    } else {
+                        s.config.device_name()
+                    }
+                })
+            });
+        if !dev_name.is_empty() && s.coordinator.player_name.as_str() != dev_name.as_str() {
+            s.coordinator.player_name.clear();
+            let _ = s.coordinator.player_name.push_str(dev_name.as_str());
+        }
+
+        let cfg_snap = s.config.read(|c| c.clone());
+        let target_vol = cfg_snap.volume.min(100);
+        if target_vol != s.current_vol_pct {
+            s.current_vol_pct = target_vol;
+            let mut backend =
+                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+            s.coordinator
+                .set_volume_percent(target_vol, &mut backend, s.pipeline);
+            let _ = s.cyd_bridge.send_message(&CydMessage::Volume(target_vol));
+        }
+
+        let target_again = cfg_snap.analog_gain_code.min(31);
+        if target_again != s.amp.analog_gain_code() {
+            let _ = s.amp.set_analog_gain(target_again);
+        }
+
+        s.pipeline.set_loudness(cfg_snap.loudness_enabled);
+        s.pipeline
+            .set_loudness_level(if cfg_snap.loudness_enabled { 5 } else { 0 });
+
+        let preset = EqPreset::from_u8(cfg_snap.equalizer_preset);
+        if let Some(csv) = s.config.nvs_override("equalizer") {
+            if let Some(gains) =
+                louder_esp32_app::config_handle::parse_equalizer_bands(csv.as_str())
+            {
+                if gains.iter().any(|&g| g.abs() > 0.01) {
+                    s.pipeline.set_eq_gains_db(&gains);
+                } else if preset != EqPreset::Flat {
+                    s.pipeline.apply_eq_preset(preset);
+                } else {
+                    s.pipeline.set_eq_gains_db(&[0.0; 10]);
+                }
+            } else if preset != s.pipeline.eq_preset() {
+                s.pipeline.apply_eq_preset(preset);
+            }
+        } else if preset != s.pipeline.eq_preset() {
+            s.pipeline.apply_eq_preset(preset);
+        }
+
+        let bt_name = s.config.effective_bt_name();
+        s.bt_sink.security_policy.update_device_name(bt_name.as_str());
+    }
+
     /// `bt_a2dp`: lazy BT controller bring-up after the DHCP lease, then A2DP sink
     /// poll. A2DP
     /// audio feeds the pipeline only while LMS does not own the output; the
@@ -866,6 +947,9 @@ mod device {
     /// (`begin_external_playback`) so it reports nothing about it to LMS.
     #[inline(never)]
     fn bt_poll(s: &mut FirmwareState) {
+        if !s.config.is_bt_sink_enabled() {
+            return;
+        }
         let now_ms = s.now_ms;
         // Lazy initialization of Bluetooth after Wi-Fi association and DHCPv4 lease
         if s.assigned_ip.is_some() && s.bt_transport.is_none() {
@@ -1174,6 +1258,40 @@ mod device {
                         }
                         (free, used)
                     };
+                    let mut eq_bands_db = [0i8; 10];
+                    for (dst, &gain) in
+                        eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
+                    {
+                        let rounded = if gain >= 0.0 {
+                            (gain + 0.5) as i8
+                        } else {
+                            (gain - 0.5) as i8
+                        };
+                        *dst = rounded.clamp(-15, 15);
+                    }
+                    let active_player_name = s
+                        .config
+                        .nvs_override("host_name")
+                        .and_then(|h| {
+                            let t = h.trim();
+                            if t.is_empty() {
+                                None
+                            } else {
+                                let mut out = heapless::String::<32>::new();
+                                let max_len = t.floor_char_boundary(t.len().min(32));
+                                let _ = out.push_str(&t[..max_len]);
+                                Some(out)
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            s.config.read(|c| {
+                                if !c.player_name.is_empty() {
+                                    c.player_name.clone()
+                                } else {
+                                    s.config.device_name()
+                                }
+                            })
+                        });
                     let snap = HttpStatusSnapshot {
                         ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
                         netmask: s.assigned_mask,
@@ -1228,6 +1346,8 @@ mod device {
                             0
                         },
                         bt_sub_status: 0,
+                        eq_bands_db,
+                        player_name: active_player_name.as_str(),
                     };
                     let snapshot = snap.clone();
                     let mut resp_buf = &mut s.http_resp_buf[..];
@@ -1279,10 +1399,16 @@ mod device {
                                 let preset = EqPreset::from_u8(preset_id);
                                 s.pipeline.apply_eq_preset(preset);
                                 s.config.update(|c| c.equalizer_preset = preset_id);
+                                let _ = s.config.set_nvs_override(
+                                    "equalizer",
+                                    "0,0,0,0,0,0,0,0,0,0",
+                                );
+                                s.config.flush_now(&mut *s.journal);
                             }
                             HttpControlAction::SetAnalogGain(again_code) => {
                                 let _ = s.amp.set_analog_gain(again_code);
                                 s.config.update(|c| c.analog_gain_code = again_code);
+                                s.config.flush_now(&mut *s.journal);
                             }
                             HttpControlAction::PlayerIrCommand {
                                 ir_code,
@@ -1302,6 +1428,7 @@ mod device {
                                         .set_volume_percent(pct, &mut backend, s.pipeline);
                                     let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
                                     s.config.update(|c| c.volume = pct);
+                                    s.config.flush_now(&mut *s.journal);
                                 }
                                 if let Some(m) = mute {
                                     // User mute: survives the next output write.
@@ -1339,6 +1466,7 @@ mod device {
                                     s.config,
                                     &mut *s.journal,
                                 );
+                                sync_config_to_runtime(s);
                             }
                             HttpControlAction::ConnectWifi => {
                                 if let Some(creds) = dispatch_web_post_action(
@@ -1483,7 +1611,7 @@ mod device {
             }
         }
         s.slim_was_open = open;
-        if !open && s.slim_reconnect.may_connect(now_ms) {
+        if !open && s.config.is_autoexec_enabled() && s.slim_reconnect.may_connect(now_ms) {
             s.helo_sent = false;
             s.slim_link.reset();
             let remote_ep = (IpAddress::Ipv4(Ipv4Address::from(s.lms_ip)), s.lms_port);

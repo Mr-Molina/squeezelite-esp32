@@ -231,6 +231,10 @@ pub struct HttpStatusSnapshot<'a> {
     pub bt_status: u8,
     /// C-compatible Bluetooth sub-status code (`"bt_sub_status"`).
     pub bt_sub_status: u8,
+    /// Active 10-band equalizer band gains in dB (-12..=+12).
+    pub eq_bands_db: [i8; 10],
+    /// Squeezelite player name / hostname override.
+    pub player_name: &'a str,
 }
 
 /// Type alias for runtime status snapshot.
@@ -286,6 +290,8 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             urc: 0,
             bt_status: 0,
             bt_sub_status: 0,
+            eq_bands_db: [0; 10],
+            player_name: "BASEMENT",
         }
     }
 }
@@ -485,7 +491,7 @@ pub const BOARD_GPIO_MAP: &[GpioPinDescriptor] = &[
         fixed: true,
     },
     GpioPinDescriptor {
-        gpio: 22,
+        gpio: 27,
         name: "SCL",
         group: "I2C",
         fixed: true,
@@ -531,12 +537,12 @@ pub const DEFAULT_NVS_CONFIG_ENTRIES: &[(&str, &str, u8)] = &[
     ("enable_telnet", "0", crate::config_handle::NVS_TYPE_U8),
     (
         "dac_config",
-        "model=TAS5805M,bck=26,ws=25,do=22,sda=21,scl=22,mute=17:0",
+        "model=TAS5805M,bck=26,ws=25,do=22,sda=21,scl=27,mute=17:0",
         crate::config_handle::NVS_TYPE_STR,
     ),
     (
         "i2c_config",
-        "sda=21,scl=22,speed=400000,port=0",
+        "sda=21,scl=27,speed=400000,port=0",
         crate::config_handle::NVS_TYPE_STR,
     ),
     ("rotary_config", "", crate::config_handle::NVS_TYPE_STR),
@@ -1976,14 +1982,25 @@ pub fn write_eq_json(
     out_buf: &mut [u8],
 ) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
+    let preset = if snapshot.eq_enabled
+        && snapshot.eq_preset == "Flat"
+        && snapshot.eq_bands_db.iter().any(|&b| b != 0)
+    {
+        "Custom"
+    } else {
+        snapshot.eq_preset
+    };
+    let b = snapshot.eq_bands_db;
     write!(
         writer,
         "{{\"ok\":true,\"eq_preset\":\"{}\",\"eq_enabled\":{},\
-         \"again_code\":{},\"vol_pct\":{}}}",
-        JsonEscaped(snapshot.eq_preset),
+         \"again_code\":{},\"vol_pct\":{},\
+         \"bands\":[{},{},{},{},{},{},{},{},{},{}]}}",
+        JsonEscaped(preset),
         snapshot.eq_enabled,
         snapshot.again_code,
         snapshot.vol_pct,
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
     )
     .ok()?;
     Some(writer.written_len())
@@ -2317,7 +2334,11 @@ pub fn handle_http_request_streaming_impl(
             Some(new_dh)
         })?;
         let device_id = "142137fd329622137a149016c82e18beb834";
-        let remote_name = "BASEMENT";
+        let remote_name = if !snapshot.player_name.is_empty() {
+            snapshot.player_name
+        } else {
+            "BASEMENT"
+        };
 
         let mut zc = ZeroConfServer::new();
         if let Ok(resp) = zc.handle_request(
@@ -3508,6 +3529,8 @@ mod tests {
             urc: 0,
             bt_status: 0,
             bt_sub_status: 0,
+            eq_bands_db: [0; 10],
+            player_name: "BASEMENT",
         };
         // Task 10: `i2c_nack_by_op` pushed a typical response past 1,024 bytes;
         // the device response buffer and HTTP TX buffer are 1,536 bytes.
@@ -3776,6 +3799,28 @@ mod tests {
         assert!(resp.contains("\"eq_enabled\":true"));
         assert!(resp.contains("\"again_code\":12"));
         assert!(resp.contains("\"vol_pct\":75"));
+        assert!(resp.contains("\"bands\":[0,0,0,0,0,0,0,0,0,0]"));
+
+        // Custom preset when Flat has non-zero bands
+        let snap_custom = HttpStatusSnapshot {
+            eq_preset: "Flat",
+            eq_enabled: true,
+            eq_bands_db: [0, 2, 0, 0, 0, 0, 0, 0, 0, -3],
+            ..HttpStatusSnapshot::default()
+        };
+        let (len2, _) = handle_http_control_request(req, &snap_custom, &mut buf).unwrap();
+        let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
+        assert!(resp2.contains("\"eq_preset\":\"Custom\""));
+        assert!(resp2.contains("\"bands\":[0,2,0,0,0,0,0,0,0,-3]"));
+    }
+
+    #[test]
+    fn test_board_gpio_map_scl_pin_27_no_conflict() {
+        let scl = BOARD_GPIO_MAP.iter().find(|p| p.name == "SCL").expect("SCL pin");
+        assert_eq!(scl.gpio, 27);
+        let do_pin = BOARD_GPIO_MAP.iter().find(|p| p.name == "DO").expect("DO pin");
+        assert_eq!(do_pin.gpio, 22);
+        assert_ne!(scl.gpio, do_pin.gpio);
     }
 
     #[test]
@@ -3928,6 +3973,14 @@ mod tests {
             "id=\"tasks\"",
             "id=\"save-autoexec1\"",
             "id=\"save-nvs\"",
+            "id=\"save-audio\"",
+            "id=\"save-hw\"",
+            "id=\"sq-name\"",
+            "id=\"sq-server\"",
+            "id=\"led-vu\"",
+            "id=\"led-brightness\"",
+            "id=\"eq-b0\"",
+            "id=\"eq-v0\"",
             "id=\"fwUpload\"",
             "eq_loudness",
             "again4",

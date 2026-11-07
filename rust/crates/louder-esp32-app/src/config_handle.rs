@@ -101,6 +101,55 @@ pub fn is_secret_config_key(key: &str) -> bool {
     )
 }
 
+/// Parses a comma-separated list of up to 10 equalizer bands, clamping each to
+/// `-15.0..=15.0`. Returns `Some([f32; 10])` if 1..=10 bands are parsed
+/// (filling any omitted trailing bands with `0.0`), or `None` if `csv` is
+/// empty or contains non-numeric tokens.
+#[must_use]
+pub fn parse_equalizer_bands(csv: &str) -> Option<[f32; 10]> {
+    let trimmed = csv.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut bands = [0.0f32; 10];
+    let mut count = 0;
+    for part in trimmed.split(',') {
+        if count >= 10 {
+            break;
+        }
+        let p = part.trim();
+        if p.is_empty() {
+            return None;
+        }
+        let val: f32 = p.parse().ok()?;
+        bands[count] = val.clamp(-15.0, 15.0);
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(bands)
+}
+
+/// Parses an IPv4 dotted-quad string (e.g. `"192.168.1.50"`) into `[u8; 4]`.
+#[must_use]
+pub fn parse_ipv4_dotted(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut count = 0;
+    for part in s.trim().split('.') {
+        if count >= 4 {
+            return None;
+        }
+        octets[count] = part.parse::<u8>().ok()?;
+        count += 1;
+    }
+    if count == 4 {
+        Some(octets)
+    } else {
+        None
+    }
+}
+
 /// Something that durably records a configuration snapshot (device:
 /// [`RamJournal`]).
 pub trait ConfigJournal {
@@ -231,6 +280,218 @@ impl ConfigHandle {
         })
     }
 
+    /// Looks up an NVS override value by key.
+    #[must_use]
+    pub fn nvs_override(&self, key: &str) -> Option<heapless::String<64>> {
+        self.state.lock(|state| {
+            let s = state.borrow();
+            let k = key.trim();
+            for slot in &s.nvs_overrides {
+                if slot.used && slot.key.as_str() == k {
+                    return Some(slot.value.clone());
+                }
+            }
+            None
+        })
+    }
+
+    /// Returns the active LMS server IPv4 address from typed configuration, if set.
+    #[must_use]
+    pub fn lms_server_ip(&self) -> Option<[u8; 4]> {
+        self.read(|c| c.lms_server_ip)
+    }
+
+    /// Updates the LMS server IPv4 address in typed configuration.
+    pub fn set_lms_server(&mut self, ip: [u8; 4]) -> bool {
+        self.update(|c| c.lms_server_ip = Some(ip))
+    }
+
+    /// Returns the sequence / generation number of this configuration.
+    #[must_use]
+    pub fn sequence(&self) -> u32 {
+        self.state.lock(|s| s.borrow().generation)
+    }
+
+    /// Sets the sequence / generation number of this configuration.
+    pub fn set_sequence(&self, seq: u32) {
+        self.state.lock(|s| {
+            let mut state = s.borrow_mut();
+            state.generation = seq;
+            state.snapshot_generation = seq;
+        });
+    }
+
+    /// Returns the device / player name.
+    #[must_use]
+    pub fn device_name(&self) -> heapless::String<32> {
+        let mut s = heapless::String::new();
+        if !self.host_name.is_empty() {
+            let _ = s.push_str(self.host_name.as_str());
+        } else {
+            let name = self.read(|c| {
+                if !c.player_name.is_empty() {
+                    c.player_name.clone()
+                } else {
+                    heapless::String::try_from("BASEMENT").unwrap_or_default()
+                }
+            });
+            let _ = s.push_str(name.as_str());
+        }
+        s
+    }
+
+    /// Parses command-line flags from an `autoexec1` command string (such as
+    /// `-s <ip[:port]>` or `-n <name>`) and updates `lms_server_ip` and
+    /// `host_name`.
+    pub fn apply_autoexec1_flags(&mut self, cmd: &str) {
+        let mut iter = cmd.split_whitespace();
+        while let Some(tok) = iter.next() {
+            if tok == "-s" {
+                if let Some(val) = iter.next() {
+                    let ip_str = val.split(':').next().unwrap_or(val);
+                    if let Some(ip) = parse_ipv4_dotted(ip_str) {
+                        if ip != [0, 0, 0, 0] {
+                            let _ = self.update(|c| c.lms_server_ip = Some(ip));
+                        }
+                    }
+                }
+            } else if tok.starts_with("-s") && tok.len() > 2 {
+                let val = &tok[2..];
+                let ip_str = val.split(':').next().unwrap_or(val);
+                if let Some(ip) = parse_ipv4_dotted(ip_str) {
+                    if ip != [0, 0, 0, 0] {
+                        let _ = self.update(|c| c.lms_server_ip = Some(ip));
+                    }
+                }
+            } else if tok == "-n" {
+                if let Some(val) = iter.next() {
+                    let trimmed = val.trim_matches(|c| c == '"' || c == '\'');
+                    if !trimmed.is_empty() {
+                        let _ = self.set_host_name(trimmed);
+                    }
+                }
+            } else if tok.starts_with("-n") && tok.len() > 2 {
+                let val = &tok[2..];
+                let trimmed = val.trim_matches(|c| c == '"' || c == '\'');
+                if !trimmed.is_empty() {
+                    let _ = self.set_host_name(trimmed);
+                }
+            }
+        }
+    }
+
+    /// Resolves the effective LMS server IPv4 address across typed config,
+    /// `lms_server_ip`/`lms_ip` NVS overrides, and `-s` flags in `autoexec1`.
+    #[must_use]
+    pub fn effective_lms_server_ip(&self) -> Option<[u8; 4]> {
+        if let Some(ip) = self.lms_server_ip() {
+            if ip != [0, 0, 0, 0] {
+                return Some(ip);
+            }
+        }
+        if let Some(val) = self
+            .nvs_override("lms_server_ip")
+            .or_else(|| self.nvs_override("lms_ip"))
+        {
+            if let Some(ip) = parse_ipv4_dotted(val.as_str()) {
+                if ip != [0, 0, 0, 0] {
+                    return Some(ip);
+                }
+            }
+        }
+        if let Some(cmd) = self.nvs_override("autoexec1") {
+            let mut iter = cmd.as_str().split_whitespace();
+            while let Some(tok) = iter.next() {
+                if tok == "-s" {
+                    if let Some(val) = iter.next() {
+                        let ip_str = val.split(':').next().unwrap_or(val);
+                        if let Some(ip) = parse_ipv4_dotted(ip_str) {
+                            if ip != [0, 0, 0, 0] {
+                                return Some(ip);
+                            }
+                        }
+                    }
+                } else if tok.starts_with("-s") && tok.len() > 2 {
+                    let val = &tok[2..];
+                    let ip_str = val.split(':').next().unwrap_or(val);
+                    if let Some(ip) = parse_ipv4_dotted(ip_str) {
+                        if ip != [0, 0, 0, 0] {
+                            return Some(ip);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the effective Spotify Connect device name.
+    #[must_use]
+    pub fn effective_cspot_name(&self) -> heapless::String<32> {
+        if let Some(val) = self.nvs_override("cspot_name") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                let mut s = heapless::String::new();
+                let max_len = trimmed.floor_char_boundary(trimmed.len().min(32));
+                let _ = s.push_str(&trimmed[..max_len]);
+                return s;
+            }
+        }
+        self.device_name()
+    }
+
+    /// Returns the effective Bluetooth device name.
+    #[must_use]
+    pub fn effective_bt_name(&self) -> heapless::String<32> {
+        if let Some(val) = self.nvs_override("bt_name") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                let mut s = heapless::String::new();
+                let max_len = trimmed.floor_char_boundary(trimmed.len().min(32));
+                let _ = s.push_str(&trimmed[..max_len]);
+                return s;
+            }
+        }
+        self.device_name()
+    }
+
+    /// Returns whether AirPlay RAOP service is enabled (defaults to true).
+    #[must_use]
+    pub fn is_airplay_enabled(&self) -> bool {
+        !matches!(
+            self.nvs_override("enable_airplay").as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    }
+
+    /// Returns whether Bluetooth A2DP Sink service is enabled (defaults to true).
+    #[must_use]
+    pub fn is_bt_sink_enabled(&self) -> bool {
+        !matches!(
+            self.nvs_override("enable_bt_sink").as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    }
+
+    /// Returns whether Spotify Connect (`cspot`) service is enabled
+    /// (defaults to true).
+    #[must_use]
+    pub fn is_cspot_enabled(&self) -> bool {
+        !matches!(
+            self.nvs_override("enable_cspot").as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    }
+
+    /// Returns whether `autoexec` script execution is enabled (defaults to true).
+    #[must_use]
+    pub fn is_autoexec_enabled(&self) -> bool {
+        !matches!(
+            self.nvs_override("autoexec").as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    }
+
     /// Creates a mutable working copy of this handle's current state.
     #[must_use]
     pub fn clone_handle(&self) -> Self {
@@ -280,29 +541,28 @@ impl ConfigHandle {
                 true
             }
             "lms_ip" | "lms_server_ip" => {
-                let mut octets = [0u8; 4];
-                let mut count = 0;
-                let mut ok = true;
-                for part in v.split('.') {
-                    if count >= 4 {
-                        ok = false;
-                        break;
-                    }
-                    if let Ok(num) = part.parse::<u8>() {
-                        octets[count] = num;
-                        count += 1;
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok && count == 4 {
+                if let Some(octets) = parse_ipv4_dotted(v) {
                     let _ = self.update(|c| c.lms_server_ip = Some(octets));
+                    self.set_nvs_override("lms_server_ip", v);
                     self.set_nvs_override("lms_ip", v);
                     true
                 } else {
                     false
                 }
+            }
+            "autoexec1" => {
+                self.set_nvs_override("autoexec1", v);
+                self.apply_autoexec1_flags(v);
+                true
+            }
+            "equalizer" => {
+                self.set_nvs_override("equalizer", v);
+                if let Some(bands) = parse_equalizer_bands(v) {
+                    if bands.iter().all(|&b| b == 0.0) {
+                        let _ = self.update(|c| c.equalizer_preset = 0);
+                    }
+                }
+                true
             }
             "vol" | "vol_pct" | "volume" => {
                 if let Ok(pct) = v.parse::<u8>() {
@@ -576,6 +836,68 @@ impl ConfigWriter {
 /// Alias for [`ConfigWriter`].
 pub type DebouncedConfigWriter = ConfigWriter;
 
+/// Alias for [`RamJournal`].
+pub type FlashNvsJournal<'a> = RamJournal<'a>;
+
+/// Target for restoring configuration and NVS entries from a journal sector.
+pub trait RestoreSectorTarget {
+    /// Clears any existing entries before restoration.
+    fn clear_entries(&mut self) {}
+
+    /// Applies a restored key-value entry.
+    fn apply_entry(&mut self, key: &str, val: &str);
+
+    /// Finalizes restoration with the sector sequence counter.
+    fn finalize_restore(&mut self, _sequence: u32) {}
+}
+
+impl RestoreSectorTarget for [NvsEntrySlot; 20] {
+    fn clear_entries(&mut self) {
+        for slot in self.iter_mut() {
+            *slot = NvsEntrySlot::default();
+        }
+    }
+
+    fn apply_entry(&mut self, key: &str, val: &str) {
+        for slot in self.iter_mut() {
+            if !slot.used {
+                slot.used = true;
+                slot.key.clear();
+                let _ = slot.key.push_str(key);
+                slot.value.clear();
+                let _ = slot.value.push_str(val);
+                break;
+            }
+        }
+    }
+}
+
+impl RestoreSectorTarget for ConfigHandle {
+    fn apply_entry(&mut self, key: &str, val: &str) {
+        let _ = self.apply_key_value(key, val);
+    }
+
+    fn finalize_restore(&mut self, sequence: u32) {
+        if let Some(cmd) = self.nvs_override("autoexec1") {
+            self.apply_autoexec1_flags(cmd.as_str());
+        }
+        if let Some(ip_str) = self
+            .nvs_override("lms_server_ip")
+            .or_else(|| self.nvs_override("lms_ip"))
+        {
+            if let Some(ip) = parse_ipv4_dotted(ip_str.as_str()) {
+                if ip != [0, 0, 0, 0] {
+                    let _ = self.set_lms_server(ip);
+                }
+            }
+        }
+        if let Some(host) = self.nvs_override("host_name") {
+            let _ = self.set_host_name(host.as_str());
+        }
+        self.set_sequence(sequence);
+    }
+}
+
 /// A word-aligned journal sector buffer (flash writes go straight from it, no
 /// bounce copy).
 #[repr(C, align(4))]
@@ -712,30 +1034,34 @@ impl<'a> RamJournal<'a> {
         }
     }
 
-    /// Restores NVS overrides from a sector into an overrides array.
-    pub fn restore_sector_into(
+    /// Restores NVS overrides from a sector into a target implementing
+    /// [`RestoreSectorTarget`].
+    pub fn restore_sector_into<T: RestoreSectorTarget>(
         sector: &[u8; JOURNAL_SECTOR_SIZE],
-        overrides: &mut [NvsEntrySlot; 20],
+        target: &mut T,
     ) -> bool {
-        let (_pos, valid) = if sector.len() >= 20
+        let (_pos, valid, sequence) = if sector.len() >= 20
             && sector[16..20] == squeezelite_config::FlashJournal::MAGIC
         {
-            if squeezelite_config::FlashJournal::validate_sector(sector).is_err() {
-                return false;
+            match squeezelite_config::FlashJournal::validate_sector(sector) {
+                Ok((seq, _, _)) => (16usize, true, seq),
+                Err(_) => return false,
             }
-            (16usize, true)
         } else if sector.len() >= 4
             && sector[0..4] == squeezelite_config::FlashJournal::MAGIC
         {
             if sector[12..16] != [0xFF; 4]
                 && sector[12..16] != [0; 4]
-                && squeezelite_config::FlashJournal::validate_sector(sector).is_err()
             {
-                return false;
+                match squeezelite_config::FlashJournal::validate_sector(sector) {
+                    Ok((seq, _, _)) => (0usize, true, seq),
+                    Err(_) => return false,
+                }
+            } else {
+                (0usize, true, 0u32)
             }
-            (0usize, true)
         } else {
-            (0usize, false)
+            (0usize, false, 0u32)
         };
         if !valid {
             return false;
@@ -743,14 +1069,11 @@ impl<'a> RamJournal<'a> {
         if sector.len() < 2058 || &sector[2048..2052] != b"NVS2" {
             return false;
         }
+        target.clear_entries();
         let count = sector[2057] as usize;
         let mut offset = 2058;
-        let mut slot_idx = 0;
-        for slot in overrides.iter_mut() {
-            *slot = NvsEntrySlot::default();
-        }
         for _ in 0..count {
-            if offset >= 4096 || slot_idx >= overrides.len() {
+            if offset >= 4096 {
                 break;
             }
             let k_len = sector[offset] as usize;
@@ -772,15 +1095,10 @@ impl<'a> RamJournal<'a> {
             offset += v_len;
 
             if !k_str.is_empty() {
-                let slot = &mut overrides[slot_idx];
-                slot.used = true;
-                slot.key.clear();
-                let _ = slot.key.push_str(k_str);
-                slot.value.clear();
-                let _ = slot.value.push_str(v_str);
-                slot_idx += 1;
+                target.apply_entry(k_str, v_str);
             }
         }
+        target.finalize_restore(sequence);
         true
     }
 
@@ -790,13 +1108,31 @@ impl<'a> RamJournal<'a> {
         Self::restore_sector_into(sector, &mut self.nvs_overrides)
     }
 
-    /// Restores journal's NVS overrides into `handle`.
+    /// Restores journal's NVS overrides into `handle`, synchronizing key-values,
+    /// autoexec flags, LMS IP, host name, and sequence counter.
     pub fn restore_into_handle(&self, handle: &mut ConfigHandle) {
         for slot in self.nvs_overrides.iter() {
             if slot.used && !slot.key.is_empty() {
-                handle.set_nvs_override(slot.key.as_str(), slot.value.as_str());
+                let _ = handle.apply_key_value(slot.key.as_str(), slot.value.as_str());
             }
         }
+        if let Some(cmd) = handle.nvs_override("autoexec1") {
+            handle.apply_autoexec1_flags(cmd.as_str());
+        }
+        if let Some(ip_str) = handle
+            .nvs_override("lms_server_ip")
+            .or_else(|| handle.nvs_override("lms_ip"))
+        {
+            if let Some(ip) = parse_ipv4_dotted(ip_str.as_str()) {
+                if ip != [0, 0, 0, 0] {
+                    let _ = handle.set_lms_server(ip);
+                }
+            }
+        }
+        if let Some(host) = handle.nvs_override("host_name") {
+            let _ = handle.set_host_name(host.as_str());
+        }
+        handle.set_sequence(self.sequence);
     }
 
     /// Serializes `cfg` and writes `nvs_overrides` at `sector[2048..4096]`
@@ -1447,5 +1783,69 @@ mod tests {
         assert!(restored_overrides.iter().any(|s| {
             s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v"
         }));
+    }
+
+    #[test]
+    fn test_autoexec1_flags_and_effective_getters() {
+        let mut handle = ConfigHandle::new(AudioConfig::default());
+        assert!(handle.apply_key_value(
+            "autoexec1",
+            "squeezelite -o I2S -n BASEMENT -s 10.0.0.50 -b 500:2000 -c flc,p"
+        ));
+        assert_eq!(handle.effective_lms_server_ip(), Some([10, 0, 0, 50]));
+        assert_eq!(handle.device_name().as_str(), "BASEMENT");
+
+        // Service enables default to true
+        assert!(handle.is_airplay_enabled());
+        assert!(handle.is_bt_sink_enabled());
+        assert!(handle.is_cspot_enabled());
+        assert!(handle.is_autoexec_enabled());
+
+        // Can disable services
+        handle.apply_key_value("enable_airplay", "0");
+        assert!(!handle.is_airplay_enabled());
+        handle.apply_key_value("enable_bt_sink", "no");
+        assert!(!handle.is_bt_sink_enabled());
+        handle.apply_key_value("enable_cspot", "false");
+        assert!(!handle.is_cspot_enabled());
+        handle.apply_key_value("autoexec", "off");
+        assert!(!handle.is_autoexec_enabled());
+
+        // Parse equalizer bands
+        assert_eq!(parse_equalizer_bands(""), None);
+        let bands = parse_equalizer_bands("2,1,0,-1,-2,0,1,2,1,0").expect("valid bands");
+        assert_eq!(bands, [2.0, 1.0, 0.0, -1.0, -2.0, 0.0, 1.0, 2.0, 1.0, 0.0]);
+
+        // Trailing fill with 0.0
+        let partial = parse_equalizer_bands("3.5,-4.0").expect("partial bands");
+        assert_eq!(partial[0], 3.5);
+        assert_eq!(partial[1], -4.0);
+        assert_eq!(partial[2], 0.0);
+    }
+
+    #[test]
+    fn test_restore_sector_into_config_handle() {
+        let mut handle = ConfigHandle::new(AudioConfig::default());
+        handle.apply_key_value(
+            "autoexec1",
+            "squeezelite -o I2S -n BASEMENT -s 10.0.0.50 -b 500:2000 -c flc,p",
+        );
+        handle.set_sequence(42);
+
+        let mut image = JournalSector::erased();
+        let mut ram = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
+        assert!(handle.force_flush(&mut ram));
+
+        let pending = ram.pending_image().expect("pending image");
+
+        let mut restored_handle = ConfigHandle::new(AudioConfig::default());
+        assert!(FlashNvsJournal::restore_sector_into(
+            pending.sector,
+            &mut restored_handle
+        ));
+
+        assert_eq!(restored_handle.effective_lms_server_ip(), Some([10, 0, 0, 50]));
+        assert_eq!(restored_handle.device_name().as_str(), "BASEMENT");
+        assert_eq!(restored_handle.sequence(), 1);
     }
 }
