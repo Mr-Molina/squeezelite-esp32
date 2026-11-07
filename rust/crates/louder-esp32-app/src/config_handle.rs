@@ -106,6 +106,27 @@ pub fn is_secret_config_key(key: &str) -> bool {
 pub trait ConfigJournal {
     /// Records `cfg`; `false` if it was not recorded (the snapshot stays dirty).
     fn commit(&mut self, cfg: &AudioConfig) -> bool;
+
+    /// Sets NVS override slots if supported by this journal.
+    fn set_nvs_overrides(&mut self, _overrides: &[NvsEntrySlot; 20]) {}
+}
+
+/// A slot storing an NVS key-value override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvsEntrySlot {
+    pub used: bool,
+    pub key: heapless::String<24>,
+    pub value: heapless::String<64>,
+}
+
+impl Default for NvsEntrySlot {
+    fn default() -> Self {
+        Self {
+            used: false,
+            key: heapless::String::new(),
+            value: heapless::String::new(),
+        }
+    }
 }
 
 struct HandleState {
@@ -115,6 +136,7 @@ struct HandleState {
     generation: u32,
     /// Generation seen by the last [`ConfigHandle::snapshot_if_dirty`].
     snapshot_generation: u32,
+    nvs_overrides: [NvsEntrySlot; 20],
 }
 
 /// The runtime configuration: an [`AudioConfig`] plus a dirty flag behind one
@@ -140,9 +162,51 @@ impl ConfigHandle {
                 dirty: false,
                 generation: 0,
                 snapshot_generation: 0,
+                nvs_overrides: Default::default(),
             })),
             host_name,
         }
+    }
+
+    /// Sets an NVS override key-value pair.
+    pub fn set_nvs_override(&self, key: &str, value: &str) -> bool {
+        self.state.lock(|state| {
+            let mut s = state.borrow_mut();
+            let k = key.trim();
+            if k.is_empty() || k.len() > 24 {
+                return false;
+            }
+            for slot in &mut s.nvs_overrides {
+                if slot.used && slot.key.as_str() == k {
+                    slot.value.clear();
+                    let max_len = value.floor_char_boundary(value.len().min(64));
+                    let _ = slot.value.push_str(&value[..max_len]);
+                    s.dirty = true;
+                    s.generation = s.generation.wrapping_add(1);
+                    return true;
+                }
+            }
+            for slot in &mut s.nvs_overrides {
+                if !slot.used {
+                    slot.used = true;
+                    slot.key.clear();
+                    let _ = slot.key.push_str(k);
+                    slot.value.clear();
+                    let max_len = value.floor_char_boundary(value.len().min(64));
+                    let _ = slot.value.push_str(&value[..max_len]);
+                    s.dirty = true;
+                    s.generation = s.generation.wrapping_add(1);
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    /// Returns the active NVS override slots.
+    #[must_use]
+    pub fn nvs_overrides(&self) -> [NvsEntrySlot; 20] {
+        self.state.lock(|state| state.borrow().nvs_overrides.clone())
     }
 
     /// Returns the current host / player name string slice.
@@ -179,6 +243,7 @@ impl ConfigHandle {
                     dirty: s.dirty,
                     generation: s.generation,
                     snapshot_generation: s.snapshot_generation,
+                    nvs_overrides: s.nvs_overrides.clone(),
                 })),
                 host_name,
             }
@@ -187,8 +252,18 @@ impl ConfigHandle {
 
     /// Synchronizes changes from a working copy back into this shared handle.
     pub fn sync_from(&self, other: &Self) -> bool {
-        let next_cfg = other.read(Clone::clone);
-        self.update(|c| *c = next_cfg)
+        let (next_cfg, next_overrides) = other.state.lock(|state| {
+            let s = state.borrow();
+            (s.cfg.clone(), s.nvs_overrides.clone())
+        });
+        self.state.lock(|state| {
+            let mut s = state.borrow_mut();
+            s.cfg = next_cfg;
+            s.nvs_overrides = next_overrides;
+            s.dirty = true;
+            s.generation = s.generation.wrapping_add(1);
+        });
+        true
     }
 
     /// Applies a string key-value configuration mutation to the handle.
@@ -201,7 +276,33 @@ impl ConfigHandle {
         match k {
             "host_name" | "player_name" | "name" => {
                 let _ = self.set_host_name(v);
+                self.set_nvs_override("host_name", v);
                 true
+            }
+            "lms_ip" | "lms_server_ip" => {
+                let mut octets = [0u8; 4];
+                let mut count = 0;
+                let mut ok = true;
+                for part in v.split('.') {
+                    if count >= 4 {
+                        ok = false;
+                        break;
+                    }
+                    if let Ok(num) = part.parse::<u8>() {
+                        octets[count] = num;
+                        count += 1;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && count == 4 {
+                    let _ = self.update(|c| c.lms_server_ip = Some(octets));
+                    self.set_nvs_override("lms_ip", v);
+                    true
+                } else {
+                    false
+                }
             }
             "vol" | "vol_pct" | "volume" => {
                 if let Ok(pct) = v.parse::<u8>() {
@@ -272,8 +373,32 @@ impl ConfigHandle {
                     false
                 }
             }
-            _ => true,
+            _ => {
+                self.set_nvs_override(k, v);
+                true
+            }
         }
+    }
+
+    /// Flushes any pending changes and syncs NVS overrides to `journal`.
+    pub fn force_flush(&self, journal: &mut impl ConfigJournal) -> bool {
+        let overrides = self.nvs_overrides();
+        journal.set_nvs_overrides(&overrides);
+        self.flush_now(journal)
+    }
+
+    /// Syncs NVS overrides and polls `writer` for debounced commit.
+    pub fn flush_if_due(
+        &self,
+        writer: &mut ConfigWriter,
+        journal: &mut impl ConfigJournal,
+        now_ms: u64,
+    ) -> bool {
+        if self.is_dirty() {
+            let overrides = self.nvs_overrides();
+            journal.set_nvs_overrides(&overrides);
+        }
+        writer.poll(self, journal, now_ms)
     }
 
     /// Applies `f` to the configuration. The result is published only if it is
@@ -324,7 +449,9 @@ impl ConfigHandle {
     /// Journals any pending change now (called before every reboot action):
     /// snapshot, commit,
     /// mark clean. Returns whether a snapshot was committed.
-    pub fn flush_now<J: ConfigJournal>(&self, journal: &mut J) -> bool {
+    pub fn flush_now(&self, journal: &mut impl ConfigJournal) -> bool {
+        let overrides = self.nvs_overrides();
+        journal.set_nvs_overrides(&overrides);
         // The commit runs OUTSIDE the lock: it may be slow (serialization; on the
         // device with
         // `runtime-flash-persist`, a flash write follows), and `update` must never wait
@@ -420,10 +547,10 @@ impl ConfigWriter {
     /// dirty and quiet for [`DEBOUNCE_MS`], journals the snapshot
     /// ([`ConfigHandle::flush_now`]).
     /// Returns whether it committed.
-    pub fn poll<J: ConfigJournal>(
+    pub fn poll(
         &mut self,
         handle: &ConfigHandle,
-        journal: &mut J,
+        journal: &mut impl ConfigJournal,
         now_ms: u64,
     ) -> bool {
         let generation = handle.generation();
@@ -436,6 +563,7 @@ impl ConfigWriter {
         {
             return false;
         }
+        journal.set_nvs_overrides(&handle.nvs_overrides());
         let committed = handle.flush_now(journal);
         if !committed {
             // Never retry a refused commit in a tight loop: wait another quiet period.
@@ -444,6 +572,9 @@ impl ConfigWriter {
         committed
     }
 }
+
+/// Alias for [`ConfigWriter`].
+pub type DebouncedConfigWriter = ConfigWriter;
 
 /// A word-aligned journal sector buffer (flash writes go straight from it, no
 /// bounce copy).
@@ -548,6 +679,7 @@ pub struct RamJournal<'a> {
     policy: FlashTargetPolicy,
     flash_pending: bool,
     pending_wifi: Option<WifiStaCredentials>,
+    pub nvs_overrides: [NvsEntrySlot; 20],
 }
 
 impl<'a> RamJournal<'a> {
@@ -564,6 +696,10 @@ impl<'a> RamJournal<'a> {
             (FlashTargetPolicy::FixedA, _) | (FlashTargetPolicy::PingPong, None) => JournalSlot::A,
             (FlashTargetPolicy::PingPong, Some((active, _))) => active.other(),
         };
+        let mut overrides = <[NvsEntrySlot; 20]>::default();
+        if boot.is_some() {
+            let _ = Self::restore_sector_into(&image.0, &mut overrides);
+        }
         Self {
             image,
             image_len: 0,
@@ -572,7 +708,154 @@ impl<'a> RamJournal<'a> {
             policy,
             flash_pending: false,
             pending_wifi: None,
+            nvs_overrides: overrides,
         }
+    }
+
+    /// Restores NVS overrides from a sector into an overrides array.
+    pub fn restore_sector_into(
+        sector: &[u8; JOURNAL_SECTOR_SIZE],
+        overrides: &mut [NvsEntrySlot; 20],
+    ) -> bool {
+        let (_pos, valid) = if sector.len() >= 20
+            && sector[16..20] == squeezelite_config::FlashJournal::MAGIC
+        {
+            if squeezelite_config::FlashJournal::validate_sector(sector).is_err() {
+                return false;
+            }
+            (16usize, true)
+        } else if sector.len() >= 4
+            && sector[0..4] == squeezelite_config::FlashJournal::MAGIC
+        {
+            if sector[12..16] != [0xFF; 4]
+                && sector[12..16] != [0; 4]
+                && squeezelite_config::FlashJournal::validate_sector(sector).is_err()
+            {
+                return false;
+            }
+            (0usize, true)
+        } else {
+            (0usize, false)
+        };
+        if !valid {
+            return false;
+        }
+        if sector.len() < 2058 || &sector[2048..2052] != b"NVS2" {
+            return false;
+        }
+        let count = sector[2057] as usize;
+        let mut offset = 2058;
+        let mut slot_idx = 0;
+        for slot in overrides.iter_mut() {
+            *slot = NvsEntrySlot::default();
+        }
+        for _ in 0..count {
+            if offset >= 4096 || slot_idx >= overrides.len() {
+                break;
+            }
+            let k_len = sector[offset] as usize;
+            offset += 1;
+            if offset + k_len > 4096 {
+                break;
+            }
+            let k_str = core::str::from_utf8(&sector[offset..offset + k_len]).unwrap_or("");
+            offset += k_len;
+            if offset >= 4096 {
+                break;
+            }
+            let v_len = sector[offset] as usize;
+            offset += 1;
+            if offset + v_len > 4096 {
+                break;
+            }
+            let v_str = core::str::from_utf8(&sector[offset..offset + v_len]).unwrap_or("");
+            offset += v_len;
+
+            if !k_str.is_empty() {
+                let slot = &mut overrides[slot_idx];
+                slot.used = true;
+                slot.key.clear();
+                let _ = slot.key.push_str(k_str);
+                slot.value.clear();
+                let _ = slot.value.push_str(v_str);
+                slot_idx += 1;
+            }
+        }
+        true
+    }
+
+    /// Restores NVS overrides and LMS IP from a journal sector if magic
+    /// `b"NVS2"` is present.
+    pub fn restore_from_sector(&mut self, sector: &[u8; JOURNAL_SECTOR_SIZE]) -> bool {
+        Self::restore_sector_into(sector, &mut self.nvs_overrides)
+    }
+
+    /// Restores journal's NVS overrides into `handle`.
+    pub fn restore_into_handle(&self, handle: &mut ConfigHandle) {
+        for slot in self.nvs_overrides.iter() {
+            if slot.used && !slot.key.is_empty() {
+                handle.set_nvs_override(slot.key.as_str(), slot.value.as_str());
+            }
+        }
+    }
+
+    /// Serializes `cfg` and writes `nvs_overrides` at `sector[2048..4096]`
+    /// with magic `b"NVS2"`.
+    pub fn serialize_into(
+        nvs_overrides: &[NvsEntrySlot; 20],
+        sector: &mut [u8; JOURNAL_SECTOR_SIZE],
+        cfg: &AudioConfig,
+        sequence: u32,
+        wifi: Option<(&str, &str)>,
+    ) -> Result<usize, squeezelite_config::StorageError> {
+        let len = serialize_image(sector, cfg, sequence, wifi)?;
+        let nvs_slice = &mut sector[2048..4096];
+        nvs_slice.fill(0xFF);
+        nvs_slice[0..4].copy_from_slice(b"NVS2");
+        if let Some(ip) = cfg.lms_server_ip {
+            nvs_slice[4] = 1;
+            nvs_slice[5..9].copy_from_slice(&ip);
+        } else {
+            nvs_slice[4] = 0;
+            nvs_slice[5..9].copy_from_slice(&[0, 0, 0, 0]);
+        }
+        let mut used_count: u8 = 0;
+        for slot in nvs_overrides {
+            if slot.used {
+                used_count += 1;
+            }
+        }
+        nvs_slice[9] = used_count;
+        let mut offset = 10;
+        for slot in nvs_overrides {
+            if slot.used {
+                let k_bytes = slot.key.as_bytes();
+                let v_bytes = slot.value.as_bytes();
+                if offset + 2 + k_bytes.len() + v_bytes.len() <= 2048 {
+                    nvs_slice[offset] = k_bytes.len() as u8;
+                    offset += 1;
+                    nvs_slice[offset..offset + k_bytes.len()].copy_from_slice(k_bytes);
+                    offset += k_bytes.len();
+                    nvs_slice[offset] = v_bytes.len() as u8;
+                    offset += 1;
+                    nvs_slice[offset..offset + v_bytes.len()].copy_from_slice(v_bytes);
+                    offset += v_bytes.len();
+                }
+            }
+        }
+        Ok(len)
+    }
+
+    /// Serializes `cfg` and writes `self.nvs_overrides` at
+    /// `sector[2048..4096]` with magic `b"NVS2"`.
+    pub fn serialize_image(
+        &self,
+        sector: &mut [u8; JOURNAL_SECTOR_SIZE],
+        cfg: &AudioConfig,
+        sequence: u32,
+        wifi: Option<(&str, &str)>,
+    ) -> Result<usize, squeezelite_config::StorageError> {
+        Self::serialize_into(&self.nvs_overrides, sector, cfg, sequence, wifi)
     }
 
     /// Sets pending Wi-Fi credentials to be written on the next commit.
@@ -650,6 +933,10 @@ impl<'a> RamJournal<'a> {
 }
 
 impl ConfigJournal for RamJournal<'_> {
+    fn set_nvs_overrides(&mut self, overrides: &[NvsEntrySlot; 20]) {
+        self.nvs_overrides = overrides.clone();
+    }
+
     fn commit(&mut self, cfg: &AudioConfig) -> bool {
         let next = self.sequence.wrapping_add(1);
         let mut preserved_ssid = heapless::String::<32>::new();
@@ -686,7 +973,13 @@ impl ConfigJournal for RamJournal<'_> {
             None
         };
 
-        match serialize_image(&mut self.image.0, cfg, next, wifi_ref) {
+        match Self::serialize_into(
+            &self.nvs_overrides,
+            &mut self.image.0,
+            cfg,
+            next,
+            wifi_ref,
+        ) {
             Ok(len) => {
                 self.image_len = len;
                 self.sequence = next;
@@ -830,7 +1123,9 @@ fn serialize_image(
         }
     }
     let len = writer.finish(sequence)?;
-    if len < JOURNAL_SECTOR_SIZE {
+    if len < 2048 {
+        sector[len..2048].fill(0xFF);
+    } else if len < JOURNAL_SECTOR_SIZE {
         sector[len..].fill(0xFF);
     }
     Ok(len)
@@ -1108,5 +1403,49 @@ mod tests {
         );
         assert!(committed);
         assert_eq!(*simulated_flash.borrow(), ram.image.0);
+    }
+
+    #[test]
+    fn test_nvs2_overrides_serialization_and_restore() {
+        let mut handle = ConfigHandle::new(AudioConfig::default());
+        assert!(handle.apply_key_value("host_name", "KitchenPlayer"));
+        assert!(handle.apply_key_value("lms_ip", "192.168.1.50"));
+        assert!(handle.apply_key_value("custom_k", "custom_v"));
+
+        assert_eq!(handle.host_name_str(), "KitchenPlayer");
+        let overrides = handle.nvs_overrides();
+        assert!(overrides.iter().any(|s| {
+            s.used && s.key.as_str() == "host_name" && s.value.as_str() == "KitchenPlayer"
+        }));
+        assert!(overrides.iter().any(|s| {
+            s.used && s.key.as_str() == "lms_ip" && s.value.as_str() == "192.168.1.50"
+        }));
+        assert!(overrides.iter().any(|s| {
+            s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v"
+        }));
+
+        let mut image = JournalSector::erased();
+        let mut ram = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
+        assert!(handle.force_flush(&mut ram));
+
+        let pending = ram.pending_image().expect("pending image");
+        assert_eq!(&pending.sector[2048..2052], b"NVS2");
+
+        let mut image2 = JournalSector::erased();
+        let mut restored_ram = RamJournal::new(&mut image2, None, FlashTargetPolicy::FixedA);
+        assert!(restored_ram.restore_from_sector(pending.sector));
+        let mut restored_handle = ConfigHandle::new(AudioConfig::default());
+        restored_ram.restore_into_handle(&mut restored_handle);
+
+        let restored_overrides = restored_handle.nvs_overrides();
+        assert!(restored_overrides.iter().any(|s| {
+            s.used && s.key.as_str() == "host_name" && s.value.as_str() == "KitchenPlayer"
+        }));
+        assert!(restored_overrides.iter().any(|s| {
+            s.used && s.key.as_str() == "lms_ip" && s.value.as_str() == "192.168.1.50"
+        }));
+        assert!(restored_overrides.iter().any(|s| {
+            s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v"
+        }));
     }
 }

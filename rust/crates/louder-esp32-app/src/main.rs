@@ -1600,13 +1600,8 @@ mod xtensa_hw {
         // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
         // and config handle.
         // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
-        #[unsafe(link_section = ".dram2_uninit")]
         static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> =
             core::mem::MaybeUninit::uninit();
-        // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
-        // and config handle.
-        // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
-        #[unsafe(link_section = ".dram2_uninit")]
         static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> =
             core::mem::MaybeUninit::uninit();
         static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1644,6 +1639,14 @@ mod xtensa_hw {
             ));
             let config =
                 (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
+            if let Some((index, _seq)) = selected {
+                let winning_buf = if index == 0 { sector_a } else { sector_b };
+                if let Ok(winning_arr) = <&[u8; 4096]>::try_from(&*winning_buf) {
+                    if journal.restore_from_sector(winning_arr) {
+                        journal.restore_into_handle(config);
+                    }
+                }
+            }
             (&*config, journal)
         }
     }
@@ -1805,7 +1808,6 @@ mod xtensa_hw {
         /// (`runtime-flash-persist` only; see `tasks::runtime_flash_commit`).
         /// Default build: the manual path's core 1 runs the IRAM NOP
         /// heartbeat, so it resumes where it was parked.
-        #[cfg(feature = "runtime-flash-persist")]
         pub(crate) fn unpark_after_flash_write(&mut self) {
             CORE1_PARK_REQ.store(false, core::sync::atomic::Ordering::Release);
             #[cfg(not(feature = "esp-rtos-core1"))]
@@ -2935,7 +2937,11 @@ mod xtensa_hw {
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
             let _ = s.flash.erase(offset, offset + 4096);
-            let _ = s.flash.write_nor(offset, &image.sector[..image.used_len]);
+            if image.used_len > 16 {
+                let _ = s.flash.write_nor(offset + 16, &image.sector[16..image.used_len]);
+            }
+            let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
+            let _ = s.flash.write_nor(offset, &image.sector[..16]);
         }
     }
 
@@ -3225,12 +3231,63 @@ mod xtensa_hw {
                 && http_sock.can_recv()
                 && http_sock.may_send()
             {
-                let mut req_buf = [0u8; 1024];
-                let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
-                while http_sock.can_recv() {
-                    let _ = http_sock.recv(|buf| (buf.len(), ()));
+                static POST_WAIT_MS: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+
+                let mut should_wait = false;
+                let mut peek_buf = [0u8; 256];
+                if let Ok(peek_n) = http_sock.peek_slice(&mut peek_buf) {
+                    let peek_bytes = &peek_buf[..peek_n];
+                    if peek_bytes.starts_with(b"POST ") {
+                        if let Some(pos) = peek_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let hdr_end = pos + 4;
+                            let mut cl = 0usize;
+                            if let Some(cl_idx) = peek_bytes[..hdr_end]
+                                .windows(16)
+                                .position(|w| w.eq_ignore_ascii_case(b"content-length: "))
+                            {
+                                for &b in &peek_bytes[cl_idx + 16..hdr_end] {
+                                    if b.is_ascii_digit() {
+                                        cl = cl
+                                            .saturating_mul(10)
+                                            .saturating_add((b - b'0') as usize);
+                                    } else if b == b'\r' || b == b'\n' {
+                                        break;
+                                    }
+                                }
+                            }
+                            if cl > 0 && http_sock.recv_queue() < hdr_end + cl {
+                                let start =
+                                    POST_WAIT_MS.load(core::sync::atomic::Ordering::Relaxed);
+                                if start == 0 {
+                                    POST_WAIT_MS.store(
+                                        now_ms as u32,
+                                        core::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    should_wait = true;
+                                } else if (now_ms as u32).wrapping_sub(start) < 250 {
+                                    should_wait = true;
+                                }
+                            }
+                        }
+                    }
                 }
-                if n > 0 {
+
+                if !should_wait {
+                    POST_WAIT_MS.store(0, core::sync::atomic::Ordering::Relaxed);
+                    let mut req_buf = [0u8; 1024];
+                    let mut req_len = 0;
+                    while req_len < req_buf.len() && http_sock.can_recv() {
+                        let chunk = http_sock.recv_slice(&mut req_buf[req_len..]).unwrap_or(0);
+                        if chunk == 0 {
+                            break;
+                        }
+                        req_len += chunk;
+                    }
+                    while http_sock.can_recv() {
+                        let _ = http_sock.recv(|buf| (buf.len(), ()));
+                    }
+                    if req_len > 0 {
                     let amp_mode_str = match s.amp.mode() {
                         louder_esp32_app::AmpMode::Play => "Play",
                         louder_esp32_app::AmpMode::Standby => "Standby",
@@ -3345,11 +3402,32 @@ mod xtensa_hw {
                         },
                         bt_sub_status: 0,
                     };
+                    let snapshot = snap.clone();
+                    let mut resp_buf = &mut s.http_resp_buf[..];
+                    let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
+                        "",
+                        "",
+                        "string",
+                    ); 20];
+                    let mut view_len = 0usize;
+                    let nvs_overrides = s.config.nvs_overrides();
+                    for slot in &nvs_overrides {
+                        if slot.used && view_len < extra_views.len() {
+                            extra_views[view_len] =
+                                louder_esp32_app::http_control::ConfigEntryView::new(
+                                    slot.key.as_str(),
+                                    slot.value.as_str(),
+                                    "string",
+                                );
+                            view_len += 1;
+                        }
+                    }
                     if let Some((hdr_or_resp_len, static_body, action)) =
-                        handle_http_request_streaming(
-                            &req_buf[..n],
-                            &snap,
-                            &mut s.http_resp_buf[..],
+                        louder_esp32_app::http_control::handle_http_request_streaming_with_entries(
+                            &req_buf[..req_len],
+                            &snapshot,
+                            &extra_views[..view_len],
+                            &mut resp_buf,
                         )
                     {
                         let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
@@ -3362,12 +3440,12 @@ mod xtensa_hw {
                             if s.pending_http_body.is_empty() {
                                 http_sock.close();
                                 s.pending_http_closing = true;
-                                s.pending_close_deadline_ms = now_ms + 500;
+                                s.pending_close_deadline_ms = now_ms + 80;
                             }
                         } else {
                             http_sock.close();
                             s.pending_http_closing = true;
-                            s.pending_close_deadline_ms = now_ms + 500;
+                            s.pending_close_deadline_ms = now_ms + 80;
                         }
                         match action {
                             HttpControlAction::SetEqPreset(preset_id) => {
@@ -3448,13 +3526,26 @@ mod xtensa_hw {
                                 s.pending_http_action = action;
                                 s.pending_action_deadline_ms = now_ms + 250;
                             }
-                            HttpControlAction::UpdateConfig
-                            | HttpControlAction::ExecuteCliCommand
+                            HttpControlAction::UpdateConfig => {
+                                let _ = dispatch_web_post_action(
+                                    action,
+                                    &req_buf[..req_len],
+                                    &snap,
+                                    s.config,
+                                    &mut *s.journal,
+                                );
+                                let cfg_snap = s.config.read(|cfg| cfg.clone());
+                                if let Some(ip) = cfg_snap.lms_server_ip {
+                                    s.lms_ip = ip;
+                                }
+                                s.current_vol_pct = cfg_snap.volume;
+                            }
+                            HttpControlAction::ExecuteCliCommand
                             | HttpControlAction::TriggerWifiScan => {
                                 let _ = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
-                                    &snap,
+                                    &req_buf[..req_len],
+                                    &snapshot,
                                     s.config,
                                     &mut *s.journal,
                                 );
@@ -3462,8 +3553,8 @@ mod xtensa_hw {
                             HttpControlAction::ConnectWifi => {
                                 if let Some(creds) = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
-                                    &snap,
+                                    &req_buf[..req_len],
+                                    &snapshot,
                                     s.config,
                                     &mut *s.journal,
                                 ) {
@@ -3488,7 +3579,7 @@ mod xtensa_hw {
                             HttpControlAction::DisconnectWifi => {
                                 let _ = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
+                                    &req_buf[..req_len],
                                     &snap,
                                     s.config,
                                     &mut *s.journal,
@@ -3499,7 +3590,7 @@ mod xtensa_hw {
                             HttpControlAction::StartOtaFlash => {
                                 let _ = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
+                                    &req_buf[..req_len],
                                     &snap,
                                     s.config,
                                     &mut *s.journal,
@@ -3513,6 +3604,7 @@ mod xtensa_hw {
                         http_sock.close();
                         s.pending_http_closing = true;
                         s.pending_close_deadline_ms = now_ms + 250;
+                    }
                     }
                 }
             }
@@ -4109,7 +4201,23 @@ mod xtensa_hw {
 
         if now_ms.saturating_sub(s.last_config_poll_ms) >= 100 {
             s.last_config_poll_ms = now_ms;
-            s.config_writer.poll(s.config, &mut *s.journal, now_ms);
+            if s.config_writer.poll(s.config, &mut *s.journal, now_ms) {
+                if let Some(image) = s.journal.pending_image() {
+                    s.core1.park_for_flash_write();
+                    #[cfg(not(feature = "runtime-flash-persist"))]
+                    let offset = SETTINGS_JOURNAL_OFFSET;
+                    #[cfg(feature = "runtime-flash-persist")]
+                    let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
+                    let _ = s.flash.erase(offset, offset + 4096);
+                    if image.used_len > 16 {
+                        let _ = s.flash.write_nor(offset + 16, &image.sector[16..image.used_len]);
+                    }
+                    let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
+                    let _ = s.flash.write_nor(offset, &image.sector[..16]);
+                    s.journal.mark_flash_written();
+                    s.core1.unpark_after_flash_write();
+                }
+            }
         }
     }
 

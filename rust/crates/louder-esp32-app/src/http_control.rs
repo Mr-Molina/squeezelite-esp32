@@ -589,6 +589,9 @@ pub fn write_config_json(
     out_buf: &mut [u8],
 ) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
+    let find_override = |k: &str| -> Option<&str> {
+        extra_entries.iter().find(|e| e.key == k).map(|e| e.value)
+    };
     write!(writer, "{{\"settings_seq\":{},\"gpio\":[", snapshot.settings_seq).ok()?;
     for (idx, pin) in BOARD_GPIO_MAP.iter().enumerate() {
         if idx > 0 {
@@ -625,17 +628,28 @@ pub fn write_config_json(
         if crate::config_handle::is_secret_config_key(key) {
             continue;
         }
+        let effective_val = find_override(key).unwrap_or(val);
         write!(
             writer,
             ",\"{}\":{{\"value\":\"{}\",\"type\":{}}}",
             JsonEscaped(key),
-            JsonEscaped(val),
+            JsonEscaped(effective_val),
             nvs_type,
         )
         .ok()?;
     }
     for entry in extra_entries {
         if crate::config_handle::is_secret_config_key(entry.key) {
+            continue;
+        }
+        if DEFAULT_NVS_CONFIG_ENTRIES
+            .iter()
+            .any(|&(k, _, _)| k == entry.key)
+            || matches!(
+                entry.key,
+                "lms_ip" | "volume" | "again_code"
+            )
+        {
             continue;
         }
         write!(
@@ -647,12 +661,19 @@ pub fn write_config_json(
         )
         .ok()?;
     }
+    let host_name_val = find_override("host_name").unwrap_or("BASEMENT");
+    let autoexec_val = find_override("autoexec").unwrap_or("1");
+    let autoexec1_val = find_override("autoexec1")
+        .unwrap_or("squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W");
     write!(
         writer,
-        "}},\"nvs\":{{\"host_name\":{{\"value\":\"BASEMENT\",\"type\":33}},\
-         \"autoexec\":{{\"value\":\"1\",\"type\":1}},\
-         \"autoexec1\":{{\"value\":\"squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W\",\
-         \"type\":33}}}}}}"
+        "}},\"nvs\":{{\"host_name\":{{\"value\":\"{}\",\"type\":33}},\
+         \"autoexec\":{{\"value\":\"{}\",\"type\":1}},\
+         \"autoexec1\":{{\"value\":\"{}\",\
+         \"type\":33}}}}}}",
+        JsonEscaped(host_name_val),
+        JsonEscaped(autoexec_val),
+        JsonEscaped(autoexec1_val),
     )
     .ok()?;
     Some(writer.written_len())
@@ -793,6 +814,14 @@ pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> 
             return Some(ParsedConfigUpdate {
                 key: "fwurl",
                 value: fwurl,
+            });
+        }
+    }
+    if let Some(eq) = extract_param_or_json_field(input, "equalizer") {
+        if !eq.is_empty() {
+            return Some(ParsedConfigUpdate {
+                key: "equalizer",
+                value: eq,
             });
         }
     }
@@ -2118,7 +2147,7 @@ impl HttpControlRouter {
                 return Some((resp_bytes.len(), &[], HttpControlAction::None));
             }
         }
-        handle_http_request_streaming_impl(req_bytes, snapshot, out_buf)
+        handle_http_request_streaming_impl(req_bytes, snapshot, &[], out_buf)
     }
 
     /// Handles an HTTP request into `out_buf`.
@@ -2180,6 +2209,7 @@ fn is_permitted_origin(req_bytes: &[u8]) -> bool {
 pub fn handle_http_request_streaming_impl(
     req_bytes: &[u8],
     snapshot: &HttpStatusSnapshot<'_>,
+    extra_entries: &[ConfigEntryView<'_>],
     out_buf: &mut [u8],
 ) -> Option<(usize, &'static [u8], HttpControlAction)> {
     let line_end = req_bytes.iter().position(|&b| b == b'\n')?;
@@ -2622,12 +2652,23 @@ pub fn handle_http_request_streaming_impl(
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], HttpControlAction::None))
         }
+        ("POST", "/eq.json") => {
+            const HEADER_ROOM: usize = 160;
+            if out_buf.len() <= HEADER_ROOM {
+                return None;
+            }
+            let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+            writer.write_str("{\"ok\":true,\"result\":\"OK\"}").ok()?;
+            let body_len = writer.written_len();
+            let total_len = write_json_http_response(body_len, out_buf)?;
+            Some((total_len, &[], HttpControlAction::UpdateConfig))
+        }
         ("GET", "/config.json") => {
             const HEADER_ROOM: usize = 160;
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
-            let body_len = write_config_json(snapshot, &[], &mut out_buf[HEADER_ROOM..])?;
+            let body_len = write_config_json(snapshot, extra_entries, &mut out_buf[HEADER_ROOM..])?;
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], HttpControlAction::None))
         }
@@ -2876,7 +2917,19 @@ pub fn handle_http_request_streaming(
     snapshot: &HttpStatusSnapshot<'_>,
     out_buf: &mut [u8],
 ) -> Option<(usize, &'static [u8], HttpControlAction)> {
-    HttpControlRouter::new().handle_request_streaming(req_bytes, snapshot, out_buf)
+    handle_http_request_streaming_impl(req_bytes, snapshot, &[], out_buf)
+}
+
+/// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
+/// response for JSON) into `out_buf`, including caller-supplied configuration
+/// entries in `GET /config.json`.
+pub fn handle_http_request_streaming_with_entries(
+    req_bytes: &[u8],
+    snapshot: &HttpStatusSnapshot<'_>,
+    extra_entries: &[ConfigEntryView<'_>],
+    out_buf: &mut [u8],
+) -> Option<(usize, &'static [u8], HttpControlAction)> {
+    handle_http_request_streaming_impl(req_bytes, snapshot, extra_entries, out_buf)
 }
 
 /// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1

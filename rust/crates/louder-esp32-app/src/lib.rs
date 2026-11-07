@@ -83,4 +83,5 @@ pub use network::{HttpAudioStream, LmsDiscovery, RaopStreamClient, SlimprotoClie
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};
 pub use squeezelite_tas58xx::{Play, PowerDown, Standby, Tas58xx};
+pub use http_control::handle_http_request_streaming_with_entries;
 

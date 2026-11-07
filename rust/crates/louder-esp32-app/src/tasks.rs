@@ -1124,11 +1124,18 @@ mod device {
                 && http_sock.may_send()
             {
                 let mut req_buf = [0u8; 1024];
-                let n = http_sock.recv_slice(&mut req_buf).unwrap_or(0);
+                let mut req_len = 0;
+                while req_len < req_buf.len() && http_sock.can_recv() {
+                    let chunk = http_sock.recv_slice(&mut req_buf[req_len..]).unwrap_or(0);
+                    if chunk == 0 {
+                        break;
+                    }
+                    req_len += chunk;
+                }
                 while http_sock.can_recv() {
                     let _ = http_sock.recv(|buf| (buf.len(), ()));
                 }
-                if n > 0 {
+                if req_len > 0 {
                     let amp_mode_str = match s.amp.mode() {
                         louder_esp32_app::AmpMode::Play => "Play",
                         louder_esp32_app::AmpMode::Standby => "Standby",
@@ -1222,11 +1229,32 @@ mod device {
                         },
                         bt_sub_status: 0,
                     };
+                    let snapshot = snap.clone();
+                    let mut resp_buf = &mut s.http_resp_buf[..];
+                    let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
+                        "",
+                        "",
+                        "string",
+                    ); 20];
+                    let mut view_len = 0usize;
+                    let nvs_overrides = s.config.nvs_overrides();
+                    for slot in &nvs_overrides {
+                        if slot.used && view_len < extra_views.len() {
+                            extra_views[view_len] =
+                                louder_esp32_app::http_control::ConfigEntryView::new(
+                                    slot.key.as_str(),
+                                    slot.value.as_str(),
+                                    "string",
+                                );
+                            view_len += 1;
+                        }
+                    }
                     if let Some((hdr_or_resp_len, static_body, action)) =
-                        handle_http_request_streaming(
-                            &req_buf[..n],
-                            &snap,
-                            &mut s.http_resp_buf[..],
+                        louder_esp32_app::http_control::handle_http_request_streaming_with_entries(
+                            &req_buf[..req_len],
+                            &snapshot,
+                            &extra_views[..view_len],
+                            &mut resp_buf,
                         )
                     {
                         let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
@@ -1306,7 +1334,7 @@ mod device {
                             | HttpControlAction::TriggerWifiScan => {
                                 let _ = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
+                                    &req_buf[..req_len],
                                     &snap,
                                     s.config,
                                     &mut *s.journal,
@@ -1315,7 +1343,7 @@ mod device {
                             HttpControlAction::ConnectWifi => {
                                 if let Some(creds) = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
+                                    &req_buf[..req_len],
                                     &snap,
                                     s.config,
                                     &mut *s.journal,
@@ -1342,7 +1370,7 @@ mod device {
                             HttpControlAction::DisconnectWifi => {
                                 let _ = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
+                                    &req_buf[..req_len],
                                     &snap,
                                     s.config,
                                     &mut *s.journal,
@@ -1353,7 +1381,7 @@ mod device {
                             HttpControlAction::StartOtaFlash => {
                                 let _ = dispatch_web_post_action(
                                     action,
-                                    &req_buf[..n],
+                                    &req_buf[..req_len],
                                     &snap,
                                     s.config,
                                     &mut *s.journal,
