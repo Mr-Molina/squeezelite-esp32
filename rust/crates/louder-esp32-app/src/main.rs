@@ -1134,7 +1134,7 @@ mod xtensa_hw {
     // in DRAM2.
     // SAFETY: Managed as singleton heap storage by single Bluetooth task context.
     #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 14 * 1024]> =
+    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 12 * 1024]> =
         core::mem::MaybeUninit::uninit();
     #[allow(unsafe_code)]
     // JUSTIFICATION: Static allocation for Bluetooth A2DP sink state machine in
