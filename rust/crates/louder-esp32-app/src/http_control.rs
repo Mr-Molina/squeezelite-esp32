@@ -1195,6 +1195,20 @@ impl SyslogRingBuffer {
 static WEB_SYSLOG_RING: Mutex<CriticalSectionRawMutex, RefCell<SyslogRingBuffer>> =
     Mutex::new(RefCell::new(SyslogRingBuffer::new()));
 
+/// Appends a runtime event to the global web syslog ring buffer without heap
+/// allocation.
+pub fn push_runtime_syslog(level: &str, msg_class: &str, msg: &str, timestamp_ms: u64) {
+    WEB_SYSLOG_RING.lock(|cell| {
+        cell.borrow_mut().push(timestamp_ms, level, msg_class, msg);
+    });
+}
+
+/// Appends a runtime event to the web syslog ring buffer (alias for
+/// [`push_runtime_syslog`]).
+pub fn push_syslog_entry(level: &str, msg_class: &str, msg: &str, timestamp_ms: u64) {
+    push_runtime_syslog(level, msg_class, msg, timestamp_ms);
+}
+
 /// Applies a configuration key-value mutation from `/config.json` to
 /// [`crate::config_handle::ConfigHandle`] and logs the update to `syslog`.
 pub fn apply_web_config_update(
@@ -2836,7 +2850,7 @@ pub fn handle_http_request_streaming_impl(
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], action))
         }
-        ("GET", "/messages.json") => {
+        ("GET", "/messages.json") | ("GET", "/syslog.json") => {
             const HEADER_ROOM: usize = 160;
             if out_buf.len() <= HEADER_ROOM {
                 return None;
@@ -4141,6 +4155,36 @@ mod tests {
         assert!(body.contains("\"messages\":["));
         assert!(body.contains("MESSAGING_CLASS_STATS"));
         assert!(body.contains("MESSAGING_INFO"));
+    }
+
+    #[test]
+    fn test_syslog_json_route_and_push_runtime_syslog() {
+        let snap = sample_snapshot();
+        push_runtime_syslog(
+            "WARN",
+            "MESSAGING_CLASS_SYSTEM",
+            "I2C NACK on read op",
+            snap.uptime_ms,
+        );
+        let req = b"GET /syslog.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
+        let (resp, _) = handle_request_bytes(req, &snap, None);
+        let body = extract_http_body(&resp);
+        assert!(body.contains("\"messages\":["));
+        assert!(body.contains("I2C NACK on read op"));
+        assert!(body.contains("MESSAGING_WARNING"));
+        assert!(body.contains("MESSAGING_CLASS_SYSTEM"));
+        assert!(body.contains("MESSAGING_CLASS_STATS"));
+
+        push_syslog_entry(
+            "ERROR",
+            "MESSAGING_CLASS_SYSTEM",
+            "TAS5805M fault recovery cooldown",
+            snap.uptime_ms,
+        );
+        let (resp2, _) = handle_request_bytes(req, &snap, None);
+        let body2 = extract_http_body(&resp2);
+        assert!(body2.contains("TAS5805M fault recovery cooldown"));
+        assert!(body2.contains("MESSAGING_ERROR"));
     }
 
     #[test]

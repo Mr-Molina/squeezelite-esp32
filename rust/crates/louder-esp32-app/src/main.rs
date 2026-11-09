@@ -2374,6 +2374,17 @@ mod xtensa_hw {
         wifi_connected_logged: bool,
         last_fault_recovery_ms: u64,
         last_bt_idle_poll_ms: u64,
+        boot_ota0_confirmed: bool,
+        was_wifi_connected: bool,
+        disconnect_count: u32,
+        last_wifi_reconnect_ms: u64,
+        cached_raop_mdns: [u8; 512],
+        cached_raop_mdns_len: usize,
+        cached_spot_mdns: [u8; 384],
+        cached_spot_mdns_len: usize,
+        cached_mdns_ip: [u8; 4],
+        cached_mdns_raop_name: heapless::String<32>,
+        cached_mdns_cspot_name: heapless::String<32>,
     }
 
     /// Device entry: bring-up, then the Phase 0+1 + Multi-Protocol runtime
@@ -2848,6 +2859,17 @@ mod xtensa_hw {
             wifi_connected_logged: false,
             last_fault_recovery_ms: 0,
             last_bt_idle_poll_ms: 0,
+            boot_ota0_confirmed: false,
+            was_wifi_connected: false,
+            disconnect_count: 0,
+            last_wifi_reconnect_ms: 0,
+            cached_raop_mdns: [0u8; 512],
+            cached_raop_mdns_len: 0,
+            cached_spot_mdns: [0u8; 384],
+            cached_spot_mdns_len: 0,
+            cached_mdns_ip: [0u8; 4],
+            cached_mdns_raop_name: heapless::String::new(),
+            cached_mdns_cspot_name: heapless::String::new(),
         }));
         sync_config_to_runtime(state);
         state
@@ -2951,6 +2973,26 @@ mod xtensa_hw {
     }
 
     #[inline(never)]
+    fn persist_ota_0_boot_partition(s: &mut DeviceRuntimeState) -> bool {
+        let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
+        s.core1.park_for_flash_write();
+        let ok = s
+            .flash
+            .write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes)
+            .is_ok();
+        s.core1.unpark_after_flash_write();
+        ok
+    }
+
+    #[inline(never)]
+    fn erase_otadata_for_factory_recovery(s: &mut DeviceRuntimeState) -> bool {
+        s.core1.park_for_flash_write();
+        s.flash
+            .erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END)
+            .is_ok()
+    }
+
+    #[inline(never)]
     fn flush_settings_before_reboot(s: &mut DeviceRuntimeState) {
         s.core1.park_for_flash_write();
         let _ = s.amp.set_mute(true);
@@ -2996,6 +3038,12 @@ mod xtensa_hw {
                 s.lms_ip = ip;
                 s.coordinator.lms_ip = ip;
                 s.slim_switch_to = Some(ip);
+                louder_esp32_app::http_control::push_runtime_syslog(
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "slimproto: switching LMS server endpoint",
+                    s.now_ms,
+                );
             }
         }
 
@@ -3157,11 +3205,36 @@ mod xtensa_hw {
             s.wifi_connected_logged = false;
         }
 
+        if wifi_connected && s.assigned_ip.is_some() && !s.boot_ota0_confirmed {
+            let ok = persist_ota_0_boot_partition(s);
+            s.boot_ota0_confirmed = true;
+            if ok {
+                louder_esp32_app::http_control::push_runtime_syslog(
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "boot: ota_0 confirmed healthy; otadata pinned to ota_0",
+                    now_ms,
+                );
+            }
+        }
+
+        if s.was_wifi_connected && !wifi_connected {
+            s.disconnect_count = s.disconnect_count.saturating_add(1);
+            louder_esp32_app::http_control::push_runtime_syslog(
+                "WARN",
+                "MESSAGING_CLASS_SYSTEM",
+                "wifi: station disconnected; scheduling reconnect",
+                now_ms,
+            );
+        }
+        s.was_wifi_connected = wifi_connected;
+
         if !wifi_connected
             && (s.last_connect_attempt_ms == 0
                 || now_ms.saturating_sub(s.last_connect_attempt_ms) >= 5_000)
         {
             s.last_connect_attempt_ms = now_ms.max(1);
+            s.last_wifi_reconnect_ms = now_ms;
             let mut connect_fut = pin!(s.wifi_controller.connect_async());
             let waker = Waker::noop();
             let mut cx = Context::from_waker(waker);
@@ -3174,9 +3247,11 @@ mod xtensa_hw {
             s.assigned_ip.is_some(),
         ) == LeaseHealth::ExpiredResetToRecovery
         {
+            flush_settings_before_reboot(s);
             println!(
                 "[ANTI-BRICK GATE 3] Network lease timeout expired -> \
-                 resetting to recovery (0x10000)"
+                 resetting (otadata confirmed={})",
+                s.boot_ota0_confirmed
             );
             esp_hal::system::software_reset();
         }
@@ -3243,8 +3318,20 @@ mod xtensa_hw {
                     "[DHCPv4] Acquired IP {}.{}.{}.{}/{}",
                     ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3], prefix_len
                 );
+                louder_esp32_app::http_control::push_runtime_syslog(
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "net: DHCPv4 lease acquired",
+                    now_ms,
+                );
             }
             Some(dhcpv4::Event::Deconfigured) => {
+                louder_esp32_app::http_control::push_runtime_syslog(
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "net: DHCPv4 lease deconfigured",
+                    now_ms,
+                );
                 s.assigned_ip = None;
                 s.smol_iface.update_ip_addrs(|addrs| addrs.clear());
                 let _ = s
@@ -3493,6 +3580,10 @@ mod xtensa_hw {
                                 }
                             })
                         });
+                    let i2c_acks = Esp32I2cBus::hw_ack_count();
+                    let i2c_nacks = Esp32I2cBus::hw_nack_count();
+                    let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
+                    let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
                     let snap = HttpStatusSnapshot {
                         ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
                         netmask: s.assigned_mask,
@@ -3502,13 +3593,13 @@ mod xtensa_hw {
                         lms_ip: s.lms_ip,
                         lms_port: 9000,
                         lms_cport: 9090,
-                        otadata_prearmed_factory: true,
+                        otadata_prearmed_factory: !s.boot_ota0_confirmed,
                         frames_played: s.pipeline.frames_played,
                         amp_mode: amp_mode_str,
                         vol_pct: s.current_vol_pct,
-                        i2c_acks: Esp32I2cBus::hw_ack_count(),
-                        i2c_nacks: Esp32I2cBus::hw_nack_count(),
-                        i2c_nack_by_op: Esp32I2cBus::hw_nack_by_op(),
+                        i2c_acks,
+                        i2c_nacks,
+                        i2c_nack_by_op,
                         uptime_ms: now_ms.saturating_sub(s.boot_ms),
                         psram_free_bytes,
                         psram_used_bytes,
@@ -3535,9 +3626,9 @@ mod xtensa_hw {
                         decode_us_first: s.pipeline.decode_us_first,
                         jack_inserted: false,
                         voltage_mv: 0,
-                        disconnect_count: 0,
+                        disconnect_count: s.disconnect_count,
                         avg_conn_time_ms: 0,
-                        is_i2c_locked: false,
+                        is_i2c_locked,
                         urc: if s.assigned_ip.is_some() { 0 } else { 2 },
                         bt_status: if s.bt_sink.is_streaming() {
                             2
@@ -3767,25 +3858,21 @@ mod xtensa_hw {
             flush_settings_before_reboot(s);
             match action {
                 HttpControlAction::RebootToRecovery => {
+                    let _ = erase_otadata_for_factory_recovery(s);
                     println!(
-                        "[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json \
-                         -> resetting into factory recovery (0x10000)"
+                        "[ANTI-BRICK GATE 4] HTTP /recovery.json \
+                         -> erased otadata & resetting into factory recovery (0x10000)"
                     );
                     esp_hal::system::software_reset();
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    let mut verify_buf = [0u8; 32];
-                    if s.flash.write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes).is_ok()
-                        && s.flash.read_nor(OTADATA_PARTITION_OFFSET, &mut verify_buf).is_ok()
-                        && verify_buf == entry_bytes
-                    {
-                        println!(
-                            "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
-                             wrote ota_0 select entry & resetting"
-                        );
-                        esp_hal::system::software_reset();
-                    }
+                    let _ = s.flash.write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes);
+                    println!(
+                        "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
+                         wrote ota_0 select entry & resetting"
+                    );
+                    esp_hal::system::software_reset();
                 }
                 _ => {}
             }
@@ -3995,7 +4082,11 @@ mod xtensa_hw {
                     }
                 }
 
-                if airplay_enabled && should_announce_raop && mdns_sock.can_send() {
+                let mdns_cache_stale = local_ip != s.cached_mdns_ip
+                    || raop_name.as_str() != s.cached_mdns_raop_name.as_str()
+                    || cspot_name.as_str() != s.cached_mdns_cspot_name.as_str()
+                    || (s.cached_raop_mdns_len == 0 && s.cached_spot_mdns_len == 0);
+                if mdns_cache_stale {
                     let mcfg = MdnsConfig {
                         player_name: alloc::string::String::from(raop_name.as_str()),
                         mac_address: s.sta_mac,
@@ -4003,9 +4094,10 @@ mod xtensa_hw {
                         port: 5000,
                     };
                     let rpkt = MdnsBuilder::build_announcement(&mcfg);
-                    let _ = mdns_sock.send_slice(&rpkt, raop_ep);
-                }
-                if cspot_enabled && should_announce_spotify && mdns_sock.can_send() {
+                    let rlen = rpkt.len().min(s.cached_raop_mdns.len());
+                    s.cached_raop_mdns[..rlen].copy_from_slice(&rpkt[..rlen]);
+                    s.cached_raop_mdns_len = rlen;
+
                     let scfg = SpotifyMdnsConfig {
                         player_name: alloc::string::String::from(cspot_name.as_str()),
                         mac_address: s.sta_mac,
@@ -4013,7 +4105,34 @@ mod xtensa_hw {
                         port: 80,
                     };
                     let spkt = SpotifyMdnsBuilder::build_announcement(&scfg);
-                    let _ = mdns_sock.send_slice(&spkt, spot_ep);
+                    let slen = spkt.len().min(s.cached_spot_mdns.len());
+                    s.cached_spot_mdns[..slen].copy_from_slice(&spkt[..slen]);
+                    s.cached_spot_mdns_len = slen;
+
+                    s.cached_mdns_ip = local_ip;
+                    s.cached_mdns_raop_name = raop_name.clone();
+                    s.cached_mdns_cspot_name = cspot_name.clone();
+                }
+
+                if airplay_enabled
+                    && should_announce_raop
+                    && s.cached_raop_mdns_len > 0
+                    && mdns_sock.can_send()
+                {
+                    let _ = mdns_sock.send_slice(
+                        &s.cached_raop_mdns[..s.cached_raop_mdns_len],
+                        raop_ep,
+                    );
+                }
+                if cspot_enabled
+                    && should_announce_spotify
+                    && s.cached_spot_mdns_len > 0
+                    && mdns_sock.can_send()
+                {
+                    let _ = mdns_sock.send_slice(
+                        &s.cached_spot_mdns[..s.cached_spot_mdns_len],
+                        spot_ep,
+                    );
                 }
             }
         }
@@ -4366,6 +4485,12 @@ mod xtensa_hw {
                 {
                     s.last_fault_recovery_ms = now_ms;
                     let _ = s.amp.recover_from_fault();
+                    louder_esp32_app::http_control::push_runtime_syslog(
+                        "WARN",
+                        "MESSAGING_CLASS_SYSTEM",
+                        "amp: TAS5805M fault detected and cleared",
+                        now_ms,
+                    );
                 }
             }
         }

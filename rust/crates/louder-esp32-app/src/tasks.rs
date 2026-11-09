@@ -308,7 +308,7 @@ mod device {
         TcpPhase, TcpSocketOps,
     };
     use louder_esp32_app::ota_safety::{
-        OtaSelectEntry, WifiStaCredentials,
+        OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_END,
         OTADATA_PARTITION_OFFSET as OTADATA_SECTOR_0_OFFSET, SETTINGS_JOURNAL_OFFSET,
     };
     use louder_esp32_app::pipeline::ActiveDecoder;
@@ -1535,21 +1535,21 @@ mod device {
             flush_settings_before_reboot(s);
             match s.pending_http_action {
                 HttpControlAction::RebootToRecovery => {
+                    let _ = s.flash.erase(OTADATA_SECTOR_0_OFFSET, OTADATA_PARTITION_END);
                     println!(
-                        "[ANTI-BRICK GATE 4] HTTP /recovery.json or /reboot.json \
-                         -> resetting into factory recovery (0x10000)"
+                        "[ANTI-BRICK GATE 4] HTTP /recovery.json \
+                         -> erased otadata & resetting into factory recovery (0x10000)"
                     );
                     esp_hal::system::software_reset();
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    if s.flash.write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes).is_ok() {
-                        println!(
-                            "[ANTI-BRICK GATE 4] HTTP /reboot_ota.json -> \
-                             wrote ota_0 select entry & resetting"
-                        );
-                        esp_hal::system::software_reset();
-                    }
+                    let _ = s.flash.write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes);
+                    println!(
+                        "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
+                         wrote ota_0 select entry & resetting"
+                    );
+                    esp_hal::system::software_reset();
                 }
                 _ => {}
             }
