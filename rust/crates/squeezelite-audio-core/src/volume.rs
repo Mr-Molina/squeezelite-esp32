@@ -121,6 +121,25 @@ fn q16(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
+/// Multiplies a sample `s` by fixed-point gain `g` without clamping.
+///
+/// Mathematical range proof:
+/// When `-FIXED_ONE < g && g <= FIXED_ONE` (`-0xFFFF <= g <= 0x1_0000`), for
+/// every `s: i32`:
+/// - Max positive product: `0x1_0000 * i32::MAX = 0x7fff_ffff_0000 <=
+///   MAX_SCALESAMPLE`, and `(-0xFFFF) * i32::MIN = 0x7fff_8000_0000 <=
+///   MAX_SCALESAMPLE`.
+/// - Min negative product: `0x1_0000 * i32::MIN = -0x8000_0000_0000`, where
+///   `(-0x8000_0000_0000_i64 >> 16) as i32 == i32::MIN == gain(FIXED_ONE,
+///   i32::MIN)`.
+/// - Strict `<` on `-FIXED_ONE` is required because `g = -FIXED_ONE`
+///   (`-0x1_0000`) at `s = i32::MIN` yields `+0x8000_0000_0000 >
+///   MAX_SCALESAMPLE`, requiring clamping to `i32::MAX`.
+#[inline(always)]
+fn gain_unclamped(g: i32, s: i32) -> i32 {
+    ((i64::from(g) * i64::from(s)) >> 16) as i32
+}
+
 impl GainStage {
     /// Unity volume, no replay gain, no fade, no inversion, stereo.
     #[must_use]
@@ -196,6 +215,8 @@ impl GainStage {
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn apply(&self, samples: &mut [i32]) {
         let (gl, gr) = self.channel_gains();
+        let unclamped_l = -FIXED_ONE < gl && gl <= FIXED_ONE;
+        let unclamped_r = -FIXED_ONE < gr && gr <= FIXED_ONE;
         let frames = samples.chunks_exact_mut(2);
         match self.channel_mode {
             ChannelMode::Stereo => {
@@ -203,35 +224,70 @@ impl GainStage {
                 if gl == FIXED_ONE && gr == FIXED_ONE {
                     return;
                 }
-                for f in frames {
-                    f[0] = gain(gl, f[0]);
-                    f[1] = gain(gr, f[1]);
+                if unclamped_l && unclamped_r {
+                    for f in frames {
+                        f[0] = gain_unclamped(gl, f[0]);
+                        f[1] = gain_unclamped(gr, f[1]);
+                    }
+                } else {
+                    for f in frames {
+                        f[0] = gain(gl, f[0]);
+                        f[1] = gain(gr, f[1]);
+                    }
                 }
             }
             ChannelMode::MonoMix => {
-                // C parity: output_pack.c:386-392. Declared divergence: the sum is taken in
-                // 64 bits (C adds two s32_t, undefined on overflow); the result is identical
-                // whenever C's sum does not overflow. `/` truncates toward zero, as C.
-                for f in frames {
-                    let m = ((i64::from(gain(gl, f[0])) + i64::from(gain(gr, f[1]))) / 2) as i32;
-                    f[0] = m;
-                    f[1] = m;
+                // C parity: output_pack.c:386-392. Declared divergence: the sum
+                // is taken in 64 bits (C adds two s32_t, undefined on
+                // overflow); the result is identical whenever C's sum does not
+                // overflow. `/` truncates toward zero, as C.
+                if unclamped_l && unclamped_r {
+                    for f in frames {
+                        let m = ((i64::from(gain_unclamped(gl, f[0]))
+                            + i64::from(gain_unclamped(gr, f[1])))
+                            / 2) as i32;
+                        f[0] = m;
+                        f[1] = m;
+                    }
+                } else {
+                    for f in frames {
+                        let m =
+                            ((i64::from(gain(gl, f[0])) + i64::from(gain(gr, f[1]))) / 2) as i32;
+                        f[0] = m;
+                        f[1] = m;
+                    }
                 }
             }
             ChannelMode::RightOnly => {
                 // C parity: output_pack.c:394-399.
-                for f in frames {
-                    let r = gain(gr, f[1]);
-                    f[0] = r;
-                    f[1] = r;
+                if unclamped_r {
+                    for f in frames {
+                        let r = gain_unclamped(gr, f[1]);
+                        f[0] = r;
+                        f[1] = r;
+                    }
+                } else {
+                    for f in frames {
+                        let r = gain(gr, f[1]);
+                        f[0] = r;
+                        f[1] = r;
+                    }
                 }
             }
             ChannelMode::LeftOnly => {
                 // C parity: output_pack.c:400-405.
-                for f in frames {
-                    let l = gain(gl, f[0]);
-                    f[0] = l;
-                    f[1] = l;
+                if unclamped_l {
+                    for f in frames {
+                        let l = gain_unclamped(gl, f[0]);
+                        f[0] = l;
+                        f[1] = l;
+                    }
+                } else {
+                    for f in frames {
+                        let l = gain(gl, f[0]);
+                        f[0] = l;
+                        f[1] = l;
+                    }
                 }
             }
         }
@@ -239,6 +295,10 @@ impl GainStage {
 }
 
 /// Applies volume scaling to interleaved stereo 32-bit audio samples in-place.
+///
+/// Production firmware and audio pipeline code uses [`GainStage::apply`].
+/// This function is retained only as a standalone test and ring-buffer
+/// stress-test helper (`tests/stress_test.rs`).
 #[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn scale_samples_inplace(samples: &mut [i32], volume: VolumeScale) {
     if volume.muted {
@@ -613,5 +673,134 @@ mod tests {
         let mut s = [10, 20];
         g.apply(&mut s);
         assert_eq!(s, [-20, -20]);
+    }
+
+    #[test]
+    fn test_apply_unclamped_fast_path_matches_clamped_gain() {
+        // Reference implementation using clamped fade::gain for ground truth.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
+        fn reference_apply(stage: &GainStage, samples: &mut [i32]) {
+            let (gl, gr) = stage.channel_gains();
+            let frames = samples.chunks_exact_mut(2);
+            match stage.channel_mode {
+                ChannelMode::Stereo => {
+                    if gl == FIXED_ONE && gr == FIXED_ONE {
+                        return;
+                    }
+                    for f in frames {
+                        f[0] = gain(gl, f[0]);
+                        f[1] = gain(gr, f[1]);
+                    }
+                }
+                ChannelMode::MonoMix => {
+                    for f in frames {
+                        let m =
+                            ((i64::from(gain(gl, f[0])) + i64::from(gain(gr, f[1]))) / 2) as i32;
+                        f[0] = m;
+                        f[1] = m;
+                    }
+                }
+                ChannelMode::RightOnly => {
+                    for f in frames {
+                        let r = gain(gr, f[1]);
+                        f[0] = r;
+                        f[1] = r;
+                    }
+                }
+                ChannelMode::LeftOnly => {
+                    for f in frames {
+                        let l = gain(gl, f[0]);
+                        f[0] = l;
+                        f[1] = l;
+                    }
+                }
+            }
+        }
+
+        const BOUNDARY_SAMPLES: [i32; 9] = [
+            i32::MIN,
+            i32::MIN + 1,
+            -0x4000_0000,
+            -1,
+            0,
+            1,
+            0x4000_0000,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+
+        // Construct 81 stereo pairs from all boundary combinations + 1 odd
+        // trailing sample to verify the remainder is untouched.
+        let mut template = [0i32; 163];
+        let mut idx = 0;
+        for &s0 in &BOUNDARY_SAMPLES {
+            for &s1 in &BOUNDARY_SAMPLES {
+                template[idx] = s0;
+                template[idx + 1] = s1;
+                idx += 2;
+            }
+        }
+        const ODD_SENTINEL: i32 = 0x5a5a_33cc;
+        template[162] = ODD_SENTINEL;
+
+        let modes = [
+            ChannelMode::Stereo,
+            ChannelMode::MonoMix,
+            ChannelMode::RightOnly,
+            ChannelMode::LeftOnly,
+        ];
+
+        // Gain test cases: (vol_l, vol_r, replay_gain, invert)
+        // Tests required gains {0, 0x8000, 0xFFFF, 0x1_0000, -0xFFFF},
+        // fallback gain -0x1_0000 (-FIXED_ONE), and > FIXED_ONE (0x1_8000).
+        let gain_cases: &[(u32, u32, u32, bool)] = &[
+            (0, 0, 0, false),
+            (0x8000, 0x8000, 0, false),
+            (0xFFFF, 0xFFFF, 0, false),
+            (0x1_0000, 0x1_0000, 0, false),
+            (0xFFFF, 0xFFFF, 0, true),
+            // Boundary fallback: -FIXED_ONE (-0x1_0000) requires clamping.
+            (0x1_0000, 0x1_0000, 0, true),
+            // Boundary fallback: > FIXED_ONE (0x1_8000) via replay gain.
+            (0x1_0000, 0x1_0000, 0x1_8000, false),
+            // Mixed asymmetric gains.
+            (0x8000, 0x1_0000, 0, false),
+            (0x1_0000, 0x8000, 0, false),
+            (0x8000, 0x1_0000, 0x1_8000, false),
+            (0x1_8000, 0x1_0000, 0, false),
+            (0x1_0000, 0x1_8000, 0, false),
+        ];
+
+        for &mode in &modes {
+            for &(vl, vr, rg, inv) in gain_cases {
+                let stage = GainStage {
+                    volume_l_q16: vl,
+                    volume_r_q16: vr,
+                    replay_gain_q16: rg,
+                    fade_q16: FIXED_ONE as u32,
+                    invert_polarity: inv,
+                    channel_mode: mode,
+                };
+
+                let mut actual = template;
+                let mut expected = template;
+
+                stage.apply(&mut actual);
+                reference_apply(&stage, &mut expected);
+
+                assert_eq!(
+                    actual,
+                    expected,
+                    "mismatch in mode {:?} with gains {:?}",
+                    mode,
+                    (vl, vr, rg, inv)
+                );
+                assert_eq!(
+                    actual[162], ODD_SENTINEL,
+                    "trailing odd sample was mutated in mode {:?}",
+                    mode
+                );
+            }
+        }
     }
 }
