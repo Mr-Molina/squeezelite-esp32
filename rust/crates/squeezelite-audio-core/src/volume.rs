@@ -190,7 +190,9 @@ impl GainStage {
     /// Scales interleaved stereo `samples` in place, with polarity and channel
     /// select (C parity: output_pack.c:383-410 `_apply_gain`). A trailing odd
     /// sample is left alone.
-    #[inline]
+    // #[inline(never)] keeps codegen inside squeezelite-audio-core at
+    // opt-level = 3 when lto = false.
+    #[inline(never)]
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn apply(&self, samples: &mut [i32]) {
         let (gl, gr) = self.channel_gains();

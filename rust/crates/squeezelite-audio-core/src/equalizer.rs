@@ -539,8 +539,6 @@ impl<const BANDS: usize> Equalizer<BANDS> {
     /// Operates in normalized $[-1.0, 1.0]$ float domain with denormal flushing,
     /// NaN state isolation, and accurate 32-bit boundary saturation.
     #[inline]
-    #[cfg_attr(target_arch = "xtensa", link_section = ".iram1")]
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_interleaved(&mut self, samples: &mut [i32]) {
         if !self.enabled {
             return;
@@ -548,19 +546,6 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         if self.active_mask == 0 && !self.loudness_enabled {
             return;
         }
-
-        const NORM: f32 = 1.0 / 2147483648.0;
-        const DENORM: f32 = 2147483648.0;
-        const MAX_F32_I32: f32 = 2147483520.0; // Largest representable f32 <= i32::MAX
-        const MIN_F32_I32: f32 = i32::MIN as f32;
-        const ANTI_DENORMAL_DC: f32 = 1e-25_f32;
-
-        let loud_gain = if self.loudness_enabled {
-            horner_loudness(0.5)
-        } else {
-            1.0
-        };
-        let out_scale = DENORM * loud_gain;
 
         let mut active_indices = [0usize; BANDS];
         let mut active_count = 0;
@@ -575,86 +560,125 @@ impl<const BANDS: usize> Equalizer<BANDS> {
         }
         let active_bands = &active_indices[..active_count];
 
-        let mut chunks = samples.chunks_exact_mut(2);
-        for chunk in &mut chunks {
-            let mut l = chunk[0] as f32 * NORM;
-            let mut r = chunk[1] as f32 * NORM;
+        process_interleaved_iram(
+            &self.filters,
+            &mut self.hist_left,
+            &mut self.hist_right,
+            active_bands,
+            self.loudness_enabled,
+            samples,
+        );
+    }
+}
 
-            for &i in active_bands {
-                let f = &self.filters[i];
+// Non-generic DSP inner loop placed in .iram1 on Xtensa.
+// #[inline(never)] prevents inlining across compilation units, ensuring
+// the hot loop executes from IRAM at opt-level = 3 within
+// squeezelite-audio-core even when the caller binary builds at opt-level = 2
+// with lto = false.
+#[inline(never)]
+#[cfg_attr(target_arch = "xtensa", link_section = ".iram1")]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn process_interleaved_iram(
+    filters: &[BiquadCoeffs],
+    hist_left: &mut [(f32, f32)],
+    hist_right: &mut [(f32, f32)],
+    active_bands: &[usize],
+    loudness_enabled: bool,
+    samples: &mut [i32],
+) {
+    const NORM: f32 = 1.0 / 2147483648.0;
+    const DENORM: f32 = 2147483648.0;
+    const MAX_F32_I32: f32 = 2147483520.0; // Largest representable f32 <= i32::MAX
+    const MIN_F32_I32: f32 = i32::MIN as f32;
+    const ANTI_DENORMAL_DC: f32 = 1e-25_f32;
 
-                // Left channel biquad (Direct Form II Transposed)
-                let (z1_l, z2_l) = &mut self.hist_left[i];
-                let mut out_l = f.b0 * l + *z1_l;
-                if !out_l.is_finite() {
-                    *z1_l = 0.0;
-                    *z2_l = 0.0;
-                    out_l = 0.0;
-                } else {
-                    *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
-                    *z2_l = f.b2 * l - f.a2 * out_l + ANTI_DENORMAL_DC;
-                }
-                l = out_l;
+    let loud_gain = if loudness_enabled {
+        horner_loudness(0.5)
+    } else {
+        1.0
+    };
+    let out_scale = DENORM * loud_gain;
 
-                // Right channel biquad (Direct Form II Transposed)
-                let (z1_r, z2_r) = &mut self.hist_right[i];
-                let mut out_r = f.b0 * r + *z1_r;
-                if !out_r.is_finite() {
-                    *z1_r = 0.0;
-                    *z2_r = 0.0;
-                    out_r = 0.0;
-                } else {
-                    *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
-                    *z2_r = f.b2 * r - f.a2 * out_r + ANTI_DENORMAL_DC;
-                }
-                r = out_r;
+    let mut chunks = samples.chunks_exact_mut(2);
+    for chunk in &mut chunks {
+        let mut l = chunk[0] as f32 * NORM;
+        let mut r = chunk[1] as f32 * NORM;
+
+        for &i in active_bands {
+            let f = &filters[i];
+
+            // Left channel biquad (Direct Form II Transposed)
+            let (z1_l, z2_l) = &mut hist_left[i];
+            let mut out_l = f.b0 * l + *z1_l;
+            if !out_l.is_finite() {
+                *z1_l = 0.0;
+                *z2_l = 0.0;
+                out_l = 0.0;
+            } else {
+                *z1_l = f.b1 * l - f.a1 * out_l + *z2_l;
+                *z2_l = f.b2 * l - f.a2 * out_l + ANTI_DENORMAL_DC;
             }
+            l = out_l;
 
-            let scaled_l = l * out_scale;
-            let scaled_r = r * out_scale;
-            chunk[0] = if scaled_l.is_nan() {
-                0
+            // Right channel biquad (Direct Form II Transposed)
+            let (z1_r, z2_r) = &mut hist_right[i];
+            let mut out_r = f.b0 * r + *z1_r;
+            if !out_r.is_finite() {
+                *z1_r = 0.0;
+                *z2_r = 0.0;
+                out_r = 0.0;
             } else {
-                let rounded = if scaled_l >= 0.0 {
-                    scaled_l + 0.5
-                } else {
-                    scaled_l - 0.5
-                };
-                rounded.clamp(MIN_F32_I32, MAX_F32_I32) as i32
-            };
-            chunk[1] = if scaled_r.is_nan() {
-                0
-            } else {
-                let rounded = if scaled_r >= 0.0 {
-                    scaled_r + 0.5
-                } else {
-                    scaled_r - 0.5
-                };
-                rounded.clamp(MIN_F32_I32, MAX_F32_I32) as i32
-            };
+                *z1_r = f.b1 * r - f.a1 * out_r + *z2_r;
+                *z2_r = f.b2 * r - f.a2 * out_r + ANTI_DENORMAL_DC;
+            }
+            r = out_r;
         }
 
-        // Flush subnormal floats to prevent CPU traps once per active band after
-        // sample loop (DSP-006 / AUD2-FPU-001).
-        // Bitspace check (|z| < 1e-15_f32) avoids hardware FPU float
-        // comparisons on subnormals.
-        const SUBNORMAL_THRESHOLD_BITS: u32 = 0x268D_4FDF;
-        for &i in active_bands {
-            let (z1_l, z2_l) = &mut self.hist_left[i];
-            if (z1_l.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
-                *z1_l = 0.0;
-            }
-            if (z2_l.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
-                *z2_l = 0.0;
-            }
+        let scaled_l = l * out_scale;
+        let scaled_r = r * out_scale;
+        chunk[0] = if scaled_l.is_nan() {
+            0
+        } else {
+            let rounded = if scaled_l >= 0.0 {
+                scaled_l + 0.5
+            } else {
+                scaled_l - 0.5
+            };
+            rounded.clamp(MIN_F32_I32, MAX_F32_I32) as i32
+        };
+        chunk[1] = if scaled_r.is_nan() {
+            0
+        } else {
+            let rounded = if scaled_r >= 0.0 {
+                scaled_r + 0.5
+            } else {
+                scaled_r - 0.5
+            };
+            rounded.clamp(MIN_F32_I32, MAX_F32_I32) as i32
+        };
+    }
 
-            let (z1_r, z2_r) = &mut self.hist_right[i];
-            if (z1_r.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
-                *z1_r = 0.0;
-            }
-            if (z2_r.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
-                *z2_r = 0.0;
-            }
+    // Flush subnormal floats to prevent CPU traps once per active band after
+    // sample loop (DSP-006 / AUD2-FPU-001).
+    // Bitspace check (|z| < 1e-15_f32) avoids hardware FPU float
+    // comparisons on subnormals.
+    const SUBNORMAL_THRESHOLD_BITS: u32 = 0x268D_4FDF;
+    for &i in active_bands {
+        let (z1_l, z2_l) = &mut hist_left[i];
+        if (z1_l.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+            *z1_l = 0.0;
+        }
+        if (z2_l.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+            *z2_l = 0.0;
+        }
+
+        let (z1_r, z2_r) = &mut hist_right[i];
+        if (z1_r.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+            *z1_r = 0.0;
+        }
+        if (z2_r.to_bits() & 0x7FFF_FFFF) < SUBNORMAL_THRESHOLD_BITS {
+            *z2_r = 0.0;
         }
     }
 }

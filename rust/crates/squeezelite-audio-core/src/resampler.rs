@@ -205,7 +205,9 @@ impl Resampler {
     /// Processes interleaved stereo `i32` samples (`[L0, R0, L1, R1, ...]`),
     /// returning `(consumed_samples, produced_samples)` in `i32` elements
     /// (always even multiples of 2).
-    #[inline]
+    // #[inline(never)] keeps codegen inside squeezelite-audio-core at
+    // opt-level = 3 when lto = false.
+    #[inline(never)]
     pub fn process(&mut self, input: &[i32], output: &mut [i32]) -> (usize, usize) {
         if self.to_hz == 0 {
             return (0, 0);
