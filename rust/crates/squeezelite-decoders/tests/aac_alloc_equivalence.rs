@@ -19,8 +19,10 @@ use squeezelite_decoders::{AacDecoder, AudioDecoder, DecoderError};
 const FIXTURE: &[u8] = include_bytes!("fixtures/sine_440_1000_stereo_44k1_lc.aac");
 
 /// FNV-1a 64 over the little-endian bytes of every decoded i32 sample.
-/// In `std`, syom links platform x86 SIMD/math and yields `0xc928_58a4_46ca_5780`.
-/// In `no_std + alloc`, syom links `libm` and yields `0xec34_c84f_47bb_d5ed` (WO-199).
+/// In `std`, syom links platform x86 SIMD/math and yields
+/// `0xc928_58a4_46ca_5780`.
+/// In `no_std + alloc`, syom links `libm` and yields `0xec34_c84f_47bb_d5ed`
+/// (WO-199).
 const GOLDEN_PCM_FNV1A64_STD: u64 = 0xc928_58a4_46ca_5780;
 const GOLDEN_PCM_FNV1A64_NO_STD: u64 = 0xec34_c84f_47bb_d5ed;
 const GOLDEN_FRAMES: usize = 23552;
