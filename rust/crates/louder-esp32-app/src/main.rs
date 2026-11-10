@@ -915,7 +915,11 @@ mod xtensa_hw {
         // SAFETY: Placed in executable IRAM section with no side effects.
         #[unsafe(link_section = ".iram1")]
         fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
-            if data.is_empty() {
+            // Invariant 46: only whole 8-byte stereo frames may enter the
+            // circular DMA buffer; a partial frame would shift every later
+            // frame and swap L/R until the transfer restarts.
+            let valid_len = data.len() & !7;
+            if valid_len == 0 {
                 return Ok(0);
             }
             self.ensure_running();
@@ -924,14 +928,6 @@ mod xtensa_hw {
                 Some(t) => t,
                 None => return Ok(0),
             };
-
-            if data.len() < 8 {
-                let n = transfer.push(data);
-                note_dma_fill(transfer.available_bytes());
-                return Ok(n);
-            }
-
-            let valid_len = data.len() & !7;
 
             if !self.tx_enabled {
                 let silence = [0u8; 512];
