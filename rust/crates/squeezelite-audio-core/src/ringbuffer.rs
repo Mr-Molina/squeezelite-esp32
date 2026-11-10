@@ -115,11 +115,9 @@ impl<'a> AudioRingBuffer<'a> {
     /// whole audio frames of size `frame_bytes`.
     #[inline]
     pub fn available_write_frames(&self, frame_bytes: usize) -> usize {
-        if frame_bytes == 0 {
-            0
-        } else {
-            (self.available_write() / frame_bytes) * frame_bytes
-        }
+        self.available_write()
+            .checked_div(frame_bytes)
+            .map_or(0, |frames| frames * frame_bytes)
     }
 
     /// Writes data from `src` into the ringbuffer.
@@ -800,5 +798,22 @@ mod tests {
         rb.write(b"XYZ").unwrap();
         rb.rewind_read(usize::MAX);
         assert_eq!(read_all(&mut rb), b"abcXYZ");
+    }
+
+    #[test]
+    fn test_available_write_frames() {
+        let mut storage = [0u8; 17];
+        let rb = AudioRingBuffer::new(&mut storage);
+        // capacity is 17; available_write starts at 16 (capacity - 1).
+        assert_eq!(rb.available_write(), 16);
+        assert_eq!(rb.available_write_frames(0), 0);
+        assert_eq!(rb.available_write_frames(1), 16);
+        assert_eq!(rb.available_write_frames(4), 16);
+        assert_eq!(rb.available_write_frames(6), 12);
+        assert_eq!(rb.available_write_frames(8), 16);
+        assert_eq!(rb.available_write_frames(10), 10);
+        assert_eq!(rb.available_write_frames(16), 16);
+        assert_eq!(rb.available_write_frames(17), 0);
+        assert_eq!(rb.available_write_frames(32), 0);
     }
 }
