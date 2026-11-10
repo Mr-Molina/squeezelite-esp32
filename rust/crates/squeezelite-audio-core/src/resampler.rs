@@ -17,6 +17,10 @@ const HISTORY_CAP: usize = MAX_TAPS * 2;
 const ONE_Q30: i64 = 1_i64 << 30;
 const HALF_Q30: i64 = 1_i64 << 29;
 
+/// Maximum supported sample rate in Hz (`(1 << 20) - 1`), bounding phase math
+/// to 32-bit division without 64-bit software routines on Xtensa.
+pub const MAX_RESAMPLE_RATE_HZ: u32 = 1_048_575;
+
 /// Filter tap-length and stopband attenuation tier for [`Resampler`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -84,7 +88,7 @@ impl From<bool> for InterpolationMode {
 pub struct Resampler {
     coeffs_q30: Box<[[i32; MAX_TAPS]]>,
     history: Box<[[i32; 2]]>,
-    phase_num: u64,
+    phase_num: u32,
     from_hz: u32,
     to_hz: u32,
     need_input_frames: u32,
@@ -122,8 +126,8 @@ impl Resampler {
         quality: ResampleQuality,
         interp: impl Into<InterpolationMode>,
     ) -> Self {
-        let safe_from = from_hz.max(1);
-        let safe_to = to_hz.max(1);
+        let safe_from = from_hz.clamp(1, MAX_RESAMPLE_RATE_HZ);
+        let safe_to = to_hz.clamp(1, MAX_RESAMPLE_RATE_HZ);
         let interp_mode = interp.into();
         let taps = quality.taps() as u8;
         let coeffs_q30 = build_polyphase_table(safe_from, safe_to, quality);
@@ -176,8 +180,8 @@ impl Resampler {
 
     /// Reconfigures sample rates in-place without heap reallocation.
     pub fn reconfigure(&mut self, from_hz: u32, to_hz: u32) {
-        let safe_from = from_hz.max(1);
-        let safe_to = to_hz.max(1);
+        let safe_from = from_hz.clamp(1, MAX_RESAMPLE_RATE_HZ);
+        let safe_to = to_hz.clamp(1, MAX_RESAMPLE_RATE_HZ);
         if self.from_hz == safe_from && self.to_hz == safe_to {
             return;
         }
@@ -282,8 +286,8 @@ impl Resampler {
 
     #[inline]
     fn advance_phase(&mut self) {
-        self.phase_num += u64::from(self.from_hz);
-        let to_hz = u64::from(self.to_hz);
+        self.phase_num += self.from_hz;
+        let to_hz = self.to_hz;
         let mut step = 0_u32;
         while self.phase_num >= to_hz {
             self.phase_num -= to_hz;
@@ -296,58 +300,38 @@ impl Resampler {
     fn eval_frame(&self) -> (i32, i32) {
         let taps = usize::from(self.taps);
         let pos = usize::from(self.hist_pos);
-        let hist_slice = &self.history[pos..pos + taps];
-        let h = &hist_slice[..taps];
+        let hist = &self.history[pos..pos + taps];
 
-        let scaled_phase = ((self.phase_num * (NUM_PHASES as u64)) << 16) / u64::from(self.to_hz);
-        let phase_idx = ((scaled_phase >> 16) as usize).min(NUM_PHASES - 1);
-        let frac_q16 = (scaled_phase & 0xFFFF) as i64;
-
-        let row0 = &self.coeffs_q30[phase_idx];
         let mut acc_l = 0_i64;
         let mut acc_r = 0_i64;
 
         match self.interp {
             InterpolationMode::QuantizedPhase => {
+                let (phase_idx, frac_q16) = compute_phase_and_frac_q16(self.phase_num, self.to_hz);
                 let nearest_idx = if frac_q16 >= 32_768 {
                     phase_idx + 1
                 } else {
                     phase_idx
                 };
-                let row = &self.coeffs_q30[nearest_idx];
-                let r0 = &row[..taps];
-                for k in 0..taps {
-                    let c = i64::from(r0[k]);
-                    let frame = h[k];
+                let row = &self.coeffs_q30[nearest_idx][..taps];
+                for (&frame, &coeff) in hist.iter().zip(row.iter()) {
+                    let c = i64::from(coeff);
                     acc_l += i64::from(frame[0]) * c;
                     acc_r += i64::from(frame[1]) * c;
                 }
             }
             InterpolationMode::LinearPhase => {
-                let row1 = &self.coeffs_q30[phase_idx + 1];
-                let r0 = &row0[..taps];
-                let r1 = &row1[..taps];
-                let mut dot0_l = 0_i64;
-                let mut dot0_r = 0_i64;
-                let mut dot1_l = 0_i64;
-                let mut dot1_r = 0_i64;
-                for (&frame, (&c0, &c1)) in h.iter().zip(r0.iter().zip(r1.iter())) {
-                    let c0 = i64::from(c0);
-                    let c1 = i64::from(c1);
-                    let fl = i64::from(frame[0]);
-                    let fr = i64::from(frame[1]);
-                    dot0_l += fl * c0;
-                    dot0_r += fr * c0;
-                    dot1_l += fl * c1;
-                    dot1_r += fr * c1;
+                let (phase_idx, frac_q16) = compute_phase_and_frac_q16(self.phase_num, self.to_hz);
+                let row0 = &self.coeffs_q30[phase_idx][..taps];
+                let row1 = &self.coeffs_q30[phase_idx + 1][..taps];
+                let frac = i64::from(frac_q16);
+                for (&frame, (&c0_raw, &c1_raw)) in hist.iter().zip(row0.iter().zip(row1.iter())) {
+                    let c0 = i64::from(c0_raw);
+                    let c1 = i64::from(c1_raw);
+                    let c = (c0 + (((c1 - c0) * frac) >> 16)) as i32;
+                    acc_l += i64::from(c) * i64::from(frame[0]);
+                    acc_r += i64::from(c) * i64::from(frame[1]);
                 }
-                let diff_l = dot1_l - dot0_l;
-                let diff_r = dot1_r - dot0_r;
-                let frac = frac_q16;
-                let delta_l = (diff_l >> 16) * frac + (((diff_l & 0xFFFF) * frac + 32_768) >> 16);
-                let delta_r = (diff_r >> 16) * frac + (((diff_r & 0xFFFF) * frac + 32_768) >> 16);
-                acc_l = dot0_l + delta_l;
-                acc_r = dot0_r + delta_r;
             }
         }
 
@@ -357,6 +341,26 @@ impl Resampler {
             (acc_r.saturating_add(HALF_Q30) >> 30).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
         (out_l as i32, out_r as i32)
     }
+}
+
+/// Computes the polyphase table branch index and 16-bit fractional phase
+/// interpolation factor without performing 64-bit division on audio rates.
+#[inline(always)]
+fn compute_phase_and_frac_q16(phase_num: u32, to_hz: u32) -> (usize, u32) {
+    debug_assert!((1..=MAX_RESAMPLE_RATE_HZ).contains(&to_hz));
+    let p = phase_num * (NUM_PHASES as u32);
+    let idx = p / to_hz;
+    let rem = p - idx * to_hz;
+    let frac_q16 = if to_hz <= 0xFFFF {
+        // Single 32-bit hardware `quou` for rates <= 65,535 Hz (44.1k, 48k).
+        (rem << 16) / to_hz
+    } else {
+        // Exact 2-step 32-bit Euclidean division for rates (88.2k..768k).
+        let q_hi = (rem << 12) / to_hz;
+        let r_hi = (rem << 12) - q_hi * to_hz;
+        (q_hi << 4) | ((r_hi << 4) / to_hz)
+    };
+    ((idx as usize).min(NUM_PHASES - 1), frac_q16)
 }
 
 fn populate_polyphase_table(
@@ -461,7 +465,7 @@ fn bessel_i0_f64(x: f64) -> f64 {
     sum
 }
 
-/// Pure `no_std` IEEE-754 square root on `f64` using Newton-Raphson iterations.
+/// Pure `no_std` IEEE-754 square root on `f64` via Newton-Raphson iterations.
 fn sqrt_f64(x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
@@ -534,7 +538,7 @@ mod tests {
         assert_eq!(consumed, 256);
         assert!(produced > 256);
 
-        // After settling (first 32 stereo frames), DC output must equal 100_000.
+        // After settling (first 32 frames), DC output must equal 100_000.
         let prod_frames = produced / 2;
         for f in 40..prod_frames {
             assert_eq!(dc_out[f * 2], 100_000, "left DC mismatch at frame {f}");
@@ -563,5 +567,28 @@ mod tests {
         let (consumed, produced) = r.process(&in_buf, &mut out_buf);
         assert_eq!(consumed, 64);
         assert!(produced > 64);
+    }
+
+    #[test]
+    fn test_u32_phase_math_matches_u64_reference_all_phases() {
+        let test_cases = [(44_100, 48_000), (96_000, 48_000), (48_000, 96_000)];
+        for (from_hz, to_hz) in test_cases {
+            for phase_num in 0..to_hz {
+                let (idx, frac_q16) = compute_phase_and_frac_q16(phase_num, to_hz);
+                let ref_scaled =
+                    ((u64::from(phase_num) * (NUM_PHASES as u64)) << 16) / u64::from(to_hz);
+                let ref_idx = ((ref_scaled >> 16) as usize).min(NUM_PHASES - 1);
+                let ref_frac = (ref_scaled & 0xFFFF) as u32;
+                assert_eq!(
+                    idx, ref_idx,
+                    "idx mismatch for rate {from_hz}->{to_hz} at phase {phase_num}"
+                );
+                assert!(
+                    frac_q16.abs_diff(ref_frac) <= 1,
+                    "frac mismatch for rate {from_hz}->{to_hz} at phase {phase_num}: \
+                     got {frac_q16}, expected {ref_frac}"
+                );
+            }
+        }
     }
 }
