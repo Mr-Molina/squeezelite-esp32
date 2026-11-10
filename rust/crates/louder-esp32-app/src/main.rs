@@ -790,6 +790,10 @@ mod xtensa_hw {
     pub(crate) static DMA_OUTSTANDING_FRAMES: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
 
+    /// Decode bursts top the DMA up between steps below this many queued
+    /// frames: three quarters of the buffer (1536 frames, ~35 ms at 44.1 kHz).
+    const DMA_REFILL_BELOW_FRAMES: usize = I2S_DMA_BUFFER_BYTES / 8 * 3 / 4;
+
     fn note_dma_fill(available_bytes: usize) {
         let queued = I2S_DMA_BUFFER_BYTES.saturating_sub(available_bytes) / 8;
         DMA_OUTSTANDING_FRAMES.store(queued as u32, core::sync::atomic::Ordering::Relaxed);
@@ -862,6 +866,15 @@ mod xtensa_hw {
                         }
                     }
                 }
+            }
+        }
+
+        /// Stereo frames currently queued in the DMA buffer (live, unlike
+        /// [`DMA_OUTSTANDING_FRAMES`], which is only refreshed on a push).
+        pub fn dma_queued_frames(&mut self) -> usize {
+            match self.transfer.as_mut() {
+                Some(t) => I2S_DMA_BUFFER_BYTES.saturating_sub(t.available_bytes()) / 8,
+                None => 0,
             }
         }
 
@@ -3993,7 +4006,16 @@ mod xtensa_hw {
             ActiveDecoder::Pcm(_) => 4,
             _ => 16,
         };
-        s.coordinator.pump_decode(s.pipeline, max_steps);
+        // Up to 16 decode steps per lap (e.g. 16 MP3 frames while the output
+        // ring fills after a track start) can outlast the ~46 ms I2S DMA
+        // buffer, so top the DMA up between steps once it falls below
+        // three quarters full.
+        s.coordinator.pump_decode_paced(
+            s.pipeline,
+            max_steps,
+            |p| p.sink.driver.dma_queued_frames() < DMA_REFILL_BELOW_FRAMES,
+            || Instant::now().duration_since_epoch().as_micros(),
+        );
         s.coordinator.pump_output(s.pipeline, 16);
         s.coordinator.current_sample_rate = s.pipeline.sample_rate;
 

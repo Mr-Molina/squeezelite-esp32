@@ -1389,16 +1389,19 @@ impl PlayerCoordinator {
     /// [`PUMP_DECODE_MIN_OUTPUT_SPACE`] bytes free in the output ring, decodes
     /// in bursts of at most `max_steps` steps while progress is made and
     /// output space remains (`CPU-101` / `PIPE-203`). After the stream ended
-    /// an undecodable tail is dropped.
+    /// an undecodable tail is dropped. Returns the steps that made progress
+    /// (consumed input or produced PCM); 0 means the burst is over, so a
+    /// caller pacing decode one step at a time knows when to stop.
     pub fn pump_decode<S: AudioOutputSink>(
         &mut self,
         pipeline: &mut StreamPipeline<'_, S>,
         max_steps: usize,
-    ) {
+    ) -> usize {
         if self.state != PlayerState::Playing || !self.decoder_may_run() {
-            return;
+            return 0;
         }
         self.signal_end_of_input(pipeline);
+        let mut progressed_steps = 0;
         for _ in 0..max_steps {
             if pipeline.has_pending_pcm()
                 || pipeline.output_buffer.available_write() < PUMP_DECODE_MIN_OUTPUT_SPACE
@@ -1414,6 +1417,9 @@ impl PlayerCoordinator {
             }
             self.drop_undecodable_tail(pipeline, &decoded);
             if pipeline.has_pending_pcm() {
+                // The step produced more PCM than fit: progress, but the
+                // output side drains it before the next decode.
+                progressed_steps += 1;
                 break;
             }
             let progressed = matches!(decoded, Ok(consumed) if consumed > 0)
@@ -1421,7 +1427,45 @@ impl PlayerCoordinator {
             if !progressed {
                 break;
             }
+            progressed_steps += 1;
         }
+        progressed_steps
+    }
+
+    /// [`Self::pump_decode`] paced for a small output DMA buffer: decodes one
+    /// step at a time, up to `max_steps`, and after each step tops up the
+    /// output (one [`Self::pump_output`] pass) whenever `output_low` reports
+    /// the DMA is running low. A long burst (track start, seek, an MP3 frame
+    /// per step) therefore cannot drain the DMA while it decodes ahead.
+    /// `now_us` times each step that made progress into
+    /// [`StreamPipeline::record_decode_us`] (the `decode_us_max` telemetry).
+    /// Returns the steps that made progress.
+    pub fn pump_decode_paced<S, Low, Clock>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+        max_steps: usize,
+        mut output_low: Low,
+        mut now_us: Clock,
+    ) -> usize
+    where
+        S: AudioOutputSink,
+        Low: FnMut(&mut StreamPipeline<'_, S>) -> bool,
+        Clock: FnMut() -> u64,
+    {
+        let mut progressed_steps = 0;
+        for _ in 0..max_steps {
+            let started = now_us();
+            if self.pump_decode(pipeline, 1) == 0 {
+                break;
+            }
+            let elapsed = now_us().saturating_sub(started);
+            pipeline.record_decode_us(u32::try_from(elapsed).unwrap_or(u32::MAX));
+            progressed_steps += 1;
+            if output_low(pipeline) {
+                self.pump_output(pipeline, 16);
+            }
+        }
+        progressed_steps
     }
 
     /// Drops a stream that failed after connecting and marks it ended (the
@@ -4282,6 +4326,43 @@ mod tests {
             0,
             "partial frame dropped"
         );
+    }
+
+    #[test]
+    fn test_paced_decode_tops_up_output_only_when_low_and_times_steps() {
+        for output_low in [false, true] {
+            let mut rig =
+                Rig::with_source([6; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
+            let mut stream_storage = [0u8; 2048];
+            let mut output_storage = [0u8; 2048];
+            let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+            rig.coord.external_audio_pump = true;
+            start_held(&mut rig, &mut pipeline, true, 0);
+            pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+            rig.tick(&mut pipeline, 15).unwrap();
+            assert_eq!(rig.coord.state, PlayerState::Playing);
+
+            let mut low_checks = 0;
+            let mut clock = 0u64;
+            let steps = rig.coord.pump_decode_paced(
+                &mut pipeline,
+                4,
+                |_| {
+                    low_checks += 1;
+                    output_low
+                },
+                || {
+                    clock += 250;
+                    clock
+                },
+            );
+            assert!(steps > 0, "the burst decoded");
+            assert_eq!(low_checks, steps, "DMA level checked after every step");
+            assert_eq!(pipeline.decode_us_max, 250, "each step is timed");
+            // Topped up inside the burst only when the DMA reported low.
+            let expected_played = if output_low { 2 } else { 0 };
+            assert_eq!(pipeline.frames_played, expected_played);
+        }
     }
 
     static FLAC_STREAM: Segments = &[
