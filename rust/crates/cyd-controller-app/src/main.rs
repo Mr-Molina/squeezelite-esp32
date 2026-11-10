@@ -464,7 +464,7 @@ mod xtensa_hw {
             }
 
             // 2. Display rendering, touch polling, and heartbeat (~60 Hz)
-            if tick % 16 == 0 {
+            if tick.is_multiple_of(16) {
                 // Heartbeat & Resync Monitor
                 let was_active = link.state().link_active;
                 let _ = link.poll_heartbeat(now_us);

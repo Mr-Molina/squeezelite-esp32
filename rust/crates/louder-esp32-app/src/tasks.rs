@@ -894,19 +894,19 @@ mod device {
                     }
                 });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() {
-                if s.pipeline.stream_buffer.available_read() < 4
-                    && s.pipeline.output_buffer.available_read() == 0
-                    && !s.pipeline.has_pending_pcm()
-                {
-                    if s.pipeline.stream_buffer.available_read() > 0 {
-                        s.pipeline.stream_buffer.flush();
-                    }
-                    s.coordinator
-                        .release_source(louder_esp32_app::AudioSource::Bluetooth);
-                    s.coordinator.end_external_playback_and_restore(s.pipeline);
-                    s.bt_audio_active = false;
+            if s.bt_audio_active
+                && !s.bt_sink.is_streaming()
+                && s.pipeline.stream_buffer.available_read() < 4
+                && s.pipeline.output_buffer.available_read() == 0
+                && !s.pipeline.has_pending_pcm()
+            {
+                if s.pipeline.stream_buffer.available_read() > 0 {
+                    s.pipeline.stream_buffer.flush();
                 }
+                s.coordinator
+                    .release_source(louder_esp32_app::AudioSource::Bluetooth);
+                s.coordinator.end_external_playback_and_restore(s.pipeline);
+                s.bt_audio_active = false;
             }
         }
     }
@@ -979,7 +979,7 @@ mod device {
         match dhcp_event {
             Some(Ok((addr, prefix_len, router, cidr))) => {
                 let ip_octets = addr.octets();
-                let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
+                let ip_changed = s.assigned_ip.is_some_and(|old| old != ip_octets);
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
@@ -1068,13 +1068,12 @@ mod device {
 
             // Immediate recycling of closing sockets once FIN/ACK handshake completes
             // (TimeWait) or on timeout
-            if s.pending_http_closing {
-                if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
-                    || now_ms >= s.pending_close_deadline_ms
-                {
-                    http_sock.abort();
-                    s.pending_http_closing = false;
-                }
+            if s.pending_http_closing
+                && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                    || now_ms >= s.pending_close_deadline_ms)
+            {
+                http_sock.abort();
+                s.pending_http_closing = false;
             }
 
             if s.pending_http_body.is_empty()

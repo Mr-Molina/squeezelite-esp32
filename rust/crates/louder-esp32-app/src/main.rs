@@ -3021,18 +3021,18 @@ mod xtensa_hw {
                     }
                 });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() {
-                if s.pipeline.stream_buffer.available_read() < 4
-                    && s.pipeline.output_buffer.available_read() == 0
-                    && !s.pipeline.has_pending_pcm()
-                {
-                    if s.pipeline.stream_buffer.available_read() > 0 {
-                        s.pipeline.stream_buffer.flush();
-                    }
-                    s.bt_audio_active = false;
-                    s.coordinator.release_source(AudioSource::Bluetooth);
-                    restore_suspended_or_stop(s);
+            if s.bt_audio_active
+                && !s.bt_sink.is_streaming()
+                && s.pipeline.stream_buffer.available_read() < 4
+                && s.pipeline.output_buffer.available_read() == 0
+                && !s.pipeline.has_pending_pcm()
+            {
+                if s.pipeline.stream_buffer.available_read() > 0 {
+                    s.pipeline.stream_buffer.flush();
                 }
+                s.bt_audio_active = false;
+                s.coordinator.release_source(AudioSource::Bluetooth);
+                restore_suspended_or_stop(s);
             }
         }
     }
@@ -3093,7 +3093,7 @@ mod xtensa_hw {
                 let cfg_address = config.address;
                 let cfg_router = config.router;
                 let ip_octets = cfg_address.address().octets();
-                let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
+                let ip_changed = s.assigned_ip.is_some_and(|old| old != ip_octets);
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
@@ -3198,13 +3198,12 @@ mod xtensa_hw {
                 }
             }
 
-            if s.pending_http_closing {
-                if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
-                    || now_ms >= s.pending_close_deadline_ms
-                {
-                    http_sock.abort();
-                    s.pending_http_closing = false;
-                }
+            if s.pending_http_closing
+                && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                    || now_ms >= s.pending_close_deadline_ms)
+            {
+                http_sock.abort();
+                s.pending_http_closing = false;
             }
 
             if s.pending_http_body.is_empty()
@@ -3629,10 +3628,8 @@ mod xtensa_hw {
         // Spotify `_spotify-connect._tcp.local`
         {
             let mdns_sock = s.sockets.get_mut::<udp::Socket>(s.mdns_handle);
-            if !s.mdns_bound {
-                if mdns_sock.bind(5353).is_ok() {
-                    s.mdns_bound = true;
-                }
+            if !s.mdns_bound && mdns_sock.bind(5353).is_ok() {
+                s.mdns_bound = true;
             }
             if s.mdns_bound {
                 let mut should_announce_raop = false;
@@ -3864,15 +3861,13 @@ mod xtensa_hw {
             if s.raop_streaming
                 && (s.raop_rtsp.state() != ServerState::Streaming
                     || now_ms.saturating_sub(s.last_rtp_packet_ms) >= 3_000)
+                && s.pipeline.stream_buffer.available_read() == 0
+                && s.pipeline.output_buffer.available_read() == 0
+                && !s.pipeline.has_pending_pcm()
             {
-                if s.pipeline.stream_buffer.available_read() == 0
-                    && s.pipeline.output_buffer.available_read() == 0
-                    && !s.pipeline.has_pending_pcm()
-                {
-                    s.raop_streaming = false;
-                    s.coordinator.release_source(AudioSource::AirPlay);
-                    restore_suspended_or_stop(s);
-                }
+                s.raop_streaming = false;
+                s.coordinator.release_source(AudioSource::AirPlay);
+                restore_suspended_or_stop(s);
             }
         }
 
