@@ -117,6 +117,12 @@ pub trait AudioDecoder {
 
     /// Flushes any internal state or history buffers.
     fn flush(&mut self);
+
+    /// Tells the decoder that no more input will follow until the next
+    /// non-empty `decode` call (end of stream). Decoders that defer work on a
+    /// partially buffered frame use it to decode that last frame on the next
+    /// `decode(&[], ..)` call. Non-empty input clears it again.
+    fn finish_input(&mut self) {}
 }
 
 /// Parse AIFF 80-bit IEEE 754 extended precision floating point sample rate.
@@ -1431,6 +1437,17 @@ impl<'a> BitReader<'a> {
         if n == 0 {
             return Ok(0);
         }
+        // Fast path: up to 24 bits from one big-endian 32-bit window
+        // (bit_pos + n <= 31 fits in it).
+        if n <= 24 && self.byte_pos + 4 <= self.bytes.len() {
+            let b = &self.bytes[self.byte_pos..self.byte_pos + 4];
+            let window = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            let val = (window << self.bit_pos) >> (32 - n);
+            let total = self.bit_pos as usize + n;
+            self.byte_pos += total >> 3;
+            self.bit_pos = (total & 7) as u8;
+            return Ok(val);
+        }
         let mut val = 0u32;
         while n > 0 {
             if self.byte_pos >= self.bytes.len() {
@@ -1501,7 +1518,11 @@ impl<'a> BitReader<'a> {
         if n > 64 {
             return Err(());
         }
-        let u = self.read_bits_u64(n)?;
+        let u = if n <= 24 {
+            u64::from(self.read_bits(n)?)
+        } else {
+            self.read_bits_u64(n)?
+        };
         if n == 64 {
             return Ok(u as i64);
         }
@@ -1517,12 +1538,24 @@ impl<'a> BitReader<'a> {
     #[inline(always)]
     fn read_unary_zeros(&mut self) -> Result<u32, ()> {
         let mut count = 0u32;
-        while self.bit_pos > 0 {
-            let b = self.read_bit()?;
-            if b == 1 {
-                return Ok(count);
+        if self.bit_pos > 0 {
+            // Rest of the current byte in one step instead of bit by bit.
+            if self.byte_pos >= self.bytes.len() {
+                return Err(());
             }
-            count += 1;
+            let rest = self.bytes[self.byte_pos] << self.bit_pos;
+            if rest != 0 {
+                let zeros = rest.leading_zeros();
+                self.bit_pos += (zeros + 1) as u8;
+                if self.bit_pos == 8 {
+                    self.bit_pos = 0;
+                    self.byte_pos += 1;
+                }
+                return Ok(zeros);
+            }
+            count = 8 - u32::from(self.bit_pos);
+            self.bit_pos = 0;
+            self.byte_pos += 1;
         }
         while self.byte_pos < self.bytes.len() && self.bytes[self.byte_pos] == 0 {
             count += 8;
@@ -1921,12 +1954,23 @@ fn decode_subframe(
             }
             decode_residual(reader, block_size, order, &mut out[order..block_size])?;
 
-            if eff_bps <= 16 && qlp_prec <= 15 && order <= 12 {
+            // 32-bit accumulation is exact when |sum| < order * 2^(qlp_prec-1) *
+            // 2^(eff_bps-1) <= 2^31, i.e. eff_bps + qlp_prec + floor(log2(order))
+            // <= 32 (libFLAC's bound). This covers the bps+1 side channel of
+            // 16-bit stereo, which a fixed `eff_bps <= 16` test sent down the
+            // 64-bit path.
+            let ilog2_order = (usize::BITS - 1 - order.leading_zeros()) as usize;
+            if eff_bps + qlp_prec + ilog2_order <= 32 {
+                let mut coeffs32 = [0i32; 32];
+                for (c32, &c) in coeffs32[..order].iter_mut().zip(&coeffs[..order]) {
+                    *c32 = c as i32;
+                }
+                let coeffs32 = &coeffs32[..order];
                 for i in order..block_size {
+                    let history = &out[i - order..i];
                     let mut sum: i32 = 0;
-                    for j in 0..order {
-                        sum = sum
-                            .wrapping_add((coeffs[j] as i32).wrapping_mul(out[i - 1 - j] as i32));
+                    for (&c, &x) in coeffs32.iter().zip(history.iter().rev()) {
+                        sum = sum.wrapping_add(c.wrapping_mul(x as i32));
                     }
                     let predicted = (sum >> qlp_shift) as i64;
                     out[i] = out[i].wrapping_add(predicted);
@@ -2141,6 +2185,19 @@ pub struct FlacDecoder {
     is_ogg_flac: Option<bool>,
     ogg_raw_buf: vec::Vec<u8>,
     ogg_partial_pkt: vec::Vec<u8>,
+    /// STREAMINFO maximum frame size in bytes (0 = unknown).
+    max_frame_size: usize,
+    /// Buffered bytes of the current frame when its last decode attempt ran
+    /// out of input (0 = no failed attempt on this frame).
+    incomplete_len: usize,
+    /// Where the search for the following frame header resumes, relative to
+    /// the current frame start.
+    sync_scan_pos: usize,
+    /// A decode attempt on the current frame was deferred because the frame is
+    /// not completely buffered yet.
+    frame_deferred: bool,
+    /// The caller signalled end of input ([`AudioDecoder::finish_input`]).
+    input_finished: bool,
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -2183,11 +2240,30 @@ impl FlacDecoder {
             is_ogg_flac: None,
             ogg_raw_buf: vec::Vec::with_capacity(4096),
             ogg_partial_pkt: vec::Vec::with_capacity(4096),
+            max_frame_size: 0,
+            incomplete_len: 0,
+            sync_scan_pos: 0,
+            frame_deferred: false,
+            input_finished: false,
         }
+    }
+
+    /// Forgets the decode progress on the current frame (its start moved or
+    /// the stream was reset).
+    #[inline]
+    fn reset_frame_progress(&mut self) {
+        self.incomplete_len = 0;
+        self.sync_scan_pos = 0;
+        self.frame_deferred = false;
     }
 
     pub fn has_pending_pcm(&self) -> bool {
         if self.pending_offset < self.pending_pcm.len() {
+            return true;
+        }
+        // End of input with a deferred frame: one more `decode(&[])` decodes
+        // it (or finds it truncated).
+        if self.input_finished && self.frame_deferred {
             return true;
         }
         if !self.need_more_input
@@ -2214,6 +2290,8 @@ impl FlacDecoder {
         self.is_ogg_flac = None;
         self.ogg_raw_buf.clear();
         self.ogg_partial_pkt.clear();
+        self.reset_frame_progress();
+        self.input_finished = false;
         if self.header_len > 0 && self.stream_buf.len() >= self.header_len {
             self.stream_buf.truncate(self.header_len);
         } else {
@@ -2364,6 +2442,10 @@ impl AudioDecoder for FlacDecoder {
             return Ok((0, to_copy));
         }
 
+        if !encoded_in.is_empty() {
+            self.input_finished = false;
+        }
+
         if self.header_len > 0
             && (encoded_in.starts_with(b"fLaC")
                 || encoded_in.starts_with(b"\x7fFLAC")
@@ -2372,6 +2454,8 @@ impl AudioDecoder for FlacDecoder {
             self.stream_buf.clear();
             self.header_len = 0;
             self.is_ogg_flac = None;
+            self.max_frame_size = 0;
+            self.reset_frame_progress();
         }
 
         if self.is_ogg_flac.is_none() {
@@ -2414,6 +2498,7 @@ impl AudioDecoder for FlacDecoder {
                 self.pending_offset = 0;
                 self.meta_skip_remaining = 0;
                 self.in_metadata = false;
+                self.reset_frame_progress();
                 return Err(DecoderError::CorruptedFrame);
             }
 
@@ -2463,6 +2548,11 @@ impl AudioDecoder for FlacDecoder {
                 let si = &self.stream_buf[8..42];
                 self.min_block_size = u16::from_be_bytes([si[0], si[1]]);
                 self.max_block_size = u16::from_be_bytes([si[2], si[3]]);
+                self.max_frame_size =
+                    ((si[7] as usize) << 16) | ((si[8] as usize) << 8) | (si[9] as usize);
+                self.incomplete_len = 0;
+                self.sync_scan_pos = 0;
+                self.frame_deferred = false;
                 let b10 = si[10] as u32;
                 let b11 = si[11] as u32;
                 let b12 = si[12] as u32;
@@ -2556,6 +2646,7 @@ impl AudioDecoder for FlacDecoder {
             if sync_idx > 0 {
                 self.stream_buf
                     .drain(self.header_len..self.header_len + sync_idx);
+                self.reset_frame_progress();
             }
 
             let frame_buf = &self.stream_buf[self.header_len..];
@@ -2577,10 +2668,41 @@ impl AudioDecoder for FlacDecoder {
                 }
                 Err(()) => {
                     self.stream_buf.drain(self.header_len..self.header_len + 1);
+                    self.reset_frame_progress();
                     corrupted_block = true;
                     continue;
                 }
             };
+
+            // Decoding a frame that is not completely buffered fails at the
+            // end of the data and is thrown away, so with small input chunks a
+            // large frame would be decoded from scratch once per chunk. Defer
+            // the attempt until the frame is known to be complete: the buffer
+            // reaches the STREAMINFO maximum frame size, or the next frame's
+            // header (CRC-8 checked) is present. A frame with no known size is
+            // still tried once, so a caller that hands over whole frames is
+            // unaffected; at end of input `finish_input` lifts the deferral.
+            if !self.input_finished && (self.incomplete_len > 0 || self.max_frame_size > 0) {
+                let len = frame_buf.len();
+                let mut ready = self.max_frame_size > 0 && len >= self.max_frame_size;
+                if !ready && len > self.incomplete_len {
+                    let (found, resume) = find_next_frame_header(
+                        frame_buf,
+                        self.sync_scan_pos.max(hdr.header_bytes),
+                        self.sample_rate,
+                        self.bits_per_sample,
+                        self.min_block_size,
+                    );
+                    ready = found;
+                    self.sync_scan_pos = resume;
+                }
+                if !ready {
+                    self.frame_deferred = true;
+                    self.need_more_input = true;
+                    break;
+                }
+            }
+            self.frame_deferred = false;
 
             self.sample_rate = hdr.sample_rate;
             self.bits_per_sample = hdr.bits_per_sample;
@@ -2612,11 +2734,14 @@ impl AudioDecoder for FlacDecoder {
             }
 
             if subframe_incomplete {
+                self.incomplete_len = frame_buf.len();
+                self.sync_scan_pos = self.sync_scan_pos.max(hdr.header_bytes);
                 self.need_more_input = true;
                 break;
             }
             if subframe_err {
                 self.stream_buf.drain(self.header_len..self.header_len + 1);
+                self.reset_frame_progress();
                 corrupted_block = true;
                 continue;
             }
@@ -2624,6 +2749,8 @@ impl AudioDecoder for FlacDecoder {
             reader.align_to_byte();
             let frame_body_len = hdr.header_bytes + reader.byte_pos;
             if frame_buf.len() < frame_body_len + 2 {
+                self.incomplete_len = frame_buf.len();
+                self.sync_scan_pos = self.sync_scan_pos.max(frame_body_len);
                 self.need_more_input = true;
                 break;
             }
@@ -2633,6 +2760,7 @@ impl AudioDecoder for FlacDecoder {
             let actual_crc = flac_crc16(&frame_buf[0..frame_body_len]);
             if expected_crc != actual_crc {
                 self.stream_buf.drain(self.header_len..self.header_len + 1);
+                self.reset_frame_progress();
                 corrupted_block = true;
                 continue;
             }
@@ -2661,6 +2789,7 @@ impl AudioDecoder for FlacDecoder {
 
             self.stream_buf
                 .drain(self.header_len..self.header_len + total_frame_bytes);
+            self.reset_frame_progress();
             self.need_more_input = false;
 
             if !self.pending_pcm.is_empty() {
@@ -2683,6 +2812,37 @@ impl AudioDecoder for FlacDecoder {
     fn flush(&mut self) {
         self.flush();
     }
+
+    fn finish_input(&mut self) {
+        self.input_finished = true;
+    }
+}
+
+/// Searches `frame_buf` (which starts with the current frame's header) from
+/// `from` for the next valid FLAC frame header, which proves the current frame
+/// is completely buffered. Returns whether one was found and where a later
+/// search should resume (a header cut off by the end of the buffer is
+/// rechecked there).
+#[cfg(any(feature = "alloc", feature = "std"))]
+fn find_next_frame_header(
+    frame_buf: &[u8],
+    from: usize,
+    stream_sr: u32,
+    stream_bps: u32,
+    min_bs: u16,
+) -> (bool, usize) {
+    let mut i = from.max(1);
+    while i + 1 < frame_buf.len() {
+        if frame_buf[i] == 0xFF && (frame_buf[i + 1] & 0xFE) == 0xF8 {
+            match parse_frame_header(&frame_buf[i..], stream_sr, stream_bps, min_bs) {
+                Ok(Some(_)) => return (true, i),
+                Ok(None) => return (false, i),
+                Err(()) => {}
+            }
+        }
+        i += 1;
+    }
+    (false, i)
 }
 
 /// Standard ISO/IEC 14496-3 / 13818-7 ADTS sampling frequency table (indices
@@ -5622,6 +5782,10 @@ mod tests {
             {
                 let end = (offset + 512).min(data.len());
                 let chunk = &data[offset..end];
+                if chunk.is_empty() {
+                    // End of stream: lets the decoder finish the last frame.
+                    decoder.finish_input();
+                }
                 match decoder.decode(chunk, &mut pcm_buf) {
                     Ok((consumed, frames)) => {
                         offset += consumed;
@@ -5687,6 +5851,10 @@ mod tests {
         {
             let end = (offset + 1024).min(data.len());
             let chunk = &data[offset..end];
+            if chunk.is_empty() {
+                // End of stream: lets the decoder finish the last frame.
+                decoder.finish_input();
+            }
             match decoder.decode(chunk, &mut pcm_buf) {
                 Ok((consumed, frames)) => {
                     offset += consumed;
@@ -6287,6 +6455,109 @@ mod tests {
             aac_dec.decode(&bad_m4a, &mut pcm_out),
             Err(DecodeError::UnsupportedFeature)
         );
+    }
+
+    #[test]
+    fn test_bitreader_fast_paths_match_bitwise_reads() {
+        // Pseudo-random bytes with runs of zeros so unary codes cross bytes.
+        let mut data = [0u8; 512];
+        let mut x = 0x1234_5678u32;
+        for (i, b) in data.iter_mut().enumerate() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = if i % 37 < 3 { 0 } else { (x >> 24) as u8 };
+        }
+        let mut fast = BitReader::new(&data);
+        let mut slow = BitReader::new(&data);
+        let mut op = 0x9E37_79B9u32;
+        loop {
+            op = op.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if op & 1 == 0 {
+                let got = fast.read_unary_zeros();
+                let mut zeros = 0u32;
+                let want = loop {
+                    match slow.read_bit() {
+                        Ok(0) => zeros += 1,
+                        Ok(_) => break Ok(zeros),
+                        Err(()) => break Err(()),
+                    }
+                };
+                assert_eq!(got, want);
+                if want.is_err() {
+                    break;
+                }
+            } else {
+                let n = 1 + ((op >> 8) % 24) as usize;
+                let got = fast.read_bits(n);
+                let mut want = Ok(0u32);
+                for _ in 0..n {
+                    want = match (want, slow.read_bit()) {
+                        (Ok(v), Ok(bit)) => Ok((v << 1) | bit),
+                        _ => Err(()),
+                    };
+                }
+                if want.is_err() {
+                    break;
+                }
+                assert_eq!(got, want, "read_bits({n})");
+            }
+            assert_eq!((fast.byte_pos, fast.bit_pos), (slow.byte_pos, slow.bit_pos));
+        }
+    }
+
+    #[test]
+    fn test_flac_last_frame_waits_for_finish_input() {
+        let data = include_bytes!("../tests/fixtures/stereo_16bit.flac");
+        let mut claxon_reader = claxon::FlacReader::new(std::io::Cursor::new(data)).unwrap();
+        let shift = FlacDecoder::sample_shift(claxon_reader.streaminfo().bits_per_sample);
+        let expected: std::vec::Vec<i32> = claxon_reader
+            .samples()
+            .map(|s| s.unwrap() << shift)
+            .collect();
+
+        let mut decoder = FlacDecoder::new();
+        let mut pcm = [0i32; 2304];
+        let mut output = std::vec::Vec::new();
+        let mut drain =
+            |decoder: &mut FlacDecoder, input: &[u8], output: &mut std::vec::Vec<i32>| {
+                let mut input = input;
+                loop {
+                    match decoder.decode(input, &mut pcm) {
+                        Ok((_, frames)) => output.extend_from_slice(&pcm[..frames * 2]),
+                        Err(DecoderError::NeedMoreData) => {}
+                        Err(e) => panic!("decode error: {e:?}"),
+                    }
+                    input = &[];
+                    if !decoder.has_pending_pcm() {
+                        break;
+                    }
+                }
+            };
+
+        // The whole file at once: every frame but the last is proven complete
+        // by the header that follows it; the last one waits for end of input.
+        drain(&mut decoder, data, &mut output);
+        assert!(output.len() < expected.len(), "last frame decoded early");
+        assert!(!decoder.has_pending_pcm());
+
+        decoder.finish_input();
+        assert!(decoder.has_pending_pcm(), "deferred frame must be offered");
+        drain(&mut decoder, &[], &mut output);
+        assert_eq!(output, expected);
+        assert!(!decoder.has_pending_pcm());
+    }
+
+    #[test]
+    fn test_flac_partial_frame_is_not_redecoded_per_chunk() {
+        let data = include_bytes!("../tests/fixtures/stereo_16bit.flac");
+        let mut decoder = FlacDecoder::new();
+        let mut pcm = [0i32; 2304];
+        // Metadata (frame 1 starts at byte 8286) plus the first 214 bytes of
+        // frame 1: the attempt is deferred (the STREAMINFO maximum frame size,
+        // 1464, is known) rather than run and thrown away.
+        assert_eq!(decoder.decode(&data[..8500], &mut pcm), Ok((8500, 0)));
+        assert!(decoder.max_frame_size > 0);
+        assert!(decoder.frame_deferred);
+        assert_eq!(decoder.incomplete_len, 0, "no decode attempt was made");
     }
 
     #[test]

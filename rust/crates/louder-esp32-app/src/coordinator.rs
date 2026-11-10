@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use squeezelite_audio_core::output::AudioOutputSink;
 use squeezelite_audio_core::{ResampleQuality, VolumeScale};
 use squeezelite_cyd_link::{CydCommand, CydMessage, PlayState};
-use squeezelite_decoders::{DecoderError, PcmDecoder};
+use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 use squeezelite_proto::{
     build_capabilities, sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason,
     Endianness, ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
@@ -1260,6 +1260,16 @@ impl PlayerCoordinator {
         supported
     }
 
+    /// Once the stream has ended and its ring is drained, tells the decoder no
+    /// more input follows, so a decoder holding back a partly buffered frame
+    /// (FLAC) decodes it on its next drain call instead of waiting for bytes
+    /// that will never come.
+    fn signal_end_of_input<S: AudioOutputSink>(&self, pipeline: &mut StreamPipeline<'_, S>) {
+        if self.stream_eof && pipeline.stream_buffer.available_read() == 0 {
+            pipeline.decoder.finish_input();
+        }
+    }
+
     /// Drops the stream-ring tail when the stream has ended and the decoder
     /// cannot make anything of what is left (a truncated last frame), so
     /// the track can finish (`STMd`/`STMu`) instead of waiting forever for
@@ -1388,6 +1398,7 @@ impl PlayerCoordinator {
         if self.state != PlayerState::Playing || !self.decoder_may_run() {
             return;
         }
+        self.signal_end_of_input(pipeline);
         for _ in 0..max_steps {
             if pipeline.has_pending_pcm()
                 || pipeline.output_buffer.available_write() < PUMP_DECODE_MIN_OUTPUT_SPACE
@@ -2375,6 +2386,7 @@ impl PlayerCoordinator {
 
         // Try decoding a frame chunk
         if self.decoder_may_run() {
+            self.signal_end_of_input(pipeline);
             let decoded = pipeline.process_decode_step();
             self.note_decode_result(pipeline, &decoded);
             self.drop_undecodable_tail(pipeline, &decoded);
@@ -4270,6 +4282,38 @@ mod tests {
             0,
             "partial frame dropped"
         );
+    }
+
+    static FLAC_STREAM: Segments = &[
+        OK_HEAD,
+        include_bytes!("../../squeezelite-decoders/tests/fixtures/stereo_16bit.flac"),
+    ];
+
+    #[test]
+    fn test_pump_decode_finishes_the_last_flac_frame_at_eof() {
+        // FLAC defers a frame until it is proven complete (the next frame's
+        // header follows it); the last frame has none, so the end of the
+        // stream must release it or the track loses its final block.
+        let mut rig = Rig::with_source([5; 6], "T", GatedSource::new(b"/stream.mp3", FLAC_STREAM));
+        let mut stream_storage = vec![0u8; 16384];
+        let mut output_storage = vec![0u8; 1 << 17];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame_fmt(b'f', true, 9000), 10);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+        rig.src.hold_data = false;
+        for _ in 0..64 {
+            let _ = rig.coord.poll_stream(&mut rig.src, &mut pipeline);
+        }
+        assert!(rig.coord.stream_eof);
+        rig.coord.evaluate_state(&mut pipeline);
+        for _ in 0..64 {
+            rig.coord.pump_decode(&mut pipeline, 16);
+            rig.coord.pump_output(&mut pipeline, 16);
+        }
+        let decoded_frames =
+            pipeline.frames_played as usize + pipeline.output_buffer.available_read() / 8;
+        assert_eq!(decoded_frames, 8820, "every frame, including the last");
+        assert!(!pipeline.has_pending_pcm());
     }
 
     #[test]

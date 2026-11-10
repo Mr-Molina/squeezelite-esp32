@@ -108,6 +108,18 @@ impl AudioDecoder for ActiveDecoder {
             Self::Opus(d) => d.flush(),
         }
     }
+
+    fn finish_input(&mut self) {
+        match self {
+            Self::Pcm(d) => d.finish_input(),
+            Self::Mp3(d) => d.finish_input(),
+            Self::Flac(d) => d.finish_input(),
+            Self::Aac(d) => d.finish_input(),
+            Self::Vorbis(d) => d.finish_input(),
+            Self::Alac(d) => d.finish_input(),
+            Self::Opus(d) => d.finish_input(),
+        }
+    }
 }
 
 impl ActiveDecoder {
@@ -2333,6 +2345,10 @@ mod tests {
                 if let Ok(ingested) = pipeline.ingest_stream_data(&flac_bytes[offset..]) {
                     offset += ingested;
                 }
+            } else if pipeline.stream_buffer_available() == 0 {
+                // End of stream (the coordinator does this on `stream_eof`):
+                // the decoder finishes the last, deferred frame.
+                pipeline.decoder.finish_input();
             }
             let _ = pipeline.process_decode_step();
             let _ = pipeline.process_output_step();
