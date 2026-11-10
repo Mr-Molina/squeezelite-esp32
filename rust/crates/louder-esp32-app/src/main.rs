@@ -4163,17 +4163,11 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback (starts at VOL_DEFAULT_M20DB = 0x58)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // check_faults returns a non-clean fault (overcurrent on channel)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write_read(
                 addr,
                 vec![registers::CHAN_FAULT],
@@ -4187,9 +4181,6 @@ mod tests {
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
         ];
         let mut i2c = I2cMock::new(&expectations);
