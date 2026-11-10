@@ -18,7 +18,8 @@ use squeezelite_decoders::VorbisDecoder;
 const FIXTURE: &[u8] = include_bytes!("fixtures/sine_440_1000_stereo_44k1.ogg");
 
 /// FNV-1a 64 over the little-endian bytes of every decoded i32 sample.
-const GOLDEN_PCM_FNV1A64: u64 = 0xfe93_46f1_654b_ca6d;
+/// Regenerated for 24/32-bit InterleavedSamples<f32> + DSP-003 round-half-away (87793784).
+const GOLDEN_PCM_FNV1A64: u64 = 0x6ac9_f063_ec6d_a742;
 const GOLDEN_FRAMES: usize = 22080;
 
 struct Decoded {

@@ -13,7 +13,8 @@ use squeezelite_decoders::OpusDecoder;
 const FIXTURE: &[u8] = include_bytes!("fixtures/test_stereo_05s_48k.opus");
 
 /// FNV-1a 64 over the little-endian bytes of every decoded i32 sample.
-const GOLDEN_PCM_FNV1A64: u64 = 0x626fe7b25b0baae2;
+/// Regenerated for DSP-003 round-half-away symmetric quantization (87793784).
+const GOLDEN_PCM_FNV1A64: u64 = 0x1984_0093_8ff8_d57f;
 const GOLDEN_FRAMES: usize = 24648;
 
 struct Decoded {

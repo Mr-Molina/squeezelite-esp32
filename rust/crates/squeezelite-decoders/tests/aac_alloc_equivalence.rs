@@ -19,7 +19,10 @@ use squeezelite_decoders::{AacDecoder, AudioDecoder, DecoderError};
 const FIXTURE: &[u8] = include_bytes!("fixtures/sine_440_1000_stereo_44k1_lc.aac");
 
 /// FNV-1a 64 over the little-endian bytes of every decoded i32 sample.
-const GOLDEN_PCM_FNV1A64: u64 = 0xec34_c84f_47bb_d5ed;
+/// In `std`, syom links platform x86 SIMD/math and yields `0xc928_58a4_46ca_5780`.
+/// In `no_std + alloc`, syom links `libm` and yields `0xec34_c84f_47bb_d5ed` (WO-199).
+const GOLDEN_PCM_FNV1A64_STD: u64 = 0xc928_58a4_46ca_5780;
+const GOLDEN_PCM_FNV1A64_NO_STD: u64 = 0xec34_c84f_47bb_d5ed;
 const GOLDEN_FRAMES: usize = 23552;
 
 struct Decoded {
@@ -136,7 +139,12 @@ fn adts_lc_fixture_decodes_to_golden_pcm() {
         syom::STD_ENABLED
     );
     assert_eq!(frames, GOLDEN_FRAMES);
-    assert_eq!(digest, GOLDEN_PCM_FNV1A64);
+    let expected = if syom::STD_ENABLED {
+        GOLDEN_PCM_FNV1A64_STD
+    } else {
+        GOLDEN_PCM_FNV1A64_NO_STD
+    };
+    assert_eq!(digest, expected);
 }
 
 #[test]
