@@ -770,8 +770,8 @@ const S_BOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-/// AES Inverse S-box.
-const INV_S_BOX: [u8; 256] = [
+/// AES Inverse S-box initializer.
+const INV_S_BOX_INIT: [u8; 256] = [
     0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
     0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
     0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
@@ -789,6 +789,14 @@ const INV_S_BOX: [u8; 256] = [
     0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
     0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
 ];
+
+// JUSTIFICATION: Placing INV_S_BOX in internal .dram1 avoids SPI flash
+// cache stalls during real-time AirPlay RTP packet decryption.
+// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
+// script for plain [u8; 256] data with no alignment or init hazards.
+#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
+#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+static INV_S_BOX: [u8; 256] = INV_S_BOX_INIT;
 
 /// AES Rcon array.
 const RCON: [u32; 10] = [
@@ -813,40 +821,55 @@ const fn xtime(x: u8) -> u8 {
     (x << 1) ^ (((x >> 7) & 1).wrapping_neg() & 0x1b)
 }
 
-const fn compute_gf_mul_table(factor: u8) -> [u8; 256] {
-    let mut table = [0u8; 256];
+#[inline(always)]
+const fn gf_mul(x: u8, factor: u8) -> u8 {
+    let x2 = xtime(x);
+    let x4 = xtime(x2);
+    let x8 = xtime(x4);
+    match factor {
+        9 => x8 ^ x,
+        11 => x8 ^ x2 ^ x,
+        13 => x8 ^ x4 ^ x,
+        14 => x8 ^ x4 ^ x2,
+        _ => 0,
+    }
+}
+
+const fn compute_td0() -> [u32; 256] {
+    let mut table = [0u32; 256];
     let mut i = 0usize;
     while i < 256 {
-        let x = i as u8;
-        let x2 = xtime(x);
-        let x4 = xtime(x2);
-        let x8 = xtime(x4);
-        table[i] = match factor {
-            9 => x8 ^ x,
-            11 => x8 ^ x2 ^ x,
-            13 => x8 ^ x4 ^ x,
-            14 => x8 ^ x4 ^ x2,
-            _ => 0,
-        };
+        let s = INV_S_BOX_INIT[i];
+        table[i] = ((gf_mul(s, 14) as u32) << 24)
+            | ((gf_mul(s, 9) as u32) << 16)
+            | ((gf_mul(s, 13) as u32) << 8)
+            | (gf_mul(s, 11) as u32);
         i += 1;
     }
     table
 }
 
-pub const GF_MUL_9: [u8; 256] = compute_gf_mul_table(9);
-pub const GF_MUL_11: [u8; 256] = compute_gf_mul_table(11);
-pub const GF_MUL_13: [u8; 256] = compute_gf_mul_table(13);
-pub const GF_MUL_14: [u8; 256] = compute_gf_mul_table(14);
+// JUSTIFICATION: Placing TD0 in internal .dram1 avoids SPI flash cache
+// stalls during real-time AirPlay RTP packet decryption.
+// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
+// script for plain [u32; 256] data with no alignment or init hazards.
+#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
+#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+static TD0: [u32; 256] = compute_td0();
 
 #[inline(always)]
-const fn inv_mix_muls(x: u8) -> (u8, u8, u8, u8) {
-    let idx = x as usize;
-    (
-        GF_MUL_9[idx],
-        GF_MUL_11[idx],
-        GF_MUL_13[idx],
-        GF_MUL_14[idx],
-    )
+const fn inv_mix_col_word(w: u32) -> u32 {
+    let b0 = (w >> 24) as u8;
+    let b1 = (w >> 16) as u8;
+    let b2 = (w >> 8) as u8;
+    let b3 = w as u8;
+
+    let r0 = gf_mul(b0, 14) ^ gf_mul(b1, 11) ^ gf_mul(b2, 13) ^ gf_mul(b3, 9);
+    let r1 = gf_mul(b0, 9) ^ gf_mul(b1, 14) ^ gf_mul(b2, 11) ^ gf_mul(b3, 13);
+    let r2 = gf_mul(b0, 13) ^ gf_mul(b1, 9) ^ gf_mul(b2, 14) ^ gf_mul(b3, 11);
+    let r3 = gf_mul(b0, 11) ^ gf_mul(b1, 13) ^ gf_mul(b2, 9) ^ gf_mul(b3, 14);
+
+    u32::from_be_bytes([r0, r1, r2, r3])
 }
 
 /// AES-128-CBC Decryptor in pure `#![no_std]`.
@@ -870,112 +893,76 @@ impl Aes128Cbc {
             }
             rk[i] = rk[i - 4] ^ temp;
         }
+        for w in &mut rk[4..40] {
+            *w = inv_mix_col_word(*w);
+        }
         Self { round_keys: rk }
     }
 
     /// Decrypts a single 16-byte block in place.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
-        let mut state = [0u8; 16];
-        state.copy_from_slice(block);
+        let mut s0 =
+            u32::from_be_bytes([block[0], block[1], block[2], block[3]]) ^ self.round_keys[40];
+        let mut s1 =
+            u32::from_be_bytes([block[4], block[5], block[6], block[7]]) ^ self.round_keys[41];
+        let mut s2 =
+            u32::from_be_bytes([block[8], block[9], block[10], block[11]]) ^ self.round_keys[42];
+        let mut s3 =
+            u32::from_be_bytes([block[12], block[13], block[14], block[15]]) ^ self.round_keys[43];
 
-        // Round 10: AddRoundKey
-        let rk_last = &self.round_keys[40..44];
-        for c in 0..4 {
-            let k = rk_last[c].to_be_bytes();
-            for r in 0..4 {
-                state[r + 4 * c] ^= k[r];
-            }
-        }
-
-        // Rounds 9 down to 1
         for round in (1..10).rev() {
-            // InvShiftRows
-            let mut temp = [0u8; 16];
-            temp[0] = state[0];
-            temp[4] = state[4];
-            temp[8] = state[8];
-            temp[12] = state[12];
-
-            temp[1] = state[13];
-            temp[5] = state[1];
-            temp[9] = state[5];
-            temp[13] = state[9];
-
-            temp[2] = state[10];
-            temp[6] = state[14];
-            temp[10] = state[2];
-            temp[14] = state[6];
-
-            temp[3] = state[7];
-            temp[7] = state[11];
-            temp[11] = state[15];
-            temp[15] = state[3];
-
-            // InvSubBytes
-            for b in &mut temp {
-                *b = INV_S_BOX[*b as usize];
-            }
-
-            // AddRoundKey
-            let rk_cur = &self.round_keys[round * 4..(round + 1) * 4];
-            for c in 0..4 {
-                let k = rk_cur[c].to_be_bytes();
-                for r in 0..4 {
-                    temp[r + 4 * c] ^= k[r];
-                }
-            }
-
-            // InvMixColumns
-            for c in 0..4 {
-                let (s0_9, s0_11, s0_13, s0_14) = inv_mix_muls(temp[4 * c]);
-                let (s1_9, s1_11, s1_13, s1_14) = inv_mix_muls(temp[4 * c + 1]);
-                let (s2_9, s2_11, s2_13, s2_14) = inv_mix_muls(temp[4 * c + 2]);
-                let (s3_9, s3_11, s3_13, s3_14) = inv_mix_muls(temp[4 * c + 3]);
-
-                state[4 * c] = s0_14 ^ s1_11 ^ s2_13 ^ s3_9;
-                state[4 * c + 1] = s0_9 ^ s1_14 ^ s2_11 ^ s3_13;
-                state[4 * c + 2] = s0_13 ^ s1_9 ^ s2_14 ^ s3_11;
-                state[4 * c + 3] = s0_11 ^ s1_13 ^ s2_9 ^ s3_14;
-            }
+            let rk = &self.round_keys[round * 4..round * 4 + 4];
+            let t0 = TD0[(s0 >> 24) as usize]
+                ^ TD0[((s3 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s2 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s1 & 0xFF) as usize].rotate_right(24)
+                ^ rk[0];
+            let t1 = TD0[(s1 >> 24) as usize]
+                ^ TD0[((s0 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s3 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s2 & 0xFF) as usize].rotate_right(24)
+                ^ rk[1];
+            let t2 = TD0[(s2 >> 24) as usize]
+                ^ TD0[((s1 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s0 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s3 & 0xFF) as usize].rotate_right(24)
+                ^ rk[2];
+            let t3 = TD0[(s3 >> 24) as usize]
+                ^ TD0[((s2 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s1 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s0 & 0xFF) as usize].rotate_right(24)
+                ^ rk[3];
+            s0 = t0;
+            s1 = t1;
+            s2 = t2;
+            s3 = t3;
         }
 
-        // Round 0: InvShiftRows
-        let mut temp = [0u8; 16];
-        temp[0] = state[0];
-        temp[4] = state[4];
-        temp[8] = state[8];
-        temp[12] = state[12];
+        let out0 = (((INV_S_BOX[(s0 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s3 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s2 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s1 & 0xFF) as usize] as u32))
+            ^ self.round_keys[0];
+        let out1 = (((INV_S_BOX[(s1 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s0 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s3 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s2 & 0xFF) as usize] as u32))
+            ^ self.round_keys[1];
+        let out2 = (((INV_S_BOX[(s2 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s1 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s0 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s3 & 0xFF) as usize] as u32))
+            ^ self.round_keys[2];
+        let out3 = (((INV_S_BOX[(s3 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s2 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s1 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s0 & 0xFF) as usize] as u32))
+            ^ self.round_keys[3];
 
-        temp[1] = state[13];
-        temp[5] = state[1];
-        temp[9] = state[5];
-        temp[13] = state[9];
-
-        temp[2] = state[10];
-        temp[6] = state[14];
-        temp[10] = state[2];
-        temp[14] = state[6];
-
-        temp[3] = state[7];
-        temp[7] = state[11];
-        temp[11] = state[15];
-        temp[15] = state[3];
-
-        // InvSubBytes
-        for b in &mut temp {
-            *b = INV_S_BOX[*b as usize];
-        }
-
-        // AddRoundKey 0
-        let rk_first = &self.round_keys[0..4];
-        for c in 0..4 {
-            let k = rk_first[c].to_be_bytes();
-            for r in 0..4 {
-                temp[r + 4 * c] ^= k[r];
-            }
-        }
-
-        block.copy_from_slice(&temp);
+        block[0..4].copy_from_slice(&out0.to_be_bytes());
+        block[4..8].copy_from_slice(&out1.to_be_bytes());
+        block[8..12].copy_from_slice(&out2.to_be_bytes());
+        block[12..16].copy_from_slice(&out3.to_be_bytes());
     }
 
     /// Decrypts packet buffer in-place using CBC mode.
@@ -992,22 +979,8 @@ impl Aes128Cbc {
             block.copy_from_slice(chunk);
             let next_iv = block;
             self.decrypt_block(&mut block);
-            for w in 0..4 {
-                let offset = w * 4;
-                let b_word = u32::from_ne_bytes([
-                    block[offset],
-                    block[offset + 1],
-                    block[offset + 2],
-                    block[offset + 3],
-                ]);
-                let p_word = u32::from_ne_bytes([
-                    prev_block[offset],
-                    prev_block[offset + 1],
-                    prev_block[offset + 2],
-                    prev_block[offset + 3],
-                ]);
-                let out_word = (b_word ^ p_word).to_ne_bytes();
-                chunk[offset..offset + 4].copy_from_slice(&out_word);
+            for (dst, (&b, &p)) in chunk.iter_mut().zip(block.iter().zip(&prev_block)) {
+                *dst = b ^ p;
             }
             prev_block = next_iv;
         }
@@ -1207,5 +1180,65 @@ mod tests {
         let modulus = BigUint::from_u32(17);
         let res1 = montgomery_mod_pow(&base, &exp1, &modulus).expect("mod pow succeeds");
         assert_eq!(res1, BigUint::from_u32(5)); // 3^5 = 243 = 14*17 + 5 = 5 mod 17
+    }
+
+    #[test]
+    fn test_aes128_fips197_appendix_b_decrypt_block() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let mut block = [
+            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
+            0x0b, 0x32,
+        ];
+        let expected = [
+            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
+            0x07, 0x34,
+        ];
+        let cipher = Aes128Cbc::new(&key);
+        cipher.decrypt_block(&mut block);
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn test_aes128_cbc_nist_sp800_38a_f22_and_raop_tail() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let iv = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let mut data = [
+            // Block 1
+            0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46, 0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9,
+            0x19, 0x7d, // Block 2
+            0x50, 0x86, 0xcb, 0x9b, 0x50, 0x72, 0x19, 0xee, 0x95, 0xdb, 0x11, 0x3a, 0x91, 0x76,
+            0x78, 0xb2, // Block 3
+            0x73, 0xbe, 0xd6, 0xb8, 0xe3, 0xc1, 0x74, 0x3b, 0x71, 0x16, 0xe6, 0x9e, 0x22, 0x22,
+            0x95, 0x16, // Block 4
+            0x3f, 0xf1, 0xca, 0xa1, 0x68, 0x1f, 0xac, 0x09, 0x12, 0x0e, 0xca, 0x30, 0x75, 0x86,
+            0xe1, 0xa7, // Trailing 5 unencrypted bytes
+            0xde, 0xad, 0xbe, 0xef, 0x42,
+        ];
+        let expected_prefix = [
+            // Block 1
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a, // Block 2
+            0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf,
+            0x8e, 0x51, // Block 3
+            0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a,
+            0x52, 0xef, // Block 4
+            0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17, 0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c,
+            0x37, 0x10,
+        ];
+        let expected_tail = [0xde, 0xad, 0xbe, 0xef, 0x42];
+
+        let cipher = Aes128Cbc::new(&key);
+        cipher.decrypt_in_place(&iv, &mut data);
+        assert_eq!(&data[..64], &expected_prefix);
+        assert_eq!(&data[64..], &expected_tail);
     }
 }
