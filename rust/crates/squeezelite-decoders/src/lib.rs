@@ -435,11 +435,9 @@ impl AudioDecoder for PcmDecoder {
             }
             // 16-bit Stereo Big-Endian (Common Squeezebox PCM format)
             (16, true, 2) => {
-                for (src, dst) in pcm_in
-                    .chunks_exact(4)
-                    .zip(pcm_out.chunks_exact_mut(2))
-                    .take(frames_to_decode)
-                {
+                let src_bytes = &pcm_in[..frames_to_decode * 4];
+                let dst_pairs = &mut pcm_out[..frames_to_decode * 2];
+                for (src, dst) in src_bytes.chunks(4).zip(dst_pairs.chunks_mut(2)) {
                     let l = i16::from_be_bytes([src[0], src[1]]) as i32;
                     let r = i16::from_be_bytes([src[2], src[3]]) as i32;
                     dst[0] = l << 16;
@@ -457,11 +455,9 @@ impl AudioDecoder for PcmDecoder {
             }
             // 16-bit Stereo Little-Endian
             (16, false, 2) => {
-                for (src, dst) in pcm_in
-                    .chunks_exact(4)
-                    .zip(pcm_out.chunks_exact_mut(2))
-                    .take(frames_to_decode)
-                {
+                let src_bytes = &pcm_in[..frames_to_decode * 4];
+                let dst_pairs = &mut pcm_out[..frames_to_decode * 2];
+                for (src, dst) in src_bytes.chunks(4).zip(dst_pairs.chunks_mut(2)) {
                     let l = i16::from_le_bytes([src[0], src[1]]) as i32;
                     let r = i16::from_le_bytes([src[2], src[3]]) as i32;
                     dst[0] = l << 16;
@@ -479,11 +475,9 @@ impl AudioDecoder for PcmDecoder {
             }
             // 24-bit Stereo Big-Endian
             (24, true, 2) => {
-                for (src, dst) in pcm_in
-                    .chunks_exact(6)
-                    .zip(pcm_out.chunks_exact_mut(2))
-                    .take(frames_to_decode)
-                {
+                let src_bytes = &pcm_in[..frames_to_decode * 6];
+                let dst_pairs = &mut pcm_out[..frames_to_decode * 2];
+                for (src, dst) in src_bytes.chunks(6).zip(dst_pairs.chunks_mut(2)) {
                     let l =
                         ((src[0] as i32) << 24) | ((src[1] as i32) << 16) | ((src[2] as i32) << 8);
                     let r =
@@ -505,11 +499,9 @@ impl AudioDecoder for PcmDecoder {
             }
             // 24-bit Stereo Little-Endian
             (24, false, 2) => {
-                for (src, dst) in pcm_in
-                    .chunks_exact(6)
-                    .zip(pcm_out.chunks_exact_mut(2))
-                    .take(frames_to_decode)
-                {
+                let src_bytes = &pcm_in[..frames_to_decode * 6];
+                let dst_pairs = &mut pcm_out[..frames_to_decode * 2];
+                for (src, dst) in src_bytes.chunks(6).zip(dst_pairs.chunks_mut(2)) {
                     let l =
                         ((src[0] as i32) << 8) | ((src[1] as i32) << 16) | ((src[2] as i32) << 24);
                     let r =
@@ -531,11 +523,9 @@ impl AudioDecoder for PcmDecoder {
             }
             // 32-bit Stereo Big-Endian
             (32, true, 2) => {
-                for (src, dst) in pcm_in
-                    .chunks_exact(8)
-                    .zip(pcm_out.chunks_exact_mut(2))
-                    .take(frames_to_decode)
-                {
+                let src_bytes = &pcm_in[..frames_to_decode * 8];
+                let dst_pairs = &mut pcm_out[..frames_to_decode * 2];
+                for (src, dst) in src_bytes.chunks(8).zip(dst_pairs.chunks_mut(2)) {
                     let l = i32::from_be_bytes([src[0], src[1], src[2], src[3]]);
                     let r = i32::from_be_bytes([src[4], src[5], src[6], src[7]]);
                     dst[0] = l;
@@ -558,11 +548,9 @@ impl AudioDecoder for PcmDecoder {
             }
             // 32-bit Stereo Little-Endian
             (32, false, 2) => {
-                for (src, dst) in pcm_in
-                    .chunks_exact(8)
-                    .zip(pcm_out.chunks_exact_mut(2))
-                    .take(frames_to_decode)
-                {
+                let src_bytes = &pcm_in[..frames_to_decode * 8];
+                let dst_pairs = &mut pcm_out[..frames_to_decode * 2];
+                for (src, dst) in src_bytes.chunks(8).zip(dst_pairs.chunks_mut(2)) {
                     let l = i32::from_le_bytes([src[0], src[1], src[2], src[3]]);
                     let r = i32::from_le_bytes([src[4], src[5], src[6], src[7]]);
                     dst[0] = l;
