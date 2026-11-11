@@ -1585,7 +1585,7 @@ mod tests {
 
         for _ in 0..16 {
             let mut ct = [0u8; 256];
-            for chunk in ct.chunks_exact_mut(8) {
+            for chunk in ct.chunks_mut(8) {
                 chunk.copy_from_slice(&next_u64().to_le_bytes());
             }
             // Mask top byte to guarantee ct < n (AIRPORT_EXPRESS_N_BYTES[0] is 0xe7)
