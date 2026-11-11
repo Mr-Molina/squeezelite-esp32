@@ -4800,7 +4800,7 @@ mod tests {
         rig.command(&mut pipeline, &server_frame(b"codc", b"f"), 10);
         let id = match &mut pipeline.decoder {
             ActiveDecoder::Flac(d) => {
-                d.pending_pcm.extend_from_slice(&[1, 2, 3, 4]);
+                d.scratch_len = 2;
                 d.stream_buf.extend_from_slice(b"stale");
                 &**d as *const squeezelite_decoders::FlacDecoder
             }
@@ -4811,7 +4811,7 @@ mod tests {
             ActiveDecoder::Flac(d) => {
                 assert_eq!(&**d as *const _, id, "same decoder kept");
                 assert!(
-                    d.pending_pcm.is_empty() && d.stream_buf.is_empty(),
+                    !d.has_pending_pcm() && d.stream_buf.is_empty(),
                     "and flushed"
                 );
             }

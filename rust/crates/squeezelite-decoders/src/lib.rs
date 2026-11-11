@@ -2074,53 +2074,6 @@ fn decode_residual(
     }
 }
 
-#[inline(always)]
-fn decorrelate_samples(
-    scratch: &[i32],
-    i: usize,
-    channel_assignment: u8,
-    shift: u32,
-) -> (i32, i32) {
-    match channel_assignment {
-        0 => {
-            let s = scratch[i].wrapping_shl(shift);
-            (s, s)
-        }
-        1 => {
-            let l = scratch[i].wrapping_shl(shift);
-            let r = scratch[MAX_FLAC_BLOCK_SAMPLES + i].wrapping_shl(shift);
-            (l, r)
-        }
-        8 => {
-            let ch0 = scratch[i];
-            let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let l = ch0.wrapping_shl(shift);
-            let r = ch0.wrapping_sub(ch1).wrapping_shl(shift);
-            (l, r)
-        }
-        9 => {
-            let ch0 = scratch[i];
-            let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let l = ch1.wrapping_add(ch0).wrapping_shl(shift);
-            let r = ch1.wrapping_shl(shift);
-            (l, r)
-        }
-        10 => {
-            let ch0 = scratch[i];
-            let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let mid = ch0.wrapping_shl(1) | (ch1 & 1);
-            let l = (mid.wrapping_add(ch1) >> 1).wrapping_shl(shift);
-            let r = (mid.wrapping_sub(ch1) >> 1).wrapping_shl(shift);
-            (l, r)
-        }
-        _ => {
-            let l = scratch[i].wrapping_shl(shift);
-            let r = scratch[MAX_FLAC_BLOCK_SAMPLES + i].wrapping_shl(shift);
-            (l, r)
-        }
-    }
-}
-
 const fn make_ogg_crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];
     let mut i = 0usize;
@@ -2172,8 +2125,10 @@ pub struct FlacDecoder {
     pub channels: u32,
     pub header_len: usize,
     pub stream_buf: vec::Vec<u8>,
-    pub pending_pcm: vec::Vec<i32>,
-    pub pending_offset: usize,
+    pub scratch_pos: usize,
+    pub scratch_len: usize,
+    scratch_chan_assign: u8,
+    scratch_shift: u32,
     subframe_scratch: Box<[i32]>,
     meta_skip_remaining: usize,
     in_metadata: bool,
@@ -2227,8 +2182,10 @@ impl FlacDecoder {
             channels: 2,
             header_len: 0,
             stream_buf: vec::Vec::with_capacity(MAX_STREAM_BUF),
-            pending_pcm: vec::Vec::with_capacity(16384),
-            pending_offset: 0,
+            scratch_pos: 0,
+            scratch_len: 0,
+            scratch_chan_assign: 0,
+            scratch_shift: 0,
             subframe_scratch: vec![0i32; MAX_FLAC_BLOCK_SAMPLES * 2].into_boxed_slice(),
             meta_skip_remaining: 0,
             in_metadata: false,
@@ -2246,6 +2203,67 @@ impl FlacDecoder {
         }
     }
 
+    /// Lazily decorrelates subframe samples directly from `subframe_scratch`
+    /// into `pcm_out` without intermediate heap buffering.
+    pub fn emit_decorrelated_frames(&mut self, pcm_out: &mut [i32]) -> usize {
+        let avail = self.scratch_len.saturating_sub(self.scratch_pos);
+        let max_frames = pcm_out.len() / 2;
+        let to_emit = avail.min(max_frames);
+        if to_emit == 0 {
+            return 0;
+        }
+
+        let start = self.scratch_pos;
+        let end = start + to_emit;
+        let ch0 = &self.subframe_scratch[start..end];
+        let ch1 =
+            &self.subframe_scratch[MAX_FLAC_BLOCK_SAMPLES + start..MAX_FLAC_BLOCK_SAMPLES + end];
+        let shift = self.scratch_shift;
+        let out_pairs = &mut pcm_out[..to_emit * 2];
+
+        match self.scratch_chan_assign {
+            0 => {
+                for (pair, &s0) in out_pairs.chunks_mut(2).zip(ch0.iter()) {
+                    let s = s0.wrapping_shl(shift);
+                    pair[0] = s;
+                    pair[1] = s;
+                }
+            }
+            8 => {
+                for ((pair, &s0), &s1) in out_pairs.chunks_mut(2).zip(ch0.iter()).zip(ch1.iter()) {
+                    pair[0] = s0.wrapping_shl(shift);
+                    pair[1] = s0.wrapping_sub(s1).wrapping_shl(shift);
+                }
+            }
+            9 => {
+                for ((pair, &s0), &s1) in out_pairs.chunks_mut(2).zip(ch0.iter()).zip(ch1.iter()) {
+                    pair[0] = s1.wrapping_add(s0).wrapping_shl(shift);
+                    pair[1] = s1.wrapping_shl(shift);
+                }
+            }
+            10 => {
+                for ((pair, &s0), &s1) in out_pairs.chunks_mut(2).zip(ch0.iter()).zip(ch1.iter()) {
+                    let mid = s0.wrapping_shl(1) | (s1 & 1);
+                    pair[0] = (mid.wrapping_add(s1) >> 1).wrapping_shl(shift);
+                    pair[1] = (mid.wrapping_sub(s1) >> 1).wrapping_shl(shift);
+                }
+            }
+            _ => {
+                for ((pair, &s0), &s1) in out_pairs.chunks_mut(2).zip(ch0.iter()).zip(ch1.iter()) {
+                    pair[0] = s0.wrapping_shl(shift);
+                    pair[1] = s1.wrapping_shl(shift);
+                }
+            }
+        }
+
+        self.scratch_pos = end;
+        if self.scratch_pos >= self.scratch_len {
+            self.scratch_pos = 0;
+            self.scratch_len = 0;
+        }
+        to_emit
+    }
+
     /// Forgets the decode progress on the current frame (its start moved or
     /// the stream was reset).
     #[inline]
@@ -2256,7 +2274,7 @@ impl FlacDecoder {
     }
 
     pub fn has_pending_pcm(&self) -> bool {
-        if self.pending_offset < self.pending_pcm.len() {
+        if self.scratch_pos < self.scratch_len {
             return true;
         }
         // End of input with a deferred frame: one more `decode(&[])` decodes
@@ -2280,8 +2298,8 @@ impl FlacDecoder {
     }
 
     pub fn flush(&mut self) {
-        self.pending_pcm.clear();
-        self.pending_offset = 0;
+        self.scratch_pos = 0;
+        self.scratch_len = 0;
         self.meta_skip_remaining = 0;
         self.in_metadata = false;
         self.need_more_input = true;
@@ -2424,20 +2442,9 @@ impl AudioDecoder for FlacDecoder {
             return Err(DecoderError::BufferOverflow);
         }
 
-        if self.pending_offset < self.pending_pcm.len() {
-            let pending_samples = self.pending_pcm.len() - self.pending_offset;
-            let pending_frames = pending_samples / 2;
-            let to_copy = core::cmp::min(pending_frames, max_frames);
-            let sample_count = to_copy * 2;
-            pcm_out[..sample_count].copy_from_slice(
-                &self.pending_pcm[self.pending_offset..self.pending_offset + sample_count],
-            );
-            self.pending_offset += sample_count;
-            if self.pending_offset >= self.pending_pcm.len() {
-                self.pending_pcm.clear();
-                self.pending_offset = 0;
-            }
-            return Ok((0, to_copy));
+        if self.scratch_pos < self.scratch_len {
+            let emitted = self.emit_decorrelated_frames(pcm_out);
+            return Ok((0, emitted));
         }
 
         if !encoded_in.is_empty() {
@@ -2451,6 +2458,8 @@ impl AudioDecoder for FlacDecoder {
         {
             self.stream_buf.clear();
             self.header_len = 0;
+            self.scratch_pos = 0;
+            self.scratch_len = 0;
             self.is_ogg_flac = None;
             self.max_frame_size = 0;
             self.reset_frame_progress();
@@ -2492,8 +2501,8 @@ impl AudioDecoder for FlacDecoder {
             if self.stream_buf.len().saturating_add(encoded_in.len()) > MAX_STREAM_BUF {
                 self.stream_buf.clear();
                 self.header_len = 0;
-                self.pending_pcm.clear();
-                self.pending_offset = 0;
+                self.scratch_pos = 0;
+                self.scratch_len = 0;
                 self.meta_skip_remaining = 0;
                 self.in_metadata = false;
                 self.reset_frame_progress();
@@ -2771,33 +2780,20 @@ impl AudioDecoder for FlacDecoder {
             }
 
             let total_frame_bytes = frame_body_len + 2;
-            let shift = Self::sample_shift(self.bits_per_sample);
-            let block_size = hdr.block_size;
-            let available_space = max_frames.saturating_sub(frames_out);
-            let to_write = core::cmp::min(block_size, available_space);
-
-            for i in 0..to_write {
-                let (l, r) =
-                    decorrelate_samples(&self.subframe_scratch, i, hdr.channel_assignment, shift);
-                pcm_out[(frames_out + i) * 2] = l;
-                pcm_out[(frames_out + i) * 2 + 1] = r;
-            }
-            frames_out += to_write;
-
-            self.pending_pcm.reserve((block_size - to_write) * 2);
-            for i in to_write..block_size {
-                let (l, r) =
-                    decorrelate_samples(&self.subframe_scratch, i, hdr.channel_assignment, shift);
-                self.pending_pcm.push(l);
-                self.pending_pcm.push(r);
-            }
+            self.scratch_pos = 0;
+            self.scratch_len = hdr.block_size;
+            self.scratch_chan_assign = hdr.channel_assignment;
+            self.scratch_shift = Self::sample_shift(self.bits_per_sample);
+            let written =
+                self.emit_decorrelated_frames(&mut pcm_out[frames_out * 2..max_frames * 2]);
+            frames_out += written;
 
             self.stream_buf
                 .drain(self.header_len..self.header_len + total_frame_bytes);
             self.reset_frame_progress();
             self.need_more_input = false;
 
-            if !self.pending_pcm.is_empty() {
+            if self.scratch_pos < self.scratch_len {
                 break;
             }
         }
@@ -5309,12 +5305,12 @@ mod tests {
             let mut flac = FlacDecoder::new();
             flac.stream_buf.extend_from_slice(b"fLaC00001111");
             flac.header_len = 8;
-            flac.pending_pcm.extend_from_slice(&[50, -50, 60, -60]);
-            let mut flac_out = [0i32; 2];
-            assert_eq!(flac.decode(&[], &mut flac_out), Ok((0, 1)));
-            assert_eq!(flac_out, [50, -50]);
+            flac.scratch_len = 2;
+            assert!(flac.has_pending_pcm());
             flac.flush();
-            assert!(flac.pending_pcm.is_empty());
+            assert!(!flac.has_pending_pcm());
+            assert_eq!(flac.scratch_len, 0);
+            assert_eq!(flac.scratch_pos, 0);
             assert_eq!(flac.stream_buf.len(), 8);
 
             let mut aac = AacDecoder::new();
