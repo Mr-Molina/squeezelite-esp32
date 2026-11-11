@@ -1859,7 +1859,7 @@ fn decode_subframe(
     reader: &mut BitReader<'_>,
     subframe_bps: u32,
     block_size: usize,
-    out: &mut [i64],
+    out: &mut [i32],
 ) -> Result<(), ()> {
     let pad = reader.read_bit()?;
     if pad != 0 {
@@ -1879,12 +1879,12 @@ fn decode_subframe(
 
     match sf_type {
         0 => {
-            let val = reader.read_signed(eff_bps)?;
+            let val = reader.read_signed(eff_bps)? as i32;
             out[..block_size].fill(val);
         }
         1 => {
             for sample in out[..block_size].iter_mut() {
-                *sample = reader.read_signed(eff_bps)?;
+                *sample = reader.read_signed(eff_bps)? as i32;
             }
         }
         8..=12 => {
@@ -1893,7 +1893,7 @@ fn decode_subframe(
                 return Err(());
             }
             for sample in out[..order].iter_mut() {
-                *sample = reader.read_signed(eff_bps)?;
+                *sample = reader.read_signed(eff_bps)? as i32;
             }
             decode_residual(reader, block_size, order, &mut out[order..block_size])?;
             match order {
@@ -1905,25 +1905,25 @@ fn decode_subframe(
                 }
                 2 => {
                     for i in 2..block_size {
-                        let term = (2i64).wrapping_mul(out[i - 1]).wrapping_sub(out[i - 2]);
+                        let term = (2i32).wrapping_mul(out[i - 1]).wrapping_sub(out[i - 2]);
                         out[i] = out[i].wrapping_add(term);
                     }
                 }
                 3 => {
                     for i in 3..block_size {
-                        let term = (3i64)
+                        let term = (3i32)
                             .wrapping_mul(out[i - 1])
-                            .wrapping_sub((3i64).wrapping_mul(out[i - 2]))
+                            .wrapping_sub((3i32).wrapping_mul(out[i - 2]))
                             .wrapping_add(out[i - 3]);
                         out[i] = out[i].wrapping_add(term);
                     }
                 }
                 4 => {
                     for i in 4..block_size {
-                        let term = (4i64)
+                        let term = (4i32)
                             .wrapping_mul(out[i - 1])
-                            .wrapping_sub((6i64).wrapping_mul(out[i - 2]))
-                            .wrapping_add((4i64).wrapping_mul(out[i - 3]))
+                            .wrapping_sub((6i32).wrapping_mul(out[i - 2]))
+                            .wrapping_add((4i32).wrapping_mul(out[i - 3]))
                             .wrapping_sub(out[i - 4]);
                         out[i] = out[i].wrapping_add(term);
                     }
@@ -1937,7 +1937,7 @@ fn decode_subframe(
                 return Err(());
             }
             for sample in out[..order].iter_mut() {
-                *sample = reader.read_signed(eff_bps)?;
+                *sample = reader.read_signed(eff_bps)? as i32;
             }
             let raw_prec = reader.read_bits(4)?;
             let qlp_prec = (raw_prec + 1) as usize;
@@ -1948,9 +1948,9 @@ fn decode_subframe(
             if qlp_shift < 0 {
                 return Err(());
             }
-            let mut coeffs = [0i64; 32];
+            let mut coeffs = [0i32; 32];
             for coeff in coeffs[..order].iter_mut() {
-                *coeff = reader.read_signed(qlp_prec)?;
+                *coeff = reader.read_signed(qlp_prec)? as i32;
             }
             decode_residual(reader, block_size, order, &mut out[order..block_size])?;
 
@@ -1961,27 +1961,25 @@ fn decode_subframe(
             // 64-bit path.
             let ilog2_order = (usize::BITS - 1 - order.leading_zeros()) as usize;
             if eff_bps + qlp_prec + ilog2_order <= 32 {
-                let mut coeffs32 = [0i32; 32];
-                for (c32, &c) in coeffs32[..order].iter_mut().zip(&coeffs[..order]) {
-                    *c32 = c as i32;
-                }
-                let coeffs32 = &coeffs32[..order];
+                let coeffs = &coeffs[..order];
                 for i in order..block_size {
                     let history = &out[i - order..i];
                     let mut sum: i32 = 0;
-                    for (&c, &x) in coeffs32.iter().zip(history.iter().rev()) {
-                        sum = sum.wrapping_add(c.wrapping_mul(x as i32));
+                    for (&c, &x) in coeffs.iter().zip(history.iter().rev()) {
+                        sum = sum.wrapping_add(c.wrapping_mul(x));
                     }
-                    let predicted = (sum >> qlp_shift) as i64;
+                    let predicted = sum >> qlp_shift;
                     out[i] = out[i].wrapping_add(predicted);
                 }
             } else {
                 for i in order..block_size {
                     let mut sum: i64 = 0;
                     for j in 0..order {
-                        sum = sum.wrapping_add(coeffs[j].wrapping_mul(out[i - 1 - j]));
+                        sum = sum.wrapping_add(
+                            i64::from(coeffs[j]).wrapping_mul(i64::from(out[i - 1 - j])),
+                        );
                     }
-                    let predicted = sum >> qlp_shift;
+                    let predicted = (sum >> qlp_shift) as i32;
                     out[i] = out[i].wrapping_add(predicted);
                 }
             }
@@ -1991,7 +1989,7 @@ fn decode_subframe(
 
     if wasted_bits > 0 {
         for s in out[..block_size].iter_mut() {
-            *s <<= wasted_bits;
+            *s = s.wrapping_shl(wasted_bits as u32);
         }
     }
 
@@ -2002,7 +2000,7 @@ fn decode_residual(
     reader: &mut BitReader<'_>,
     block_size: usize,
     order: usize,
-    out: &mut [i64],
+    out: &mut [i32],
 ) -> Result<(), ()> {
     let method = reader.read_bits(2)?;
     if method != 0 && method != 1 {
@@ -2037,7 +2035,7 @@ fn decode_residual(
                 if sample_idx >= out.len() {
                     return Err(());
                 }
-                out[sample_idx] = reader.read_signed(b)?;
+                out[sample_idx] = reader.read_signed(b)? as i32;
                 sample_idx += 1;
             }
         } else {
@@ -2059,9 +2057,9 @@ fn decode_residual(
                     None => return Err(()),
                 };
                 let val = if (u & 1) != 0 {
-                    -1 - (u >> 1) as i64
+                    (-1i64).wrapping_sub((u >> 1) as i64) as i32
                 } else {
-                    (u >> 1) as i64
+                    (u >> 1) as i32
                 };
                 out[sample_idx] = val;
                 sample_idx += 1;
@@ -2078,46 +2076,46 @@ fn decode_residual(
 
 #[inline(always)]
 fn decorrelate_samples(
-    scratch: &[i64],
+    scratch: &[i32],
     i: usize,
     channel_assignment: u8,
     shift: u32,
 ) -> (i32, i32) {
     match channel_assignment {
         0 => {
-            let s = (scratch[i] as i32) << shift;
+            let s = scratch[i].wrapping_shl(shift);
             (s, s)
         }
         1 => {
-            let l = (scratch[i] as i32) << shift;
-            let r = (scratch[MAX_FLAC_BLOCK_SAMPLES + i] as i32) << shift;
+            let l = scratch[i].wrapping_shl(shift);
+            let r = scratch[MAX_FLAC_BLOCK_SAMPLES + i].wrapping_shl(shift);
             (l, r)
         }
         8 => {
             let ch0 = scratch[i];
             let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let l = (ch0 as i32) << shift;
-            let r = (ch0.wrapping_sub(ch1) as i32) << shift;
+            let l = ch0.wrapping_shl(shift);
+            let r = ch0.wrapping_sub(ch1).wrapping_shl(shift);
             (l, r)
         }
         9 => {
             let ch0 = scratch[i];
             let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
-            let l = (ch1.wrapping_add(ch0) as i32) << shift;
-            let r = (ch1 as i32) << shift;
+            let l = ch1.wrapping_add(ch0).wrapping_shl(shift);
+            let r = ch1.wrapping_shl(shift);
             (l, r)
         }
         10 => {
             let ch0 = scratch[i];
             let ch1 = scratch[MAX_FLAC_BLOCK_SAMPLES + i];
             let mid = ch0.wrapping_shl(1) | (ch1 & 1);
-            let l = (((mid.wrapping_add(ch1)) >> 1) as i32) << shift;
-            let r = (((mid.wrapping_sub(ch1)) >> 1) as i32) << shift;
+            let l = (mid.wrapping_add(ch1) >> 1).wrapping_shl(shift);
+            let r = (mid.wrapping_sub(ch1) >> 1).wrapping_shl(shift);
             (l, r)
         }
         _ => {
-            let l = (scratch[i] as i32) << shift;
-            let r = (scratch[MAX_FLAC_BLOCK_SAMPLES + i] as i32) << shift;
+            let l = scratch[i].wrapping_shl(shift);
+            let r = scratch[MAX_FLAC_BLOCK_SAMPLES + i].wrapping_shl(shift);
             (l, r)
         }
     }
@@ -2176,7 +2174,7 @@ pub struct FlacDecoder {
     pub stream_buf: vec::Vec<u8>,
     pub pending_pcm: vec::Vec<i32>,
     pub pending_offset: usize,
-    subframe_scratch: Box<[i64]>,
+    subframe_scratch: Box<[i32]>,
     meta_skip_remaining: usize,
     in_metadata: bool,
     min_block_size: u16,
@@ -2231,7 +2229,7 @@ impl FlacDecoder {
             stream_buf: vec::Vec::with_capacity(MAX_STREAM_BUF),
             pending_pcm: vec::Vec::with_capacity(16384),
             pending_offset: 0,
-            subframe_scratch: vec![0i64; MAX_FLAC_BLOCK_SAMPLES * 2].into_boxed_slice(),
+            subframe_scratch: vec![0i32; MAX_FLAC_BLOCK_SAMPLES * 2].into_boxed_slice(),
             meta_skip_remaining: 0,
             in_metadata: false,
             min_block_size: 0,
@@ -2564,6 +2562,9 @@ impl AudioDecoder for FlacDecoder {
                 if self.channels != 1 && self.channels != 2 {
                     return Err(DecoderError::UnsupportedFeature);
                 }
+                if self.bits_per_sample > 24 {
+                    return Err(DecoderError::UnsupportedFeature);
+                }
                 if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&self.sample_rate) {
                     return Err(DecoderError::UnsupportedFeature);
                 }
@@ -2673,6 +2674,10 @@ impl AudioDecoder for FlacDecoder {
                     continue;
                 }
             };
+
+            if hdr.bits_per_sample > 24 {
+                return Err(DecoderError::UnsupportedFeature);
+            }
 
             // Decoding a frame that is not completely buffered fails at the
             // end of the data and is thrown away, so with small input chunks a
@@ -6587,5 +6592,62 @@ mod tests {
         // 33 bits where sign bit (bit 32) is 0: 0x0100000000 >> 7 = 0x02000000
         let pos33 = br3.read_signed(33).expect("read positive 33 bits");
         assert!(pos33 > 0);
+    }
+
+    #[test]
+    fn test_flac_32bit_stream_returns_unsupported_feature() {
+        // 1. STREAMINFO with bits_per_sample = 32 (bps - 1 = 31 = 0b1_1111)
+        let mut hdr = [0u8; 42];
+        hdr[0..4].copy_from_slice(b"fLaC");
+        hdr[4] = 0x80;
+        hdr[5..8].copy_from_slice(&34u32.to_be_bytes()[1..]);
+        // min/max block size = 512
+        hdr[8..10].copy_from_slice(&512u16.to_be_bytes());
+        hdr[10..12].copy_from_slice(&512u16.to_be_bytes());
+        // sample rate = 44100 (0x0AC44), channels = 2 (coded 1),
+        // bps = 32 (coded 31 = 0b1_1111)
+        // si[10] = 0x0A, si[11] = 0xC4,
+        // si[12] = 0x43 (sr: 4, chan: 1<<1, bps_hi: 1), si[13] = 0xF0
+        hdr[18] = 0x0A;
+        hdr[19] = 0xC4;
+        hdr[20] = 0x43;
+        hdr[21] = 0xF0;
+
+        let mut decoder = FlacDecoder::new();
+        let mut pcm = [0i32; 1024];
+        assert_eq!(
+            decoder.decode(&hdr, &mut pcm),
+            Err(DecoderError::UnsupportedFeature)
+        );
+
+        // 2. 16-bit STREAMINFO followed by frame header with
+        // sample_size_code = 7 (32-bit).
+        // Set STREAMINFO bps to 16 (coded 15 = 0b0_1111).
+        hdr[20] = 0x42;
+        hdr[21] = 0xF0;
+
+        // Frame header:
+        // buf[0] = 0xFF, buf[1] = 0xF8
+        // buf[2] = 0x10 (block_size_code = 1 -> 192 samples, sample_rate_code = 0)
+        // buf[3] = 0x1E (channel_assignment = 1, sample_size_code = 7 -> 32-bit)
+        // buf[4] = 0x00 (frame number 0)
+        // buf[5] = flac_crc8(&buf[0..5])
+        let mut frame_hdr = [0u8; 6];
+        frame_hdr[0] = 0xFF;
+        frame_hdr[1] = 0xF8;
+        frame_hdr[2] = 0x10;
+        frame_hdr[3] = 0x1E;
+        frame_hdr[4] = 0x00;
+        frame_hdr[5] = flac_crc8(&frame_hdr[0..5]);
+
+        let mut stream = std::vec::Vec::new();
+        stream.extend_from_slice(&hdr);
+        stream.extend_from_slice(&frame_hdr);
+
+        let mut decoder2 = FlacDecoder::new();
+        assert_eq!(
+            decoder2.decode(&stream, &mut pcm),
+            Err(DecoderError::UnsupportedFeature)
+        );
     }
 }
