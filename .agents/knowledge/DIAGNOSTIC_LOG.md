@@ -585,3 +585,9 @@
     - Benchmark 2 (`64 KiB` & `8 KiB` PSRAM Sockets on `10.0.0.10`): SlimProto `:3483` reports **`snd_wnd:8192`** (`4x` expansion), HTTP proxy `:9000` reports **`snd_wnd:65536`** (`16x` expansion), and `pgrep -af 'lame|SqueezeDSP'` returns **0 transcoding processes**.
     - Benchmark 4 (`PowerSaveMode::None` Wi-Fi Ping RTT): 20/20 packets received (`0%` loss), min RTT **`2.729 ms`**, avg RTT **`33.894 ms`** (down from pre-remediation `45.48 ms` baseline).
   - **Hardware Safety**: Zero touch of `/dev/ttyUSB0`, zero calls to `/reboot_ota.json`, 1-flash circuit breaker strictly adhered to.
+
+## 2026-11-14 Session Diagnostics
+| Date | ID / Commit | Scope / Action | Status & Test Parity |
+| :--- | :--- | :--- | :--- |
+| 2026-11-14 | `4d45efc7` / `3102822a` | Linux glibc vs Windows CRT `GOLDEN_PCM_FNV1A64_STD` gate fix in `aac_alloc_equivalence.rs` | 840/840 workspace tests PASS (`cargo test --workspace`), 0 Clippy warnings, 0 GRS warnings |
+
