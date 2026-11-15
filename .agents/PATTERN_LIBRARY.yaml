@@ -11,7 +11,7 @@ patterns:
     '
   escalation_level: 1
   current_mitigation: advisory
-  mitigation_target: C:\Users\jmolina\.gemini\config\skills\goodbye\SKILL.md
+  mitigation_target: /home/console-admin/.gemini/config/skills/goodbye/SKILL.md
   occurrences:
   - session: conversation://9594ed66-2b40-4cb4-9b9a-5d3829ee8c39
     date: '2026-08-13'
@@ -27,7 +27,7 @@ patterns:
     '
   escalation_level: 1
   current_mitigation: advisory
-  mitigation_target: C:\Users\jmolina\.gemini\config\skills\improvement\SKILL.md
+  mitigation_target: /home/console-admin/.gemini/config/skills/improvement/SKILL.md
   occurrences:
   - session: conversation://9594ed66-2b40-4cb4-9b9a-5d3829ee8c39
     date: '2026-08-13'
@@ -41,7 +41,7 @@ patterns:
     is needed, the list_dir tool MUST be used instead of delegating to the shell.
   escalation_level: 1
   current_mitigation: advisory
-  mitigation_target: C:\Users\jmolina\.gemini\config\pattern-library.yaml
+  mitigation_target: /home/console-admin/.gemini/config/pattern-library.yaml
   occurrences:
   - session: conversation://411c5d3b-944c-4240-8f99-3eef88c7e5de
     date: '2026-08-13'
@@ -55,8 +55,8 @@ patterns:
     Agents MUST instead write Python code to a .py file and execute it.
   escalation_level: 2
   current_mitigation: 'mechanical_invariant — write to .py files, ban inline python
-    -c. Rule file: C:\Users\jmolina\.gemini\config\rules\python-scripts.md'
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\python-scripts.md
+    -c. Rule file: /home/console-admin/.gemini/config/rules/python-scripts.md'
+  mitigation_target: /home/console-admin/.gemini/config/rules/python-scripts.md
   occurrences:
   - session: conversation://411c5d3b-944c-4240-8f99-3eef88c7e5de
     date: '2026-08-13'
@@ -73,7 +73,7 @@ patterns:
     before logical layer. MUST separate diagnosis from prescription.
   escalation_level: 3
   current_mitigation: automation - Infrastructure Invariants check script/gate
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\no-guessing.md
+  mitigation_target: /home/console-admin/.gemini/config/rules/no-guessing.md
   occurrences:
   - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
     date: '2026-08-14'
@@ -98,8 +98,8 @@ patterns:
     confirming desired end-state for every target. MUST NOT treat HTTP 200 as proof.
     MUST NOT report completion without verification.
   escalation_level: 2
-  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\verify-autonomous-work.md
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\verify-autonomous-work.md
+  current_mitigation: mechanical_invariant — /home/console-admin/.gemini/config/rules/verify-autonomous-work.md
+  mitigation_target: /home/console-admin/.gemini/config/rules/verify-autonomous-work.md
   occurrences:
   - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
     date: '2026-08-14'
@@ -116,7 +116,7 @@ patterns:
     or documentation.
   escalation_level: 1
   current_mitigation: advisory — covered by no-guessing.md invariant
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\no-guessing.md
+  mitigation_target: /home/console-admin/.gemini/config/rules/no-guessing.md
   occurrences:
   - session: conversation://d431852f-baba-4339-ab63-d07015404b7b
     date: '2026-08-14'
@@ -131,7 +131,7 @@ patterns:
     claiming completion.
   escalation_level: 1
   current_mitigation: advisory
-  mitigation_target: C:\Users\jmolina\.gemini\config\pattern-library.yaml
+  mitigation_target: /home/console-admin/.gemini/config/pattern-library.yaml
   occurrences:
   - session: conversation://e36506f3-5f42-46d3-8047-436bb01e9c8a
     date: '2026-08-14'
@@ -145,8 +145,8 @@ patterns:
     MUST query live infrastructure (SSH, API, CLI, SNMP) rather than relying on static
     documentation or CSV exports.
   escalation_level: 2
-  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\live-ground-truth.md
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\live-ground-truth.md
+  current_mitigation: mechanical_invariant — /home/console-admin/.gemini/config/rules/live-ground-truth.md
+  mitigation_target: /home/console-admin/.gemini/config/rules/live-ground-truth.md
   occurrences:
   - session: conversation://a2033ca6-1777-4661-a00f-de81d123b352
     date: '2026-08-18'
@@ -159,8 +159,8 @@ patterns:
     tools are unavailable, presenting results as if live testing occurred. Agents
     MUST verify live tool attachment and halt/notify immediately if disconnected.
   escalation_level: 2
-  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\live-browser-verification.md
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\live-browser-verification.md
+  current_mitigation: mechanical_invariant — /home/console-admin/.gemini/config/rules/live-browser-verification.md
+  mitigation_target: /home/console-admin/.gemini/config/rules/live-browser-verification.md
   occurrences:
   - session: conversation://ba0d3e62-a2c8-4640-93bf-1efc1effb74b
     date: '2026-08-19'
@@ -175,8 +175,8 @@ patterns:
     and the agent MUST halt to allow the user to complete and verify the upload before
     issuing restart commands.
   escalation_level: 2
-  current_mitigation: mechanical_invariant — C:\Users\jmolina\.gemini\config\rules\staging-before-restart.md
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\staging-before-restart.md
+  current_mitigation: mechanical_invariant — /home/console-admin/.gemini/config/rules/staging-before-restart.md
+  mitigation_target: /home/console-admin/.gemini/config/rules/staging-before-restart.md
   occurrences:
   - session: conversation://2d9609c4-f4d9-42aa-8316-48a5b6482439
     date: '2026-08-26'
@@ -192,7 +192,7 @@ patterns:
     (SQL, fields), MUST NEVER modify a file the user says is working.
   escalation_level: 1
   current_mitigation: advisory
-  mitigation_target: C:\Users\jmolina\.gemini\config\pattern-library.yaml
+  mitigation_target: /home/console-admin/.gemini/config/pattern-library.yaml
   occurrences:
   - session: conversation://7ce4bb58-cddd-46b6-8aa1-8b93d7ac3d30
     date: '2026-08-27'
@@ -209,8 +209,8 @@ patterns:
   escalation_level: 3
   current_mitigation: 'automation — automated test gate (TestInstitutionalGroundTruth in
     run_tests.py) & pre-deployment blocker in deploy_production.sh; mechanical invariant
-    in C:\Users\jmolina\.gemini\config\rules\ground-truth-entity-verification.md'
-  mitigation_target: C:\Users\jmolina\.gemini\config\rules\ground-truth-entity-verification.md
+    in /home/console-admin/.gemini/config/rules/ground-truth-entity-verification.md'
+  mitigation_target: /home/console-admin/.gemini/config/rules/ground-truth-entity-verification.md
   occurrences:
   - session: conversation://8a779460-b3e0-4c18-972f-af0baecb5405
     date: '2026-09-10'

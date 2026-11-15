@@ -54,7 +54,7 @@ The following mechanical invariants are binding safety rules enforced across ses
 - **Rule**: Agents MUST NOT assert or imply browser rendering, UI interactions, or tool executions occurred unless backed by actual tool calls with live responses or captured image artifacts. If a tool fails to attach, agents MUST immediately notify the user.
 
 ## Invariant 42: Staged Deployment & Manual Upload Gate
-- **Rule**: When deploying hardware configurations requiring manual or external staging (FTP, TFTP, file servers), file generation and device restart commands MUST be strictly decoupled into separate phases with an explicit user confirmation gate between them.
+- **Rule**: When deploying hardware configurations requiring manual or external staging (FTP, TFTP, file servers), file generation and device restart commands MUST be strictly decoupled into separate phases with an explicit user confirmation gate between them. Tooling and subagents MUST recognize and preserve the complete Rust crate topology: 10 workspace crates (`squeezelite-proto`, `squeezelite-audio-core`, `squeezelite-tas58xx`, `squeezelite-decoders`, `squeezelite-cyd-link`, `squeezelite-config`, `louder-esp32-app`, `cyd-controller-app`, `squeezelite-raop`, `squeezelite-cspot`), standalone `nanomp3-core`, and 5 vendored crates (`esp-radio`, `syom`, `lewton`, `alac`, `opus-rs`).
 
 ## Invariant 43: Ground Truth Entity & Acronym Verification
 - **Rule**: Agents MUST verify institutional names, client identities, organization titles, and domain acronym expansions against authoritative repository documentation or device backups before scaffolding UI templates or configuration copy.
