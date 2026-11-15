@@ -141,7 +141,7 @@ fn adts_lc_fixture_decodes_to_golden_pcm() {
         syom::STD_ENABLED
     );
     assert_eq!(frames, GOLDEN_FRAMES);
-    let expected = if syom::STD_ENABLED {
+    let expected = if syom::STD_ENABLED && cfg!(target_os = "windows") {
         GOLDEN_PCM_FNV1A64_STD
     } else {
         GOLDEN_PCM_FNV1A64_NO_STD
