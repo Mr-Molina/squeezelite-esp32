@@ -609,3 +609,9 @@
    - **DRAM0 / Rule 64 Baseline Accounting**: The `louder-esp32-app` `.stack` size (`28528` B) reflects the pre-existing `e6488153` Rule 64 DRAM0 baseline (alongside pre-Wave-1 `WEB_SYSLOG_RING` / Web UI / EQ static allocations). Waves 1–3 (`c186c659`..`579ffcde`) introduced **0 bytes of DRAM regression**, verified by relocating `squeezelite-cspot` `const TE0` (`1,024` B) to flash `.rodata` in `579ffcde`.
 5. **Remaining Open Gates**: `HW1` (physical ESP32 hardware bench check) and `D1` (core 1 decode/output migration, owner-gated under `esp-rtos-core1` & Invariant 47) remain `[ ]` open.
 
+## 2026-11-15 Session Diagnostics (`WO-2026-1115-001` Repository Cleanup & Ledger Closeout)
+1. **Warm Host Test Gate (`cargo test --workspace --all-features --no-fail-fast`)**: `859 passed, 0 failed` (`0` ignored, `exit code 0`) verified prior to cache reclamation.
+2. **Build Cache Reclamation (`rust/target`)**: Reclaimed `4.8G` (`5098148876` B) across `15896` files via `cargo clean` (`Removed 15896 files, 5.2GiB total`; `rust/target` removed).
+3. **Ignored & Stale Artifact Cleanup**: Archived to `/home/console-admin/.gemini/antigravity/brain/41a3bf17-ecf0-4763-ae21-7f5eb1ef2af6/backups/` and removed `/home/console-admin/Github/squeezelite-esp32/rust/crates/louder-esp32-app/src/coordinator.rs.bak` (`271920` B) and `/home/console-admin/Github/squeezelite-esp32/rust/vendor/opus-rs/Cargo.lock` (`24544` B).
+4. **Repository Hygiene**: Executed `git worktree prune` and `git gc --auto`; verified `0` ignored or untracked leftovers remaining prior to ledger updates.
+

@@ -2,6 +2,14 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-15 08:29 | Antigravity Orchestrator | [squeezelite-esp32] Repository Cache Reclamation, Ignored Artifact Cleanup & Ledger Sync (`WO-2026-1115-001`)
+**Scope**: Executed Wave 1 repository cleanup and Wave 2 ledger closeout (`WO-2026-1115-001`) on `MK5-Rust`, preserving the verified `579ffcde` / `2c90732b` codebase locally without pushing (`no git push`).
+- **Key Outcomes**:
+  - **Warm Host Test Gate (`[EXECUTED & VERIFIED]`)**: Confirmed `cargo test --workspace --all-features --no-fail-fast` passed `859` tests (`0` failed, `0` ignored) before cache reclamation.
+  - **Build Cache & Ignored Artifact Cleanup (`[EXECUTED & VERIFIED]`)**: Reclaimed `rust/target` (`4.8G` / `5098148876` B across `15896` files via `cargo clean` removing `5.2GiB`); archived to session `backups/` and removed `rust/crates/louder-esp32-app/src/coordinator.rs.bak` (`271920` B) and `rust/vendor/opus-rs/Cargo.lock` (`24544` B); ran `git worktree prune` and `git gc --auto` leaving `0` ignored or untracked leftovers.
+  - **Ledger & Context Sync (`[EXECUTED & VERIFIED]`)**: Synchronized `DIAGNOSTIC_LOG.md`, `SYSTEM_STATE.md`, workspace `.agents/sessions.md`, and Obsidian vault `sessions.md`, refreshed TokenEconomizer repomap, and finalized local `.agents` commit on `MK5-Rust` (not pushed).
+- **Next-Session Handoff Notes**: Working tree and ignored/untracked state completely clean on `MK5-Rust` (local commits ahead of `origin/MK5-Rust`). Pending `HW1` hardware-gated ESP32 bench validation, owner authorization for `D1`, and remote push of `MK5-Rust`.
+
 ## 2026-11-15 00:55 | Antigravity Orchestrator | [squeezelite-esp32] MK5-Rust Performance & Hygiene Backlog Waves 1–3 (`T01`–`T27` Complete, `WO-2026-1114-004`)
 **Scope**: Executed Waves 1–3 of `docs/mk5-rust-todo.md` on `MK5-Rust` (`WO-2026-1114-004`), verified host, static audit, Xtensa clippy, and bare-metal release ELF gates, and finalized repository and vault ledgers locally without pushing.
 - **Key Outcomes**:
