@@ -20,3 +20,5 @@ artifacts
 web-installer
 client_info.h
 scratch/
+.superpowers/
+.agents/backups/

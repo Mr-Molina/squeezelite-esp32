@@ -48,6 +48,6 @@ Execute `cargo check`, `cargo clippy`, `cargo test`, `cargo tree`, and `git diff
 
 <!-- USER_CUSTOM_START -->
 ## User & Repository Customizations
-- Primary branch for pure-Rust firmware: `MK5-Rust` (`rust/` workspace with 8 crates).
+- Primary branch for pure-Rust firmware: `MK5-Rust` (`rust/` workspace with 10 crates: `squeezelite-proto`, `squeezelite-audio-core`, `squeezelite-tas58xx`, `squeezelite-decoders`, `squeezelite-cyd-link`, `squeezelite-config`, `louder-esp32-app`, `cyd-controller-app`, `squeezelite-raop`, `squeezelite-cspot`).
 - Hardware targets: Louder-ESP32 (`ESP32-WROVER-N8R8`), Louder-ESP32-Plus (`ESP32-S3-WROOM-N8R8`), Cheap Yellow Display (`ESP32-2432S028R`).
 <!-- USER_CUSTOM_END -->

@@ -77,5 +77,44 @@ The following mechanical invariants are binding safety rules enforced across ses
 ## Invariant 49: Live Streaming Throughput, PSRAM Socket Window, Twin-Path Parity & Latency Certification Gate
 - **Rule**: (1) Every live certification on `"BASEMENT"` (`172.22.1.15`) MUST measure a `>= 15s` steady-state playback window and verify `frames_played/s` in `44,080..44,120` fps (`>= 99.95%` of `44.1 kHz`), `i2c_acks/s <= 3.05` ACKs/s (`FaultStatus::has_critical_amp_fault()` + 30s fault-recovery cooldown in both `tasks.rs` and `main.rs`), and cached `GET /?action=getInfo` TTFB `< 100 ms` (`ZEROCONF_DH_CACHE`). (2) When `4 MB` PSRAM is active, `smoltcp` TCP receive buffers MUST be allocated in PSRAM (`audio_rx_buf >= 65,536` B, `slim_rx_buf >= 8,192` B) with immediate egress `smol_iface.poll(...)` after socket drain, `PowerSaveMode::None` re-applied after Wi-Fi association, and LMS `mp3StreamingMethod == 1` (LAN proxy). (3) Any bug fix applied to `StaticMp3Decoder` or `tasks.rs` MUST be audited and applied symmetrically to its twin implementation (`Mp3Decoder` or `main.rs`).
 
+## Invariant 50: Production 3D Scene Hygiene & Diagnostic Quarantine
+- **Rule**: Isolate or purge debug cameras, temporary shaders, and obsolete armature/mesh datablocks before finalizing 3D deliverables.
+
+## Invariant 51: Windows Interactive Desktop `WinSta0\Default` Routing & Physical HWND Visibility
+- **Rule**: Route interactive GUI launches to `WinSta0\Default` and verify `IsWindowVisible(hwnd)` with non-zero `GetWindowRect` bounds before claiming visibility.
+
+## Invariant 52: Fail-Safe Win32 Window Management & Process PID Scoping
+- **Rule**: Scope Win32 window calls (`EnumWindows`, `ShowWindow`, `SetForegroundWindow`) to `target_pid > 0`, exclude OS shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `IME`), and abort if matches > 5.
+
+## Invariant 53: PowerShell Inline Python Escaping & Syntax Hardening
+- **Rule**: Ban complex inline `python -c` (f-strings, nested quotes, semicolons, multi-line code) and bash `\"` escaping in `pwsh`; use `.py` files.
+
+## Invariant 65: Single-Target Troubleshooting Isolation & Post-Completion Scope Boundary Gate (GLB-012 / PM-2026-1026-007)
+- **Rule**: Isolate fixes strictly to the failing unit; never modify working files unprompted. Stop cleanly at 100% completion without pitching out-of-scope follow-ups or artificial decision menus (`PM-2026-1026-007`).
+
+## Invariant 66: Real-Time User Narration, Output Hygiene & Anti-Silent Tool Chaining Gate
+- **Rule**: Emit a clean 1–2 sentence status update on every Orchestrator tool-calling turn (including `/wakeup` Turn 1); ban silent tool chaining and thought leakage.
+
+## Invariant 67: Embedded Appliance Boot/GPT, Wi-Fi, Klipper Motion & Vendor IPC Daemon Safety
+- **Rule**: Never write raw MBR/GPT sectors (`dd`, `sgdisk`, `sfdisk`, `parted`, `fdisk`) or disable vendor IPC daemons (`app-server`, `upgrade-server`, `master-server`, `log_main`).
+- Arm a Dead-Man's Rollback Watchdog and verify `/etc/init.d/*` or Wi-Fi/network edits via cold reboot; on Klipper, verify `G28` after `HOME_CUR`/`driver_SGTHRS` edits, keep `noz_ex_com`, split G-code on `;`, and ban high exhaust on `ASA`/`ABS`/`PC`/`PA`.
+
+## Invariant 68: Bounded Subagent Lifecycle (<= 25 Steps / 180s), Unconditional 60s Heartbeat Timer, Telemetry Wakeup & Scope Slicing Gate (PAT-2026-1014-001 / GLB-017 / PM-2026-1026-001 / PM-2026-1026-008 / PM-2026-1102-007)
+- **Rule**: Bound `invoke_subagent` prompts to `<= 25 steps / 180s` (`<= 12–15 steps / 90s` default), `<= 1–3 files`, `<= 4 tasks`, and `Parent Conversation ID: <id>`.
+- Arm one `schedule(DurationSeconds=60, TimerCondition="any")` timer on subagent dispatch/message; on 60s wakeup, run `parse_transcript.py --heartbeat` + `manage_subagents(list)` (ban `read_file` on `transcript.jsonl`), and intervene/kill if `>25 steps` or `>180s`.
+
+## Invariant 69: User-Intent Preservation & Anti-Feature-Stripping Gate (PAT-2026-1014-002 / PM-2026-1026-002)
+- **Rule**: Never resolve a bug or test failure by silently disabling or downgrading an enabled feature (`ADAPTIVE_BED_MESH`, `transfer_call`, call forwarding) without prior user consent.
+
+## Historical / Retired Global Invariants Index
+Retired/merged global numbers (1–99) are never reused:
+- **Invariants 1–12**: Consolidated into `/wakeup`, `/goodbye`, `wakeup_bootstrap.py`, and Invariant 13.
+- **Invariants 15–23**: Consolidated into `single-target-troubleshooting.md`, `verify-autonomous-work.md`, and Invariants 14, 24, 28, 29.
+- **Invariants 25–27**: Consolidated into tool hygiene and verification gates (Invariants 28–32).
+- **Invariant 38**: Merged into Invariant 14 (Three Strikes).
+- **Invariants 44–49**: Consolidated into `no-guessing.md` and Invariants 39–43.
+- **Invariants 54–64**: Consolidated into `powershell-syntax-hardening.md`, `orchestrator-delegation-and-narration.md`, and Invariants 50–53, 65–68.
+
+
 
 
