@@ -2,6 +2,14 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-15 00:55 | Antigravity Orchestrator | [squeezelite-esp32] MK5-Rust Performance & Hygiene Backlog Waves 1–3 (`T01`–`T27` Complete, `WO-2026-1114-004`)
+**Scope**: Executed Waves 1–3 of `docs/mk5-rust-todo.md` on `MK5-Rust` (`WO-2026-1114-004`), verified host, static audit, Xtensa clippy, and bare-metal release ELF gates, and finalized repository and vault ledgers locally without pushing.
+- **Key Outcomes**:
+  - **Waves 1–3 Implementation (`c186c659`, `f7b58cf0`, `579ffcde`, `[EXECUTED & VERIFIED]`)**: Completed Wave 1 (`c186c659`: `T04`, `T05`, `T19`, `T23`, `T24`, `T25`), Wave 2 (`f7b58cf0`: `T05`, `T17`, `T18`, `T20`, `T21`, `T26`, `T27`), and Wave 3 (`579ffcde`: `T14`, `T15`, `T16`, Xtensa clippy cleanup, and amended `T26` flash `.rodata` `TE0` + `#![forbid(unsafe_code)]`), marking `T01`–`T27` complete in `docs/mk5-rust-todo.md`.
+  - **Verification & Release ELF Gates (`579ffcde`, `[EXECUTED & VERIFIED]`)**: `859` host tests passed (`0` failed), `google_rust_audit.py --strict` `0` strict audit errors (`0` warnings), `10`-crate Xtensa clippy pass, `esp-rtos-core1` check pass, and bare-metal `xtensa-esp32-none-elf` release ELF sizes verified (`louder-esp32-app` IRAM `129636` B, `.dram2_uninit` `98520` B, `.stack` `28528` B; `cyd-controller-app` IRAM `18236` B; `0` B Wave 1–3 DRAM regression).
+  - **Open Gated Items & Repo Telemetry**: `T01`–`T27` are complete while `HW1` (hardware-gated physical ESP32 bench validation) and `D1` (owner-gated Core 1 decode/output migration) remain open; branch `MK5-Rust` carries local commits only (Waves 1–3 + ledger closeout; not pushed).
+- **Next-Session Handoff Notes**: `T01`–`T27` complete with clean working tree and synchronized ledgers. Pending `HW1` hardware-gated ESP32 bench validation, owner authorization for `D1`, and remote push of `MK5-Rust`.
+
 ## 2026-11-14 22:24 | Antigravity Orchestrator | [squeezelite-esp32] Governance Onboarding, Compaction & Vault Audit, Upstream Reconciliation & 22.5 GiB Cleanup (`WO-2026-1114-001`–`WO-2026-1114-003`)
 **Scope**: Executed governance onboarding (`WO-2026-1114-001`), repository housekeeping & vault audit (`WO-2026-1114-002`), `origin/MK5-Rust` upstream reconciliation with cross-OS AAC golden digest fix (`3102822a`), 22.5 GiB target cleanup, and multi-pathway wakeup/plugin context synchronization (`WO-2026-1114-003`).
 - **Key Outcomes**:

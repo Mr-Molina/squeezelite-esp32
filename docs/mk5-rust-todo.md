@@ -4,7 +4,8 @@ Audience: a coding agent picking this up cold. Everything you need is in this
 file plus the code; you do not need the conversation that produced it.
 
 State when written: branch `MK5-Rust` at `e35b2e24`, pushed to `origin`.
-Line numbers below were checked at that commit; they drift, so locate code by
+Updated at: branch `MK5-Rust` at `579ffcde` (`WO-2026-1114-004` Waves 1–3 complete: `T01`–`T27` marked `[x]`; `HW1` hardware-gated and `D1` owner-gated remain `[ ]`).
+Line numbers below were checked at `e35b2e24`; they drift, so locate code by
 the function or symbol named next to each one.
 
 ---
@@ -106,7 +107,7 @@ L = a day+) · where · problem · fix · done when.
 
 ### Phase 0 — needs a human with hardware
 
-**HW1 — Field-check the three recent commits** · P0 · S · device
+- [ ] **HW1 — Field-check the three recent commits** · P0 · S · device · **OPEN (hardware-gated)**
 - Flash `MK5-Rust`. Verify: (a) start/skip MP3 tracks — no clicks at track start
   (pacing, `e35b2e24`); (b) play a FLAC track to the end — final ~100 ms is not
   cut off (`finish_input`, `3cdbcd08`); (c) `decode_us_max` is non-zero and
@@ -116,7 +117,7 @@ L = a day+) · where · problem · fix · done when.
 
 ### Phase 1 — restore a green baseline (do these first)
 
-**T01 — Fix the Xtensa clippy `manual checked division` lint** · P0 · S
+- [x] **T01 — Fix the Xtensa clippy `manual checked division` lint** · P0 · S · **DONE (`60dc7894`, `27c85edb`)**
 - Where: `squeezelite-audio-core/src/ringbuffer.rs:118` (the `frame_bytes == 0`
   check before `(self.available_write() / frame_bytes) * frame_bytes`).
 - Fix: use `checked_div`, e.g.
@@ -126,7 +127,7 @@ L = a day+) · where · problem · fix · done when.
   stops only on further pre-existing lints, which you then fix the same way and
   list in the commit.
 
-**T02 — Repair `test_run_firmware_tick_with_network_recovers_amp_fault_and_syncs_rate`** · P0 · S
+- [x] **T02 — Repair `test_run_firmware_tick_with_network_recovers_amp_fault_and_syncs_rate`** · P0 · S · **DONE (`f9afd5dc`)**
 - Where: test in `louder-esp32-app/src/main.rs` (bin target, host build); panics
   in `embedded-hal-mock` I2C expectations.
 - Cause: commit `87793784` made the TAS58xx driver cache the selected
@@ -138,7 +139,7 @@ L = a day+) · where · problem · fix · done when.
   actually wrong (if so, stop and report).
 - Done when: `cargo test -p louder-esp32-app` is fully green.
 
-**T03 — Resolve the AAC / Opus / Vorbis golden-PCM failures** · P1 · M
+- [x] **T03 — Resolve the AAC / Opus / Vorbis golden-PCM failures** · P1 · M · **DONE (`4d45efc7`, `1f8db64a`, `3102822a`)**
 - Where: `squeezelite-decoders/tests/{aac,opus,vorbis}_alloc_equivalence.rs`
   (golden assertions at ~lines 139 / 100 / 105) and the decoders in
   `squeezelite-decoders/src/lib.rs`.
@@ -157,7 +158,7 @@ L = a day+) · where · problem · fix · done when.
 
 ### Phase 2 — correctness
 
-**T04 — Crossfade: restore the "missing frames" debug assert** · P2 · S
+- [x] **T04 — Crossfade: restore the "missing frames" debug assert** · P2 · S · **DONE (Wave 1 `c186c659`)**
 - Where: `louder-esp32-app/src/pipeline.rs:940`, `scale_chunk` (crossfade
   branch): `let to_process = (frames * OUTPUT_FRAME_BYTES).min(self.write_scratch.len());`
   followed by `debug_assert_eq!(got, to_process, ...)`.
@@ -169,7 +170,7 @@ L = a day+) · where · problem · fix · done when.
   keep the clamp and add `debug_assert!(frames * OUTPUT_FRAME_BYTES <= self.write_scratch.len())`.
 - Done when: crossfade tests pass; assert covers the full chunk.
 
-**T05 — Vorbis/Opus `has_pending_pcm` true on any partial Ogg page** · P2 · S · host-only
+- [x] **T05 — Vorbis/Opus `has_pending_pcm` true on any partial Ogg page** · P2 · S · host-only · **DONE (Wave 1 `c186c659` decoder check; Wave 2 `f7b58cf0` coordinator pump test)**
 - Where: `squeezelite-decoders/src/lib.rs` — `VorbisDecoder::has_pending_pcm`
   (~3847) and `OpusDecoder::has_pending_pcm` (~4700):
   `... || self.stream_buf.len() >= 27`.
@@ -189,7 +190,7 @@ L = a day+) · where · problem · fix · done when.
 Cost estimates below are reasoned from the code, not measured. Measure with
 `decode_us_max` or cycle counters where you can.
 
-**T06 — Resampler: remove the per-frame 64-bit divide; cheaper inner loop** · P1 · M
+- [x] **T06 — Resampler: remove the per-frame 64-bit divide; cheaper inner loop** · P1 · M · **DONE (`1165573d`)**
 - Where: `squeezelite-audio-core/src/resampler.rs`. `phase_num: u64` (87),
   `advance_phase` (284), `eval_frame` line 302:
   `((self.phase_num * (NUM_PHASES as u64)) << 16) / u64::from(self.to_hz)`;
@@ -211,7 +212,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
   old one for all phases at 44.1→48 k and 96→48 k within 1 LSB of `frac_q16`.
 - Only matters while the resampler is enabled (coordinator.rs ~1819-1843).
 
-**T07 — Hot audio kernels compiled at opt-level 2; EQ loses IRAM placement** · P1 · S (+ measurement)
+- [x] **T07 — Hot audio kernels compiled at opt-level 2; EQ loses IRAM placement** · P1 · S (+ measurement) · **DONE (`7e66d682`)**
 - Where: `rust/Cargo.toml` profiles; `squeezelite-audio-core/src/equalizer.rs:542-544`
   (`#[cfg_attr(target_arch = "xtensa", link_section = ".iram1")]` on an
   `#[inline]` generic `process_interleaved`).
@@ -228,7 +229,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: firmware builds in release for both ESP32 and ESP32-S3, size delta
   recorded in the commit, tests green.
 
-**T08 — Gain stage: drop the 64-bit clamp when gain ≤ 1.0; remove dead fast path** · P2 · S
+- [x] **T08 — Gain stage: drop the 64-bit clamp when gain ≤ 1.0; remove dead fast path** · P2 · S · **DONE (`69531ff3`)**
 - Where: `squeezelite-audio-core/src/volume.rs:195` `GainStage::apply` (live path,
   called from `pipeline.rs` `scale_chunk`) uses `gain()` (`fade.rs:34`):
   `(i64 * i64).clamp(-MAX_SCALESAMPLE, MAX_SCALESAMPLE) >> 16` per sample.
@@ -242,7 +243,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
   for gains {0, 0x8000, 0xFFFF, 0x10000, -0xFFFF} over samples including
   `i32::MIN`/`i32::MAX`.
 
-**T09 — AirPlay AES-128-CBC: T-table (or hardware) decrypt** · P1 · M
+- [x] **T09 — AirPlay AES-128-CBC: T-table (or hardware) decrypt** · P1 · M · **DONE (`e5ac13d6`)**
 - Where: `squeezelite-raop/src/crypto.rs` — `Aes128Cbc::decrypt_block` (877),
   `INV_S_BOX` (774), `GF_MUL_*` tables (836, `pub const`), CBC XOR (995).
   Called per RTP packet via `RtpAudioReceiver::process_packet` (`rtp.rs`), from
@@ -260,7 +261,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: existing AES/CBC tests pass; add a test against an FIPS-197 /
   NIST SP 800-38A CBC decrypt vector; record measured or estimated gain.
 
-**T10 — RSA-2048 on AirPlay connect: CRT and no per-step allocation** · P2 · M
+- [x] **T10 — RSA-2048 on AirPlay connect: CRT and no per-step allocation** · P2 · M · **DONE (`4c968a9d`, `d28bbb0d`)**
 - Where: `squeezelite-raop/src/crypto.rs` — `montgomery_mod_pow` (317),
   `mont_reduce` (260, allocates: `t[k..].to_vec()`, `n.to_vec()`, `res.sub`),
   `mul_limbs` (295, `vec![0u32; ..]`). Called by `decrypt_raw` (722) and
@@ -276,7 +277,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: existing RSA tests pass (signature and decrypt results identical);
   add a test that CRT result == non-CRT result on random inputs.
 
-**T11 — FLAC: 32-bit sample scratch** · P2 · M
+- [x] **T11 — FLAC: 32-bit sample scratch** · P2 · M · **DONE (`f78ec657`)**
 - Where: `squeezelite-decoders/src/lib.rs` — `subframe_scratch: Box<[i64]>`
   (2179, 2 × 4608 samples = 73.7 KB), `decode_subframe`, fixed predictors,
   wasted-bits shift, `decorrelate_samples` (2080).
@@ -289,7 +290,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: `test_flac_cross_validation_all_fixtures` (claxon, bit-exact) and
   all FLAC tests pass; heap saving noted in the commit.
 
-**T12 — FLAC: decorrelate lazily instead of copying through `pending_pcm`** · P2 · M · do after T11
+- [x] **T12 — FLAC: decorrelate lazily instead of copying through `pending_pcm`** · P2 · M · do after T11 · **DONE (`eed273f2`, `43b87f77`)**
 - Where: `lib.rs` ~2232 (`pending_pcm: Vec::with_capacity(16384)`, 64 KB
   reserved) and the block output loop ~2770-2790 (`for i in to_write..block_size`
   pushes into `pending_pcm`; `decorrelate_samples` matches channel mode per
@@ -304,7 +305,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: FLAC tests (including the constrained-buffer and
   `finish_input` tests) pass bit-exact.
 
-**T13 — Equalizer: bands-outer loop, no per-sample finiteness branch** · P2 · M
+- [x] **T13 — Equalizer: bands-outer loop, no per-sample finiteness branch** · P2 · M · **DONE (`cccb84f2`)**
 - Where: `squeezelite-audio-core/src/equalizer.rs` `process_interleaved` (544);
   sample loop with `for &i in active_bands` at 583.
 - Problem: per frame it reloads coefficients/history for every band, pays bounds
@@ -317,7 +318,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: equalizer tests pass; add a test that output equals the current
   implementation within 1 LSB on a swept sine with 10 active bands + loudness.
 
-**T14 — Output path: one fewer copy per sample** · P3 · M
+- [x] **T14 — Output path: one fewer copy per sample** · P3 · M · **DONE (Wave 3 `579ffcde`)**
 - Where: `louder-esp32-app/src/hal.rs:214` `EspI2sSink::write_frames` packs
   i32→bytes into `dma_scratch`; `main.rs` `Esp32HardwareI2sDma::write_dma`
   copies again into a 512-byte scratch to swap L/R words, then pushes.
@@ -328,7 +329,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: keep Invariant 46 (whole frames only); hal/DMA tests pass;
   loopback test shows identical byte stream.
 
-**T15 — mDNS: answer queries only, cache the reply, bound the loop** · P3 · S
+- [x] **T15 — mDNS: answer queries only, cache the reply, bound the loop** · P3 · S · **DONE (Wave 3 `579ffcde`)**
 - Where: `louder-esp32-app/src/main.rs:3651` `while mdns_sock.can_recv()`:
   four `windows().any()` scans per packet, no QR-bit check (responses from
   Apple TVs etc. trigger our multicast announcement), announcement rebuilt on
@@ -341,7 +342,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
   should come from config.
 - Done when: unit-test the query/response filter on captured packet bytes.
 
-**T16 — Bound smoltcp polling and top up DMA mid-lap** · P3 · M
+- [x] **T16 — Bound smoltcp polling and top up DMA mid-lap** · P3 · M · **DONE (Wave 3 `579ffcde`)**
 - Where: `main.rs` `net_poll_phase` (3077, `s.smol_iface.poll(...)` at 3083)
   and a second poll in `pump_device_phase` (4084); output is only refilled in
   `output_decode_phase` (4003) at the end of the lap.
@@ -353,7 +354,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: Xtensa check passes; no behaviour change in host tests; note that
   hardware validation is needed (HW1-style).
 
-**T17 — Bluetooth SBC synthesis without 64-bit MACs** · P3 · M
+- [x] **T17 — Bluetooth SBC synthesis without 64-bit MACs** · P3 · M · **DONE (Wave 2 `f7b58cf0`)**
 - Where: `louder-esp32-app/src/bt_a2dp.rs:1889` `synthesize_eight`
   (`acc += SYNMATRIX8[i][sb] as i64 * (sb_sample[..] as i64)`, 128 + 80 MACs
   per block per channel).
@@ -362,7 +363,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Done when: SBC decode tests produce identical PCM (or document an accepted
   ≤ 1 LSB difference with justification).
 
-**T18 — Stream ingest: fewer copies and callbacks** · P3 · M
+- [x] **T18 — Stream ingest: fewer copies and callbacks** · P3 · M · **DONE (Wave 2 `f7b58cf0`)**
 - Where: `coordinator.rs:2231` `let mut chunk = [0u8; 1024];` →
   `source.poll_bytes` → `pipeline.ingest_stream_data`; `take_stream_side_data`
   runs every 1 KB iteration; `stream_codec.rs:110` and `:294`
@@ -375,7 +376,7 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 
 ### Phase 4 — cleanup from the review of `87793784`
 
-**T19 — TAS58xx: use the page/book cache consistently** · P3 · S
+- [x] **T19 — TAS58xx: use the page/book cache consistently** · P3 · S · **DONE (Wave 1 `c186c659`)**
 - Where: `squeezelite-tas58xx/src/lib.rs` — `configure_silicon_maximization`
   (449, 920), `set_analog_gain` (461, 932), `read_telemetry` (467, 938) still
   call `select_page0_book0()` (always 3 I2C writes); everything else uses
@@ -385,32 +386,32 @@ Cost estimates below are reasoned from the code, not measured. Measure with
   already invalidates the cache). Update mock expectations in `amp.rs` and the
   driver tests.
 
-**T20 — Remove the duplicate CDN IV function** · P4 · S
+- [x] **T20 — Remove the duplicate CDN IV function** · P4 · S · **DONE (Wave 2 `f7b58cf0`)**
 - `squeezelite-cspot/src/cdn.rs:199` `CdnAudioDecryptor::calculate_iv` has the
   same body as `AudioKeyDecryptor::counter_iv` (109). Make one call the other.
 
-**T21 — Revert hand-rolled word XOR in AES CTR/CBC** · P4 · S
+- [x] **T21 — Revert hand-rolled word XOR in AES CTR/CBC** · P4 · S · **DONE (Wave 2 `f7b58cf0` cspot; raop CBC superseded by T09 `e5ac13d6`)**
 - `squeezelite-cspot/src/crypto.rs:883` `Aes128Ctr::process` and
   `squeezelite-raop/src/crypto.rs:995` (CBC) build `u32` words with
   `from_ne_bytes` just to XOR 16 bytes. Replace with
   `for (d, k) in chunk.iter_mut().zip(&keystream) { *d ^= *k }`. Skip T21 for
   the raop file if T09 rewrites it anyway.
 
-**T22 — AES multiply tables: `static`, not `pub const`** · P4 · S
+- [x] **T22 — AES multiply tables: `static`, not `pub const`** · P4 · S · **DONE (superseded by T09 `e5ac13d6`)**
 - `squeezelite-raop/src/crypto.rs:836` `GF_MUL_9/11/13/14`. Make them private
   `static`. Superseded by T09 if done first.
 
-**T23 — Delete unused `apply_crossfade`** · P4 · S
+- [x] **T23 — Delete unused `apply_crossfade`** · P4 · S · **DONE (Wave 1 `c186c659`)**
 - `squeezelite-audio-core/src/fade.rs:111`, an alias of `mix_crossfade` with no
   callers.
 
-**T24 — Delete the duplicate `SlimprotoParser::OP_*` constants** · P4 · S
+- [x] **T24 — Delete the duplicate `SlimprotoParser::OP_*` constants** · P4 · S · **DONE (Wave 1 `c186c659`)**
 - `squeezelite-proto/src/lib.rs:482` onward: ten associated consts mirroring the
   module-level `OPCODE_*`, unused. Keep `OPCODE_*`.
 
 ### Phase 5 — host-only or not wired in (lowest priority)
 
-**T25 — Vorbis/Opus/AAC allocation and copy churn** · P4 · M · host-only
+- [x] **T25 — Vorbis/Opus/AAC allocation and copy churn** · P4 · M · host-only · **DONE (Wave 1 `c186c659`)**
 - Vorbis/Opus: `Vec::new()` per page, `core::mem::take(&mut self.partial_packet)`
   drops capacity per packet, `packet_queue: VecDeque<Vec<u8>>` (lib.rs Vorbis
   ~3974-4009, Opus ~4813-4848). Decode in-page packets straight from
@@ -419,21 +420,21 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - AAC MP4 (~3410-3422): split direct/pending output like the ADTS path,
   `reserve` before pushing.
 
-**T26 — cspot crypto when Spotify gets wired in** · P4 · M · not wired
+- [x] **T26 — cspot crypto when Spotify gets wired in** · P4 · M · not wired · **DONE (Wave 2 `f7b58cf0`, amended by Wave 3 `579ffcde`: `const TE0` in flash `.rodata` & `#![forbid(unsafe_code)]` restored)**
 - `squeezelite-cspot/src/crypto.rs` AES-CTR is byte-wise (share the T09 core,
   forward T-tables). `cdn.rs` `feed_and_decode` (~256-268) decrypts the whole
   chunk but reports only the decoder's `consumed`, so re-fed bytes are decrypted
   twice — track a decrypted watermark. `shannon.rs:96/106` shifts both 16-word
   arrays per keystream word — use a circular index.
 
-**T27 — `RtpJitterBuffer` per-packet allocation** · P4 · S · not wired
+- [x] **T27 — `RtpJitterBuffer` per-packet allocation** · P4 · S · not wired · **DONE (Wave 2 `f7b58cf0`)**
 - `squeezelite-raop/src/rtp.rs` `push`/`push_pcm` (`to_vec()` per packet),
   `drain_ready`/`missing_sequences` return Vecs. Pre-allocate slots if it is
   ever used by the app.
 
 ### Deferred (blocked)
 
-**D1 — Move decode + output to core 1** · biggest structural win · L
+- [ ] **D1 — Move decode + output to core 1** · biggest structural win · L · **OPEN (owner-gated)**
 - Core 1 runs only a heartbeat (`app_core_loop`, `main.rs:1192`). Moving
   `pump_decode_paced` + `pump_output` there (via the existing SPSC ring split
   handles) would free core 0 for Wi-Fi/BT/network.

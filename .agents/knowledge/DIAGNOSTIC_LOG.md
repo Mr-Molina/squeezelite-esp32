@@ -594,3 +594,18 @@
 | 2026-11-14 | `3f838ecb` | Active branch HEAD commit (`MK5-Rust`) | `ahead 20` of origin pending OAuth `workflow` scope |
 | 2026-11-14 | `WO-2026-1114-003` | Multi-pathway wakeup, plugin/MCP context sync, invariant hardening | 16 enabled plugins, 10 active MCP servers (`obsidian_vault`, `spotify` user `Jose`, `rea` `6.8.0`), `cargo audit` 0 vulns across 267 deps (1 `paste` `RUSTSEC-2024-0436` unmaintained warning, exit code 0), `.manifest_hash` `313212844a91644cc40af285d356c89550b59e7bf478ce4222fec0549234a243` scanned, `gh auth status` missing `workflow` scope, `skills.json` + `PATTERN_LIBRARY.yaml` normalized, Invariant 42 `10+1+5` crates verified [EXECUTED & VERIFIED] |
 
+## 2026-11-15 Session Diagnostics (`WO-2026-1114-004` Waves 1–3 Verification)
+1. **Wave 1 (`c186c659`)**: Implemented `T04` (crossfade full-chunk assert), `T05` decoder check (`has_pending_pcm` complete Ogg page check), `T19` (TAS58xx `ensure_page0_book0()` consistency), `T23` (remove unused `apply_crossfade`), `T24` (remove duplicate `SlimprotoParser::OP_*` constants), and `T25` (Vorbis/Opus/AAC buffer/allocation churn). Verified `845` host workspace tests pass.
+2. **Wave 2 (`f7b58cf0`)**: Implemented `T05` coordinator pump test, `T17` (SBC `synthesize_eight` symmetry + 32-bit MACs), `T18` (stream ingest `r == w` skip + hoisted side-data callback), `T20` (cspot CDN IV reuse), `T21` (`squeezelite-cspot` `Aes128Ctr::process` byte-wise XOR), `T26` (cspot crypto/watermark/Shannon circular index, subsequently amended by `579ffcde` to place `const TE0` in flash `.rodata`), and `T27` (`RtpJitterBuffer` pre-allocated slots). Verified `851` host workspace tests pass.
+3. **Wave 3 (`579ffcde`)**: Implemented `T14` (`SWAP_LR` / `write_frames_i32` single-copy DMA output + hoisted `muted`), `T15` (mDNS QR-bit query filter, cached announcements, 1/s rate limit, bounded lap), `T16` (bounded smoltcp ingress + mid-lap `pump_output`), pre-existing Xtensa clippy cleanup, plus amended `T26` (`const TE0` placed in flash `.rodata` instead of `.dram1` and `#![forbid(unsafe_code)]` restored in `squeezelite-cspot/src/lib.rs`).
+4. **Full Verification Gates at `579ffcde`**:
+   - Host test suite (`cargo test --workspace --all-features --no-fail-fast`): `859 passed, 0 failed` (`0` ignored).
+   - Static audit (`google_rust_audit.py --strict`): `0` errors, `0` warnings across all crates.
+   - Xtensa 10-crate Clippy (`cargo +esp clippy --workspace --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -- -D warnings`): `PASS` (`0` warnings).
+   - Core 1 feature check (`esp-rtos-core1` on `louder-esp32-app` `xtensa-esp32-none-elf`): `PASS`.
+   - Release ELF sections (`target/xtensa-esp32-none-elf/release/`):
+     - `louder-esp32-app`: IRAM `129636` B, `.dram2_uninit` `98520` B, `.data.wifi` `3400` B, `.stack` `28528` B.
+     - `cyd-controller-app`: IRAM `18236` B, `.stack` `188856` B.
+   - **DRAM0 / Rule 64 Baseline Accounting**: The `louder-esp32-app` `.stack` size (`28528` B) reflects the pre-existing `e6488153` Rule 64 DRAM0 baseline (alongside pre-Wave-1 `WEB_SYSLOG_RING` / Web UI / EQ static allocations). Waves 1–3 (`c186c659`..`579ffcde`) introduced **0 bytes of DRAM regression**, verified by relocating `squeezelite-cspot` `const TE0` (`1,024` B) to flash `.rodata` in `579ffcde`.
+5. **Remaining Open Gates**: `HW1` (physical ESP32 hardware bench check) and `D1` (core 1 decode/output migration, owner-gated under `esp-rtos-core1` & Invariant 47) remain `[ ]` open.
+
