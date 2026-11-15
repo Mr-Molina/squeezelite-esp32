@@ -4,7 +4,7 @@ Audience: a coding agent picking this up cold. Everything you need is in this
 file plus the code; you do not need the conversation that produced it.
 
 State when written: branch `MK5-Rust` at `e35b2e24`, pushed to `origin`.
-Updated at: branch `MK5-Rust` at `579ffcde` (`WO-2026-1114-004` Waves 1–3 complete: `T01`–`T27` marked `[x]`; `HW1` hardware-gated and `D1` owner-gated remain `[ ]`).
+Updated at: branch `MK5-Rust` at `579ffcde` (`WO-2026-1114-004` Waves 1–3 complete: `T01`–`T27` marked `[x]`; `WO-2026-1115-002` complete: `HW1` certified `[x]` on `"BASEMENT"` `172.22.1.15`; only owner-gated `D1` remains `[ ]`).
 Line numbers below were checked at `e35b2e24`; they drift, so locate code by
 the function or symbol named next to each one.
 
@@ -107,13 +107,12 @@ L = a day+) · where · problem · fix · done when.
 
 ### Phase 0 — needs a human with hardware
 
-- [ ] **HW1 — Field-check the three recent commits** · P0 · S · device · **OPEN (hardware-gated)**
-- Flash `MK5-Rust`. Verify: (a) start/skip MP3 tracks — no clicks at track start
-  (pacing, `e35b2e24`); (b) play a FLAC track to the end — final ~100 ms is not
-  cut off (`finish_input`, `3cdbcd08`); (c) `decode_us_max` is non-zero and
-  plausible (MP3 a few ms; FLAC well under the old value).
-- An agent cannot do this; list it for the user and do not block other tasks on
-  it, except T09/T13 measurements.
+- [x] **HW1 — Field-check the three recent commits** · P0 · S · device · **DONE (`WO-2026-1115-002`, commit `579ffcde` on `"BASEMENT"` `172.22.1.15`)**
+- Flashed `MK5-Rust` (`579ffcde`, `2,007,568` B, SHA-256 `954f842661487857dd95aa89eaeb1a4468a80228049b878340c314d3dfd92fa0`) via single-shot OTA to `ota_0`. Verified muted (`vol_pct: 0`):
+  - (a) MP3 steady-state (Ibiza Global Radio, `15.612 s` device window): `frames_played` rate `44,101.46` fps (`44,080..44,120` PASS), `i2c_acks/s = 1.5373` (`<= 3.05`, `i2c_nacks = 0`), `decode_us_max = 14,013` us (`decode_us_first = 949` us; Wave 3 initial MP3 `decode_us_max = 12,384` us, `decode_us_first = 865` us, `1.4933` ACKs/s).
+  - (b) Native `45.000 s` (`1,984,500`-frame) 44.1 kHz/16-bit/stereo FLAC EOF flush (`finish_input`, `/var/lib/squeezeboxserver/cache/test_stereo_16bit.flac` on `10.0.0.50`): tight-poll reached `peak_flac_frames_played = 1,984,500` / `1,984,500` (`100.000%`, `>= 1,981,500` PASS); `15.629 s` steady-state `frames_played` rate `44,102.63` fps (`44,080..44,120` PASS), `i2c_acks/s = 1.3437` (`<= 3.05`, `i2c_nacks = 0`).
+  - (c) `decode_us_max` non-zero and `< 46,000` us: FLAC `25,718` us (`decode_us_first = 624` us), MP3 `14,013` us (`decode_us_first = 949` us).
+  - Gate 2 `GET /?action=getInfo` TTFB (`--interface eno1`): `505.121 ms` (`0.505121 s`) cold prime, `14.481 ms` (`0.014481 s < 100 ms`) cached (`ZEROCONF_DH_CACHE`).
 
 ### Phase 1 — restore a green baseline (do these first)
 
