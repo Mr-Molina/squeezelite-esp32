@@ -107,7 +107,9 @@ impl ChunkedDecoder {
             if let ChunkState::Data(rem) = self.state {
                 // Bulk copy of payload bytes.
                 let take = rem.min(buf.len() - r);
-                buf.copy_within(r..r + take, w);
+                if r != w {
+                    buf.copy_within(r..r + take, w);
+                }
                 r += take;
                 w += take;
                 self.state = if take == rem {
@@ -291,7 +293,9 @@ impl IcyStripper {
             match self.state {
                 IcyState::Audio => {
                     let take = self.remaining.min(buf.len() - r);
-                    buf.copy_within(r..r + take, w);
+                    if r != w {
+                        buf.copy_within(r..r + take, w);
+                    }
                     r += take;
                     w += take;
                     self.remaining -= take;
@@ -969,5 +973,41 @@ mod tests {
         );
         assert_eq!(request_host(b"GET / HTTP/1.0\r\n\r\n"), None);
         assert_eq!(request_host(b"GET / HTTP/1.0\r\nHost:\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn test_chunked_and_icy_in_place_copy_guard_paths() {
+        // 1. ChunkedDecoder:
+        let mut chunked = ChunkedDecoder::new();
+
+        // r != w path: header "4\r\n" advances r ahead of w before payload
+        let mut wire1 = b"4\r\nabcd\r\n".to_vec();
+        let n1 = chunked.decode_in_place(&mut wire1).unwrap();
+        assert_eq!(&wire1[..n1], b"abcd");
+
+        // r == w path: chunk split across buffers keeps state in ChunkState::Data(4).
+        // First buffer ingests header and partial 4 bytes of 8-byte chunk.
+        let mut wire2_part1 = b"8\r\n1234".to_vec();
+        let n2_1 = chunked.decode_in_place(&mut wire2_part1).unwrap();
+        assert_eq!(&wire2_part1[..n2_1], b"1234");
+
+        // Second buffer starts immediately with remaining 4 bytes of data:
+        // r == 0 && w == 0 (r == w path).
+        let mut wire2_part2 = b"5678\r\n0\r\n\r\n".to_vec();
+        let n2_2 = chunked.decode_in_place(&mut wire2_part2).unwrap();
+        assert_eq!(&wire2_part2[..n2_2], b"5678");
+        assert!(chunked.is_done());
+
+        // 2. IcyStripper:
+        let mut icy = IcyStripper::new();
+        icy.set_metaint(4);
+
+        // First 4 bytes: r == 0 && w == 0 (r == w path).
+        // Then metadata byte \x00 advances r to 5 while w is 4.
+        // Subsequent 4 audio bytes: r == 5 && w == 4 (r != w path).
+        let mut icy_wire = b"1234\x005678".to_vec();
+        let n_icy = icy.strip_in_place(&mut icy_wire);
+        assert_eq!(n_icy, 8);
+        assert_eq!(&icy_wire[..n_icy], b"12345678");
     }
 }

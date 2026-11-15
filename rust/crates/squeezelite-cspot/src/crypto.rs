@@ -743,6 +743,27 @@ const fn inv_mix_muls(x: u8) -> (u8, u8, u8, u8) {
     (x8 ^ x, x8 ^ x2 ^ x, x8 ^ x4 ^ x, x8 ^ x4 ^ x2)
 }
 
+const fn compute_te0() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let s = S_BOX[i];
+        let s2 = xtime(s);
+        let s3 = s2 ^ s;
+        table[i] = ((s2 as u32) << 24) | ((s as u32) << 16) | ((s as u32) << 8) | (s3 as u32);
+        i += 1;
+    }
+    table
+}
+
+// JUSTIFICATION: Placing TE0 in internal .dram1 avoids SPI flash cache
+// stalls during real-time Spotify audio decryption.
+// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
+// script for plain [u32; 256] data with no alignment or init hazards.
+#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
+#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+static TE0: [u32; 256] = compute_te0();
+
 /// AES-128 CTR mode stream cipher.
 #[derive(Clone, Debug)]
 pub struct Aes128Ctr {
@@ -769,103 +790,70 @@ impl Aes128Ctr {
     }
 
     fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
-        let mut state = *block;
+        let mut s0 =
+            u32::from_be_bytes([block[0], block[1], block[2], block[3]]) ^ self.round_keys[0];
+        let mut s1 =
+            u32::from_be_bytes([block[4], block[5], block[6], block[7]]) ^ self.round_keys[1];
+        let mut s2 =
+            u32::from_be_bytes([block[8], block[9], block[10], block[11]]) ^ self.round_keys[2];
+        let mut s3 =
+            u32::from_be_bytes([block[12], block[13], block[14], block[15]]) ^ self.round_keys[3];
 
-        // Round 0: AddRoundKey
-        let rk_first = &self.round_keys[0..4];
-        for c in 0..4 {
-            let k = rk_first[c].to_be_bytes();
-            for r in 0..4 {
-                state[r + 4 * c] ^= k[r];
-            }
-        }
-
-        // Rounds 1..9
         for round in 1..10 {
-            // SubBytes
-            for b in &mut state {
-                *b = S_BOX[*b as usize];
-            }
-
-            // ShiftRows
-            let mut temp = [0u8; 16];
-            temp[0] = state[0];
-            temp[4] = state[4];
-            temp[8] = state[8];
-            temp[12] = state[12];
-
-            temp[1] = state[5];
-            temp[5] = state[9];
-            temp[9] = state[13];
-            temp[13] = state[1];
-
-            temp[2] = state[10];
-            temp[6] = state[14];
-            temp[10] = state[2];
-            temp[14] = state[6];
-
-            temp[3] = state[15];
-            temp[7] = state[3];
-            temp[11] = state[7];
-            temp[15] = state[11];
-
-            // MixColumns
-            for c in 0..4 {
-                let s0 = temp[4 * c];
-                let s1 = temp[4 * c + 1];
-                let s2 = temp[4 * c + 2];
-                let s3 = temp[4 * c + 3];
-
-                state[4 * c] = xtime(s0) ^ (xtime(s1) ^ s1) ^ s2 ^ s3;
-                state[4 * c + 1] = s0 ^ xtime(s1) ^ (xtime(s2) ^ s2) ^ s3;
-                state[4 * c + 2] = s0 ^ s1 ^ xtime(s2) ^ (xtime(s3) ^ s3);
-                state[4 * c + 3] = (xtime(s0) ^ s0) ^ s1 ^ s2 ^ xtime(s3);
-            }
-
-            // AddRoundKey
-            let rk_cur = &self.round_keys[round * 4..(round + 1) * 4];
-            for c in 0..4 {
-                let k = rk_cur[c].to_be_bytes();
-                for r in 0..4 {
-                    state[r + 4 * c] ^= k[r];
-                }
-            }
+            let rk = &self.round_keys[round * 4..(round + 1) * 4];
+            let t0 = TE0[(s0 >> 24) as usize]
+                ^ TE0[((s1 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TE0[((s2 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TE0[(s3 & 0xFF) as usize].rotate_right(24)
+                ^ rk[0];
+            let t1 = TE0[(s1 >> 24) as usize]
+                ^ TE0[((s2 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TE0[((s3 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TE0[(s0 & 0xFF) as usize].rotate_right(24)
+                ^ rk[1];
+            let t2 = TE0[(s2 >> 24) as usize]
+                ^ TE0[((s3 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TE0[((s0 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TE0[(s1 & 0xFF) as usize].rotate_right(24)
+                ^ rk[2];
+            let t3 = TE0[(s3 >> 24) as usize]
+                ^ TE0[((s0 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TE0[((s1 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TE0[(s2 & 0xFF) as usize].rotate_right(24)
+                ^ rk[3];
+            s0 = t0;
+            s1 = t1;
+            s2 = t2;
+            s3 = t3;
         }
 
-        // Round 10: SubBytes, ShiftRows, AddRoundKey (no MixColumns)
-        for b in &mut state {
-            *b = S_BOX[*b as usize];
-        }
-        let mut temp = [0u8; 16];
-        temp[0] = state[0];
-        temp[4] = state[4];
-        temp[8] = state[8];
-        temp[12] = state[12];
+        let out0 = (((S_BOX[(s0 >> 24) as usize] as u32) << 24)
+            | ((S_BOX[((s1 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((S_BOX[((s2 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (S_BOX[(s3 & 0xFF) as usize] as u32))
+            ^ self.round_keys[40];
+        let out1 = (((S_BOX[(s1 >> 24) as usize] as u32) << 24)
+            | ((S_BOX[((s2 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((S_BOX[((s3 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (S_BOX[(s0 & 0xFF) as usize] as u32))
+            ^ self.round_keys[41];
+        let out2 = (((S_BOX[(s2 >> 24) as usize] as u32) << 24)
+            | ((S_BOX[((s3 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((S_BOX[((s0 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (S_BOX[(s1 & 0xFF) as usize] as u32))
+            ^ self.round_keys[42];
+        let out3 = (((S_BOX[(s3 >> 24) as usize] as u32) << 24)
+            | ((S_BOX[((s0 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((S_BOX[((s1 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (S_BOX[(s2 & 0xFF) as usize] as u32))
+            ^ self.round_keys[43];
 
-        temp[1] = state[5];
-        temp[5] = state[9];
-        temp[9] = state[13];
-        temp[13] = state[1];
-
-        temp[2] = state[10];
-        temp[6] = state[14];
-        temp[10] = state[2];
-        temp[14] = state[6];
-
-        temp[3] = state[15];
-        temp[7] = state[3];
-        temp[11] = state[7];
-        temp[15] = state[11];
-
-        let rk_last = &self.round_keys[40..44];
-        for c in 0..4 {
-            let k = rk_last[c].to_be_bytes();
-            for r in 0..4 {
-                temp[r + 4 * c] ^= k[r];
-            }
-        }
-
-        temp
+        let mut result = [0u8; 16];
+        result[0..4].copy_from_slice(&out0.to_be_bytes());
+        result[4..8].copy_from_slice(&out1.to_be_bytes());
+        result[8..12].copy_from_slice(&out2.to_be_bytes());
+        result[12..16].copy_from_slice(&out3.to_be_bytes());
+        result
     }
 
     fn increment_iv(iv: &mut [u8; 16]) {
@@ -881,36 +869,11 @@ impl Aes128Ctr {
 
     /// Encrypts or decrypts bytes in-place using CTR keystream.
     pub fn process(&mut self, data: &mut [u8]) {
-        let mut pos = 0;
-        let full_blocks_len = data.len() / 16 * 16;
-        while pos < full_blocks_len {
+        for chunk in data.chunks_mut(16) {
             let keystream = self.encrypt_block(&self.iv);
             Self::increment_iv(&mut self.iv);
-            for j in 0..4 {
-                let offset = pos + j * 4;
-                let d_word = u32::from_ne_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]);
-                let k_word = u32::from_ne_bytes([
-                    keystream[j * 4],
-                    keystream[j * 4 + 1],
-                    keystream[j * 4 + 2],
-                    keystream[j * 4 + 3],
-                ]);
-                data[offset..offset + 4].copy_from_slice(&(d_word ^ k_word).to_ne_bytes());
-            }
-            pos += 16;
-        }
-
-        if pos < data.len() {
-            let keystream = self.encrypt_block(&self.iv);
-            Self::increment_iv(&mut self.iv);
-            let take = data.len() - pos;
-            for i in 0..take {
-                data[pos + i] ^= keystream[i];
+            for (d, k) in chunk.iter_mut().zip(&keystream) {
+                *d ^= *k;
             }
         }
     }
@@ -1289,5 +1252,40 @@ mod tests {
             montgomery_mod_pow(&base, &exp, &huge_mod),
             Err(CryptoError::InvalidModulus)
         );
+    }
+
+    #[test]
+    fn test_nist_sp800_38a_f51_aes128_ctr() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let iv = [
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+            0xfe, 0xff,
+        ];
+        let plaintext = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac,
+            0x45, 0xaf, 0x8e, 0x51, 0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb,
+            0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef, 0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17,
+            0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10,
+        ];
+        let expected = [
+            0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26, 0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d,
+            0xb6, 0xce, 0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff, 0x86, 0x17, 0x18, 0x7b,
+            0xb9, 0xff, 0xfd, 0xff, 0x5a, 0xe4, 0xdf, 0x3e, 0xdb, 0xd5, 0xd3, 0x5e, 0x5b, 0x4f,
+            0x09, 0x02, 0x0d, 0xb0, 0x3e, 0xab, 0x1e, 0x03, 0x1d, 0xda, 0x2f, 0xbe, 0x03, 0xd1,
+            0x79, 0x21, 0x70, 0xa0, 0xf3, 0x00, 0x9c, 0xee,
+        ];
+
+        let mut data = plaintext;
+        let mut cipher = Aes128Ctr::new(&key, iv);
+        cipher.process(&mut data);
+        assert_eq!(data, expected);
+
+        let mut decipher = Aes128Ctr::new(&key, iv);
+        decipher.process(&mut data);
+        assert_eq!(data, plaintext);
     }
 }

@@ -108,7 +108,7 @@ pub const fn ms_to_ntp(ms: u64) -> u64 {
 }
 
 /// Parsed 12-byte RTP audio packet header.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RtpHeader {
     pub payload_type: u8,
     pub sequence_number: u16,
@@ -522,7 +522,7 @@ pub fn parse_rtp_info(rtp_info: &str) -> (Option<u16>, Option<u32>) {
 }
 
 /// A single reordered audio frame or packet entry inside `RtpJitterBuffer`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct JitterEntry {
     /// Parsed 12-byte RTP header (`sequence_number`, `timestamp`, `ssrc`).
@@ -544,6 +544,47 @@ impl JitterEntry {
             pcm,
         }
     }
+
+    /// Resets this entry with a new header, copying payload slice into the existing
+    /// vector without reallocating if capacity is sufficient.
+    pub fn reset_payload(&mut self, header: RtpHeader, payload: &[u8]) {
+        self.header = header;
+        self.payload.clear();
+        self.payload.extend_from_slice(payload);
+        self.pcm.clear();
+    }
+
+    /// Resets this entry with a new header, copying PCM slice into the existing
+    /// vector without reallocating if capacity is sufficient.
+    pub fn reset_pcm(&mut self, header: RtpHeader, pcm: &[i16]) {
+        self.header = header;
+        self.payload.clear();
+        self.pcm.clear();
+        self.pcm.extend_from_slice(pcm);
+    }
+
+    /// Clears both payload and PCM buffers while retaining allocated capacity.
+    pub fn clear_buffers(&mut self) {
+        self.payload.clear();
+        self.pcm.clear();
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct JitterSlot {
+    occupied: bool,
+    entry: JitterEntry,
+}
+
+impl JitterSlot {
+    fn clear(&mut self) -> bool {
+        if !self.occupied {
+            return false;
+        }
+        self.occupied = false;
+        self.entry.clear_buffers();
+        true
+    }
 }
 
 /// Bounded RTP jitter and packet reorder ring buffer.
@@ -553,7 +594,8 @@ impl JitterEntry {
 /// (`0x80 0xD5`) on sequence gaps, and flushes cleanly on RTSP `FLUSH`.
 pub struct RtpJitterBuffer {
     capacity: usize,
-    slots: Vec<Option<JitterEntry>>,
+    slots: Vec<JitterSlot>,
+    spare_pool: Vec<JitterEntry>,
     buffered_count: usize,
     read_seq: Option<u16>,
     write_seq: Option<u16>,
@@ -579,7 +621,8 @@ impl RtpJitterBuffer {
         let cap = capacity.max(1).next_power_of_two();
         Self {
             capacity: cap,
-            slots: vec![None; cap],
+            slots: vec![JitterSlot::default(); cap],
+            spare_pool: Vec::new(),
             buffered_count: 0,
             read_seq: None,
             write_seq: None,
@@ -648,28 +691,78 @@ impl RtpJitterBuffer {
         self.buffered_count
     }
 
+    /// Returns the allocated buffer capacity `(payload_capacity, pcm_capacity)`
+    /// for slot `idx` (modulo capacity).
+    #[must_use]
+    pub fn slot_capacity(&self, idx: usize) -> (usize, usize) {
+        let idx = idx & (self.capacity - 1);
+        (
+            self.slots[idx].entry.payload.capacity(),
+            self.slots[idx].entry.pcm.capacity(),
+        )
+    }
+
     #[inline(always)]
     fn slot_index(&self, seq: u16) -> usize {
         (seq as usize) & (self.capacity - 1)
     }
 
     fn clear_slots(&mut self) {
-        self.slots.fill(None);
+        for slot in &mut self.slots {
+            let _ = slot.clear();
+        }
         self.buffered_count = 0;
     }
 
-    fn put_slot(&mut self, idx: usize, entry: JitterEntry) {
-        if self.slots[idx].replace(entry).is_none() {
-            self.buffered_count += 1;
+    fn clear_slot(&mut self, idx: usize) {
+        if self.slots[idx].clear() {
+            self.buffered_count -= 1;
         }
     }
 
-    fn take_slot(&mut self, idx: usize) -> Option<JitterEntry> {
-        let taken = self.slots[idx].take();
-        if taken.is_some() {
-            self.buffered_count -= 1;
+    fn put_slot_with<F>(&mut self, idx: usize, write_fn: F)
+    where
+        F: FnOnce(&mut JitterEntry),
+    {
+        let slot = &mut self.slots[idx];
+        if !slot.occupied {
+            if slot.entry.payload.capacity() == 0 && slot.entry.pcm.capacity() == 0 {
+                if let Some(spare) = self.spare_pool.pop() {
+                    slot.entry = spare;
+                }
+            }
+            self.buffered_count += 1;
+            slot.occupied = true;
         }
-        taken
+        write_fn(&mut slot.entry);
+    }
+
+    fn take_slot(&mut self, idx: usize) -> Option<JitterEntry> {
+        let slot = &mut self.slots[idx];
+        if !slot.occupied {
+            return None;
+        }
+        slot.occupied = false;
+        self.buffered_count -= 1;
+        let replacement = self.spare_pool.pop().unwrap_or_default();
+        Some(core::mem::replace(&mut slot.entry, replacement))
+    }
+
+    /// Recycles a drained `JitterEntry`, clearing its payload and PCM buffers
+    /// while preserving allocated capacity in the internal spare buffer pool.
+    pub fn recycle_entry(&mut self, mut entry: JitterEntry) {
+        entry.clear_buffers();
+        if self.spare_pool.len() < self.capacity {
+            self.spare_pool.push(entry);
+        }
+    }
+
+    /// Recycles all entries from `entries` into the internal spare pool while
+    /// preserving the caller's outer `Vec` capacity.
+    pub fn recycle_entries(&mut self, entries: &mut Vec<JitterEntry>) {
+        for entry in entries.drain(..) {
+            self.recycle_entry(entry);
+        }
     }
 
     /// Pushes a raw RTP audio packet (`0x60`) or retransmit reply (`0x56`/`0xD6`)
@@ -693,15 +786,13 @@ impl RtpJitterBuffer {
         {
             return Err(RtpReceiverError::UnexpectedPayloadType(header.payload_type));
         }
-        let entry = JitterEntry::new(header, payload.to_vec(), Vec::new());
-        Ok(self.insert_entry(entry))
+        Ok(self.insert_payload(header, payload))
     }
 
     /// Pushes pre-decoded stereo PCM samples and their `RtpHeader` into the
     /// reorder ring.
     pub fn push_pcm(&mut self, header: RtpHeader, pcm: &[i16]) -> Option<RtpResendRequest> {
-        let entry = JitterEntry::new(header, Vec::new(), pcm.to_vec());
-        self.insert_entry(entry)
+        self.insert_pcm(header, pcm)
     }
 
     /// Decrypts and decodes an RTP packet (`0x60` or `0x56`/`0xD6` retransmit)
@@ -715,8 +806,19 @@ impl RtpJitterBuffer {
         Ok(self.push_pcm(header, pcm))
     }
 
-    fn insert_entry(&mut self, entry: JitterEntry) -> Option<RtpResendRequest> {
-        let seq = entry.header.sequence_number;
+    fn insert_payload(&mut self, header: RtpHeader, payload: &[u8]) -> Option<RtpResendRequest> {
+        self.insert_slot_with(header, |entry| entry.reset_payload(header, payload))
+    }
+
+    fn insert_pcm(&mut self, header: RtpHeader, pcm: &[i16]) -> Option<RtpResendRequest> {
+        self.insert_slot_with(header, |entry| entry.reset_pcm(header, pcm))
+    }
+
+    fn insert_slot_with<F>(&mut self, header: RtpHeader, write_fn: F) -> Option<RtpResendRequest>
+    where
+        F: FnOnce(&mut JitterEntry),
+    {
+        let seq = header.sequence_number;
 
         if let Some(min_seq) = self.min_allowed_seq {
             if seq_before(seq, min_seq) {
@@ -724,7 +826,7 @@ impl RtpJitterBuffer {
             }
             if self.write_seq.is_none() {
                 let idx = self.slot_index(seq);
-                self.put_slot(idx, entry);
+                self.put_slot_with(idx, write_fn);
                 self.read_seq = Some(seq);
                 self.write_seq = Some(seq);
                 self.min_allowed_seq = None;
@@ -735,7 +837,7 @@ impl RtpJitterBuffer {
 
         let (Some(last_w), Some(cur_r)) = (self.write_seq, self.read_seq) else {
             let idx = self.slot_index(seq);
-            self.put_slot(idx, entry);
+            self.put_slot_with(idx, write_fn);
             self.read_seq = Some(seq);
             self.write_seq = Some(seq);
             return None;
@@ -745,7 +847,7 @@ impl RtpJitterBuffer {
         if diff_w == 1 {
             // Expected next packet in sequence
             let idx = self.slot_index(seq);
-            self.put_slot(idx, entry);
+            self.put_slot_with(idx, write_fn);
             self.write_seq = Some(seq);
             let d = seq_diff(seq, cur_r);
             if d > 0 && (d as usize) >= self.capacity {
@@ -760,23 +862,23 @@ impl RtpJitterBuffer {
                 // Gap exceeds ring capacity: reset ring to new anchor
                 self.clear_slots();
                 let idx = self.slot_index(seq);
-                self.put_slot(idx, entry);
+                self.put_slot_with(idx, write_fn);
                 self.read_seq = Some(seq);
                 self.write_seq = Some(seq);
                 return None;
             }
 
             // Clear skipped slots so stale entries from previous wrap cannot
-            // masquerade as ready frames
+            // masquerade as ready frames while retaining slot buffer capacity.
             let mut s = last_w.wrapping_add(1);
             while s != seq {
                 let s_idx = self.slot_index(s);
-                let _ = self.take_slot(s_idx);
+                self.clear_slot(s_idx);
                 s = s.wrapping_add(1);
             }
 
             let idx = self.slot_index(seq);
-            self.put_slot(idx, entry);
+            self.put_slot_with(idx, write_fn);
             self.write_seq = Some(seq);
 
             let d = seq_diff(seq, cur_r);
@@ -794,13 +896,12 @@ impl RtpJitterBuffer {
             // Out-of-order or retransmitted packet (`seq <= last_w`)
             if seq_diff(seq, cur_r) >= 0 {
                 let idx = self.slot_index(seq);
-                let already_present = self.slots[idx]
-                    .as_ref()
-                    .is_some_and(|e| e.header.sequence_number == seq);
+                let already_present =
+                    self.slots[idx].occupied && self.slots[idx].entry.header.sequence_number == seq;
                 if !already_present {
                     self.recovered_packets = self.recovered_packets.saturating_add(1);
                 }
-                self.put_slot(idx, entry);
+                self.put_slot_with(idx, write_fn);
             } else {
                 self.late_packets = self.late_packets.saturating_add(1);
             }
@@ -812,9 +913,8 @@ impl RtpJitterBuffer {
     pub fn pop_ready(&mut self) -> Option<JitterEntry> {
         let r_seq = self.read_seq?;
         let idx = self.slot_index(r_seq);
-        let is_match = self.slots[idx]
-            .as_ref()
-            .is_some_and(|e| e.header.sequence_number == r_seq);
+        let is_match =
+            self.slots[idx].occupied && self.slots[idx].entry.header.sequence_number == r_seq;
         if !is_match {
             return None;
         }
@@ -825,13 +925,47 @@ impl RtpJitterBuffer {
         entry
     }
 
-    /// Drains all contiguous ready entries in sequence order starting from
-    /// `read_seq`.
-    pub fn drain_ready(&mut self) -> Vec<JitterEntry> {
-        let mut out = Vec::new();
+    /// Drains all contiguous ready entries in sequence order into a closure
+    /// without reallocating packet or PCM vectors, preserving slot capacities.
+    pub fn drain_ready_with<F>(&mut self, mut f: F) -> usize
+    where
+        F: FnMut(&JitterEntry),
+    {
+        let mut count = 0;
+        while let Some(r_seq) = self.read_seq {
+            let idx = self.slot_index(r_seq);
+            let is_match =
+                self.slots[idx].occupied && self.slots[idx].entry.header.sequence_number == r_seq;
+            if !is_match {
+                break;
+            }
+            f(&self.slots[idx].entry);
+            self.slots[idx].occupied = false;
+            self.slots[idx].entry.clear_buffers();
+            self.buffered_count -= 1;
+            if self.write_seq.is_some() {
+                self.read_seq = Some(r_seq.wrapping_add(1));
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Drains all contiguous ready entries in sequence order into `out`.
+    pub fn drain_ready_into(&mut self, out: &mut Vec<JitterEntry>) -> usize {
+        let prev = out.len();
         while let Some(entry) = self.pop_ready() {
             out.push(entry);
         }
+        out.len() - prev
+    }
+
+    /// Drains all contiguous ready entries in sequence order starting from
+    /// `read_seq`.
+    #[must_use]
+    pub fn drain_ready(&mut self) -> Vec<JitterEntry> {
+        let mut out = Vec::new();
+        self.drain_ready_into(&mut out);
         out
     }
 
@@ -845,9 +979,8 @@ impl RtpJitterBuffer {
             return false;
         }
         let idx = self.slot_index(r_seq);
-        let is_ready = self.slots[idx]
-            .as_ref()
-            .is_some_and(|e| e.header.sequence_number == r_seq);
+        let is_ready =
+            self.slots[idx].occupied && self.slots[idx].entry.header.sequence_number == r_seq;
         if is_ready {
             return false;
         }
@@ -855,28 +988,34 @@ impl RtpJitterBuffer {
         true
     }
 
+    /// Fills `out` with all currently missing sequence numbers between `read_seq`
+    /// and `write_seq` without allocating if `out` has sufficient capacity.
+    pub fn missing_sequences_into(&self, out: &mut Vec<u16>) {
+        out.clear();
+        let (Some(r_seq), Some(w_seq)) = (self.read_seq, self.write_seq) else {
+            return;
+        };
+        if seq_diff(w_seq, r_seq) <= 0 {
+            return;
+        }
+        let mut s = r_seq;
+        while seq_before(s, w_seq) {
+            let idx = self.slot_index(s);
+            let present =
+                self.slots[idx].occupied && self.slots[idx].entry.header.sequence_number == s;
+            if !present {
+                out.push(s);
+            }
+            s = s.wrapping_add(1);
+        }
+    }
+
     /// Returns all currently missing sequence numbers between `read_seq` and
     /// `write_seq`.
     #[must_use]
     pub fn missing_sequences(&self) -> Vec<u16> {
         let mut missing = Vec::new();
-        let (Some(r_seq), Some(w_seq)) = (self.read_seq, self.write_seq) else {
-            return missing;
-        };
-        if seq_diff(w_seq, r_seq) <= 0 {
-            return missing;
-        }
-        let mut s = r_seq;
-        while seq_before(s, w_seq) {
-            let idx = self.slot_index(s);
-            let present = self.slots[idx]
-                .as_ref()
-                .is_some_and(|e| e.header.sequence_number == s);
-            if !present {
-                missing.push(s);
-            }
-            s = s.wrapping_add(1);
-        }
+        self.missing_sequences_into(&mut missing);
         missing
     }
 
@@ -887,11 +1026,11 @@ impl RtpJitterBuffer {
         self.last_flush_rtptime = Some(flush_rtptime);
 
         for slot in &mut self.slots {
-            let should_drop = slot
-                .as_ref()
-                .is_some_and(|e| seq_before(e.header.sequence_number, flush_seq));
+            let should_drop =
+                slot.occupied && seq_before(slot.entry.header.sequence_number, flush_seq);
             if should_drop {
-                *slot = None;
+                slot.occupied = false;
+                slot.entry.clear_buffers();
                 self.buffered_count -= 1;
             }
         }
@@ -1278,5 +1417,226 @@ impl RtpAudioReceiver {
         };
 
         Ok((&self.pcm_out[..decoded_len], header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_audio_packet(seq: u16, ts: u32, payload: &[u8]) -> Vec<u8> {
+        let header = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: seq,
+            timestamp: ts,
+            ssrc: 42,
+        };
+        let mut raw = Vec::with_capacity(12 + payload.len());
+        raw.extend_from_slice(&header.to_bytes(false));
+        raw.extend_from_slice(payload);
+        raw
+    }
+
+    #[test]
+    fn test_jitter_buffer_slot_capacity_reuse() {
+        let mut jb = RtpJitterBuffer::new(8);
+
+        // 1. First push allocates initial capacity in slot
+        let payload1 = [0xAAu8; 64];
+        let raw1 = build_audio_packet(1, 1000, &payload1);
+        assert_eq!(jb.push_packet(&raw1), Ok(None));
+        let slot_idx = jb.slot_index(1);
+        let (cap_p1, _) = jb.slot_capacity(slot_idx);
+        assert!(
+            cap_p1 >= 64,
+            "initial push allocates payload capacity: {cap_p1}"
+        );
+
+        // Drain using drain_ready_with - slot capacity must be retained
+        let mut drained_count = 0;
+        let drained = jb.drain_ready_with(|entry| {
+            assert_eq!(entry.header.sequence_number, 1);
+            assert_eq!(entry.payload.as_slice(), &payload1[..]);
+            drained_count += 1;
+        });
+        assert_eq!(drained, 1);
+        assert_eq!(drained_count, 1);
+        let (cap_after_drain, _) = jb.slot_capacity(slot_idx);
+        assert_eq!(
+            cap_after_drain, cap_p1,
+            "slot capacity preserved after drain_ready_with: {cap_after_drain} != {cap_p1}"
+        );
+
+        // 2. Advance ring to seq 8 and drain, then push seq 9 into the same
+        // slot (1 + 8 = 9) to reuse its buffer.
+        for seq in 2..=8u16 {
+            let raw = build_audio_packet(seq, u32::from(seq) * 1000, &[0x11u8; 8]);
+            assert_eq!(jb.push_packet(&raw), Ok(None));
+        }
+        assert_eq!(jb.drain_ready_with(|_| {}), 7);
+
+        let payload9 = [0xBBu8; 32];
+        let raw9 = build_audio_packet(9, 9000, &payload9);
+        assert_eq!(jb.push_packet(&raw9), Ok(None));
+        let (cap_p9, _) = jb.slot_capacity(slot_idx);
+        assert_eq!(
+            cap_p9, cap_p1,
+            "slot capacity reused without reallocation: {cap_p9} != {cap_p1}"
+        );
+        let _ = jb.drain_ready_with(|_| {});
+
+        // 3. Gap-skipping and flush retain slot capacities
+        let raw10 = build_audio_packet(10, 10_000, &[0xCCu8; 48]);
+        assert_eq!(jb.push_packet(&raw10), Ok(None));
+        let gap_idx = jb.slot_index(11);
+        let raw11 = build_audio_packet(11, 11_000, &[0xDDu8; 48]);
+        assert_eq!(jb.push_packet(&raw11), Ok(None));
+        let (cap_gap_before, _) = jb.slot_capacity(gap_idx);
+        assert!(cap_gap_before >= 48, "slot 11 allocated: {cap_gap_before}");
+        jb.flush(12, 12_000);
+        let (cap_gap_after, _) = jb.slot_capacity(gap_idx);
+        assert_eq!(
+            cap_gap_after, cap_gap_before,
+            "flush keeps slot capacity: {cap_gap_after} != {cap_gap_before}"
+        );
+
+        // 4. Test push_pcm capacity preservation across drain and re-push
+        let mut jb_pcm = RtpJitterBuffer::new(8);
+        let pcm_large = [100i16; 16];
+        let pcm_small = [200i16; 4];
+        let h1 = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: 1,
+            timestamp: 1000,
+            ssrc: 42,
+        };
+        let h9 = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: 9,
+            timestamp: 9000,
+            ssrc: 42,
+        };
+        assert_eq!(jb_pcm.push_pcm(h1, &pcm_large), None);
+        let (_, cap_pcm1) = jb_pcm.slot_capacity(slot_idx);
+        assert!(cap_pcm1 >= pcm_large.len(), "initial PCM cap: {cap_pcm1}");
+
+        let drained_pcm = jb_pcm.drain_ready_with(|entry| {
+            assert_eq!(entry.pcm.as_slice(), &pcm_large[..]);
+        });
+        assert_eq!(drained_pcm, 1);
+        let (_, cap_pcm_drained) = jb_pcm.slot_capacity(slot_idx);
+        assert_eq!(
+            cap_pcm_drained, cap_pcm1,
+            "PCM capacity preserved after drain: {cap_pcm_drained} != {cap_pcm1}"
+        );
+
+        for seq in 2..=8u16 {
+            let h = RtpHeader {
+                payload_type: RTP_PT_AUDIO_DATA,
+                sequence_number: seq,
+                timestamp: u32::from(seq) * 1000,
+                ssrc: 42,
+            };
+            assert_eq!(jb_pcm.push_pcm(h, &[1i16; 2]), None);
+        }
+        assert_eq!(jb_pcm.drain_ready_with(|_| {}), 7);
+
+        assert_eq!(jb_pcm.push_pcm(h9, &pcm_small), None);
+        let (_, cap_pcm9) = jb_pcm.slot_capacity(slot_idx);
+        assert_eq!(
+            cap_pcm9, cap_pcm1,
+            "PCM capacity reused on re-push: {cap_pcm9} != {cap_pcm1}"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_recycle_and_missing_sequences_into() {
+        let mut jb = RtpJitterBuffer::new(8);
+        let payload = [0x5Au8; 64];
+
+        // 1. pop_ready + recycle_entry returns warmed capacity to slots
+        assert_eq!(
+            jb.push_packet(&build_audio_packet(1, 100, &payload)),
+            Ok(None)
+        );
+        let idx1 = jb.slot_index(1);
+        let (cap1, _) = jb.slot_capacity(idx1);
+        assert!(cap1 >= 64, "initial cap: {cap1}");
+
+        let Some(entry1) = jb.pop_ready() else {
+            panic!("seq 1 should be ready");
+        };
+        assert_eq!(entry1.payload.capacity(), cap1);
+        jb.recycle_entry(entry1);
+        jb.flush(9, 900);
+
+        // Next push into slot 1 pulls recycled entry from spare_pool
+        let small_payload = [0x7Bu8; 16];
+        assert_eq!(
+            jb.push_packet(&build_audio_packet(9, 900, &small_payload)),
+            Ok(None)
+        );
+        let (cap9, _) = jb.slot_capacity(idx1);
+        assert_eq!(
+            cap9, cap1,
+            "recycled entry reused in slot: {cap9} != {cap1}"
+        );
+
+        // 2. drain_ready_into + recycle_entries reuses caller scratch and slots
+        let mut scratch = Vec::with_capacity(4);
+        assert_eq!(jb.drain_ready_into(&mut scratch), 1);
+        assert_eq!(scratch.len(), 1);
+        jb.recycle_entries(&mut scratch);
+        assert!(scratch.is_empty(), "scratch cleared after recycle_entries");
+        assert!(
+            scratch.capacity() >= 4,
+            "scratch capacity preserved: {}",
+            scratch.capacity()
+        );
+
+        // 3. missing_sequences_into clears stale data and preserves capacity
+        let mut jb_miss = RtpJitterBuffer::new(16);
+        let pcm_sample = [1i16, -1i16, 2i16, -2i16];
+        let h10 = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: 10,
+            timestamp: 1000,
+            ssrc: 1,
+        };
+        let h13 = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: 13,
+            timestamp: 4000,
+            ssrc: 1,
+        };
+        assert_eq!(jb_miss.push_pcm(h10, &pcm_sample), None);
+        assert!(jb_miss.push_pcm(h13, &pcm_sample).is_some());
+
+        let mut missing_buf = Vec::with_capacity(8);
+        missing_buf.push(999);
+        let cap_before = missing_buf.capacity();
+        jb_miss.missing_sequences_into(&mut missing_buf);
+        assert_eq!(missing_buf, vec![11, 12]);
+        assert_eq!(missing_buf, jb_miss.missing_sequences());
+        assert_eq!(missing_buf.capacity(), cap_before);
+
+        // Verify clearing when no gaps remain
+        let h11 = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: 11,
+            timestamp: 2000,
+            ssrc: 1,
+        };
+        let h12 = RtpHeader {
+            payload_type: RTP_PT_AUDIO_DATA,
+            sequence_number: 12,
+            timestamp: 3000,
+            ssrc: 1,
+        };
+        assert_eq!(jb_miss.push_pcm(h11, &pcm_sample), None);
+        assert_eq!(jb_miss.push_pcm(h12, &pcm_sample), None);
+        jb_miss.missing_sequences_into(&mut missing_buf);
+        assert!(missing_buf.is_empty(), "no gaps remain: {missing_buf:?}");
+        assert_eq!(missing_buf.capacity(), cap_before);
     }
 }

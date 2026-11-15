@@ -2230,7 +2230,6 @@ impl PlayerCoordinator {
         let mut total_written = 0;
         let mut chunk = [0u8; 1024];
         while self.stream == StreamLink::Open {
-            self.take_stream_side_data(source);
             let avail_write = pipeline.stream_buffer.available_write();
             if avail_write == 0 {
                 break;
@@ -2238,10 +2237,6 @@ impl PlayerCoordinator {
             let max_read = avail_write.min(chunk.len());
             match source.poll_bytes(&mut chunk[..max_read]) {
                 Ok(0) => {
-                    if source.is_eof() {
-                        self.take_stream_side_data(source);
-                        self.end_stream(source);
-                    }
                     break;
                 }
                 Ok(n) => {
@@ -2253,6 +2248,7 @@ impl PlayerCoordinator {
                     }
                 }
                 Err(e) => {
+                    self.take_stream_side_data(source);
                     self.fail_stream(source);
                     return Err(e);
                 }
@@ -6827,5 +6823,117 @@ mod tests {
         assert!(!pipeline.sink.muted);
         assert!(!rig.backend.muted);
         assert_eq!(pipeline.stream_buffer.available_read(), 32);
+    }
+
+    fn verify_ogg_1728_pump(
+        format_byte: u8,
+        fixture: &[u8],
+        expected_frames: usize,
+        expected_rate: u32,
+    ) {
+        let mut rig = Rig::with_source(
+            [0x55; 6],
+            "T05Pump",
+            GatedSource::new(b"/stream.mp3", SHORT_STREAM),
+        );
+        let mut stream_storage = vec![0u8; 16_384];
+        let mut output_storage = vec![0u8; 1 << 17];
+        let mut pipeline = gapless_pipeline(&mut stream_storage, &mut output_storage);
+        rig.coord.external_audio_pump = true;
+        rig.src.hold_data = true;
+        rig.command(&mut pipeline, &strm_frame_fmt(format_byte, true, 9000), 10);
+
+        let expected_decoder = match format_byte {
+            b'o' => matches!(pipeline.decoder, ActiveDecoder::Vorbis(_)),
+            b'u' => matches!(pipeline.decoder, ActiveDecoder::Opus(_)),
+            _ => false,
+        };
+        assert!(
+            expected_decoder,
+            "unexpected decoder for format {format_byte}"
+        );
+
+        let mut now_ms = 20u32;
+        for chunk in fixture.chunks(1728) {
+            let ingested = pipeline
+                .ingest_stream_data(chunk)
+                .expect("stream buffer accepts 1728-byte chunk");
+            assert_eq!(
+                ingested,
+                chunk.len(),
+                "short ingest for chunk of {} bytes",
+                chunk.len()
+            );
+            now_ms += 10;
+            rig.tick(&mut pipeline, now_ms)
+                .expect("coordinator tick succeeds after chunk ingest");
+            assert_eq!(rig.coord.state, PlayerState::Playing);
+
+            let mut chunk_iters = 0usize;
+            while pipeline.stream_buffer.available_read() > 0 || pipeline.has_pending_pcm() {
+                let decoded_steps = rig.coord.pump_decode(&mut pipeline, 16);
+                let out_frames = rig.coord.pump_output(&mut pipeline, 16);
+                chunk_iters += 1;
+                assert!(
+                    chunk_iters < 128,
+                    "iteration cap hit during chunk pump (format={format_byte})"
+                );
+                if decoded_steps == 0 && out_frames == 0 {
+                    break;
+                }
+            }
+        }
+
+        rig.coord.stream_eof = true;
+        let mut drain_iters = 0usize;
+        while pipeline.stream_buffer.available_read() > 0
+            || pipeline.has_pending_pcm()
+            || pipeline.output_buffer.available_read() >= 8
+        {
+            let decoded_steps = rig.coord.pump_decode(&mut pipeline, 16);
+            let out_frames = rig.coord.pump_output(&mut pipeline, 16);
+            drain_iters += 1;
+            assert!(
+                drain_iters < 128,
+                "iteration cap hit draining EOF (format={format_byte})"
+            );
+            if decoded_steps == 0 && out_frames == 0 {
+                break;
+            }
+        }
+
+        assert!(
+            !rig.coord.decode_failed,
+            "decoder error (format={format_byte})"
+        );
+        assert_eq!(pipeline.stream_buffer.available_read(), 0);
+        assert!(!pipeline.has_pending_pcm());
+        assert_eq!(pipeline.output_buffer.available_read(), 0);
+        assert_eq!(pipeline.active_sample_rate_hz, expected_rate);
+        assert_eq!(pipeline.frames_played as usize, expected_frames);
+        assert_eq!(pipeline.sink.samples.len(), expected_frames * 2);
+
+        let mut non_zero_samples = 0usize;
+        for &sample in &pipeline.sink.samples {
+            if sample != 0 {
+                non_zero_samples += 1;
+            }
+        }
+        assert!(
+            non_zero_samples > 0,
+            "expected non-silent PCM output (format={format_byte})"
+        );
+    }
+
+    #[test]
+    fn test_t05_vorbis_and_opus_1728_chunk_coordinator_pump() {
+        const VORBIS_OGG: &[u8] = include_bytes!(
+            "../../squeezelite-decoders/tests/fixtures/sine_440_1000_stereo_44k1.ogg"
+        );
+        const OPUS_OGG: &[u8] =
+            include_bytes!("../../squeezelite-decoders/tests/fixtures/test_stereo_05s_48k.opus");
+
+        verify_ogg_1728_pump(b'o', VORBIS_OGG, 22_080, 44_100);
+        verify_ogg_1728_pump(b'u', OPUS_OGG, 24_648, 48_000);
     }
 }

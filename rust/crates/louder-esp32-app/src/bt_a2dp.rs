@@ -1354,6 +1354,15 @@ pub fn sbc_clip16(s: i32) -> i16 {
     }
 }
 
+#[inline(always)]
+fn saturating_i64_to_i32(val: i64) -> i32 {
+    match i32::try_from(val) {
+        Ok(v) => v,
+        Err(_) if val < 0 => i32::MIN,
+        Err(_) => i32::MAX,
+    }
+}
+
 // ============================================================================
 // SBC Decoder Implementation
 // ============================================================================
@@ -1905,31 +1914,191 @@ impl SbcDecoder {
             } else {
                 offset[i] -= 1;
             }
+        }
 
-            let mut acc = 0i64;
-            for sb in 0..8 {
-                acc += SYNMATRIX8[i][sb] as i64 * (sb_sample[blk][ch][sb] as i64);
-            }
+        // Subband samples for this block and channel
+        let s = sb_sample[blk][ch];
 
-            v[offset[i]] = (acc >> 15) as i32;
+        // Dynamic range bounds & overflow analysis:
+        // Standard SBC subbands have magnitude up to 18-19 bits.
+        // For |s[sb]| <= 32768 (16-bit full scale), max |p_k|, |d_k| <= 65536,
+        // max row |sum| <= 23170 * 65536 = 1,518,469,120, and
+        // |-acc0 - sum_s| <= 1,518,731,264 < i32::MAX (2,147,483,647).
+        // Larger subband samples fall back to 64-bit accumulation.
+        //
+        // Matrix MAC reduction via SYNMATRIX8 symmetry and antisymmetry:
+        // - Symmetric rows (0, 2, 10): SYNMATRIX8[i][k] == SYNMATRIX8[i][7-k]
+        //   acc = sum_{k=0..3} SYNMATRIX8[i][k] * (s[k] + s[7-k]) (4 MACs)
+        // - Antisymmetric rows (1, 3, 9, 11):
+        //   SYNMATRIX8[i][7-k] == -SYNMATRIX8[i][k] - 1
+        //   acc = sum_{k=0..3} SYNMATRIX8[i][k] * (s[k] - s[7-k]) - tail_sum
+        // - Row 4: all zeros -> 0 (0 MACs)
+        // - Row 12: all -8192 -> (acc >> 15) == (-sum_s) >> 2 (0 MACs)
+        // - Complementary rows (5..8):
+        //   SYNMATRIX8[8-i][k] == -SYNMATRIX8[i][k] - 1
+        //   acc[8-i] = -acc[i] - sum_s (0 MACs)
+        // - Identical rows: row 13 == 11, row 14 == 10, row 15 == 9 (0 MACs)
+        // Total MACs reduced from 128 to 28 (78.1% reduction).
+        let mut max_mag = 0u32;
+        for &sample in &s {
+            max_mag = max_mag.max(sample.unsigned_abs());
+        }
+
+        if max_mag <= 32768 {
+            let p0 = s[0] + s[7];
+            let p1 = s[1] + s[6];
+            let p2 = s[2] + s[5];
+            let p3 = s[3] + s[4];
+
+            let d0 = s[0] - s[7];
+            let d1 = s[1] - s[6];
+            let d2 = s[2] - s[5];
+            let d3 = s[3] - s[4];
+
+            let tail_sum = s[4] + s[5] + s[6] + s[7];
+            let sum_s = p0 + p1 + p2 + p3;
+
+            let acc0 = SYNMATRIX8[0][0] * p0
+                + SYNMATRIX8[0][1] * p1
+                + SYNMATRIX8[0][2] * p2
+                + SYNMATRIX8[0][3] * p3;
+            let acc1 = SYNMATRIX8[1][0] * d0
+                + SYNMATRIX8[1][1] * d1
+                + SYNMATRIX8[1][2] * d2
+                + SYNMATRIX8[1][3] * d3
+                - tail_sum;
+            let acc2 = SYNMATRIX8[2][0] * p0
+                + SYNMATRIX8[2][1] * p1
+                + SYNMATRIX8[2][2] * p2
+                + SYNMATRIX8[2][3] * p3;
+            let acc3 = SYNMATRIX8[3][0] * d0
+                + SYNMATRIX8[3][1] * d1
+                + SYNMATRIX8[3][2] * d2
+                + SYNMATRIX8[3][3] * d3
+                - tail_sum;
+
+            let acc9 = SYNMATRIX8[9][0] * d0
+                + SYNMATRIX8[9][1] * d1
+                + SYNMATRIX8[9][2] * d2
+                + SYNMATRIX8[9][3] * d3
+                - tail_sum;
+            let acc10 = SYNMATRIX8[10][0] * p0
+                + SYNMATRIX8[10][1] * p1
+                + SYNMATRIX8[10][2] * p2
+                + SYNMATRIX8[10][3] * p3;
+            let acc11 = SYNMATRIX8[11][0] * d0
+                + SYNMATRIX8[11][1] * d1
+                + SYNMATRIX8[11][2] * d2
+                + SYNMATRIX8[11][3] * d3
+                - tail_sum;
+
+            v[offset[0]] = acc0 >> 15;
+            v[offset[1]] = acc1 >> 15;
+            v[offset[2]] = acc2 >> 15;
+            v[offset[3]] = acc3 >> 15;
+            v[offset[4]] = 0;
+            v[offset[5]] = (-acc3 - sum_s) >> 15;
+            v[offset[6]] = (-acc2 - sum_s) >> 15;
+            v[offset[7]] = (-acc1 - sum_s) >> 15;
+            v[offset[8]] = (-acc0 - sum_s) >> 15;
+            v[offset[9]] = acc9 >> 15;
+            v[offset[10]] = acc10 >> 15;
+            v[offset[11]] = acc11 >> 15;
+            v[offset[12]] = (-sum_s) >> 2;
+            v[offset[13]] = v[offset[11]];
+            v[offset[14]] = v[offset[10]];
+            v[offset[15]] = v[offset[9]];
+        } else {
+            let s0 = i64::from(s[0]);
+            let s1 = i64::from(s[1]);
+            let s2 = i64::from(s[2]);
+            let s3 = i64::from(s[3]);
+            let s4 = i64::from(s[4]);
+            let s5 = i64::from(s[5]);
+            let s6 = i64::from(s[6]);
+            let s7 = i64::from(s[7]);
+
+            let p0 = s0 + s7;
+            let p1 = s1 + s6;
+            let p2 = s2 + s5;
+            let p3 = s3 + s4;
+
+            let d0 = s0 - s7;
+            let d1 = s1 - s6;
+            let d2 = s2 - s5;
+            let d3 = s3 - s4;
+
+            let tail_sum = s4 + s5 + s6 + s7;
+            let sum_s = p0 + p1 + p2 + p3;
+
+            let acc0 = i64::from(SYNMATRIX8[0][0]) * p0
+                + i64::from(SYNMATRIX8[0][1]) * p1
+                + i64::from(SYNMATRIX8[0][2]) * p2
+                + i64::from(SYNMATRIX8[0][3]) * p3;
+            let acc1 = i64::from(SYNMATRIX8[1][0]) * d0
+                + i64::from(SYNMATRIX8[1][1]) * d1
+                + i64::from(SYNMATRIX8[1][2]) * d2
+                + i64::from(SYNMATRIX8[1][3]) * d3
+                - tail_sum;
+            let acc2 = i64::from(SYNMATRIX8[2][0]) * p0
+                + i64::from(SYNMATRIX8[2][1]) * p1
+                + i64::from(SYNMATRIX8[2][2]) * p2
+                + i64::from(SYNMATRIX8[2][3]) * p3;
+            let acc3 = i64::from(SYNMATRIX8[3][0]) * d0
+                + i64::from(SYNMATRIX8[3][1]) * d1
+                + i64::from(SYNMATRIX8[3][2]) * d2
+                + i64::from(SYNMATRIX8[3][3]) * d3
+                - tail_sum;
+
+            let acc9 = i64::from(SYNMATRIX8[9][0]) * d0
+                + i64::from(SYNMATRIX8[9][1]) * d1
+                + i64::from(SYNMATRIX8[9][2]) * d2
+                + i64::from(SYNMATRIX8[9][3]) * d3
+                - tail_sum;
+            let acc10 = i64::from(SYNMATRIX8[10][0]) * p0
+                + i64::from(SYNMATRIX8[10][1]) * p1
+                + i64::from(SYNMATRIX8[10][2]) * p2
+                + i64::from(SYNMATRIX8[10][3]) * p3;
+            let acc11 = i64::from(SYNMATRIX8[11][0]) * d0
+                + i64::from(SYNMATRIX8[11][1]) * d1
+                + i64::from(SYNMATRIX8[11][2]) * d2
+                + i64::from(SYNMATRIX8[11][3]) * d3
+                - tail_sum;
+
+            v[offset[0]] = saturating_i64_to_i32(acc0 >> 15);
+            v[offset[1]] = saturating_i64_to_i32(acc1 >> 15);
+            v[offset[2]] = saturating_i64_to_i32(acc2 >> 15);
+            v[offset[3]] = saturating_i64_to_i32(acc3 >> 15);
+            v[offset[4]] = 0;
+            v[offset[5]] = saturating_i64_to_i32((-acc3 - sum_s) >> 15);
+            v[offset[6]] = saturating_i64_to_i32((-acc2 - sum_s) >> 15);
+            v[offset[7]] = saturating_i64_to_i32((-acc1 - sum_s) >> 15);
+            v[offset[8]] = saturating_i64_to_i32((-acc0 - sum_s) >> 15);
+            v[offset[9]] = saturating_i64_to_i32(acc9 >> 15);
+            v[offset[10]] = saturating_i64_to_i32(acc10 >> 15);
+            v[offset[11]] = saturating_i64_to_i32(acc11 >> 15);
+            v[offset[12]] = saturating_i64_to_i32((-sum_s) >> 2);
+            v[offset[13]] = v[offset[11]];
+            v[offset[14]] = v[offset[10]];
+            v[offset[15]] = v[offset[9]];
         }
 
         for i in 0..8 {
             let idx = i * 5;
             let k = (i + 8) & 0x0F;
 
-            let acc = (v[offset[i] + 0] as i64 * SBC_PROTO_8_80M0[idx + 0] as i64)
-                + (v[offset[k] + 1] as i64 * SBC_PROTO_8_80M1[idx + 0] as i64)
-                + (v[offset[i] + 2] as i64 * SBC_PROTO_8_80M0[idx + 1] as i64)
-                + (v[offset[k] + 3] as i64 * SBC_PROTO_8_80M1[idx + 1] as i64)
-                + (v[offset[i] + 4] as i64 * SBC_PROTO_8_80M0[idx + 2] as i64)
-                + (v[offset[k] + 5] as i64 * SBC_PROTO_8_80M1[idx + 2] as i64)
-                + (v[offset[i] + 6] as i64 * SBC_PROTO_8_80M0[idx + 3] as i64)
-                + (v[offset[k] + 7] as i64 * SBC_PROTO_8_80M1[idx + 3] as i64)
-                + (v[offset[i] + 8] as i64 * SBC_PROTO_8_80M0[idx + 4] as i64)
-                + (v[offset[k] + 9] as i64 * SBC_PROTO_8_80M1[idx + 4] as i64);
+            let acc = (i64::from(v[offset[i]]) * i64::from(SBC_PROTO_8_80M0[idx]))
+                + (i64::from(v[offset[k] + 1]) * i64::from(SBC_PROTO_8_80M1[idx]))
+                + (i64::from(v[offset[i] + 2]) * i64::from(SBC_PROTO_8_80M0[idx + 1]))
+                + (i64::from(v[offset[k] + 3]) * i64::from(SBC_PROTO_8_80M1[idx + 1]))
+                + (i64::from(v[offset[i] + 4]) * i64::from(SBC_PROTO_8_80M0[idx + 2]))
+                + (i64::from(v[offset[k] + 5]) * i64::from(SBC_PROTO_8_80M1[idx + 2]))
+                + (i64::from(v[offset[i] + 6]) * i64::from(SBC_PROTO_8_80M0[idx + 3]))
+                + (i64::from(v[offset[k] + 7]) * i64::from(SBC_PROTO_8_80M1[idx + 3]))
+                + (i64::from(v[offset[i] + 8]) * i64::from(SBC_PROTO_8_80M0[idx + 4]))
+                + (i64::from(v[offset[k] + 9]) * i64::from(SBC_PROTO_8_80M1[idx + 4]));
 
-            let sample = (acc >> 15) as i32;
+            let sample = saturating_i64_to_i32(acc >> 15);
             pcm_out[blk * 8 + i] = sbc_clip16(sample);
         }
     }
@@ -6056,5 +6225,126 @@ mod tests {
             assert_eq!(rate, 44100);
         });
         assert_eq!(decoded_bytes, 512);
+    }
+
+    #[test]
+    fn test_sbc_synthesize_eight_optimized_matches_reference() {
+        fn synthesize_eight_reference(
+            dec: &mut SbcDecoder,
+            sb_sample: &[[[i32; 8]; 2]; 16],
+            ch: usize,
+            blk: usize,
+            pcm_out: &mut [i16],
+        ) {
+            let offset = &mut dec.offset[ch];
+            let v = &mut dec.v[ch];
+
+            for i in 0..16 {
+                if offset[i] == 0 {
+                    offset[i] = 159;
+                    for j in 0..9 {
+                        v[j + 160] = v[j];
+                    }
+                } else {
+                    offset[i] -= 1;
+                }
+
+                let mut acc = 0i64;
+                for sb in 0..8 {
+                    acc += i64::from(SYNMATRIX8[i][sb]) * i64::from(sb_sample[blk][ch][sb]);
+                }
+
+                v[offset[i]] = saturating_i64_to_i32(acc >> 15);
+            }
+
+            for i in 0..8 {
+                let idx = i * 5;
+                let k = (i + 8) & 0x0F;
+
+                let acc = (i64::from(v[offset[i]]) * i64::from(SBC_PROTO_8_80M0[idx]))
+                    + (i64::from(v[offset[k] + 1]) * i64::from(SBC_PROTO_8_80M1[idx]))
+                    + (i64::from(v[offset[i] + 2]) * i64::from(SBC_PROTO_8_80M0[idx + 1]))
+                    + (i64::from(v[offset[k] + 3]) * i64::from(SBC_PROTO_8_80M1[idx + 1]))
+                    + (i64::from(v[offset[i] + 4]) * i64::from(SBC_PROTO_8_80M0[idx + 2]))
+                    + (i64::from(v[offset[k] + 5]) * i64::from(SBC_PROTO_8_80M1[idx + 2]))
+                    + (i64::from(v[offset[i] + 6]) * i64::from(SBC_PROTO_8_80M0[idx + 3]))
+                    + (i64::from(v[offset[k] + 7]) * i64::from(SBC_PROTO_8_80M1[idx + 3]))
+                    + (i64::from(v[offset[i] + 8]) * i64::from(SBC_PROTO_8_80M0[idx + 4]))
+                    + (i64::from(v[offset[k] + 9]) * i64::from(SBC_PROTO_8_80M1[idx + 4]));
+
+                let sample = saturating_i64_to_i32(acc >> 15);
+                pcm_out[blk * 8 + i] = sbc_clip16(sample);
+            }
+        }
+
+        fn assert_block_matches(
+            dec_opt: &mut SbcDecoder,
+            dec_ref: &mut SbcDecoder,
+            sb_sample: &[[[i32; 8]; 2]; 16],
+            ch: usize,
+            blk: usize,
+            label: &str,
+        ) {
+            let mut pcm_opt = [0i16; 16 * 8];
+            let mut pcm_ref = [0i16; 16 * 8];
+            dec_opt.synthesize_eight(sb_sample, ch, blk, &mut pcm_opt);
+            synthesize_eight_reference(dec_ref, sb_sample, ch, blk, &mut pcm_ref);
+            for i in 0..8 {
+                let opt_val = i32::from(pcm_opt[blk * 8 + i]);
+                let ref_val = i32::from(pcm_ref[blk * 8 + i]);
+                let delta = (opt_val - ref_val).abs();
+                assert!(
+                    delta <= 1,
+                    "{label} ch={ch} blk={blk} idx={i}: delta {delta} > 1"
+                );
+            }
+            assert_eq!(dec_opt.v[ch], dec_ref.v[ch], "{label} ring state mismatch");
+        }
+
+        let mut dec_opt = SbcDecoder::new();
+        let mut dec_ref = SbcDecoder::new();
+
+        // 1. Silence test
+        let sb_silence = [[[0i32; 8]; 2]; 16];
+        for blk in 0..16 {
+            assert_block_matches(&mut dec_opt, &mut dec_ref, &sb_silence, 0, blk, "silence");
+        }
+
+        // 2. Impulse test across all 8 subbands
+        for sb in 0..8 {
+            let mut sb_impulse = [[[0i32; 8]; 2]; 16];
+            sb_impulse[0][0][sb] = 16384;
+            sb_impulse[0][1][sb] = -32768;
+            assert_block_matches(&mut dec_opt, &mut dec_ref, &sb_impulse, 0, 0, "impulse");
+            assert_block_matches(&mut dec_opt, &mut dec_ref, &sb_impulse, 1, 0, "impulse");
+        }
+
+        // 3. Full-scale 16-bit and extended-range (>32768) fallback patterns
+        let mut sb_full = [[[0i32; 8]; 2]; 16];
+        sb_full[0][0] = [32767, -32768, 32767, -32768, 32767, -32768, 32767, -32768];
+        sb_full[1][0] = [32768, -32768, -32768, 32768, 32768, -32768, -32768, 32768];
+        sb_full[2][0] = [
+            262_144, -262_144, 524_287, -524_288, 131_072, -65_536, 32_769, -32_769,
+        ];
+        for blk in 0..3 {
+            assert_block_matches(&mut dec_opt, &mut dec_ref, &sb_full, 0, blk, "full-scale");
+        }
+
+        // 4. Pseudo-random patterns across 32 blocks (wraps ring offsets)
+        let mut seed = 0x1234_5678u32;
+        let mut sb_rand = [[[0i32; 8]; 2]; 16];
+        for frame in 0..2 {
+            for blk in 0..16 {
+                for ch in 0..2 {
+                    for sb in 0..8 {
+                        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        let word = u16::try_from((seed >> 16) & 0xFFFF).unwrap_or(0);
+                        let sample = i32::from(word) - 32_768;
+                        sb_rand[blk][ch][sb] = if frame == 0 { sample } else { sample * 8 };
+                    }
+                    assert_block_matches(&mut dec_opt, &mut dec_ref, &sb_rand, ch, blk, "random");
+                }
+            }
+        }
     }
 }

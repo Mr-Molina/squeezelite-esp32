@@ -19,6 +19,8 @@ pub struct Shannon {
     sbuf: u32,
     mbuf: u32,
     nbuf: i32,
+    r_head: usize,
+    crc_head: usize,
 }
 
 impl core::fmt::Debug for Shannon {
@@ -51,6 +53,10 @@ impl Drop for Shannon {
         core::hint::black_box(&mut self.mbuf);
         self.nbuf = 0;
         core::hint::black_box(&mut self.nbuf);
+        self.r_head = 0;
+        core::hint::black_box(&mut self.r_head);
+        self.crc_head = 0;
+        core::hint::black_box(&mut self.crc_head);
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -72,7 +78,24 @@ impl Shannon {
             sbuf: 0,
             mbuf: 0,
             nbuf: 0,
+            r_head: 0,
+            crc_head: 0,
         }
+    }
+
+    #[inline(always)]
+    fn r_get(&self, i: usize) -> u32 {
+        self.r[(self.r_head + i) & 0x0F]
+    }
+
+    #[inline(always)]
+    fn r_xor(&mut self, i: usize, val: u32) {
+        self.r[(self.r_head + i) & 0x0F] ^= val;
+    }
+
+    #[inline(always)]
+    fn crc_get(&self, i: usize) -> u32 {
+        self.crc[(self.crc_head + i) & 0x0F]
     }
 
     #[inline(always)]
@@ -91,29 +114,31 @@ impl Shannon {
 
     #[inline(always)]
     fn cycle(&mut self) {
-        let mut t = self.r[12] ^ self.r[13] ^ self.konst;
-        t = Self::sbox1(t) ^ self.r[0].rotate_left(1);
-        self.r.copy_within(1..SHANNON_N, 0);
-        self.r[SHANNON_N - 1] = t;
-        let t2 = Self::sbox2(self.r[2] ^ self.r[15]);
-        self.r[0] ^= t2;
-        self.sbuf = t2 ^ self.r[8] ^ self.r[12];
+        let mut t = self.r_get(12) ^ self.r_get(13) ^ self.konst;
+        t = Self::sbox1(t) ^ self.r_get(0).rotate_left(1);
+        self.r_head = (self.r_head + 1) & 0x0F;
+        self.r[(self.r_head + 15) & 0x0F] = t;
+        let t2 = Self::sbox2(self.r_get(2) ^ self.r_get(15));
+        self.r_xor(0, t2);
+        self.sbuf = t2 ^ self.r_get(8) ^ self.r_get(12);
     }
 
     #[inline(always)]
     fn crcfunc(&mut self, i: u32) {
-        let t = self.crc[0] ^ self.crc[2] ^ self.crc[15] ^ i;
-        self.crc.copy_within(1..SHANNON_N, 0);
-        self.crc[SHANNON_N - 1] = t;
+        let t = self.crc_get(0) ^ self.crc_get(2) ^ self.crc_get(15) ^ i;
+        self.crc_head = (self.crc_head + 1) & 0x0F;
+        self.crc[(self.crc_head + 15) & 0x0F] = t;
     }
 
     #[inline(always)]
     fn macfunc(&mut self, i: u32) {
         self.crcfunc(i);
-        self.r[KEYP] ^= i;
+        self.r_xor(KEYP, i);
     }
 
     fn init_state(&mut self) {
+        self.r_head = 0;
+        self.crc_head = 0;
         self.r[0] = 1;
         self.r[1] = 1;
         for i in 2..SHANNON_N {
@@ -123,15 +148,19 @@ impl Shannon {
     }
 
     fn save_state(&mut self) {
-        self.init_r.copy_from_slice(&self.r);
+        for i in 0..SHANNON_N {
+            self.init_r[i] = self.r_get(i);
+        }
     }
 
     fn reload_state(&mut self) {
         self.r.copy_from_slice(&self.init_r);
+        self.r_head = 0;
+        self.crc_head = 0;
     }
 
     fn genkonst(&mut self) {
-        self.konst = self.r[0];
+        self.konst = self.r_get(0);
     }
 
     fn diffuse(&mut self) {
@@ -146,7 +175,7 @@ impl Shannon {
         let mut i = 0;
         while i < word_len {
             let k = u32::from_le_bytes([key[i], key[i + 1], key[i + 2], key[i + 3]]);
-            self.r[KEYP] ^= k;
+            self.r_xor(KEYP, k);
             self.cycle();
             i += 4;
         }
@@ -160,18 +189,22 @@ impl Shannon {
                 i += 1;
             }
             let k = u32::from_le_bytes(xtra);
-            self.r[KEYP] ^= k;
+            self.r_xor(KEYP, k);
             self.cycle();
         }
 
-        self.r[KEYP] ^= keylen as u32;
+        self.r_xor(KEYP, keylen as u32);
         self.cycle();
 
-        self.crc.copy_from_slice(&self.r);
+        for idx in 0..SHANNON_N {
+            self.crc[idx] = self.r_get(idx);
+        }
+        self.crc_head = 0;
         self.diffuse();
 
         for idx in 0..SHANNON_N {
-            self.r[idx] ^= self.crc[idx];
+            let crc_val = self.crc_get(idx);
+            self.r_xor(idx, crc_val);
         }
     }
 
@@ -375,11 +408,12 @@ impl Shannon {
         }
 
         self.cycle();
-        self.r[KEYP] ^= INITKONST ^ ((self.nbuf as u32) << 3);
+        self.r_xor(KEYP, INITKONST ^ ((self.nbuf as u32) << 3));
         self.nbuf = 0;
 
         for i in 0..SHANNON_N {
-            self.r[i] ^= self.crc[i];
+            let crc_val = self.crc_get(i);
+            self.r_xor(i, crc_val);
         }
         self.diffuse();
 
@@ -411,11 +445,12 @@ impl Shannon {
         }
 
         self.cycle();
-        self.r[KEYP] ^= INITKONST ^ ((self.nbuf as u32) << 3);
+        self.r_xor(KEYP, INITKONST ^ ((self.nbuf as u32) << 3));
         self.nbuf = 0;
 
         for i in 0..SHANNON_N {
-            self.r[i] ^= self.crc[i];
+            let crc_val = self.crc_get(i);
+            self.r_xor(i, crc_val);
         }
         self.diffuse();
 

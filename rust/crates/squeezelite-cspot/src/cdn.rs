@@ -197,10 +197,7 @@ impl CdnAudioDecryptor {
     /// Calculates 16-byte IV for given byte position in audio file.
     #[must_use]
     pub const fn calculate_iv(offset: usize) -> [u8; 16] {
-        let block_idx = (offset / 16) as u128;
-        u128::from_be_bytes(AUDIO_AES_IV)
-            .wrapping_add(block_idx)
-            .to_be_bytes()
+        AudioKeyDecryptor::counter_iv(offset)
     }
 
     /// Decrypts a chunk in-place given absolute file byte offset.
@@ -216,6 +213,8 @@ pub struct CdnStreamFeeder {
     decoder: VorbisDecoder,
     total_bytes_fed: usize,
     decrypt_scratch: Vec<u8>,
+    decrypted_len: usize,
+    buffer_offset: usize,
 }
 
 impl CdnStreamFeeder {
@@ -226,6 +225,8 @@ impl CdnStreamFeeder {
             decoder: VorbisDecoder::new(),
             total_bytes_fed: 0,
             decrypt_scratch: Vec::with_capacity(4096),
+            decrypted_len: 0,
+            buffer_offset: 0,
         }
     }
 
@@ -244,6 +245,8 @@ impl CdnStreamFeeder {
         self.decoder.flush();
         self.total_bytes_fed = 0;
         self.decrypt_scratch.clear();
+        self.decrypted_len = 0;
+        self.buffer_offset = 0;
     }
 
     /// Feeds raw (encrypted) CDN chunk, decrypts it, and decodes PCM frames.
@@ -253,19 +256,45 @@ impl CdnStreamFeeder {
         offset: usize,
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), CdnError> {
-        self.decrypt_scratch.clear();
-        self.decrypt_scratch.extend_from_slice(chunk);
-        self.decryptor
-            .decrypt_chunk(&mut self.decrypt_scratch, offset);
+        let expected_offset = self
+            .buffer_offset
+            .saturating_add(self.decrypt_scratch.len());
+        if self.decrypt_scratch.is_empty() || offset != expected_offset {
+            self.decrypt_scratch.clear();
+            self.decrypted_len = 0;
+            self.buffer_offset = offset;
+        }
 
-        let slice_to_feed = AudioKeyDecryptor::strip_ogg_header(&self.decrypt_scratch, offset);
+        self.decrypt_scratch.extend_from_slice(chunk);
+        let total_len = self.decrypt_scratch.len();
+        if total_len > self.decrypted_len {
+            let decrypt_offset = self.buffer_offset.saturating_add(self.decrypted_len);
+            let to_decrypt = &mut self.decrypt_scratch[self.decrypted_len..total_len];
+            self.decryptor.decrypt_chunk(to_decrypt, decrypt_offset);
+            self.decrypted_len = total_len;
+        }
+
+        let decrypted = &self.decrypt_scratch[..self.decrypted_len];
+        let slice_to_feed = AudioKeyDecryptor::strip_ogg_header(decrypted, self.buffer_offset);
+        let skip = decrypted.len() - slice_to_feed.len();
 
         if slice_to_feed.is_empty() {
+            if skip > 0 {
+                self.decrypt_scratch.drain(..skip);
+                self.decrypted_len = self.decrypted_len.saturating_sub(skip);
+                self.buffer_offset = self.buffer_offset.saturating_add(skip);
+            }
             return Ok((chunk.len(), 0));
         }
 
-        self.total_bytes_fed += slice_to_feed.len();
         let (consumed, samples) = self.decoder.decode(slice_to_feed, pcm_out)?;
+        self.total_bytes_fed += consumed;
+        let drain_len = skip + consumed;
+        if drain_len > 0 {
+            self.decrypt_scratch.drain(..drain_len);
+            self.decrypted_len = self.decrypted_len.saturating_sub(drain_len);
+            self.buffer_offset = self.buffer_offset.saturating_add(drain_len);
+        }
         Ok((consumed, samples))
     }
 
