@@ -1331,7 +1331,7 @@ mod device {
                         player_name: active_player_name.as_str(),
                     };
                     let snapshot = snap.clone();
-                    let mut resp_buf = &mut s.http_resp_buf[..];
+                    let resp_buf = &mut s.http_resp_buf[..];
                     let mut extra_views =
                         [louder_esp32_app::http_control::ConfigEntryView::new("", "", "string");
                             20];
@@ -1353,7 +1353,7 @@ mod device {
                             &req_buf[..req_len],
                             &snapshot,
                             &extra_views[..view_len],
-                            &mut resp_buf,
+                            resp_buf,
                         )
                     {
                         let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);

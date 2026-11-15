@@ -756,13 +756,7 @@ const fn compute_te0() -> [u32; 256] {
     table
 }
 
-// JUSTIFICATION: Placing TE0 in internal .dram1 avoids SPI flash cache
-// stalls during real-time Spotify audio decryption.
-// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
-// script for plain [u32; 256] data with no alignment or init hazards.
-#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
-#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
-static TE0: [u32; 256] = compute_te0();
+const TE0: [u32; 256] = compute_te0();
 
 /// AES-128 CTR mode stream cipher.
 #[derive(Clone, Debug)]

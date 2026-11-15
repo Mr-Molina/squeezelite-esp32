@@ -81,6 +81,41 @@ pub const fn encode_i2s0_clkm_conf(orig: u32, div_num: u32, div_b: u32, div_a: u
     louder_esp32_app::backend_device::encode_clkm_conf(orig, &cfg)
 }
 
+/// Minimum interval between multicast mDNS replies in milliseconds.
+pub const MDNS_MULTICAST_COOLDOWN_MS: u64 = 1_000;
+
+/// Returns `true` when `payload` is an mDNS service query (`QR == 0`,
+/// non-zero `QDCOUNT`) targeting AirPlay or Spotify Connect labels.
+#[must_use]
+pub fn is_mdns_service_query(payload: &[u8]) -> bool {
+    if payload.len() < 12 {
+        return false;
+    }
+    if (payload[2] & 0x80) != 0 {
+        return false;
+    }
+    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+    if qdcount == 0 {
+        return false;
+    }
+    let body = &payload[12..];
+    body.windows(5).any(|w| w.eq_ignore_ascii_case(b"_raop"))
+        || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_airplay"))
+        || body
+            .windows(16)
+            .any(|w| w.eq_ignore_ascii_case(b"_spotify-connect"))
+        || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_spotify"))
+}
+
+/// Returns `true` if a multicast mDNS reply may be sent at `now_ms`.
+#[must_use]
+pub const fn can_send_mdns_multicast_reply(last_reply_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_reply_ms {
+        None => true,
+        Some(prev_ms) => now_ms.saturating_sub(prev_ms) >= MDNS_MULTICAST_COOLDOWN_MS,
+    }
+}
+
 /// Executes one integrated firmware tick across the CYD UART bridge,
 /// audio pipeline, and digital amplifier health monitor (`HALNET-409`).
 ///
@@ -464,7 +499,7 @@ mod xtensa_hw {
     use louder_esp32_app::PlayerState;
     use smoltcp::iface::{
         Config as SmolIfaceConfig, Context as SmolContext, Interface as SmolInterface,
-        SocketHandle, SocketSet, SocketStorage,
+        PollIngressSingleResult, SocketHandle, SocketSet, SocketStorage,
     };
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
     use smoltcp::socket::{dhcpv4, tcp, udp, AnySocket};
@@ -922,6 +957,8 @@ mod xtensa_hw {
     }
 
     impl I2sDmaDriver for Esp32HardwareI2sDma<'_> {
+        const SWAP_STEREO_LR: bool = true;
+
         #[allow(unsafe_code)]
         // JUSTIFICATION: Hot I2S DMA write loop placed in IRAM (.iram1) to
         // eliminate SPI flash wait states.
@@ -965,32 +1002,51 @@ mod xtensa_hw {
                 return Ok(written);
             }
 
+            let aligned_data = &data[..valid_len];
             let mut total_written = 0;
-            let mut offset = 0;
-            let mut scratch = [0u8; 512];
 
-            while offset < valid_len {
+            while total_written < valid_len {
                 let avail_aligned = transfer.available_bytes() & !7;
                 if avail_aligned == 0 {
                     break;
                 }
-                let rem_frames = (valid_len - offset) / 8;
-                let frames_in_chunk = rem_frames.min(64).min(avail_aligned / 8);
-                if frames_in_chunk == 0 {
+                let rem_aligned = (valid_len - total_written) & !7;
+                let to_push = rem_aligned.min(avail_aligned) & !7;
+                if to_push == 0 {
                     break;
                 }
-                for f in 0..frames_in_chunk {
-                    let src_idx = offset + f * 8;
-                    let dst_idx = f * 8;
-                    scratch[dst_idx..dst_idx + 4].copy_from_slice(&data[src_idx + 4..src_idx + 8]);
-                    scratch[dst_idx + 4..dst_idx + 8].copy_from_slice(&data[src_idx..src_idx + 4]);
+
+                let mut pushed =
+                    transfer.push(&aligned_data[total_written..total_written + to_push]);
+                if pushed == 0 {
+                    break;
                 }
-                let chunk_bytes = frames_in_chunk * 8;
-                let n = transfer.push(&scratch[..chunk_bytes]);
-                let aligned_n = n & !7;
+
+                // Invariant 46: complete any partial 8-byte tail before returning
+                // so a split stereo frame cannot leave L/R swapped in DMA.
+                if pushed % 8 != 0 {
+                    let frame_end = (total_written + pushed + (8 - (pushed % 8))).min(valid_len);
+                    let mut pos = total_written + pushed;
+                    let mut retries = 0u8;
+                    while pos < frame_end {
+                        let tail = transfer.push(&aligned_data[pos..frame_end]);
+                        if tail == 0 {
+                            retries += 1;
+                            if retries >= 64 {
+                                note_dma_fill(transfer.available_bytes());
+                                return Err(OutputError::HardwareFault);
+                            }
+                            continue;
+                        }
+                        retries = 0;
+                        pos += tail;
+                    }
+                    pushed = pos - total_written;
+                }
+
+                let aligned_n = pushed & !7;
                 total_written += aligned_n;
-                offset += aligned_n;
-                if n < chunk_bytes {
+                if pushed < to_push {
                     break;
                 }
             }
@@ -2376,6 +2432,7 @@ mod xtensa_hw {
         last_config_poll_ms: u64,
         mdns_bound: bool,
         last_mdns_announce_ms: u64,
+        last_mdns_reply_ms: Option<u64>,
         raop_rtsp: alloc::boxed::Box<RtspServer>,
         raop_rtp: alloc::boxed::Box<RtpAudioReceiver>,
         raop_streaming: bool,
@@ -2512,8 +2569,7 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
-                let ptr =
-                    (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr() as *mut [u8; 12_288];
+                let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr();
                 &mut *ptr
             };
             init_config(&mut flash, boot_scratch)
@@ -2525,8 +2581,7 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
-                let ptr =
-                    (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr() as *mut [u8; 12_288];
+                let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr();
                 &mut *ptr
             };
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
@@ -2860,6 +2915,7 @@ mod xtensa_hw {
             last_config_poll_ms: 0,
             mdns_bound: false,
             last_mdns_announce_ms: 0,
+            last_mdns_reply_ms: None,
             raop_rtsp,
             raop_rtp,
             raop_streaming: false,
@@ -3269,19 +3325,29 @@ mod xtensa_hw {
         }
     }
 
+    /// Bounds `smoltcp` RX ingress to at most 8 frames per poll while always
+    /// flushing egress so incoming bursts cannot starve the audio loop.
+    fn poll_smoltcp_bounded(s: &mut DeviceRuntimeState) {
+        let now = SmolInstant::from_millis(i64::try_from(s.now_ms).unwrap_or(0));
+        let mut dev = SmolDevice {
+            driver: &mut s.sta_iface,
+        };
+        for _ in 0..8 {
+            if matches!(
+                s.smol_iface
+                    .poll_ingress_single(now, &mut dev, &mut s.sockets),
+                PollIngressSingleResult::None
+            ) {
+                break;
+            }
+        }
+        let _ = s.smol_iface.poll_egress(now, &mut dev, &mut s.sockets);
+    }
+
     #[inline(never)]
     fn net_poll_phase(s: &mut DeviceRuntimeState) {
         let now_ms = s.now_ms;
-        {
-            let mut dev = SmolDevice {
-                driver: &mut s.sta_iface,
-            };
-            let _ = s.smol_iface.poll(
-                SmolInstant::from_millis(now_ms as i64),
-                &mut dev,
-                &mut s.sockets,
-            );
-        }
+        poll_smoltcp_bounded(s);
 
         let dhcp_event = s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp_handle).poll();
         match dhcp_event {
@@ -3299,6 +3365,7 @@ mod xtensa_hw {
                     s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
                     s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
                     s.mdns_bound = false;
+                    s.last_mdns_reply_ms = None;
                     s.raop_streaming = false;
                     s.spot_streaming = false;
                     s.rtsp_rx_acc.clear();
@@ -3654,7 +3721,7 @@ mod xtensa_hw {
                             player_name: player_name_val.as_str(),
                         };
                         let snapshot = snap.clone();
-                        let mut resp_buf = &mut s.http_resp_buf[..];
+                        let resp_buf = &mut s.http_resp_buf[..];
                         let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
                             "", "", "string",
                         ); 20];
@@ -3676,7 +3743,7 @@ mod xtensa_hw {
                             &req_buf[..req_len],
                             &snapshot,
                             &extra_views[..view_len],
-                            &mut resp_buf,
+                            resp_buf,
                         )
                     {
                         let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
@@ -4028,8 +4095,12 @@ mod xtensa_hw {
         let now_ms = s.now_ms;
         let airplay_enabled = s.config.is_airplay_enabled();
         let cspot_enabled = s.config.is_cspot_enabled();
-        let cspot_name = s.config.effective_cspot_name();
-        let raop_name = s
+        let mut cspot_name = s.config.effective_cspot_name();
+        if cspot_name.trim().is_empty() {
+            cspot_name.clear();
+            let _ = cspot_name.push_str("BASEMENT");
+        }
+        let mut raop_name = s
             .config
             .nvs_override("host_name")
             .and_then(|h| {
@@ -4045,13 +4116,21 @@ mod xtensa_hw {
             })
             .unwrap_or_else(|| {
                 s.config.read(|c| {
-                    if !c.player_name.is_empty() {
-                        c.player_name.clone()
+                    let t = c.player_name.trim();
+                    if !t.is_empty() {
+                        let mut out = heapless::String::<32>::new();
+                        let max_len = t.floor_char_boundary(t.len().min(32));
+                        let _ = out.push_str(&t[..max_len]);
+                        out
                     } else {
                         s.config.device_name()
                     }
                 })
             });
+        if raop_name.trim().is_empty() {
+            raop_name.clear();
+            let _ = raop_name.push_str("BASEMENT");
+        }
 
         // 1. mDNS responder (`UDP 5353`) for AirPlay `_raop._tcp.local` &
         // Spotify `_spotify-connect._tcp.local`
@@ -4061,10 +4140,11 @@ mod xtensa_hw {
                 s.mdns_bound = true;
             }
             if s.mdns_bound {
+                let multicast_ep = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
                 let mut should_announce_raop = false;
                 let mut should_announce_spotify = false;
-                let mut raop_ep = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
-                let mut spot_ep = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+                let mut raop_ep = multicast_ep;
+                let mut spot_ep = multicast_ep;
 
                 if s.last_mdns_announce_ms == 0
                     || now_ms.saturating_sub(s.last_mdns_announce_ms) >= 30_000
@@ -4074,35 +4154,50 @@ mod xtensa_hw {
                     should_announce_spotify = cspot_enabled;
                 }
 
-                while mdns_sock.can_recv() {
-                    if let Ok((payload, meta)) = mdns_sock.recv() {
-                        if airplay_enabled
-                            && (payload.windows(5).any(|w| w == b"_raop")
-                                || payload.windows(8).any(|w| w == b"_airplay"))
-                        {
-                            should_announce_raop = true;
-                            if meta.endpoint.port != 5353 {
-                                raop_ep = meta.endpoint;
-                            }
-                        } else if cspot_enabled
-                            && (payload.windows(16).any(|w| w == b"_spotify-connect")
-                                || payload.windows(8).any(|w| w == b"_spotify"))
-                        {
-                            should_announce_spotify = true;
-                            if meta.endpoint.port != 5353 {
-                                spot_ep = meta.endpoint;
-                            }
-                        }
-                    } else {
+                for _ in 0..4 {
+                    if !mdns_sock.can_recv() {
                         break;
+                    }
+                    let Ok((payload, meta)) = mdns_sock.recv() else {
+                        break;
+                    };
+                    if !is_mdns_service_query(payload) {
+                        continue;
+                    }
+                    let body = &payload[12..];
+                    if airplay_enabled
+                        && (body.windows(5).any(|w| w.eq_ignore_ascii_case(b"_raop"))
+                            || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_airplay")))
+                    {
+                        should_announce_raop = true;
+                        if meta.endpoint.port != 5353 {
+                            raop_ep = meta.endpoint;
+                        }
+                    }
+                    if cspot_enabled
+                        && (body
+                            .windows(16)
+                            .any(|w| w.eq_ignore_ascii_case(b"_spotify-connect"))
+                            || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_spotify")))
+                    {
+                        should_announce_spotify = true;
+                        if meta.endpoint.port != 5353 {
+                            spot_ep = meta.endpoint;
+                        }
                     }
                 }
 
-                let mdns_cache_stale = local_ip != s.cached_mdns_ip
+                let ip_or_name_changed = local_ip != s.cached_mdns_ip
                     || raop_name.as_str() != s.cached_mdns_raop_name.as_str()
-                    || cspot_name.as_str() != s.cached_mdns_cspot_name.as_str()
-                    || (s.cached_raop_mdns_len == 0 && s.cached_spot_mdns_len == 0);
-                if mdns_cache_stale {
+                    || cspot_name.as_str() != s.cached_mdns_cspot_name.as_str();
+                if ip_or_name_changed {
+                    s.cached_raop_mdns_len = 0;
+                    s.cached_spot_mdns_len = 0;
+                    s.cached_mdns_ip = local_ip;
+                    s.cached_mdns_raop_name = raop_name.clone();
+                    s.cached_mdns_cspot_name = cspot_name.clone();
+                }
+                if airplay_enabled && s.cached_raop_mdns_len == 0 {
                     let mcfg = MdnsConfig {
                         player_name: alloc::string::String::from(raop_name.as_str()),
                         mac_address: s.sta_mac,
@@ -4113,7 +4208,8 @@ mod xtensa_hw {
                     let rlen = rpkt.len().min(s.cached_raop_mdns.len());
                     s.cached_raop_mdns[..rlen].copy_from_slice(&rpkt[..rlen]);
                     s.cached_raop_mdns_len = rlen;
-
+                }
+                if cspot_enabled && s.cached_spot_mdns_len == 0 {
                     let scfg = SpotifyMdnsConfig {
                         player_name: alloc::string::String::from(cspot_name.as_str()),
                         mac_address: s.sta_mac,
@@ -4124,27 +4220,36 @@ mod xtensa_hw {
                     let slen = spkt.len().min(s.cached_spot_mdns.len());
                     s.cached_spot_mdns[..slen].copy_from_slice(&spkt[..slen]);
                     s.cached_spot_mdns_len = slen;
-
-                    s.cached_mdns_ip = local_ip;
-                    s.cached_mdns_raop_name = raop_name.clone();
-                    s.cached_mdns_cspot_name = cspot_name.clone();
                 }
 
+                let multicast_allowed = can_send_mdns_multicast_reply(s.last_mdns_reply_ms, now_ms);
+                let mut sent_multicast = false;
                 if airplay_enabled
                     && should_announce_raop
                     && s.cached_raop_mdns_len > 0
                     && mdns_sock.can_send()
+                    && (raop_ep != multicast_ep || multicast_allowed)
+                    && mdns_sock
+                        .send_slice(&s.cached_raop_mdns[..s.cached_raop_mdns_len], raop_ep)
+                        .is_ok()
+                    && raop_ep == multicast_ep
                 {
-                    let _ = mdns_sock
-                        .send_slice(&s.cached_raop_mdns[..s.cached_raop_mdns_len], raop_ep);
+                    sent_multicast = true;
                 }
                 if cspot_enabled
                     && should_announce_spotify
                     && s.cached_spot_mdns_len > 0
                     && mdns_sock.can_send()
+                    && (spot_ep != multicast_ep || multicast_allowed)
+                    && mdns_sock
+                        .send_slice(&s.cached_spot_mdns[..s.cached_spot_mdns_len], spot_ep)
+                        .is_ok()
+                    && spot_ep == multicast_ep
                 {
-                    let _ = mdns_sock
-                        .send_slice(&s.cached_spot_mdns[..s.cached_spot_mdns_len], spot_ep);
+                    sent_multicast = true;
+                }
+                if sent_multicast {
+                    s.last_mdns_reply_ms = Some(now_ms);
                 }
             }
         }
@@ -4559,16 +4664,8 @@ mod xtensa_hw {
         net_poll_phase(s);
         http_serve_phase(s);
         slim_session_phase(s);
-        {
-            let mut dev = SmolDevice {
-                driver: &mut s.sta_iface,
-            };
-            let _ = s.smol_iface.poll(
-                SmolInstant::from_millis(i64::try_from(s.now_ms).unwrap_or(0)),
-                &mut dev,
-                &mut s.sockets,
-            );
-        }
+        let _ = s.coordinator.pump_output(s.pipeline, 2);
+        poll_smoltcp_bounded(s);
         multi_proto_poll(s);
         cyd_command_phase(s);
         output_decode_phase(s);
@@ -4791,5 +4888,61 @@ mod tests {
         assert_eq!(coordinator.active_source(), AudioSource::SlimProto);
         coordinator.release_source(AudioSource::SlimProto);
         assert_eq!(coordinator.active_source(), AudioSource::None);
+    }
+
+    #[test]
+    fn test_mdns_service_query_drops_short_payloads() {
+        assert!(!is_mdns_service_query(&[]));
+        assert!(!is_mdns_service_query(&[0u8; 11]));
+    }
+
+    #[test]
+    fn test_mdns_service_query_drops_qr1_responses() {
+        let mut pkt = vec![
+            0x00, 0x00, 0x84, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        pkt.extend_from_slice(b"\x05_raop\x04_tcp\x05local\x00");
+        assert!(
+            !is_mdns_service_query(&pkt),
+            "mDNS response with QR=1 must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_mdns_service_query_accepts_qr0_service_queries() {
+        let mut raop_q = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        raop_q.extend_from_slice(b"\x05_raop\x04_tcp\x05local\x00");
+        assert!(
+            is_mdns_service_query(&raop_q),
+            "mDNS query with QR=0 and QDCOUNT=1 for _raop must pass"
+        );
+
+        let mut spot_q = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        spot_q.extend_from_slice(b"\x10_spotify-connect\x04_tcp\x05local\x00");
+        assert!(
+            is_mdns_service_query(&spot_q),
+            "mDNS query with QR=0 and QDCOUNT=1 for _spotify-connect must pass"
+        );
+
+        // Zero QDCOUNT must still be dropped even with matching label.
+        raop_q[5] = 0x00;
+        assert!(
+            !is_mdns_service_query(&raop_q),
+            "mDNS query with QDCOUNT=0 must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_mdns_multicast_reply_rate_limit_1000ms() {
+        assert!(can_send_mdns_multicast_reply(None, 0));
+        assert!(can_send_mdns_multicast_reply(None, 500));
+        assert!(!can_send_mdns_multicast_reply(Some(1_000), 1_000));
+        assert!(!can_send_mdns_multicast_reply(Some(1_000), 1_999));
+        assert!(can_send_mdns_multicast_reply(Some(1_000), 2_000));
+        assert!(can_send_mdns_multicast_reply(Some(1_000), 5_000));
     }
 }

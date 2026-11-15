@@ -78,6 +78,10 @@ impl BitDepth {
 
 /// Low-level hardware I2S DMA driver abstraction.
 pub trait I2sDmaDriver {
+    /// Whether the hardware I2S DMA peripheral expects `[right, left]` word
+    /// order per stereo frame instead of `[left, right]`.
+    const SWAP_STEREO_LR: bool = false;
+
     /// Writes raw little-endian 32-bit stereo I2S DMA bytes.
     ///
     /// Must return the number of bytes written, which must be a multiple of 8.
@@ -212,28 +216,36 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
 
         // Process in chunks of up to 256 stereo frames (512 i32 samples = 2048 bytes)
         for chunk in frames.chunks(512) {
-            let mut chunk_bytes = 0;
-            for (pair, slot) in chunk
-                .chunks_exact(2)
-                .zip(self.dma_scratch.chunks_exact_mut(8))
-            {
-                let (l, r) = if self.muted {
-                    (0i32, 0i32)
-                } else {
-                    (pair[0], pair[1])
-                };
-                slot[0..4].copy_from_slice(&l.to_le_bytes());
-                slot[4..8].copy_from_slice(&r.to_le_bytes());
-                chunk_bytes += 8;
-            }
+            let frame_count = (chunk.len() / 2).min(self.dma_scratch.len() / 8);
+            let bytes_needed = frame_count * 8;
 
-            if chunk_bytes == 0 {
+            if bytes_needed == 0 {
                 break;
             }
 
-            let mut written_bytes = self.driver.write_dma(&self.dma_scratch[..chunk_bytes])?;
-            if written_bytes > chunk_bytes {
-                written_bytes = chunk_bytes;
+            if self.muted {
+                self.dma_scratch[..bytes_needed].fill(0);
+            } else if D::SWAP_STEREO_LR {
+                for (pair, slot) in chunk
+                    .chunks_exact(2)
+                    .zip(self.dma_scratch[..bytes_needed].chunks_exact_mut(8))
+                {
+                    slot[0..4].copy_from_slice(&pair[1].to_le_bytes());
+                    slot[4..8].copy_from_slice(&pair[0].to_le_bytes());
+                }
+            } else {
+                for (pair, slot) in chunk
+                    .chunks_exact(2)
+                    .zip(self.dma_scratch[..bytes_needed].chunks_exact_mut(8))
+                {
+                    slot[0..4].copy_from_slice(&pair[0].to_le_bytes());
+                    slot[4..8].copy_from_slice(&pair[1].to_le_bytes());
+                }
+            }
+
+            let mut written_bytes = self.driver.write_dma(&self.dma_scratch[..bytes_needed])?;
+            if written_bytes > bytes_needed {
+                written_bytes = bytes_needed;
             }
 
             // HALNET-402: I2S 32-bit stereo frame is 8 bytes (4B Left + 4B Right).
@@ -262,7 +274,7 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
             total_frames_written += frames_from_chunk;
             self.frames_written += frames_from_chunk;
 
-            if written_bytes < chunk_bytes {
+            if written_bytes < bytes_needed {
                 break;
             }
         }
@@ -1236,5 +1248,151 @@ mod tests {
             backend.erase_range(bad_range),
             Err(HalError::StorageBoundsError)
         );
+    }
+
+    struct RecordingDmaDriver<const SWAP: bool> {
+        written: Vec<u8>,
+        max_push_bytes: usize,
+        tx_enabled: bool,
+    }
+
+    impl<const SWAP: bool> RecordingDmaDriver<SWAP> {
+        fn new(max_push_bytes: usize) -> Self {
+            Self {
+                written: Vec::new(),
+                max_push_bytes,
+                tx_enabled: true,
+            }
+        }
+    }
+
+    impl<const SWAP: bool> I2sDmaDriver for RecordingDmaDriver<SWAP> {
+        const SWAP_STEREO_LR: bool = SWAP;
+
+        fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
+            let valid_len = data.len() & !7;
+            if valid_len == 0 {
+                return Ok(0);
+            }
+            let n = valid_len.min(self.max_push_bytes) & !7;
+            self.written.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+
+        fn set_clock_rate(&mut self, _sample_rate_hz: u32) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn set_tx_enabled(&mut self, enabled: bool) {
+            self.tx_enabled = enabled;
+        }
+    }
+
+    #[test]
+    fn test_esp_i2s_sink_swap_stereo_lr_false_byte_exact() {
+        let driver = RecordingDmaDriver::<false>::new(usize::MAX);
+        let mut sink = EspI2sSink::for_active_board(driver, 44100);
+        let frames = [
+            0x1122_3344_i32,
+            0x5566_7788_i32,
+            -0x0102_0304_i32,
+            0x7060_5040_i32,
+        ];
+
+        assert_eq!(sink.write_frames(&frames), Ok(2));
+        assert_eq!(sink.frames_written(), 2);
+
+        let mut expected = Vec::with_capacity(16);
+        expected.extend_from_slice(&0x1122_3344_i32.to_le_bytes());
+        expected.extend_from_slice(&0x5566_7788_i32.to_le_bytes());
+        expected.extend_from_slice(&(-0x0102_0304_i32).to_le_bytes());
+        expected.extend_from_slice(&0x7060_5040_i32.to_le_bytes());
+        assert_eq!(sink.driver.written, expected);
+    }
+
+    #[test]
+    fn test_esp_i2s_sink_swap_stereo_lr_true_byte_exact() {
+        let driver = RecordingDmaDriver::<true>::new(usize::MAX);
+        let mut sink = EspI2sSink::for_active_board(driver, 44100);
+        let frames = [
+            0x1122_3344_i32,
+            0x5566_7788_i32,
+            -0x0102_0304_i32,
+            0x7060_5040_i32,
+        ];
+
+        assert_eq!(sink.write_frames(&frames), Ok(2));
+        assert_eq!(sink.frames_written(), 2);
+
+        let mut expected = Vec::with_capacity(16);
+        expected.extend_from_slice(&0x5566_7788_i32.to_le_bytes());
+        expected.extend_from_slice(&0x1122_3344_i32.to_le_bytes());
+        expected.extend_from_slice(&0x7060_5040_i32.to_le_bytes());
+        expected.extend_from_slice(&(-0x0102_0304_i32).to_le_bytes());
+        assert_eq!(sink.driver.written, expected);
+    }
+
+    #[test]
+    fn test_esp_i2s_sink_muted_zero_fill_overwrites_scratch() {
+        let driver = RecordingDmaDriver::<true>::new(usize::MAX);
+        let mut sink = EspI2sSink::for_active_board(driver, 44100);
+        let frames = [
+            0x1122_3344_i32,
+            0x5566_7788_i32,
+            0x0102_0304_i32,
+            0x0506_0708_i32,
+        ];
+
+        assert_eq!(sink.write_frames(&frames), Ok(2));
+        sink.driver.written.clear();
+
+        sink.set_mute(true);
+        assert!(sink.is_muted());
+        assert!(!sink.driver.tx_enabled);
+        assert_eq!(sink.write_frames(&frames), Ok(2));
+        assert_eq!(sink.driver.written, vec![0u8; 16]);
+
+        sink.set_mute(false);
+        sink.driver.written.clear();
+        assert_eq!(sink.write_frames(&frames[..2]), Ok(1));
+        let mut expected = Vec::with_capacity(8);
+        expected.extend_from_slice(&0x5566_7788_i32.to_le_bytes());
+        expected.extend_from_slice(&0x1122_3344_i32.to_le_bytes());
+        assert_eq!(sink.driver.written, expected);
+    }
+
+    #[test]
+    fn test_esp_i2s_sink_and_loopback_partial_push_alignment() {
+        // Verify `& !7` whole-frame alignment truncates partial capacity.
+        let driver = RecordingDmaDriver::<true>::new(13);
+        let mut sink = EspI2sSink::for_active_board(driver, 44100);
+        let frames = [
+            0x1111_2222_i32,
+            0x3333_4444_i32,
+            0x5555_6666_i32,
+            0x7777_8888_i32,
+            0x1234_5678_i32,
+        ];
+
+        assert_eq!(sink.write_frames(&frames), Ok(1));
+        assert_eq!(sink.frames_written(), 1);
+        let mut expected = Vec::with_capacity(8);
+        expected.extend_from_slice(&0x3333_4444_i32.to_le_bytes());
+        expected.extend_from_slice(&0x1111_2222_i32.to_le_bytes());
+        assert_eq!(sink.driver.written, expected);
+
+        // Verify odd sample count (< 2) writes zero frames.
+        assert_eq!(sink.write_frames(&[0x7FFF_FFFF_i32]), Ok(0));
+
+        // Verify LoopbackI2sDma enforces whole 8-byte frame alignment.
+        let mut loopback = LoopbackI2sDma::new(44100);
+        let mut raw = [0u8; 13];
+        raw[0..4].copy_from_slice(&100_i32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(-100_i32).to_le_bytes());
+        assert_eq!(loopback.write_dma(&raw[..7]), Ok(0));
+        assert_eq!(loopback.dma_bytes_written, 0);
+        assert_eq!(loopback.write_dma(&raw), Ok(8));
+        assert_eq!(loopback.dma_bytes_written, 8);
+        assert_eq!(loopback.last_frame_samples, [100, -100]);
     }
 }
