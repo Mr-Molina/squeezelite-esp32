@@ -3,7 +3,7 @@
 - **Host Machine**: `pc-1` (Dell Precision Tower 3431)
 - **Host OS**: Linux `x86_64` (Debian GNU/Linux 13 trixie/sid, kernel `6.12.113+deb13-amd64`)
 - **Workspace Directory**: `/home/console-admin/Github/squeezelite-esp32`
-- **Active Git Branch**: `MK5-Rust` (code baseline `579ffcde`, `WO-2026-1114-004` closeout `2c90732b`, `WO-2026-1115-001` cleanup closeout `faa3624a`, `WO-2026-1115-002` OTA deploy & `HW1` certification in Wave 4 closeout local on `MK5-Rust`, ahead of `origin/MK5-Rust` at `b24f937a`)
+- **Active Git Branch**: `MK5-Rust` (sole local branch, sole `origin` branch, and GitHub default branch for `Mr-Molina/squeezelite-esp32`; pushed to `origin` at `cdffe9cf`, pending final ledger commit; legacy branches `master-v4.3`, `milestone-mk-5`, `My_Version` archived to `wo_20261115_003_pruned_branches.bundle` and pruned)
 - **Verified Code Baseline Commit**: `579ffcde464258064fb2670132f5de1098b46601` (Wave 3 `louder-esp32-app` T14–T16, Xtensa clippy cleanup, `const TE0` in flash `.rodata`, `#![forbid(unsafe_code)]` restored; `859 passed, 0 failed` host tests, `0` Clippy + GRS warnings)
 - **Recent Wave & Housekeeping Commits**:
   - `5e6c042f`: Governance & repository housekeeping
@@ -12,7 +12,8 @@
   - `f7b58cf0`: Wave 2 (`T05` coordinator pump test, `T17`, `T18`, `T20`, `T21` cspot, `T26` later amended by `579ffcde`, `T27`; `851` host tests)
   - `579ffcde`: Wave 3 (`T14`, `T15`, `T16`, Xtensa clippy cleanup, `const TE0` in flash `.rodata`, `#![forbid(unsafe_code)]`; `859` host tests)
   - `2c90732b`: Ledger closeout for `WO-2026-1114-004` (`T01`–`T27` complete)
-  - `faa3624a`: `WO-2026-1115-001` build cache reclamation, ignored file cleanup, and ledger closeout (local on `MK5-Rust`)
+  - `faa3624a`: `WO-2026-1115-001` build cache reclamation, ignored file cleanup, and ledger closeout
+  - `cdffe9cf`: `WO-2026-1115-002` Wave 4 closeout (`HW1` certified on `BASEMENT`, ledgers finalized; pushed to `origin/MK5-Rust`)
 
 ## Compilers & Toolchains
 - **Host Rust Toolchain**: Stable/nightly `rustc 1.99.1` (`cargo test --workspace`)
@@ -69,10 +70,15 @@
   - Network (`eno1`): `ping -I eno1 -c 20 -i 0.1 172.22.1.15` `20/20` (`0%` loss), RTT `min/avg/max/mdev = 2.539/8.785/27.055/6.688 ms`.
 - DRAM0 / Rule 64 baseline note: `louder-esp32-app` reflects the pre-existing `e6488153` Rule 64 DRAM0 baseline (`.stack = 28528` B) with **0-byte Wave 1–3 DRAM regression** (`const TE0` placed in flash `.rodata` in `579ffcde` and `#![forbid(unsafe_code)]` restored in `squeezelite-cspot`).
 
-## Cleanup & Disk Hygiene (`WO-2026-1115-001` & `WO-2026-1115-002`)
+## Cleanup & Disk Hygiene (`WO-2026-1115-001`, `WO-2026-1115-002`, `WO-2026-1115-003`)
 - **Warm Host Test Gate Pre-Cleanup (`WO-2026-1115-001`)**: `859 passed, 0 failed` (`0` ignored) via `cargo test --workspace --all-features --no-fail-fast`.
 - **Target Cache Reclamation**:
   - `WO-2026-1115-001`: Reclaimed `rust/target` (`4.8G` / `5098148876` B across `15896` files) via `cargo clean` (`Removed 15896 files, 5.2GiB total`).
   - `WO-2026-1115-002` Wave 4A-1: Reclaimed `rust/target` Xtensa release build artifacts (`Removed 1852 files, 612.9MiB total`) via `cargo clean --manifest-path /home/console-admin/Github/squeezelite-esp32/rust/Cargo.toml` while preserving staged OTA image `/home/console-admin/.gemini/antigravity/brain/41a3bf17-ecf0-4763-ae21-7f5eb1ef2af6/backups/louder-esp32-app-579ffcde-ota.bin` (`2,007,568` B, SHA-256 `954f842661487857dd95aa89eaeb1a4468a80228049b878340c314d3dfd92fa0`).
 - **Ignored & Stale Artifact Removal (`WO-2026-1115-001`)**: Archived to `/home/console-admin/.gemini/antigravity/brain/41a3bf17-ecf0-4763-ae21-7f5eb1ef2af6/backups/` and removed `rust/crates/louder-esp32-app/src/coordinator.rs.bak` (`271920` B) and `rust/vendor/opus-rs/Cargo.lock` (`24544` B).
-- **Repo Hygiene**: Executed `git worktree prune` and `git gc --auto`; `0` ignored or untracked leftovers remaining.
+- **Repo Hygiene & Branch Pruning (`WO-2026-1115-003`)**:
+  - Legacy branches archived to `/home/console-admin/.gemini/antigravity/brain/41a3bf17-ecf0-4763-ae21-7f5eb1ef2af6/backups/wo_20261115_003_pruned_branches.bundle` (`39,896,168` bytes; `master-v4.3` at `f3ccf718`, `My_Version` at `80067169`, `milestone-mk-5` at `92546cd8`).
+  - GitHub default branch for `Mr-Molina/squeezelite-esp32` switched from `master-v4.3` to `MK5-Rust`.
+  - Deleted `master-v4.3`, `milestone-mk-5`, and `My_Version` on `origin`; deleted local `master-v4.3`.
+  - Kept `upstream` (`sle118/squeezelite-esp32`), pruned remote tracking refs (`git fetch --prune`), set `origin/HEAD -> origin/MK5-Rust`, and ran `git worktree prune`.
+  - Executed `git gc --prune=now`: compacted `count-objects -vH` from `2277` loose objects (`24.08 MiB`) across 9 packs down to `0` loose objects (`0 bytes`) and `1` pack (`63.43 MiB`, `28436` in-pack, `0` prune-packable, `0` garbage). Sole `origin` head: `cdffe9cf refs/heads/MK5-Rust`.

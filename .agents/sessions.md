@@ -2,6 +2,15 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-15 10:10 | Antigravity Orchestrator | [squeezelite-esp32] Branch Pruning, Default-Branch Promotion, Git GC & Remote Push (WO-2026-1115-003)
+**Scope**: Executed `WO-2026-1115-003` repository restructuring and hygiene closeout: promoted `MK5-Rust` to GitHub repository default branch, pushed active branch `MK5-Rust` (`b24f937a..cdffe9cf`), archived legacy branches (`master-v4.3`, `origin/My_Version`, `origin/milestone-mk-5`) into a verified bundle, pruned remote and local branches, maintained `sle118` upstream remote, aligned `origin/HEAD`, performed aggressive `git gc --prune=now` compaction, and updated system ledgers.
+- **Key Outcomes**:
+  - **Default Branch Promotion & Remote Push (`[EXECUTED & VERIFIED]`)**: Promoted `MK5-Rust` to repository default branch on GitHub (`Mr-Molina/squeezelite-esp32`); pushed `MK5-Rust` (`b24f937a..cdffe9cf`) bringing `origin` into sync with all local Waves 1–3, OTA deployment, and hardware certification commits.
+  - **Pre-Prune Archive Bundle (`[EXECUTED & VERIFIED]`)**: Archived `master-v4.3` (`f3ccf718`), `origin/My_Version` (`80067169`), and `origin/milestone-mk-5` (`92546cd8`) into bundle `wo_20261115_003_pruned_branches.bundle` (`39,896,168` B, verified intact) in the session backups directory.
+  - **Branch Pruning & Remote Alignment (`[EXECUTED & VERIFIED]`)**: Deleted `origin/master-v4.3`, `origin/My_Version`, `origin/milestone-mk-5`, and local `master-v4.3` (PR `#1` auto-closed); kept `upstream` (`sle118`), ran `fetch --prune` on `origin` and `upstream`, and reset `origin/HEAD` to `MK5-Rust`; `MK5-Rust` is now the sole branch locally and on `origin`.
+  - **Git Garbage Collection & Compaction (`[EXECUTED & VERIFIED]`)**: Ran `git worktree prune` and `git gc --prune=now`: compacted `count-objects -vH` from `2,277` loose objects (`24.08 MiB`) + `9` packs (`61.58 MiB`) to `0` loose objects (`0` B) + `1` pack (`63.43 MiB`, `28,436` objects, `0` prune-packable, `0` garbage).
+- **Next-Session Handoff Notes**: `MK5-Rust` is now the GitHub default branch and sole local/`origin` branch, pushed in sync once committed. Live `"BASEMENT"` (`172.22.1.15`) runs `579ffcde` in `ota_0` (`never touch /dev/ttyUSB0`, never call `POST /reboot_ota.json`). In `docs/mk5-rust-todo.md`, tasks `T01`–`T27` and `HW1` are complete (`[x]`); only owner-gated `D1` (Core 1 decode/output migration) remains open (`[ ]`).
+
 ## 2026-11-15 09:48 | Antigravity Orchestrator | [squeezelite-esp32] Bare-Metal OTA Deployment (`579ffcde`), Live `"BASEMENT"` `HW1` Certification & Ledger Sync (`WO-2026-1115-002`)
 **Scope**: Executed `WO-2026-1115-002` (Waves 1–4B) on `MK5-Rust`: built and staged `--stage-only` bare-metal `louder-esp32-app` (`579ffcde`), flashed `"BASEMENT"` (`172.22.1.15`, LMS `10.0.0.50`) via single-shot recovery OTA, certified Gate 1/2, Invariant 49, and `HW1` (`docs/mk5-rust-todo.md` marked `[x]`), reclaimed build caches, and finalized local git commit and ledgers (`no git push`).
 - **Key Outcomes**:

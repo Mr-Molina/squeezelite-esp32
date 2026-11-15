@@ -639,3 +639,21 @@
      - Steady-state `15.5s` window (`mp3_s1` at `uptime_ms = 821,731`, `frames_played = 93,184`, `i2c_acks = 1,265` -> `mp3_s2` at `uptime_ms = 837,343`, `frames_played = 781,696`, `i2c_acks = 1,289`; `dt_uptime_s = 15.612` s / `dt_host_s = 15.6437` s, `frames_delta = 688,512`, `acks_delta = 24`, `vol_pct = 0`): **`mp3_fps = 44,101.46` fps** (device `uptime_ms` basis; host `44,011.987` fps; target `44,080.0..44,120.0`), **`mp3_acks_per_s = 1.5373` ACKs/s** (`<= 3.05`; host `1.5342`), **`i2c_nacks = 0`**, **`decode_us_max = 14,013` us** (`< 46,000` us; `decode_us_first = 949` us).
    - **Clean LMS & Device Restoration**: Sent `["stop"]`, `["playlist","clear"]`, `["playlist","add","https://cdn-peer032.streaming-pro.com:8025/ibizaglobalradio.mp3"]`, verified LMS `mode = "stop"`, then restored `["mixer","volume","50"]`. Confirmed LMS `mode = "stop"`, `mixer volume = 50`, `playlist_tracks = 1`, `player_connected = 1` (`172.22.1.15:52981`), and device `/status.json` (`uptime_ms = 837,693`) `recovery = 0`, `rust_engine = true`, `version = "I2S-4MFlash-Rust"`, `frames_played = 0`, `i2c_acks = 1,291`, `i2c_nacks = 0`, `tas_automuted = true`, `tas_pll_locked = true`, `vol_pct = 65`, `psram_free_bytes = 1,441,212`, `psram_used_bytes = 2,753,092`, `core1_active = true`, `core1_loops = 2,822,000`, `disconnect_count = 0`, `rssi = -52`.
 
+
+## 2026-11-15 Session Diagnostics (`WO-2026-1115-003` Branch Pruning, Default-Branch Promotion, Git GC & Remote Push)
+1. **GitHub Default Branch Promotion & Remote Sync (`[EXECUTED & VERIFIED]`)**:
+   - Switched GitHub repository (`Mr-Molina/squeezelite-esp32`) default branch from legacy `master-v4.3` to pure-Rust `MK5-Rust` via GitHub API.
+   - Pushed active branch `MK5-Rust` (`b24f937a..cdffe9cf`) to `origin/MK5-Rust`, bringing remote into exact sync with all local Waves 1–3, OTA deployment, and certification commits.
+2. **Pre-Prune Archive Bundle Creation (`[EXECUTED & VERIFIED]`)**:
+   - Archived branches prior to deletion: `master-v4.3` (`f3ccf71887010f3cfa521cbce9c222621fb7aee0`), `origin/My_Version` (`800671694b9ffcf1bcbc9fbeebf281e4ae35cf97`), and `origin/milestone-mk-5` (`92546cd8e20e85f4032d8ff5521b72e12e32a68c`).
+   - Saved bundle to `/home/console-admin/.gemini/antigravity/brain/41a3bf17-ecf0-4763-ae21-7f5eb1ef2af6/backups/wo_20261115_003_pruned_branches.bundle` (`39,896,168` B, verified via `git bundle verify` as valid and self-contained).
+3. **Branch Pruning & Remote Alignment (`[EXECUTED & VERIFIED]`)**:
+   - Deleted legacy branches on `origin`: `master-v4.3`, `My_Version`, and `milestone-mk-5` (PR `#1` automatically closed).
+   - Deleted local branch `master-v4.3`.
+   - Maintained `upstream` remote (`https://github.com/sle118/squeezelite-esp32.git`), executed `git fetch --prune origin` and `git fetch --prune upstream`.
+   - Set remote HEAD reference `git remote set-head origin -a` (`origin/HEAD` -> `origin/MK5-Rust`).
+   - Confirmed `MK5-Rust` is the sole branch locally and on `origin`.
+4. **Git Repository Compaction & GC (`[EXECUTED & VERIFIED]`)**:
+   - Executed `git worktree prune` and `git gc --prune=now`.
+   - Compacted `git count-objects -vH` from `2,277` loose objects (`24.08 MiB`) + `9` pack files (`61.58 MiB`) to `0` loose objects (`0` B) + `1` pack file (`63.43 MiB`, `28,436` objects, `0` prune-packable, `0` garbage).
+   - Repository state clean, verified, and compacted with zero loose object fragmentation.
