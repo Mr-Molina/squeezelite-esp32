@@ -604,7 +604,10 @@ mod xtensa_hw {
 
         pub fn hw_nack_count() -> u32 {
             let by_op = Self::hw_nack_by_op();
-            by_op.read.wrapping_add(by_op.write).wrapping_add(by_op.write_read)
+            by_op
+                .read
+                .wrapping_add(by_op.write)
+                .wrapping_add(by_op.write_read)
         }
 
         pub fn hw_nack_by_op() -> louder_esp32_app::http_control::I2cNackByOp {
@@ -787,6 +790,10 @@ mod xtensa_hw {
     pub(crate) static DMA_OUTSTANDING_FRAMES: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
 
+    /// Decode bursts top the DMA up between steps below this many queued
+    /// frames: three quarters of the buffer (1536 frames, ~35 ms at 44.1 kHz).
+    const DMA_REFILL_BELOW_FRAMES: usize = I2S_DMA_BUFFER_BYTES / 8 * 3 / 4;
+
     fn note_dma_fill(available_bytes: usize) {
         let queued = I2S_DMA_BUFFER_BYTES.saturating_sub(available_bytes) / 8;
         DMA_OUTSTANDING_FRAMES.store(queued as u32, core::sync::atomic::Ordering::Relaxed);
@@ -862,6 +869,15 @@ mod xtensa_hw {
             }
         }
 
+        /// Stereo frames currently queued in the DMA buffer (live, unlike
+        /// [`DMA_OUTSTANDING_FRAMES`], which is only refreshed on a push).
+        pub fn dma_queued_frames(&mut self) -> usize {
+            match self.transfer.as_mut() {
+                Some(t) => I2S_DMA_BUFFER_BYTES.saturating_sub(t.available_bytes()) / 8,
+                None => 0,
+            }
+        }
+
         pub fn pump_silence_if_needed(&mut self, is_playing: bool, has_buffered_audio: bool) {
             self.ensure_running();
             if is_playing && has_buffered_audio {
@@ -912,6 +928,9 @@ mod xtensa_hw {
         // SAFETY: Placed in executable IRAM section with no side effects.
         #[unsafe(link_section = ".iram1")]
         fn write_dma(&mut self, data: &[u8]) -> Result<usize, OutputError> {
+            // Invariant 46: only whole 8-byte stereo frames may enter the
+            // circular DMA buffer; a partial frame would shift every later
+            // frame and swap L/R until the transfer restarts.
             let valid_len = data.len() & !7;
             if valid_len == 0 {
                 return Ok(0);
@@ -1088,9 +1107,8 @@ mod xtensa_hw {
         // JUSTIFICATION: Place static MP3 decoder in DRAM2 uninitialized section.
         // SAFETY: Guarded by atomic MP3_DEC_TAKEN ensuring exclusive access.
         #[unsafe(link_section = ".dram2_uninit")]
-        static mut STATIC_MP3_DEC: core::mem::MaybeUninit<
-            squeezelite_decoders::StaticMp3Decoder,
-        > = core::mem::MaybeUninit::uninit();
+        static mut STATIC_MP3_DEC: core::mem::MaybeUninit<squeezelite_decoders::StaticMp3Decoder> =
+            core::mem::MaybeUninit::uninit();
         // JUSTIFICATION: Access to global static MP3 decoder singleton in DRAM2.
         // SAFETY: Exclusive singleton access is guaranteed by MP3_DEC_TAKEN.
         unsafe {
@@ -1637,8 +1655,7 @@ mod xtensa_hw {
                 boot_slot,
                 SETTINGS_FLASH_TARGET,
             ));
-            let config =
-                (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
+            let config = (*core::ptr::addr_of_mut!(CONFIG_HANDLE)).write(ConfigHandle::new(audio));
             if let Some((index, seq)) = selected {
                 let winning_buf = if index == 0 { sector_a } else { sector_b };
                 if let Ok(winning_arr) = <&[u8; 4096]>::try_from(&*winning_buf) {
@@ -1729,8 +1746,7 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).mp3_spare).write(Some(take_static_mp3_decoder()));
             core::ptr::addr_of_mut!((*ptr).boundary)
                 .write(louder_esp32_app::pipeline::TrackBoundary::new(44_100));
-            core::ptr::addr_of_mut!((*ptr).fade)
-                .write(squeezelite_audio_core::FadeEngine::new());
+            core::ptr::addr_of_mut!((*ptr).fade).write(squeezelite_audio_core::FadeEngine::new());
             core::ptr::addr_of_mut!((*ptr).decode_us_max).write(0);
             core::ptr::addr_of_mut!((*ptr).decode_us_first).write(0);
             core::ptr::addr_of_mut!((*ptr).eq_gains_db).write([0.0; 10]);
@@ -1961,8 +1977,8 @@ mod xtensa_hw {
         let mut tx_buffer = esp_hal::dma::DmaTxStreamBuf::new(tx_descriptors, dma_tx_slice)
             .unwrap_or_else(|_| esp_hal::system::software_reset());
         Esp32HardwareI2sDma::prefill_silence(&mut tx_buffer);
-        let i2s = I2s::new(i2s0, dma, i2s_tdm_cfg)
-            .unwrap_or_else(|_| esp_hal::system::software_reset());
+        let i2s =
+            I2s::new(i2s0, dma, i2s_tdm_cfg).unwrap_or_else(|_| esp_hal::system::software_reset());
         let i2s_tx = i2s
             .i2s_tx
             .with_bclk(bclk)
@@ -2186,11 +2202,8 @@ mod xtensa_hw {
         sta_mac: [u8; 6],
         tcp_bufs: TcpBuffers,
     ) -> NetStack {
-        let [
-            (http_rx_buf, http_tx_buf),
-            (slim_rx_buf, slim_tx_buf),
-            (audio_rx_buf, audio_tx_buf),
-        ] = tcp_bufs;
+        let [(http_rx_buf, http_tx_buf), (slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] =
+            tcp_bufs;
         let hw_rng = Rng::new();
         let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
@@ -2458,7 +2471,9 @@ mod xtensa_hw {
         }
         let mut verify_s0 = [0u8; 64];
         let mut verify_s1 = [0u8; 64];
-        if flash.read(OTADATA_PARTITION_OFFSET, &mut verify_s0).is_err()
+        if flash
+            .read(OTADATA_PARTITION_OFFSET, &mut verify_s0)
+            .is_err()
             || flash.read(OTADATA_SECTOR_1_OFFSET, &mut verify_s1).is_err()
             || verify_otadata_erased(&verify_s0).is_err()
             || verify_otadata_erased(&verify_s1).is_err()
@@ -2497,8 +2512,8 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
-                let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr()
-                    as *mut [u8; 12_288];
+                let ptr =
+                    (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr() as *mut [u8; 12_288];
                 &mut *ptr
             };
             init_config(&mut flash, boot_scratch)
@@ -2510,8 +2525,8 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
-                let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr()
-                    as *mut [u8; 12_288];
+                let ptr =
+                    (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr() as *mut [u8; 12_288];
                 &mut *ptr
             };
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
@@ -2714,12 +2729,9 @@ mod xtensa_hw {
             // APP_CORE_STACK for Core 1 executor.
             // SAFETY: APP_CPU is started once at boot and owns APP_CORE_STACK.
             let stack = unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) };
-            esp_rtos::start_second_core(
-                cpu_ctrl_periph,
-                peripherals.FROM_CPU_INTR1,
-                stack,
-                || crate::tasks::run_core1_executor(),
-            );
+            esp_rtos::start_second_core(cpu_ctrl_periph, peripherals.FROM_CPU_INTR1, stack, || {
+                crate::tasks::run_core1_executor()
+            });
             Core1Ctl { active: true }
         };
 
@@ -2748,10 +2760,7 @@ mod xtensa_hw {
                     alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
                 )
             } else {
-                (
-                    &mut slim_rx_buf[..],
-                    &mut audio_rx_buf[..],
-                )
+                (&mut slim_rx_buf[..], &mut audio_rx_buf[..])
             };
 
         let NetStack {
@@ -3176,18 +3185,18 @@ mod xtensa_hw {
                     }
                 });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() {
-                if s.pipeline.stream_buffer.available_read() < 4
-                    && s.pipeline.output_buffer.available_read() == 0
-                    && !s.pipeline.has_pending_pcm()
-                {
-                    if s.pipeline.stream_buffer.available_read() > 0 {
-                        s.pipeline.stream_buffer.flush();
-                    }
-                    s.bt_audio_active = false;
-                    s.coordinator.release_source(AudioSource::Bluetooth);
-                    restore_suspended_or_stop(s);
+            if s.bt_audio_active
+                && !s.bt_sink.is_streaming()
+                && s.pipeline.stream_buffer.available_read() < 4
+                && s.pipeline.output_buffer.available_read() == 0
+                && !s.pipeline.has_pending_pcm()
+            {
+                if s.pipeline.stream_buffer.available_read() > 0 {
+                    s.pipeline.stream_buffer.flush();
                 }
+                s.bt_audio_active = false;
+                s.coordinator.release_source(AudioSource::Bluetooth);
+                restore_suspended_or_stop(s);
             }
         }
     }
@@ -3241,11 +3250,9 @@ mod xtensa_hw {
             let _ = connect_fut.as_mut().poll(&mut cx);
         }
 
-        if s.lease_watchdog.evaluate(
-            now_ms,
-            wifi_connected,
-            s.assigned_ip.is_some(),
-        ) == LeaseHealth::ExpiredResetToRecovery
+        if s.lease_watchdog
+            .evaluate(now_ms, wifi_connected, s.assigned_ip.is_some())
+            == LeaseHealth::ExpiredResetToRecovery
         {
             flush_settings_before_reboot(s);
             println!(
@@ -3277,7 +3284,7 @@ mod xtensa_hw {
                 let cfg_address = config.address;
                 let cfg_router = config.router;
                 let ip_octets = cfg_address.address().octets();
-                let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
+                let ip_changed = s.assigned_ip.is_some_and(|old| old != ip_octets);
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
@@ -3394,13 +3401,12 @@ mod xtensa_hw {
                 }
             }
 
-            if s.pending_http_closing {
-                if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
-                    || now_ms >= s.pending_close_deadline_ms
-                {
-                    http_sock.abort();
-                    s.pending_http_closing = false;
-                }
+            if s.pending_http_closing
+                && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                    || now_ms >= s.pending_close_deadline_ms)
+            {
+                http_sock.abort();
+                s.pending_http_closing = false;
             }
 
             if s.pending_http_body.is_empty()
@@ -3514,18 +3520,17 @@ mod xtensa_hw {
                             }
                         }
                     };
-                    let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
-                        match s.latest_telemetry {
-                            Some(t) => (
-                                t.detected_sample_rate_hz_with_hint(
-                                    s.coordinator.current_sample_rate,
-                                ),
-                                t.bck_ratio(),
-                                t.is_pll_locked(),
-                                t.is_automuted(),
-                            ),
-                            None => (s.coordinator.current_sample_rate, 64, true, false),
-                        };
+                    let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) = match s
+                        .latest_telemetry
+                    {
+                        Some(t) => (
+                            t.detected_sample_rate_hz_with_hint(s.coordinator.current_sample_rate),
+                            t.bck_ratio(),
+                            t.is_pll_locked(),
+                            t.is_automuted(),
+                        ),
+                        None => (s.coordinator.current_sample_rate, 64, true, false),
+                    };
                     let (psram_free_bytes, psram_used_bytes) = {
                         let stats = esp_alloc::HEAP.stats();
                         let mut free = 0u32;
@@ -3747,10 +3752,9 @@ mod xtensa_hw {
                                         s.coordinator.current_sample_rate = 44_100;
                                         let _ = s.pipeline.set_sample_rate(44_100);
                                     }
-                                    s.pipeline
-                                        .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                            16, 2, false,
-                                        )));
+                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
+                                        16, 2, false,
+                                    )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
                                     s.coordinator.begin_external_playback();
@@ -3867,12 +3871,21 @@ mod xtensa_hw {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    let _ = s.flash.write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes);
-                    println!(
-                        "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
-                         wrote ota_0 select entry & resetting"
-                    );
-                    esp_hal::system::software_reset();
+                    let mut verify_buf = [0u8; 32];
+                    if s.flash
+                        .write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes)
+                        .is_ok()
+                        && s.flash
+                            .read_nor(OTADATA_PARTITION_OFFSET, &mut verify_buf)
+                            .is_ok()
+                        && verify_buf == entry_bytes
+                    {
+                        println!(
+                            "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
+                             wrote ota_0 select entry & resetting"
+                        );
+                        esp_hal::system::software_reset();
+                    }
                 }
                 _ => {}
             }
@@ -4039,10 +4052,8 @@ mod xtensa_hw {
         // Spotify `_spotify-connect._tcp.local`
         if airplay_enabled || cspot_enabled {
             let mdns_sock = s.sockets.get_mut::<udp::Socket>(s.mdns_handle);
-            if !s.mdns_bound {
-                if mdns_sock.bind(5353).is_ok() {
-                    s.mdns_bound = true;
-                }
+            if !s.mdns_bound && mdns_sock.bind(5353).is_ok() {
+                s.mdns_bound = true;
             }
             if s.mdns_bound {
                 let mut should_announce_raop = false;
@@ -4284,10 +4295,9 @@ mod xtensa_hw {
                                         s.coordinator.current_sample_rate = 44_100;
                                         let _ = s.pipeline.set_sample_rate(44_100);
                                     }
-                                    s.pipeline
-                                        .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                            16, 2, false,
-                                        )));
+                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
+                                        16, 2, false,
+                                    )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
                                     s.coordinator.begin_external_playback();
@@ -4309,15 +4319,13 @@ mod xtensa_hw {
             if s.raop_streaming
                 && (s.raop_rtsp.state() != ServerState::Streaming
                     || now_ms.saturating_sub(s.last_rtp_packet_ms) >= 3_000)
+                && s.pipeline.stream_buffer.available_read() == 0
+                && s.pipeline.output_buffer.available_read() == 0
+                && !s.pipeline.has_pending_pcm()
             {
-                if s.pipeline.stream_buffer.available_read() == 0
-                    && s.pipeline.output_buffer.available_read() == 0
-                    && !s.pipeline.has_pending_pcm()
-                {
-                    s.raop_streaming = false;
-                    s.coordinator.release_source(AudioSource::AirPlay);
-                    restore_suspended_or_stop(s);
-                }
+                s.raop_streaming = false;
+                s.coordinator.release_source(AudioSource::AirPlay);
+                restore_suspended_or_stop(s);
             }
         }
 
@@ -4409,8 +4417,11 @@ mod xtensa_hw {
                                             DeviceClockRegs,
                                             &DMA_OUTSTANDING_FRAMES,
                                         );
-                                        s.coordinator
-                                            .set_volume_percent(pct, &mut backend, s.pipeline);
+                                        s.coordinator.set_volume_percent(
+                                            pct,
+                                            &mut backend,
+                                            s.pipeline,
+                                        );
                                         let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
                                         s.config.update(|c| c.volume = pct);
                                     }
@@ -4455,7 +4466,16 @@ mod xtensa_hw {
             ActiveDecoder::Pcm(_) => 4,
             _ => 16,
         };
-        s.coordinator.pump_decode(s.pipeline, max_steps);
+        // Up to 16 decode steps per lap (e.g. 16 MP3 frames while the output
+        // ring fills after a track start) can outlast the ~46 ms I2S DMA
+        // buffer, so top the DMA up between steps once it falls below
+        // three quarters full.
+        s.coordinator.pump_decode_paced(
+            s.pipeline,
+            max_steps,
+            |p| p.sink.driver.dma_queued_frames() < DMA_REFILL_BELOW_FRAMES,
+            || Instant::now().duration_since_epoch().as_micros(),
+        );
         s.coordinator.pump_output(s.pipeline, 16);
         s.coordinator.current_sample_rate = s.pipeline.sample_rate;
 
@@ -4478,8 +4498,7 @@ mod xtensa_hw {
             s.last_fault_check_ms = now_ms;
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
-                if (s.coordinator.state == PlayerState::Playing
-                    || s.coordinator.external_playback)
+                if (s.coordinator.state == PlayerState::Playing || s.coordinator.external_playback)
                     && fault.has_critical_amp_fault()
                     && now_ms.saturating_sub(s.last_fault_recovery_ms) >= 30_000
                 {
@@ -4500,7 +4519,8 @@ mod xtensa_hw {
             if s.coordinator.state == PlayerState::Playing && s.coordinator.current_sample_rate > 0
             {
                 let elapsed_secs = (s.coordinator.frames_for_stat(s.pipeline)
-                    / s.coordinator.current_sample_rate as u64) as u32;
+                    / s.coordinator.current_sample_rate as u64)
+                    as u32;
                 let _ = s.cyd_bridge.send_message(&CydMessage::Progress {
                     elapsed_secs,
                     duration_secs: 0,
@@ -4582,8 +4602,7 @@ mod tests {
             44100,
         );
 
-        let mut coordinator =
-            PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
+        let mut coordinator = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
         let mut cyd_bridge = CydUartBridge::new(LoopbackUartPort::new());
         let mut amp = AmpManager::for_active_board(TargetI2cBus::new());
         amp.initialize(32).unwrap();
@@ -4596,8 +4615,7 @@ mod tests {
             .ingest_stream_data(&[0x01, 0x00, 0xFF, 0x00])
             .unwrap();
 
-        let frames =
-            run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
+        let frames = run_firmware_tick(&mut coordinator, &mut pipeline, &mut cyd_bridge, &mut amp);
         assert_eq!(coordinator.state, PlayerState::Playing);
         assert_eq!(frames, 1);
         assert_eq!(cyd_bridge.port.tx_bytes(), b"STATE=P\n");
@@ -4632,17 +4650,11 @@ mod tests {
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // start_playback (starts at VOL_DEFAULT_M20DB = 0x58)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
             // check_faults returns a non-clean fault (overcurrent on channel)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write_read(
                 addr,
                 vec![registers::CHAN_FAULT],
@@ -4656,9 +4668,6 @@ mod tests {
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
         ];
         let mut i2c = I2cMock::new(&expectations);
@@ -4755,14 +4764,8 @@ mod tests {
             "MaxSampleRate={}",
             louder_esp32_app::clock_table::max_verified_rate()
         )));
-        assert!(
-            caps.contains(",pcm,"),
-            "Capabilities must advertise pcm"
-        );
-        assert!(
-            caps.contains(",mp3"),
-            "Capabilities must advertise mp3"
-        );
+        assert!(caps.contains(",pcm,"), "Capabilities must advertise pcm");
+        assert!(caps.contains(",mp3"), "Capabilities must advertise mp3");
         assert!(!caps.contains("HasDigitalOut"));
         assert!(caps.starts_with("Model=squeezeesp32,"));
         assert!(
@@ -4793,4 +4796,3 @@ mod tests {
         assert_eq!(coordinator.active_source(), AudioSource::None);
     }
 }
-

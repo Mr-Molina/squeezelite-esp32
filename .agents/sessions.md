@@ -2,6 +2,16 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-10 21:34 | Antigravity (IDE) | [squeezelite-esp32] MK5-Rust Phase 1 Baseline & Phase 3 DSP/AirPlay/FLAC/EQ Optimization Waves (T01-T03, T06-T13)
+**Scope**: Executed docs/mk5-rust-todo.md Phase 1 baseline fixes (T01-T03) and Phase 3 device performance Waves A & B (T06-T13) across 15 verified commits on branch MK5-Rust.
+- **Key Outcomes**:
+  - Restored 100% green baseline (T01-T03: Xtensa clippy clean, TAS58xx I2C mock test fixed, AAC/Opus/Vorbis golden PCM digests aligned; commits 60dc7894..1f8db64a).
+  - Completed Phase 3 Wave A DSP throughput wins (T06-T08: eliminated 64-bit udivdi3/divdi3 divides in Resampler with 3-MAC pre-interpolated taps, preserved opt-level 3 and .iram1 placement on hot audio kernels, and added unclamped <= 1.0 fast path in GainStage::apply; commits 1165573d..69531ff3).
+  - Completed Phase 3 Wave B AirPlay, FLAC & EQ optimizations (T09-T13: AirPlay AES-128-CBC .dram1 TD0 T-table = 1,280 B, zero-heap constant-time RSA-2048 CRT + stack CIOS Montgomery, 100 KiB / 102,400 B FLAC heap reduction via i32 scratch + lazy decorrelation, and 64-frame bands-outer .iram1 EQ kernel = 1,250 B code + 144 B literals; commits e5ac13d6..43b87f77).
+  - Verified 11/11 gates green: 825/825 host workspace tests, 23/23 no_std+alloc equivalence tests, 0 host & Xtensa clippy -D warnings, ESP32/ESP32-S3 release builds/checks green, cargo fmt --check clean, and google_rust_audit.py --strict 0 errors / 0 warnings.
+  - **Repo & Hygiene Telemetry**: branch `MK5-Rust` (github_synced) | hygiene `0 secrets, 0 scratch`
+- **Next-Session Handoff Notes**: Branch MK5-Rust is clean, verified, and synced to origin/MK5-Rust. Ready for HW1 physical ESP32 bench validation (MP3 pacing, FLAC finish_input, decode_us_max, AirPlay connect latency) and optional Phase 2 (T04-T05), Phase 3 tail (T14-T18), or Phase 4 cleanup (T19-T24) tasks.
+
 ## 2026-11-10 11:08 | Antigravity Orchestrator | `[squeezelite-esp32]` TokenEconomizer Repository Optimization (`repomap=on`, Tree-Sitter AST Symbol Map `1,605` Tokens, Session Folding & LoopGuard Calibration)
 **Agent**: Antigravity Orchestrator (`d1b03498-43d7-4dcf-91a1-829159cc0b41`)
 **Host OS**: Linux (`x86_64`)
@@ -20,6 +30,13 @@
 ### Next-Session Handoff Notes
 - **TokenEconomizer State**: Active at `/home/console-admin/.tokeneconomizer/repos/squeezelite-esp32-949df7c471` (`microskills=envfacts`, `loopguard=nudge`, `repomap=on`).
 - **Live `"BASEMENT"` (`172.22.1.15`) State**: Remains untouched on remediated `ota_0` firmware (`27b64b17...`). Never call `POST /reboot_ota.json` and **never touch `/dev/ttyUSB0`** (separate CYD board).
+
+## 2026-11-05 13:23 | Antigravity (IDE) | [squeezelite-esp32] MK5-Rust Performance Tuning Sprint, Deep Code Analysis & Deep Code Audit
+**Scope**: Executed aggressive performance tuning sprint, /deep-code-analysis, and full /deep-code-audit (12 auditors, 8 remediation clusters, 3 Pro counter-verifiers) across 11 crates (83 files) on MK5-Rust
+- **Key Outcomes**:
+  - Remediated and counter-verified all 22 audit findings (1 CRITICAL, 8 HIGH, 5 MEDIUM, 8 LOW) plus earlier performance/quality optimizations across 66 files; passed cargo fmt --check, google_rust_audit.py --strict (0 errors, 0 warnings), cargo clippy -D warnings, and 639+ unit/golden tests
+  - **Repo & Hygiene Telemetry**: branch `MK5-Rust` (github_synced) | hygiene `0 secrets, 0 scratch`
+- **Next-Session Handoff Notes**: Branch MK5-Rust is clean, formatted, and verified against all unit/golden audio tests; ready for ESP32-WROVER hardware flash and real-time playback validation
 
 ## 2026-11-05 11:34 | Antigravity Orchestrator | `[squeezelite-esp32]` Bare-Metal `xtensa-esp32-none-elf` OTA Image Staging (`27b64b17`, `1,904,368` B), Live `"BASEMENT"` (`172.22.1.15`) 6-Gate + 4-Benchmark Certification, & `origin/MK5-Rust` Sync (`b6fef51e`)
 **Agent**: Antigravity Orchestrator (`a13abc13-a35b-4ff9-935f-36176c47169e`)

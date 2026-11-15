@@ -310,9 +310,13 @@ impl SlimTransport for LoopbackTransport {
         }
         if self.echo {
             // Capacity checked above, so neither push can fail.
-            let _ = self.rx.push_back(Frame::from_slice(frame).map_err(|_| TransportError::Io)?);
+            let _ = self
+                .rx
+                .push_back(Frame::from_slice(frame).map_err(|_| TransportError::Io)?);
         }
-        let _ = self.tx.push_back(Frame::from_slice(frame).map_err(|_| TransportError::Io)?);
+        let _ = self
+            .tx
+            .push_back(Frame::from_slice(frame).map_err(|_| TransportError::Io)?);
         Ok(())
     }
 
@@ -905,10 +909,8 @@ mod tests {
 
     #[test]
     fn icy_metaint_header_is_honoured_without_set_call() {
-        static SEGS: Segments = &[
-            b"HTTP/1.0 200 OK\r\nIcy-MetaInt: 4\r\n\r\n\
-              abcd\x01Hi\0\0\0\0\0\0\0\0\0\0\0\0\0\0wxyz\0",
-        ];
+        static SEGS: Segments = &[b"HTTP/1.0 200 OK\r\nIcy-MetaInt: 4\r\n\r\n\
+              abcd\x01Hi\0\0\0\0\0\0\0\0\0\0\0\0\0\0wxyz\0"];
         let mut s = FakeStreamSource::new();
         assert!(s.add_route(b"/i", SEGS));
         s.connect(ADDR, b"GET /i HTTP/1.0\r\n\r\n").unwrap();

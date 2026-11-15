@@ -34,8 +34,7 @@ use squeezelite_config::{FlashJournal, KeyValueStorage, MemConfigStore, StorageE
 /// (spec §3.1), so this is the player's first-boot name and does not follow a
 /// later rename (`setd`); the fixed SDP record layout needs exactly 8 bytes
 /// (checked at compile time where the record is built).
-const BT_LOCAL_NAME: &[u8] =
-    crate::board::first_boot_defaults::PLAYER_NAME.as_bytes();
+const BT_LOCAL_NAME: &[u8] = crate::board::first_boot_defaults::PLAYER_NAME.as_bytes();
 
 // ============================================================================
 // HCI Transport Trait
@@ -343,12 +342,7 @@ impl AvrcpTrackMetadata {
     }
 
     #[must_use]
-    pub fn with_metadata(
-        title: &str,
-        artist: &str,
-        album: &str,
-        duration_ms: u32,
-    ) -> Self {
+    pub fn with_metadata(title: &str, artist: &str, album: &str, duration_ms: u32) -> Self {
         let mut meta = Self::new();
         meta.update_title(title);
         meta.update_artist(artist);
@@ -407,10 +401,7 @@ impl AvrcpTrackMetadata {
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.title_len == 0
-            && self.artist_len == 0
-            && self.album_len == 0
-            && self.duration_ms == 0
+        self.title_len == 0 && self.artist_len == 0 && self.album_len == 0 && self.duration_ms == 0
     }
 }
 
@@ -553,11 +544,7 @@ pub fn parse_avrcp_passthrough(
 }
 
 /// Builds an AVRCP `SetAbsoluteVolume` (`0x50`) command frame over AVCTP.
-pub fn build_avrcp_set_absolute_volume_cmd(
-    tx_label: u8,
-    volume_raw: u8,
-    out: &mut [u8],
-) -> usize {
+pub fn build_avrcp_set_absolute_volume_cmd(tx_label: u8, volume_raw: u8, out: &mut [u8]) -> usize {
     if out.len() < 14 {
         return 0;
     }
@@ -575,11 +562,7 @@ pub fn build_avrcp_set_absolute_volume_cmd(
 }
 
 /// Builds an AVRCP `SetAbsoluteVolume` (`0x50`) `ACCEPTED` response frame.
-pub fn build_avrcp_set_absolute_volume_rsp(
-    tx_label: u8,
-    volume_raw: u8,
-    out: &mut [u8],
-) -> usize {
+pub fn build_avrcp_set_absolute_volume_rsp(tx_label: u8, volume_raw: u8, out: &mut [u8]) -> usize {
     if out.len() < 14 {
         return 0;
     }
@@ -598,10 +581,7 @@ pub fn build_avrcp_set_absolute_volume_rsp(
 
 /// Builds an AVRCP `RegisterNotification` (`0x31`) command for
 /// `EVENT_VOLUME_CHANGED` (`0x0D`).
-pub fn build_avrcp_register_volume_notify_cmd(
-    tx_label: u8,
-    out: &mut [u8],
-) -> usize {
+pub fn build_avrcp_register_volume_notify_cmd(tx_label: u8, out: &mut [u8]) -> usize {
     if out.len() < 18 {
         return 0;
     }
@@ -647,10 +627,7 @@ pub fn build_avrcp_volume_notify_rsp(
 /// Builds an AVRCP `GetElementAttributes` (`0x20`) command requesting
 /// `Title` (`0x01`), `Artist` (`0x02`), `Album` (`0x03`), and
 /// `DurationMs` (`0x07`).
-pub fn build_avrcp_get_element_attributes_cmd(
-    tx_label: u8,
-    out: &mut [u8],
-) -> usize {
+pub fn build_avrcp_get_element_attributes_cmd(tx_label: u8, out: &mut [u8]) -> usize {
     // 13 header + 8 identifier + 1 count + 4*4 attr_ids = 38 bytes
     if out.len() < 38 {
         return 0;
@@ -724,9 +701,7 @@ pub fn build_avrcp_get_element_attributes_rsp(
 /// Parses an AVRCP `GetElementAttributes` (`0x20`) response (either full AVCTP
 /// frame or attribute parameter block) into [`AvrcpTrackMetadata`].
 #[must_use]
-pub fn parse_avrcp_element_attributes_rsp(
-    payload: &[u8],
-) -> Option<AvrcpTrackMetadata> {
+pub fn parse_avrcp_element_attributes_rsp(payload: &[u8]) -> Option<AvrcpTrackMetadata> {
     let params = if payload.len() >= 14
         && u16::from_be_bytes([payload[1], payload[2]]) == AVRCP_PID
         && payload[5] == AVRCP_OPCODE_VENDOR_DEPENDENT
@@ -1030,18 +1005,14 @@ impl BondingStore {
     /// [`BondingStore::encode_hex`].
     pub fn decode_hex(hex_str: &str) -> Result<Self, StorageError> {
         let bytes = hex_str.as_bytes();
-        if !bytes.len().is_multiple_of(2)
-            || bytes.len() / 2 > Self::BINARY_MAX_BYTES
-        {
+        if !bytes.len().is_multiple_of(2) || bytes.len() / 2 > Self::BINARY_MAX_BYTES {
             return Err(StorageError::InvalidFormat);
         }
         let mut raw = [0u8; Self::BINARY_MAX_BYTES];
         let raw_len = bytes.len() / 2;
         for i in 0..raw_len {
-            let hi = decode_hex_nibble(bytes[i * 2])
-                .ok_or(StorageError::InvalidFormat)?;
-            let lo = decode_hex_nibble(bytes[i * 2 + 1])
-                .ok_or(StorageError::InvalidFormat)?;
+            let hi = decode_hex_nibble(bytes[i * 2]).ok_or(StorageError::InvalidFormat)?;
+            let lo = decode_hex_nibble(bytes[i * 2 + 1]).ok_or(StorageError::InvalidFormat)?;
             raw[i] = (hi << 4) | lo;
         }
         Self::decode_binary(&raw[..raw_len])
@@ -1049,10 +1020,7 @@ impl BondingStore {
 
     /// Saves the bonding store under key [`BT_BONDS_CONFIG_KEY`] (`"bt.bonds"`)
     /// in any [`KeyValueStorage`] implementation.
-    pub fn save_to_storage<S: KeyValueStorage>(
-        &self,
-        storage: &mut S,
-    ) -> Result<(), StorageError> {
+    pub fn save_to_storage<S: KeyValueStorage>(&self, storage: &mut S) -> Result<(), StorageError> {
         let mut buf = [0u8; Self::BINARY_MAX_BYTES];
         let n = self.encode_binary(&mut buf);
         if n == 0 {
@@ -1063,9 +1031,7 @@ impl BondingStore {
 
     /// Loads the bonding store from key [`BT_BONDS_CONFIG_KEY`] (`"bt.bonds"`)
     /// in any [`KeyValueStorage`] implementation.
-    pub fn load_from_storage<S: KeyValueStorage>(
-        storage: &S,
-    ) -> Result<Self, StorageError> {
+    pub fn load_from_storage<S: KeyValueStorage>(storage: &S) -> Result<Self, StorageError> {
         let mut buf = [0u8; 128];
         let n = storage.get(BT_BONDS_CONFIG_KEY, &mut buf)?;
         Self::decode_binary(&buf[..n])
@@ -1279,12 +1245,7 @@ impl AclReassembly {
 // SBC Decoder Tables
 // ============================================================================
 
-pub const SBC_OFFSET4: [[i32; 4]; 4] = [
-    [-1, 0, 0, 0],
-    [-2, 0, 0, 1],
-    [-2, 0, 0, 1],
-    [-2, 0, 0, 1],
-];
+pub const SBC_OFFSET4: [[i32; 4]; 4] = [[-1, 0, 0, 0], [-2, 0, 0, 1], [-2, 0, 0, 1], [-2, 0, 0, 1]];
 
 pub const SBC_OFFSET8: [[i32; 8]; 4] = [
     [-2, 0, 0, 0, 0, 0, 0, 1],
@@ -1294,25 +1255,25 @@ pub const SBC_OFFSET8: [[i32; 8]; 4] = [
 ];
 
 pub const SBC_PROTO_4_40M0: [i32; 20] = [
-    0, -1431, -17773, 17772, 1430, -71, -2679, -25558, 10177, 401, -196, -3785, -32328, 3777,
-    -245, -359, -4220, -36940, -804, -511,
+    0, -1431, -17773, 17772, 1430, -71, -2679, -25558, 10177, 401, -196, -3785, -32328, 3777, -245,
+    -359, -4220, -36940, -804, -511,
 ];
 
 pub const SBC_PROTO_4_40M1: [i32; 20] = [
-    -503, -3392, -38577, -3392, -503, -511, -804, -36940, -4220, -359, -245, 3777, -32328,
-    -3785, -196, 401, 10177, -25558, -2679, -71,
+    -503, -3392, -38577, -3392, -503, -511, -804, -36940, -4220, -359, -245, 3777, -32328, -3785,
+    -196, 401, 10177, -25558, -2679, -71,
 ];
 
 pub const SBC_PROTO_8_80M0: [i32; 40] = [
-    0, -1484, -17826, 17825, 1483, -42, -2105, -21754, 13942, 916, -90, -2742, -25579, 10243,
-    432, -146, -3342, -29150, 6844, 46, -216, -3842, -32314, 3837, -237, -299, -4170, -34935,
-    1288, -424, -388, -4253, -36898, -767, -523, -468, -4016, -38114, -2322, -552,
+    0, -1484, -17826, 17825, 1483, -42, -2105, -21754, 13942, 916, -90, -2742, -25579, 10243, 432,
+    -146, -3342, -29150, 6844, 46, -216, -3842, -32314, 3837, -237, -299, -4170, -34935, 1288,
+    -424, -388, -4253, -36898, -767, -523, -468, -4016, -38114, -2322, -552,
 ];
 
 pub const SBC_PROTO_8_80M1: [i32; 40] = [
-    -528, -3392, -38524, -3392, -528, -552, -2322, -38114, -4016, -468, -523, -767, -36898,
-    -4253, -388, -424, 1288, -34935, -4170, -299, -237, 3837, -32314, -3842, -216, 46, 6844,
-    -29150, -3342, -146, 432, 10243, -25579, -2742, -90, 916, 13942, -21754, -2105, -42,
+    -528, -3392, -38524, -3392, -528, -552, -2322, -38114, -4016, -468, -523, -767, -36898, -4253,
+    -388, -424, 1288, -34935, -4170, -299, -237, 3837, -32314, -3842, -216, 46, 6844, -29150,
+    -3342, -146, 432, 10243, -25579, -2742, -90, 916, 13942, -21754, -2105, -42,
 ];
 
 pub const SYNMATRIX4: [[i32; 4]; 8] = [
@@ -1346,24 +1307,22 @@ pub const SYNMATRIX8: [[i32; 8]; 16] = [
 ];
 
 pub const CRC_TABLE: [u8; 256] = [
-    0x00, 0x1D, 0x3A, 0x27, 0x74, 0x69, 0x4E, 0x53, 0xE8, 0xF5, 0xD2, 0xCF, 0x9C, 0x81, 0xA6,
-    0xBB, 0xCD, 0xD0, 0xF7, 0xEA, 0xB9, 0xA4, 0x83, 0x9E, 0x25, 0x38, 0x1F, 0x02, 0x51, 0x4C,
-    0x6B, 0x76, 0x87, 0x9A, 0xBD, 0xA0, 0xF3, 0xEE, 0xC9, 0xD4, 0x6F, 0x72, 0x55, 0x48, 0x1B,
-    0x06, 0x21, 0x3C, 0x4A, 0x57, 0x70, 0x6D, 0x3E, 0x23, 0x04, 0x19, 0xA2, 0xBF, 0x98, 0x85,
-    0xD6, 0xCB, 0xEC, 0xF1, 0x13, 0x0E, 0x29, 0x34, 0x67, 0x7A, 0x5D, 0x40, 0xFB, 0xE6, 0xC1,
-    0xDC, 0x8F, 0x92, 0xB5, 0xA8, 0xDE, 0xC3, 0xE4, 0xF9, 0xAA, 0xB7, 0x90, 0x8D, 0x36, 0x2B,
-    0x0C, 0x11, 0x42, 0x5F, 0x78, 0x65, 0x94, 0x89, 0xAE, 0xB3, 0xE0, 0xFD, 0xDA, 0xC7, 0x7C,
-    0x61, 0x46, 0x5B, 0x08, 0x15, 0x32, 0x2F, 0x59, 0x44, 0x63, 0x7E, 0x2D, 0x30, 0x17, 0x0A,
-    0xB1, 0xAC, 0x8B, 0x96, 0xC5, 0xD8, 0xFF, 0xE2, 0x26, 0x3B, 0x1C, 0x01, 0x52, 0x4F, 0x68,
-    0x75, 0xCE, 0xD3, 0xF4, 0xE9, 0xBA, 0xA7, 0x80, 0x9D, 0xEB, 0xF6, 0xD1, 0xCC, 0x9F, 0x82,
-    0xA5, 0xB8, 0x03, 0x1E, 0x39, 0x24, 0x77, 0x6A, 0x4D, 0x50, 0xA1, 0xBC, 0x9B, 0x86, 0xD5,
-    0xC8, 0xEF, 0xF2, 0x49, 0x54, 0x73, 0x6E, 0x3D, 0x20, 0x07, 0x1A, 0x6C, 0x71, 0x56, 0x4B,
-    0x18, 0x05, 0x22, 0x3F, 0x84, 0x99, 0xBE, 0xA3, 0xF0, 0xED, 0xCA, 0xD7, 0x35, 0x28, 0x0F,
-    0x12, 0x41, 0x5C, 0x7B, 0x66, 0xDD, 0xC0, 0xE7, 0xFA, 0xA9, 0xB4, 0x93, 0x8E, 0xF8, 0xE5,
-    0xC2, 0xDF, 0x8C, 0x91, 0xB6, 0xAB, 0x10, 0x0D, 0x2A, 0x37, 0x64, 0x79, 0x5E, 0x43, 0xB2,
-    0xAF, 0x88, 0x95, 0xC6, 0xDB, 0xFC, 0xE1, 0x5A, 0x47, 0x60, 0x7D, 0x2E, 0x33, 0x14, 0x09,
-    0x7F, 0x62, 0x45, 0x58, 0x0B, 0x16, 0x31, 0x2C, 0x97, 0x8A, 0xAD, 0xB0, 0xE3, 0xFE, 0xD9,
-    0xC4,
+    0x00, 0x1D, 0x3A, 0x27, 0x74, 0x69, 0x4E, 0x53, 0xE8, 0xF5, 0xD2, 0xCF, 0x9C, 0x81, 0xA6, 0xBB,
+    0xCD, 0xD0, 0xF7, 0xEA, 0xB9, 0xA4, 0x83, 0x9E, 0x25, 0x38, 0x1F, 0x02, 0x51, 0x4C, 0x6B, 0x76,
+    0x87, 0x9A, 0xBD, 0xA0, 0xF3, 0xEE, 0xC9, 0xD4, 0x6F, 0x72, 0x55, 0x48, 0x1B, 0x06, 0x21, 0x3C,
+    0x4A, 0x57, 0x70, 0x6D, 0x3E, 0x23, 0x04, 0x19, 0xA2, 0xBF, 0x98, 0x85, 0xD6, 0xCB, 0xEC, 0xF1,
+    0x13, 0x0E, 0x29, 0x34, 0x67, 0x7A, 0x5D, 0x40, 0xFB, 0xE6, 0xC1, 0xDC, 0x8F, 0x92, 0xB5, 0xA8,
+    0xDE, 0xC3, 0xE4, 0xF9, 0xAA, 0xB7, 0x90, 0x8D, 0x36, 0x2B, 0x0C, 0x11, 0x42, 0x5F, 0x78, 0x65,
+    0x94, 0x89, 0xAE, 0xB3, 0xE0, 0xFD, 0xDA, 0xC7, 0x7C, 0x61, 0x46, 0x5B, 0x08, 0x15, 0x32, 0x2F,
+    0x59, 0x44, 0x63, 0x7E, 0x2D, 0x30, 0x17, 0x0A, 0xB1, 0xAC, 0x8B, 0x96, 0xC5, 0xD8, 0xFF, 0xE2,
+    0x26, 0x3B, 0x1C, 0x01, 0x52, 0x4F, 0x68, 0x75, 0xCE, 0xD3, 0xF4, 0xE9, 0xBA, 0xA7, 0x80, 0x9D,
+    0xEB, 0xF6, 0xD1, 0xCC, 0x9F, 0x82, 0xA5, 0xB8, 0x03, 0x1E, 0x39, 0x24, 0x77, 0x6A, 0x4D, 0x50,
+    0xA1, 0xBC, 0x9B, 0x86, 0xD5, 0xC8, 0xEF, 0xF2, 0x49, 0x54, 0x73, 0x6E, 0x3D, 0x20, 0x07, 0x1A,
+    0x6C, 0x71, 0x56, 0x4B, 0x18, 0x05, 0x22, 0x3F, 0x84, 0x99, 0xBE, 0xA3, 0xF0, 0xED, 0xCA, 0xD7,
+    0x35, 0x28, 0x0F, 0x12, 0x41, 0x5C, 0x7B, 0x66, 0xDD, 0xC0, 0xE7, 0xFA, 0xA9, 0xB4, 0x93, 0x8E,
+    0xF8, 0xE5, 0xC2, 0xDF, 0x8C, 0x91, 0xB6, 0xAB, 0x10, 0x0D, 0x2A, 0x37, 0x64, 0x79, 0x5E, 0x43,
+    0xB2, 0xAF, 0x88, 0x95, 0xC6, 0xDB, 0xFC, 0xE1, 0x5A, 0x47, 0x60, 0x7D, 0x2E, 0x33, 0x14, 0x09,
+    0x7F, 0x62, 0x45, 0x58, 0x0B, 0x16, 0x31, 0x2C, 0x97, 0x8A, 0xAD, 0xB0, 0xE3, 0xFE, 0xD9, 0xC4,
 ];
 
 pub fn sbc_crc8(data: &[u8], len_bits: usize) -> u8 {
@@ -1430,7 +1389,9 @@ impl SbcDecoder {
     pub const fn new() -> Self {
         Self {
             v: [[0; 170]; 2],
-            offset: [[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160]; 2],
+            offset: [[
+                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+            ]; 2],
             subbands: 0,
         }
     }
@@ -1693,11 +1654,7 @@ impl SbcDecoder {
                                 SBC_OFFSET8[sf_idx][sb]
                             };
                             let loudness = (scale_factor[ch][sb] as i32) - offset;
-                            bitneed[sb] = if loudness > 0 {
-                                loudness / 2
-                            } else {
-                                loudness
-                            };
+                            bitneed[sb] = if loudness > 0 { loudness / 2 } else { loudness };
                         }
                         if bitneed[sb] > max_bitneed {
                             max_bitneed = bitneed[sb];
@@ -1788,11 +1745,7 @@ impl SbcDecoder {
                                 SBC_OFFSET8[sf_idx][sb]
                             };
                             let loudness = (scale_factor[ch][sb] as i32) - offset;
-                            bitneed[ch][sb] = if loudness > 0 {
-                                loudness / 2
-                            } else {
-                                loudness
-                            };
+                            bitneed[ch][sb] = if loudness > 0 { loudness / 2 } else { loudness };
                         }
                         if bitneed[ch][sb] > max_bitneed {
                             max_bitneed = bitneed[ch][sb];
@@ -2207,9 +2160,7 @@ impl SbcEncoder {
         );
 
         // Compute total bits to verify sbc_out capacity
-        let header_bits = 32
-            + (if mode == 3 { subbands } else { 0 })
-            + (4 * subbands * channels);
+        let header_bits = 32 + (if mode == 3 { subbands } else { 0 }) + (4 * subbands * channels);
         let mut payload_bits = 0usize;
         for ch in 0..channels {
             for sb in 0..subbands {
@@ -2276,8 +2227,7 @@ impl SbcEncoder {
                     let limit = (1i32 << shift) - 1;
                     let clamped = sb_sample[blk][ch][sb].clamp(-limit, limit);
                     let shifted = (clamped + (1i32 << shift)) as u64;
-                    let audio_sample =
-                        ((shifted * lvl) >> (shift + 1)).min(lvl - 1) as u32;
+                    let audio_sample = ((shifted * lvl) >> (shift + 1)).min(lvl - 1) as u32;
 
                     for b in 0..num_bits {
                         let bit_val = (audio_sample >> (num_bits - 1 - b)) & 0x01;
@@ -2947,7 +2897,11 @@ impl BtA2dpSink {
                 eir_param[offset + 1] = 0x0A;
                 eir_param[offset + 2] = 0x09;
 
-                Self::send_cmd(transport, OPCODE_WRITE_EXTENDED_INQUIRY_RESPONSE, &eir_param)
+                Self::send_cmd(
+                    transport,
+                    OPCODE_WRITE_EXTENDED_INQUIRY_RESPONSE,
+                    &eir_param,
+                )
             }
             InitStep::WriteInquiryMode => {
                 // HCI_Write_Inquiry_Mode (0x0C45) -> 0x02
@@ -2974,7 +2928,11 @@ impl BtA2dpSink {
             InitStep::WriteDefaultLinkPolicySettings => {
                 // 0x0007 = Role Switch + Hold + Sniff
                 let params = [0x07, 0x00];
-                Self::send_cmd(transport, OPCODE_WRITE_DEFAULT_LINK_POLICY_SETTINGS, &params)
+                Self::send_cmd(
+                    transport,
+                    OPCODE_WRITE_DEFAULT_LINK_POLICY_SETTINGS,
+                    &params,
+                )
             }
             InitStep::WriteScanEnable => {
                 // 0x03 = Inquiry Scan + Page Scan
@@ -2986,12 +2944,13 @@ impl BtA2dpSink {
                 let params: [u8; 15] = [
                     0x00, 0x01, // Advertising_Interval_Min = 0x0100
                     0x00, 0x02, // Advertising_Interval_Max = 0x0200
-                    0x00,       // Advertising_Type = ADV_IND
-                    0x00,       // Own_Address_Type = Public
-                    0x00,       // Peer_Address_Type = Public
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Peer_Address (6 bytes, indices 7..13)
-                    0x07,       // Advertising_Channel_Map = 0x07 (index 13: ch 37, 38, 39)
-                    0x00,       // Advertising_Filter_Policy = 0x00 (index 14)
+                    0x00, // Advertising_Type = ADV_IND
+                    0x00, // Own_Address_Type = Public
+                    0x00, // Peer_Address_Type = Public
+                    0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, // Peer_Address (6 bytes, indices 7..13)
+                    0x07, // Advertising_Channel_Map = 0x07 (index 13: ch 37, 38, 39)
+                    0x00, // Advertising_Filter_Policy = 0x00 (index 14)
                 ];
                 Self::send_cmd(transport, OPCODE_LE_SET_ADV_PARAMS, &params)
             }
@@ -3073,9 +3032,7 @@ impl BtA2dpSink {
             InitStep::WritePageScanType if opcode == OPCODE_WRITE_PAGE_SCAN_TYPE => {
                 self.init_step = InitStep::WriteInquiryScanActivity;
             }
-            InitStep::WriteInquiryScanActivity
-                if opcode == OPCODE_WRITE_INQUIRY_SCAN_ACTIVITY =>
-            {
+            InitStep::WriteInquiryScanActivity if opcode == OPCODE_WRITE_INQUIRY_SCAN_ACTIVITY => {
                 self.init_step = InitStep::WriteInquiryScanType;
             }
             InitStep::WriteInquiryScanType if opcode == OPCODE_WRITE_INQUIRY_SCAN_TYPE => {
@@ -3227,11 +3184,7 @@ impl BtA2dpSink {
                     if self.security_policy.pairing_policy == BtPairingPolicy::BondedOnly
                         && self.find_bond_key(&bd_addr).is_none()
                     {
-                        Self::send_cmd(
-                            transport,
-                            OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY,
-                            &bd_addr,
-                        );
+                        Self::send_cmd(transport, OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY, &bd_addr);
                     } else {
                         let pin = self.security_policy.pin_code();
                         let pin_len = pin.len().min(16);
@@ -3296,7 +3249,11 @@ impl BtA2dpSink {
                         );
                         return;
                     }
-                    Self::send_cmd(transport, OPCODE_USER_CONFIRMATION_REQUEST_REPLY, &params[..6]);
+                    Self::send_cmd(
+                        transport,
+                        OPCODE_USER_CONFIRMATION_REQUEST_REPLY,
+                        &params[..6],
+                    );
                 }
             }
             _ => {}
@@ -3844,14 +3801,12 @@ impl BtA2dpSink {
         // 0x0311: Uint16(0x0001) [6 bytes]
         const RECORD_ATTRS: [u8; 77] = {
             let mut attrs = [
-                0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01,
-                0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x0B,
-                0x09, 0x00, 0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x19, 0x35,
-                0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03,
-                0x09, 0x00, 0x05, 0x35, 0x03, 0x19, 0x10, 0x02,
-                0x09, 0x00, 0x09, 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0D, 0x09, 0x01, 0x03,
-                0x09, 0x01, 0x00, 0x25, 0x08, 0, 0, 0, 0, 0, 0, 0, 0,
-                0x09, 0x03, 0x11, 0x09, 0x00, 0x01,
+                0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x09, 0x00, 0x01, 0x35, 0x03, 0x19,
+                0x11, 0x0B, 0x09, 0x00, 0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00,
+                0x19, 0x35, 0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03, 0x09, 0x00, 0x05, 0x35, 0x03,
+                0x19, 0x10, 0x02, 0x09, 0x00, 0x09, 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0D, 0x09,
+                0x01, 0x03, 0x09, 0x01, 0x00, 0x25, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0x09, 0x03, 0x11,
+                0x09, 0x00, 0x01,
             ];
             // ServiceName (0x0100) is a Text(8) element at bytes 63..71; this
             // fixed record layout only fits an 8-byte name.
@@ -3878,7 +3833,7 @@ impl BtA2dpSink {
                 rsp[1..3].copy_from_slice(&tid.to_be_bytes());
                 if matches {
                     rsp[3..5].copy_from_slice(&0x0009u16.to_be_bytes()); // Param len
-                    // TotalServiceRecordCount = 1
+                                                                         // TotalServiceRecordCount = 1
                     rsp[5..7].copy_from_slice(&0x0001u16.to_be_bytes());
                     // CurrentServiceRecordCount = 1
                     rsp[7..9].copy_from_slice(&0x0001u16.to_be_bytes());
@@ -3896,9 +3851,8 @@ impl BtA2dpSink {
             0x04 => {
                 // ServiceAttributeRequest -> 0x05 ServiceAttributeResponse
                 if params.len() >= 4 {
-                    let req_handle = u32::from_be_bytes([
-                        params[0], params[1], params[2], params[3],
-                    ]);
+                    let req_handle =
+                        u32::from_be_bytes([params[0], params[1], params[2], params[3]]);
                     let mut rsp = [0u8; 128];
                     rsp[0] = 0x05;
                     rsp[1..3].copy_from_slice(&tid.to_be_bytes());
@@ -3962,12 +3916,8 @@ impl BtA2dpSink {
         // Match 16-bit, 32-bit, or 128-bit UUID against known A2DP/AVDTP UUIDs:
         // 0x110B (AudioSink), 0x110D (A2DP), 0x0019 (AVDTP),
         // 0x0100 (L2CAP), 0x1002 (BrowseRoot)
-        let is_target = |uuid: u16| -> bool {
-            matches!(
-                uuid,
-                0x110B | 0x110D | 0x0019 | 0x0100 | 0x1002
-            )
-        };
+        let is_target =
+            |uuid: u16| -> bool { matches!(uuid, 0x110B | 0x110D | 0x0019 | 0x0100 | 0x1002) };
         const BT_BASE_UUID_SUFFIX: [u8; 12] = [
             0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB,
         ];
@@ -4159,10 +4109,9 @@ impl BtA2dpSink {
             if payload.len() < rtp_header_len + 4 {
                 return;
             }
-            let ext_words = u16::from_be_bytes([
-                payload[rtp_header_len + 2],
-                payload[rtp_header_len + 3],
-            ]) as usize;
+            let ext_words =
+                u16::from_be_bytes([payload[rtp_header_len + 2], payload[rtp_header_len + 3]])
+                    as usize;
             rtp_header_len += 4 + ext_words * 4;
         }
 
@@ -4180,7 +4129,10 @@ impl BtA2dpSink {
                 continue;
             }
 
-            match self.sbc_decoder.decode_frame(&payload[offset..], &mut self.pcm_staging) {
+            match self
+                .sbc_decoder
+                .decode_frame(&payload[offset..], &mut self.pcm_staging)
+            {
                 Ok((bytes_consumed, num_stereo_samples)) => {
                     self.decoded_frames =
                         self.decoded_frames.wrapping_add(num_stereo_samples as u64);
@@ -4324,8 +4276,7 @@ impl BtA2dpSink {
             } else if opcode == AVRCP_OPCODE_VENDOR_DEPENDENT && payload.len() >= 13 {
                 if payload[6..9] == BT_SIG_COMPANY_ID {
                     let pdu_id = payload[9];
-                    let param_len =
-                        u16::from_be_bytes([payload[11], payload[12]]) as usize;
+                    let param_len = u16::from_be_bytes([payload[11], payload[12]]) as usize;
                     let params = &payload[13..payload.len().min(13 + param_len)];
 
                     match pdu_id {
@@ -4334,11 +4285,8 @@ impl BtA2dpSink {
                             self.avrcp_volume_raw = vol_raw;
                             self.avrcp_volume_pct = avrcp_raw_to_volume_pct(vol_raw);
                             let mut rsp = [0u8; 14];
-                            let n = build_avrcp_set_absolute_volume_rsp(
-                                tx_label,
-                                vol_raw,
-                                &mut rsp,
-                            );
+                            let n =
+                                build_avrcp_set_absolute_volume_rsp(tx_label, vol_raw, &mut rsp);
                             Self::send_l2cap(transport, handle, cid, &rsp[..n]);
                             return;
                         }
@@ -4657,7 +4605,8 @@ mod tests {
             EVT_COMMAND_COMPLETE,
             0x04,
             0x01,
-            0x03, 0x0C, // OPCODE_RESET
+            0x03,
+            0x0C, // OPCODE_RESET
             0x00,
         ]);
 
@@ -4682,8 +4631,15 @@ mod tests {
             HCI_PKT_EVENT,
             EVT_CONNECTION_REQUEST,
             10,
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, // bd_addr
-            0x04, 0x04, 0x20, // cod
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66, // bd_addr
+            0x04,
+            0x04,
+            0x20, // cod
             0x01, // link_type: ACL
         ];
         sink.process_packet(&mut transport, &conn_req, |_, _| {});
@@ -4703,8 +4659,14 @@ mod tests {
             EVT_CONNECTION_COMPLETE,
             11,
             0x00, // Status: Success
-            0x40, 0x00, // Handle = 0x0040
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x40,
+            0x00, // Handle = 0x0040
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
             0x01, // ACL
             0x00, // Encryption disabled
         ];
@@ -4714,7 +4676,15 @@ mod tests {
 
         // 3. Link Key Request (not yet paired) -> Negative Reply
         let link_key_req = [
-            HCI_PKT_EVENT, EVT_LINK_KEY_REQUEST, 6, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            HCI_PKT_EVENT,
+            EVT_LINK_KEY_REQUEST,
+            6,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
         ];
         sink.process_packet(&mut transport, &link_key_req, |_, _| {});
         let last_cmd = transport.tx_packets.last().unwrap();
@@ -4726,7 +4696,15 @@ mod tests {
 
         // 4. IO Capability Request -> NoInputNoOutput (0x03)
         let io_cap_req = [
-            HCI_PKT_EVENT, EVT_IO_CAPABILITY_REQUEST, 6, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            HCI_PKT_EVENT,
+            EVT_IO_CAPABILITY_REQUEST,
+            6,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
         ];
         sink.process_packet(&mut transport, &io_cap_req, |_, _| {});
         let last_cmd = transport.tx_packets.last().unwrap();
@@ -4742,8 +4720,16 @@ mod tests {
             HCI_PKT_EVENT,
             EVT_USER_CONFIRMATION_REQUEST,
             10,
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-            0x12, 0x34, 0x56, 0x78, // numeric value
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+            0x12,
+            0x34,
+            0x56,
+            0x78, // numeric value
         ];
         sink.process_packet(&mut transport, &user_confirm_req, |_, _| {});
         let last_cmd = transport.tx_packets.last().unwrap();
@@ -4769,7 +4755,10 @@ mod tests {
         // 7. Subsequent Link Key Request -> Now responds with Link_Key_Request_Reply
         sink.process_packet(&mut transport, &link_key_req, |_, _| {});
         let last_cmd = transport.tx_packets.last().unwrap();
-        assert_eq!(u16::from_le_bytes([last_cmd[1], last_cmd[2]]), OPCODE_LINK_KEY_REQUEST_REPLY);
+        assert_eq!(
+            u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
+            OPCODE_LINK_KEY_REQUEST_REPLY
+        );
         assert_eq!(&last_cmd[10..26], &dummy_key);
     }
 
@@ -4784,8 +4773,16 @@ mod tests {
             HCI_PKT_EVENT,
             EVT_USER_CONFIRMATION_REQUEST,
             10,
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-            0x12, 0x34, 0x56, 0x78,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+            0x12,
+            0x34,
+            0x56,
+            0x78,
         ];
         sink.process_packet(&mut transport, &user_confirm_req, |_, _| {});
         let last_cmd = transport.tx_packets.last().unwrap();
@@ -4820,10 +4817,13 @@ mod tests {
             AVRCP_CTYPE_CONTROL,
             0x48, // Subunit: Panel
             AVRCP_OPCODE_VENDOR_DEPENDENT,
-            0x00, 0x19, 0x58, // BT_SIG_COMPANY_ID
+            0x00,
+            0x19,
+            0x58, // BT_SIG_COMPANY_ID
             0xFE, // Unknown PDU
             0x00, // Packet type: Single
-            0x00, 0x00, // Parameter length: 0
+            0x00,
+            0x00, // Parameter length: 0
         ];
         let mut acl = Vec::new();
         acl.push(HCI_PKT_ACL);
@@ -4855,7 +4855,7 @@ mod tests {
         echo_req.extend_from_slice(&acl_data_len.to_le_bytes()); // ACL data len
         echo_req.extend_from_slice(&l2cap_info_len.to_le_bytes()); // L2CAP len
         echo_req.extend_from_slice(&L2CAP_CID_SIGNALING.to_le_bytes()); // CID 0x0001
-        // Signaling command: code=0x08 (Echo Req), ident=0x42, len
+                                                                        // Signaling command: code=0x08 (Echo Req), ident=0x42, len
         echo_req.push(L2CAP_CMD_ECHO_REQ);
         echo_req.push(0x42); // Ident
         echo_req.extend_from_slice(&(ping_payload.len() as u16).to_le_bytes());
@@ -4866,7 +4866,10 @@ mod tests {
         // Expect Echo Response on CID 0x0001
         let last_tx = transport.tx_packets.last().expect("echo response sent");
         assert_eq!(last_tx[0], HCI_PKT_ACL);
-        assert_eq!(u16::from_le_bytes([last_tx[7], last_tx[8]]), L2CAP_CID_SIGNALING);
+        assert_eq!(
+            u16::from_le_bytes([last_tx[7], last_tx[8]]),
+            L2CAP_CID_SIGNALING
+        );
         assert_eq!(last_tx[9], L2CAP_CMD_ECHO_RSP);
         assert_eq!(last_tx[10], 0x42); // Matching ident
         assert_eq!(&last_tx[13..13 + ping_payload.len()], ping_payload);
@@ -4874,14 +4877,20 @@ mod tests {
         // Test Information Request for Extended Features Mask (0x0002)
         let info_req = [
             HCI_PKT_ACL,
-            0x40, 0x20, // Handle 0x0040, PB=2
-            10, 0, // ACL len
-            6, 0, // L2CAP len
-            0x01, 0x00, // CID 0x0001
+            0x40,
+            0x20, // Handle 0x0040, PB=2
+            10,
+            0, // ACL len
+            6,
+            0, // L2CAP len
+            0x01,
+            0x00, // CID 0x0001
             L2CAP_CMD_INFO_REQ,
             0x43, // Ident
-            0x02, 0x00, // Cmd len
-            0x02, 0x00, // info_type: Extended Features Mask
+            0x02,
+            0x00, // Cmd len
+            0x02,
+            0x00, // info_type: Extended Features Mask
         ];
         sink.process_packet(&mut transport, &info_req, |_, _| {});
         let last_tx = transport.tx_packets.last().unwrap();
@@ -4944,8 +4953,23 @@ mod tests {
 
         // Establish SDP channel (PSM 0x0001, peer SCID 0x0050)
         let sdp_conn_req = [
-            HCI_PKT_ACL, 0x40, 0x20, 12, 0, 8, 0, 0x01, 0x00,
-            L2CAP_CMD_CONN_REQ, 0x10, 4, 0, 0x01, 0x00, 0x50, 0x00,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            12,
+            0,
+            8,
+            0,
+            0x01,
+            0x00,
+            L2CAP_CMD_CONN_REQ,
+            0x10,
+            4,
+            0,
+            0x01,
+            0x00,
+            0x50,
+            0x00,
         ];
         sink.process_packet(&mut transport, &sdp_conn_req, |_, _| {});
         let sdp_cid = sink.channels[0].local_cid;
@@ -4954,28 +4978,71 @@ mod tests {
         // 1. Search for AudioSink (0x110B) via SDP
         // ServiceSearchAttributeRequest (PDU 0x06)
         let sdp_req_audio = [
-            HCI_PKT_ACL, 0x40, 0x20, 21, 0, 17, 0, sdp_cid as u8, (sdp_cid >> 8) as u8,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            21,
+            0,
+            17,
+            0,
+            sdp_cid as u8,
+            (sdp_cid >> 8) as u8,
             0x06, // PDU 0x06
-            0x00, 0x01, // TID
-            0x00, 0x0C, // Param len
+            0x00,
+            0x01, // TID
+            0x00,
+            0x0C, // Param len
             // ServiceSearchPattern: DES { UUID16(0x110B) }
-            0x35, 0x03, 0x19, 0x11, 0x0B,
-            0x03, 0xFF, // Max attr byte count
-            0x35, 0x03, 0x09, 0x00, 0x00, // Attr list
+            0x35,
+            0x03,
+            0x19,
+            0x11,
+            0x0B,
+            0x03,
+            0xFF, // Max attr byte count
+            0x35,
+            0x03,
+            0x09,
+            0x00,
+            0x00, // Attr list
         ];
         sink.process_packet(&mut transport, &sdp_req_audio, |_, _| {});
         let last_tx = transport.tx_packets.last().unwrap();
         assert_eq!(u16::from_le_bytes([last_tx[7], last_tx[8]]), 0x0050); // Peer SCID
         assert_eq!(last_tx[9], 0x07); // SDP ServiceSearchAttributeResponse
-        // Contains the BT local name in the service name
+                                      // Contains the BT local name in the service name
         assert!(last_tx.windows(8).any(|w| w == BT_LOCAL_NAME));
 
         // 1b. Search for AudioSink via 32-bit UUID (0x1A)
         let sdp_req_audio32 = [
-            HCI_PKT_ACL, 0x40, 0x20, 23, 0, 19, 0, sdp_cid as u8, (sdp_cid >> 8) as u8,
-            0x06, 0x00, 0x03, 0x00, 0x0E,
-            0x35, 0x05, 0x1A, 0x00, 0x00, 0x11, 0x0B, // 32-bit UUID
-            0x03, 0xFF, 0x35, 0x03, 0x09, 0x00, 0x00,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            23,
+            0,
+            19,
+            0,
+            sdp_cid as u8,
+            (sdp_cid >> 8) as u8,
+            0x06,
+            0x00,
+            0x03,
+            0x00,
+            0x0E,
+            0x35,
+            0x05,
+            0x1A,
+            0x00,
+            0x00,
+            0x11,
+            0x0B, // 32-bit UUID
+            0x03,
+            0xFF,
+            0x35,
+            0x03,
+            0x09,
+            0x00,
+            0x00,
         ];
         sink.process_packet(&mut transport, &sdp_req_audio32, |_, _| {});
         let last_tx = transport.tx_packets.last().unwrap();
@@ -4984,12 +5051,46 @@ mod tests {
 
         // 1c. Search for AudioSink via 128-bit Bluetooth Base UUID (0x1C)
         let sdp_req_audio128 = [
-            HCI_PKT_ACL, 0x40, 0x20, 35, 0, 31, 0, sdp_cid as u8, (sdp_cid >> 8) as u8,
-            0x06, 0x00, 0x04, 0x00, 0x1A,
-            0x35, 0x11, 0x1C,
-            0x00, 0x00, 0x11, 0x0B, // 16-bit short in 128-bit base
-            0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB,
-            0x03, 0xFF, 0x35, 0x03, 0x09, 0x00, 0x00,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            35,
+            0,
+            31,
+            0,
+            sdp_cid as u8,
+            (sdp_cid >> 8) as u8,
+            0x06,
+            0x00,
+            0x04,
+            0x00,
+            0x1A,
+            0x35,
+            0x11,
+            0x1C,
+            0x00,
+            0x00,
+            0x11,
+            0x0B, // 16-bit short in 128-bit base
+            0x00,
+            0x00,
+            0x10,
+            0x00,
+            0x80,
+            0x00,
+            0x00,
+            0x80,
+            0x5F,
+            0x9B,
+            0x34,
+            0xFB,
+            0x03,
+            0xFF,
+            0x35,
+            0x03,
+            0x09,
+            0x00,
+            0x00,
         ];
         sink.process_packet(&mut transport, &sdp_req_audio128, |_, _| {});
         let last_tx = transport.tx_packets.last().unwrap();
@@ -4998,13 +5099,32 @@ mod tests {
 
         // 2. Search for HFP (0x111E) -> Must reject with empty match [0x35, 0x00]
         let sdp_req_hfp = [
-            HCI_PKT_ACL, 0x40, 0x20, 21, 0, 17, 0, sdp_cid as u8, (sdp_cid >> 8) as u8,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            21,
+            0,
+            17,
+            0,
+            sdp_cid as u8,
+            (sdp_cid >> 8) as u8,
             0x06, // PDU 0x06
-            0x00, 0x02, // TID
-            0x00, 0x0C, // Param len
-            0x35, 0x03, 0x19, 0x11, 0x1E, // UUID16 0x111E (HFP)
-            0x03, 0xFF,
-            0x35, 0x03, 0x09, 0x00, 0x00,
+            0x00,
+            0x02, // TID
+            0x00,
+            0x0C, // Param len
+            0x35,
+            0x03,
+            0x19,
+            0x11,
+            0x1E, // UUID16 0x111E (HFP)
+            0x03,
+            0xFF,
+            0x35,
+            0x03,
+            0x09,
+            0x00,
+            0x00,
         ];
         sink.process_packet(&mut transport, &sdp_req_hfp, |_, _| {});
         let last_tx = transport.tx_packets.last().unwrap();
@@ -5021,8 +5141,23 @@ mod tests {
 
         // Open AVDTP Signaling channel (PSM 0x0019, peer SCID 0x0060)
         let avdtp_sig_conn = [
-            HCI_PKT_ACL, 0x40, 0x20, 12, 0, 8, 0, 0x01, 0x00,
-            L2CAP_CMD_CONN_REQ, 0x20, 4, 0, 0x19, 0x00, 0x60, 0x00,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            12,
+            0,
+            8,
+            0,
+            0x01,
+            0x00,
+            L2CAP_CMD_CONN_REQ,
+            0x20,
+            4,
+            0,
+            0x19,
+            0x00,
+            0x60,
+            0x00,
         ];
         sink.process_packet(&mut transport, &avdtp_sig_conn, |_, _| {});
         let sig_cid = sink.channels[0].local_cid;
@@ -5030,7 +5165,15 @@ mod tests {
 
         // 1. DISCOVER
         let discover_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 6, 0, 2, 0, sig_cid as u8, (sig_cid >> 8) as u8,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            6,
+            0,
+            2,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
             0x00, // TxLabel=0, MsgType=Cmd (0)
             AVDTP_DISCOVER,
         ];
@@ -5044,8 +5187,18 @@ mod tests {
 
         // 2. GET_ALL_CAPABILITIES
         let get_caps_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 7, 0, 3, 0, sig_cid as u8, (sig_cid >> 8) as u8,
-            0x10, AVDTP_GET_ALL_CAPABILITIES, 0x04,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            7,
+            0,
+            3,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
+            0x10,
+            AVDTP_GET_ALL_CAPABILITIES,
+            0x04,
         ];
         sink.process_packet(&mut transport, &get_caps_cmd, |_, _| {});
         let last_tx = transport.tx_packets.last().unwrap();
@@ -5054,10 +5207,29 @@ mod tests {
 
         // 3. SET_CONFIGURATION (Configuring 48kHz SBC)
         let set_cfg_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 18, 0, 14, 0, sig_cid as u8, (sig_cid >> 8) as u8,
-            0x20, AVDTP_SET_CONFIGURATION, 0x04, 0x04,
-            0x01, 0x00, // Media Transport
-            0x07, 0x06, 0x00, 0x00, 0x11, 0xFF, 2, 53, // 48kHz (0x10) + Joint Stereo (0x01)
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            18,
+            0,
+            14,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
+            0x20,
+            AVDTP_SET_CONFIGURATION,
+            0x04,
+            0x04,
+            0x01,
+            0x00, // Media Transport
+            0x07,
+            0x06,
+            0x00,
+            0x00,
+            0x11,
+            0xFF,
+            2,
+            53, // 48kHz (0x10) + Joint Stereo (0x01)
         ];
         sink.process_packet(&mut transport, &set_cfg_cmd, |_, _| {});
         assert_eq!(sink.avdtp_state, AvdtpStreamState::Configured);
@@ -5065,8 +5237,18 @@ mod tests {
 
         // 4. OPEN
         let open_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 7, 0, 3, 0, sig_cid as u8, (sig_cid >> 8) as u8,
-            0x30, AVDTP_OPEN, 0x04,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            7,
+            0,
+            3,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
+            0x30,
+            AVDTP_OPEN,
+            0x04,
         ];
         sink.process_packet(&mut transport, &open_cmd, |_, _| {});
         assert_eq!(sink.avdtp_state, AvdtpStreamState::Open);
@@ -5079,8 +5261,18 @@ mod tests {
 
         // 5. START
         let start_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 7, 0, 3, 0, sig_cid as u8, (sig_cid >> 8) as u8,
-            0x40, AVDTP_START, 0x04,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            7,
+            0,
+            3,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
+            0x40,
+            AVDTP_START,
+            0x04,
         ];
         sink.process_packet(&mut transport, &start_cmd, |_, _| {});
         assert_eq!(sink.avdtp_state, AvdtpStreamState::Streaming);
@@ -5088,8 +5280,18 @@ mod tests {
 
         // 6. SUSPEND
         let suspend_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 7, 0, 3, 0, sig_cid as u8, (sig_cid >> 8) as u8,
-            0x50, AVDTP_SUSPEND, 0x04,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            7,
+            0,
+            3,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
+            0x50,
+            AVDTP_SUSPEND,
+            0x04,
         ];
         sink.process_packet(&mut transport, &suspend_cmd, |_, _| {});
         assert_eq!(sink.avdtp_state, AvdtpStreamState::Open);
@@ -5097,8 +5299,18 @@ mod tests {
 
         // 7. CLOSE
         let close_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 7, 0, 3, 0, sig_cid as u8, (sig_cid >> 8) as u8,
-            0x60, AVDTP_CLOSE, 0x04,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            7,
+            0,
+            3,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
+            0x60,
+            AVDTP_CLOSE,
+            0x04,
         ];
         sink.process_packet(&mut transport, &close_cmd, |_, _| {});
         assert_eq!(sink.avdtp_state, AvdtpStreamState::Idle);
@@ -5106,7 +5318,15 @@ mod tests {
 
         // 8. Unknown AVDTP command -> General Reject (msg_type 0x01)
         let unknown_cmd = [
-            HCI_PKT_ACL, 0x40, 0x20, 6, 0, 2, 0, sig_cid as u8, (sig_cid >> 8) as u8,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            6,
+            0,
+            2,
+            0,
+            sig_cid as u8,
+            (sig_cid >> 8) as u8,
             0x70, // TxLabel=7, MsgType=Cmd (0)
             0x3E, // Unknown sig_id
         ];
@@ -5135,7 +5355,10 @@ mod tests {
                 non_zero_count += 1;
             }
         }
-        assert!(non_zero_count > 0, "Synthesized PCM samples must be non-zero");
+        assert!(
+            non_zero_count > 0,
+            "Synthesized PCM samples must be non-zero"
+        );
 
         // 2. Decode 4-subband frame (16 blocks, 4 subbands, Stereo, SNR, Bitpool 30)
         let mut pcm_buf4 = [0i16; 512];
@@ -5151,7 +5374,10 @@ mod tests {
                 non_zero_count4 += 1;
             }
         }
-        assert!(non_zero_count4 > 0, "4-subband synthesized PCM samples must be non-zero");
+        assert!(
+            non_zero_count4 > 0,
+            "4-subband synthesized PCM samples must be non-zero"
+        );
     }
 
     #[test]
@@ -5164,15 +5390,45 @@ mod tests {
 
         // Open first AVDTP channel (Signaling)
         let sig_conn = [
-            HCI_PKT_ACL, 0x40, 0x20, 12, 0, 8, 0, 0x01, 0x00,
-            L2CAP_CMD_CONN_REQ, 0x01, 4, 0, 0x19, 0x00, 0x60, 0x00,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            12,
+            0,
+            8,
+            0,
+            0x01,
+            0x00,
+            L2CAP_CMD_CONN_REQ,
+            0x01,
+            4,
+            0,
+            0x19,
+            0x00,
+            0x60,
+            0x00,
         ];
         sink.process_packet(&mut transport, &sig_conn, |_, _| {});
 
         // Open second AVDTP channel (Media)
         let media_conn = [
-            HCI_PKT_ACL, 0x40, 0x20, 12, 0, 8, 0, 0x01, 0x00,
-            L2CAP_CMD_CONN_REQ, 0x02, 4, 0, 0x19, 0x00, 0x61, 0x00,
+            HCI_PKT_ACL,
+            0x40,
+            0x20,
+            12,
+            0,
+            8,
+            0,
+            0x01,
+            0x00,
+            L2CAP_CMD_CONN_REQ,
+            0x02,
+            4,
+            0,
+            0x19,
+            0x00,
+            0x61,
+            0x00,
         ];
         sink.process_packet(&mut transport, &media_conn, |_, _| {});
         let media_cid = sink.channels[1].local_cid;
@@ -5219,7 +5475,10 @@ mod tests {
         sink.process_packet(&mut transport, &media_pkt, |_, _| {
             dropped_pcm = true;
         });
-        assert!(!dropped_pcm, "Media packet must be dropped when not in Streaming state");
+        assert!(
+            !dropped_pcm,
+            "Media packet must be dropped when not in Streaming state"
+        );
 
         // Verify RTP header extension (X bit set) is properly parsed and skipped
         sink.avdtp_state = AvdtpStreamState::Streaming;
@@ -5246,7 +5505,10 @@ mod tests {
         sink.process_packet(&mut transport, &ext_media_pkt, |pcm, _| {
             ext_pcm_bytes += pcm.len();
         });
-        assert_eq!(ext_pcm_bytes, 512, "RTP extension header must be skipped to decode PCM");
+        assert_eq!(
+            ext_pcm_bytes, 512,
+            "RTP extension header must be skipped to decode PCM"
+        );
     }
 
     #[test]
@@ -5256,11 +5518,20 @@ mod tests {
 
         // send_cmd > 255 bytes returns false
         let large_params = [0u8; 256];
-        assert!(!BtA2dpSink::send_cmd(&mut transport, OPCODE_RESET, &large_params));
+        assert!(!BtA2dpSink::send_cmd(
+            &mut transport,
+            OPCODE_RESET,
+            &large_params
+        ));
 
         // send_l2cap > 1015 bytes returns false
         let large_l2cap = [0u8; 1016];
-        assert!(!BtA2dpSink::send_l2cap(&mut transport, 0x0040, 0x0040, &large_l2cap));
+        assert!(!BtA2dpSink::send_l2cap(
+            &mut transport,
+            0x0040,
+            0x0040,
+            &large_l2cap
+        ));
 
         // ACL packet with l2cap_len > 1020 triggers reassembly abort
         let mut oversized_acl = Vec::new();
@@ -5272,7 +5543,10 @@ mod tests {
         oversized_acl.extend_from_slice(&[0u8; 30]);
 
         sink.process_packet(&mut transport, &oversized_acl, |_, _| {});
-        assert!(!sink.acl_reassembly.active, "Oversized L2CAP PDU must abort reassembly");
+        assert!(
+            !sink.acl_reassembly.active,
+            "Oversized L2CAP PDU must abort reassembly"
+        );
     }
 
     #[test]
@@ -5337,12 +5611,8 @@ mod tests {
         ];
         for (idx, &op) in ops.iter().enumerate() {
             let mut cmd = [0u8; 8];
-            let cmd_len = build_avrcp_passthrough_cmd(
-                idx as u8,
-                op,
-                AvrcpButtonState::Pressed,
-                &mut cmd,
-            );
+            let cmd_len =
+                build_avrcp_passthrough_cmd(idx as u8, op, AvrcpButtonState::Pressed, &mut cmd);
             let acl = wrap_avrcp(avrcp_cid, &cmd[..cmd_len]);
             sink.process_packet(&mut transport, &acl, |_, _| {});
             assert_eq!(sink.last_passthrough_op, Some(op));
@@ -5359,11 +5629,8 @@ mod tests {
 
         // 2. Test SetAbsoluteVolume (0x50) command from peer
         let mut vol_cmd = [0u8; 14];
-        let vol_len = build_avrcp_set_absolute_volume_cmd(
-            5,
-            volume_pct_to_avrcp_raw(80),
-            &mut vol_cmd,
-        );
+        let vol_len =
+            build_avrcp_set_absolute_volume_cmd(5, volume_pct_to_avrcp_raw(80), &mut vol_cmd);
         let acl_vol = wrap_avrcp(avrcp_cid, &vol_cmd[..vol_len]);
         sink.process_packet(&mut transport, &acl_vol, |_, _| {});
         assert_eq!(sink.avrcp_volume_pct, 80);
@@ -5451,7 +5718,11 @@ mod tests {
         acl_req.extend_from_slice(&req_pdu[..req_len]);
 
         sink.process_packet(&mut transport, &acl_req, |_, _| {});
-        let target_rsp = transport.tx_packets.last().expect("element attributes rsp").clone();
+        let target_rsp = transport
+            .tx_packets
+            .last()
+            .expect("element attributes rsp")
+            .clone();
 
         // Feed target response into a second sink acting as Controller
         let mut controller_sink = BtA2dpSink::new();
@@ -5508,7 +5779,9 @@ mod tests {
 
         // FlashJournal MemConfigStore round-trip under key "bt.bonds"
         let mut kv: MemConfigStore<8> = MemConfigStore::new();
-        store.save_to_storage(&mut kv).expect("save to MemConfigStore");
+        store
+            .save_to_storage(&mut kv)
+            .expect("save to MemConfigStore");
         let loaded_kv = BondingStore::load_from_storage(&kv).expect("load from MemConfigStore");
         assert_eq!(loaded_kv.count(), 4);
         assert_eq!(loaded_kv.peek(&addr1).map(|p| p.link_key), Some([0x11; 16]));
@@ -5671,8 +5944,8 @@ mod tests {
         eir_params[12] = 0x34;
         eir_params[13] = 0x12; // Clock_Offset = 0x1234
         eir_params[14] = (-55i8) as u8; // RSSI
-        // EIR data starts at eir_params[15..]
-        // AD1: Complete Local Name "JBL Flip 6" (10 bytes)
+                                        // EIR data starts at eir_params[15..]
+                                        // AD1: Complete Local Name "JBL Flip 6" (10 bytes)
         eir_params[15] = 11;
         eir_params[16] = 0x09;
         eir_params[17..27].copy_from_slice(b"JBL Flip 6");
@@ -5752,12 +6025,8 @@ mod tests {
             .encode_frame(&pcm_frame, &mut sbc_frame)
             .expect("SBC encode");
         let mut media_payload = [0u8; 256];
-        let media_len = source.build_rtp_media_packet(
-            &sbc_frame[..sbc_len],
-            1,
-            128,
-            &mut media_payload,
-        );
+        let media_len =
+            source.build_rtp_media_packet(&sbc_frame[..sbc_len], 1, 128, &mut media_payload);
         assert!(media_len > 13);
 
         // Feed the generated RTP/SBC payload into BtA2dpSink

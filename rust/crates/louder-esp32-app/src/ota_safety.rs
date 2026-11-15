@@ -262,7 +262,10 @@ pub fn esp_crc32_le(initial_crc: u32, buf: &[u8]) -> u32 {
 /// (`len <= 55` bytes).
 #[must_use]
 pub fn sha256_short(data: &[u8]) -> [u8; 32] {
-    assert!(data.len() <= 55, "sha256_short only supports messages up to 55 bytes");
+    assert!(
+        data.len() <= 55,
+        "sha256_short only supports messages up to 55 bytes"
+    );
     let mut block = [0u8; 64];
     block[..data.len()].copy_from_slice(data);
     block[data.len()] = 0x80;
@@ -283,8 +286,8 @@ pub fn sha256_short(data: &[u8]) -> [u8; 32] {
     }
 
     let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
 
@@ -726,7 +729,11 @@ where
         NVS_PARTITION_OFFSET + (2 * NVS_PAGE_SIZE as u32),
         &mut nvs_buf[NVS_PAGE_SIZE..],
     );
-    scan_nvs_namespaces(&nvs_buf[NVS_PAGE_SIZE..], &mut config_ns_id, &mut aplist_ns_id);
+    scan_nvs_namespaces(
+        &nvs_buf[NVS_PAGE_SIZE..],
+        &mut config_ns_id,
+        &mut aplist_ns_id,
+    );
     // Scan only Page 3 (nvs_buf[2 * NVS_PAGE_SIZE..]) since Pages 0, 1, 2 were
     // already scanned in Pass 1! Never re-scan Page 0 (at nvs_buf[0..4096])
     // after Page 1 to prevent newer credentials from being overwritten.
@@ -866,8 +873,8 @@ impl Sha256Incremental {
     pub const fn new() -> Self {
         Self {
             state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
             ],
             buf: [0u8; 64],
             buf_len: 0,
@@ -1233,9 +1240,8 @@ impl OtaStreamAssembler {
         }
         if let Some(expected) = self.expected_size {
             if new_total > expected {
-                let err = OtaSafetyError::InvalidBinaryHeader(
-                    "stream exceeded declared expected_size",
-                );
+                let err =
+                    OtaSafetyError::InvalidBinaryHeader("stream exceeded declared expected_size");
                 self.state = OtaStreamState::Aborted(err.clone());
                 return Err(err);
             }
@@ -1722,7 +1728,8 @@ impl RecoveryCoordinator {
         F: FnMut(u32, &[u8]),
     {
         let op = self.feed_ota_chunk(chunk)?;
-        self.assembler.write_chunk_to_flash(chunk, &op, &mut write_flash)?;
+        self.assembler
+            .write_chunk_to_flash(chunk, &op, &mut write_flash)?;
         Ok(op)
     }
 
@@ -1822,20 +1829,18 @@ mod tests {
         assert_eq!(
             empty,
             [
-                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
-                0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
-                0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
-                0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55
             ]
         );
         let abc = sha256_short(b"abc");
         assert_eq!(
             abc,
             [
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-                0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-                0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-                0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
             ]
         );
     }
@@ -1846,8 +1851,7 @@ mod tests {
         let encrypted = encrypt_for_test(secret, &FIXTURE_STA_MAC);
         assert!(encrypted.as_str().starts_with("enc:"));
 
-        let decrypted =
-            decrypt_nvs_wifi_password(encrypted.as_str(), &FIXTURE_STA_MAC).unwrap();
+        let decrypted = decrypt_nvs_wifi_password(encrypted.as_str(), &FIXTURE_STA_MAC).unwrap();
         assert_eq!(decrypted.as_str(), secret);
 
         let plain = decrypt_nvs_wifi_password("PlainPass123\0", &FIXTURE_STA_MAC).unwrap();
@@ -2132,7 +2136,9 @@ mod tests {
         let mut asm = OtaStreamAssembler::new(Some(1024)).expect("valid assembler");
         // Feed partial garbage chunk (< 288 bytes)
         let garbage1 = [0x55u8; 120];
-        let op1 = asm.ingest_chunk(&garbage1).expect("buffered awaiting header");
+        let op1 = asm
+            .ingest_chunk(&garbage1)
+            .expect("buffered awaiting header");
         assert_eq!(op1.bytes_written, 0);
         assert_eq!(op1.first_new_sector_offset, None);
         assert_eq!(op1.new_sectors_to_erase, 0);
@@ -2140,7 +2146,9 @@ mod tests {
 
         // Feed second chunk completing 288 bytes with invalid magic byte/app desc
         let garbage2 = [0xAAu8; 200];
-        let err = asm.ingest_chunk(&garbage2).expect_err("must reject invalid header");
+        let err = asm
+            .ingest_chunk(&garbage2)
+            .expect_err("must reject invalid header");
         assert!(matches!(err, OtaSafetyError::InvalidBinaryHeader(_)));
         assert!(matches!(asm.state(), OtaStreamState::Aborted(_)));
     }

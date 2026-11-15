@@ -10,7 +10,7 @@ const INITKONST: u32 = 0x6996c53a;
 const KEYP: usize = 13;
 
 /// Shannon stream cipher and message authentication code (MAC) context.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Shannon {
     r: [u32; SHANNON_N],
     crc: [u32; SHANNON_N],
@@ -19,6 +19,40 @@ pub struct Shannon {
     sbuf: u32,
     mbuf: u32,
     nbuf: i32,
+}
+
+impl core::fmt::Debug for Shannon {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Shannon")
+            .field("r", &"[REDACTED]")
+            .field("crc", &"[REDACTED]")
+            .field("init_r", &"[REDACTED]")
+            .field("konst", &"[REDACTED]")
+            .field("sbuf", &"[REDACTED]")
+            .field("mbuf", &"[REDACTED]")
+            .field("nbuf", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for Shannon {
+    fn drop(&mut self) {
+        self.r.fill(0);
+        core::hint::black_box(&mut self.r);
+        self.crc.fill(0);
+        core::hint::black_box(&mut self.crc);
+        self.init_r.fill(0);
+        core::hint::black_box(&mut self.init_r);
+        self.konst = 0;
+        core::hint::black_box(&mut self.konst);
+        self.sbuf = 0;
+        core::hint::black_box(&mut self.sbuf);
+        self.mbuf = 0;
+        core::hint::black_box(&mut self.mbuf);
+        self.nbuf = 0;
+        core::hint::black_box(&mut self.nbuf);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Default for Shannon {
@@ -73,6 +107,7 @@ impl Shannon {
         self.crc[SHANNON_N - 1] = t;
     }
 
+    #[inline(always)]
     fn macfunc(&mut self, i: u32) {
         self.crcfunc(i);
         self.r[KEYP] ^= i;
@@ -221,12 +256,7 @@ impl Shannon {
         let end_words = pos + (nbytes & !0x03);
         while pos < end_words {
             self.cycle();
-            let t = u32::from_le_bytes([
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-            ]);
+            let t = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
             self.macfunc(t);
             pos += 4;
         }
@@ -267,12 +297,7 @@ impl Shannon {
         let end_words = pos + (nbytes & !0x03);
         while pos < end_words {
             self.cycle();
-            let mut t = u32::from_le_bytes([
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-            ]);
+            let mut t = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
             self.macfunc(t);
             t ^= self.sbuf;
             let out_bytes = t.to_le_bytes();
@@ -317,12 +342,8 @@ impl Shannon {
         let end_words = pos + (nbytes & !0x03);
         while pos < end_words {
             self.cycle();
-            let t = u32::from_le_bytes([
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-            ]) ^ self.sbuf;
+            let t = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+                ^ self.sbuf;
             self.macfunc(t);
             let out_bytes = t.to_le_bytes();
             buf[pos..pos + 4].copy_from_slice(&out_bytes);
@@ -416,6 +437,7 @@ impl Shannon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate alloc;
 
     #[test]
     fn test_finish_and_verify() {
@@ -464,5 +486,15 @@ mod tests {
         assert_eq!(s.sbuf, 0);
         assert_eq!(s.mbuf, 0);
         assert_eq!(s.nbuf, 0);
+    }
+
+    #[test]
+    fn test_shannon_debug_redacted() {
+        let key = [0x55; 16];
+        let mut s = Shannon::new();
+        s.key(&key);
+        let debug_str = alloc::format!("{s:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("0x6996c53a"));
     }
 }

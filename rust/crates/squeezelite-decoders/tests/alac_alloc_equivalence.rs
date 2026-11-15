@@ -92,7 +92,10 @@ fn alac_fixture_decodes_successfully() {
     assert_eq!(d.pcm.len() % 2, 0);
     let frames = d.pcm.len() / 2;
     let digest = fnv1a64(&d.pcm);
-    println!("std={} frames={frames} fnv1a64={digest:#018x}", cfg!(feature = "std"));
+    println!(
+        "std={} frames={frames} fnv1a64={digest:#018x}",
+        cfg!(feature = "std")
+    );
     assert_eq!(frames, GOLDEN_FRAMES);
     assert_eq!(digest, GOLDEN_PCM_FNV1A64);
 }

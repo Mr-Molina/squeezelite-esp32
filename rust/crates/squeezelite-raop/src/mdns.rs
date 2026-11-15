@@ -168,12 +168,7 @@ impl MdnsBuilder {
     }
 
     /// Appends a TXT resource record containing key-value attribute strings.
-    fn append_txt_record(
-        records: &mut Vec<u8>,
-        instance_name: &str,
-        entries: &[&str],
-        ttl: u32,
-    ) {
+    fn append_txt_record(records: &mut Vec<u8>, instance_name: &str, entries: &[&str], ttl: u32) {
         records.extend_from_slice(&Self::encode_dns_name(instance_name));
         records.extend_from_slice(&16u16.to_be_bytes()); // Type: TXT
         records.extend_from_slice(&0x8001u16.to_be_bytes()); // Class: IN (cache-flush)
@@ -195,12 +190,7 @@ impl MdnsBuilder {
     }
 
     /// Appends an A (IPv4) host address resource record.
-    fn append_a_record(
-        records: &mut Vec<u8>,
-        host_name: &str,
-        ip: &[u8; 4],
-        ttl: u32,
-    ) {
+    fn append_a_record(records: &mut Vec<u8>, host_name: &str, ip: &[u8; 4], ttl: u32) {
         records.extend_from_slice(&Self::encode_dns_name(host_name));
         records.extend_from_slice(&1u16.to_be_bytes()); // Type: A
         records.extend_from_slice(&0x8001u16.to_be_bytes()); // Class: IN (cache-flush)
@@ -256,10 +246,7 @@ impl MdnsBuilder {
         Self::append_srv_record(&mut answers, &airplay_inst, &host, config.port, ttl);
 
         // 6. AirPlay TXT
-        const AIRPLAY_TXT: &[&str] = &[
-            "model=AirPort4,107",
-            "srcvers=220.68",
-        ];
+        const AIRPLAY_TXT: &[&str] = &["model=AirPort4,107", "srcvers=220.68"];
         Self::append_txt_record(&mut answers, &airplay_inst, AIRPLAY_TXT, ttl);
 
         // 7. A record: <NAME>.local -> IPv4
@@ -270,7 +257,7 @@ impl MdnsBuilder {
         // Construct 12-byte DNS header
         let mut packet = Vec::with_capacity(12 + answers.len());
         packet.extend_from_slice(&0u16.to_be_bytes()); // Transaction ID: 0
-        // Flags: Standard response (0x8000) | Authoritative (0x0400)
+                                                       // Flags: Standard response (0x8000) | Authoritative (0x0400)
         packet.extend_from_slice(&0x8400u16.to_be_bytes());
         packet.extend_from_slice(&0u16.to_be_bytes()); // Questions: 0
         packet.extend_from_slice(&answer_count.to_be_bytes()); // Answers: 7

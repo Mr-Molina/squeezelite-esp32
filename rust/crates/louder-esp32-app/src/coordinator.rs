@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use squeezelite_audio_core::output::AudioOutputSink;
 use squeezelite_audio_core::{ResampleQuality, VolumeScale};
 use squeezelite_cyd_link::{CydCommand, CydMessage, PlayState};
-use squeezelite_decoders::{DecoderError, PcmDecoder};
+use squeezelite_decoders::{AudioDecoder, DecoderError, PcmDecoder};
 use squeezelite_proto::{
     build_capabilities, sample_rate_from_index, AudioFormat, AutostartMode, DisconnectReason,
     Endianness, ServerCommand, SlimprotoBuilder, SlimprotoParser, StatBuilder, StatEvent,
@@ -1260,6 +1260,16 @@ impl PlayerCoordinator {
         supported
     }
 
+    /// Once the stream has ended and its ring is drained, tells the decoder no
+    /// more input follows, so a decoder holding back a partly buffered frame
+    /// (FLAC) decodes it on its next drain call instead of waiting for bytes
+    /// that will never come.
+    fn signal_end_of_input<S: AudioOutputSink>(&self, pipeline: &mut StreamPipeline<'_, S>) {
+        if self.stream_eof && pipeline.stream_buffer.available_read() == 0 {
+            pipeline.decoder.finish_input();
+        }
+    }
+
     /// Drops the stream-ring tail when the stream has ended and the decoder
     /// cannot make anything of what is left (a truncated last frame), so
     /// the track can finish (`STMd`/`STMu`) instead of waiting forever for
@@ -1379,15 +1389,19 @@ impl PlayerCoordinator {
     /// [`PUMP_DECODE_MIN_OUTPUT_SPACE`] bytes free in the output ring, decodes
     /// in bursts of at most `max_steps` steps while progress is made and
     /// output space remains (`CPU-101` / `PIPE-203`). After the stream ended
-    /// an undecodable tail is dropped.
+    /// an undecodable tail is dropped. Returns the steps that made progress
+    /// (consumed input or produced PCM); 0 means the burst is over, so a
+    /// caller pacing decode one step at a time knows when to stop.
     pub fn pump_decode<S: AudioOutputSink>(
         &mut self,
         pipeline: &mut StreamPipeline<'_, S>,
         max_steps: usize,
-    ) {
+    ) -> usize {
         if self.state != PlayerState::Playing || !self.decoder_may_run() {
-            return;
+            return 0;
         }
+        self.signal_end_of_input(pipeline);
+        let mut progressed_steps = 0;
         for _ in 0..max_steps {
             if pipeline.has_pending_pcm()
                 || pipeline.output_buffer.available_write() < PUMP_DECODE_MIN_OUTPUT_SPACE
@@ -1403,6 +1417,9 @@ impl PlayerCoordinator {
             }
             self.drop_undecodable_tail(pipeline, &decoded);
             if pipeline.has_pending_pcm() {
+                // The step produced more PCM than fit: progress, but the
+                // output side drains it before the next decode.
+                progressed_steps += 1;
                 break;
             }
             let progressed = matches!(decoded, Ok(consumed) if consumed > 0)
@@ -1410,7 +1427,45 @@ impl PlayerCoordinator {
             if !progressed {
                 break;
             }
+            progressed_steps += 1;
         }
+        progressed_steps
+    }
+
+    /// [`Self::pump_decode`] paced for a small output DMA buffer: decodes one
+    /// step at a time, up to `max_steps`, and after each step tops up the
+    /// output (one [`Self::pump_output`] pass) whenever `output_low` reports
+    /// the DMA is running low. A long burst (track start, seek, an MP3 frame
+    /// per step) therefore cannot drain the DMA while it decodes ahead.
+    /// `now_us` times each step that made progress into
+    /// [`StreamPipeline::record_decode_us`] (the `decode_us_max` telemetry).
+    /// Returns the steps that made progress.
+    pub fn pump_decode_paced<S, Low, Clock>(
+        &mut self,
+        pipeline: &mut StreamPipeline<'_, S>,
+        max_steps: usize,
+        mut output_low: Low,
+        mut now_us: Clock,
+    ) -> usize
+    where
+        S: AudioOutputSink,
+        Low: FnMut(&mut StreamPipeline<'_, S>) -> bool,
+        Clock: FnMut() -> u64,
+    {
+        let mut progressed_steps = 0;
+        for _ in 0..max_steps {
+            let started = now_us();
+            if self.pump_decode(pipeline, 1) == 0 {
+                break;
+            }
+            let elapsed = now_us().saturating_sub(started);
+            pipeline.record_decode_us(u32::try_from(elapsed).unwrap_or(u32::MAX));
+            progressed_steps += 1;
+            if output_low(pipeline) {
+                self.pump_output(pipeline, 16);
+            }
+        }
+        progressed_steps
     }
 
     /// Drops a stream that failed after connecting and marks it ended (the
@@ -1819,11 +1874,8 @@ impl PlayerCoordinator {
         let capped_rate = self.max_sample_rate > 0 && rate_hint > self.max_sample_rate;
         let unverified_rate = !crate::clock_table::VERIFIED_RATES.contains(&rate_hint);
         let output_rate = if capped_rate {
-            if pipeline.configure_resampler(
-                rate_hint,
-                self.max_sample_rate,
-                self.resampler_quality,
-            ) {
+            if pipeline.configure_resampler(rate_hint, self.max_sample_rate, self.resampler_quality)
+            {
                 self.max_sample_rate
             } else {
                 rate_hint
@@ -2378,6 +2430,7 @@ impl PlayerCoordinator {
 
         // Try decoding a frame chunk
         if self.decoder_may_run() {
+            self.signal_end_of_input(pipeline);
             let decoded = pipeline.process_decode_step();
             self.note_decode_result(pipeline, &decoded);
             self.drop_undecodable_tail(pipeline, &decoded);
@@ -4276,6 +4329,75 @@ mod tests {
     }
 
     #[test]
+    fn test_paced_decode_tops_up_output_only_when_low_and_times_steps() {
+        for output_low in [false, true] {
+            let mut rig =
+                Rig::with_source([6; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
+            let mut stream_storage = [0u8; 2048];
+            let mut output_storage = [0u8; 2048];
+            let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+            rig.coord.external_audio_pump = true;
+            start_held(&mut rig, &mut pipeline, true, 0);
+            pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+            rig.tick(&mut pipeline, 15).unwrap();
+            assert_eq!(rig.coord.state, PlayerState::Playing);
+
+            let mut low_checks = 0;
+            let mut clock = 0u64;
+            let steps = rig.coord.pump_decode_paced(
+                &mut pipeline,
+                4,
+                |_| {
+                    low_checks += 1;
+                    output_low
+                },
+                || {
+                    clock += 250;
+                    clock
+                },
+            );
+            assert!(steps > 0, "the burst decoded");
+            assert_eq!(low_checks, steps, "DMA level checked after every step");
+            assert_eq!(pipeline.decode_us_max, 250, "each step is timed");
+            // Topped up inside the burst only when the DMA reported low.
+            let expected_played = if output_low { 2 } else { 0 };
+            assert_eq!(pipeline.frames_played, expected_played);
+        }
+    }
+
+    static FLAC_STREAM: Segments = &[
+        OK_HEAD,
+        include_bytes!("../../squeezelite-decoders/tests/fixtures/stereo_16bit.flac"),
+    ];
+
+    #[test]
+    fn test_pump_decode_finishes_the_last_flac_frame_at_eof() {
+        // FLAC defers a frame until it is proven complete (the next frame's
+        // header follows it); the last frame has none, so the end of the
+        // stream must release it or the track loses its final block.
+        let mut rig = Rig::with_source([5; 6], "T", GatedSource::new(b"/stream.mp3", FLAC_STREAM));
+        let mut stream_storage = vec![0u8; 16384];
+        let mut output_storage = vec![0u8; 1 << 17];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.command(&mut pipeline, &strm_frame_fmt(b'f', true, 9000), 10);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+        rig.src.hold_data = false;
+        for _ in 0..64 {
+            let _ = rig.coord.poll_stream(&mut rig.src, &mut pipeline);
+        }
+        assert!(rig.coord.stream_eof);
+        rig.coord.evaluate_state(&mut pipeline);
+        for _ in 0..64 {
+            rig.coord.pump_decode(&mut pipeline, 16);
+            rig.coord.pump_output(&mut pipeline, 16);
+        }
+        let decoded_frames =
+            pipeline.frames_played as usize + pipeline.output_buffer.available_read() / 8;
+        assert_eq!(decoded_frames, 8820, "every frame, including the last");
+        assert!(!pipeline.has_pending_pcm());
+    }
+
+    #[test]
     fn test_codc_selects_the_decoder() {
         let mut rig = Rig::new([4; 6], "T");
         let mut stream_storage = [0u8; 1024];
@@ -4678,7 +4800,7 @@ mod tests {
         rig.command(&mut pipeline, &server_frame(b"codc", b"f"), 10);
         let id = match &mut pipeline.decoder {
             ActiveDecoder::Flac(d) => {
-                d.pending_pcm.extend_from_slice(&[1, 2, 3, 4]);
+                d.scratch_len = 2;
                 d.stream_buf.extend_from_slice(b"stale");
                 &**d as *const squeezelite_decoders::FlacDecoder
             }
@@ -4689,7 +4811,7 @@ mod tests {
             ActiveDecoder::Flac(d) => {
                 assert_eq!(&**d as *const _, id, "same decoder kept");
                 assert!(
-                    d.pending_pcm.is_empty() && d.stream_buf.is_empty(),
+                    !d.has_pending_pcm() && d.stream_buf.is_empty(),
                     "and flushed"
                 );
             }
@@ -6405,10 +6527,7 @@ mod tests {
     }
 
     impl AudioBackend for DmaTrackingBackend {
-        fn set_sample_rate(
-            &mut self,
-            rate_hz: u32,
-        ) -> Result<(), crate::io_traits::ClockError> {
+        fn set_sample_rate(&mut self, rate_hz: u32) -> Result<(), crate::io_traits::ClockError> {
             self.rate_calls += 1;
             self.inner.set_sample_rate(rate_hz)
         }
@@ -6513,9 +6632,7 @@ mod tests {
         // Rate code `b'>'` = 384_000 Hz, which is not in `VERIFIED_RATES`.
         // With resampler disabled (default), `strm 's'` must refuse with `STMn`
         // without calling `backend.set_sample_rate`.
-        rig.lms
-            .inject_frame(&strm_start(1, b'>', true))
-            .unwrap();
+        rig.lms.inject_frame(&strm_start(1, b'>', true)).unwrap();
         rig.coord
             .tick(&mut rig.lms, &mut rig.src, &mut backend, &mut pipeline, 10)
             .unwrap();
@@ -6567,11 +6684,7 @@ mod tests {
 
     #[test]
     fn test_engages_only_for_unverified_or_capped_rates() {
-        let mut rig = gapless_rig(&[
-            track_bytes(1, 32),
-            track_bytes(2, 32),
-            track_bytes(3, 32),
-        ]);
+        let mut rig = gapless_rig(&[track_bytes(1, 32), track_bytes(2, 32), track_bytes(3, 32)]);
         let mut stream_storage = [0u8; 4096];
         let mut output_storage = [0u8; 4096];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
@@ -6634,7 +6747,8 @@ mod tests {
         assert_eq!(pipeline.stream_buffer.available_read(), 64);
 
         // Begin external playback flushes stream buffer (LOGIC-206)
-        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
         assert_eq!(pipeline.stream_buffer.available_read(), 0);
         assert!(rig.coord.external_playback);
 
@@ -6664,7 +6778,8 @@ mod tests {
         rig.coord.stream = StreamLink::Open;
 
         // Begin external playback
-        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
         assert!(rig.coord.external_playback);
 
         // Ingest external PCM bytes
@@ -6693,7 +6808,8 @@ mod tests {
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
         // Active external playback owns arbiter
-        rig.coord.begin_external_playback_with_pipeline(&mut pipeline);
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
         assert!(rig.coord.external_playback);
         assert_eq!(rig.coord.state, PlayerState::Playing);
 

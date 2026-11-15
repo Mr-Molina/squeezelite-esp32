@@ -149,8 +149,7 @@ impl DmapMetadata {
             4 => Some(u32::from_be_bytes([val[0], val[1], val[2], val[3]])),
             8 => {
                 let hi = u64::from_be_bytes([
-                    val[0], val[1], val[2], val[3], val[4], val[5], val[6],
-                    val[7],
+                    val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7],
                 ]);
                 Some(hi as u32)
             }
@@ -158,11 +157,7 @@ impl DmapMetadata {
         }
     }
 
-    fn parse_slice(
-        buf: &[u8],
-        meta: &mut Self,
-        depth: usize,
-    ) -> Result<(), DmapError> {
+    fn parse_slice(buf: &[u8], meta: &mut Self, depth: usize) -> Result<(), DmapError> {
         if depth > MAX_DMAP_DEPTH {
             return Err(DmapError::RecursionLimitExceeded);
         }
@@ -270,11 +265,7 @@ pub struct CoverArtwork {
 impl CoverArtwork {
     /// Creates a new `CoverArtwork` container.
     #[must_use]
-    pub fn new(
-        mime_type: ArtworkMimeType,
-        data: Vec<u8>,
-        rtp_timestamp: Option<u32>,
-    ) -> Self {
+    pub fn new(mime_type: ArtworkMimeType, data: Vec<u8>, rtp_timestamp: Option<u32>) -> Self {
         Self {
             mime_type,
             data,

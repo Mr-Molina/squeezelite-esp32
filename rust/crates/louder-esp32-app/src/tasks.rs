@@ -664,43 +664,23 @@ mod device {
         static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
         EXECUTOR0.init(Executor::new()).run(|spawner| {
             spawner.spawn(
-                watchdog_lease(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+                watchdog_lease(shared).unwrap_or_else(|_| esp_hal::system::software_reset()),
             );
+            spawner.spawn(bt_a2dp(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner.spawn(net_stack(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner
+                .spawn(http_control(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
             spawner.spawn(
-                bt_a2dp(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
+                slimproto_session(shared).unwrap_or_else(|_| esp_hal::system::software_reset()),
             );
-            spawner.spawn(
-                net_stack(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                http_control(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                slimproto_session(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                cyd_bridge(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
+            spawner.spawn(cyd_bridge(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
             // Core-0 placement of the audio tasks: see "Core placement" in the
             // module docs.
-            spawner.spawn(
-                decode_pump(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                i2s_feed(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
-            spawner.spawn(
-                config_writer(shared)
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
+            spawner
+                .spawn(decode_pump(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner.spawn(i2s_feed(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
+            spawner
+                .spawn(config_writer(shared).unwrap_or_else(|_| esp_hal::system::software_reset()));
             let first = PHASE_ORDER[0];
             TURN[first.owner().index()].signal(first);
         })
@@ -725,10 +705,7 @@ mod device {
     pub(crate) fn run_core1_executor() -> ! {
         static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
         EXECUTOR1.init(Executor::new()).run(|spawner| {
-            spawner.spawn(
-                core1_heartbeat()
-                    .unwrap_or_else(|_| esp_hal::system::software_reset()),
-            );
+            spawner.spawn(core1_heartbeat().unwrap_or_else(|_| esp_hal::system::software_reset()));
         })
     }
 
@@ -968,7 +945,9 @@ mod device {
         if let Some(ref mut transport) = s.bt_transport {
             s.bt_sink
                 .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                    if s.coordinator.request_source(louder_esp32_app::AudioSource::Bluetooth) {
+                    if s.coordinator
+                        .request_source(louder_esp32_app::AudioSource::Bluetooth)
+                    {
                         if s.coordinator.current_sample_rate != sample_rate_hz
                             || s.pipeline.sample_rate != sample_rate_hz
                         {
@@ -984,7 +963,8 @@ mod device {
                             // `current_replay_gain` set, decode_external.c:147-154).
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
+                            s.coordinator
+                                .begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -998,18 +978,19 @@ mod device {
                     }
                 });
 
-            if s.bt_audio_active && !s.bt_sink.is_streaming() {
-                if s.pipeline.stream_buffer.available_read() < 4
-                    && s.pipeline.output_buffer.available_read() == 0
-                    && !s.pipeline.has_pending_pcm()
-                {
-                    if s.pipeline.stream_buffer.available_read() > 0 {
-                        s.pipeline.stream_buffer.flush();
-                    }
-                    s.coordinator.release_source(louder_esp32_app::AudioSource::Bluetooth);
-                    s.coordinator.end_external_playback_and_restore(s.pipeline);
-                    s.bt_audio_active = false;
+            if s.bt_audio_active
+                && !s.bt_sink.is_streaming()
+                && s.pipeline.stream_buffer.available_read() < 4
+                && s.pipeline.output_buffer.available_read() == 0
+                && !s.pipeline.has_pending_pcm()
+            {
+                if s.pipeline.stream_buffer.available_read() > 0 {
+                    s.pipeline.stream_buffer.flush();
                 }
+                s.coordinator
+                    .release_source(louder_esp32_app::AudioSource::Bluetooth);
+                s.coordinator.end_external_playback_and_restore(s.pipeline);
+                s.bt_audio_active = false;
             }
         }
     }
@@ -1082,7 +1063,7 @@ mod device {
         match dhcp_event {
             Some(Ok((addr, prefix_len, router, cidr))) => {
                 let ip_octets = addr.octets();
-                let ip_changed = s.assigned_ip.map_or(false, |old| old != ip_octets);
+                let ip_changed = s.assigned_ip.is_some_and(|old| old != ip_octets);
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
@@ -1171,13 +1152,12 @@ mod device {
 
             // Immediate recycling of closing sockets once FIN/ACK handshake completes
             // (TimeWait) or on timeout
-            if s.pending_http_closing {
-                if matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
-                    || now_ms >= s.pending_close_deadline_ms
-                {
-                    http_sock.abort();
-                    s.pending_http_closing = false;
-                }
+            if s.pending_http_closing
+                && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                    || now_ms >= s.pending_close_deadline_ms)
+            {
+                http_sock.abort();
+                s.pending_http_closing = false;
             }
 
             if s.pending_http_body.is_empty()
@@ -1544,12 +1524,16 @@ mod device {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    let _ = s.flash.write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes);
-                    println!(
-                        "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
-                         wrote ota_0 select entry & resetting"
-                    );
-                    esp_hal::system::software_reset();
+                    if s.flash
+                        .write_nor(OTADATA_SECTOR_0_OFFSET, &entry_bytes)
+                        .is_ok()
+                    {
+                        println!(
+                            "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
+                             wrote ota_0 select entry & resetting"
+                        );
+                        esp_hal::system::software_reset();
+                    }
                 }
                 _ => {}
             }

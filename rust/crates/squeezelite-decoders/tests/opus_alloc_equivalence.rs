@@ -13,7 +13,8 @@ use squeezelite_decoders::OpusDecoder;
 const FIXTURE: &[u8] = include_bytes!("fixtures/test_stereo_05s_48k.opus");
 
 /// FNV-1a 64 over the little-endian bytes of every decoded i32 sample.
-const GOLDEN_PCM_FNV1A64: u64 = 0x626fe7b25b0baae2;
+/// Regenerated for DSP-003 round-half-away symmetric quantization (87793784).
+const GOLDEN_PCM_FNV1A64: u64 = 0x1984_0093_8ff8_d57f;
 const GOLDEN_FRAMES: usize = 24648;
 
 struct Decoded {
@@ -92,7 +93,10 @@ fn opus_fixture_decodes_successfully() {
     assert_eq!(d.pcm.len() % 2, 0);
     let frames = d.pcm.len() / 2;
     let digest = fnv1a64(&d.pcm);
-    println!("std={} frames={frames} fnv1a64={digest:#018x}", cfg!(feature = "std"));
+    println!(
+        "std={} frames={frames} fnv1a64={digest:#018x}",
+        cfg!(feature = "std")
+    );
     assert_eq!(frames, GOLDEN_FRAMES);
     assert_eq!(digest, GOLDEN_PCM_FNV1A64);
 }
@@ -128,9 +132,18 @@ fn decoder_flush_resets_pending_state() {
 fn opus_decoder_struct_size_guard() {
     let sz = core::mem::size_of::<OpusDecoder>();
     println!("OpusDecoder struct size={sz} bytes");
-    println!("opus_rs::OpusDecoder: {}", core::mem::size_of::<opus_rs::OpusDecoder>());
-    println!("CeltDecoder: {}", core::mem::size_of::<opus_rs::celt::CeltDecoder>());
-    println!("SilkDecoder: {}", core::mem::size_of::<opus_rs::silk::dec_api::SilkDecoder>());
+    println!(
+        "opus_rs::OpusDecoder: {}",
+        core::mem::size_of::<opus_rs::OpusDecoder>()
+    );
+    println!(
+        "CeltDecoder: {}",
+        core::mem::size_of::<opus_rs::celt::CeltDecoder>()
+    );
+    println!(
+        "SilkDecoder: {}",
+        core::mem::size_of::<opus_rs::silk::dec_api::SilkDecoder>()
+    );
     // Hard budget: must be well under 1024 B to prevent task stack overflows
     assert!(sz < 1024, "OpusDecoder size {sz} >= 1024 bytes");
 }

@@ -92,7 +92,8 @@ pub trait KeyValueStorage {
             Ok(len) => {
                 let s = core::str::from_utf8(&buf[..len]).map_err(|_| StorageError::InvalidUtf8)?;
                 let mut res = String::new();
-                res.push_str(s).map_err(|_| StorageError::CapacityExceeded)?;
+                res.push_str(s)
+                    .map_err(|_| StorageError::CapacityExceeded)?;
                 Ok(Some(res))
             }
             Err(StorageError::KeyNotFound) => Ok(None),
@@ -215,17 +216,22 @@ impl<const MAX_ENTRIES: usize> KeyValueStorage for MemConfigStore<MAX_ENTRIES> {
         for (k, v) in &mut self.entries {
             if k.as_str() == key {
                 v.clear();
-                v.extend_from_slice(val).map_err(|_| StorageError::CapacityExceeded)?;
+                v.extend_from_slice(val)
+                    .map_err(|_| StorageError::CapacityExceeded)?;
                 return Ok(());
             }
         }
 
         // Insert new entry
         let mut key_str = String::new();
-        key_str.push_str(key).map_err(|_| StorageError::CapacityExceeded)?;
+        key_str
+            .push_str(key)
+            .map_err(|_| StorageError::CapacityExceeded)?;
 
         let mut val_vec = Vec::new();
-        val_vec.extend_from_slice(val).map_err(|_| StorageError::CapacityExceeded)?;
+        val_vec
+            .extend_from_slice(val)
+            .map_err(|_| StorageError::CapacityExceeded)?;
 
         self.entries
             .push((key_str, val_vec))
@@ -384,9 +390,8 @@ impl FlashJournal {
 
         let entry_count = u16::from_be_bytes([sector[5], sector[6]]) as usize;
         let sequence = u32::from_be_bytes([sector[8], sector[9], sector[10], sector[11]]);
-        let expected_sector_crc = u32::from_be_bytes([
-            sector[12], sector[13], sector[14], sector[15],
-        ]);
+        let expected_sector_crc =
+            u32::from_be_bytes([sector[12], sector[13], sector[14], sector[15]]);
 
         // First pass: validate entry structure and find total data length
         let mut offset = Self::HEADER_SIZE;
@@ -435,9 +440,8 @@ impl FlashJournal {
         let mut read_offset = Self::HEADER_SIZE;
         for _ in 0..entry_count {
             let key_len = sector[read_offset] as usize;
-            let val_len = u16::from_be_bytes([
-                sector[read_offset + 1], sector[read_offset + 2],
-            ]) as usize;
+            let val_len =
+                u16::from_be_bytes([sector[read_offset + 1], sector[read_offset + 2]]) as usize;
             let expected_entry_crc = u32::from_be_bytes([
                 sector[read_offset + 3],
                 sector[read_offset + 4],
@@ -576,7 +580,12 @@ impl FlashJournal {
         let key_start = offset + 7;
         let val_start = key_start + key_len;
         let next = val_start + val_len;
-        (&sector[key_start..val_start], &sector[val_start..next], crc, next)
+        (
+            &sector[key_start..val_start],
+            &sector[val_start..next],
+            crc,
+            next,
+        )
     }
 
     /// Entry CRC over lengths and payload (the format
@@ -666,7 +675,10 @@ impl<'a> JournalView<'a> {
     /// or `0` (unlimited) if not present or malformed.
     #[must_use]
     pub fn max_sample_rate(&self) -> u32 {
-        self.get_u32(AudioConfig::KEY_MAXRATE).ok().flatten().unwrap_or(0)
+        self.get_u32(AudioConfig::KEY_MAXRATE)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     fn find(&self, key: &str) -> Option<&'a [u8]> {
@@ -857,9 +869,11 @@ impl WifiCredentials {
 
     pub fn new(ssid: &str, passphrase: &str) -> Result<Self, StorageError> {
         let mut s = String::new();
-        s.push_str(ssid).map_err(|_| StorageError::CapacityExceeded)?;
+        s.push_str(ssid)
+            .map_err(|_| StorageError::CapacityExceeded)?;
         let mut p = String::new();
-        p.push_str(passphrase).map_err(|_| StorageError::CapacityExceeded)?;
+        p.push_str(passphrase)
+            .map_err(|_| StorageError::CapacityExceeded)?;
 
         Ok(Self {
             ssid: s,
@@ -1159,8 +1173,8 @@ fn read_ip_opt<S: KeyValueStorage>(store: &S, key: &str) -> Result<Option<[u8; 4
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::format;
     use super::*;
+    use std::format;
 
     #[test]
     fn test_mem_store_basic_operations() {
@@ -1215,19 +1229,24 @@ mod tests {
         assert!(bytes_written > FlashJournal::HEADER_SIZE);
 
         let mut restored_store = MemConfigStore::<16>::new();
-        let entries = FlashJournal::load_from_sector(
-            &sector[..bytes_written],
-            &mut restored_store,
-        )
-        .unwrap();
+        let entries =
+            FlashJournal::load_from_sector(&sector[..bytes_written], &mut restored_store).unwrap();
         assert_eq!(entries, 4);
 
         assert_eq!(
-            restored_store.get_str::<32>("wifi.ssid").unwrap().unwrap().as_str(),
+            restored_store
+                .get_str::<32>("wifi.ssid")
+                .unwrap()
+                .unwrap()
+                .as_str(),
             "Main_AP"
         );
         assert_eq!(
-            restored_store.get_str::<32>("wifi.pass").unwrap().unwrap().as_str(),
+            restored_store
+                .get_str::<32>("wifi.pass")
+                .unwrap()
+                .unwrap()
+                .as_str(),
             "Pass1234"
         );
         assert_eq!(restored_store.get_u8("audio.vol").unwrap(), Some(85));
@@ -1267,30 +1286,29 @@ mod tests {
         let mut sector_b = [0u8; 512];
 
         // First write -> goes to sector A (sequence 1)
-        let (wrote_b, n1) = FlashJournal::save_to_dual_sectors(
-            &store,
-            &mut sector_a,
-            &mut sector_b,
-        )
-        .unwrap();
+        let (wrote_b, n1) =
+            FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
         assert!(!wrote_b);
         assert!(n1 > FlashJournal::HEADER_SIZE);
 
         // Second write -> goes to sector B (sequence 2)
         store.set_str("setting.k1", "v2").unwrap();
-        let (wrote_b2, n2) = FlashJournal::save_to_dual_sectors(
-            &store,
-            &mut sector_a,
-            &mut sector_b,
-        )
-        .unwrap();
+        let (wrote_b2, n2) =
+            FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
         assert!(wrote_b2);
         assert!(n2 > FlashJournal::HEADER_SIZE);
 
         // Load selects sector B (seq 2 > seq 1)
         let mut loaded = MemConfigStore::<16>::new();
         FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut loaded).unwrap();
-        assert_eq!(loaded.get_str::<32>("setting.k1").unwrap().unwrap().as_str(), "v2");
+        assert_eq!(
+            loaded
+                .get_str::<32>("setting.k1")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "v2"
+        );
 
         // Simulate power cut during write to B by corrupting sector B
         sector_b[FlashJournal::HEADER_SIZE + 2] ^= 0xFF;
@@ -1298,7 +1316,14 @@ mod tests {
         // Fallback loads cleanly from intact sector A (v1)
         let mut fallback = MemConfigStore::<16>::new();
         FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut fallback).unwrap();
-        assert_eq!(fallback.get_str::<32>("setting.k1").unwrap().unwrap().as_str(), "v1");
+        assert_eq!(
+            fallback
+                .get_str::<32>("setting.k1")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "v1"
+        );
     }
 
     #[test]
@@ -1338,13 +1363,16 @@ mod tests {
         bad_sector[4] = 1;
         bad_sector[5..7].copy_from_slice(&1u16.to_be_bytes()); // 1 entry
         bad_sector[8..12].copy_from_slice(&1u32.to_be_bytes()); // seq 1
-        // Bad CRC
+                                                                // Bad CRC
         bad_sector[12..16].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
 
         let res = FlashJournal::load_from_sector(&bad_sector, &mut store);
         assert!(res.is_err());
         // Store must NOT have been cleared!
-        assert_eq!(store.get_str::<32>("existing").unwrap().unwrap().as_str(), "preserved");
+        assert_eq!(
+            store.get_str::<32>("existing").unwrap().unwrap().as_str(),
+            "preserved"
+        );
     }
 
     #[test]
@@ -1375,11 +1403,17 @@ mod tests {
 
         // Store 5 bytes under IP key -> read_ip_opt must return InvalidFormat
         store.set("bad.ip", &[1, 2, 3, 4, 5]).unwrap();
-        assert_eq!(read_ip_opt(&store, "bad.ip"), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            read_ip_opt(&store, "bad.ip"),
+            Err(StorageError::InvalidFormat)
+        );
 
         // Store 3 bytes under IP key -> read_ip_opt must return InvalidFormat
         store.set("short.ip", &[1, 2, 3]).unwrap();
-        assert_eq!(read_ip_opt(&store, "short.ip"), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            read_ip_opt(&store, "short.ip"),
+            Err(StorageError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -1416,7 +1450,10 @@ mod tests {
         // AudioConfig save_to validates config
         let mut store = MemConfigStore::<16>::new();
         valid_config.volume = 105;
-        assert_eq!(valid_config.save_to(&mut store), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            valid_config.save_to(&mut store),
+            Err(StorageError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -1463,16 +1500,27 @@ mod tests {
         // PROTOCFG-808: save_to and load_from enforce validation
         let mut store = MemConfigStore::<16>::new();
         let mut bad_creds = WifiCredentials::new("", "ValidPassword123").unwrap();
-        assert_eq!(bad_creds.save_to(&mut store), Err(ConfigError::InvalidFormat));
+        assert_eq!(
+            bad_creds.save_to(&mut store),
+            Err(ConfigError::InvalidFormat)
+        );
 
         bad_creds = WifiCredentials::new("ValidSSID", "ValidPassword123").unwrap();
         bad_creds.static_ip = Some([0, 0, 0, 0]);
-        assert_eq!(bad_creds.save_to(&mut store), Err(ConfigError::InvalidFormat));
+        assert_eq!(
+            bad_creds.save_to(&mut store),
+            Err(ConfigError::InvalidFormat)
+        );
 
         // Corrupt stored IP in store and verify load_from rejects it via validate()
-        store.set_str(WifiCredentials::KEY_SSID, "ValidSSID").unwrap();
+        store
+            .set_str(WifiCredentials::KEY_SSID, "ValidSSID")
+            .unwrap();
         store.set(WifiCredentials::KEY_IP, &[0, 0, 0, 0]).unwrap();
-        assert_eq!(WifiCredentials::load_from(&store), Err(ConfigError::InvalidFormat));
+        assert_eq!(
+            WifiCredentials::load_from(&store),
+            Err(ConfigError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -1488,13 +1536,22 @@ mod tests {
         let mut sector_b = [0u8; 256];
         FlashJournal::save_to_sector_with_seq(&store, &mut sector_a, u32::MAX).unwrap();
         FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 0).unwrap();
-        assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_b), Ok(1));
-        assert_eq!(DualSectorFlashStore::active_sector(&sector_b, &sector_a), Ok(0));
+        assert_eq!(
+            DualSectorFlashStore::active_sector(&sector_a, &sector_b),
+            Ok(1)
+        );
+        assert_eq!(
+            DualSectorFlashStore::active_sector(&sector_b, &sector_a),
+            Ok(0)
+        );
 
         // Equal sequence numbers must consistently select Sector A (Ok(0))
         let mut sector_equal_b = [0u8; 256];
         FlashJournal::save_to_sector_with_seq(&store, &mut sector_equal_b, u32::MAX).unwrap();
-        assert_eq!(DualSectorFlashStore::active_sector(&sector_a, &sector_equal_b), Ok(0));
+        assert_eq!(
+            DualSectorFlashStore::active_sector(&sector_a, &sector_equal_b),
+            Ok(0)
+        );
 
         // Buffer too small for entries does not mutate header
         let mut small_buf = [0xFFu8; 20]; // fits 16-byte header, but not entry
@@ -1512,13 +1569,9 @@ mod tests {
         let mut sector_b = [0xFFu8; 256];
 
         // Sector A has seq 10 (older)
-        let _ = FlashJournal::save_to_sector_with_seq(
-            &store, &mut sector_a, 10,
-        ).unwrap();
+        let _ = FlashJournal::save_to_sector_with_seq(&store, &mut sector_a, 10).unwrap();
         // Sector B has seq 11 (newer)
-        let _ = FlashJournal::save_to_sector_with_seq(
-            &store, &mut sector_b, 11,
-        ).unwrap();
+        let _ = FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 11).unwrap();
 
         // Sector B is newer, so it is active (index 1)
         assert_eq!(
@@ -1559,12 +1612,9 @@ mod tests {
         cfg.loudness_enabled = true;
 
         cfg.save_to(&mut store).expect("save_to ok");
-        let (wrote_b, bytes) = FlashJournal::save_to_dual_sectors(
-            &store,
-            &mut sector_a,
-            &mut sector_b,
-        )
-        .expect("journal save ok");
+        let (wrote_b, bytes) =
+            FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b)
+                .expect("journal save ok");
         assert!(!wrote_b);
         assert!(bytes > FlashJournal::HEADER_SIZE);
 
@@ -1581,7 +1631,9 @@ mod tests {
     #[test]
     fn test_audio_config_backwards_compatibility_missing_again_loud() {
         let mut store = MemConfigStore::<16>::new();
-        store.set_str(AudioConfig::KEY_NAME, "LegacyPlayer").unwrap();
+        store
+            .set_str(AudioConfig::KEY_NAME, "LegacyPlayer")
+            .unwrap();
         store.set_u8(AudioConfig::KEY_VOL, 75).unwrap();
         store.set_u8(AudioConfig::KEY_EQ, 1).unwrap();
 
@@ -1589,7 +1641,10 @@ mod tests {
         assert_eq!(loaded.player_name.as_str(), "LegacyPlayer");
         assert_eq!(loaded.volume, 75);
         assert_eq!(loaded.equalizer_preset, 1);
-        assert_eq!(loaded.analog_gain_code, AudioConfig::DEFAULT_ANALOG_GAIN_CODE);
+        assert_eq!(
+            loaded.analog_gain_code,
+            AudioConfig::DEFAULT_ANALOG_GAIN_CODE
+        );
         assert!(!loaded.loudness_enabled);
     }
 
@@ -1615,7 +1670,10 @@ mod tests {
         cfg.lms_server_ip = Some([192, 168, 1, 2]);
         cfg.volume = 42;
         cfg.save_to(&mut store).unwrap();
-        WifiCredentials::new("Studio", "secret-pass").unwrap().save_to(&mut store).unwrap();
+        WifiCredentials::new("Studio", "secret-pass")
+            .unwrap()
+            .save_to(&mut store)
+            .unwrap();
         store
     }
 
@@ -1644,20 +1702,35 @@ mod tests {
         // usual KeyNotFound.
         assert_eq!(writer.remove("absent"), Err(StorageError::KeyNotFound));
         // Append-only: a written key can be neither rewritten nor removed.
-        assert_eq!(writer.set(AudioConfig::KEY_VOL, &[1]), Err(StorageError::InvalidFormat));
-        assert_eq!(writer.remove(AudioConfig::KEY_VOL), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            writer.set(AudioConfig::KEY_VOL, &[1]),
+            Err(StorageError::InvalidFormat)
+        );
+        assert_eq!(
+            writer.remove(AudioConfig::KEY_VOL),
+            Err(StorageError::InvalidFormat)
+        );
         assert_eq!(writer.set("", &[1]), Err(StorageError::EmptyKey));
-        assert_eq!(writer.set("k", &[0u8; 129]), Err(StorageError::CapacityExceeded));
+        assert_eq!(
+            writer.set("k", &[0u8; 129]),
+            Err(StorageError::CapacityExceeded)
+        );
         assert_eq!(writer.get_u8(AudioConfig::KEY_VOL), Ok(Some(80)));
         let len = writer.finish(3).unwrap();
         let mut loaded = MemConfigStore::<16>::new();
         FlashJournal::load_from_sector(&sector[..len], &mut loaded).unwrap();
-        assert_eq!(AudioConfig::load_from(&loaded).unwrap(), AudioConfig::default());
+        assert_eq!(
+            AudioConfig::load_from(&loaded).unwrap(),
+            AudioConfig::default()
+        );
 
         // Out of space: nothing past the buffer, and the error is BufferTooSmall.
         let mut tiny = [0xFFu8; FlashJournal::HEADER_SIZE + 8];
         let mut writer = SectorWriter::new(&mut tiny).unwrap();
-        assert_eq!(writer.set("key", b"0123456789"), Err(StorageError::BufferTooSmall));
+        assert_eq!(
+            writer.set("key", b"0123456789"),
+            Err(StorageError::BufferTooSmall)
+        );
         assert!(SectorWriter::new(&mut [0u8; 4]).is_err());
     }
 
@@ -1680,12 +1753,18 @@ mod tests {
         assert!(view.contains(AudioConfig::KEY_NAME));
         assert!(!view.contains("nope"));
         let mut small = [0u8; 2];
-        assert_eq!(view.get(AudioConfig::KEY_NAME, &mut small), Err(StorageError::BufferTooSmall));
+        assert_eq!(
+            view.get(AudioConfig::KEY_NAME, &mut small),
+            Err(StorageError::BufferTooSmall)
+        );
 
         // Read-only.
         let mut view = view;
         assert_eq!(view.set("x", &[1]), Err(StorageError::InvalidFormat));
-        assert_eq!(view.remove(AudioConfig::KEY_NAME), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            view.remove(AudioConfig::KEY_NAME),
+            Err(StorageError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -1693,7 +1772,10 @@ mod tests {
         let store = sample_store();
         let mut sector = [0xFFu8; 1024];
         let len = FlashJournal::save_to_sector_with_seq(&store, &mut sector, 5).unwrap();
-        assert_eq!(FlashJournal::validate_sector(&sector), Ok((5, store.len(), len)));
+        assert_eq!(
+            FlashJournal::validate_sector(&sector),
+            Ok((5, store.len(), len))
+        );
 
         // Every single-bit flip inside the image is rejected by both validators.
         for byte in 0..len {
@@ -1732,7 +1814,10 @@ mod tests {
             FlashJournal::load_from_sector(&dup, &mut sink),
             Err(StorageError::InvalidFormat)
         );
-        assert_eq!(FlashJournal::validate_sector(&dup), Err(StorageError::InvalidFormat));
+        assert_eq!(
+            FlashJournal::validate_sector(&dup),
+            Err(StorageError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -1753,7 +1838,10 @@ mod tests {
         let mut wrap_new = [0xFFu8; 512];
         FlashJournal::save_to_sector_with_seq(&store, &mut wrap_old, u32::MAX).unwrap();
         FlashJournal::save_to_sector_with_seq(&store, &mut wrap_new, 0).unwrap();
-        assert_eq!(FlashJournal::select_dual_sector(&wrap_old, &wrap_new), Some((1, 0)));
+        assert_eq!(
+            FlashJournal::select_dual_sector(&wrap_old, &wrap_new),
+            Some((1, 0))
+        );
         // Newer header but a corrupt entry falls back to the older valid sector.
         let mut bad4 = s4;
         bad4[FlashJournal::HEADER_SIZE + 3] ^= 0x01; // entry CRC byte

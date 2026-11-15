@@ -3,6 +3,7 @@
 //! Provides pure-Rust `#![no_std]` RSA private key operations
 //! (modular exponentiation, PKCS#1 v1.5 and OAEP unpadding) and AES-128-CBC.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -256,63 +257,126 @@ fn inv32(n: u32) -> u32 {
     0u32.wrapping_sub(x)
 }
 
-/// Montgomery reduction: computes (t / R) mod n where R = 2^(32 * k).
-fn mont_reduce(t: &mut [u32], n: &[u32], n_prime: u32) -> Vec<u32> {
-    let k = n.len();
-    for i in 0..k {
-        let m = t[i].wrapping_mul(n_prime);
+/// Maximum limbs supported by stack-allocated Montgomery arithmetic
+/// (2,176 bits).
+const MAX_LIMBS: usize = 68;
+/// Limb count for 1024-bit CRT components.
+const CRT_LIMBS: usize = 32;
+
+/// Fused constant-time CIOS Montgomery multiplication: computes
+/// `(a * b * R^-1) mod n` over `k` limbs (`R = 2^(32 * k)`), assuming
+/// `a[..k] < n[..k]` and `b[..k] < n[..k]`.
+fn cios_mont_mul(k: usize, a: &[u32], b: &[u32], n: &[u32], n_prime: u32, out: &mut [u32]) {
+    let mut t = [0u32; MAX_LIMBS + 2];
+    for &val in &a[..k] {
         let mut carry = 0u64;
+        let ai = u64::from(val);
         for j in 0..k {
-            let prod = (m as u64) * (n[j] as u64) + (t[i + j] as u64) + carry;
-            t[i + j] = prod as u32;
+            let prod = u64::from(t[j]) + ai * u64::from(b[j]) + carry;
+            t[j] = prod as u32;
             carry = prod >> 32;
         }
-        let mut p = i + k;
-        while carry > 0 && p < t.len() {
-            let sum = (t[p] as u64) + carry;
-            t[p] = sum as u32;
-            carry = sum >> 32;
-            p += 1;
+        let sum = u64::from(t[k]) + carry;
+        t[k] = sum as u32;
+        t[k + 1] = (sum >> 32) as u32;
+
+        let m = u64::from(t[0].wrapping_mul(n_prime));
+        let prod0 = u64::from(t[0]) + m * u64::from(n[0]);
+        let mut red_carry = prod0 >> 32;
+        for j in 1..k {
+            let prod = u64::from(t[j]) + m * u64::from(n[j]) + red_carry;
+            t[j - 1] = prod as u32;
+            red_carry = prod >> 32;
         }
+        let red_sum = u64::from(t[k]) + red_carry;
+        t[k - 1] = red_sum as u32;
+        t[k] = t[k + 1].wrapping_add((red_sum >> 32) as u32);
+        t[k + 1] = 0;
     }
 
-    let mut res = BigUint {
-        limbs: t[k..].to_vec(),
-    };
-    res.normalize();
-
-    let n_big = BigUint {
-        limbs: n.to_vec(),
-    };
-    if res >= n_big {
-        res = res.sub(&n_big);
+    let mut diff = [0u32; MAX_LIMBS];
+    let mut borrow = 0u64;
+    for j in 0..k {
+        let sub = u64::from(t[j])
+            .wrapping_sub(u64::from(n[j]))
+            .wrapping_sub(borrow);
+        diff[j] = sub as u32;
+        borrow = (sub >> 63) & 1;
     }
-
-    let mut out = res.limbs;
-    out.resize(k, 0);
-    out
+    let top = u64::from(t[k]).wrapping_sub(borrow);
+    let keep_t_mask = (((top >> 63) & 1) as u32).wrapping_neg();
+    let pick_diff_mask = !keep_t_mask;
+    for j in 0..k {
+        out[j] = (t[j] & keep_t_mask) | (diff[j] & pick_diff_mask);
+    }
 }
 
-/// Multiplies two limb slices into a product vector.
-fn mul_limbs(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut res = vec![0u32; a.len() + b.len() + 4];
-    for (i, &x) in a.iter().enumerate() {
-        let mut carry = 0u64;
-        let x_val = x as u64;
-        for (j, &y) in b.iter().enumerate() {
-            let prod = x_val * (y as u64) + (res[i + j] as u64) + carry;
-            res[i + j] = prod as u32;
-            carry = prod >> 32;
+/// Precomputes `R^2 mod n` where `R = 2^(32 * k)` on stack with zero heap
+/// allocations.
+fn compute_r2_mod_n(k: usize, n: &[u32], out: &mut [u32]) {
+    let mut r = [0u32; MAX_LIMBS];
+    r[0] = 1;
+    for _ in 0..(64 * k) {
+        let mut shifted = [0u32; MAX_LIMBS];
+        let mut carry = 0u32;
+        for j in 0..k {
+            let v = r[j];
+            shifted[j] = (v << 1) | carry;
+            carry = v >> 31;
         }
-        let mut p = i + b.len();
-        while carry > 0 && p < res.len() {
-            let sum = (res[p] as u64) + carry;
-            res[p] = sum as u32;
-            carry = sum >> 32;
-            p += 1;
+        let mut diff = [0u32; MAX_LIMBS];
+        let mut borrow = 0u64;
+        for j in 0..k {
+            let sub = u64::from(shifted[j])
+                .wrapping_sub(u64::from(n[j]))
+                .wrapping_sub(borrow);
+            diff[j] = sub as u32;
+            borrow = (sub >> 63) & 1;
+        }
+        let top = u64::from(carry).wrapping_sub(borrow);
+        let keep_s_mask = (((top >> 63) & 1) as u32).wrapping_neg();
+        let pick_d_mask = !keep_s_mask;
+        for j in 0..k {
+            r[j] = (shifted[j] & keep_s_mask) | (diff[j] & pick_d_mask);
         }
     }
-    res
+    out[..k].copy_from_slice(&r[..k]);
+}
+
+/// Constant-time Montgomery exponentiation over `k` limbs.
+fn mont_pow_limbs(
+    k: usize,
+    base: &[u32],
+    exp_limbs: &[u32],
+    n: &[u32],
+    n_prime: u32,
+    r2: &[u32],
+    out: &mut [u32],
+) {
+    let mut one = [0u32; MAX_LIMBS];
+    one[0] = 1;
+    let mut c_bar = [0u32; MAX_LIMBS];
+    cios_mont_mul(k, base, r2, n, n_prime, &mut c_bar);
+    let mut x_bar = [0u32; MAX_LIMBS];
+    cios_mont_mul(k, &one, r2, n, n_prime, &mut x_bar);
+    let mut sq = [0u32; MAX_LIMBS];
+    let mut next = [0u32; MAX_LIMBS];
+    for bit_idx in (0..(k * 32)).rev() {
+        let limb_idx = bit_idx / 32;
+        let bit_in_limb = bit_idx % 32;
+        let bit = if limb_idx < exp_limbs.len() {
+            (exp_limbs[limb_idx] >> bit_in_limb) & 1
+        } else {
+            0
+        };
+        cios_mont_mul(k, &x_bar, &x_bar, n, n_prime, &mut sq);
+        cios_mont_mul(k, &sq, &c_bar, n, n_prime, &mut next);
+        let mask = 0u32.wrapping_sub(bit);
+        for j in 0..k {
+            x_bar[j] = (next[j] & mask) | (sq[j] & !mask);
+        }
+    }
+    cios_mont_mul(k, &x_bar, &one, n, n_prime, out);
 }
 
 /// Montgomery modular exponentiation: computes (base^exp) mod modulus.
@@ -332,110 +396,31 @@ pub fn montgomery_mod_pow(
     }
 
     let k = modulus.limbs.len();
-    let n_limbs = modulus.limbs.clone();
-    let n_prime = inv32(n_limbs[0]);
-
-    // Precompute R^2 mod N where R = 2^(32 * k) using fixed stack buffers
-    const MAX_LIMBS: usize = 128;
-    let mut r_limbs = [0u32; MAX_LIMBS];
-    let mut r_len = 1usize;
-    r_limbs[0] = 1;
-
-    let mod_limbs = &modulus.limbs;
-    for _ in 0..(2 * 32 * k) {
-        let mut carry = 0u32;
-        for limb in &mut r_limbs[..r_len] {
-            let val = *limb;
-            *limb = (val << 1) | carry;
-            carry = val >> 31;
-        }
-        if carry > 0 && r_len < MAX_LIMBS {
-            r_limbs[r_len] = carry;
-            r_len += 1;
-        }
-
-        while r_len > 0 && r_limbs[r_len - 1] == 0 {
-            r_len -= 1;
-        }
-        let is_ge = if r_len > mod_limbs.len() {
-            true
-        } else if r_len < mod_limbs.len() {
-            false
-        } else {
-            let mut ge = true;
-            for i in (0..r_len).rev() {
-                if r_limbs[i] > mod_limbs[i] {
-                    ge = true;
-                    break;
-                } else if r_limbs[i] < mod_limbs[i] {
-                    ge = false;
-                    break;
-                }
-            }
-            ge
-        };
-
-        if is_ge {
-            let mut borrow = 0u64;
-            for i in 0..r_len {
-                let m = if i < mod_limbs.len() { mod_limbs[i] as u64 } else { 0 };
-                let diff = (r_limbs[i] as u64).wrapping_sub(m).wrapping_sub(borrow);
-                r_limbs[i] = diff as u32;
-                borrow = (diff >> 63) & 1;
-            }
-            while r_len > 0 && r_limbs[r_len - 1] == 0 {
-                r_len -= 1;
-            }
-        }
+    if k > MAX_LIMBS {
+        return Err(CryptoError::CiphertextTooLarge);
     }
+    let n_prime = inv32(modulus.limbs[0]);
 
-    let r = BigUint { limbs: r_limbs[..r_len].to_vec() };
+    let mut r2 = [0u32; MAX_LIMBS];
+    compute_r2_mod_n(k, &modulus.limbs, &mut r2);
 
-    let mut r2_limbs = r.limbs;
-    r2_limbs.resize(k, 0);
+    let mut b_limbs = [0u32; MAX_LIMBS];
+    let copy_len = base.limbs.len().min(k);
+    b_limbs[..copy_len].copy_from_slice(&base.limbs[..copy_len]);
 
-    let mut c_limbs = base.limbs.clone();
-    c_limbs.resize(k, 0);
-
-    // Convert base to Montgomery form: c_bar = mont_reduce(base * R^2)
-    let mut prod_c_r2 = mul_limbs(&c_limbs, &r2_limbs);
-    let c_bar = mont_reduce(&mut prod_c_r2, &n_limbs, n_prime);
-
-    // Initial accumulator = 1 in Montgomery form = mont_reduce(1 * R^2)
-    let mut one_limbs = vec![0u32; k];
-    one_limbs[0] = 1;
-    let mut prod_one_r2 = mul_limbs(&one_limbs, &r2_limbs);
-    let mut x_bar = mont_reduce(&mut prod_one_r2, &n_limbs, n_prime);
-
-    // Exponentiate MSB to LSB over fixed modulus bit size (k * 32)
-    let total_bits = k * 32;
-    for bit_idx in (0..total_bits).rev() {
-        let limb_idx = bit_idx / 32;
-        let bit_in_limb = bit_idx % 32;
-        let bit = if limb_idx < exp.limbs.len() {
-            (exp.limbs[limb_idx] >> bit_in_limb) & 1
-        } else {
-            0
-        };
-
-        let mut sq = mul_limbs(&x_bar, &x_bar);
-        x_bar = mont_reduce(&mut sq, &n_limbs, n_prime);
-
-        let mut mul = mul_limbs(&x_bar, &c_bar);
-        let next = mont_reduce(&mut mul, &n_limbs, n_prime);
-
-        let mask = 0u32.wrapping_sub(bit);
-        for i in 0..x_bar.len() {
-            x_bar[i] = (next[i] & mask) | (x_bar[i] & !mask);
-        }
-    }
-
-    // Convert from Montgomery form: x = mont_reduce(x_bar * 1)
-    let mut final_prod = vec![0u32; 2 * k + 4];
-    final_prod[..k].copy_from_slice(&x_bar);
-    let final_limbs = mont_reduce(&mut final_prod, &n_limbs, n_prime);
-
-    let mut res = BigUint { limbs: final_limbs };
+    let mut out = [0u32; MAX_LIMBS];
+    mont_pow_limbs(
+        k,
+        &b_limbs,
+        &exp.limbs,
+        &modulus.limbs,
+        n_prime,
+        &r2,
+        &mut out,
+    );
+    let mut res = BigUint {
+        limbs: out[..k].to_vec(),
+    };
     res.normalize();
     Ok(res)
 }
@@ -688,12 +673,246 @@ pub fn pad_pkcs1_v15_type1(message: &[u8], target_len: usize) -> Result<Vec<u8>,
     Ok(buf)
 }
 
+/// Converts 128 big-endian bytes into 32 little-endian 32-bit limbs.
+fn be_128_to_limbs(bytes: &[u8; 128]) -> [u32; CRT_LIMBS] {
+    let mut limbs = [0u32; CRT_LIMBS];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let off = (CRT_LIMBS - 1 - i) * 4;
+        *limb = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+    }
+    limbs
+}
+
+/// Constant-time subtraction if `a >= m` over 32 limbs.
+fn ct_sub_if_ge_32(a: &[u32; 32], m: &[u32; 32]) -> [u32; 32] {
+    let mut diff = [0u32; 32];
+    let mut borrow = 0u64;
+    for j in 0..32 {
+        let sub = u64::from(a[j])
+            .wrapping_sub(u64::from(m[j]))
+            .wrapping_sub(borrow);
+        diff[j] = sub as u32;
+        borrow = (sub >> 63) & 1;
+    }
+    let keep_a_mask = ((borrow as u32) & 1).wrapping_neg();
+    let pick_d_mask = !keep_a_mask;
+    let mut out = [0u32; 32];
+    for j in 0..32 {
+        out[j] = (a[j] & keep_a_mask) | (diff[j] & pick_d_mask);
+    }
+    out
+}
+
+/// Constant-time modular addition `(a + b) mod m` assuming `a, b < m`.
+fn ct_add_mod_32(a: &[u32; 32], b: &[u32; 32], m: &[u32; 32]) -> [u32; 32] {
+    let mut sum = [0u32; 32];
+    let mut carry = 0u64;
+    for j in 0..32 {
+        let s = u64::from(a[j]) + u64::from(b[j]) + carry;
+        sum[j] = s as u32;
+        carry = s >> 32;
+    }
+    let mut diff = [0u32; 32];
+    let mut borrow = 0u64;
+    for j in 0..32 {
+        let sub = u64::from(sum[j])
+            .wrapping_sub(u64::from(m[j]))
+            .wrapping_sub(borrow);
+        diff[j] = sub as u32;
+        borrow = (sub >> 63) & 1;
+    }
+    let top = carry.wrapping_sub(borrow);
+    let keep_s_mask = (((top >> 63) & 1) as u32).wrapping_neg();
+    let pick_d_mask = !keep_s_mask;
+    let mut out = [0u32; 32];
+    for j in 0..32 {
+        out[j] = (sum[j] & keep_s_mask) | (diff[j] & pick_d_mask);
+    }
+    out
+}
+
+/// Constant-time modular subtraction `(a - b) mod m` assuming `a, b < m`.
+fn ct_sub_mod_32(a: &[u32; 32], b: &[u32; 32], m: &[u32; 32]) -> [u32; 32] {
+    let mut diff = [0u32; 32];
+    let mut borrow = 0u64;
+    for j in 0..32 {
+        let sub = u64::from(a[j])
+            .wrapping_sub(u64::from(b[j]))
+            .wrapping_sub(borrow);
+        diff[j] = sub as u32;
+        borrow = (sub >> 63) & 1;
+    }
+    let mask = (borrow as u32).wrapping_neg();
+    let mut carry = 0u64;
+    let mut out = [0u32; 32];
+    for j in 0..32 {
+        let add = u64::from(diff[j]) + u64::from(m[j] & mask) + carry;
+        out[j] = add as u32;
+        carry = add >> 32;
+    }
+    out
+}
+
+/// Precomputed Chinese Remainder Theorem (CRT) parameters for 2048-bit RSA
+/// keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RsaCrtParams {
+    p: [u32; CRT_LIMBS],
+    p_prime: u32,
+    p_r2: [u32; CRT_LIMBS],
+    dp: [u32; CRT_LIMBS],
+    q: [u32; CRT_LIMBS],
+    q_prime: u32,
+    q_r2: [u32; CRT_LIMBS],
+    dq: [u32; CRT_LIMBS],
+    qinv_mont_p: [u32; CRT_LIMBS],
+}
+
+impl RsaCrtParams {
+    /// Constructs precomputed CRT parameters from 128-byte big-endian components.
+    pub fn new(
+        p_bytes: &[u8; 128],
+        q_bytes: &[u8; 128],
+        dp_bytes: &[u8; 128],
+        dq_bytes: &[u8; 128],
+        qinv_bytes: &[u8; 128],
+    ) -> Self {
+        let p = be_128_to_limbs(p_bytes);
+        let q = be_128_to_limbs(q_bytes);
+        let dp = be_128_to_limbs(dp_bytes);
+        let dq = be_128_to_limbs(dq_bytes);
+        let qinv = be_128_to_limbs(qinv_bytes);
+
+        let p_prime = inv32(p[0]);
+        let q_prime = inv32(q[0]);
+
+        let mut p_r2 = [0u32; CRT_LIMBS];
+        compute_r2_mod_n(CRT_LIMBS, &p, &mut p_r2);
+
+        let mut q_r2 = [0u32; CRT_LIMBS];
+        compute_r2_mod_n(CRT_LIMBS, &q, &mut q_r2);
+
+        let mut qinv_mont_p = [0u32; CRT_LIMBS];
+        cios_mont_mul(CRT_LIMBS, &qinv, &p_r2, &p, p_prime, &mut qinv_mont_p);
+
+        Self {
+            p,
+            p_prime,
+            p_r2,
+            dp,
+            q,
+            q_prime,
+            q_r2,
+            dq,
+            qinv_mont_p,
+        }
+    }
+
+    /// Evaluates `c^d mod n` using Garner's CRT algorithm in constant time.
+    pub fn mod_pow_2048(&self, c: &BigUint) -> Vec<u8> {
+        let mut c64 = [0u32; 64];
+        for (dst, &src) in c64.iter_mut().zip(&c.limbs) {
+            *dst = src;
+        }
+        let mut c_lo = [0u32; 32];
+        let mut c_hi = [0u32; 32];
+        c_lo.copy_from_slice(&c64[0..32]);
+        c_hi.copy_from_slice(&c64[32..64]);
+
+        let lo_p = ct_sub_if_ge_32(&c_lo, &self.p);
+        let hi_p = ct_sub_if_ge_32(&c_hi, &self.p);
+        let mut hi_r_p = [0u32; CRT_LIMBS];
+        cios_mont_mul(
+            CRT_LIMBS,
+            &hi_p,
+            &self.p_r2,
+            &self.p,
+            self.p_prime,
+            &mut hi_r_p,
+        );
+        let c_mod_p = ct_add_mod_32(&lo_p, &hi_r_p, &self.p);
+
+        let lo_q = ct_sub_if_ge_32(&c_lo, &self.q);
+        let hi_q = ct_sub_if_ge_32(&c_hi, &self.q);
+        let mut hi_r_q = [0u32; CRT_LIMBS];
+        cios_mont_mul(
+            CRT_LIMBS,
+            &hi_q,
+            &self.q_r2,
+            &self.q,
+            self.q_prime,
+            &mut hi_r_q,
+        );
+        let c_mod_q = ct_add_mod_32(&lo_q, &hi_r_q, &self.q);
+
+        let mut m1 = [0u32; CRT_LIMBS];
+        mont_pow_limbs(
+            CRT_LIMBS,
+            &c_mod_p,
+            &self.dp,
+            &self.p,
+            self.p_prime,
+            &self.p_r2,
+            &mut m1,
+        );
+
+        let mut m2 = [0u32; CRT_LIMBS];
+        mont_pow_limbs(
+            CRT_LIMBS,
+            &c_mod_q,
+            &self.dq,
+            &self.q,
+            self.q_prime,
+            &self.q_r2,
+            &mut m2,
+        );
+
+        let diff = ct_sub_mod_32(&m1, &m2, &self.p);
+        let mut h = [0u32; CRT_LIMBS];
+        cios_mont_mul(
+            CRT_LIMBS,
+            &diff,
+            &self.qinv_mont_p,
+            &self.p,
+            self.p_prime,
+            &mut h,
+        );
+
+        let mut m64 = [0u32; 64];
+        m64[..32].copy_from_slice(&m2);
+        for i in 0..32 {
+            let mut carry = 0u64;
+            let hi = u64::from(h[i]);
+            for j in 0..32 {
+                let prod = u64::from(m64[i + j]) + hi * u64::from(self.q[j]) + carry;
+                m64[i + j] = prod as u32;
+                carry = prod >> 32;
+            }
+            let mut k_idx = i + 32;
+            while carry > 0 && k_idx < 64 {
+                let sum = u64::from(m64[k_idx]) + carry;
+                m64[k_idx] = sum as u32;
+                carry = sum >> 32;
+                k_idx += 1;
+            }
+        }
+
+        let mut out = vec![0u8; 256];
+        for (i, &limb) in m64.iter().enumerate() {
+            let off = (63 - i) * 4;
+            out[off..off + 4].copy_from_slice(&limb.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// RSA Private Key supporting arbitrary modulus bit sizes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RsaPrivateKey {
     pub n: BigUint,
     pub d: BigUint,
     n_len: usize,
+    crt: Option<Box<RsaCrtParams>>,
 }
 
 impl RsaPrivateKey {
@@ -703,6 +922,7 @@ impl RsaPrivateKey {
             n: BigUint::from_be_bytes(n_bytes),
             d: BigUint::from_be_bytes(d_bytes),
             n_len: n_bytes.len(),
+            crt: None,
         }
     }
 
@@ -711,11 +931,25 @@ impl RsaPrivateKey {
         self.n_len
     }
 
+    /// Attaches precomputed CRT parameters to this private key.
+    pub fn with_crt(mut self, crt: RsaCrtParams) -> Self {
+        self.crt = Some(Box::new(crt));
+        self
+    }
+
+    /// Returns true if this private key has CRT parameters configured.
+    pub fn has_crt(&self) -> bool {
+        self.crt.is_some()
+    }
+
     /// Performs private key operation: m = c^d mod n.
     pub fn decrypt_raw(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let c = BigUint::from_be_bytes(ciphertext);
         if c >= self.n {
             return Err(CryptoError::CiphertextTooLarge);
+        }
+        if let Some(crt) = &self.crt {
+            return Ok(crt.mod_pow_2048(&c));
         }
         let m = montgomery_mod_pow(&c, &self.d, &self.n)?;
         m.to_be_bytes_padded(self.n_len)
@@ -737,9 +971,7 @@ impl RsaPrivateKey {
     /// Signs an Apple-Challenge payload using PKCS#1 v1.5 block type 01.
     pub fn sign_apple_challenge(&self, challenge_data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let padded = pad_pkcs1_v15_type1(challenge_data, self.n_len)?;
-        let m = BigUint::from_be_bytes(&padded);
-        let s = montgomery_mod_pow(&m, &self.d, &self.n)?;
-        s.to_be_bytes_padded(self.n_len)
+        self.decrypt_raw(&padded)
     }
 }
 
@@ -763,8 +995,8 @@ const S_BOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-/// AES Inverse S-box.
-const INV_S_BOX: [u8; 256] = [
+/// AES Inverse S-box initializer.
+const INV_S_BOX_INIT: [u8; 256] = [
     0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
     0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
     0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
@@ -783,10 +1015,18 @@ const INV_S_BOX: [u8; 256] = [
     0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
 ];
 
+// JUSTIFICATION: Placing INV_S_BOX in internal .dram1 avoids SPI flash
+// cache stalls during real-time AirPlay RTP packet decryption.
+// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
+// script for plain [u8; 256] data with no alignment or init hazards.
+#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
+#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+static INV_S_BOX: [u8; 256] = INV_S_BOX_INIT;
+
 /// AES Rcon array.
 const RCON: [u32; 10] = [
-    0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000,
-    0x80000000, 0x1b000000, 0x36000000,
+    0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000, 0x80000000,
+    0x1b000000, 0x36000000,
 ];
 
 fn sub_word(w: u32) -> u32 {
@@ -807,11 +1047,54 @@ const fn xtime(x: u8) -> u8 {
 }
 
 #[inline(always)]
-const fn inv_mix_muls(x: u8) -> (u8, u8, u8, u8) {
+const fn gf_mul(x: u8, factor: u8) -> u8 {
     let x2 = xtime(x);
     let x4 = xtime(x2);
     let x8 = xtime(x4);
-    (x8 ^ x, x8 ^ x2 ^ x, x8 ^ x4 ^ x, x8 ^ x4 ^ x2)
+    match factor {
+        9 => x8 ^ x,
+        11 => x8 ^ x2 ^ x,
+        13 => x8 ^ x4 ^ x,
+        14 => x8 ^ x4 ^ x2,
+        _ => 0,
+    }
+}
+
+const fn compute_td0() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let s = INV_S_BOX_INIT[i];
+        table[i] = ((gf_mul(s, 14) as u32) << 24)
+            | ((gf_mul(s, 9) as u32) << 16)
+            | ((gf_mul(s, 13) as u32) << 8)
+            | (gf_mul(s, 11) as u32);
+        i += 1;
+    }
+    table
+}
+
+// JUSTIFICATION: Placing TD0 in internal .dram1 avoids SPI flash cache
+// stalls during real-time AirPlay RTP packet decryption.
+// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
+// script for plain [u32; 256] data with no alignment or init hazards.
+#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
+#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+static TD0: [u32; 256] = compute_td0();
+
+#[inline(always)]
+const fn inv_mix_col_word(w: u32) -> u32 {
+    let b0 = (w >> 24) as u8;
+    let b1 = (w >> 16) as u8;
+    let b2 = (w >> 8) as u8;
+    let b3 = w as u8;
+
+    let r0 = gf_mul(b0, 14) ^ gf_mul(b1, 11) ^ gf_mul(b2, 13) ^ gf_mul(b3, 9);
+    let r1 = gf_mul(b0, 9) ^ gf_mul(b1, 14) ^ gf_mul(b2, 11) ^ gf_mul(b3, 13);
+    let r2 = gf_mul(b0, 13) ^ gf_mul(b1, 9) ^ gf_mul(b2, 14) ^ gf_mul(b3, 11);
+    let r3 = gf_mul(b0, 11) ^ gf_mul(b1, 13) ^ gf_mul(b2, 9) ^ gf_mul(b3, 14);
+
+    u32::from_be_bytes([r0, r1, r2, r3])
 }
 
 /// AES-128-CBC Decryptor in pure `#![no_std]`.
@@ -825,12 +1108,8 @@ impl Aes128Cbc {
     pub fn new(key: &[u8; 16]) -> Self {
         let mut rk = [0u32; 44];
         for i in 0..4 {
-            rk[i] = u32::from_be_bytes([
-                key[i * 4],
-                key[i * 4 + 1],
-                key[i * 4 + 2],
-                key[i * 4 + 3],
-            ]);
+            rk[i] =
+                u32::from_be_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
         }
         for i in 4..44 {
             let mut temp = rk[i - 1];
@@ -839,112 +1118,76 @@ impl Aes128Cbc {
             }
             rk[i] = rk[i - 4] ^ temp;
         }
+        for w in &mut rk[4..40] {
+            *w = inv_mix_col_word(*w);
+        }
         Self { round_keys: rk }
     }
 
     /// Decrypts a single 16-byte block in place.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
-        let mut state = [0u8; 16];
-        state.copy_from_slice(block);
+        let mut s0 =
+            u32::from_be_bytes([block[0], block[1], block[2], block[3]]) ^ self.round_keys[40];
+        let mut s1 =
+            u32::from_be_bytes([block[4], block[5], block[6], block[7]]) ^ self.round_keys[41];
+        let mut s2 =
+            u32::from_be_bytes([block[8], block[9], block[10], block[11]]) ^ self.round_keys[42];
+        let mut s3 =
+            u32::from_be_bytes([block[12], block[13], block[14], block[15]]) ^ self.round_keys[43];
 
-        // Round 10: AddRoundKey
-        let rk_last = &self.round_keys[40..44];
-        for c in 0..4 {
-            let k = rk_last[c].to_be_bytes();
-            for r in 0..4 {
-                state[r + 4 * c] ^= k[r];
-            }
-        }
-
-        // Rounds 9 down to 1
         for round in (1..10).rev() {
-            // InvShiftRows
-            let mut temp = [0u8; 16];
-            temp[0] = state[0];
-            temp[4] = state[4];
-            temp[8] = state[8];
-            temp[12] = state[12];
-
-            temp[1] = state[13];
-            temp[5] = state[1];
-            temp[9] = state[5];
-            temp[13] = state[9];
-
-            temp[2] = state[10];
-            temp[6] = state[14];
-            temp[10] = state[2];
-            temp[14] = state[6];
-
-            temp[3] = state[7];
-            temp[7] = state[11];
-            temp[11] = state[15];
-            temp[15] = state[3];
-
-            // InvSubBytes
-            for b in &mut temp {
-                *b = INV_S_BOX[*b as usize];
-            }
-
-            // AddRoundKey
-            let rk_cur = &self.round_keys[round * 4..(round + 1) * 4];
-            for c in 0..4 {
-                let k = rk_cur[c].to_be_bytes();
-                for r in 0..4 {
-                    temp[r + 4 * c] ^= k[r];
-                }
-            }
-
-            // InvMixColumns
-            for c in 0..4 {
-                let (s0_9, s0_11, s0_13, s0_14) = inv_mix_muls(temp[4 * c]);
-                let (s1_9, s1_11, s1_13, s1_14) = inv_mix_muls(temp[4 * c + 1]);
-                let (s2_9, s2_11, s2_13, s2_14) = inv_mix_muls(temp[4 * c + 2]);
-                let (s3_9, s3_11, s3_13, s3_14) = inv_mix_muls(temp[4 * c + 3]);
-
-                state[4 * c] = s0_14 ^ s1_11 ^ s2_13 ^ s3_9;
-                state[4 * c + 1] = s0_9 ^ s1_14 ^ s2_11 ^ s3_13;
-                state[4 * c + 2] = s0_13 ^ s1_9 ^ s2_14 ^ s3_11;
-                state[4 * c + 3] = s0_11 ^ s1_13 ^ s2_9 ^ s3_14;
-            }
+            let rk = &self.round_keys[round * 4..round * 4 + 4];
+            let t0 = TD0[(s0 >> 24) as usize]
+                ^ TD0[((s3 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s2 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s1 & 0xFF) as usize].rotate_right(24)
+                ^ rk[0];
+            let t1 = TD0[(s1 >> 24) as usize]
+                ^ TD0[((s0 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s3 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s2 & 0xFF) as usize].rotate_right(24)
+                ^ rk[1];
+            let t2 = TD0[(s2 >> 24) as usize]
+                ^ TD0[((s1 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s0 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s3 & 0xFF) as usize].rotate_right(24)
+                ^ rk[2];
+            let t3 = TD0[(s3 >> 24) as usize]
+                ^ TD0[((s2 >> 16) & 0xFF) as usize].rotate_right(8)
+                ^ TD0[((s1 >> 8) & 0xFF) as usize].rotate_right(16)
+                ^ TD0[(s0 & 0xFF) as usize].rotate_right(24)
+                ^ rk[3];
+            s0 = t0;
+            s1 = t1;
+            s2 = t2;
+            s3 = t3;
         }
 
-        // Round 0: InvShiftRows
-        let mut temp = [0u8; 16];
-        temp[0] = state[0];
-        temp[4] = state[4];
-        temp[8] = state[8];
-        temp[12] = state[12];
+        let out0 = (((INV_S_BOX[(s0 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s3 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s2 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s1 & 0xFF) as usize] as u32))
+            ^ self.round_keys[0];
+        let out1 = (((INV_S_BOX[(s1 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s0 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s3 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s2 & 0xFF) as usize] as u32))
+            ^ self.round_keys[1];
+        let out2 = (((INV_S_BOX[(s2 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s1 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s0 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s3 & 0xFF) as usize] as u32))
+            ^ self.round_keys[2];
+        let out3 = (((INV_S_BOX[(s3 >> 24) as usize] as u32) << 24)
+            | ((INV_S_BOX[((s2 >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((INV_S_BOX[((s1 >> 8) & 0xFF) as usize] as u32) << 8)
+            | (INV_S_BOX[(s0 & 0xFF) as usize] as u32))
+            ^ self.round_keys[3];
 
-        temp[1] = state[13];
-        temp[5] = state[1];
-        temp[9] = state[5];
-        temp[13] = state[9];
-
-        temp[2] = state[10];
-        temp[6] = state[14];
-        temp[10] = state[2];
-        temp[14] = state[6];
-
-        temp[3] = state[7];
-        temp[7] = state[11];
-        temp[11] = state[15];
-        temp[15] = state[3];
-
-        // InvSubBytes
-        for b in &mut temp {
-            *b = INV_S_BOX[*b as usize];
-        }
-
-        // AddRoundKey 0
-        let rk_first = &self.round_keys[0..4];
-        for c in 0..4 {
-            let k = rk_first[c].to_be_bytes();
-            for r in 0..4 {
-                temp[r + 4 * c] ^= k[r];
-            }
-        }
-
-        block.copy_from_slice(&temp);
+        block[0..4].copy_from_slice(&out0.to_be_bytes());
+        block[4..8].copy_from_slice(&out1.to_be_bytes());
+        block[8..12].copy_from_slice(&out2.to_be_bytes());
+        block[12..16].copy_from_slice(&out3.to_be_bytes());
     }
 
     /// Decrypts packet buffer in-place using CBC mode.
@@ -961,8 +1204,8 @@ impl Aes128Cbc {
             block.copy_from_slice(chunk);
             let next_iv = block;
             self.decrypt_block(&mut block);
-            for i in 0..16 {
-                chunk[i] = block[i] ^ prev_block[i];
+            for (dst, (&b, &p)) in chunk.iter_mut().zip(block.iter().zip(&prev_block)) {
+                *dst = b ^ p;
             }
             prev_block = next_iv;
         }
@@ -971,59 +1214,110 @@ impl Aes128Cbc {
 
 /// Airport Express 2048-bit RSA Private Key Modulus ($n$).
 pub const AIRPORT_EXPRESS_N_BYTES: [u8; 256] = [
-    0xe7, 0xd7, 0x44, 0xf2, 0xa2, 0xe2, 0x78, 0x8b, 0x6c, 0x1f, 0x55, 0xa0,
-    0x8e, 0xb7, 0x05, 0x44, 0xa8, 0xfa, 0x79, 0x45, 0xaa, 0x8b, 0xe6, 0xc6,
-    0x2c, 0xe5, 0xf5, 0x1c, 0xbd, 0xd4, 0xdc, 0x68, 0x42, 0xfe, 0x3d, 0x10,
-    0x83, 0xdd, 0x2e, 0xde, 0xc1, 0xbf, 0xd4, 0x25, 0x2d, 0xc0, 0x2e, 0x6f,
-    0x39, 0x8b, 0xdf, 0x0e, 0x61, 0x48, 0xea, 0x84, 0x85, 0x5e, 0x2e, 0x44,
-    0x2d, 0xa6, 0xd6, 0x26, 0x64, 0xf6, 0x74, 0xa1, 0xf3, 0x04, 0x92, 0x9a,
-    0xde, 0x4f, 0x68, 0x93, 0xef, 0x2d, 0xf6, 0xe7, 0x11, 0xa8, 0xc7, 0x7a,
-    0x0d, 0x91, 0xc9, 0xd9, 0x80, 0x82, 0x2e, 0x50, 0xd1, 0x29, 0x22, 0xaf,
-    0xea, 0x40, 0xea, 0x9f, 0x0e, 0x14, 0xc0, 0xf7, 0x69, 0x38, 0xc5, 0xf3,
-    0x88, 0x2f, 0xc0, 0x32, 0x3d, 0xd9, 0xfe, 0x55, 0x15, 0x5f, 0x51, 0xbb,
-    0x59, 0x21, 0xc2, 0x01, 0x62, 0x9f, 0xd7, 0x33, 0x52, 0xd5, 0xe2, 0xef,
-    0xaa, 0xbf, 0x9b, 0xa0, 0x48, 0xd7, 0xb8, 0x13, 0xa2, 0xb6, 0x76, 0x7f,
-    0x6c, 0x3c, 0xcf, 0x1e, 0xb4, 0xce, 0x67, 0x3d, 0x03, 0x7b, 0x0d, 0x2e,
-    0xa3, 0x0c, 0x5f, 0xff, 0xeb, 0x06, 0xf8, 0xd0, 0x8a, 0xdd, 0xe4, 0x09,
-    0x57, 0x1a, 0x9c, 0x68, 0x9f, 0xef, 0x10, 0x72, 0x88, 0x55, 0xdd, 0x8c,
-    0xfb, 0x9a, 0x8b, 0xef, 0x5c, 0x89, 0x43, 0xef, 0x3b, 0x5f, 0xaa, 0x15,
-    0xdd, 0xe6, 0x98, 0xbe, 0xdd, 0xf3, 0x59, 0x96, 0x03, 0xeb, 0x3e, 0x6f,
-    0x61, 0x37, 0x2b, 0xb6, 0x28, 0xf6, 0x55, 0x9f, 0x59, 0x9a, 0x78, 0xbf,
-    0x50, 0x06, 0x87, 0xaa, 0x7f, 0x49, 0x76, 0xc0, 0x56, 0x2d, 0x41, 0x29,
-    0x56, 0xf8, 0x98, 0x9e, 0x18, 0xa6, 0x35, 0x5b, 0xd8, 0x15, 0x97, 0x82,
-    0x5e, 0x0f, 0xc8, 0x75, 0x34, 0x3e, 0xc7, 0x82, 0x11, 0x76, 0x25, 0xcd,
-    0xbf, 0x98, 0x44, 0x7b,
+    0xe7, 0xd7, 0x44, 0xf2, 0xa2, 0xe2, 0x78, 0x8b, 0x6c, 0x1f, 0x55, 0xa0, 0x8e, 0xb7, 0x05, 0x44,
+    0xa8, 0xfa, 0x79, 0x45, 0xaa, 0x8b, 0xe6, 0xc6, 0x2c, 0xe5, 0xf5, 0x1c, 0xbd, 0xd4, 0xdc, 0x68,
+    0x42, 0xfe, 0x3d, 0x10, 0x83, 0xdd, 0x2e, 0xde, 0xc1, 0xbf, 0xd4, 0x25, 0x2d, 0xc0, 0x2e, 0x6f,
+    0x39, 0x8b, 0xdf, 0x0e, 0x61, 0x48, 0xea, 0x84, 0x85, 0x5e, 0x2e, 0x44, 0x2d, 0xa6, 0xd6, 0x26,
+    0x64, 0xf6, 0x74, 0xa1, 0xf3, 0x04, 0x92, 0x9a, 0xde, 0x4f, 0x68, 0x93, 0xef, 0x2d, 0xf6, 0xe7,
+    0x11, 0xa8, 0xc7, 0x7a, 0x0d, 0x91, 0xc9, 0xd9, 0x80, 0x82, 0x2e, 0x50, 0xd1, 0x29, 0x22, 0xaf,
+    0xea, 0x40, 0xea, 0x9f, 0x0e, 0x14, 0xc0, 0xf7, 0x69, 0x38, 0xc5, 0xf3, 0x88, 0x2f, 0xc0, 0x32,
+    0x3d, 0xd9, 0xfe, 0x55, 0x15, 0x5f, 0x51, 0xbb, 0x59, 0x21, 0xc2, 0x01, 0x62, 0x9f, 0xd7, 0x33,
+    0x52, 0xd5, 0xe2, 0xef, 0xaa, 0xbf, 0x9b, 0xa0, 0x48, 0xd7, 0xb8, 0x13, 0xa2, 0xb6, 0x76, 0x7f,
+    0x6c, 0x3c, 0xcf, 0x1e, 0xb4, 0xce, 0x67, 0x3d, 0x03, 0x7b, 0x0d, 0x2e, 0xa3, 0x0c, 0x5f, 0xff,
+    0xeb, 0x06, 0xf8, 0xd0, 0x8a, 0xdd, 0xe4, 0x09, 0x57, 0x1a, 0x9c, 0x68, 0x9f, 0xef, 0x10, 0x72,
+    0x88, 0x55, 0xdd, 0x8c, 0xfb, 0x9a, 0x8b, 0xef, 0x5c, 0x89, 0x43, 0xef, 0x3b, 0x5f, 0xaa, 0x15,
+    0xdd, 0xe6, 0x98, 0xbe, 0xdd, 0xf3, 0x59, 0x96, 0x03, 0xeb, 0x3e, 0x6f, 0x61, 0x37, 0x2b, 0xb6,
+    0x28, 0xf6, 0x55, 0x9f, 0x59, 0x9a, 0x78, 0xbf, 0x50, 0x06, 0x87, 0xaa, 0x7f, 0x49, 0x76, 0xc0,
+    0x56, 0x2d, 0x41, 0x29, 0x56, 0xf8, 0x98, 0x9e, 0x18, 0xa6, 0x35, 0x5b, 0xd8, 0x15, 0x97, 0x82,
+    0x5e, 0x0f, 0xc8, 0x75, 0x34, 0x3e, 0xc7, 0x82, 0x11, 0x76, 0x25, 0xcd, 0xbf, 0x98, 0x44, 0x7b,
 ];
 
 /// Airport Express 2048-bit RSA Private Key Exponent ($d$).
 pub const AIRPORT_EXPRESS_D_BYTES: [u8; 256] = [
-    0xe5, 0xf0, 0x0c, 0x72, 0xf5, 0x77, 0xd6, 0x04, 0xb9, 0xa4, 0xce, 0x41,
-    0x22, 0xaa, 0x84, 0xb0, 0x17, 0x43, 0xec, 0x99, 0x5a, 0xcf, 0xcc, 0x7f,
-    0x4a, 0xb2, 0x7c, 0x0b, 0x18, 0x7f, 0x90, 0x66, 0x5b, 0xe3, 0x59, 0xdf,
-    0x12, 0x59, 0x81, 0x8d, 0xee, 0xed, 0x79, 0xd3, 0xb1, 0xef, 0x84, 0x5e,
-    0x4d, 0xdd, 0xda, 0xc9, 0xa1, 0x55, 0x37, 0x3b, 0x5e, 0x27, 0x0d, 0x8e,
-    0x13, 0x15, 0x00, 0x1a, 0x2e, 0x52, 0x7d, 0x54, 0xcd, 0xf9, 0x00, 0x0a,
-    0x57, 0x68, 0xbc, 0x98, 0xd4, 0x44, 0x6b, 0x37, 0xbb, 0xbd, 0x00, 0xb2,
-    0x9d, 0xd8, 0xb5, 0x30, 0x62, 0x13, 0x3b, 0x2a, 0x6e, 0x77, 0xf4, 0xee,
-    0x32, 0x50, 0x56, 0x22, 0x90, 0x4d, 0xa7, 0x20, 0xfb, 0x1c, 0x12, 0xc0,
-    0x39, 0x96, 0xda, 0x71, 0x3a, 0x05, 0x06, 0x09, 0x8e, 0xdb, 0xed, 0xec,
-    0xf9, 0x36, 0xd0, 0xfa, 0x9c, 0xbd, 0x59, 0x29, 0xab, 0xb0, 0xed, 0xa3,
-    0x57, 0x99, 0x50, 0x2f, 0x98, 0x94, 0xdc, 0xb8, 0xfc, 0x56, 0x9a, 0x89,
-    0x2d, 0x17, 0x78, 0x03, 0x24, 0xa2, 0xb6, 0xc3, 0x16, 0x6e, 0x34, 0x67,
-    0x09, 0x13, 0x4b, 0x85, 0x40, 0x41, 0xb8, 0x67, 0x70, 0x6b, 0x58, 0xfe,
-    0xf2, 0xa0, 0xdb, 0x92, 0x2b, 0x77, 0x62, 0x8b, 0x68, 0xe6, 0x96, 0x93,
-    0xc7, 0xaf, 0x43, 0xbf, 0x2a, 0x73, 0xd0, 0xb7, 0x32, 0x37, 0x7a, 0x0b,
-    0xa1, 0x7b, 0x44, 0xf0, 0x51, 0xe9, 0xbf, 0x79, 0x84, 0x9d, 0xcb, 0x33,
-    0x32, 0x57, 0x1f, 0xd8, 0xa7, 0x09, 0x33, 0xc2, 0xd6, 0x0b, 0xde, 0xc4,
-    0x79, 0x93, 0x4a, 0x3d, 0xac, 0xa4, 0x0b, 0xb6, 0xf2, 0xf3, 0x7c, 0x0a,
-    0x9d, 0x07, 0x10, 0x6e, 0xad, 0xc8, 0xb3, 0x69, 0xa0, 0x3f, 0x2f, 0x41,
-    0xc8, 0x80, 0x09, 0x8e, 0x8a, 0xdd, 0x46, 0x24, 0x0d, 0xac, 0x68, 0xcc,
-    0x53, 0x54, 0xf3, 0x61,
+    0xe5, 0xf0, 0x0c, 0x72, 0xf5, 0x77, 0xd6, 0x04, 0xb9, 0xa4, 0xce, 0x41, 0x22, 0xaa, 0x84, 0xb0,
+    0x17, 0x43, 0xec, 0x99, 0x5a, 0xcf, 0xcc, 0x7f, 0x4a, 0xb2, 0x7c, 0x0b, 0x18, 0x7f, 0x90, 0x66,
+    0x5b, 0xe3, 0x59, 0xdf, 0x12, 0x59, 0x81, 0x8d, 0xee, 0xed, 0x79, 0xd3, 0xb1, 0xef, 0x84, 0x5e,
+    0x4d, 0xdd, 0xda, 0xc9, 0xa1, 0x55, 0x37, 0x3b, 0x5e, 0x27, 0x0d, 0x8e, 0x13, 0x15, 0x00, 0x1a,
+    0x2e, 0x52, 0x7d, 0x54, 0xcd, 0xf9, 0x00, 0x0a, 0x57, 0x68, 0xbc, 0x98, 0xd4, 0x44, 0x6b, 0x37,
+    0xbb, 0xbd, 0x00, 0xb2, 0x9d, 0xd8, 0xb5, 0x30, 0x62, 0x13, 0x3b, 0x2a, 0x6e, 0x77, 0xf4, 0xee,
+    0x32, 0x50, 0x56, 0x22, 0x90, 0x4d, 0xa7, 0x20, 0xfb, 0x1c, 0x12, 0xc0, 0x39, 0x96, 0xda, 0x71,
+    0x3a, 0x05, 0x06, 0x09, 0x8e, 0xdb, 0xed, 0xec, 0xf9, 0x36, 0xd0, 0xfa, 0x9c, 0xbd, 0x59, 0x29,
+    0xab, 0xb0, 0xed, 0xa3, 0x57, 0x99, 0x50, 0x2f, 0x98, 0x94, 0xdc, 0xb8, 0xfc, 0x56, 0x9a, 0x89,
+    0x2d, 0x17, 0x78, 0x03, 0x24, 0xa2, 0xb6, 0xc3, 0x16, 0x6e, 0x34, 0x67, 0x09, 0x13, 0x4b, 0x85,
+    0x40, 0x41, 0xb8, 0x67, 0x70, 0x6b, 0x58, 0xfe, 0xf2, 0xa0, 0xdb, 0x92, 0x2b, 0x77, 0x62, 0x8b,
+    0x68, 0xe6, 0x96, 0x93, 0xc7, 0xaf, 0x43, 0xbf, 0x2a, 0x73, 0xd0, 0xb7, 0x32, 0x37, 0x7a, 0x0b,
+    0xa1, 0x7b, 0x44, 0xf0, 0x51, 0xe9, 0xbf, 0x79, 0x84, 0x9d, 0xcb, 0x33, 0x32, 0x57, 0x1f, 0xd8,
+    0xa7, 0x09, 0x33, 0xc2, 0xd6, 0x0b, 0xde, 0xc4, 0x79, 0x93, 0x4a, 0x3d, 0xac, 0xa4, 0x0b, 0xb6,
+    0xf2, 0xf3, 0x7c, 0x0a, 0x9d, 0x07, 0x10, 0x6e, 0xad, 0xc8, 0xb3, 0x69, 0xa0, 0x3f, 0x2f, 0x41,
+    0xc8, 0x80, 0x09, 0x8e, 0x8a, 0xdd, 0x46, 0x24, 0x0d, 0xac, 0x68, 0xcc, 0x53, 0x54, 0xf3, 0x61,
 ];
 
-/// Returns the standard Airport Express 2048-bit RSA Private Key.
+const AIRPORT_EXPRESS_P_BYTES: [u8; 128] = [
+    0xf7, 0xe0, 0xbf, 0x5a, 0x1e, 0x67, 0x18, 0x31, 0x9a, 0x8b, 0x62, 0x09, 0xc3, 0x17, 0x14, 0x44,
+    0x04, 0x59, 0xf9, 0x73, 0x85, 0x66, 0x13, 0xb1, 0x7a, 0xe1, 0x50, 0x8b, 0xb3, 0xe6, 0x31, 0x6e,
+    0x6b, 0x7f, 0x46, 0x2d, 0x2f, 0x7d, 0x64, 0x41, 0x2b, 0x84, 0xb7, 0x6b, 0xc2, 0x3f, 0x2b, 0x0c,
+    0x35, 0x62, 0x45, 0x52, 0x79, 0xb2, 0x43, 0xa9, 0xf7, 0x31, 0x6f, 0x95, 0x80, 0x07, 0xb3, 0x4c,
+    0x61, 0xf7, 0x68, 0xe2, 0xd4, 0x4e, 0xd5, 0xff, 0x2b, 0x27, 0x28, 0x17, 0xec, 0x32, 0xb3, 0xe4,
+    0x93, 0x92, 0x92, 0x28, 0xfa, 0xe7, 0x8e, 0x77, 0x4c, 0xa0, 0xf7, 0x5e, 0xbd, 0x69, 0xd5, 0x92,
+    0x02, 0x79, 0x8f, 0x11, 0x6e, 0x36, 0x0c, 0x64, 0x38, 0xb3, 0x2e, 0x1b, 0xd8, 0xb9, 0xdc, 0x1e,
+    0x32, 0x32, 0xf0, 0xd3, 0x09, 0x18, 0x88, 0x3c, 0xc4, 0x3e, 0xf8, 0xdd, 0xa2, 0x2c, 0x36, 0x91,
+];
+
+const AIRPORT_EXPRESS_Q_BYTES: [u8; 128] = [
+    0xef, 0x6f, 0xff, 0xf9, 0x94, 0xf1, 0xe5, 0x64, 0x41, 0xaa, 0x00, 0x35, 0xfd, 0x19, 0xa0, 0xc8,
+    0xd6, 0xf0, 0x23, 0x78, 0xc7, 0x05, 0x80, 0xd9, 0xc4, 0x84, 0x20, 0x79, 0x1d, 0xf4, 0x07, 0xc5,
+    0x91, 0xfb, 0x6e, 0xbf, 0xca, 0x32, 0x2c, 0x30, 0x86, 0xdd, 0x90, 0x1f, 0xd2, 0xfa, 0xe1, 0xae,
+    0xbb, 0x64, 0xad, 0xf6, 0xbb, 0x79, 0xff, 0x80, 0x51, 0xbe, 0xbd, 0x0c, 0xd8, 0x20, 0xab, 0x89,
+    0x87, 0x40, 0x06, 0x01, 0xa7, 0xb2, 0xfe, 0x93, 0x90, 0xca, 0xcc, 0x9a, 0xca, 0xb8, 0xed, 0x2b,
+    0xf9, 0x1d, 0x18, 0x6d, 0x8f, 0x69, 0x64, 0x3d, 0x7e, 0xfe, 0x0f, 0x5d, 0x56, 0xdf, 0x75, 0x77,
+    0xa2, 0xd0, 0x35, 0xea, 0x54, 0x13, 0xfc, 0x98, 0xd8, 0xf3, 0xf9, 0x08, 0xda, 0x05, 0x9a, 0x37,
+    0x9d, 0xa4, 0xb1, 0xcc, 0x38, 0xf1, 0x5d, 0x56, 0x0a, 0x83, 0xcc, 0x31, 0x71, 0x53, 0xc8, 0x4b,
+];
+
+const AIRPORT_EXPRESS_DP_BYTES: [u8; 128] = [
+    0xd0, 0xeb, 0xaf, 0xbc, 0x40, 0x25, 0xba, 0x81, 0x8c, 0x75, 0x70, 0x23, 0x34, 0x38, 0x4e, 0x8f,
+    0x69, 0x6f, 0x80, 0x4d, 0x7a, 0xa0, 0xe7, 0x76, 0x4e, 0x50, 0x7b, 0xb7, 0xd3, 0xdf, 0xef, 0xc7,
+    0xd6, 0x78, 0xc6, 0x68, 0x2d, 0x3f, 0xad, 0x71, 0x34, 0x41, 0xbe, 0xea, 0xe7, 0x24, 0xa0, 0x9e,
+    0xc0, 0x9b, 0xdc, 0x3b, 0xc0, 0x70, 0x9c, 0x91, 0x33, 0xd4, 0x89, 0xec, 0xe2, 0xa5, 0x1a, 0xdd,
+    0x05, 0x31, 0x27, 0x49, 0x0f, 0x92, 0x86, 0xd1, 0x73, 0xc8, 0xa4, 0x05, 0x4d, 0xc2, 0x0a, 0x57,
+    0x5c, 0x7e, 0x4c, 0x0c, 0x98, 0x34, 0xf4, 0xa1, 0xde, 0x87, 0x49, 0x17, 0xa3, 0xe4, 0x00, 0xea,
+    0xf8, 0x85, 0x06, 0x2d, 0xb5, 0xcb, 0x7e, 0x34, 0x36, 0x89, 0xe7, 0x11, 0xf7, 0x5f, 0xe7, 0x83,
+    0xd7, 0xe1, 0x91, 0x92, 0xfd, 0x76, 0x9c, 0xd5, 0x42, 0xbe, 0xa4, 0xb9, 0x01, 0x07, 0xec, 0xd1,
+];
+
+const AIRPORT_EXPRESS_DQ_BYTES: [u8; 128] = [
+    0x7f, 0x40, 0x18, 0xdc, 0x7d, 0xea, 0x29, 0x2d, 0xa5, 0x30, 0x42, 0x38, 0x6f, 0x31, 0x05, 0xa0,
+    0x77, 0x8a, 0xdc, 0x6f, 0x3d, 0xe6, 0x90, 0xda, 0x2b, 0x74, 0xc5, 0x05, 0x59, 0x83, 0xed, 0xf5,
+    0x74, 0x66, 0x1a, 0x2f, 0xd7, 0xb7, 0xde, 0x80, 0x53, 0xcc, 0xc0, 0xe2, 0x08, 0xf0, 0xc8, 0xac,
+    0x62, 0x6f, 0x59, 0x7d, 0x3d, 0x99, 0xd2, 0xce, 0x51, 0xa3, 0x7b, 0x39, 0xae, 0x4b, 0x7e, 0x9e,
+    0xf2, 0xc0, 0x75, 0xf0, 0xbf, 0x3d, 0x83, 0xca, 0xcd, 0x32, 0xda, 0x96, 0x91, 0x92, 0xc2, 0x89,
+    0x92, 0x35, 0x82, 0x5c, 0x07, 0xd1, 0xcd, 0x32, 0x59, 0xa1, 0x90, 0x6c, 0xdc, 0xd4, 0x99, 0xcb,
+    0x61, 0x3e, 0x22, 0xc9, 0x4c, 0xb1, 0xea, 0x97, 0x19, 0x06, 0x60, 0x9d, 0xf1, 0xb0, 0xf4, 0x8b,
+    0x06, 0x3f, 0x17, 0x37, 0x20, 0x34, 0x36, 0x94, 0x99, 0xb5, 0xfd, 0xf9, 0x70, 0xef, 0x44, 0x0d,
+];
+
+const AIRPORT_EXPRESS_QINV_BYTES: [u8; 128] = [
+    0x90, 0x4e, 0xe9, 0x20, 0xf9, 0x44, 0xef, 0x5a, 0xaf, 0x7c, 0x94, 0x20, 0xa0, 0x0f, 0x5e, 0x9b,
+    0x48, 0x08, 0x2c, 0x0b, 0x84, 0xe0, 0xfb, 0xb5, 0xdd, 0xa2, 0xa2, 0x26, 0x77, 0xdf, 0xb7, 0xb8,
+    0x48, 0x8d, 0xb2, 0xbe, 0xe6, 0x4c, 0x9b, 0xdd, 0x3c, 0xac, 0x66, 0xfa, 0x32, 0x0e, 0x76, 0xf7,
+    0x1c, 0xe2, 0xaf, 0x22, 0x72, 0xbb, 0xbd, 0x76, 0xca, 0xb9, 0x4e, 0x08, 0x4a, 0x0c, 0x41, 0xd9,
+    0xb0, 0x77, 0x1d, 0xc6, 0x33, 0x40, 0xc1, 0xac, 0xcf, 0x5a, 0x89, 0xda, 0x01, 0xb4, 0x37, 0x98,
+    0x6f, 0x26, 0x9c, 0xf0, 0xc2, 0x16, 0xe1, 0x5e, 0xa1, 0x4a, 0x03, 0x8c, 0xda, 0x69, 0x2a, 0xf0,
+    0xeb, 0x6d, 0xb0, 0x0e, 0x78, 0x80, 0x2b, 0x93, 0x25, 0x20, 0x4d, 0x2d, 0x20, 0x02, 0x8a, 0x3f,
+    0x8c, 0xb1, 0x34, 0x68, 0xe8, 0x0f, 0x64, 0x18, 0x8e, 0x10, 0x46, 0xba, 0x1b, 0xe4, 0x58, 0xa6,
+];
+
+/// Returns the standard Airport Express 2048-bit RSA Private Key with CRT
+/// acceleration.
 pub fn airport_express_key() -> RsaPrivateKey {
-    RsaPrivateKey::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES, &AIRPORT_EXPRESS_D_BYTES)
+    let crt = RsaCrtParams::new(
+        &AIRPORT_EXPRESS_P_BYTES,
+        &AIRPORT_EXPRESS_Q_BYTES,
+        &AIRPORT_EXPRESS_DP_BYTES,
+        &AIRPORT_EXPRESS_DQ_BYTES,
+        &AIRPORT_EXPRESS_QINV_BYTES,
+    );
+    RsaPrivateKey::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES, &AIRPORT_EXPRESS_D_BYTES).with_crt(crt)
 }
 
 /// Encodes binary bytes to standard Base64 string.
@@ -1034,8 +1328,16 @@ pub fn base64_encode(data: &[u8]) -> String {
     let mut i = 0;
     while i < data.len() {
         let b0 = data[i] as usize;
-        let b1 = if i + 1 < data.len() { data[i + 1] as usize } else { 0 };
-        let b2 = if i + 2 < data.len() { data[i + 2] as usize } else { 0 };
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as usize
+        } else {
+            0
+        };
+        let b2 = if i + 2 < data.len() {
+            data[i + 2] as usize
+        } else {
+            0
+        };
 
         let triple = (b0 << 16) | (b1 << 8) | b2;
 
@@ -1146,7 +1448,10 @@ mod tests {
         pad[0] = 0x01; // corrupted byte 0
         pad[1] = 0x02;
         pad[15] = 0x00; // sep
-        assert_eq!(unpad_pkcs1_v15_type2(&pad), Err(CryptoError::InvalidPadding));
+        assert_eq!(
+            unpad_pkcs1_v15_type2(&pad),
+            Err(CryptoError::InvalidPadding)
+        );
     }
 
     #[test]
@@ -1163,5 +1468,134 @@ mod tests {
         let modulus = BigUint::from_u32(17);
         let res1 = montgomery_mod_pow(&base, &exp1, &modulus).expect("mod pow succeeds");
         assert_eq!(res1, BigUint::from_u32(5)); // 3^5 = 243 = 14*17 + 5 = 5 mod 17
+    }
+
+    #[test]
+    fn test_aes128_fips197_appendix_b_decrypt_block() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let mut block = [
+            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
+            0x0b, 0x32,
+        ];
+        let expected = [
+            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
+            0x07, 0x34,
+        ];
+        let cipher = Aes128Cbc::new(&key);
+        cipher.decrypt_block(&mut block);
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn test_aes128_cbc_nist_sp800_38a_f22_and_raop_tail() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let iv = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let mut data = [
+            // Block 1
+            0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46, 0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9,
+            0x19, 0x7d, // Block 2
+            0x50, 0x86, 0xcb, 0x9b, 0x50, 0x72, 0x19, 0xee, 0x95, 0xdb, 0x11, 0x3a, 0x91, 0x76,
+            0x78, 0xb2, // Block 3
+            0x73, 0xbe, 0xd6, 0xb8, 0xe3, 0xc1, 0x74, 0x3b, 0x71, 0x16, 0xe6, 0x9e, 0x22, 0x22,
+            0x95, 0x16, // Block 4
+            0x3f, 0xf1, 0xca, 0xa1, 0x68, 0x1f, 0xac, 0x09, 0x12, 0x0e, 0xca, 0x30, 0x75, 0x86,
+            0xe1, 0xa7, // Trailing 5 unencrypted bytes
+            0xde, 0xad, 0xbe, 0xef, 0x42,
+        ];
+        let expected_prefix = [
+            // Block 1
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a, // Block 2
+            0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf,
+            0x8e, 0x51, // Block 3
+            0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a,
+            0x52, 0xef, // Block 4
+            0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17, 0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c,
+            0x37, 0x10,
+        ];
+        let expected_tail = [0xde, 0xad, 0xbe, 0xef, 0x42];
+
+        let cipher = Aes128Cbc::new(&key);
+        cipher.decrypt_in_place(&iv, &mut data);
+        assert_eq!(&data[..64], &expected_prefix);
+        assert_eq!(&data[64..], &expected_tail);
+    }
+
+    #[test]
+    fn test_rsa2048_crt_matches_non_crt_random_inputs() {
+        let p_big = BigUint::from_be_bytes(&AIRPORT_EXPRESS_P_BYTES);
+        let q_big = BigUint::from_be_bytes(&AIRPORT_EXPRESS_Q_BYTES);
+        let n_big = BigUint::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES);
+        assert_eq!(p_big.mul(&q_big), n_big);
+
+        let crt_key = airport_express_key();
+        assert!(crt_key.has_crt());
+
+        let non_crt_key =
+            RsaPrivateKey::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES, &AIRPORT_EXPRESS_D_BYTES);
+        assert!(!non_crt_key.has_crt());
+
+        let zero_ct = [0u8; 256];
+        assert_eq!(
+            crt_key.decrypt_raw(&zero_ct).expect("CRT zero decrypt"),
+            non_crt_key
+                .decrypt_raw(&zero_ct)
+                .expect("non-CRT zero decrypt")
+        );
+
+        let mut one_ct = [0u8; 256];
+        one_ct[255] = 1;
+        assert_eq!(
+            crt_key.decrypt_raw(&one_ct).expect("CRT one decrypt"),
+            non_crt_key
+                .decrypt_raw(&one_ct)
+                .expect("non-CRT one decrypt")
+        );
+
+        let mut n_minus_1 = AIRPORT_EXPRESS_N_BYTES;
+        let mut borrow = 1u16;
+        for byte in n_minus_1.iter_mut().rev() {
+            let sub = (*byte as u16).wrapping_sub(borrow);
+            *byte = sub as u8;
+            borrow = (sub >> 8) & 1;
+        }
+        assert_eq!(
+            crt_key.decrypt_raw(&n_minus_1).expect("CRT n-1 decrypt"),
+            non_crt_key
+                .decrypt_raw(&n_minus_1)
+                .expect("non-CRT n-1 decrypt")
+        );
+
+        let mut seed = 0x8543_291a_ef49_3125u64;
+        let mut next_u64 = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for _ in 0..16 {
+            let mut ct = [0u8; 256];
+            for chunk in ct.chunks_mut(8) {
+                chunk.copy_from_slice(&next_u64().to_le_bytes());
+            }
+            // Mask top byte to guarantee ct < n (AIRPORT_EXPRESS_N_BYTES[0] is 0xe7)
+            ct[0] &= 0x7f;
+            assert_eq!(
+                crt_key.decrypt_raw(&ct).expect("CRT random decrypt"),
+                non_crt_key
+                    .decrypt_raw(&ct)
+                    .expect("non-CRT random decrypt")
+            );
+        }
     }
 }

@@ -67,8 +67,8 @@ pub mod registers {
     pub const RESET_CTRL: u8 = 0x01;
     pub const DEVICE_CTRL_1: u8 = 0x02;
     pub const DEVICE_CTRL_2: u8 = 0x03;
-    pub const SAP_CTRL_1: u8 = 0x33;   // Audio Port Format & Word Length
-    pub const SAP_CTRL_2: u8 = 0x34;   // Audio Port Sample Rate
+    pub const SAP_CTRL_1: u8 = 0x33; // Audio Port Format & Word Length
+    pub const SAP_CTRL_2: u8 = 0x34; // Audio Port Sample Rate
     /// `FS_MON`: Detected I2S frame sync (LRCLK) frequency monitor (`0x37`).
     pub const FS_MON: u8 = 0x37;
     /// `BCK_MON`: Detected BCK-to-FS clock ratio monitor (`0x38`).
@@ -500,7 +500,7 @@ where
 
     /// Reads hardware fault status registers (0x70..=0x73) during Standby.
     pub fn check_faults(&mut self) -> Result<FaultStatus, DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         let mut status = [0u8; 4];
         self.i2c
             .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
@@ -515,7 +515,7 @@ where
 
     /// Clears any latched hardware faults.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ALL])
             .map_err(DriverError::I2cError)
@@ -527,7 +527,7 @@ where
     pub fn check_faults_and_telemetry(
         &mut self,
     ) -> Result<(FaultStatus, Tas58xxTelemetry), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
 
         let mut status = [0u8; 4];
         self.i2c
@@ -565,7 +565,7 @@ where
     /// upper-bound clamping. Clamps values below `0x30` to `VOL_UNITY_0DB`
     /// (0.0 dB) to prevent hazardous overdrive prior to unmuting into Play.
     pub fn set_digital_volume(&mut self, volume: u8) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         let safe_vol = if volume < VOL_UNITY_0DB {
             VOL_UNITY_0DB // Clamp to 0.0dB unity gain
         } else {
@@ -579,17 +579,20 @@ where
     /// Re-confirms Book 0 and Page 0 selection and clears hardware faults
     /// after reset.
     pub fn reconfirm_book_page_and_clear_faults(&mut self) -> Result<(), DriverError<E>> {
+        self.current_book = 0xFF;
+        self.current_page = 0xFF;
         self.i2c
             .write(self.addr, &[registers::PAGE_SELECT, 0x00])
             .map_err(DriverError::I2cError)?;
         self.i2c
             .write(self.addr, &[registers::BOOK_SELECT, 0x00])
             .map_err(DriverError::I2cError)?;
-        self.current_book = 0;
-        self.current_page = 0;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG])
-            .map_err(DriverError::I2cError)
+            .map_err(DriverError::I2cError)?;
+        self.current_book = 0;
+        self.current_page = 0;
+        Ok(())
     }
 
     /// Selects a register Book and Page, ensuring Page 0 is selected
@@ -603,15 +606,21 @@ where
     /// 2. Write `BOOK_SELECT (0x7F)` = `book`
     /// 3. Write `PAGE_SELECT (0x00)` = `page`
     pub fn select_book_page(&mut self, book: u8, page: u8) -> Result<(), DriverError<E>> {
-        self.i2c
-            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
-            .map_err(DriverError::I2cError)?;
-        self.i2c
-            .write(self.addr, &[registers::BOOK_SELECT, book])
-            .map_err(DriverError::I2cError)?;
-        self.i2c
-            .write(self.addr, &[registers::PAGE_SELECT, page])
-            .map_err(DriverError::I2cError)?;
+        if let Err(err) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
+            self.current_book = 0xFF;
+            self.current_page = 0xFF;
+            return Err(DriverError::I2cError(err));
+        }
+        if let Err(err) = self.i2c.write(self.addr, &[registers::BOOK_SELECT, book]) {
+            self.current_book = 0xFF;
+            self.current_page = 0xFF;
+            return Err(DriverError::I2cError(err));
+        }
+        if let Err(err) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, page]) {
+            self.current_book = 0xFF;
+            self.current_page = 0xFF;
+            return Err(DriverError::I2cError(err));
+        }
         self.current_book = book;
         self.current_page = page;
         Ok(())
@@ -623,6 +632,7 @@ where
     /// 1. `DEVICE_CTRL_2 (0x03)` = `CTRL2_MODE_HIZ (0x02)`
     /// 2. `FAULT_CLEAR (0x78)` = `FAULT_CLEAR_ANALOG (0x80)`
     pub fn stage_hiz_and_clear_faults(&mut self) -> Result<(), DriverError<E>> {
+        self.ensure_page0_book0()?;
         self.i2c
             .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ])
             .map_err(DriverError::I2cError)?;
@@ -735,10 +745,10 @@ where
         if let Err(e) = self.ensure_page0_book0() {
             return Err((self, e));
         }
-        if let Err(e) = self
-            .i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_DEEP_SLEEP])
-        {
+        if let Err(e) = self.i2c.write(
+            self.addr,
+            &[registers::DEVICE_CTRL_2, CTRL2_MODE_DEEP_SLEEP],
+        ) {
             return Err((self, DriverError::I2cError(e)));
         }
         Ok(Tas58xx {
@@ -760,7 +770,7 @@ where
     /// Values above `0x30` attenuate down to `0xFE` (-103 dB).
     /// `0xFF` is hardware muted.
     pub fn set_digital_volume(&mut self, volume: u8) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         let safe_vol = if volume < VOL_UNITY_0DB {
             VOL_UNITY_0DB // Clamp to 0.0dB unity gain
         } else {
@@ -773,7 +783,7 @@ where
 
     /// Reads hardware fault status registers (0x70..=0x73) during Play.
     pub fn check_faults(&mut self) -> Result<FaultStatus, DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         let mut status = [0u8; 4];
         self.i2c
             .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
@@ -788,7 +798,7 @@ where
 
     /// Clears any latched hardware faults during Play.
     pub fn clear_faults(&mut self) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         self.i2c
             .write(self.addr, &[registers::FAULT_CLEAR, FAULT_CLEAR_ALL])
             .map_err(DriverError::I2cError)
@@ -826,15 +836,21 @@ where
     /// 2. Write `BOOK_SELECT (0x7F)` = `book`
     /// 3. Write `PAGE_SELECT (0x00)` = `page`
     pub fn select_book_page(&mut self, book: u8, page: u8) -> Result<(), DriverError<E>> {
-        self.i2c
-            .write(self.addr, &[registers::PAGE_SELECT, 0x00])
-            .map_err(DriverError::I2cError)?;
-        self.i2c
-            .write(self.addr, &[registers::BOOK_SELECT, book])
-            .map_err(DriverError::I2cError)?;
-        self.i2c
-            .write(self.addr, &[registers::PAGE_SELECT, page])
-            .map_err(DriverError::I2cError)?;
+        if let Err(err) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
+            self.current_book = 0xFF;
+            self.current_page = 0xFF;
+            return Err(DriverError::I2cError(err));
+        }
+        if let Err(err) = self.i2c.write(self.addr, &[registers::BOOK_SELECT, book]) {
+            self.current_book = 0xFF;
+            self.current_page = 0xFF;
+            return Err(DriverError::I2cError(err));
+        }
+        if let Err(err) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, page]) {
+            self.current_book = 0xFF;
+            self.current_page = 0xFF;
+            return Err(DriverError::I2cError(err));
+        }
         self.current_book = book;
         self.current_page = page;
         Ok(())
@@ -944,7 +960,7 @@ where
     pub fn check_faults_and_telemetry(
         &mut self,
     ) -> Result<(FaultStatus, Tas5805mTelemetry), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
 
         let mut status = [0u8; 4];
         self.i2c
@@ -982,10 +998,10 @@ where
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::vec;
-    use std::vec::Vec;
     use super::*;
     use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
+    use std::vec;
+    use std::vec::Vec;
     fn page0_book0(addr: u8) -> [I2cTrans; 3] {
         [
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
@@ -1022,9 +1038,6 @@ mod tests {
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x03]),
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, 0x30]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
@@ -1043,11 +1056,10 @@ mod tests {
 
     #[test]
     fn test_volume_clamping_prevents_overdrive() {
-        let mut expectations = Vec::new();
-        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
-        expectations.push(
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
-        );
+        let expectations = [I2cTrans::write(
+            DEFAULT_I2C_ADDR,
+            vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB],
+        )];
         let mut i2c = I2cMock::new(&expectations);
 
         let mut playing = Tas58xx {
@@ -1066,15 +1078,11 @@ mod tests {
 
     #[test]
     fn test_multi_byte_fault_status_polling() {
-        let mut expectations = Vec::new();
-        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
-        expectations.push(
-            I2cTrans::write_read(
-                DEFAULT_I2C_ADDR,
-                vec![registers::CHAN_FAULT],
-                vec![0x00, 0x00, 0x01, 0x00], // global_fault2 bit 0 = OTSD (overtemperature)
-            ),
-        );
+        let expectations = [I2cTrans::write_read(
+            DEFAULT_I2C_ADDR,
+            vec![registers::CHAN_FAULT],
+            vec![0x00, 0x00, 0x01, 0x00], // global_fault2 bit 0 = OTSD (overtemperature)
+        )];
         let mut i2c = I2cMock::new(&expectations);
 
         let mut standby = Tas58xx {
@@ -1094,15 +1102,13 @@ mod tests {
 
     #[test]
     fn test_standby_set_digital_volume_with_clamping() {
-        let mut expectations = Vec::new();
-        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
-        expectations.push(
-            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB]),
-        );
-        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
-        expectations.push(
+        let expectations = [
+            I2cTrans::write(
+                DEFAULT_I2C_ADDR,
+                vec![registers::DIG_VOL_CTRL, VOL_UNITY_0DB],
+            ),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DIG_VOL_CTRL, 0x48]),
-        );
+        ];
         let mut i2c = I2cMock::new(&expectations);
 
         let mut standby = Tas58xx {
@@ -1115,8 +1121,40 @@ mod tests {
 
         // Clamped from overdrive 0x10 to 0x30
         standby.set_digital_volume(0x10).unwrap();
-        // Valid attenuated volume 0x48 unchanged
+        // Valid attenuated volume 0x48 unchanged (redundant page selection
+        // deduplicated).
         standby.set_digital_volume(0x48).unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_set_digital_volume_page_cache_deduplication() {
+        let mut expectations = Vec::new();
+        // Starting from book 1: first call writes page0_book0 then DIG_VOL_CTRL
+        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
+        expectations.push(I2cTrans::write(
+            DEFAULT_I2C_ADDR,
+            vec![registers::DIG_VOL_CTRL, 0x30],
+        ));
+        // Repeated call: page 0 book 0 already selected, so only
+        // DIG_VOL_CTRL is written.
+        expectations.push(I2cTrans::write(
+            DEFAULT_I2C_ADDR,
+            vec![registers::DIG_VOL_CTRL, 0x35],
+        ));
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: DEFAULT_I2C_ADDR,
+            current_book: 1,
+            current_page: 0,
+            _state: PhantomData::<Standby>,
+        };
+
+        standby.set_digital_volume(0x30).unwrap();
+        standby.set_digital_volume(0x35).unwrap();
 
         i2c.done();
     }
@@ -1292,17 +1330,16 @@ mod tests {
 
     #[test]
     fn test_clear_faults_writes_fault_clear_all() {
-        let mut expectations = Vec::new();
-        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
-        expectations.push(I2cTrans::write(
-            DEFAULT_I2C_ADDR,
-            vec![registers::FAULT_CLEAR, FAULT_CLEAR_ALL],
-        ));
-        expectations.extend(page0_book0(DEFAULT_I2C_ADDR));
-        expectations.push(I2cTrans::write(
-            DEFAULT_I2C_ADDR,
-            vec![registers::FAULT_CLEAR, FAULT_CLEAR_ALL],
-        ));
+        let expectations = [
+            I2cTrans::write(
+                DEFAULT_I2C_ADDR,
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ALL],
+            ),
+            I2cTrans::write(
+                DEFAULT_I2C_ADDR,
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ALL],
+            ),
+        ];
         let mut i2c = I2cMock::new(&expectations);
 
         let mut standby = Tas58xx {
@@ -1322,6 +1359,31 @@ mod tests {
             _state: PhantomData::<Play>,
         };
         play.clear_faults().unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_select_book_page_invalidates_cache_on_error() {
+        let expectations = [
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x01])
+                .with_error(embedded_hal::i2c::ErrorKind::Other),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
+            _state: PhantomData::<Standby>,
+        };
+
+        let err = standby.select_book_page(0x01, 0x02);
+        assert!(err.is_err());
+        assert_eq!(standby.current_book, 0xFF);
+        assert_eq!(standby.current_page, 0xFF);
 
         i2c.done();
     }
@@ -1363,15 +1425,27 @@ mod tests {
                 TAS5805M_I2C_ADDR_DEFAULT,
                 vec![registers::PAGE_SELECT, 0x00],
             ),
-            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::BOOK_SELECT, 0x8C]),
-            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::PAGE_SELECT, 0x2A]),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::BOOK_SELECT, 0x8C],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x2A],
+            ),
             // Play call: PAGE_SELECT 0x00 -> BOOK_SELECT 0x00 -> PAGE_SELECT 0x00
             I2cTrans::write(
                 TAS5805M_I2C_ADDR_DEFAULT,
                 vec![registers::PAGE_SELECT, 0x00],
             ),
-            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::BOOK_SELECT, 0x00],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x00],
+            ),
         ];
         let mut i2c = I2cMock::new(&expectations);
 
@@ -1419,6 +1493,67 @@ mod tests {
         };
 
         standby.stage_hiz_and_clear_faults().unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_stage_hiz_and_clear_faults_restores_book0_page0_after_non_zero_selection() {
+        let expectations = [
+            // select_book_page(0xAA, 0x2A):
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x00],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::BOOK_SELECT, 0xAA],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x2A],
+            ),
+            // stage_hiz_and_clear_faults() -> ensure_page0_book0() ->
+            // select_book_page(0x00, 0x00):
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x00],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::BOOK_SELECT, 0x00],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::PAGE_SELECT, 0x00],
+            ),
+            // stage_hiz_and_clear_faults() writes:
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_2, CTRL2_MODE_HIZ],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::FAULT_CLEAR, FAULT_CLEAR_ANALOG],
+            ),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
+            _state: PhantomData::<Standby>,
+        };
+
+        standby.select_book_page(0xAA, 0x2A).unwrap();
+        assert_eq!(standby.current_book, 0xAA);
+        assert_eq!(standby.current_page, 0x2A);
+
+        standby.stage_hiz_and_clear_faults().unwrap();
+        assert_eq!(standby.current_book, 0x00);
+        assert_eq!(standby.current_page, 0x00);
 
         i2c.done();
     }
@@ -1472,7 +1607,7 @@ mod tests {
         fn default() -> Self {
             let mut regs = [0u8; 256];
             regs[0x37] = 0x09; // FS_MON: 48 kHz
-            regs[0x38] = 64;   // BCK_MON: 64
+            regs[0x38] = 64; // BCK_MON: 64
             regs[0x39] = 0x08; // CLKDET_STATUS: PLL locked
             regs[0x69] = 0x00; // AUTOMUTE_STATE: unmuted
             Self {
@@ -1655,13 +1790,22 @@ mod tests {
         assert_eq!(t_48k.detected_sample_rate_hz_with_hint(48_000), 48_000);
         assert_eq!(t_48k.bck_ratio(), 64);
 
-        let t_88k = Tas5805mTelemetry { fs_mon: 0x0A, ..Default::default() };
+        let t_88k = Tas5805mTelemetry {
+            fs_mon: 0x0A,
+            ..Default::default()
+        };
         assert_eq!(t_88k.detected_sample_rate_hz(), 88_200);
 
-        let t_176k = Tas5805mTelemetry { fs_mon: 0x0C, ..Default::default() };
+        let t_176k = Tas5805mTelemetry {
+            fs_mon: 0x0C,
+            ..Default::default()
+        };
         assert_eq!(t_176k.detected_sample_rate_hz(), 176_400);
 
-        let t_192k = Tas5805mTelemetry { fs_mon: 0x0D, ..Default::default() };
+        let t_192k = Tas5805mTelemetry {
+            fs_mon: 0x0D,
+            ..Default::default()
+        };
         assert_eq!(t_192k.detected_sample_rate_hz(), 192_000);
 
         // Test high BCK bits in FS_MON [5:4]

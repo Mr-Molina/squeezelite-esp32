@@ -40,8 +40,7 @@ use squeezelite_raop::rtsp::RtspServer;
 use squeezelite_raop::rtsp::ServerState;
 
 const GOLDEN_AES_KEY: [u8; 16] = [
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-    0x00,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
 ];
 
 // 1024-bit RSA Key Modulus (128 bytes)
@@ -191,8 +190,8 @@ fn test_rsa_padding_validation_and_errors() {
 #[test]
 fn test_aes128_cbc_audio_packet_decryption() {
     let iv = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-        0x0f, 0x10,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
     ];
     let ct = hex_to_bytes("7be957563e9135f57b777a5ec15efe9853af3807d7ba56b47b4c27e6904c2116212223");
     let pt_expected = hex_to_bytes(concat!(
@@ -344,7 +343,10 @@ fn test_rtsp_full_session_lifecycle() {
 #[test]
 fn test_rtsp_errors() {
     let no_cseq = "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r\n\r\n";
-    assert_eq!(RtspRequest::parse(no_cseq.as_bytes()), Err(RtspError::MissingCSeq));
+    assert_eq!(
+        RtspRequest::parse(no_cseq.as_bytes()),
+        Err(RtspError::MissingCSeq)
+    );
 
     let malformed = "NOT_A_VALID_REQUEST\r\n\r\n";
     assert_eq!(
@@ -490,20 +492,12 @@ fn make_raw_rtp_packet(seq: u16, timestamp: u32, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn test_rtp_control_sync_and_retransmit_unwrap() {
     // 1. Sync packet (0xD4 with first-sync extension bit 0x10 -> byte 0 = 0x90)
-    let sync = RtpSyncPacket::new(
-        true,
-        7,
-        100_000,
-        0xE3B0_1234,
-        0x8000_0000,
-        177_175,
-    );
+    let sync = RtpSyncPacket::new(true, 7, 100_000, 0xE3B0_1234, 0x8000_0000, 177_175);
     let wire = sync.to_bytes();
     assert_eq!(wire[0], 0x90);
     assert_eq!(wire[1], 0xD4);
 
-    let parsed_ctrl =
-        RtpControlPacket::parse(&wire).expect("parse sync control packet");
+    let parsed_ctrl = RtpControlPacket::parse(&wire).expect("parse sync control packet");
     match parsed_ctrl {
         RtpControlPacket::Sync(s) => {
             assert!(s.is_first_sync);
@@ -523,13 +517,11 @@ fn test_rtp_control_sync_and_retransmit_unwrap() {
     let mut retransmit_pkt = vec![0x80, 0xD6, 0x00, 0x09];
     retransmit_pkt.extend_from_slice(&inner_rtp);
 
-    let (ctrl_seq, unwrapped) =
-        unwrap_retransmit_packet(&retransmit_pkt).expect("unwrap 0xD6");
+    let (ctrl_seq, unwrapped) = unwrap_retransmit_packet(&retransmit_pkt).expect("unwrap 0xD6");
     assert_eq!(ctrl_seq, 9);
     assert_eq!(unwrapped, &inner_rtp[..]);
 
-    let ctrl_parsed =
-        RtpControlPacket::parse(&retransmit_pkt).expect("parse 0xD6");
+    let ctrl_parsed = RtpControlPacket::parse(&retransmit_pkt).expect("parse 0xD6");
     assert_eq!(
         ctrl_parsed,
         RtpControlPacket::Retransmit {
@@ -545,8 +537,7 @@ fn test_rtp_resend_request_builder_and_ntp_timing_codec() {
     let raw_req = build_resend_request(3, 1200, 5);
     assert_eq!(raw_req, [0x80, 0xD5, 0x00, 0x03, 0x04, 0xB0, 0x00, 0x05]);
 
-    let parsed_resend =
-        RtpResendRequest::parse(&raw_req).expect("parse 0xD5 resend");
+    let parsed_resend = RtpResendRequest::parse(&raw_req).expect("parse 0xD5 resend");
     assert_eq!(parsed_resend.request_seq, 3);
     assert_eq!(parsed_resend.missed_seq_start, 1200);
     assert_eq!(parsed_resend.missed_count, 5);
@@ -616,8 +607,7 @@ fn test_jitter_buffer_gap_detection_reordering_wrap_and_flush() {
 
     // Now 101, 102, 103 drain in exact sequence order!
     let ready = jb.drain_ready();
-    let seqs: Vec<u16> =
-        ready.iter().map(|e| e.header.sequence_number).collect();
+    let seqs: Vec<u16> = ready.iter().map(|e| e.header.sequence_number).collect();
     assert_eq!(seqs, vec![101, 102, 103]);
 
     // 4. Test 16-bit sequence wrap-around across 0xFFFF -> 0x0000
@@ -660,11 +650,7 @@ fn test_jitter_buffer_gap_detection_reordering_wrap_and_flush() {
 #[test]
 fn test_dmap_metadata_artwork_and_progress_set_parameter() {
     let rsa = airport_express_key();
-    let mut server = RtspServer::new(
-        rsa,
-        [0x24, 0x0A, 0xC4, 0x01, 0x02, 0x03],
-        [192, 168, 1, 50],
-    );
+    let mut server = RtspServer::new(rsa, [0x24, 0x0A, 0xC4, 0x01, 0x02, 0x03], [192, 168, 1, 50]);
 
     // 1. Binary DMAP metadata (`application/x-dmap-tagged`)
     let expected_meta = DmapMetadata::new()
@@ -689,7 +675,9 @@ fn test_dmap_metadata_artwork_and_progress_set_parameter() {
     dmap_req.extend_from_slice(&dmap_bytes);
 
     let req = RtspRequest::parse(&dmap_req).expect("parse dmap rtsp");
-    let resp = server.handle_request(&req).expect("handle dmap set_parameter");
+    let resp = server
+        .handle_request(&req)
+        .expect("handle dmap set_parameter");
     assert_eq!(resp.status_code, 200);
     assert_eq!(server.metadata(), Some(&expected_meta));
 
@@ -747,11 +735,7 @@ fn test_dmap_metadata_artwork_and_progress_set_parameter() {
 #[test]
 fn test_dacp_header_extraction_and_command_requests() {
     let rsa = airport_express_key();
-    let mut server = RtspServer::new(
-        rsa,
-        [0x24, 0x0A, 0xC4, 0x01, 0x02, 0x03],
-        [192, 168, 1, 50],
-    );
+    let mut server = RtspServer::new(rsa, [0x24, 0x0A, 0xC4, 0x01, 0x02, 0x03], [192, 168, 1, 50]);
 
     let record_req = concat!(
         "RECORD rtsp://192.168.1.50/123456 RTSP/1.0\r\n",
@@ -778,9 +762,7 @@ fn test_dacp_header_extraction_and_command_requests() {
         (DacpCommand::MuteToggle, "/ctrl-int/1/mutetoggle"),
         (DacpCommand::Stop, "/ctrl-int/1/stop"),
     ] {
-        let http_bytes = server
-            .build_dacp_command(cmd)
-            .expect("build dacp command");
+        let http_bytes = server.build_dacp_command(cmd).expect("build dacp command");
         let http_str = core::str::from_utf8(&http_bytes).expect("utf8");
         assert!(http_str.starts_with(&format!("GET {} HTTP/1.0\r\n", expected_path)));
         assert!(http_str.contains("Active-Remote: 987654321\r\n"));
@@ -867,9 +849,15 @@ fn test_wo253_base64_invalid_length_mod_4() {
     use squeezelite_raop::crypto::CryptoError;
     // Length % 4 == 1 cannot be valid Base64
     let invalid_len_1 = "A";
-    assert_eq!(base64_decode(invalid_len_1), Err(CryptoError::InvalidBase64));
+    assert_eq!(
+        base64_decode(invalid_len_1),
+        Err(CryptoError::InvalidBase64)
+    );
     let invalid_len_5 = "ABCDE";
-    assert_eq!(base64_decode(invalid_len_5), Err(CryptoError::InvalidBase64));
+    assert_eq!(
+        base64_decode(invalid_len_5),
+        Err(CryptoError::InvalidBase64)
+    );
 }
 
 #[test]
@@ -934,5 +922,3 @@ fn test_expected_playtime_ms_negative_delta_saturating() {
     let playtime = tracker.expected_playtime_ms(0);
     assert_eq!(playtime, Some(0));
 }
-
-

@@ -26,9 +26,7 @@ use squeezelite_cspot::crypto::OakleyGroup1Dh;
 use squeezelite_cspot::zeroconf::ZeroConfServer;
 
 use crate::ota_safety::{REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION};
-use crate::pipeline::{
-    PSRAM_HEAP_BYTES, PSRAM_OUTPUT_RING_BYTES, PSRAM_STREAM_RING_BYTES,
-};
+use crate::pipeline::{PSRAM_HEAP_BYTES, PSRAM_OUTPUT_RING_BYTES, PSRAM_STREAM_RING_BYTES};
 
 /// `psram_used_bytes` reported when no PSRAM heap statistics exist: the
 /// firmware's two PSRAM rings (512 KiB stream + 2000 KiB output = 2,572,288 B).
@@ -36,8 +34,7 @@ pub const DEFAULT_PSRAM_USED_BYTES: u32 =
     (PSRAM_STREAM_RING_BYTES + PSRAM_OUTPUT_RING_BYTES) as u32;
 /// `psram_free_bytes` to match [`DEFAULT_PSRAM_USED_BYTES`] in the 4 MiB
 /// region (1,622,016 B).
-pub const DEFAULT_PSRAM_FREE_BYTES: u32 =
-    PSRAM_HEAP_BYTES as u32 - DEFAULT_PSRAM_USED_BYTES;
+pub const DEFAULT_PSRAM_FREE_BYTES: u32 = PSRAM_HEAP_BYTES as u32 - DEFAULT_PSRAM_USED_BYTES;
 
 /// Maximum time allowed from boot to establish Wi-Fi STA link + DHCPv4 lease
 /// before rolling back.
@@ -459,7 +456,8 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.urc,
         bt_status,
         snapshot.bt_sub_status,
-    ).ok()?;
+    )
+    .ok()?;
     Some(writer.written_len())
 }
 
@@ -853,13 +851,7 @@ pub struct ScanApView<'a> {
 impl<'a> ScanApView<'a> {
     /// Creates a new [`ScanApView`].
     #[must_use]
-    pub const fn new(
-        ssid: &'a str,
-        bssid: [u8; 6],
-        rssi: i8,
-        channel: u8,
-        auth: &'a str,
-    ) -> Self {
+    pub const fn new(ssid: &'a str, bssid: [u8; 6], rssi: i8, channel: u8, auth: &'a str) -> Self {
         Self {
             ssid,
             bssid,
@@ -1043,7 +1035,11 @@ pub fn write_connect_status_json(
     out_buf: &mut [u8],
 ) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
-    let status_label = if connected { "connected" } else { "disconnected" };
+    let status_label = if connected {
+        "connected"
+    } else {
+        "disconnected"
+    };
     write!(
         writer,
         "{{\"connected\":{},\"status\":\"{}\",\"ssid\":\"{}\",\
@@ -1717,7 +1713,11 @@ pub const DEFAULT_COMMAND_CATALOG: &[CommandCatalogEntry<'static>] = &[
         "player <play|pause|stop|vol>",
         "Audio transport and volume",
     ),
-    CommandCatalogEntry::new("sleep", "sleep [light|deep] <seconds>", "Enter low-power sleep mode"),
+    CommandCatalogEntry::new(
+        "sleep",
+        "sleep [light|deep] <seconds>",
+        "Enter low-power sleep mode",
+    ),
     CommandCatalogEntry::new("help", "help", "List available console commands"),
 ];
 
@@ -1991,10 +1991,7 @@ pub fn derive_zeroconf_dh_private_key_with_entropy(ip: [u8; 4], entropy: [u8; 8]
 }
 
 /// Formats the `/eq.json` payload containing equalizer status into `out_buf`.
-pub fn write_eq_json(
-    snapshot: &HttpStatusSnapshot<'_>,
-    out_buf: &mut [u8],
-) -> Option<usize> {
+pub fn write_eq_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
     let preset = if snapshot.eq_enabled
         && snapshot.eq_preset == "Flat"
@@ -2027,7 +2024,11 @@ fn redact_command_password(cmd: &str) -> String<160> {
     let parts: heapless::Vec<&str, 8> = cmd.split(sep).collect();
     let ws_parts: heapless::Vec<&str, 8> = cmd.split_whitespace().collect();
     if (parts.first() == Some(&"join") || parts.first() == Some(&"connect")) && parts.len() >= 3 {
-        let mask = if parts.first() == Some(&"connect") { "<redacted>" } else { "***" };
+        let mask = if parts.first() == Some(&"connect") {
+            "<redacted>"
+        } else {
+            "***"
+        };
         let _ = write!(out, "{}{}{}{}{}", parts[0], sep, parts[1], sep, mask);
         for extra in &parts[3..] {
             let _ = write!(out, "{}{}", sep, extra);
@@ -2035,7 +2036,11 @@ fn redact_command_password(cmd: &str) -> String<160> {
     } else if (ws_parts.first() == Some(&"join") || ws_parts.first() == Some(&"connect"))
         && ws_parts.len() >= 3
     {
-        let mask = if ws_parts.first() == Some(&"connect") { "<redacted>" } else { "***" };
+        let mask = if ws_parts.first() == Some(&"connect") {
+            "<redacted>"
+        } else {
+            "***"
+        };
         let _ = write!(out, "{}{}{}{}{}", ws_parts[0], sep, ws_parts[1], sep, mask);
         for extra in &ws_parts[3..] {
             let _ = write!(out, "{}{}", sep, extra);
@@ -2047,14 +2052,7 @@ fn redact_command_password(cmd: &str) -> String<160> {
             .is_some_and(|k| crate::config_handle::is_secret_config_key(k))
         && parts.len() >= 4
     {
-        let _ = write!(
-            out,
-            "config{}set{}{}{}***",
-            sep,
-            sep,
-            parts[2],
-            sep
-        );
+        let _ = write!(out, "config{}set{}{}{}***", sep, sep, parts[2], sep);
     } else if ws_parts.first() == Some(&"config")
         && ws_parts.get(1) == Some(&"set")
         && ws_parts
@@ -2066,12 +2064,18 @@ fn redact_command_password(cmd: &str) -> String<160> {
     } else if let Some(idx) = cmd.find("wifi.pass=") {
         let prefix = &cmd[..idx + "wifi.pass=".len()];
         let rest = &cmd[idx + "wifi.pass=".len()..];
-        let end_idx = rest.find('&').or_else(|| rest.find(' ')).unwrap_or(rest.len());
+        let end_idx = rest
+            .find('&')
+            .or_else(|| rest.find(' '))
+            .unwrap_or(rest.len());
         let _ = write!(out, "{}***{}", prefix, &rest[end_idx..]);
     } else if let Some(idx) = cmd.find("password=") {
         let prefix = &cmd[..idx + "password=".len()];
         let rest = &cmd[idx + "password=".len()..];
-        let end_idx = rest.find('&').or_else(|| rest.find(' ')).unwrap_or(rest.len());
+        let end_idx = rest
+            .find('&')
+            .or_else(|| rest.find(' '))
+            .unwrap_or(rest.len());
         let _ = write!(out, "{}***{}", prefix, &rest[end_idx..]);
     } else {
         let _ = out.push_str(cmd);
@@ -2103,11 +2107,13 @@ fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
     }
     for line in req_str.lines() {
         let trimmed = line.trim();
-        if let Some(auth_val) = trimmed.strip_prefix("Authorization:")
+        if let Some(auth_val) = trimmed
+            .strip_prefix("Authorization:")
             .or_else(|| trimmed.strip_prefix("authorization:"))
         {
             let auth_val = auth_val.trim();
-            if let Some(bearer_val) = auth_val.strip_prefix("Bearer ")
+            if let Some(bearer_val) = auth_val
+                .strip_prefix("Bearer ")
                 .or_else(|| auth_val.strip_prefix("bearer "))
             {
                 if bearer_val.trim() == expected_token {
@@ -2116,7 +2122,8 @@ fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
             } else if auth_val == expected_token {
                 return true;
             }
-        } else if let Some(token_val) = trimmed.strip_prefix("X-Auth-Token:")
+        } else if let Some(token_val) = trimmed
+            .strip_prefix("X-Auth-Token:")
             .or_else(|| trimmed.strip_prefix("x-auth-token:"))
         {
             if token_val.trim() == expected_token {
@@ -2209,14 +2216,16 @@ fn is_permitted_origin(req_bytes: &[u8]) -> bool {
     };
     for line in req_str.lines() {
         let trimmed = line.trim();
-        if let Some(origin_val) = trimmed.strip_prefix("Origin:")
+        if let Some(origin_val) = trimmed
+            .strip_prefix("Origin:")
             .or_else(|| trimmed.strip_prefix("origin:"))
         {
             let val = origin_val.trim();
             if val.is_empty() || val == "null" {
                 return false;
             }
-            let host_part = val.strip_prefix("http://")
+            let host_part = val
+                .strip_prefix("http://")
                 .or_else(|| val.strip_prefix("https://"))
                 .unwrap_or(val);
             let host_end = host_part.find(&['/', ':'][..]).unwrap_or(host_part.len());
@@ -2355,13 +2364,7 @@ pub fn handle_http_request_streaming_impl(
         };
 
         let mut zc = ZeroConfServer::new();
-        if let Ok(resp) = zc.handle_request(
-            raw_path,
-            body_str,
-            &dh,
-            device_id,
-            remote_name,
-        ) {
+        if let Ok(resp) = zc.handle_request(raw_path, body_str, &dh, device_id, remote_name) {
             let mut header: String<160> = String::new();
             let _ = write!(
                 header,
@@ -2435,7 +2438,10 @@ pub fn handle_http_request_streaming_impl(
         }
         ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
             let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let mut act = query.split('&').find_map(|p| p.strip_prefix("act=")).unwrap_or("");
+            let mut act = query
+                .split('&')
+                .find_map(|p| p.strip_prefix("act="))
+                .unwrap_or("");
             if act.is_empty() {
                 let body_slice = req_bytes
                     .windows(4)
@@ -2449,7 +2455,10 @@ pub fn handle_http_request_streaming_impl(
                     })
                     .unwrap_or(&[]);
                 if let Ok(body_str) = core::str::from_utf8(body_slice) {
-                    act = body_str.split('&').find_map(|p| p.strip_prefix("act=")).unwrap_or("");
+                    act = body_str
+                        .split('&')
+                        .find_map(|p| p.strip_prefix("act="))
+                        .unwrap_or("");
                     if act.is_empty() {
                         let trimmed = body_str.trim();
                         if let Some(rest) = trimmed.strip_prefix("act=") {
@@ -2657,7 +2666,11 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
-            Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
+            Some((
+                resp_bytes.len(),
+                &[],
+                HttpControlAction::PersistOta0AndReboot,
+            ))
         }
         ("POST", "/reboot_ota.json") => {
             let body = "{\"status\":\"rebooting_to_ota_0\",\
@@ -2676,7 +2689,11 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             out_buf[..resp_bytes.len()].copy_from_slice(resp_bytes);
-            Some((resp_bytes.len(), &[], HttpControlAction::PersistOta0AndReboot))
+            Some((
+                resp_bytes.len(),
+                &[],
+                HttpControlAction::PersistOta0AndReboot,
+            ))
         }
         ("GET", "/eq.json") => {
             const HEADER_ROOM: usize = 160;
@@ -3065,8 +3082,7 @@ mod tests {
         };
         let mut buf = [0u8; 2048];
         let req = b"GET /status.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
-        let (len, action) =
-            handle_http_control_request(req, &snap, &mut buf).unwrap();
+        let (len, action) = handle_http_control_request(req, &snap, &mut buf).unwrap();
         assert_eq!(action, HttpControlAction::None);
         let resp = core::str::from_utf8(&buf[..len]).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -3106,8 +3122,7 @@ mod tests {
 
         // 1. Play
         let req1 = b"GET /cmd.json?act=play HTTP/1.1\r\n\r\n";
-        let (len1, act1) =
-            handle_http_control_request(req1, &snap, &mut buf).unwrap();
+        let (len1, act1) = handle_http_control_request(req1, &snap, &mut buf).unwrap();
         assert_eq!(
             act1,
             HttpControlAction::PlayerIrCommand {
@@ -3123,8 +3138,7 @@ mod tests {
 
         // 2. Pause
         let req2 = b"GET /cmd.json?act=pause HTTP/1.1\r\n\r\n";
-        let (_len2, act2) =
-            handle_http_control_request(req2, &snap, &mut buf).unwrap();
+        let (_len2, act2) = handle_http_control_request(req2, &snap, &mut buf).unwrap();
         assert_eq!(
             act2,
             HttpControlAction::PlayerIrCommand {
@@ -3136,8 +3150,7 @@ mod tests {
 
         // 3. Stop
         let req3 = b"GET /cmd.json?act=stop HTTP/1.1\r\n\r\n";
-        let (_len3, act3) =
-            handle_http_control_request(req3, &snap, &mut buf).unwrap();
+        let (_len3, act3) = handle_http_control_request(req3, &snap, &mut buf).unwrap();
         assert_eq!(
             act3,
             HttpControlAction::PlayerIrCommand {
@@ -3149,8 +3162,7 @@ mod tests {
 
         // 4. VolUp (+5% from snapshot.vol_pct=60 -> 65)
         let req4 = b"GET /cmd.json?act=volup HTTP/1.1\r\n\r\n";
-        let (_len4, act4) =
-            handle_http_control_request(req4, &snap, &mut buf).unwrap();
+        let (_len4, act4) = handle_http_control_request(req4, &snap, &mut buf).unwrap();
         assert_eq!(
             act4,
             HttpControlAction::PlayerIrCommand {
@@ -3162,8 +3174,7 @@ mod tests {
 
         // 5. VolDown (-5% from snapshot.vol_pct=60 -> 55)
         let req5 = b"GET /cmd.json?act=voldown HTTP/1.1\r\n\r\n";
-        let (_len5, act5) =
-            handle_http_control_request(req5, &snap, &mut buf).unwrap();
+        let (_len5, act5) = handle_http_control_request(req5, &snap, &mut buf).unwrap();
         assert_eq!(
             act5,
             HttpControlAction::PlayerIrCommand {
@@ -3175,8 +3186,7 @@ mod tests {
 
         // 6. Direct volume setting: vol70
         let req6 = b"GET /cmd.json?act=vol70 HTTP/1.1\r\n\r\n";
-        let (_len6, act6) =
-            handle_http_control_request(req6, &snap, &mut buf).unwrap();
+        let (_len6, act6) = handle_http_control_request(req6, &snap, &mut buf).unwrap();
         assert_eq!(
             act6,
             HttpControlAction::PlayerIrCommand {
@@ -3188,8 +3198,7 @@ mod tests {
 
         // 7. Preset1
         let req7 = b"GET /cmd.json?act=preset1 HTTP/1.1\r\n\r\n";
-        let (_len7, act7) =
-            handle_http_control_request(req7, &snap, &mut buf).unwrap();
+        let (_len7, act7) = handle_http_control_request(req7, &snap, &mut buf).unwrap();
         assert_eq!(
             act7,
             HttpControlAction::PlayerIrCommand {
@@ -3201,8 +3210,7 @@ mod tests {
 
         // 8. Unknown action -> ok: false
         let req8 = b"GET /cmd.json?act=unknown HTTP/1.1\r\n\r\n";
-        let (len8, act8) =
-            handle_http_control_request(req8, &snap, &mut buf).unwrap();
+        let (len8, act8) = handle_http_control_request(req8, &snap, &mut buf).unwrap();
         assert_eq!(act8, HttpControlAction::None);
         let resp8 = core::str::from_utf8(&buf[..len8]).unwrap();
         assert!(resp8.contains("{\"ok\":false,\"error\":\"unknown_action\"}"));
@@ -3251,12 +3259,17 @@ mod tests {
         let req = b"POST /cmd.json HTTP/1.1\r\nHost: 192.168.1.50\r\n\
             Content-Type: application/x-www-form-urlencoded\r\n\r\nact=pause";
         let (resp_len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
-        assert_eq!(act, HttpControlAction::PlayerIrCommand {
-            ir_code: 0x7689_20DF,
-            vol_pct: None,
-            mute: None,
-        });
-        assert!(core::str::from_utf8(&buf[..resp_len]).unwrap().contains("\"ok\":true"));
+        assert_eq!(
+            act,
+            HttpControlAction::PlayerIrCommand {
+                ir_code: 0x7689_20DF,
+                vol_pct: None,
+                mute: None,
+            }
+        );
+        assert!(core::str::from_utf8(&buf[..resp_len])
+            .unwrap()
+            .contains("\"ok\":true"));
     }
 
     #[test]
@@ -3284,8 +3297,7 @@ mod tests {
         let mut buf = [0u8; 32768];
 
         let req1 = b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
-        let (len1, act1) =
-            handle_http_control_request(req1, &snap, &mut buf).unwrap();
+        let (len1, act1) = handle_http_control_request(req1, &snap, &mut buf).unwrap();
         assert_eq!(act1, HttpControlAction::None);
         let resp1 = core::str::from_utf8(&buf[..len1]).unwrap();
         assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -3294,8 +3306,7 @@ mod tests {
         assert!(resp1.contains("/status.json"));
 
         let req2 = b"GET /index.html HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
-        let (len2, act2) =
-            handle_http_control_request(req2, &snap, &mut buf).unwrap();
+        let (len2, act2) = handle_http_control_request(req2, &snap, &mut buf).unwrap();
         assert_eq!(act2, HttpControlAction::None);
         let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
         assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -3316,8 +3327,7 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"));
 
         let (hdr_len, body_bytes, act2) =
-            handle_http_request_streaming(b"GET / HTTP/1.1\r\n\r\n", &snap, &mut buf)
-                .unwrap();
+            handle_http_request_streaming(b"GET / HTTP/1.1\r\n\r\n", &snap, &mut buf).unwrap();
         assert_eq!(act2, HttpControlAction::None);
         assert!(!body_bytes.is_empty());
         let hdr_resp = core::str::from_utf8(&buf[..hdr_len]).unwrap();
@@ -3479,14 +3489,12 @@ mod tests {
         assert!(body.starts_with('{') && body.ends_with('}'));
         // A buffer too small for the body is refused, never truncated.
         let mut small = [0u8; 600];
-        assert!(
-            handle_http_request_streaming(
-                b"GET /status.json HTTP/1.1\r\n\r\n",
-                &worst,
-                &mut small,
-            )
-            .is_none()
-        );
+        assert!(handle_http_request_streaming(
+            b"GET /status.json HTTP/1.1\r\n\r\n",
+            &worst,
+            &mut small,
+        )
+        .is_none());
     }
 
     #[test]
@@ -3623,12 +3631,9 @@ mod tests {
         let mut buf = [0u8; 2048];
 
         // 1. GET /config.json & POST /config.json
-        let (clen, cact) = handle_http_control_request(
-            b"GET /config.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .expect("GET /config.json");
+        let (clen, cact) =
+            handle_http_control_request(b"GET /config.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .expect("GET /config.json");
         assert_eq!(cact, HttpControlAction::None);
         let cstr = core::str::from_utf8(&buf[..clen]).expect("utf8");
         assert!(cstr.contains("\"settings_seq\":1"));
@@ -3645,12 +3650,9 @@ mod tests {
         assert!(ustr.contains("\"ok\":true,\"key\":\"player_name\",\"value\":\"Kitchen\""));
 
         // 2. GET /scan.json & POST /scan.json
-        let (slen, sact) = handle_http_control_request(
-            b"POST /scan.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .expect("POST /scan.json");
+        let (slen, sact) =
+            handle_http_control_request(b"POST /scan.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .expect("POST /scan.json");
         assert_eq!(sact, HttpControlAction::TriggerWifiScan);
         let sstr = core::str::from_utf8(&buf[..slen]).expect("utf8");
         assert!(sstr.contains("\"aps\":[{\"ssid\":\"iot\""));
@@ -3667,23 +3669,17 @@ mod tests {
         assert!(kstr.contains("\"status\":\"connecting\",\"ssid\":\"HomeWiFi\""));
 
         // 4. GET /messages.json
-        let (mlen, mact) = handle_http_control_request(
-            b"GET /messages.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .expect("GET /messages.json");
+        let (mlen, mact) =
+            handle_http_control_request(b"GET /messages.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .expect("GET /messages.json");
         assert_eq!(mact, HttpControlAction::None);
         let mstr = core::str::from_utf8(&buf[..mlen]).expect("utf8");
         assert!(mstr.contains("\"messages\":[{\"seq\":1"));
 
         // 5. GET /commands.json & POST /commands.json
-        let (xlen, xact) = handle_http_control_request(
-            b"GET /commands.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .expect("GET /commands.json");
+        let (xlen, xact) =
+            handle_http_control_request(b"GET /commands.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .expect("GET /commands.json");
         assert_eq!(xact, HttpControlAction::None);
         let xstr = core::str::from_utf8(&buf[..xlen]).expect("utf8");
         assert!(xstr.contains("\"commands\":[{\"name\":\"system\""));
@@ -3699,12 +3695,9 @@ mod tests {
         assert!(estr.contains("\"ok\":true,\"cmd\":\"system%20info\""));
 
         // 6. POST /flash.json
-        let (flen, fact) = handle_http_control_request(
-            b"POST /flash.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .expect("POST /flash.json");
+        let (flen, fact) =
+            handle_http_control_request(b"POST /flash.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .expect("POST /flash.json");
         assert_eq!(fact, HttpControlAction::StartOtaFlash);
         let fstr = core::str::from_utf8(&buf[..flen]).expect("utf8");
         assert!(fstr.contains("\"ota_state\":\"starting_ota\""));
@@ -3879,45 +3872,37 @@ mod tests {
         let mut buf = [0u8; 2048];
 
         // GET /recovery.json rejected with 405
-        let (len1, act1) = handle_http_control_request(
-            b"GET /recovery.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .unwrap();
+        let (len1, act1) =
+            handle_http_control_request(b"GET /recovery.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .unwrap();
         assert_eq!(act1, HttpControlAction::None);
         let resp1 = core::str::from_utf8(&buf[..len1]).unwrap();
         assert!(resp1.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
 
         // GET /reboot.json rejected with 405
-        let (len2, act2) = handle_http_control_request(
-            b"GET /reboot.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .unwrap();
+        let (len2, act2) =
+            handle_http_control_request(b"GET /reboot.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+                .unwrap();
         assert_eq!(act2, HttpControlAction::None);
         let resp2 = core::str::from_utf8(&buf[..len2]).unwrap();
         assert!(resp2.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
 
         // Authenticated router rejects missing token
         let router = HttpControlRouter::with_auth_token("secret_token_123");
-        let (len3, _) = router.handle_request(
-            b"GET /status.json HTTP/1.1\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .unwrap();
+        let (len3, _) = router
+            .handle_request(b"GET /status.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+            .unwrap();
         let resp3 = core::str::from_utf8(&buf[..len3]).unwrap();
         assert!(resp3.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
 
         // Authenticated router accepts valid header
-        let (len4, _) = router.handle_request(
-            b"GET /status.json HTTP/1.1\r\nAuthorization: Bearer secret_token_123\r\n\r\n",
-            &snap,
-            &mut buf,
-        )
-        .unwrap();
+        let (len4, _) = router
+            .handle_request(
+                b"GET /status.json HTTP/1.1\r\nAuthorization: Bearer secret_token_123\r\n\r\n",
+                &snap,
+                &mut buf,
+            )
+            .unwrap();
         let resp4 = core::str::from_utf8(&buf[..len4]).unwrap();
         assert!(resp4.starts_with("HTTP/1.1 200 OK\r\n"));
     }

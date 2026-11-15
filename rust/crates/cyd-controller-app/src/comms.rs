@@ -509,7 +509,11 @@ mod tests {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         );
         let mut json_buf = heapless::String::<160>::new();
-        let _ = write!(json_buf, "{{\"event\":\"meta\",\"title\":\"{}\"}}", long_title);
+        let _ = write!(
+            json_buf,
+            "{{\"event\":\"meta\",\"title\":\"{}\"}}",
+            long_title
+        );
 
         assert!(parse_json_event(&json_buf, &mut state).is_ok());
         assert_eq!(state.title.len(), 64);
@@ -582,8 +586,14 @@ mod tests {
         let vol_cmd = format_command("vol", 42).expect("valid vol");
         assert_eq!(&vol_cmd[..], b"{\"cmd\":\"vol\",\"val\":42}\n");
 
-        assert_eq!(&format_command("vol", 0).unwrap()[..], b"{\"cmd\":\"vol\",\"val\":0}\n");
-        assert_eq!(&format_command("vol", 100).unwrap()[..], b"{\"cmd\":\"vol\",\"val\":100}\n");
+        assert_eq!(
+            &format_command("vol", 0).unwrap()[..],
+            b"{\"cmd\":\"vol\",\"val\":0}\n"
+        );
+        assert_eq!(
+            &format_command("vol", 100).unwrap()[..],
+            b"{\"cmd\":\"vol\",\"val\":100}\n"
+        );
         assert!(format_command("vol", -1).is_none());
         assert!(format_command("vol", 101).is_none());
 
@@ -606,7 +616,8 @@ mod tests {
         let line = concat!(
             "{\"event\":\"meta\",\"title\":\"Time\",",
             "\"artist\":\"Pink Floyd\",\"album\":\"Dark Side\"}\n"
-        ).as_bytes();
+        )
+        .as_bytes();
         let parsed = link.feed_rx_bytes(line, 1000);
 
         assert_eq!(parsed, 1);
@@ -639,7 +650,8 @@ mod tests {
             "{\"event\":\"sys\",\"mode\":\"LMS\",\"ip\":\"10.0.0.5\"}\n",
             "{\"event\":\"status\",\"state\":\"play\",",
             "\"elapsed\":10,\"duration\":100,\"vol\":50}\n"
-        ).as_bytes();
+        )
+        .as_bytes();
 
         let parsed = link.feed_rx_bytes(multi, 500);
         assert_eq!(parsed, 2);

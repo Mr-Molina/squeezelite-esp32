@@ -213,15 +213,14 @@ impl MercuryHeader {
         let mut status_code = None;
 
         while pos < data.len() {
-            let key = decode_varint(data, &mut pos)
-                .map_err(|_| MercuryError::TruncatedPacket)?;
+            let key = decode_varint(data, &mut pos).map_err(|_| MercuryError::TruncatedPacket)?;
             let field_num = (key >> 3) as u32;
             let wire_type = (key & 0x07) as u8;
 
             match wire_type {
                 0 => {
-                    let val = decode_varint(data, &mut pos)
-                        .map_err(|_| MercuryError::TruncatedPacket)?;
+                    let val =
+                        decode_varint(data, &mut pos).map_err(|_| MercuryError::TruncatedPacket)?;
                     if field_num == 4 {
                         status_code = Some(val as i32);
                     }
@@ -236,9 +235,7 @@ impl MercuryHeader {
                     let len = decode_varint(data, &mut pos)
                         .map_err(|_| MercuryError::TruncatedPacket)?
                         as usize;
-                    let end = pos
-                        .checked_add(len)
-                        .ok_or(MercuryError::TruncatedPacket)?;
+                    let end = pos.checked_add(len).ok_or(MercuryError::TruncatedPacket)?;
                     if end > data.len() {
                         return Err(MercuryError::TruncatedPacket);
                     }
@@ -325,12 +322,7 @@ impl MercuryPacket {
     /// Constructs a request `MercuryPacket` from method
     /// (`"SUB"`, `"UNSUB"`, `"SEND"`, `"GET"`).
     #[must_use]
-    pub fn request(
-        seq_id: u64,
-        method: &str,
-        uri: &str,
-        payload_parts: Vec<Vec<u8>>,
-    ) -> Self {
+    pub fn request(seq_id: u64, method: &str, uri: &str, payload_parts: Vec<Vec<u8>>) -> Self {
         let cmd = MercuryType::from_method(method);
         let header = MercuryHeader::new(uri, method);
         Self::new(cmd, seq_id, header, payload_parts)
@@ -367,9 +359,7 @@ impl MercuryPacket {
         (self.cmd as u8, self.encode())
     }
 
-    fn parse_raw_parts(
-        data: &[u8],
-    ) -> Result<(u64, u8, Vec<Vec<u8>>), MercuryError> {
+    fn parse_raw_parts(data: &[u8]) -> Result<(u64, u8, Vec<Vec<u8>>), MercuryError> {
         if data.len() < 2 {
             return Err(MercuryError::TruncatedPacket);
         }
@@ -407,8 +397,7 @@ impl MercuryPacket {
             if pos + 2 > data.len() {
                 return Err(MercuryError::TruncatedPacket);
             }
-            let part_len =
-                u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            let part_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
             if pos + part_len > data.len() {
                 return Err(MercuryError::TruncatedPacket);
@@ -425,10 +414,7 @@ impl MercuryPacket {
         let typ = MercuryType::from(cmd);
         if !matches!(
             typ,
-            MercuryType::Send
-                | MercuryType::Sub
-                | MercuryType::Unsub
-                | MercuryType::Subres
+            MercuryType::Send | MercuryType::Sub | MercuryType::Unsub | MercuryType::Subres
         ) {
             return Err(MercuryError::InvalidFraming);
         }
@@ -447,20 +433,14 @@ impl MercuryPacket {
     }
 
     /// Reassembles a multipart Mercury packet across one or more AP fragments.
-    pub fn assemble_multipart(
-        cmd: u8,
-        fragments: &[&[u8]],
-    ) -> Result<Self, MercuryError> {
+    pub fn assemble_multipart(cmd: u8, fragments: &[&[u8]]) -> Result<Self, MercuryError> {
         if fragments.is_empty() {
             return Err(MercuryError::TruncatedPacket);
         }
         let typ = MercuryType::from(cmd);
         if !matches!(
             typ,
-            MercuryType::Send
-                | MercuryType::Sub
-                | MercuryType::Unsub
-                | MercuryType::Subres
+            MercuryType::Send | MercuryType::Sub | MercuryType::Unsub | MercuryType::Subres
         ) {
             return Err(MercuryError::InvalidFraming);
         }
@@ -556,9 +536,7 @@ impl AudioKeyPacket {
                 file_id,
                 track_gid,
                 seq,
-            } => MercuryPacketBuilder::build_audio_key_request(
-                file_id, track_gid, *seq,
-            ),
+            } => MercuryPacketBuilder::build_audio_key_request(file_id, track_gid, *seq),
             Self::AesKey { seq, key } => {
                 let mut buf = Vec::with_capacity(20);
                 buf.extend_from_slice(&seq.to_be_bytes());
@@ -592,12 +570,7 @@ impl AudioKeyPacket {
                 file_id.copy_from_slice(&payload[0..20]);
                 let mut track_gid = [0u8; 16];
                 track_gid.copy_from_slice(&payload[20..36]);
-                let seq = u32::from_be_bytes([
-                    payload[36],
-                    payload[37],
-                    payload[38],
-                    payload[39],
-                ]);
+                let seq = u32::from_be_bytes([payload[36], payload[37], payload[38], payload[39]]);
                 Ok(Self::RequestKey {
                     file_id,
                     track_gid,
@@ -608,9 +581,7 @@ impl AudioKeyPacket {
                 if payload.len() < 20 {
                     return Err(MercuryError::TruncatedPacket);
                 }
-                let seq = u32::from_be_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                ]);
+                let seq = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let mut key = [0u8; 16];
                 key.copy_from_slice(&payload[4..20]);
                 Ok(Self::AesKey { seq, key })
@@ -619,9 +590,7 @@ impl AudioKeyPacket {
                 if payload.len() < 6 {
                     return Err(MercuryError::TruncatedPacket);
                 }
-                let seq = u32::from_be_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                ]);
+                let seq = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let error_code = u16::from_be_bytes([payload[4], payload[5]]);
                 Ok(Self::AesKeyError { seq, error_code })
             }
@@ -636,12 +605,7 @@ pub struct MercuryPacketBuilder;
 impl MercuryPacketBuilder {
     /// Frames a Mercury request packet.
     /// Matches `MercurySession::executeSubscription`.
-    pub fn build_request(
-        seq_id: u64,
-        method: &str,
-        uri: &str,
-        payloads: &[&[u8]],
-    ) -> Vec<u8> {
+    pub fn build_request(seq_id: u64, method: &str, uri: &str, payloads: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::with_capacity(256);
 
         // Sequence ID: 8 bytes big-endian, preceded by 2-byte size (8)
@@ -698,9 +662,7 @@ impl MercuryPacketBuilder {
             AudioKeyPacket::AesKeyError { error_code, .. } => {
                 Err(MercuryError::AudioKeyFailed(error_code))
             }
-            AudioKeyPacket::RequestKey { .. } => {
-                Err(MercuryError::InvalidFraming)
-            }
+            AudioKeyPacket::RequestKey { .. } => Err(MercuryError::InvalidFraming),
         }
     }
 }

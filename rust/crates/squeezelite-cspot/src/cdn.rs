@@ -5,8 +5,8 @@
 
 extern crate alloc;
 
-use crate::crypto::big_num_add;
 use crate::crypto::Aes128Ctr;
+use alloc::vec::Vec;
 use core::fmt;
 use squeezelite_decoders::AudioDecoder;
 use squeezelite_decoders::DecoderError;
@@ -14,8 +14,7 @@ use squeezelite_decoders::VorbisDecoder;
 
 /// Spotify CDN fixed Audio AES IV matching `CDNAudioFile.h`.
 pub const AUDIO_AES_IV: [u8; 16] = [
-    0x72, 0xe0, 0x67, 0xfb, 0xdd, 0xcb, 0xcf, 0x77, 0xeb, 0xe8, 0xbc, 0x64,
-    0x3f, 0x63, 0x0d, 0x93,
+    0x72, 0xe0, 0x67, 0xfb, 0xdd, 0xcb, 0xcf, 0x77, 0xeb, 0xe8, 0xbc, 0x64, 0x3f, 0x63, 0x0d, 0x93,
 ];
 
 /// Size of Spotify proprietary container header preceding Ogg Vorbis bitstream.
@@ -118,8 +117,7 @@ impl AudioKeyDecryptor {
     #[must_use]
     pub fn strip_ogg_header(decrypted: &[u8], byte_offset: usize) -> &[u8] {
         if byte_offset < SPOTIFY_HEADER_SIZE {
-            let skip =
-                core::cmp::min(SPOTIFY_HEADER_SIZE - byte_offset, decrypted.len());
+            let skip = core::cmp::min(SPOTIFY_HEADER_SIZE - byte_offset, decrypted.len());
             &decrypted[skip..]
         } else {
             decrypted
@@ -140,11 +138,9 @@ impl AudioKeyDecryptor {
         if intra_block > 0 {
             let mut scratch = [0u8; 16];
             let take = core::cmp::min(16 - intra_block, data.len());
-            scratch[intra_block..intra_block + take]
-                .copy_from_slice(&data[..take]);
+            scratch[intra_block..intra_block + take].copy_from_slice(&data[..take]);
             ctr.process(&mut scratch);
-            data[..take]
-                .copy_from_slice(&scratch[intra_block..intra_block + take]);
+            data[..take].copy_from_slice(&scratch[intra_block..intra_block + take]);
 
             if data.len() > take {
                 ctr.process(&mut data[take..]);
@@ -156,11 +152,7 @@ impl AudioKeyDecryptor {
 
     /// Decrypts `chunk` in-place at `byte_offset` and returns the Ogg Vorbis
     /// slice with the 167-byte (`0xA7`) header stripped if `byte_offset < 0xA7`.
-    pub fn decrypt_chunk<'a>(
-        &self,
-        chunk: &'a mut [u8],
-        byte_offset: usize,
-    ) -> &'a [u8] {
+    pub fn decrypt_chunk<'a>(&self, chunk: &'a mut [u8], byte_offset: usize) -> &'a [u8] {
         self.decrypt_in_place(chunk, byte_offset);
         Self::strip_ogg_header(chunk, byte_offset)
     }
@@ -174,10 +166,26 @@ impl AudioKeyDecryptor {
     }
 }
 
+impl Drop for AudioKeyDecryptor {
+    fn drop(&mut self) {
+        self.audio_key.fill(0);
+        core::hint::black_box(&mut self.audio_key);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// AES-128-CTR audio decryptor for Spotify CDN chunks.
 #[derive(Clone, Debug)]
 pub struct CdnAudioDecryptor {
     audio_key: [u8; 16],
+}
+
+impl Drop for CdnAudioDecryptor {
+    fn drop(&mut self) {
+        self.audio_key.fill(0);
+        core::hint::black_box(&mut self.audio_key);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl CdnAudioDecryptor {
@@ -187,18 +195,12 @@ impl CdnAudioDecryptor {
     }
 
     /// Calculates 16-byte IV for given byte position in audio file.
-    pub fn calculate_iv(offset: usize) -> [u8; 16] {
-        let block_idx = offset / 16;
-        let iv_vec = big_num_add(&AUDIO_AES_IV, block_idx);
-        let mut iv = [0u8; 16];
-        if iv_vec.len() >= 16 {
-            let start = iv_vec.len() - 16;
-            iv.copy_from_slice(&iv_vec[start..]);
-        } else {
-            let pad = 16 - iv_vec.len();
-            iv[pad..].copy_from_slice(&iv_vec);
-        }
-        iv
+    #[must_use]
+    pub const fn calculate_iv(offset: usize) -> [u8; 16] {
+        let block_idx = (offset / 16) as u128;
+        u128::from_be_bytes(AUDIO_AES_IV)
+            .wrapping_add(block_idx)
+            .to_be_bytes()
     }
 
     /// Decrypts a chunk in-place given absolute file byte offset.
@@ -213,7 +215,7 @@ pub struct CdnStreamFeeder {
     decryptor: CdnAudioDecryptor,
     decoder: VorbisDecoder,
     total_bytes_fed: usize,
-    header_stripped: bool,
+    decrypt_scratch: Vec<u8>,
 }
 
 impl CdnStreamFeeder {
@@ -223,7 +225,7 @@ impl CdnStreamFeeder {
             decryptor: CdnAudioDecryptor::new(audio_key),
             decoder: VorbisDecoder::new(),
             total_bytes_fed: 0,
-            header_stripped: false,
+            decrypt_scratch: Vec::with_capacity(4096),
         }
     }
 
@@ -241,7 +243,7 @@ impl CdnStreamFeeder {
     pub fn flush(&mut self) {
         self.decoder.flush();
         self.total_bytes_fed = 0;
-        self.header_stripped = false;
+        self.decrypt_scratch.clear();
     }
 
     /// Feeds raw (encrypted) CDN chunk, decrypts it, and decodes PCM frames.
@@ -251,21 +253,12 @@ impl CdnStreamFeeder {
         offset: usize,
         pcm_out: &mut [i32],
     ) -> Result<(usize, usize), CdnError> {
-        if offset == 0 {
-            self.header_stripped = false;
-        }
-        let mut decrypted = chunk.to_vec();
-        self.decryptor.decrypt_chunk(&mut decrypted, offset);
+        self.decrypt_scratch.clear();
+        self.decrypt_scratch.extend_from_slice(chunk);
+        self.decryptor
+            .decrypt_chunk(&mut self.decrypt_scratch, offset);
 
-        let slice_to_feed = if !self.header_stripped && offset < SPOTIFY_HEADER_SIZE {
-            let strip = (SPOTIFY_HEADER_SIZE - offset).min(decrypted.len());
-            if offset + decrypted.len() >= SPOTIFY_HEADER_SIZE {
-                self.header_stripped = true;
-            }
-            &decrypted[strip..]
-        } else {
-            &decrypted[..]
-        };
+        let slice_to_feed = AudioKeyDecryptor::strip_ogg_header(&self.decrypt_scratch, offset);
 
         if slice_to_feed.is_empty() {
             return Ok((chunk.len(), 0));
@@ -279,9 +272,39 @@ impl CdnStreamFeeder {
     /// Converts 32-bit internal pipeline samples to 16-bit interleaved PCM.
     pub fn convert_to_i16_pcm(samples_i32: &[i32], pcm_16: &mut [i16]) -> usize {
         let count = core::cmp::min(samples_i32.len(), pcm_16.len());
-        for i in 0..count {
-            pcm_16[i] = (samples_i32[i] >> 16) as i16;
+        for (&sample, pcm) in samples_i32[..count].iter().zip(&mut pcm_16[..count]) {
+            *pcm = (sample.saturating_add(0x8000) >> 16) as i16;
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_convert_to_i16_pcm_rounded_arithmetic() {
+        let samples_i32 = [
+            0i32,
+            0x0000_7FFF,  // Round down: (0x7FFF + 0x8000) = 0xFFFF -> >> 16 = 0
+            0x0000_8000,  // Round up: (0x8000 + 0x8000) = 0x10000 -> >> 16 = 1
+            0x0001_0000,  // 1.0 in 16.16 -> 1
+            -0x0001_0000, // -1.0 in 16.16 -> -1
+        ];
+        let mut pcm_16 = [0i16; 5];
+        let converted = CdnStreamFeeder::convert_to_i16_pcm(&samples_i32, &mut pcm_16);
+        assert_eq!(converted, 5);
+        assert_eq!(pcm_16[0], 0);
+        assert_eq!(pcm_16[1], 0);
+        assert_eq!(pcm_16[2], 1);
+        assert_eq!(pcm_16[3], 1);
+        assert_eq!(pcm_16[4], -1);
+    }
+
+    #[test]
+    fn test_cdn_stream_feeder_scratch_capacity() {
+        let feeder = CdnStreamFeeder::new([0x33; 16]);
+        assert!(feeder.decrypt_scratch.capacity() >= 4096);
     }
 }

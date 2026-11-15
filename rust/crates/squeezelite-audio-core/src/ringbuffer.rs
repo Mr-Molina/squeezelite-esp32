@@ -11,7 +11,6 @@
 //!   raw pointers.
 //! - Separate `Producer` and `Consumer` split handles.
 
-
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,25 +23,21 @@ pub enum RingBufferError {
 }
 
 #[repr(align(64))]
-struct CachePaddedAtomic {
-    val: AtomicUsize,
-}
+struct CachePaddedAtomic(pub AtomicUsize);
 
 impl CachePaddedAtomic {
     pub const fn new(val: usize) -> Self {
-        Self {
-            val: AtomicUsize::new(val),
-        }
+        Self(AtomicUsize::new(val))
     }
 
     #[inline(always)]
     pub fn load(&self, order: Ordering) -> usize {
-        self.val.load(order)
+        self.0.load(order)
     }
 
     #[inline(always)]
     pub fn store(&self, val: usize, order: Ordering) {
-        self.val.store(val, order);
+        self.0.store(val, order);
     }
 }
 
@@ -51,7 +46,7 @@ pub struct AudioRingBuffer<'a> {
     capacity: usize,
     read_pos: CachePaddedAtomic,
     write_pos: CachePaddedAtomic,
-    rewindable: AtomicUsize,
+    rewindable: CachePaddedAtomic,
     _marker: PhantomData<&'a mut [u8]>,
 }
 
@@ -66,14 +61,17 @@ impl<'a> AudioRingBuffer<'a> {
     /// Creates a new audio ringbuffer over an existing byte slice.
     /// Panics if `storage.len() < 2`.
     pub fn new(storage: &'a mut [u8]) -> Self {
-        assert!(storage.len() >= 2, "RingBuffer storage must be at least 2 bytes");
+        assert!(
+            storage.len() >= 2,
+            "RingBuffer storage must be at least 2 bytes"
+        );
         let capacity = storage.len();
         Self {
             storage: storage.as_mut_ptr(),
             capacity,
             read_pos: CachePaddedAtomic::new(0),
             write_pos: CachePaddedAtomic::new(0),
-            rewindable: AtomicUsize::new(0),
+            rewindable: CachePaddedAtomic::new(0),
             _marker: PhantomData,
         }
     }
@@ -82,6 +80,16 @@ impl<'a> AudioRingBuffer<'a> {
     #[inline]
     pub const fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    #[inline(always)]
+    const fn wrap_index(&self, index: usize) -> usize {
+        debug_assert!(index < 2 * self.capacity);
+        if index >= self.capacity {
+            index - self.capacity
+        } else {
+            index
+        }
     }
 
     /// Returns the number of bytes currently stored and available for reading.
@@ -107,11 +115,9 @@ impl<'a> AudioRingBuffer<'a> {
     /// whole audio frames of size `frame_bytes`.
     #[inline]
     pub fn available_write_frames(&self, frame_bytes: usize) -> usize {
-        if frame_bytes == 0 {
-            0
-        } else {
-            (self.available_write() / frame_bytes) * frame_bytes
-        }
+        self.available_write()
+            .checked_div(frame_bytes)
+            .map_or(0, |frames| frames * frame_bytes)
     }
 
     /// Writes data from `src` into the ringbuffer.
@@ -151,7 +157,7 @@ impl<'a> AudioRingBuffer<'a> {
         }
 
         let to_peek = core::cmp::min(dst.len(), avail - offset);
-        let r = (r_snap + offset) % self.capacity;
+        let r = self.wrap_index(r_snap + offset);
 
         let data_to_end = self.capacity - r;
         if to_peek <= data_to_end {
@@ -234,7 +240,7 @@ impl<'a> AudioRingBuffer<'a> {
             return 0;
         }
         let r = self.read_pos.load(Ordering::Acquire);
-        let new_w = (r + keep) % self.capacity;
+        let new_w = self.wrap_index(r + keep);
         self.write_pos.store(new_w, Ordering::Release);
         avail - keep
     }
@@ -256,14 +262,19 @@ impl<'a> AudioRingBuffer<'a> {
 
     #[inline]
     pub(crate) fn write_internal(&self, src: &[u8]) -> Result<usize, RingBufferError> {
-        let avail_read = self.available_read();
+        let w = self.write_pos.load(Ordering::Relaxed);
+        let r = self.read_pos.load(Ordering::Acquire);
+        let avail_read = if w >= r {
+            w - r
+        } else {
+            self.capacity - (r - w)
+        };
         let free = self.capacity.saturating_sub(avail_read + 1);
         if free == 0 {
             return Err(RingBufferError::BufferFull);
         }
 
         let to_write = core::cmp::min(src.len(), free);
-        let w = self.write_pos.load(Ordering::Relaxed);
 
         let space_to_end = self.capacity - w;
         if to_write <= space_to_end {
@@ -292,11 +303,11 @@ impl<'a> AudioRingBuffer<'a> {
             }
         }
 
-        let new_w = (w + to_write) % self.capacity;
+        let new_w = self.wrap_index(w + to_write);
         self.write_pos.store(new_w, Ordering::Release);
 
         let max_rew = self.capacity.saturating_sub(avail_read + to_write);
-        self.rewindable.fetch_min(max_rew, Ordering::AcqRel);
+        self.rewindable.0.fetch_min(max_rew, Ordering::AcqRel);
 
         Ok(to_write)
     }
@@ -344,15 +355,18 @@ impl<'a> AudioRingBuffer<'a> {
             }
         }
 
-        let new_r = (r + to_read) % self.capacity;
+        let new_r = self.wrap_index(r + to_read);
         self.read_pos.store(new_r, Ordering::Release);
         let avail_w = self
             .capacity
             .saturating_sub(avail.saturating_sub(to_read))
             .saturating_sub(1);
-        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_add(to_read).min(avail_w))
-        });
+        let _ = self
+            .rewindable
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_add(to_read).min(avail_w))
+            });
 
         Ok(to_read)
     }
@@ -363,17 +377,20 @@ impl<'a> AudioRingBuffer<'a> {
         let avail = self.available_read();
         let to_consume = core::cmp::min(count, avail);
         let r = self.read_pos.load(Ordering::Relaxed);
-        let new_r = (r + to_consume) % self.capacity;
+        let new_r = self.wrap_index(r + to_consume);
         self.read_pos.store(new_r, Ordering::Release);
         let avail_w = self.available_write();
-        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_add(to_consume).min(avail_w))
-        });
+        let _ = self
+            .rewindable
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_add(to_consume).min(avail_w))
+            });
     }
 
     #[allow(deprecated)]
     pub(crate) fn rewind_read_internal(&mut self, count: usize) {
-        let rew = self.rewindable.load(Ordering::Acquire);
+        let rew = self.rewindable.0.load(Ordering::Acquire);
         let to_rewind = count.min(rew).min(self.available_write());
         let r = self.read_pos.load(Ordering::Relaxed);
         let new_r = if r >= to_rewind {
@@ -381,9 +398,12 @@ impl<'a> AudioRingBuffer<'a> {
         } else {
             self.capacity - (to_rewind - r)
         };
-        let _ = self.rewindable.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_sub(to_rewind))
-        });
+        let _ = self
+            .rewindable
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(to_rewind))
+            });
         self.read_pos.store(new_r, Ordering::Release);
     }
 
@@ -414,7 +434,7 @@ impl<'a> AudioRingBuffer<'a> {
             }
         }
         self.read_pos.store(w, Ordering::Release);
-        self.rewindable.store(0, Ordering::Release);
+        self.rewindable.0.store(0, Ordering::Release);
     }
 }
 
@@ -778,5 +798,22 @@ mod tests {
         rb.write(b"XYZ").unwrap();
         rb.rewind_read(usize::MAX);
         assert_eq!(read_all(&mut rb), b"abcXYZ");
+    }
+
+    #[test]
+    fn test_available_write_frames() {
+        let mut storage = [0u8; 17];
+        let rb = AudioRingBuffer::new(&mut storage);
+        // capacity is 17; available_write starts at 16 (capacity - 1).
+        assert_eq!(rb.available_write(), 16);
+        assert_eq!(rb.available_write_frames(0), 0);
+        assert_eq!(rb.available_write_frames(1), 16);
+        assert_eq!(rb.available_write_frames(4), 16);
+        assert_eq!(rb.available_write_frames(6), 12);
+        assert_eq!(rb.available_write_frames(8), 16);
+        assert_eq!(rb.available_write_frames(10), 10);
+        assert_eq!(rb.available_write_frames(16), 16);
+        assert_eq!(rb.available_write_frames(17), 0);
+        assert_eq!(rb.available_write_frames(32), 0);
     }
 }

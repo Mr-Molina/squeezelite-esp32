@@ -537,9 +537,7 @@ fn parse_http_location(location: &str) -> std::io::Result<(SocketAddr, String, S
 }
 
 /// Validates and parses an HTTP redirect Location URL (AUD03-SEC-002).
-pub fn parse_redirect_location(
-    location: &str,
-) -> std::io::Result<(SocketAddr, String, String)> {
+pub fn parse_redirect_location(location: &str) -> std::io::Result<(SocketAddr, String, String)> {
     parse_http_location(location)
 }
 

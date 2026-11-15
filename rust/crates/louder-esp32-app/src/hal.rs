@@ -149,7 +149,7 @@ pub struct EspI2sSink<D: I2sDmaDriver> {
     bclk_pin: u8,
     lrclk_pin: u8,
     dout_pin: u8,
-    dma_scratch: [u8; 1024], // 128 stereo frames = 1024 bytes (8 bytes/frame)
+    dma_scratch: [u8; 2048], // 256 stereo frames = 2048 bytes (8 bytes/frame)
 }
 
 impl<D: I2sDmaDriver> EspI2sSink<D> {
@@ -174,7 +174,7 @@ impl<D: I2sDmaDriver> EspI2sSink<D> {
             bclk_pin,
             lrclk_pin,
             dout_pin,
-            dma_scratch: [0u8; 1024],
+            dma_scratch: [0u8; 2048],
         }
     }
 
@@ -210,21 +210,23 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
         let mut total_frames_written = 0;
 
-        // Process in chunks of up to 128 stereo frames (256 i32 samples = 1024 bytes)
-        for chunk in frames.chunks(256) {
-            let mut offset = 0;
-            for pair in chunk.chunks_exact(2) {
+        // Process in chunks of up to 256 stereo frames (512 i32 samples = 2048 bytes)
+        for chunk in frames.chunks(512) {
+            let mut chunk_bytes = 0;
+            for (pair, slot) in chunk
+                .chunks_exact(2)
+                .zip(self.dma_scratch.chunks_exact_mut(8))
+            {
                 let (l, r) = if self.muted {
                     (0i32, 0i32)
                 } else {
                     (pair[0], pair[1])
                 };
-                self.dma_scratch[offset..offset + 4].copy_from_slice(&l.to_le_bytes());
-                self.dma_scratch[offset + 4..offset + 8].copy_from_slice(&r.to_le_bytes());
-                offset += 8;
+                slot[0..4].copy_from_slice(&l.to_le_bytes());
+                slot[4..8].copy_from_slice(&r.to_le_bytes());
+                chunk_bytes += 8;
             }
 
-            let chunk_bytes = offset;
             if chunk_bytes == 0 {
                 break;
             }
@@ -584,11 +586,15 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
 
         let (target_sector, next_seq) = match DualSectorFlashStore::active_sector(s0, s1) {
             Ok(0) => {
-                let seq = FlashJournal::read_sector_meta(s0).map(|(s, _, _)| s).unwrap_or(0);
+                let seq = FlashJournal::read_sector_meta(s0)
+                    .map(|(s, _, _)| s)
+                    .unwrap_or(0);
                 (1u8, seq.wrapping_add(1))
             }
             Ok(1) => {
-                let seq = FlashJournal::read_sector_meta(s1).map(|(s, _, _)| s).unwrap_or(0);
+                let seq = FlashJournal::read_sector_meta(s1)
+                    .map(|(s, _, _)| s)
+                    .unwrap_or(0);
                 (0u8, seq.wrapping_add(1))
             }
             _ => (0u8, 1u32),
@@ -702,7 +708,7 @@ impl TargetI2cBus {
     pub fn with_pins(sda_pin: u8, scl_pin: u8) -> Self {
         let mut registers = [0u8; 256];
         registers[0x37] = 0x08; // 44.1 kHz detected FS_MON
-        registers[0x38] = 64;   // 64 FS BCK_MON
+        registers[0x38] = 64; // 64 FS BCK_MON
         registers[0x39] = 0x08; // PLL locked CLKDET_STATUS
         registers[0x54] = 0x08; // -4.0 dB AGAIN
         Self {
@@ -981,7 +987,9 @@ mod tests {
         let mut bridge = CydUartBridge::new(port);
 
         let written = bridge
-            .flush_outbound(&CydMessage::PlaybackState(squeezelite_cyd_link::PlayState::Playing))
+            .flush_outbound(&CydMessage::PlaybackState(
+                squeezelite_cyd_link::PlayState::Playing,
+            ))
             .unwrap();
         assert_eq!(written, 8);
         assert_eq!(bridge.port.tx_log.as_slice(), b"STATE=P\n");
@@ -1048,7 +1056,9 @@ mod tests {
 
         // 1. Send outbound telemetry message
         let tx_len = bridge
-            .send_message(&CydMessage::PlaybackState(squeezelite_cyd_link::PlayState::Playing))
+            .send_message(&CydMessage::PlaybackState(
+                squeezelite_cyd_link::PlayState::Playing,
+            ))
             .unwrap();
         assert_eq!(tx_len, 8); // "STATE=P\n" is 8 bytes
         assert_eq!(bridge.port.tx_bytes(), b"STATE=P\n");
@@ -1112,7 +1122,9 @@ mod tests {
         assert_eq!(restored_audio.player_name.as_str(), "LouderStudio");
         assert_eq!(restored_audio.volume, 88);
 
-        let restored_creds = WifiCredentials::load_from(&restored_store).unwrap().unwrap();
+        let restored_creds = WifiCredentials::load_from(&restored_store)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored_creds.ssid.as_str(), "StudioWiFi");
         assert_eq!(restored_creds.passphrase.as_str(), "SuperPassphrase123");
     }
@@ -1192,11 +1204,20 @@ mod tests {
 
         backend.erase_all().unwrap();
         assert_eq!(backend.last_seq(), 0);
-        assert_eq!(backend.flash().read_sector(0).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
-        assert_eq!(backend.flash().read_sector(1).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
+        assert_eq!(
+            backend.flash().read_sector(0).unwrap(),
+            &[0xFF; FLASH_SECTOR_SIZE]
+        );
+        assert_eq!(
+            backend.flash().read_sector(1).unwrap(),
+            &[0xFF; FLASH_SECTOR_SIZE]
+        );
 
         backend.erase_range(0..4096).unwrap();
-        assert_eq!(backend.flash().read_sector(0).unwrap(), &[0xFF; FLASH_SECTOR_SIZE]);
+        assert_eq!(
+            backend.flash().read_sector(0).unwrap(),
+            &[0xFF; FLASH_SECTOR_SIZE]
+        );
 
         // AUD13-007: verify erase_range spanning both sectors resets last_seq
         let _ = backend.commit_store(&store).unwrap();
@@ -1206,11 +1227,14 @@ mod tests {
 
         // CODE-HAL-003: verify bounds checking on erase_range
         assert_eq!(backend.erase_range(0..0), Err(HalError::StorageBoundsError));
-        assert_eq!(backend.erase_range(100..50), Err(HalError::StorageBoundsError));
+        assert_eq!(
+            backend.erase_range(100..50),
+            Err(HalError::StorageBoundsError)
+        );
         let bad_range = 0..FLASH_SECTOR_SIZE * 3;
-        assert_eq!(backend.erase_range(bad_range), Err(HalError::StorageBoundsError));
+        assert_eq!(
+            backend.erase_range(bad_range),
+            Err(HalError::StorageBoundsError)
+        );
     }
 }
-
-
-

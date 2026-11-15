@@ -14,8 +14,8 @@ use louder_esp32_app::config_handle::{
     resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigJournal, ConfigSource, ConfigWriter,
     FlashTargetPolicy, JournalSector, JournalSlot, RamJournal, DEBOUNCE_MS, JOURNAL_SECTOR_SIZE,
 };
-use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
 use louder_esp32_app::ota_safety::WifiStaCredentials;
+use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
 use squeezelite_config::{
     AudioConfig, FlashJournal, JournalView, KeyValueStorage, MemConfigStore, WifiCredentials,
 };
@@ -86,7 +86,12 @@ fn test_config_writer_debounce_and_atomic_snapshot() {
     expected.volume = 10;
     expected.equalizer_preset = 3;
     expected.set_player_name("Den");
-    assert_eq!(journal.commits.len(), 1, "one write per burst: {:?}", journal.commits);
+    assert_eq!(
+        journal.commits.len(),
+        1,
+        "one write per burst: {:?}",
+        journal.commits
+    );
     assert_eq!(journal.commits[0].0, 900 + u64::from(DEBOUNCE_MS));
     assert_eq!(journal.commits[0].0, 2900);
     assert_eq!(journal.commits[0].1, expected);
@@ -108,7 +113,10 @@ fn test_config_writer_debounce_and_atomic_snapshot() {
     assert!(handle.update(|c| *c = state_for(3))); // races the commit of `snap`
     handle.mark_clean(); // marks `snap` journaled, not state 3
     assert_eq!(snap, state_for(2));
-    assert!(handle.is_dirty(), "update published after the snapshot was dropped");
+    assert!(
+        handle.is_dirty(),
+        "update published after the snapshot was dropped"
+    );
     assert_eq!(handle.snapshot_if_dirty(), Some(state_for(3)));
     handle.mark_clean();
     assert!(!handle.is_dirty());
@@ -173,19 +181,34 @@ fn sta(ssid: &str, password: &str) -> WifiStaCredentials {
         password: Default::default(),
     };
     creds.ssid.push_str(ssid).expect("ssid fits in buffer");
-    creds.password.push_str(password).expect("password fits in buffer");
+    creds
+        .password
+        .push_str(password)
+        .expect("password fits in buffer");
     creds
 }
 
 #[test]
 fn test_boot_resolution_order() {
     let defaults = first_boot_defaults::audio_config();
-    assert_eq!(defaults.player_name.as_str(), first_boot_defaults::PLAYER_NAME);
-    assert_eq!(defaults.lms_server_ip, Some(first_boot_defaults::LMS_SERVER_IP));
-    assert_eq!(defaults.lms_server_port, Some(first_boot_defaults::LMS_SERVER_PORT));
+    assert_eq!(
+        defaults.player_name.as_str(),
+        first_boot_defaults::PLAYER_NAME
+    );
+    assert_eq!(
+        defaults.lms_server_ip,
+        Some(first_boot_defaults::LMS_SERVER_IP)
+    );
+    assert_eq!(
+        defaults.lms_server_port,
+        Some(first_boot_defaults::LMS_SERVER_PORT)
+    );
 
     // No journal: every field is the first-boot default.
-    assert_eq!(resolve_boot_audio::<MemConfigStore<16>>(None, &defaults), defaults);
+    assert_eq!(
+        resolve_boot_audio::<MemConfigStore<16>>(None, &defaults),
+        defaults
+    );
 
     // A journal holding only some keys: those fields come from it, the rest
     // stay defaults.
@@ -219,10 +242,13 @@ fn test_boot_resolution_order() {
     let bad = audio_journal(|s| {
         s.set_str(AudioConfig::KEY_NAME, "Attic").expect("set name");
         s.set_u8(AudioConfig::KEY_VOL, 200).expect("set bad vol"); // > 100
-        s.set(AudioConfig::KEY_LMS_IP, &[0, 0, 0, 0]).expect("set bad ip"); // unroutable
-        s.set_u32(AudioConfig::KEY_LMS_PORT, 0).expect("set bad port"); // port 0
-        s.set_u32(AudioConfig::KEY_AGAIN, 0x40).expect("set bad gain"); // > MAX_ANALOG_GAIN_CODE
-        // not a bool byte... ("x" = 0x78)
+        s.set(AudioConfig::KEY_LMS_IP, &[0, 0, 0, 0])
+            .expect("set bad ip"); // unroutable
+        s.set_u32(AudioConfig::KEY_LMS_PORT, 0)
+            .expect("set bad port"); // port 0
+        s.set_u32(AudioConfig::KEY_AGAIN, 0x40)
+            .expect("set bad gain"); // > MAX_ANALOG_GAIN_CODE
+                                     // not a bool byte... ("x" = 0x78)
         s.set_str(AudioConfig::KEY_LOUD, "x").expect("set bad loud");
     });
     let cfg = resolve_boot_audio(Some(&bad), &defaults);
@@ -234,9 +260,13 @@ fn test_boot_resolution_order() {
     assert_eq!(cfg.loudness_enabled, defaults.loudness_enabled);
     // Legacy one-byte AGAIN is still accepted (AudioConfig::load_from compat).
     let legacy = audio_journal(|s| {
-        s.set_u8(AudioConfig::KEY_AGAIN, 0x10).expect("set legacy again")
+        s.set_u8(AudioConfig::KEY_AGAIN, 0x10)
+            .expect("set legacy again")
     });
-    assert_eq!(resolve_boot_audio(Some(&legacy), &defaults).analog_gain_code, 0x10);
+    assert_eq!(
+        resolve_boot_audio(Some(&legacy), &defaults).analog_gain_code,
+        0x10
+    );
 
     // Wi-Fi (Phase 0/1): NVS beats default; journal `wifi.*` keys are ignored.
     // A journal that holds Wi-Fi credentials, as an older build or a stale
@@ -253,7 +283,9 @@ fn test_boot_resolution_order() {
     let (index, _) = FlashJournal::select_dual_sector(&stale, &blank).expect("select sector");
     let view = JournalView::new([&stale, &blank][index]).expect("journal view");
     assert_eq!(
-        WifiCredentials::load_from(&view).expect("load wifi").as_ref(),
+        WifiCredentials::load_from(&view)
+            .expect("load wifi")
+            .as_ref(),
         Some(&journal_wifi)
     );
     // ... still resolves its audio fields ...
@@ -264,7 +296,10 @@ fn test_boot_resolution_order() {
         || panic!("default used although NVS has credentials"),
     )
     .expect("resolved wifi credentials");
-    assert_eq!((creds, src), (sta("NvsNet", "nvs_secret"), ConfigSource::Nvs));
+    assert_eq!(
+        (creds, src),
+        (sta("NvsNet", "nvs_secret"), ConfigSource::Nvs)
+    );
     // and journal Wi-Fi + no NVS -> first-boot default, never the journal's.
     let (creds, src) = resolve_boot_wifi(
         || None,
@@ -282,14 +317,23 @@ fn test_boot_resolution_order() {
 
     // The first commit after booting from that journal drops its `wifi.*` keys.
     let mut image = JournalSector::erased();
-    let mut ram = RamJournal::new(&mut image, Some((JournalSlot::A, 4)), FlashTargetPolicy::FixedA);
+    let mut ram = RamJournal::new(
+        &mut image,
+        Some((JournalSlot::A, 4)),
+        FlashTargetPolicy::FixedA,
+    );
     assert!(ram.commit(&full_cfg));
-    let committed = JournalView::new(
-        ram.pending_image().expect("pending image").sector,
-    )
-    .expect("journal view");
-    assert_eq!(WifiCredentials::load_from(&committed).expect("load wifi"), None);
-    for key in [WifiCredentials::KEY_SSID, WifiCredentials::KEY_PASS, WifiCredentials::KEY_AUTO] {
+    let committed =
+        JournalView::new(ram.pending_image().expect("pending image").sector).expect("journal view");
+    assert_eq!(
+        WifiCredentials::load_from(&committed).expect("load wifi"),
+        None
+    );
+    for key in [
+        WifiCredentials::KEY_SSID,
+        WifiCredentials::KEY_PASS,
+        WifiCredentials::KEY_AUTO,
+    ] {
         assert!(!committed.contains(key), "{key} carried into a commit");
     }
 
@@ -301,8 +345,8 @@ fn test_boot_resolution_order() {
     let pending = ram.pending_image().expect("pending image");
     let mut flash = [[0xFFu8; JOURNAL_SECTOR_SIZE]; 2];
     flash[0] = *pending.sector;
-    let (index, seq) = FlashJournal::select_dual_sector(&flash[0], &flash[1])
-        .expect("select dual sector");
+    let (index, seq) =
+        FlashJournal::select_dual_sector(&flash[0], &flash[1]).expect("select dual sector");
     assert_eq!((index, seq), (0, 1));
     let view = JournalView::new(&flash[index]).expect("journal view");
     assert_eq!(resolve_boot_audio(Some(&view), &defaults), full_cfg);
@@ -371,7 +415,10 @@ fn test_ping_pong_policy_alternates_sectors_and_sequence() {
     let p = ram.pending_image().expect("pending image");
     assert_eq!((p.slot, p.sequence), (JournalSlot::B, 6));
     let view = JournalView::new(p.sector).expect("journal view");
-    assert_eq!(AudioConfig::load_from(&view).expect("load config"), state_for(7));
+    assert_eq!(
+        AudioConfig::load_from(&view).expect("load config"),
+        state_for(7)
+    );
     assert_eq!(WifiCredentials::load_from(&view).expect("load wifi"), None);
 
     // An invalid config is refused without touching the image or the pending
@@ -391,27 +438,29 @@ fn test_ping_pong_policy_alternates_sectors_and_sequence() {
 fn test_ping_pong_survives_torn_write_across_reboots() {
     let mut flash = [[0xFFu8; JOURNAL_SECTOR_SIZE]; 2];
     let defaults = first_boot_defaults::audio_config();
-    let boot = |flash: &[[u8; JOURNAL_SECTOR_SIZE]; 2]| -> (
-        AudioConfig,
-        Option<(JournalSlot, u32)>,
-    ) {
-        match FlashJournal::select_dual_sector(&flash[0], &flash[1]) {
-            Some((i, seq)) => {
-                let view = JournalView::new(&flash[i]).expect("journal view");
-                (
-                    resolve_boot_audio(Some(&view), &defaults),
-                    Some((JournalSlot::from_index(i), seq)),
-                )
+    let boot =
+        |flash: &[[u8; JOURNAL_SECTOR_SIZE]; 2]| -> (AudioConfig, Option<(JournalSlot, u32)>) {
+            match FlashJournal::select_dual_sector(&flash[0], &flash[1]) {
+                Some((i, seq)) => {
+                    let view = JournalView::new(&flash[i]).expect("journal view");
+                    (
+                        resolve_boot_audio(Some(&view), &defaults),
+                        Some((JournalSlot::from_index(i), seq)),
+                    )
+                }
+                None => (defaults.clone(), None),
             }
-            None => (defaults.clone(), None),
-        }
-    };
+        };
     let slot_index = |slot: JournalSlot| if slot == JournalSlot::A { 0 } else { 1 };
 
     for k in 1..=5u32 {
         let (cfg, sel) = boot(&flash);
         if k > 1 {
-            assert_eq!(cfg, state_for(k - 1), "boot {k} sees the last completed write");
+            assert_eq!(
+                cfg,
+                state_for(k - 1),
+                "boot {k} sees the last completed write"
+            );
         }
         let mut image = JournalSector::erased();
         let mut ram = RamJournal::new(&mut image, sel, FlashTargetPolicy::PingPong);
@@ -433,7 +482,11 @@ fn test_ping_pong_survives_torn_write_across_reboots() {
     *torn = [0xFF; JOURNAL_SECTOR_SIZE];
     torn[..p.used_len / 2].copy_from_slice(&p.sector[..p.used_len / 2]);
     let (cfg, _) = boot(&flash);
-    assert_eq!(cfg, state_for(5), "the previous journal survives the torn write");
+    assert_eq!(
+        cfg,
+        state_for(5),
+        "the previous journal survives the torn write"
+    );
 }
 
 #[test]

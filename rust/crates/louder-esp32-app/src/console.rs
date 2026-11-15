@@ -306,9 +306,7 @@ impl CliRegistry {
             });
         match sub {
             "info" => {
-                let _ = out.push_str(
-                    "OK: Squeezelite-ESP32 (I2S-4MFlash-Rust) pure-Rust engine",
-                );
+                let _ = out.push_str("OK: Squeezelite-ESP32 (I2S-4MFlash-Rust) pure-Rust engine");
                 CliCommandResult {
                     ok: true,
                     output: out.clone(),
@@ -442,11 +440,7 @@ impl CliRegistry {
                     let _ = out.push_str("OK: config dump:");
                     for &item in &tokens[2..] {
                         if let Some((k, v)) = item.split_once('=') {
-                            let display_v = if is_sensitive(k) {
-                                "***"
-                            } else {
-                                v
-                            };
+                            let display_v = if is_sensitive(k) { "***" } else { v };
                             let _ = write!(out, " {}={}", k, display_v);
                         } else if is_sensitive(item) {
                             let _ = write!(out, " {}=***", item);
@@ -647,9 +641,9 @@ impl CliRegistry {
                             return CliCommandResult {
                                 ok: true,
                                 output: out.clone(),
-                                side_effect: CliSideEffect::PlayerControl(
-                                    PlayerCliAction::Volume(pct),
-                                ),
+                                side_effect: CliSideEffect::PlayerControl(PlayerCliAction::Volume(
+                                    pct,
+                                )),
                             };
                         }
                     }
@@ -1026,11 +1020,7 @@ impl TelnetSession {
                                 if res.side_effect != CliSideEffect::None {
                                     last_effect = res.side_effect;
                                 }
-                                tx_len = Self::append_reply(
-                                    tx_out,
-                                    tx_len,
-                                    res.output.as_str(),
-                                );
+                                tx_len = Self::append_reply(tx_out, tx_len, res.output.as_str());
                             }
                         }
                         0x08 | 0x7F => {
@@ -1261,10 +1251,7 @@ mod tests {
         ];
 
         let (tx_len, effect) = session.ingest_bytes(raw_stream, &reg, &mut tx);
-        assert_eq!(
-            effect,
-            CliSideEffect::PlayerControl(PlayerCliAction::Play)
-        );
+        assert_eq!(effect, CliSideEffect::PlayerControl(PlayerCliAction::Play));
         let reply = core::str::from_utf8(&tx[..tx_len]).expect("utf8");
         assert!(reply.contains("OK: player play"));
         assert!(reply.ends_with(TELNET_PROMPT));
@@ -1285,14 +1272,9 @@ mod tests {
         // and terminates cleanly on IAC SE
         let mut session2 = TelnetSession::new();
         let stream2: &[u8] = &[
-            TELNET_IAC,
-            TELNET_SB,
-            0x24,
-            TELNET_IAC,
+            TELNET_IAC, TELNET_SB, 0x24, TELNET_IAC,
             TELNET_IAC, // escaped IAC inside subnegotiation
-            0x01,
-            TELNET_IAC,
-            TELNET_SE, // end subnegotiation
+            0x01, TELNET_IAC, TELNET_SE, // end subnegotiation
             b'c',
         ];
         session2.ingest_bytes(stream2, &reg, &mut tx);

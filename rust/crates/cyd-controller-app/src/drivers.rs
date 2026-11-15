@@ -458,7 +458,11 @@ pub struct MockTouchSpiBus {
 impl MockTouchSpiBus {
     /// Create a mock touch bus with touch status and raw ADC coordinates.
     pub fn new(touched: bool, raw_x: u16, raw_y: u16) -> Self {
-        Self { touched, raw_x, raw_y }
+        Self {
+            touched,
+            raw_x,
+            raw_y,
+        }
     }
 
     /// Update mock touch status and raw ADC coordinates.
@@ -534,7 +538,12 @@ impl<B: TouchSpiBus> Xpt2046Touch<B> {
 
     /// Retrieve current calibration boundaries: (x_min, x_max, y_min, y_max).
     pub fn calibration(&self) -> (i16, i16, i16, i16) {
-        (self.cal_x_min, self.cal_x_max, self.cal_y_min, self.cal_y_max)
+        (
+            self.cal_x_min,
+            self.cal_x_max,
+            self.cal_y_min,
+            self.cal_y_max,
+        )
     }
 
     /// Configure axis swapping and inversion for touch coordinate transformation.
@@ -872,7 +881,7 @@ mod tests {
         assert!(display.bus().commands.len() >= 22);
         assert_eq!(display.bus().commands[0], 0x01); // Reset
         assert_eq!(display.bus().commands[1], 0x28); // Display OFF
-        // Verify 0x20 (INVOFF) is sent right before 0x11 (SLPOUT) and 0x29 (DISPON)
+                                                     // Verify 0x20 (INVOFF) is sent right before 0x11 (SLPOUT) and 0x29 (DISPON)
         let len = display.bus().commands.len();
         assert_eq!(display.bus().commands[len - 3], 0x20); // INVOFF
         assert_eq!(display.bus().commands[len - 2], 0x11); // SLPOUT

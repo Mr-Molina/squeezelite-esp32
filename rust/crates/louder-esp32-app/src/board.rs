@@ -265,7 +265,10 @@ mod tests {
         let cfg = first_boot_defaults::audio_config();
         assert_eq!(cfg.player_name.as_str(), first_boot_defaults::PLAYER_NAME);
         assert_eq!(cfg.lms_server_ip, Some(first_boot_defaults::LMS_SERVER_IP));
-        assert_eq!(cfg.lms_server_port, Some(first_boot_defaults::LMS_SERVER_PORT));
+        assert_eq!(
+            cfg.lms_server_port,
+            Some(first_boot_defaults::LMS_SERVER_PORT)
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -281,4 +284,3 @@ mod tests {
         assert!(!non_psram.has_sufficient_heap(8 * 1024, 0));
     }
 }
-

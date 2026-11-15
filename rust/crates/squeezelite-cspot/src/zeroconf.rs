@@ -81,11 +81,7 @@ pub struct ReusableCredentials {
 impl ReusableCredentials {
     /// Creates reusable credentials from explicit fields.
     #[must_use]
-    pub fn new(
-        canonical_username: impl Into<String>,
-        auth_type: u32,
-        auth_data: Vec<u8>,
-    ) -> Self {
+    pub fn new(canonical_username: impl Into<String>, auth_type: u32, auth_data: Vec<u8>) -> Self {
         Self {
             canonical_username: canonical_username.into(),
             auth_type,
@@ -96,10 +92,7 @@ impl ReusableCredentials {
     /// Creates reusable credentials with
     /// `AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS`.
     #[must_use]
-    pub fn stored_spotify(
-        canonical_username: impl Into<String>,
-        auth_data: Vec<u8>,
-    ) -> Self {
+    pub fn stored_spotify(canonical_username: impl Into<String>, auth_data: Vec<u8>) -> Self {
         Self::new(
             canonical_username,
             AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
@@ -108,10 +101,7 @@ impl ReusableCredentials {
     }
 
     /// Extracts reusable credentials from an AP packet (`cmd` must be `0xAC`).
-    pub fn from_ap_welcome_packet(
-        cmd: u8,
-        payload: &[u8],
-    ) -> Result<Self, CryptoError> {
+    pub fn from_ap_welcome_packet(cmd: u8, payload: &[u8]) -> Result<Self, CryptoError> {
         if cmd != AP_WELCOME_CMD {
             return Err(CryptoError::DecryptionFailed);
         }
@@ -126,8 +116,8 @@ impl ReusableCredentials {
         let mut auth_data = Vec::new();
 
         while pos < payload.len() {
-            let key = decode_varint(payload, &mut pos)
-                .map_err(|_| CryptoError::InvalidCiphertext)?;
+            let key =
+                decode_varint(payload, &mut pos).map_err(|_| CryptoError::InvalidCiphertext)?;
             let field_num = (key >> 3) as u32;
             let wire_type = (key & 0x07) as u8;
 
@@ -187,9 +177,7 @@ impl ReusableCredentials {
     /// Encodes `APWelcome` (`0xAC`) protobuf bytes matching `authentication.proto`.
     #[must_use]
     pub fn encode_ap_welcome(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            self.canonical_username.len() + self.auth_data.len() + 24,
-        );
+        let mut buf = Vec::with_capacity(self.canonical_username.len() + self.auth_data.len() + 24);
 
         // Field 10 (0x0A): canonical_username (string, wire type 2)
         encode_varint(&mut buf, (0x0A << 3) | 2);
@@ -221,9 +209,7 @@ impl ReusableCredentials {
     /// for reconnect.
     #[must_use]
     pub fn encode_login_credentials(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            self.canonical_username.len() + self.auth_data.len() + 16,
-        );
+        let mut buf = Vec::with_capacity(self.canonical_username.len() + self.auth_data.len() + 16);
 
         // Field 10 (0x0A): username
         encode_varint(&mut buf, (0x0A << 3) | 2);
@@ -277,8 +263,7 @@ impl ReusableCredentials {
         let username_str = core::str::from_utf8(&data[11..11 + user_len])
             .map_err(|_| CryptoError::DecryptionFailed)?;
         let auth_pos = 11 + user_len;
-        let auth_len =
-            u16::from_be_bytes([data[auth_pos], data[auth_pos + 1]]) as usize;
+        let auth_len = u16::from_be_bytes([data[auth_pos], data[auth_pos + 1]]) as usize;
         if auth_pos + 2 + auth_len != data.len() {
             return Err(CryptoError::DecryptionFailed);
         }
@@ -360,10 +345,7 @@ impl ReusableCredentials {
     }
 
     /// Decodes and decrypts Base64-encoded credentials from `FlashJournal`.
-    pub fn decrypt_base64(
-        encoded: &str,
-        secret: &[u8],
-    ) -> Result<Self, CryptoError> {
+    pub fn decrypt_base64(encoded: &str, secret: &[u8]) -> Result<Self, CryptoError> {
         let raw = base64_decode(encoded)?;
         Self::decrypt(&raw, secret)
     }
@@ -487,12 +469,7 @@ impl SpotifyMdnsBuilder {
         records.extend_from_slice(&rdata);
     }
 
-    fn append_a_record(
-        records: &mut Vec<u8>,
-        host_name: &str,
-        ip: [u8; 4],
-        ttl: u32,
-    ) {
+    fn append_a_record(records: &mut Vec<u8>, host_name: &str, ip: [u8; 4], ttl: u32) {
         records.extend_from_slice(&Self::encode_dns_name(host_name));
         records.extend_from_slice(&1u16.to_be_bytes()); // Type: A
         records.extend_from_slice(&0x8001u16.to_be_bytes()); // Class: IN (flush)
@@ -517,20 +494,9 @@ impl SpotifyMdnsBuilder {
         let instance = config.instance_name();
         let host = config.host_name();
 
-        Self::append_ptr_record(
-            &mut packet,
-            SpotifyMdnsConfig::SERVICE_TYPE,
-            &instance,
-            ttl,
-        );
+        Self::append_ptr_record(&mut packet, SpotifyMdnsConfig::SERVICE_TYPE, &instance, ttl);
 
-        Self::append_srv_record(
-            &mut packet,
-            &instance,
-            config.port,
-            &host,
-            ttl,
-        );
+        Self::append_srv_record(&mut packet, &instance, config.port, &host, ttl);
 
         let txt_records: [&[u8]; 3] = [b"CPath=/", b"VERSION=1.0", b"Stack=SP"];
         Self::append_txt_record(&mut packet, &instance, &txt_records, ttl);
@@ -699,11 +665,7 @@ impl ZeroConfServer {
     }
 
     /// Builds JSON response for `action=getInfo`.
-    pub fn build_get_info_json(
-        device_id: &str,
-        remote_name: &str,
-        public_key_b64: &str,
-    ) -> String {
+    pub fn build_get_info_json(device_id: &str, remote_name: &str, public_key_b64: &str) -> String {
         let esc_device_id = Self::escape_json_string(device_id);
         let esc_remote_name = Self::escape_json_string(remote_name);
         let esc_pub_key = Self::escape_json_string(public_key_b64);
@@ -730,7 +692,9 @@ impl ZeroConfServer {
             return Err(CryptoError::InvalidCiphertext);
         }
 
-        let iv: [u8; 16] = blob[0..16].try_into().map_err(|_| CryptoError::InvalidCiphertext)?;
+        let iv: [u8; 16] = blob[0..16]
+            .try_into()
+            .map_err(|_| CryptoError::InvalidCiphertext)?;
         let mut encrypted = blob[16..blob.len() - 20].to_vec();
         let checksum = &blob[blob.len() - 20..];
 
@@ -753,7 +717,8 @@ impl ZeroConfServer {
         ctr.process(&mut encrypted);
 
         // Secondary blob decode
-        let enc_str = core::str::from_utf8(&encrypted).map_err(|_| CryptoError::DecryptionFailed)?;
+        let enc_str =
+            core::str::from_utf8(&encrypted).map_err(|_| CryptoError::DecryptionFailed)?;
         let mut blob_data = base64_decode(enc_str)?;
 
         let secret = Sha1::digest(device_id.as_bytes());
@@ -779,13 +744,17 @@ impl ZeroConfServer {
         // Parse extracted loginData
         let mut pos = 1;
         let skip_len = read_blob_int(&blob_data, &mut pos)? as usize;
-        pos = pos.checked_add(skip_len).ok_or(CryptoError::DecryptionFailed)?;
+        pos = pos
+            .checked_add(skip_len)
+            .ok_or(CryptoError::DecryptionFailed)?;
         pos = pos.checked_add(1).ok_or(CryptoError::DecryptionFailed)?;
         let auth_type = read_blob_int(&blob_data, &mut pos)?;
         pos = pos.checked_add(1).ok_or(CryptoError::DecryptionFailed)?;
         let auth_size = read_blob_int(&blob_data, &mut pos)? as usize;
 
-        let end_pos = pos.checked_add(auth_size).ok_or(CryptoError::DecryptionFailed)?;
+        let end_pos = pos
+            .checked_add(auth_size)
+            .ok_or(CryptoError::DecryptionFailed)?;
         if end_pos > blob_data.len() {
             return Err(CryptoError::DecryptionFailed);
         }
@@ -837,8 +806,8 @@ impl ZeroConfServer {
                 }
                 let username = get_param(&combined_params, "userName")
                     .ok_or(ZeroConfError::MissingParameter)?;
-                let blob_b64 = get_param(&combined_params, "blob")
-                    .ok_or(ZeroConfError::MissingParameter)?;
+                let blob_b64 =
+                    get_param(&combined_params, "blob").ok_or(ZeroConfError::MissingParameter)?;
                 let client_key_b64 = get_param(&combined_params, "clientKey")
                     .ok_or(ZeroConfError::MissingParameter)?;
                 let dev_name = get_param(&combined_params, "deviceName")
@@ -848,12 +817,8 @@ impl ZeroConfServer {
                 let client_key_bytes = base64_decode(&client_key_b64)?;
 
                 let shared_key = dh.calculate_shared(&client_key_bytes)?;
-                let (auth_type, auth_data) = Self::decode_blob(
-                    &blob_bytes,
-                    &shared_key,
-                    device_id,
-                    &username,
-                )?;
+                let (auth_type, auth_data) =
+                    Self::decode_blob(&blob_bytes, &shared_key, device_id, &username)?;
 
                 self.last_user = Some(ZeroConfUser {
                     username: username.clone(),
