@@ -74,6 +74,7 @@ pub use power_boards::{BoardProfile, SleepManager, SleepState};
 pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
 
+pub use http_control::handle_http_request_streaming_with_entries;
 #[cfg(not(target_arch = "xtensa"))]
 pub use network::{HttpAudioStream, LmsDiscovery, RaopStreamClient, SlimprotoClient};
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
@@ -83,4 +84,3 @@ pub use squeezelite_config::{
 pub use squeezelite_cyd_link::{CydCommand, CydLinkProtocol, CydMessage, PlayState};
 pub use squeezelite_proto::{AudioFormat, SlimprotoBuilder, SlimprotoParser, StatEvent};
 pub use squeezelite_tas58xx::{Play, PowerDown, Standby, Tas58xx};
-pub use http_control::handle_http_request_streaming_with_entries;

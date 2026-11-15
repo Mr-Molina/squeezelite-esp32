@@ -106,12 +106,6 @@ pub fn mix_crossfade(old_tail: &mut [i32], new_head: &[i32], gain_out: i32, gain
     }
 }
 
-/// Applies crossfade mixing in-place (alias for [`mix_crossfade`]).
-#[inline(always)]
-pub fn apply_crossfade(old_tail: &mut [i32], new_head: &[i32], gain_out: i32, gain_in: i32) {
-    mix_crossfade(old_tail, new_head, gain_out, gain_in);
-}
-
 /// Transition type from `strm s` (C `fade_mode`, `squeezelite.h:661`, set by
 /// `slimproto.c:486`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

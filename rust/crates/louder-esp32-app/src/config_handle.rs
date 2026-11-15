@@ -255,7 +255,8 @@ impl ConfigHandle {
     /// Returns the active NVS override slots.
     #[must_use]
     pub fn nvs_overrides(&self) -> [NvsEntrySlot; 20] {
-        self.state.lock(|state| state.borrow().nvs_overrides.clone())
+        self.state
+            .lock(|state| state.borrow().nvs_overrides.clone())
     }
 
     /// Returns the current host / player name string slice.
@@ -597,13 +598,12 @@ impl ConfigHandle {
                 }
             }
             "again" | "again_code" | "analog_gain" => {
-                let parsed = if let Some(hex) =
-                    v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"))
-                {
-                    u8::from_str_radix(hex, 16).ok()
-                } else {
-                    v.parse::<u8>().ok()
-                };
+                let parsed =
+                    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                        u8::from_str_radix(hex, 16).ok()
+                    } else {
+                        v.parse::<u8>().ok()
+                    };
                 if let Some(code) = parsed {
                     let clamped = code.min(AudioConfig::MAX_ANALOG_GAIN_CODE);
                     let _ = self.update(|c| c.analog_gain_code = clamped);
@@ -1042,29 +1042,24 @@ impl<'a> RamJournal<'a> {
         sector: &[u8; JOURNAL_SECTOR_SIZE],
         target: &mut T,
     ) -> bool {
-        let (_pos, valid, sequence) = if sector.len() >= 20
-            && sector[16..20] == squeezelite_config::FlashJournal::MAGIC
-        {
-            match squeezelite_config::FlashJournal::validate_sector(sector) {
-                Ok((seq, _, _)) => (16usize, true, seq),
-                Err(_) => return false,
-            }
-        } else if sector.len() >= 4
-            && sector[0..4] == squeezelite_config::FlashJournal::MAGIC
-        {
-            if sector[12..16] != [0xFF; 4]
-                && sector[12..16] != [0; 4]
-            {
+        let (_pos, valid, sequence) =
+            if sector.len() >= 20 && sector[16..20] == squeezelite_config::FlashJournal::MAGIC {
                 match squeezelite_config::FlashJournal::validate_sector(sector) {
-                    Ok((seq, _, _)) => (0usize, true, seq),
+                    Ok((seq, _, _)) => (16usize, true, seq),
                     Err(_) => return false,
                 }
+            } else if sector.len() >= 4 && sector[0..4] == squeezelite_config::FlashJournal::MAGIC {
+                if sector[12..16] != [0xFF; 4] && sector[12..16] != [0; 4] {
+                    match squeezelite_config::FlashJournal::validate_sector(sector) {
+                        Ok((seq, _, _)) => (0usize, true, seq),
+                        Err(_) => return false,
+                    }
+                } else {
+                    (0usize, true, 0u32)
+                }
             } else {
-                (0usize, true, 0u32)
-            }
-        } else {
-            (0usize, false, 0u32)
-        };
+                (0usize, false, 0u32)
+            };
         if !valid {
             return false;
         }
@@ -1307,13 +1302,7 @@ impl ConfigJournal for RamJournal<'_> {
             None
         };
 
-        match Self::serialize_into(
-            &self.nvs_overrides,
-            &mut self.image.0,
-            cfg,
-            next,
-            wifi_ref,
-        ) {
+        match Self::serialize_into(&self.nvs_overrides, &mut self.image.0, cfg, next, wifi_ref) {
             Ok(len) => {
                 self.image_len = len;
                 self.sequence = next;
@@ -1759,9 +1748,9 @@ mod tests {
         assert!(overrides.iter().any(|s| {
             s.used && s.key.as_str() == "lms_ip" && s.value.as_str() == "192.168.1.50"
         }));
-        assert!(overrides.iter().any(|s| {
-            s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v"
-        }));
+        assert!(overrides
+            .iter()
+            .any(|s| { s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v" }));
 
         let mut image = JournalSector::erased();
         let mut ram = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
@@ -1783,9 +1772,9 @@ mod tests {
         assert!(restored_overrides.iter().any(|s| {
             s.used && s.key.as_str() == "lms_ip" && s.value.as_str() == "192.168.1.50"
         }));
-        assert!(restored_overrides.iter().any(|s| {
-            s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v"
-        }));
+        assert!(restored_overrides
+            .iter()
+            .any(|s| { s.used && s.key.as_str() == "custom_k" && s.value.as_str() == "custom_v" }));
     }
 
     #[test]
@@ -1847,7 +1836,10 @@ mod tests {
             &mut restored_handle
         ));
 
-        assert_eq!(restored_handle.effective_lms_server_ip(), Some([10, 0, 0, 50]));
+        assert_eq!(
+            restored_handle.effective_lms_server_ip(),
+            Some([10, 0, 0, 50])
+        );
         assert_eq!(restored_handle.device_name().as_str(), "BASEMENT");
         assert_eq!(restored_handle.sequence(), 1);
     }

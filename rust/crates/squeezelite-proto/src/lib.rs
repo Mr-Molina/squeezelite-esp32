@@ -479,16 +479,6 @@ pub const OPCODE_DSCO: u32 = u32::from_be_bytes(*b"dsco");
 
 impl SlimprotoParser {
     pub const MAX_FRAME_LENGTH: usize = 4096;
-    pub const OP_STRM: u32 = OPCODE_STRM;
-    pub const OP_AUDG: u32 = OPCODE_AUDG;
-    pub const OP_SETD: u32 = OPCODE_SETD;
-    pub const OP_FLSH: u32 = OPCODE_FLSH;
-    pub const OP_BODY: u32 = OPCODE_BODY;
-    pub const OP_AUDE: u32 = OPCODE_AUDE;
-    pub const OP_CONT: u32 = OPCODE_CONT;
-    pub const OP_SERV: u32 = OPCODE_SERV;
-    pub const OP_VERS: u32 = OPCODE_VERS;
-    pub const OP_DSCO: u32 = OPCODE_DSCO;
 
     /// Parses a single SlimProto frame from a byte slice.
     ///

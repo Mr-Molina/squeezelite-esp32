@@ -584,9 +584,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -641,9 +638,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -689,9 +683,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -728,9 +719,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -805,9 +793,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -850,9 +835,6 @@ mod tests {
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -890,9 +872,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
@@ -938,9 +917,6 @@ mod tests {
             // configure_audio_format(32)
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),

@@ -2103,6 +2103,40 @@ pub const fn ogg_crc32(page: &[u8]) -> u32 {
     crc
 }
 
+/// Returns whether the provided buffer contains at least one complete Ogg page
+/// (verifying full `"OggS"` capture pattern, version 0, complete 27-byte
+/// base header, segment table, and all segment body payload bytes).
+#[must_use]
+pub fn has_complete_ogg_page(mut buf: &[u8]) -> bool {
+    while let Some(pos) = buf.windows(4).position(|w| w == b"OggS") {
+        buf = &buf[pos..];
+        if buf.len() < 27 {
+            return false;
+        }
+        if buf[4] != 0 {
+            buf = &buf[1..];
+            continue;
+        }
+        let n_segs = buf[26] as usize;
+        let header_len = 27 + n_segs;
+        if buf.len() < header_len {
+            return false;
+        }
+        let mut body_len: usize = 0;
+        let mut seg_idx = 0;
+        while seg_idx < n_segs {
+            body_len = body_len.saturating_add(buf[27 + seg_idx] as usize);
+            seg_idx += 1;
+        }
+        let total_page_len = header_len.saturating_add(body_len);
+        if buf.len() >= total_page_len {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
 #[cfg(any(feature = "alloc", feature = "std"))]
 /// Pure-Rust RFC 9639 Lossless FLAC Decoder with 64KB External PSRAM buffer
 /// placement and native Ogg-FLAC (`"OggS"` / `\x7fFLAC\x01\x00`) container
@@ -3556,16 +3590,24 @@ impl AacDecoder {
                         left
                     };
                     let samples = core::cmp::min(left.len(), right.len());
-                    for i in 0..samples {
+                    let direct_count =
+                        core::cmp::min(samples, max_frames.saturating_sub(frames_out));
+                    for i in 0..direct_count {
                         let l_f = left[i].clamp(-1.0, 1.0);
                         let r_f = right[i].clamp(-1.0, 1.0);
                         let l = (l_f * 2147483520.0) as i32;
                         let r = (r_f * 2147483520.0) as i32;
-                        if frames_out < max_frames {
-                            pcm_out[frames_out * 2] = l;
-                            pcm_out[frames_out * 2 + 1] = r;
-                            frames_out += 1;
-                        } else {
+                        pcm_out[(frames_out + i) * 2] = l;
+                        pcm_out[(frames_out + i) * 2 + 1] = r;
+                    }
+                    frames_out += direct_count;
+                    if direct_count < samples {
+                        pending_pcm.reserve((samples - direct_count) * 2);
+                        for i in direct_count..samples {
+                            let l_f = left[i].clamp(-1.0, 1.0);
+                            let r_f = right[i].clamp(-1.0, 1.0);
+                            let l = (l_f * 2147483520.0) as i32;
+                            let r = (r_f * 2147483520.0) as i32;
                             pending_pcm.push(l);
                             pending_pcm.push(r);
                         }
@@ -3805,6 +3847,7 @@ pub struct VorbisDecoder {
     stream_buf: Vec<u8>,
     partial_packet: Vec<u8>,
     packet_queue: VecDeque<Vec<u8>>,
+    free_packets: Vec<Vec<u8>>,
     pending_pcm: Vec<i32>,
     pending_offset: usize,
     state: VorbisState,
@@ -3827,6 +3870,7 @@ impl VorbisDecoder {
             stream_buf: Vec::new(),
             partial_packet: Vec::new(),
             packet_queue: VecDeque::new(),
+            free_packets: Vec::new(),
             pending_pcm: Vec::new(),
             pending_offset: 0,
             state: VorbisState::WaitingIdent,
@@ -3836,13 +3880,18 @@ impl VorbisDecoder {
     pub fn has_pending_pcm(&self) -> bool {
         self.pending_offset < self.pending_pcm.len()
             || !self.packet_queue.is_empty()
-            || self.stream_buf.len() >= 27
+            || has_complete_ogg_page(&self.stream_buf)
     }
 
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
         self.pending_offset = 0;
-        self.packet_queue.clear();
+        while let Some(mut pkt) = self.packet_queue.pop_front() {
+            if self.free_packets.len() < 16 {
+                pkt.clear();
+                self.free_packets.push(pkt);
+            }
+        }
         self.partial_packet.clear();
         self.stream_buf.clear();
         self.packets_decoded = 0;
@@ -4041,7 +4090,13 @@ impl AudioDecoder for VorbisDecoder {
             let Some(packet) = self.packet_queue.pop_front() else {
                 break;
             };
-            self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
+            let res = self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames);
+            if self.free_packets.len() < 16 {
+                let mut recycled = packet;
+                recycled.clear();
+                self.free_packets.push(recycled);
+            }
+            res?;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
             }
@@ -4120,7 +4175,6 @@ impl AudioDecoder for VorbisDecoder {
             }
 
             let mut body_offset = header_len;
-            let mut page_packets = Vec::new();
 
             for &seg_len_u8 in seg_table {
                 let seg_len = seg_len_u8 as usize;
@@ -4137,10 +4191,14 @@ impl AudioDecoder for VorbisDecoder {
                     .extend_from_slice(&self.stream_buf[body_offset..body_offset + seg_len]);
                 body_offset += seg_len;
 
-                if seg_len_u8 < 255 {
-                    let packet = core::mem::take(&mut self.partial_packet);
-                    if !packet.is_empty() {
-                        page_packets.push(packet);
+                if seg_len_u8 < 255 && !self.partial_packet.is_empty() {
+                    let mut completed = self.free_packets.pop().unwrap_or_default();
+                    core::mem::swap(&mut self.partial_packet, &mut completed);
+                    if self.packet_queue.len() < MAX_PACKET_QUEUE {
+                        self.packet_queue.push_back(completed);
+                    } else if self.free_packets.len() < 16 {
+                        completed.clear();
+                        self.free_packets.push(completed);
                     }
                 }
             }
@@ -4151,11 +4209,19 @@ impl AudioDecoder for VorbisDecoder {
                 self.stream_buf.drain(..total_page_len);
             }
 
-            for packet in page_packets {
-                if frames_out < max_frames && self.packet_queue.is_empty() {
-                    self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
-                } else if self.packet_queue.len() < MAX_PACKET_QUEUE {
-                    self.packet_queue.push_back(packet);
+            while frames_out < max_frames && !self.packet_queue.is_empty() {
+                let Some(packet) = self.packet_queue.pop_front() else {
+                    break;
+                };
+                let res = self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames);
+                if self.free_packets.len() < 16 {
+                    let mut recycled = packet;
+                    recycled.clear();
+                    self.free_packets.push(recycled);
+                }
+                res?;
+                if frames_out >= max_frames {
+                    break;
                 }
             }
 
@@ -4656,6 +4722,7 @@ pub struct OpusDecoder {
     stream_buf: Vec<u8>,
     partial_packet: Vec<u8>,
     packet_queue: VecDeque<Vec<u8>>,
+    free_packets: Vec<Vec<u8>>,
     pending_pcm: Vec<i32>,
     pending_offset: usize,
     state: OpusState,
@@ -4679,6 +4746,7 @@ impl OpusDecoder {
             stream_buf: Vec::new(),
             partial_packet: Vec::new(),
             packet_queue: VecDeque::new(),
+            free_packets: Vec::new(),
             pending_pcm: Vec::new(),
             pending_offset: 0,
             state: OpusState::WaitingHead,
@@ -4689,13 +4757,18 @@ impl OpusDecoder {
     pub fn has_pending_pcm(&self) -> bool {
         self.pending_offset < self.pending_pcm.len()
             || !self.packet_queue.is_empty()
-            || self.stream_buf.len() >= 27
+            || has_complete_ogg_page(&self.stream_buf)
     }
 
     pub fn flush(&mut self) {
         self.pending_pcm.clear();
         self.pending_offset = 0;
-        self.packet_queue.clear();
+        while let Some(mut pkt) = self.packet_queue.pop_front() {
+            if self.free_packets.len() < 16 {
+                pkt.clear();
+                self.free_packets.push(pkt);
+            }
+        }
         self.partial_packet.clear();
         self.stream_buf.clear();
         self.packets_decoded = 0;
@@ -4880,7 +4953,13 @@ impl AudioDecoder for OpusDecoder {
             let Some(packet) = self.packet_queue.pop_front() else {
                 break;
             };
-            self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
+            let res = self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames);
+            if self.free_packets.len() < 16 {
+                let mut recycled = packet;
+                recycled.clear();
+                self.free_packets.push(recycled);
+            }
+            res?;
             if frames_out >= max_frames {
                 return Ok((0, frames_out));
             }
@@ -4959,7 +5038,6 @@ impl AudioDecoder for OpusDecoder {
             }
 
             let mut body_offset = header_len;
-            let mut page_packets = Vec::new();
 
             for &seg_len_u8 in seg_table {
                 let seg_len = seg_len_u8 as usize;
@@ -4976,10 +5054,14 @@ impl AudioDecoder for OpusDecoder {
                     .extend_from_slice(&self.stream_buf[body_offset..body_offset + seg_len]);
                 body_offset += seg_len;
 
-                if seg_len_u8 < 255 {
-                    let packet = core::mem::take(&mut self.partial_packet);
-                    if !packet.is_empty() {
-                        page_packets.push(packet);
+                if seg_len_u8 < 255 && !self.partial_packet.is_empty() {
+                    let mut completed = self.free_packets.pop().unwrap_or_default();
+                    core::mem::swap(&mut self.partial_packet, &mut completed);
+                    if self.packet_queue.len() < MAX_PACKET_QUEUE {
+                        self.packet_queue.push_back(completed);
+                    } else if self.free_packets.len() < 16 {
+                        completed.clear();
+                        self.free_packets.push(completed);
                     }
                 }
             }
@@ -4990,11 +5072,19 @@ impl AudioDecoder for OpusDecoder {
                 self.stream_buf.drain(..total_page_len);
             }
 
-            for packet in page_packets {
-                if frames_out < max_frames && self.packet_queue.is_empty() {
-                    self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames)?;
-                } else if self.packet_queue.len() < MAX_PACKET_QUEUE {
-                    self.packet_queue.push_back(packet);
+            while frames_out < max_frames && !self.packet_queue.is_empty() {
+                let Some(packet) = self.packet_queue.pop_front() else {
+                    break;
+                };
+                let res = self.decode_single_packet(&packet, pcm_out, &mut frames_out, max_frames);
+                if self.free_packets.len() < 16 {
+                    let mut recycled = packet;
+                    recycled.clear();
+                    self.free_packets.push(recycled);
+                }
+                res?;
+                if frames_out >= max_frames {
+                    break;
                 }
             }
 
@@ -6633,5 +6723,66 @@ mod tests {
             decoder2.decode(&stream, &mut pcm),
             Err(DecoderError::UnsupportedFeature)
         );
+    }
+
+    #[test]
+    fn test_has_complete_ogg_page_partial_vs_complete() {
+        assert!(!has_complete_ogg_page(&[]));
+        assert!(!has_complete_ogg_page(b"OggS"));
+
+        // Header less than 27 bytes
+        let mut page = vec![0u8; 26];
+        page[0..4].copy_from_slice(b"OggS");
+        assert!(!has_complete_ogg_page(&page));
+
+        // Exactly 27 bytes, n_segs = 1, requires 27 + 1 = 28 bytes for header
+        page.push(1);
+        assert_eq!(page.len(), 27);
+        assert!(!has_complete_ogg_page(&page));
+
+        // 28 bytes, segment length = 10, requires 28 + 10 = 38 bytes total
+        page.push(10);
+        assert_eq!(page.len(), 28);
+        assert!(!has_complete_ogg_page(&page));
+
+        // Partial body (37 bytes < 38)
+        page.extend_from_slice(&[0xAA; 9]);
+        assert_eq!(page.len(), 37);
+        assert!(!has_complete_ogg_page(&page));
+
+        // Complete page (38 bytes)
+        page.push(0xAA);
+        assert_eq!(page.len(), 38);
+        assert!(has_complete_ogg_page(&page));
+
+        // Leading junk before OggS
+        let mut with_junk = vec![0x12, 0x34, 0x56];
+        with_junk.extend_from_slice(&page);
+        assert!(has_complete_ogg_page(&with_junk));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_ogg_decoders_has_pending_pcm_page_boundary() {
+        let mut vorbis = VorbisDecoder::new();
+        let mut opus = OpusDecoder::new();
+        assert!(!vorbis.has_pending_pcm());
+        assert!(!opus.has_pending_pcm());
+
+        let mut page = vec![0u8; 27];
+        page[0..4].copy_from_slice(b"OggS");
+        page[26] = 1;
+        page.push(4);
+        page.extend_from_slice(&[1, 2, 3, 4]);
+
+        vorbis.stream_buf.extend_from_slice(&page[..20]);
+        opus.stream_buf.extend_from_slice(&page[..20]);
+        assert!(!vorbis.has_pending_pcm());
+        assert!(!opus.has_pending_pcm());
+
+        vorbis.stream_buf.extend_from_slice(&page[20..]);
+        opus.stream_buf.extend_from_slice(&page[20..]);
+        assert!(vorbis.has_pending_pcm());
+        assert!(opus.has_pending_pcm());
     }
 }

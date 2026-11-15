@@ -937,13 +937,15 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
                 .saturating_mul(OUTPUT_FRAME_BYTES);
             // `prepare` checked that the new frames follow (output.c:231): the old samples
             // are already converted, so the byte scratch is free for them.
-            let to_process = (frames * OUTPUT_FRAME_BYTES).min(self.write_scratch.len());
+            let expected_bytes = frames * OUTPUT_FRAME_BYTES;
+            debug_assert!(expected_bytes <= self.write_scratch.len());
+            let to_process = expected_bytes.min(self.write_scratch.len());
             let got = self
                 .output_buffer
                 .peek_at(offset, &mut self.write_scratch[..to_process]);
             // `prepare` guarantees used > dur_f + size, so the whole chunk of new frames is
             // there; a short read would mix only part of the chunk.
-            debug_assert_eq!(got, to_process, "crossfade new-track frames missing");
+            debug_assert_eq!(got, expected_bytes, "crossfade new-track frames missing");
             for (sample, new) in samples
                 .iter_mut()
                 .zip(self.write_scratch[..got].chunks_exact(4))
@@ -3599,5 +3601,48 @@ mod tests {
             p.write_scratch.iter().all(|&b| b == 0xAA),
             "process_output_step must bypass write_scratch outside crossfade"
         );
+    }
+
+    #[test]
+    fn test_scale_chunk_crossfade_invariants_and_mix() {
+        let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        // Pre-fill write scratch to verify it gets populated during crossfade
+        p.write_scratch.fill(0x55);
+
+        // Populate output buffer with new track frames: 2 frames = 16 bytes
+        let new_frames = [10_000_i32, -10_000_i32, 20_000_i32, -20_000_i32];
+        assert_eq!(
+            p.output_buffer.write(bytemuck::cast_slice(&new_frames)),
+            Ok(new_frames.len() * 4)
+        );
+
+        // Set up existing samples in output_i32_scratch: 2 frames = 4 samples
+        let old_frames = [30_000_i32, -30_000_i32, 40_000_i32, -40_000_i32];
+        p.output_i32_scratch[..4].copy_from_slice(&old_frames);
+
+        // Crossfade 2 frames with unity in/out weights and offset 0
+        let chunk_gain = ChunkGain::Cross {
+            gain_in: 0x10000,
+            gain_out: 0x10000,
+            new_ahead: 0,
+        };
+        p.scale_chunk(2, chunk_gain);
+
+        // Replay gain must be zeroed during crossfade per C output.c:243-245
+        assert_eq!(p.gain_stage.replay_gain_q16, 0);
+
+        // Verify scratch filled with new track frames (16 bytes = 2 frames * 8 bytes)
+        assert_eq!(
+            &p.write_scratch[..16],
+            bytemuck::cast_slice::<i32, u8>(&new_frames)
+        );
+
+        // Verify mixed samples: old_frames + new_frames
+        assert_eq!(p.output_i32_scratch[0], old_frames[0] + new_frames[0]);
+        assert_eq!(p.output_i32_scratch[1], old_frames[1] + new_frames[1]);
+        assert_eq!(p.output_i32_scratch[2], old_frames[2] + new_frames[2]);
+        assert_eq!(p.output_i32_scratch[3], old_frames[3] + new_frames[3]);
     }
 }

@@ -914,7 +914,9 @@ mod device {
         }
 
         let bt_name = s.config.effective_bt_name();
-        s.bt_sink.security_policy.update_device_name(bt_name.as_str());
+        s.bt_sink
+            .security_policy
+            .update_device_name(bt_name.as_str());
     }
 
     /// `bt_a2dp`: lazy BT controller bring-up after the DHCP lease, then A2DP sink
@@ -1239,8 +1241,7 @@ mod device {
                         (free, used)
                     };
                     let mut eq_bands_db = [0i8; 10];
-                    for (dst, &gain) in
-                        eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
+                    for (dst, &gain) in eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
                     {
                         let rounded = if gain >= 0.0 {
                             (gain + 0.5) as i8
@@ -1331,11 +1332,9 @@ mod device {
                     };
                     let snapshot = snap.clone();
                     let mut resp_buf = &mut s.http_resp_buf[..];
-                    let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
-                        "",
-                        "",
-                        "string",
-                    ); 20];
+                    let mut extra_views =
+                        [louder_esp32_app::http_control::ConfigEntryView::new("", "", "string");
+                            20];
                     let mut view_len = 0usize;
                     let nvs_overrides = s.config.nvs_overrides();
                     for slot in &nvs_overrides {
@@ -1379,10 +1378,9 @@ mod device {
                                 let preset = EqPreset::from_u8(preset_id);
                                 s.pipeline.apply_eq_preset(preset);
                                 s.config.update(|c| c.equalizer_preset = preset_id);
-                                let _ = s.config.set_nvs_override(
-                                    "equalizer",
-                                    "0,0,0,0,0,0,0,0,0,0",
-                                );
+                                let _ = s
+                                    .config
+                                    .set_nvs_override("equalizer", "0,0,0,0,0,0,0,0,0,0");
                                 s.config.flush_now(&mut *s.journal);
                             }
                             HttpControlAction::SetAnalogGain(again_code) => {
@@ -1515,7 +1513,9 @@ mod device {
             flush_settings_before_reboot(s);
             match s.pending_http_action {
                 HttpControlAction::RebootToRecovery => {
-                    let _ = s.flash.erase(OTADATA_SECTOR_0_OFFSET, OTADATA_PARTITION_END);
+                    let _ = s
+                        .flash
+                        .erase(OTADATA_SECTOR_0_OFFSET, OTADATA_PARTITION_END);
                     println!(
                         "[ANTI-BRICK GATE 4] HTTP /recovery.json \
                          -> erased otadata & resetting into factory recovery (0x10000)"

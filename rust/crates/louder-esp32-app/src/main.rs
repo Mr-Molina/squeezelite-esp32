@@ -2535,7 +2535,10 @@ mod xtensa_hw {
             config
                 .effective_lms_server_ip()
                 .unwrap_or(first_boot_defaults::LMS_SERVER_IP),
-            config.read(|c| c.lms_server_port.unwrap_or(first_boot_defaults::LMS_SERVER_PORT)),
+            config.read(|c| {
+                c.lms_server_port
+                    .unwrap_or(first_boot_defaults::LMS_SERVER_PORT)
+            }),
         );
         ring_storage.fill(0);
         wdt.feed();
@@ -3013,7 +3016,9 @@ mod xtensa_hw {
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
             let _ = s.flash.erase(offset, offset + 4096);
             if image.used_len > 16 {
-                let _ = s.flash.write_nor(offset + 16, &image.sector[16..image.used_len]);
+                let _ = s
+                    .flash
+                    .write_nor(offset + 16, &image.sector[16..image.used_len]);
             }
             let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
             let _ = s.flash.write_nor(offset, &image.sector[..16]);
@@ -3493,180 +3498,180 @@ mod xtensa_hw {
                         let _ = http_sock.recv(|buf| (buf.len(), ()));
                     }
                     if req_len > 0 {
-                    let amp_mode_str = match s.amp.mode() {
-                        louder_esp32_app::AmpMode::Play => "Play",
-                        louder_esp32_app::AmpMode::Standby => "Standby",
-                        louder_esp32_app::AmpMode::PowerDown => "PowerDown",
-                    };
-                    let codec_name = match s.coordinator.active_source() {
-                        AudioSource::AirPlay => "AirPlay",
-                        AudioSource::Bluetooth => "Bluetooth",
-                        AudioSource::Spotify => "Spotify",
-                        _ => {
-                            if s.raop_streaming {
-                                "AirPlay"
-                            } else if s.spot_streaming {
-                                "Spotify"
-                            } else {
-                                match s.pipeline.decoder {
-                                    ActiveDecoder::Mp3(_) => "MP3",
-                                    ActiveDecoder::Flac(_) => "FLAC",
-                                    ActiveDecoder::Pcm(_) => "PCM",
-                                    ActiveDecoder::Aac(_) => "AAC",
-                                    ActiveDecoder::Vorbis(_) => "Vorbis",
-                                    ActiveDecoder::Alac(_) => "ALAC",
-                                    ActiveDecoder::Opus(_) => "Opus",
+                        let amp_mode_str = match s.amp.mode() {
+                            louder_esp32_app::AmpMode::Play => "Play",
+                            louder_esp32_app::AmpMode::Standby => "Standby",
+                            louder_esp32_app::AmpMode::PowerDown => "PowerDown",
+                        };
+                        let codec_name = match s.coordinator.active_source() {
+                            AudioSource::AirPlay => "AirPlay",
+                            AudioSource::Bluetooth => "Bluetooth",
+                            AudioSource::Spotify => "Spotify",
+                            _ => {
+                                if s.raop_streaming {
+                                    "AirPlay"
+                                } else if s.spot_streaming {
+                                    "Spotify"
+                                } else {
+                                    match s.pipeline.decoder {
+                                        ActiveDecoder::Mp3(_) => "MP3",
+                                        ActiveDecoder::Flac(_) => "FLAC",
+                                        ActiveDecoder::Pcm(_) => "PCM",
+                                        ActiveDecoder::Aac(_) => "AAC",
+                                        ActiveDecoder::Vorbis(_) => "Vorbis",
+                                        ActiveDecoder::Alac(_) => "ALAC",
+                                        ActiveDecoder::Opus(_) => "Opus",
+                                    }
                                 }
                             }
-                        }
-                    };
-                    let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) = match s
-                        .latest_telemetry
-                    {
-                        Some(t) => (
-                            t.detected_sample_rate_hz_with_hint(s.coordinator.current_sample_rate),
-                            t.bck_ratio(),
-                            t.is_pll_locked(),
-                            t.is_automuted(),
-                        ),
-                        None => (s.coordinator.current_sample_rate, 64, true, false),
-                    };
-                    let (psram_free_bytes, psram_used_bytes) = {
-                        let stats = esp_alloc::HEAP.stats();
-                        let mut free = 0u32;
-                        let mut used = 0u32;
-                        for r in stats.region_stats.iter().flatten() {
-                            if r.size > 1024 * 1024 {
-                                free = r.free as u32;
-                                used = r.used as u32;
-                                break;
-                            }
-                        }
-                        if free.saturating_add(used) > 200_000 {
-                            (free, used)
-                        } else {
-                            (
-                                louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
-                                louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
-                            )
-                        }
-                    };
-                    let mut eq_bands_db = [0i8; 10];
-                    for (dst, &gain) in
-                        eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
-                    {
-                        let rounded = if gain >= 0.0 {
-                            (gain + 0.5) as i8
-                        } else {
-                            (gain - 0.5) as i8
                         };
-                        *dst = rounded.clamp(-15, 15);
-                    }
-                    let player_name_val = s
-                        .config
-                        .nvs_override("host_name")
-                        .and_then(|h| {
-                            let t = h.trim();
-                            if t.is_empty() {
-                                None
-                            } else {
-                                let mut out = heapless::String::<32>::new();
-                                let max_len = t.floor_char_boundary(t.len().min(32));
-                                let _ = out.push_str(&t[..max_len]);
-                                Some(out)
+                        let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
+                            match s.latest_telemetry {
+                                Some(t) => (
+                                    t.detected_sample_rate_hz_with_hint(
+                                        s.coordinator.current_sample_rate,
+                                    ),
+                                    t.bck_ratio(),
+                                    t.is_pll_locked(),
+                                    t.is_automuted(),
+                                ),
+                                None => (s.coordinator.current_sample_rate, 64, true, false),
+                            };
+                        let (psram_free_bytes, psram_used_bytes) = {
+                            let stats = esp_alloc::HEAP.stats();
+                            let mut free = 0u32;
+                            let mut used = 0u32;
+                            for r in stats.region_stats.iter().flatten() {
+                                if r.size > 1024 * 1024 {
+                                    free = r.free as u32;
+                                    used = r.used as u32;
+                                    break;
+                                }
                             }
-                        })
-                        .unwrap_or_else(|| {
-                            s.config.read(|c| {
-                                if !c.player_name.is_empty() {
-                                    c.player_name.clone()
+                            if free.saturating_add(used) > 200_000 {
+                                (free, used)
+                            } else {
+                                (
+                                    louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
+                                    louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
+                                )
+                            }
+                        };
+                        let mut eq_bands_db = [0i8; 10];
+                        for (dst, &gain) in
+                            eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
+                        {
+                            let rounded = if gain >= 0.0 {
+                                (gain + 0.5) as i8
+                            } else {
+                                (gain - 0.5) as i8
+                            };
+                            *dst = rounded.clamp(-15, 15);
+                        }
+                        let player_name_val = s
+                            .config
+                            .nvs_override("host_name")
+                            .and_then(|h| {
+                                let t = h.trim();
+                                if t.is_empty() {
+                                    None
                                 } else {
-                                    s.config.device_name()
+                                    let mut out = heapless::String::<32>::new();
+                                    let max_len = t.floor_char_boundary(t.len().min(32));
+                                    let _ = out.push_str(&t[..max_len]);
+                                    Some(out)
                                 }
                             })
-                        });
-                    let i2c_acks = Esp32I2cBus::hw_ack_count();
-                    let i2c_nacks = Esp32I2cBus::hw_nack_count();
-                    let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
-                    let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
-                    let snap = HttpStatusSnapshot {
-                        ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
-                        netmask: s.assigned_mask,
-                        gw: s.assigned_gw,
-                        ssid: s.wifi_sta_creds.ssid.as_str(),
-                        rssi: s.wifi_controller.rssi().unwrap_or(-50),
-                        lms_ip: s.lms_ip,
-                        lms_port: 9000,
-                        lms_cport: 9090,
-                        otadata_prearmed_factory: !s.boot_ota0_confirmed,
-                        frames_played: s.pipeline.frames_played,
-                        amp_mode: amp_mode_str,
-                        vol_pct: s.current_vol_pct,
-                        i2c_acks,
-                        i2c_nacks,
-                        i2c_nack_by_op,
-                        uptime_ms: now_ms.saturating_sub(s.boot_ms),
-                        psram_free_bytes,
-                        psram_used_bytes,
-                        core1_active: s.core1.is_active(),
-                        core1_loops: CORE1_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed),
-                        codec: codec_name,
-                        codec_sample_rate: s.coordinator.current_sample_rate,
-                        codec_channels: 2,
-                        codec_bit_depth: 16,
-                        eq_preset: s.pipeline.current_eq_preset.as_str(),
-                        eq_enabled: s.pipeline.equalizer.enabled,
-                        tas_fs_hz,
-                        tas_bck_ratio,
-                        tas_pll_locked,
-                        tas_automuted,
-                        again_code: s.amp.analog_gain_code(),
-                        settings_seq: s.journal.sequence(),
-                        bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
-                        bt_connected: s.bt_sink.is_connected(),
-                        bt_streaming: s.bt_sink.is_streaming(),
-                        bt_rx_pkts: s.bt_sink.rx_packets,
-                        bt_frames: s.bt_sink.decoded_frames,
-                        decode_us_max: s.pipeline.decode_us_max,
-                        decode_us_first: s.pipeline.decode_us_first,
-                        jack_inserted: false,
-                        voltage_mv: 0,
-                        disconnect_count: s.disconnect_count,
-                        avg_conn_time_ms: 0,
-                        is_i2c_locked,
-                        urc: if s.assigned_ip.is_some() { 0 } else { 2 },
-                        bt_status: if s.bt_sink.is_streaming() {
-                            2
-                        } else if s.bt_sink.is_connected() {
-                            1
-                        } else {
-                            0
-                        },
-                        bt_sub_status: 0,
-                        eq_bands_db,
-                        player_name: player_name_val.as_str(),
-                    };
-                    let snapshot = snap.clone();
-                    let mut resp_buf = &mut s.http_resp_buf[..];
-                    let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
-                        "",
-                        "",
-                        "string",
-                    ); 20];
-                    let mut view_len = 0usize;
-                    let nvs_overrides = s.config.nvs_overrides();
-                    for slot in &nvs_overrides {
-                        if slot.used && view_len < extra_views.len() {
-                            extra_views[view_len] =
-                                louder_esp32_app::http_control::ConfigEntryView::new(
-                                    slot.key.as_str(),
-                                    slot.value.as_str(),
-                                    "string",
-                                );
-                            view_len += 1;
+                            .unwrap_or_else(|| {
+                                s.config.read(|c| {
+                                    if !c.player_name.is_empty() {
+                                        c.player_name.clone()
+                                    } else {
+                                        s.config.device_name()
+                                    }
+                                })
+                            });
+                        let i2c_acks = Esp32I2cBus::hw_ack_count();
+                        let i2c_nacks = Esp32I2cBus::hw_nack_count();
+                        let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
+                        let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
+                        let snap = HttpStatusSnapshot {
+                            ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
+                            netmask: s.assigned_mask,
+                            gw: s.assigned_gw,
+                            ssid: s.wifi_sta_creds.ssid.as_str(),
+                            rssi: s.wifi_controller.rssi().unwrap_or(-50),
+                            lms_ip: s.lms_ip,
+                            lms_port: 9000,
+                            lms_cport: 9090,
+                            otadata_prearmed_factory: !s.boot_ota0_confirmed,
+                            frames_played: s.pipeline.frames_played,
+                            amp_mode: amp_mode_str,
+                            vol_pct: s.current_vol_pct,
+                            i2c_acks,
+                            i2c_nacks,
+                            i2c_nack_by_op,
+                            uptime_ms: now_ms.saturating_sub(s.boot_ms),
+                            psram_free_bytes,
+                            psram_used_bytes,
+                            core1_active: s.core1.is_active(),
+                            core1_loops: CORE1_HEARTBEAT
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                            codec: codec_name,
+                            codec_sample_rate: s.coordinator.current_sample_rate,
+                            codec_channels: 2,
+                            codec_bit_depth: 16,
+                            eq_preset: s.pipeline.current_eq_preset.as_str(),
+                            eq_enabled: s.pipeline.equalizer.enabled,
+                            tas_fs_hz,
+                            tas_bck_ratio,
+                            tas_pll_locked,
+                            tas_automuted,
+                            again_code: s.amp.analog_gain_code(),
+                            settings_seq: s.journal.sequence(),
+                            bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
+                            bt_connected: s.bt_sink.is_connected(),
+                            bt_streaming: s.bt_sink.is_streaming(),
+                            bt_rx_pkts: s.bt_sink.rx_packets,
+                            bt_frames: s.bt_sink.decoded_frames,
+                            decode_us_max: s.pipeline.decode_us_max,
+                            decode_us_first: s.pipeline.decode_us_first,
+                            jack_inserted: false,
+                            voltage_mv: 0,
+                            disconnect_count: s.disconnect_count,
+                            avg_conn_time_ms: 0,
+                            is_i2c_locked,
+                            urc: if s.assigned_ip.is_some() { 0 } else { 2 },
+                            bt_status: if s.bt_sink.is_streaming() {
+                                2
+                            } else if s.bt_sink.is_connected() {
+                                1
+                            } else {
+                                0
+                            },
+                            bt_sub_status: 0,
+                            eq_bands_db,
+                            player_name: player_name_val.as_str(),
+                        };
+                        let snapshot = snap.clone();
+                        let mut resp_buf = &mut s.http_resp_buf[..];
+                        let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
+                            "", "", "string",
+                        ); 20];
+                        let mut view_len = 0usize;
+                        let nvs_overrides = s.config.nvs_overrides();
+                        for slot in &nvs_overrides {
+                            if slot.used && view_len < extra_views.len() {
+                                extra_views[view_len] =
+                                    louder_esp32_app::http_control::ConfigEntryView::new(
+                                        slot.key.as_str(),
+                                        slot.value.as_str(),
+                                        "string",
+                                    );
+                                view_len += 1;
+                            }
                         }
-                    }
-                    if let Some((hdr_or_resp_len, static_body, action)) =
+                        if let Some((hdr_or_resp_len, static_body, action)) =
                         louder_esp32_app::http_control::handle_http_request_streaming_with_entries(
                             &req_buf[..req_len],
                             &snapshot,
@@ -4130,20 +4135,16 @@ mod xtensa_hw {
                     && s.cached_raop_mdns_len > 0
                     && mdns_sock.can_send()
                 {
-                    let _ = mdns_sock.send_slice(
-                        &s.cached_raop_mdns[..s.cached_raop_mdns_len],
-                        raop_ep,
-                    );
+                    let _ = mdns_sock
+                        .send_slice(&s.cached_raop_mdns[..s.cached_raop_mdns_len], raop_ep);
                 }
                 if cspot_enabled
                     && should_announce_spotify
                     && s.cached_spot_mdns_len > 0
                     && mdns_sock.can_send()
                 {
-                    let _ = mdns_sock.send_slice(
-                        &s.cached_spot_mdns[..s.cached_spot_mdns_len],
-                        spot_ep,
-                    );
+                    let _ = mdns_sock
+                        .send_slice(&s.cached_spot_mdns[..s.cached_spot_mdns_len], spot_ep);
                 }
             }
         }
@@ -4352,8 +4353,7 @@ mod xtensa_hw {
                 let mut req_buf = [0u8; 1024];
                 if let Ok(n) = spot_sock.recv_slice(&mut req_buf) {
                     if n > 0 {
-                        if req_buf[..n].starts_with(b"GET ") || req_buf[..n].starts_with(b"POST ")
-                        {
+                        if req_buf[..n].starts_with(b"GET ") || req_buf[..n].starts_with(b"POST ") {
                             let body_prefix = b"{\"status\":101,\"statusString\":\"OK\",\
                                 \"spotifyError\":0,\"version\":\"2.9.0\",\
                                 \"deviceID\":\"c82e18beb8340000000000000000000000000000\",\
@@ -4395,12 +4395,10 @@ mod xtensa_hw {
                                                 }
                                                 s.spot_streaming = true;
                                             }
-                                            let notify = s
-                                                .spot_spirc
-                                                .build_notify_frame(
-                                                    frame.seq_nr,
-                                                    cspot_name.as_str(),
-                                                );
+                                            let notify = s.spot_spirc.build_notify_frame(
+                                                frame.seq_nr,
+                                                cspot_name.as_str(),
+                                            );
                                             let _ = spot_sock.send_slice(&notify);
                                         }
                                     }
@@ -4539,7 +4537,9 @@ mod xtensa_hw {
                     let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
                     let _ = s.flash.erase(offset, offset + 4096);
                     if image.used_len > 16 {
-                        let _ = s.flash.write_nor(offset + 16, &image.sector[16..image.used_len]);
+                        let _ = s
+                            .flash
+                            .write_nor(offset + 16, &image.sector[16..image.used_len]);
                     }
                     let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
                     let _ = s.flash.write_nor(offset, &image.sector[..16]);
@@ -4640,9 +4640,6 @@ mod tests {
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
-            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
             I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
             I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),

@@ -447,7 +447,7 @@ where
     /// 6. Enables hardware automute (`0x50 = 0x07`).
     /// 7. Enables triangle spread spectrum EMI reduction (`0x6B = 0x01`).
     pub fn configure_silicon_maximization(&mut self, again_code: u8) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         self.write_reg(registers::DEVICE_CTRL_1, registers::CTRL1_1SPW_384KHZ_BTL)?;
         self.write_reg(registers::ANA_CTRL, 0x01)?;
         self.write_reg(registers::AGAIN, again_code.min(0x1F))?;
@@ -459,13 +459,13 @@ where
 
     /// Sets the analog gain attenuation register (`0x54`, bits 4:0).
     pub fn set_analog_gain(&mut self, again_code: u8) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         self.write_reg(registers::AGAIN, again_code.min(0x1F))
     }
 
     /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69.
     pub fn read_telemetry(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         let mut clk_regs = [0u8; 3];
         self.i2c
             .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
@@ -918,7 +918,7 @@ where
     /// 6. Enables hardware automute (`0x50 = 0x07`).
     /// 7. Enables triangle spread spectrum EMI reduction (`0x6B = 0x01`).
     pub fn configure_silicon_maximization(&mut self, again_code: u8) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         self.write_reg(registers::DEVICE_CTRL_1, registers::CTRL1_1SPW_384KHZ_BTL)?;
         self.write_reg(registers::ANA_CTRL, 0x01)?;
         self.write_reg(registers::AGAIN, again_code.min(0x1F))?;
@@ -930,13 +930,13 @@ where
 
     /// Sets the analog gain attenuation register (`0x54`, bits 4:0).
     pub fn set_analog_gain(&mut self, again_code: u8) -> Result<(), DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         self.write_reg(registers::AGAIN, again_code.min(0x1F))
     }
 
     /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69.
     pub fn read_telemetry(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
-        self.select_page0_book0()?;
+        self.ensure_page0_book0()?;
         let mut clk_regs = [0u8; 3];
         self.i2c
             .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
@@ -1592,6 +1592,97 @@ mod tests {
             .try_start_playback_via_hiz()
             .map_err(|(_, e)| e)
             .unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_zero_redundant_page_or_book_writes_when_cached() {
+        let expectations = [
+            // Standby configure_silicon_maximization(0x08)
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_1, registers::CTRL1_1SPW_384KHZ_BTL],
+            ),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::ANA_CTRL, 0x01]),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::AGAIN, 0x08]),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DIG_VOL_CTRL2, 0x00],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::AUTO_MUTE_CTRL, 0x07],
+            ),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::SS_CTRL0, 0x01]),
+            // Standby set_analog_gain(0x0C)
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::AGAIN, 0x0C]),
+            // Standby read_telemetry()
+            I2cTrans::write_read(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::FS_MON],
+                vec![0x09, 64, 0x08],
+            ),
+            I2cTrans::write_read(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::AUTOMUTE_STATE],
+                vec![0x00],
+            ),
+            // Play configure_silicon_maximization(0x08)
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DEVICE_CTRL_1, registers::CTRL1_1SPW_384KHZ_BTL],
+            ),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::ANA_CTRL, 0x01]),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::AGAIN, 0x08]),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::DIG_VOL_CTRL2, 0x00],
+            ),
+            I2cTrans::write(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::AUTO_MUTE_CTRL, 0x07],
+            ),
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::SS_CTRL0, 0x01]),
+            // Play set_analog_gain(0x0E)
+            I2cTrans::write(TAS5805M_I2C_ADDR_DEFAULT, vec![registers::AGAIN, 0x0E]),
+            // Play read_telemetry()
+            I2cTrans::write_read(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::FS_MON],
+                vec![0x09, 64, 0x08],
+            ),
+            I2cTrans::write_read(
+                TAS5805M_I2C_ADDR_DEFAULT,
+                vec![registers::AUTOMUTE_STATE],
+                vec![0x00],
+            ),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
+            _state: PhantomData::<Standby>,
+        };
+
+        standby.configure_silicon_maximization(0x08).unwrap();
+        standby.set_analog_gain(0x0C).unwrap();
+        let _ = standby.read_telemetry().unwrap();
+
+        let mut play = Tas58xx {
+            i2c: standby.i2c,
+            addr: TAS5805M_I2C_ADDR_DEFAULT,
+            current_book: 0,
+            current_page: 0,
+            _state: PhantomData::<Play>,
+        };
+
+        play.configure_silicon_maximization(0x08).unwrap();
+        play.set_analog_gain(0x0E).unwrap();
+        let _ = play.read_telemetry().unwrap();
 
         i2c.done();
     }

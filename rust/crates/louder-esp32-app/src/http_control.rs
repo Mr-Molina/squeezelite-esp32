@@ -593,10 +593,14 @@ pub fn write_config_json(
     out_buf: &mut [u8],
 ) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
-    let find_override = |k: &str| -> Option<&str> {
-        extra_entries.iter().find(|e| e.key == k).map(|e| e.value)
-    };
-    write!(writer, "{{\"settings_seq\":{},\"gpio\":[", snapshot.settings_seq).ok()?;
+    let find_override =
+        |k: &str| -> Option<&str> { extra_entries.iter().find(|e| e.key == k).map(|e| e.value) };
+    write!(
+        writer,
+        "{{\"settings_seq\":{},\"gpio\":[",
+        snapshot.settings_seq
+    )
+    .ok()?;
     for (idx, pin) in BOARD_GPIO_MAP.iter().enumerate() {
         if idx > 0 {
             writer.write_str(",").ok()?;
@@ -649,10 +653,7 @@ pub fn write_config_json(
         if DEFAULT_NVS_CONFIG_ENTRIES
             .iter()
             .any(|&(k, _, _)| k == entry.key)
-            || matches!(
-                entry.key,
-                "lms_ip" | "volume" | "again_code"
-            )
+            || matches!(entry.key, "lms_ip" | "volume" | "again_code")
         {
             continue;
         }
@@ -667,8 +668,8 @@ pub fn write_config_json(
     }
     let host_name_val = find_override("host_name").unwrap_or("BASEMENT");
     let autoexec_val = find_override("autoexec").unwrap_or("1");
-    let autoexec1_val = find_override("autoexec1")
-        .unwrap_or("squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W");
+    let autoexec1_val =
+        find_override("autoexec1").unwrap_or("squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W");
     write!(
         writer,
         "}},\"nvs\":{{\"host_name\":{{\"value\":\"{}\",\"type\":33}},\
@@ -685,10 +686,7 @@ pub fn write_config_json(
 
 /// Formats the `/config.json` payload into `out_buf`.
 #[inline]
-pub fn format_config_json(
-    snapshot: &HttpConfigSnapshot<'_>,
-    out_buf: &mut [u8],
-) -> Option<usize> {
+pub fn format_config_json(snapshot: &HttpConfigSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     write_config_json(snapshot, &[], out_buf)
 }
 
@@ -893,8 +891,7 @@ pub fn format_ap_list_json(
 
     for ap in aps {
         let ssid_len = (ap.ssid_len as usize).min(ap.ssid.len());
-        let ssid_str =
-            core::str::from_utf8(&ap.ssid[..ssid_len]).unwrap_or_default();
+        let ssid_str = core::str::from_utf8(&ap.ssid[..ssid_len]).unwrap_or_default();
         if ssid_str == current_ssid {
             current_found = true;
         }
@@ -1269,7 +1266,12 @@ pub fn execute_web_cli_command(
                 "PSRAM free: {} B, used: {} B",
                 snap.psram_free_bytes, snap.psram_used_bytes
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "version" => {
@@ -1278,7 +1280,12 @@ pub fn execute_web_cli_command(
                 "{} {} (seq {})",
                 REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION, snap.settings_seq
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "i2cdetect" => {
@@ -1287,7 +1294,12 @@ pub fn execute_web_cli_command(
                 "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
                 snap.i2c_acks, snap.i2c_nacks
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "i2cget" | "i2cset" | "i2cdump" | "i2c" => {
@@ -1296,7 +1308,12 @@ pub fn execute_web_cli_command(
                 "I2C0 0x2D: mode={} again=0x{:02X} ACK={} NACK={}",
                 snap.amp_mode, snap.again_code, snap.i2c_acks, snap.i2c_nacks
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "system" | "restart" | "recovery" | "restart_ota" => {
@@ -1310,7 +1327,12 @@ pub fn execute_web_cli_command(
                 snap.ip[3],
                 snap.psram_free_bytes
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "config" => {
@@ -1330,18 +1352,33 @@ pub fn execute_web_cli_command(
                 snap.vol_pct,
                 snap.eq_preset
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "join" => {
             let target_ssid = parts.next().unwrap_or(snap.ssid);
             let _ = write!(msg, "join: ssid={} (credentials staged)", target_ssid);
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "update" => {
             let _ = write!(msg, "update: OTA target ota_0_0x160000 ready");
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "player" => {
@@ -1350,12 +1387,22 @@ pub fn execute_web_cli_command(
                 "player: mode={} vol={}% frames={} codec={}",
                 snap.amp_mode, snap.vol_pct, snap.frames_played, snap.codec
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "sleep" => {
             let _ = write!(msg, "sleep: standby armed (amp={})", snap.amp_mode);
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         "help" => {
@@ -1363,7 +1410,12 @@ pub fn execute_web_cli_command(
                 msg,
                 "commands: system i2c config join update player sleep free heap version i2cdetect"
             );
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         v if v.starts_with("cfg-") => {
@@ -1385,12 +1437,22 @@ pub fn execute_web_cli_command(
                 }
             }
             let _ = write!(msg, "{}: OK (host_name={})", v, config.host_name_str());
-            syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "INFO",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             true
         }
         _ => {
             let _ = write!(msg, "unknown command: {}", verb);
-            syslog.push(snap.uptime_ms, "WARN", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+            syslog.push(
+                snap.uptime_ms,
+                "WARN",
+                "MESSAGING_CLASS_SYSTEM",
+                msg.as_str(),
+            );
             false
         }
     }
@@ -1455,7 +1517,12 @@ pub fn dispatch_web_post_action(
                     "wifi scan: active ssid={} rssi={} dBm",
                     snap.ssid, snap.rssi
                 );
-                syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
             }
             HttpControlAction::ConnectWifi => {
                 if let Some(req) = parse_connect_request(payload) {
@@ -1484,7 +1551,12 @@ pub fn dispatch_web_post_action(
                     new_wifi = Some(creds);
                     let mut msg: String<128> = String::new();
                     let _ = write!(msg, "wifi connect: ssid={}", &dec_ssid[..s_len]);
-                    syslog.push(snap.uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+                    syslog.push(
+                        snap.uptime_ms,
+                        "INFO",
+                        "MESSAGING_CLASS_SYSTEM",
+                        msg.as_str(),
+                    );
                 }
             }
             HttpControlAction::DisconnectWifi => {
@@ -1544,8 +1616,7 @@ pub fn format_messages_json(
             let Some(entry) = r.entry(idx) else {
                 continue;
             };
-            let needed = ENTRY_RESERVE_THRESHOLD
-                .max(STATS_RESERVE_BYTES + 160 + entry.msg.len());
+            let needed = ENTRY_RESERVE_THRESHOLD.max(STATS_RESERVE_BYTES + 160 + entry.msg.len());
             if writer.remaining_len() < needed {
                 break;
             }
@@ -2011,7 +2082,16 @@ pub fn write_eq_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> O
         snapshot.eq_enabled,
         snapshot.again_code,
         snapshot.vol_pct,
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
     )
     .ok()?;
     Some(writer.written_len())
@@ -2740,12 +2820,12 @@ pub fn handle_http_request_streaming_impl(
                 let decoded_val = percent_decode_into(upd.value, &mut decoded_val_buf)
                     .and_then(|len| core::str::from_utf8(&decoded_val_buf[..len]).ok())
                     .unwrap_or(upd.value);
-                let display_val =
-                    if crate::config_handle::is_secret_config_key(decoded_key.trim()) {
-                        "********"
-                    } else {
-                        decoded_val
-                    };
+                let display_val = if crate::config_handle::is_secret_config_key(decoded_key.trim())
+                {
+                    "********"
+                } else {
+                    decoded_val
+                };
                 write!(
                     writer,
                     "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
@@ -2792,12 +2872,8 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             let rssi_i8 = snapshot.rssi.clamp(-127, 0) as i8;
-            let body_len = format_ap_list_json(
-                &[],
-                snapshot.ssid,
-                rssi_i8,
-                &mut out_buf[HEADER_ROOM..],
-            );
+            let body_len =
+                format_ap_list_json(&[], snapshot.ssid, rssi_i8, &mut out_buf[HEADER_ROOM..]);
             let total_len = write_json_http_response(body_len, out_buf)?;
             Some((total_len, &[], HttpControlAction::None))
         }
@@ -3823,9 +3899,15 @@ mod tests {
 
     #[test]
     fn test_board_gpio_map_scl_pin_27_no_conflict() {
-        let scl = BOARD_GPIO_MAP.iter().find(|p| p.name == "SCL").expect("SCL pin");
+        let scl = BOARD_GPIO_MAP
+            .iter()
+            .find(|p| p.name == "SCL")
+            .expect("SCL pin");
         assert_eq!(scl.gpio, 27);
-        let do_pin = BOARD_GPIO_MAP.iter().find(|p| p.name == "DO").expect("DO pin");
+        let do_pin = BOARD_GPIO_MAP
+            .iter()
+            .find(|p| p.name == "DO")
+            .expect("DO pin");
         assert_eq!(do_pin.gpio, 22);
         assert_ne!(scl.gpio, do_pin.gpio);
     }
@@ -4178,10 +4260,20 @@ mod tests {
         let mut cfg = crate::config_handle::ConfigHandle::default();
         let mut syslog = SyslogRingBuffer::new();
 
-        assert!(execute_web_cli_command("free", &snap, &mut cfg, &mut syslog));
+        assert!(execute_web_cli_command(
+            "free",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
         assert!(syslog.latest_message().contains("PSRAM free:"));
 
-        assert!(execute_web_cli_command("i2cdetect", &snap, &mut cfg, &mut syslog));
+        assert!(execute_web_cli_command(
+            "i2cdetect",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
         assert!(syslog.latest_message().contains("0x2D"));
 
         assert!(execute_web_cli_command(
