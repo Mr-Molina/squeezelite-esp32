@@ -6,6 +6,48 @@
 
 ---
 
+## 0. Status correction (2026-11-16) — read this first
+
+Sections 1–5 below overstate what runs on the device. In them, "Rust device ✅"
+and `IMPLEMENTED & VERIFIED` mean that the code exists in the workspace and
+passes host tests. They do **not** mean the firmware calls it, and they do not
+mean it was exercised on hardware. Where this section and a later one disagree,
+this section is correct.
+
+Checked against the code at `e409596d` by searching for references from the
+firmware entry points (`louder-esp32-app/src/main.rs`, `tasks.rs`,
+`coordinator.rs`). Hardware evidence is taken from
+`.agents/knowledge/SYSTEM_STATE.md` (`HW1`, `WO-2026-1115-002`).
+
+States:
+
+- **Certified** — the firmware runs it and there is recorded hardware evidence.
+- **Wired** — the firmware calls it; no recorded hardware evidence.
+- **Library-only** — compiled and host-tested, but the firmware never calls it.
+- **Not functional** — a placeholder that cannot work on the device.
+
+| # | Subsystem | State on device | What is actually true |
+|---|---|---|---|
+| 1 | Slimproto protocol | Certified (LMS playback) | Certified for FLAC and MP3 playback from LMS. Not on device: UDP server discovery (`DiscoveryBuilder` is used only by the host `network.rs`; the LMS IP must be configured); `serv` to SqueezeNetwork is ignored (`PlayerCoordinator::switch_server`, no DNS resolver); the display and visualiser commands (`grfe`, `grfb`, `visu`, `vfdc`, `ledv`) are handled only in `display_gds.rs`/`controls.rs`, which the firmware does not call. `IR` frames are sent, from the HTTP command path only. |
+| 2 | Codecs | FLAC, MP3: Certified. PCM, AAC, Vorbis, ALAC, Opus: Wired | All seven are constructible in the firmware build (`ActiveDecoder`, `pipeline.rs`) and advertised in HELO. Only FLAC and MP3 have hardware evidence. Open question: the firmware uses the small scratch buffers (`PCM_SCRATCH_SAMPLES` 2304, `READ_SCRATCH_BYTES` 1728) while the comment above them says AAC and Vorbis need the large ones. Untested on device. |
+| 3 | Playback semantics (gapless, fade, gain) | Wired | In the pipeline and host-tested. The only hardware evidence is the FLAC end-of-stream flush. |
+| 4 | Clocking, DACs, S/PDIF, dual-core | TAS58xx at 44.1 kHz: Certified. Other rates: Wired. Rest: Library-only | `dac_platform.rs` (the other DAC families and `SpdifBmcEncoder`) is library-only. **Dual-core is not implemented**: decode and output run on core 0 in every build, and core 1 runs a heartbeat only (`tasks.rs` module docs, "Core placement"). Moving them is open task `D1`. |
+| 5 | DSP (EQ, loudness, resampler) | Wired | Called from the pipeline; no hardware evidence recorded. |
+| 6 | Wi-Fi, provisioning, mDNS, Ethernet | Station mode: Certified. mDNS: Wired. Rest: Library-only | The firmware only ever configures `WifiModeConfig::Station`, so softAP and the captive portal are never started. `eth_w5500.rs` is library-only. |
+| 7 | Web UI, REST, console | REST: Certified (subset). Telnet: Library-only | `/`, `/config.json`, `/messages.json`, `/commands.json`, `/flash.json` and `/recovery.json` were exercised on hardware. Nothing listens on TCP 23; `TELNET_PORT` is defined in `console.rs` and never bound. |
+| 8 | OTA, recovery, settings persistence | OTA: Certified | Runtime settings persistence (`runtime-flash-persist`) is off by default and not hardware-certified; settings reach flash on the reboot paths only. |
+| 9 | Bluetooth | A2DP sink: Wired. A2DP source: Library-only | `BtA2dpSink` is used by the firmware. The source state machine and `SbcEncoder` are referenced only inside `bt_a2dp.rs`. No hardware evidence in the current ledgers. |
+| 10 | AirPlay | Audio path: Wired (partial) | RTSP on TCP 5000 and RTP audio on UDP 6000 are wired. The firmware opens only two UDP sockets (mDNS and RTP audio), so there is no timing or control channel: no clock sync and no resend requests. DACP and DMAP are not referenced by the firmware. No hardware evidence. |
+| 11 | Spotify Connect | Not functional | The TCP 4070 handler (`main.rs`) answers `getInfo` with a fixed body and an empty `publicKey`, then treats raw TCP bytes as Spirc frames or PCM. The HTTP zeroconf path (`http_control.rs`) builds a new `ZeroConfServer` per request and returns `HttpControlAction::None`, so `addUser` credentials are not kept. Shannon, Mercury and the CDN client are not referenced by the firmware. Only `getInfo` was checked on hardware. |
+| 12 | Display, CYD, controls | CYD link: Wired. Rest: Library-only | `display_gds.rs` and `controls.rs` are library-only. |
+| 13 | Power, battery, LEDs, board targets | Library-only | `power_boards.rs` is library-only. ESP32-S3: every Xtensa dependency in `louder-esp32-app/Cargo.toml` selects the `esp32` chip feature, so an S3 build is not possible as configured (read from the manifest, not attempted). |
+
+Constraint that applies to wiring any of the library-only code: at `579ffcde`
+IRAM is 129,636 of 131,072 B and `.dram2_uninit` is 98,520 of 98,768 B.
+CI now enforces these budgets (`rust/scripts/check_section_budget.py`).
+
+---
+
 ## 1. Executive summary
 
 All Phases 0–7 (`WO-157`–`WO-232`) of the MK5-Rust standalone parity roadmap have been implemented and verified:
@@ -95,7 +137,7 @@ Legend: ✅ `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) · 🟡 partial �
 | TAS5805M / TAS5825M driver | — | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `squeezelite-tas58xx` with FS/BCK/PLL/automute telemetry, analog gain, fault recovery, spread spectrum |
 | Multi-DAC platform (`adac` parity) | TAS57xx, TAS5713, AC101, WM8978, ES8388, ES8311, generic-JSON | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `louder-esp32-app::dac_platform::ExternalDac` implementations for all 7 families + `dac_config` parser |
 | SPDIF digital output | ✅ software BMC | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `dac_platform::SpdifBmcEncoder` (IEC 60958 subframes, B/M/W preambles, biphase-mark encoding, `spdif_config`) |
-| Dual-core execution | ✅ FreeRTOS tasks | ✅ | ✅ | `IMPLEMENTED & VERIFIED` (`[EXECUTED & VERIFIED]`) — `esp-rtos` + `embassy-executor` on Core 0 (network/control) and Core 1 (`decode_pump` + `i2s_feed`) |
+| Dual-core execution | ✅ FreeRTOS tasks | ❌ | ⬜ | **Not implemented** (corrected 2026-11-16, see section 0) — decode and output run on core 0; core 1 runs a heartbeat only. Open as `D1` in `docs/mk5-rust-todo.md` |
 
 ### 2.5 Subsystem 5: DSP (EQ, loudness contour & resampler)
 

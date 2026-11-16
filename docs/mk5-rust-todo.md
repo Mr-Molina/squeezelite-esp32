@@ -5,6 +5,11 @@ file plus the code; you do not need the conversation that produced it.
 
 State when written: branch `MK5-Rust` at `e35b2e24`, pushed to `origin`.
 Updated at: branch `MK5-Rust` at `579ffcde` (`WO-2026-1114-004` Waves 1–3 complete: `T01`–`T27` marked `[x]`; `WO-2026-1115-002` complete: `HW1` certified `[x]` on `"BASEMENT"` `172.22.1.15`; only owner-gated `D1` remains `[ ]`).
+Corrected at: `e409596d` (2026-11-16). This list covers the performance and
+cleanup work that followed the review of `87793784`. It is **not** a statement
+of feature parity: several subsystems exist only as host-tested library code
+that the firmware never calls. See section 5 and section 0 of
+`docs/superpowers/plans/2026-10-29-rust-parity-analysis.md`.
 Line numbers below were checked at `e35b2e24`; they drift, so locate code by
 the function or symbol named next to each one.
 
@@ -29,13 +34,17 @@ ESP32. All Rust lives under `rust/` (a Cargo workspace). Key crates:
 **Device facts that drive priorities.**
 - Target: ESP32 (Xtensa LX6, 240 MHz, single-precision FPU, no 64-bit divide
   instruction, slow flash-cached rodata) and ESP32-S3. Bare metal, `esp-hal 1.0`.
-- The firmware build (default features, no `std-codecs`) ships only: the static
-  MP3 decoder, FLAC, PCM, AirPlay (ALAC), Bluetooth A2DP (SBC). AAC, Vorbis and
-  Opus are **host-only**. Spotify (`squeezelite-cspot` CDN/AES/Shannon) and
-  `RtpJitterBuffer` are **not wired into the app**.
+- The firmware build (default features, no `std-codecs`) can construct all
+  seven decoders (`ActiveDecoder` in `pipeline.rs`: PCM, the static MP3 decoder,
+  FLAC, AAC, Vorbis, ALAC, Opus) and advertises them in HELO. Only **FLAC and
+  MP3 are certified on hardware** (`HW1`); the others have never been played on
+  the device, and the firmware runs them with the small scratch buffers
+  (`READ_SCRATCH_BYTES` 1728, `PCM_SCRATCH_SAMPLES` 2304). Spotify
+  (`squeezelite-cspot` CDN/AES/Shannon) and `RtpJitterBuffer` are **not wired
+  into the app**.
 - Everything runs on core 0 in one superloop: `pump_device_phase`
-  (`main.rs:4072`). Core 1 only spins a heartbeat (`app_core_loop`,
-  `main.rs:1192`).
+  (`main.rs:4659` at `e409596d`). Core 1 only spins a heartbeat
+  (`app_core_loop`, `main.rs:1248`).
 - I2S DMA buffer is 16 KB = 2048 stereo frames ≈ 46 ms at 44.1 kHz
   (`I2S_DMA_BUFFER_BYTES`, `main.rs`). Anything that blocks the loop longer
   than that underruns audio.
@@ -81,10 +90,21 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Firmware type-check (Espressif toolchain is installed as `+esp`)
 cargo +esp check -p louder-esp32-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
-cargo +esp clippy --workspace --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -- -D warnings
+# (not `--workspace`: that builds squeezelite-decoders with its default `std`
+# feature, which fails for a no_std target; checked at `e409596d`)
+cargo +esp clippy -p louder-esp32-app -p cyd-controller-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -- -D warnings
 
 cargo fmt --all
+
+# Memory-section budgets of the release firmware (IRAM, .dram2_uninit, .stack)
+cargo +esp build --release -p louder-esp32-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+python3 scripts/check_section_budget.py target/xtensa-esp32-none-elf/release/louder-esp32-app
 ```
+
+CI (`.github/workflows/rust-ci.yml`) runs two jobs: the host gates
+(`cargo fmt --check`, host clippy, `cargo test --workspace`) and a `firmware`
+job (Xtensa clippy, the `esp-rtos-core1` feature check, the release build and
+the section-budget check above).
 
 **Known baseline failures at `e35b2e24`** (all predate the last three commits;
 T01–T03 fix them):
@@ -434,12 +454,18 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 ### Deferred (blocked)
 
 - [ ] **D1 — Move decode + output to core 1** · biggest structural win · L · **OPEN (owner-gated)**
-- Core 1 runs only a heartbeat (`app_core_loop`, `main.rs:1192`). Moving
+- Core 1 runs only a heartbeat (`app_core_loop`, `main.rs:1248` at `e409596d`). Moving
   `pump_decode_paced` + `pump_output` there (via the existing SPSC ring split
   handles) would free core 0 for Wi-Fi/BT/network.
 - Blocked on the core-1 owner hardware gate described in
   `louder-esp32-app/Cargo.toml` (feature `esp-rtos-core1`) and Invariant 47.
   Do not start without explicit go-ahead from the user.
+- Memory headroom to plan around (at `579ffcde`): IRAM 129,636 of 131,072 B,
+  `.dram2_uninit` 98,520 of 98,768 B, `.stack` 28,528 B. Core 1's entry function
+  must be in IRAM (Invariant 47), so D1 probably needs a re-budget first.
+- Unresolved: Invariant 48 requires `.stack >= 36,000` B, but the certified
+  build has 28,528 B and the ledgers gate on `>= 28,000` B. CI uses 28,000. The
+  owner should decide which number is binding and update the other.
 
 ---
 
@@ -453,3 +479,34 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 
 Report back per task: commit hash, tests run (with any still-failing names),
 whether gains were measured (`decode_us_max`, cycles, size) or estimated.
+
+---
+
+## 5. Not covered by this list
+
+Everything above is done except `D1`, but the firmware is not at feature parity
+with the C player. The per-subsystem status is in section 0 of
+`docs/superpowers/plans/2026-10-29-rust-parity-analysis.md`. None of the items
+below has a task yet; each needs an owner decision on whether it matters before
+anyone starts.
+
+Needs the device (owner approval required):
+
+- Hardware certification of what is already wired: AirPlay, Bluetooth A2DP
+  sink, the AAC/Vorbis/ALAC/Opus/PCM decoders, and sample rates other than
+  44.1 kHz.
+
+Wired but incomplete:
+
+- AirPlay has no timing or control channel (no clock sync, no resend requests)
+  and no DACP or DMAP.
+- Spotify Connect is a placeholder: no access-point login, credentials are not
+  kept, and the Shannon/Mercury/CDN code is not called.
+- No LMS discovery or DNS on the device; `serv` to SqueezeNetwork is ignored.
+- Wi-Fi is station-only; softAP and the captive portal are never started.
+
+Library-only (host-tested, never called by the firmware):
+
+- `display_gds.rs`, `controls.rs`, `dac_platform.rs` (other DACs, S/PDIF),
+  `eth_w5500.rs`, `power_boards.rs`, the Telnet server in `console.rs`, and the
+  Bluetooth A2DP source in `bt_a2dp.rs`.
