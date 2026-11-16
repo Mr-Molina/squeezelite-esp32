@@ -106,6 +106,10 @@ The following mechanical invariants are binding safety rules enforced across ses
 ## Invariant 69: User-Intent Preservation & Anti-Feature-Stripping Gate (PAT-2026-1014-002 / PM-2026-1026-002)
 - **Rule**: Never resolve a bug or test failure by silently disabling or downgrading an enabled feature (`ADAPTIVE_BED_MESH`, `transfer_call`, call forwarding) without prior user consent.
 
+## Invariant 70: Mandatory Terminal Proposal Summary Gate (GLB-023 / PM-2026-1106-001 / IMP-2026-1106-001)
+- **MUST**: Every final response that asks the user for permission or stops working MUST end with a structured `### Proposal Summary` block as the last thing printed to the screen (enumerating `#`, `Target System`, `Proposed Action`, `Scope / Affected Entities`, `Command / Mechanism`, and `Mode`, or explicitly stating `None — Task 100% complete` when zero actions remain per Invariant 65).
+- **MUST NOT**: Never bury permission requests in prose subsections or print additional content after the terminal Proposal Summary and approval prompt. Full rule: `C:\Users\jmolina\.gemini\config\rules\orchestrator-delegation-and-narration.md`.
+
 ## Historical / Retired Global Invariants Index
 Retired/merged global numbers (1–99) are never reused:
 - **Invariants 1–12**: Consolidated into `/wakeup`, `/goodbye`, `wakeup_bootstrap.py`, and Invariant 13.
