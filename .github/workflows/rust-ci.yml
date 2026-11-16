@@ -39,3 +39,52 @@ jobs:
       - name: Cargo Test
         working-directory: rust
         run: cargo test --workspace
+
+  # Builds the image that actually runs on the device. The host job above never
+  # compiles the `cfg(target_arch = "xtensa")` code or links against the
+  # ESP32 memory map.
+  firmware:
+    name: Firmware (xtensa-esp32)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      XTENSA_ARGS: --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Installs the `esp` toolchain (Xtensa rustc fork + xtensa-esp-elf GCC).
+      # Every cargo call below uses `+esp`, so `rust/rust-toolchain.toml`
+      # (host toolchain pin) does not apply to this job.
+      - name: Install Espressif Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          version: "1.97.0.0"
+          buildtargets: esp32
+          default: false
+          ldproxy: false
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Not `--workspace`: selecting every member as a root builds
+      # squeezelite-decoders with its default `std` feature, which cannot
+      # compile for a no_std target. The two firmware binaries pull in every
+      # library crate with the features the device actually uses.
+      - name: Xtensa Clippy
+        run: cargo +esp clippy -p louder-esp32-app -p cyd-controller-app $XTENSA_ARGS -- -D warnings
+
+      # Both core-1 start paths must compile (see `esp-rtos-core1` in
+      # crates/louder-esp32-app/Cargo.toml).
+      - name: Check esp-rtos-core1 feature
+        run: cargo +esp check -p louder-esp32-app --features esp-rtos-core1 $XTENSA_ARGS
+
+      - name: Build release firmware
+        run: cargo +esp build --release -p louder-esp32-app $XTENSA_ARGS
+
+      - name: Check memory-section budgets
+        run: python3 scripts/check_section_budget.py target/xtensa-esp32-none-elf/release/louder-esp32-app

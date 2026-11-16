@@ -27,6 +27,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+CI also has a `firmware` job (Espressif `+esp` toolchain): Xtensa clippy, the `esp-rtos-core1` feature check, the release build of `louder-esp32-app`, and `scripts/check_section_budget.py` on the resulting ELF. Commands are in `docs/mk5-rust-todo.md` section 2.
+
 ## Conventions
 
 - Final responses that ask for permission or stop work end with a `### Proposal Summary` block (Invariant 70).
