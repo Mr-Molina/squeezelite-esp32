@@ -463,9 +463,9 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Memory headroom to plan around (at `579ffcde`): IRAM 129,636 of 131,072 B,
   `.dram2_uninit` 98,520 of 98,768 B, `.stack` 28,528 B. Core 1's entry function
   must be in IRAM (Invariant 47), so D1 probably needs a re-budget first.
-- Unresolved: Invariant 48 requires `.stack >= 36,000` B, but the certified
-  build has 28,528 B and the ledgers gate on `>= 28,000` B. CI uses 28,000. The
-  owner should decide which number is binding and update the other.
+- Stack floor: `.stack >= 28,000` B (Invariant 48, owner decision 2026-11-16;
+  previously 36,000 B). The certified build has 28,528 B, so 528 B of headroom.
+  CI enforces it.
 
 ---
 
