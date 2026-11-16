@@ -4,6 +4,8 @@
     "ms-vscode-remote.remote-wsl",
     "ms-vscode.cpptools",
     "espressif.esp-idf-extension",
-    "eamodio.gitlens"
+    "eamodio.gitlens",
+    "rust-lang.rust-analyzer",
+    "tamasfe.even-better-toml"
   ]
 }
