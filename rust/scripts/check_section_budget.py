@@ -6,7 +6,7 @@ budget is exceeded. Budgets and their sources:
 
   IRAM (.vectors + .rwtext + .rwtext.wifi) <= 131072 B   Invariant 48
   .dram2_uninit                            <=  98768 B   Invariant 48
-  .stack                                   >=  28000 B   SYSTEM_STATE.md gate
+  .stack                                   >=  28000 B   Invariant 48
 
 Usage: check_section_budget.py <elf> [--min-stack N] [--max-iram N] [--max-dram2 N]
 """
