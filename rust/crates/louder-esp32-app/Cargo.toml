@@ -10,11 +10,12 @@ description = "Clean-slate Rust firmware application for Louder-ESP32-Plus audio
 default = ["board-louder-esp32"]
 board-louder-esp32 = []
 board-louder-esp32-s3 = []
-# Host-class codec set: heap-boxed MP3 decoder, AAC + Ogg Vorbis (std-only decoders) and the
-# larger decode scratch buffers they need. Off for the xtensa firmware (static MP3 decoder from
-# bring-up, FLAC, PCM). Host test builds turn it on through the self dev-dependency below, so
-# `cargo test` exercises the full codec set while `cargo +esp build --target xtensa-...` (default
-# features) keeps it off.
+# Host-class codec configuration: `squeezelite-decoders/std`, a heap-boxed MP3 decoder per track
+# and the larger decode scratch buffers (`pipeline.rs`). It does not decide which codecs exist:
+# every decoder (PCM, MP3, FLAC, AAC, Vorbis, ALAC, Opus) is built with `alloc` alone, so the
+# xtensa firmware has all of them too, with the static MP3 decoder from bring-up and the small
+# scratch buffers. Host test builds turn this on through the self dev-dependency below;
+# `cargo +esp build --target xtensa-...` (default features) keeps it off.
 std-codecs = ["squeezelite-decoders/std"]
 # Core-1 start path switch (Task 8, S1 sequencing note). Default (off): the battle-tested manual
 # path — park APP_CPU, copy the PRO flash-MMU/cache registers into the APP registers, then

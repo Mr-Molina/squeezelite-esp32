@@ -56,7 +56,7 @@
 
 ## Verification Status
 - `859 passed, 0 failed` host workspace tests passing (`cargo test --workspace --all-features --no-fail-fast`; re-verified warm in `WO-2026-1115-001`; Wave 1 `c186c659`: `845`, Wave 2 `f7b58cf0`: `851`, Wave 3 `579ffcde`: `859`)
-- `0` Clippy warnings on host and 10-crate Xtensa target (`cargo +esp clippy --workspace --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -- -D warnings`)
+- `0` Clippy warnings on host and Xtensa target (`cargo +esp clippy -p louder-esp32-app -p cyd-controller-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -- -D warnings`; corrected 2026-11-16: the `--workspace` form recorded here before fails in `byteorder`, because it builds `squeezelite-decoders` with its default `std` feature for a no_std target. Now enforced by the CI `firmware` job)
 - `0` Google Rust Audit errors/warnings (`google_rust_audit.py --strict`: `0 errors, 0 warnings`)
 - `esp-rtos-core1` feature check passing (`louder-esp32-app` `xtensa-esp32-none-elf`)
 - Release ELF section telemetry (`target/xtensa-esp32-none-elf/release/` at `579ffcde`; re-verified in `WO-2026-1115-002` Wave 1, `rust/target` cleaned in `WO-2026-1115-001` and Wave 4A-1):
