@@ -2,6 +2,17 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-16 17:17 | Claude Code | [squeezelite-esp32] Parity Doc Correction, Firmware CI Job, Stack-Floor Decision & Doc Cleanups
+**Scope**: Project analysis on `MK5-Rust`, then three documentation/CI changes. No Rust source under `rust/crates/*/src` changed. The device was not contacted, flashed or rebooted.
+- **Key Outcomes**:
+  - **Parity docs corrected (PR `#2`, `a825b16c`)**: `docs/superpowers/plans/2026-10-29-rust-parity-analysis.md` gained section 0 with the real per-subsystem state on the device (certified / wired / library-only / not functional). Several subsystems marked `IMPLEMENTED & VERIFIED` are host-tested library code the firmware never calls; Spotify Connect is a placeholder; dual-core is not implemented (`D1`). `docs/mk5-rust-todo.md` section 5 lists the gaps that have no task.
+  - **Firmware CI job (PR `#2`)**: `.github/workflows/rust-ci.yml` has a `firmware` job (Espressif `esp` toolchain `1.97.0.0`): Xtensa clippy, `esp-rtos-core1` feature check, release build, and `rust/scripts/check_section_budget.py`. First run passed on GitHub. Four legacy C workflows whose trigger branches no longer exist were removed.
+  - **Xtensa clippy command**: `cargo +esp clippy --workspace --target xtensa-esp32-none-elf ...` fails in `byteorder` (it builds `squeezelite-decoders` with default `std`). The working form is `-p louder-esp32-app -p cyd-controller-app`; CI, the todo and `SYSTEM_STATE.md` now use it.
+  - **Owner decisions (PR `#3`, `ee3ff537`)**: Invariant 48 stack floor set to `.stack >= 28,000` B (was `36,000`); `codeql-analysis.yml` removed. `rust-ci.yml` is the only workflow.
+  - **Cleanups (this entry's PR)**: added `rust/vendor/esp-radio/VENDOR.md` (patch list from a diff against crates.io `1.0.0-beta.1`), corrected the `std-codecs` comment in `louder-esp32-app/Cargo.toml`, corrected the clippy command in `SYSTEM_STATE.md`.
+  - **Local verification (Windows host)**: host gates green (`859` tests); release firmware ELF at IRAM `129,636` B, `.dram2_uninit` `98,520` B, `.stack` `28,528` B.
+- **Next-Session Handoff Notes**: `"BASEMENT"` (`172.22.1.15`) still runs `579ffcde` in `ota_0` (`never touch /dev/ttyUSB0`, never call `POST /reboot_ota.json`). Open, all needing the owner: hardware certification of what is wired but untested (AirPlay, BT A2DP sink, AAC/Vorbis/ALAC/Opus/PCM, rates other than 44.1 kHz); `D1` (owner-gated, memory headroom is 1,436 B IRAM / 248 B `.dram2_uninit` / 528 B stack); priority call on the parity gaps in todo section 5. `SYSTEM_STATE.md` host details still describe the Linux host `pc-1`; this session ran on a Windows host. The Obsidian vault `sessions.md` was not updated.
+
 ## 2026-11-15 10:10 | Antigravity Orchestrator | [squeezelite-esp32] Branch Pruning, Default-Branch Promotion, Git GC & Remote Push (WO-2026-1115-003)
 **Scope**: Executed `WO-2026-1115-003` repository restructuring and hygiene closeout: promoted `MK5-Rust` to GitHub repository default branch, pushed active branch `MK5-Rust` (`b24f937a..cdffe9cf`), archived legacy branches (`master-v4.3`, `origin/My_Version`, `origin/milestone-mk-5`) into a verified bundle, pruned remote and local branches, maintained `sle118` upstream remote, aligned `origin/HEAD`, performed aggressive `git gc --prune=now` compaction, and updated system ledgers.
 - **Key Outcomes**:
