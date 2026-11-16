@@ -1,0 +1,29 @@
+{
+  "workspace": "s:\\github\\squeezelite-esp32",
+  "manifests_detected": {
+    "cargo": [
+      "S:\\Github\\squeezelite-esp32\\rust\\Cargo.lock",
+      "S:\\Github\\squeezelite-esp32\\rust\\Cargo.toml"
+    ],
+    "npm": [],
+    "python": []
+  },
+  "scans": {
+    "cargo_audit": {
+      "tool": "cargo",
+      "status": "completed",
+      "findings_count": 0,
+      "exit_code": 0,
+      "stdout_preview": "{\"database\":{\"advisory-count\":1509,\"last-commit\":\"02e2517f457a359fc6d3440ea4560c8ea188fee8\",\"last-updated\":\"2026-11-15T10:59:21+01:00\"},\"lockfile\":{\"dependency-count\":267},\"settings\":{\"target_arch\":[],\"target_os\":[],\"severity\":null,\"ignore\":[],\"informational_warnings\":[\"unmaintained\",\"unsound\",\"notice\"]},\"vulnerabilities\":{\"found\":false,\"count\":0,\"list\":[]},\"warnings\":{\"unmaintained\":[{\"kind\":\"unmaintained\",\"package\":{\"name\":\"paste\",\"version\":\"1.0.15\",\"source\":\"registry+https://github.com/rust-lang/crates.io-index\",\"checksum\":\"57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a\",\"replace\":null},\"advisory\":{\"id\":\"RUSTSEC-2024-0436\",\"package\":\"paste\",\"title\":\"paste - no longer maintained\",\"description\":\"The creator of the crate `paste` has stated in the [`README.md`](https://github.com/dtolnay/paste/blob/master/README.md) \\nthat this project is not longer maintained as well as archived the repository\\n\\n## Possible Alternative(s)\\n\\n- [`pastey`]: a fork of paste and is aimed",
+      "stderr_preview": ""
+    }
+  },
+  "total_findings": 0,
+  "scanner_errors": {},
+  "timestamp": 1794847247.3722913,
+  "scanned_at": "2026-11-16T16:40:47.372294+00:00",
+  "status": "success",
+  "manifest_hash": "ee9d53a3c906325ca5b6f2197b106c0e83476c9f9aa85699af77dbc4380ea4a8",
+  "manifest_hash_persisted": "S:\\Github\\squeezelite-esp32\\.agents\\.manifest_hash",
+  "workspace_marked_scanned": true
+}
