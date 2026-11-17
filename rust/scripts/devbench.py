@@ -41,9 +41,13 @@ BASEMENT_MAC = "c8:2e:18:be:b8:34"
 CYD_MAC = "d4:d4:da:5a:e7:3c"
 
 PORT = "COM13"
-# `ota_0` in the C partition layout (`partitions.csv`): recovery ends at
-# 0x10000 + 0x150000.
-OTA_0_OFFSET = 0x160000
+# `ota_0` as read from DEVBENCH's own partition table on 2026-11-17
+# (WO-F1-dev-module-bringup): offset 0x150000, size 0x2A0000. BASEMENT's
+# `ota_0` is recorded as 0x160000 / 0x290000, so the size limit here is the
+# smaller of the two: an image that fits DEVBENCH must also fit BASEMENT.
+# If the owner has the module repartitioned to BASEMENT's layout, change the
+# offset to 0x160000.
+OTA_0_OFFSET = 0x150000
 OTA_0_SIZE = 0x290000
 
 LOCK_NAME = "dev-module.lock"
