@@ -43,3 +43,30 @@ class MacTests(unittest.TestCase):
     def test_only_recorded_mac_is_allowed(self):
         self.assertTrue(devbench.mac_allowed(devbench.DEVBENCH_MAC.upper()))
         self.assertFalse(devbench.mac_allowed("00:11:22:33:44:55"))
+
+class ReviewFixTests(unittest.TestCase):
+    """Cases added after review; the seven above are the plan's."""
+
+    def setUp(self):
+        self.lock = Path(tempfile.mkdtemp()) / "dev-module.lock"
+
+    def test_attempt_is_refused_when_lock_changed_hands(self):
+        devbench.acquire(self.lock, "feat/a", T0)
+        devbench.acquire(self.lock, "feat/b", T0 + timedelta(hours=3))
+        with self.assertRaises(devbench.LockNotHeld):
+            devbench.record_attempt(self.lock, "feat/a")
+        self.assertEqual(devbench.record_attempt(self.lock, "feat/b"), 1)
+
+    def test_mutation_waits_for_the_guard(self):
+        devbench.acquire(self.lock, "feat/a", T0)
+        guard = self.lock.with_name(self.lock.name + ".guard")
+        guard.write_text("held by another process")
+        with self.assertRaises(devbench.GuardBusy):
+            devbench.acquire(self.lock, "feat/b", T0 + timedelta(hours=3), guard_timeout=0.2)
+        guard.unlink()
+        self.assertEqual(devbench.acquire(self.lock, "feat/b", T0 + timedelta(hours=3)), "takeover")
+        self.assertFalse(guard.exists())
+
+    def test_timestamp_without_offset_is_read_as_utc(self):
+        self.lock.write_text('{"branch": "feat/a", "timestamp": "2026-11-17T12:00:00", "attempts": 0}')
+        self.assertEqual(devbench.acquire(self.lock, "feat/b", T0 + timedelta(minutes=5)), "busy")
