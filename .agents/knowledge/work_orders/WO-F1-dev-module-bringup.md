@@ -5,12 +5,12 @@
 - **Plan**: `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, work order F1
 - **Spec**: `docs/superpowers/specs/2026-11-17-parity-branch-distribution-design.md`, section 8
 - **Target**: second Louder-ESP32 on `COM13` of the owner's Windows PC (CH340, `USB\VID_1A86&PID_7523`)
-- **Status**: Tasks 1 to 3 done. **Task 4 is blocked on the owner confirming the install route in section 5.** Nothing has been written to the module.
+- **Status**: Tasks 1 to 3 done. Owner confirmed **Route A** on 2026-11-17. Task 4 Step 2 done (Rust app in `ota_0`, section 8). **Waiting for the owner to provision Wi-Fi on the C setup page** before the boot slot is switched.
 
 ## 0. Guardrails
 
 - BASEMENT (`172.22.1.15`, MAC `c8:2e:18:be:b8:34`) was not contacted in any way.
-- The only operations run on `COM13` were `espflash board-info` and `espflash read-flash`. No write, no erase.
+- Up to the owner checkpoint the only operations run on `COM13` were `espflash board-info` and `espflash read-flash`. Writes after the checkpoint are listed in section 8.
 - The backup may hold Wi-Fi credentials. Its NVS and `settings` contents were not printed or inspected; only whether those regions are blank was computed. The backup is outside the repository and is never committed.
 
 ## 1. Identification
@@ -86,7 +86,7 @@ What the difference means for the Rust firmware, from the source:
 
 ## 5. Proposed install route — owner checkpoint
 
-**No write has been made. Task 4 does not start until the owner confirms one of these.**
+**Owner decision, 2026-11-17: Route A.** The text below is the proposal as it was put to the owner.
 
 ### Route A (recommended): keep the C layout already on the module
 
@@ -167,3 +167,33 @@ Known and left alone:
 | `SL_DEVICE_NAME=DEVBENCH cargo check -p louder-esp32-app` | compiles |
 
 The firmware gates were run on the commit before this file and the `OTA_0_OFFSET` change, which touch no Rust code. There is no dev-module check in this run: nothing has been flashed.
+
+## 8. Task 4 progress (Route A)
+
+### 8.1 Wi-Fi state, read from the C recovery boot log
+
+Serial capture of one normal boot at 115200 baud, 40 s, with any line that could carry a credential withheld before it reached disk (one line was).
+
+- Bootloader: `ESP-IDF v4.3.5-dirty 2nd stage bootloader`, partition table as in section 3, `boot: Defaulting to factory image`, `Loaded app from partition at offset 0x10000`.
+- App: `App version: I2S-4MFlash-1681`, `spiram: Adding pool of 4059K of external SPI memory`, `RECOVERY APPLICATION`.
+- Wi-Fi: `Existing wifi config found. Attempting to connect.` then `WIFI_EVENT_STA_DISCONNECTED ... reason code: 201 (WIFI_REASON_NO_AP_FOUND)`, then `Configuring Access Point.` / `AP SSID: louder-esp32`.
+
+So the module holds a saved network that is not in range here, and falls back to its own access point `louder-esp32`. **It is not provisioned for this site.** `SL_WIFI_PASS` and `SL_WIFI_SSID` are not set on this PC.
+
+### 8.2 Rust app written to `ota_0`
+
+| Item | Value |
+| :--- | :--- |
+| Build | `SL_DEVICE_NAME=DEVBENCH cargo +esp build --release -p louder-esp32-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc`, commit `f99654d7` code |
+| Budget | IRAM 129,636 B, `.dram2_uninit` 98,520 B, `.stack` 28,528 B (same as the BASEMENT-named build) |
+| Image | `rust/target/devbench/louder-esp32-app-devbench.bin`, 2,007,104 B, SHA-256 `276d44945820f03695e2302fde6f35057e439bc4f3f5a51c8a456ce3b0dc402d` |
+| Command | `python rust/scripts/devbench.py flash foundation/dev-module-bringup <image>` (lock held, MAC `ac:15:18:fd:93:9c` checked, attempt 1 of 2) |
+| Result | `Binary successfully written to flash!` at `0x150000` |
+| Verification | `espflash read-flash 0x150000 2007104` read back; SHA-256 equals the image's |
+
+The lock was released afterwards. `otadata` is still blank, so the module still boots C recovery, which is what the owner needs for the next step.
+
+### 8.3 Next, in order
+
+1. **Owner:** join the access point `louder-esp32`, open the C setup page and connect the module to the site Wi-Fi. Leave it in recovery.
+2. Agent: write the `ota_0` select entry to `0xD000` (step 3a; 32 bytes: seq 1, state `OTA_IMG_VALID`, CRC `0x4743989A`, rest `0xFF`), capture the boot log to the lease, then Task 4 Steps 3 to 6.
