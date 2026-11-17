@@ -333,7 +333,8 @@ impl ConfigHandle {
                 if !c.player_name.is_empty() {
                     c.player_name.clone()
                 } else {
-                    heapless::String::try_from("BASEMENT").unwrap_or_default()
+                    heapless::String::try_from(crate::board::first_boot_defaults::PLAYER_NAME)
+                        .unwrap_or_default()
                 }
             });
             let _ = s.push_str(name.as_str());

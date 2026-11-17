@@ -4098,7 +4098,7 @@ mod xtensa_hw {
         let mut cspot_name = s.config.effective_cspot_name();
         if cspot_name.trim().is_empty() {
             cspot_name.clear();
-            let _ = cspot_name.push_str("BASEMENT");
+            let _ = cspot_name.push_str(louder_esp32_app::board::first_boot_defaults::PLAYER_NAME);
         }
         let mut raop_name = s
             .config
@@ -4129,7 +4129,7 @@ mod xtensa_hw {
             });
         if raop_name.trim().is_empty() {
             raop_name.clear();
-            let _ = raop_name.push_str("BASEMENT");
+            let _ = raop_name.push_str(louder_esp32_app::board::first_boot_defaults::PLAYER_NAME);
         }
 
         // 1. mDNS responder (`UDP 5353`) for AirPlay `_raop._tcp.local` &
@@ -4871,7 +4871,10 @@ mod tests {
     #[test]
     fn test_firmware_tick_arbiter_source_selection() {
         let mac = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x34];
-        let mut coordinator = PlayerCoordinator::new(mac, "BASEMENT");
+        let mut coordinator = PlayerCoordinator::new(
+            mac,
+            louder_esp32_app::board::first_boot_defaults::PLAYER_NAME,
+        );
         assert_eq!(coordinator.active_source(), AudioSource::None);
         assert!(coordinator.request_source(AudioSource::SlimProto));
         assert!(coordinator.request_source(AudioSource::Bluetooth));

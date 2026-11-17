@@ -59,7 +59,14 @@ pub mod first_boot_defaults {
     /// Must be exactly 8 bytes: it is also the Bluetooth local name, and the
     /// fixed SDP service record in `bt_a2dp.rs` holds an 8-byte Text element
     /// (compile-time assert where the record is built from `BT_LOCAL_NAME`).
-    pub const PLAYER_NAME: &str = "BASEMENT";
+    ///
+    /// Set the build-time environment variable `SL_DEVICE_NAME` to build an
+    /// image for another unit (the shared test board uses `DEVBENCH`, also
+    /// 8 bytes). Unset, the name is the live device's, `"BASEMENT"`.
+    pub const PLAYER_NAME: &str = match option_env!("SL_DEVICE_NAME") {
+        Some(name) => name,
+        None => "BASEMENT",
+    };
     /// Lyrion Music Server (LMS) IPv4 address.
     pub const LMS_SERVER_IP: [u8; 4] = [10, 0, 0, 10];
     /// LMS SlimProto TCP port.
