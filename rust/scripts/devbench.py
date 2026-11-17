@@ -6,6 +6,7 @@ flash it without asking, one at a time. This script is the only way they do:
 
     python rust/scripts/devbench.py acquire <branch>
     python rust/scripts/devbench.py flash <branch> <image.bin>
+    python rust/scripts/devbench.py select-ota0 <branch> [--no-reset]
     python rust/scripts/devbench.py release <branch>
     python rust/scripts/devbench.py check-mac <mac>
 
@@ -29,7 +30,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import zlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,6 +68,23 @@ EXIT_MAC = 4
 EXIT_ATTEMPTS = 5
 
 MAC_LINE = re.compile(r"MAC address:\s*([0-9A-Fa-f:]{17})")
+
+
+OTADATA_OFFSET = 0xD000
+SECTOR = 0x1000
+
+
+def otadata_ota0_sector() -> bytes:
+    """One `otadata` sector that makes the bootloader start `ota_0`.
+
+    The 32-byte entry is the one the firmware writes itself
+    (`OtaSelectEntry::new_ota_0()` in `ota_safety.rs`): sequence 1, state
+    OTA_IMG_VALID, CRC over the sequence. The rest of the sector is erased.
+    """
+    seq = (1).to_bytes(4, "little")
+    crc = zlib.crc32(seq, 0xFFFFFFFF) & 0xFFFFFFFF  # ESP-IDF esp_crc32_le(~0, seq)
+    entry = seq + b"\xff" * 20 + (2).to_bytes(4, "little") + crc.to_bytes(4, "little")
+    return entry + b"\xff" * (SECTOR - len(entry))
 
 
 class TooManyAttempts(Exception):
@@ -354,6 +374,43 @@ def cmd_flash(lock_path: Path, branch: str, image: Path) -> int:
     return EXIT_OK if proc.returncode == 0 else EXIT_FAILED
 
 
+def cmd_select_ota0(lock_path: Path, branch: str, no_reset: bool) -> int:
+    """Write the `ota_0` select entry, so the bootloader leaves C recovery.
+
+    Needed after the first install and whenever the module has fallen back to
+    recovery: the firmware erases `otadata` early in boot and only pins
+    `ota_0` again once the boot lease has passed.
+    """
+    current = holder(lock_path)
+    if current != branch:
+        print(
+            f"NOT WRITTEN: lock is held by {current or 'nobody'}, not {branch}. "
+            "Run acquire first."
+        )
+        return EXIT_LOCK
+    try:
+        mac = read_board_mac()
+    except RuntimeError as err:
+        print(f"NOT WRITTEN: {err}")
+        return EXIT_FAILED
+    if not mac_allowed(mac):
+        print(mac_refusal(mac))
+        return EXIT_MAC
+    if holder(lock_path) != branch:
+        print("NOT WRITTEN: the lock changed hands while talking to the board")
+        return EXIT_LOCK
+    with tempfile.TemporaryDirectory() as tmp:
+        blob = Path(tmp) / "otadata-ota0.bin"
+        blob.write_bytes(otadata_ota0_sector())
+        command = ["espflash", "write-bin", "--port", PORT, "--non-interactive"]
+        if no_reset:
+            command += ["--after", "no-reset"]
+        command += [f"{OTADATA_OFFSET:#x}", str(blob)]
+        print(f"select ota_0: {SECTOR} B -> {PORT} @ {OTADATA_OFFSET:#x}")
+        proc = subprocess.run(command)
+    return EXIT_OK if proc.returncode == 0 else EXIT_FAILED
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -365,6 +422,14 @@ def main(argv=None) -> int:
     p = sub.add_parser("flash")
     p.add_argument("branch")
     p.add_argument("image", type=Path)
+    p = sub.add_parser("select-ota0")
+    p.add_argument("branch")
+    p.add_argument(
+        "--no-reset",
+        action="store_true",
+        help="leave the chip in its serial bootloader afterwards, so the next "
+        "reset is the caller's and a log capture sees the whole boot",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "check-mac":
@@ -375,6 +440,8 @@ def main(argv=None) -> int:
             return cmd_acquire(lock_path, args.branch)
         if args.command == "release":
             return cmd_release(lock_path, args.branch)
+        if args.command == "select-ota0":
+            return cmd_select_ota0(lock_path, args.branch, args.no_reset)
         return cmd_flash(lock_path, args.branch, args.image)
     except GuardBusy as err:
         print(f"BUSY: {err}. Try again.")

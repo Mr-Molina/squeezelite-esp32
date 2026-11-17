@@ -70,3 +70,14 @@ class ReviewFixTests(unittest.TestCase):
     def test_timestamp_without_offset_is_read_as_utc(self):
         self.lock.write_text('{"branch": "feat/a", "timestamp": "2026-11-17T12:00:00", "attempts": 0}')
         self.assertEqual(devbench.acquire(self.lock, "feat/b", T0 + timedelta(minutes=5)), "busy")
+
+class OtadataTests(unittest.TestCase):
+    def test_select_sector_matches_the_firmware_entry(self):
+        # Same 32 bytes as OtaSelectEntry::new_ota_0().to_bytes() in ota_safety.rs.
+        sector = devbench.otadata_ota0_sector()
+        self.assertEqual(len(sector), 0x1000)
+        self.assertEqual(sector[0:4], bytes([1, 0, 0, 0]))
+        self.assertEqual(sector[4:24], b"\xff" * 20)
+        self.assertEqual(sector[24:28], bytes([2, 0, 0, 0]))
+        self.assertEqual(int.from_bytes(sector[28:32], "little"), 0x4743989A)
+        self.assertEqual(sector[32:], b"\xff" * (0x1000 - 32))

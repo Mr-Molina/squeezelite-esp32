@@ -5,7 +5,7 @@
 - **Plan**: `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, work order F1
 - **Spec**: `docs/superpowers/specs/2026-11-17-parity-branch-distribution-design.md`, section 8
 - **Target**: second Louder-ESP32 on `COM13` of the owner's Windows PC (CH340, `USB\VID_1A86&PID_7523`)
-- **Status**: Tasks 1 to 3 done. Owner confirmed **Route A** on 2026-11-17. Task 4 Step 2 done (Rust app in `ota_0`, section 8). **Waiting for the owner to provision Wi-Fi on the C setup page** before the boot slot is switched.
+- **Status**: Tasks 1 to 3 done. Owner confirmed **Route A** on 2026-11-17. Task 4: module installed and running the Rust image (section 8); early-reset markers recorded. **Open:** the LMS, AirPlay and Bluetooth baseline sessions (8.4) and the `CLAUDE.md` edit (8.6).
 
 ## 0. Guardrails
 
@@ -193,7 +193,104 @@ So the module holds a saved network that is not in range here, and falls back to
 
 The lock was released afterwards. `otadata` is still blank, so the module still boots C recovery, which is what the owner needs for the next step.
 
-### 8.3 Next, in order
+### 8.3 Boot slot switched to `ota_0` (step 3a)
 
-1. **Owner:** join the access point `louder-esp32`, open the C setup page and connect the module to the site Wi-Fi. Leave it in recovery.
-2. Agent: write the `ota_0` select entry to `0xD000` (step 3a; 32 bytes: seq 1, state `OTA_IMG_VALID`, CRC `0x4743989A`, rest `0xFF`), capture the boot log to the lease, then Task 4 Steps 3 to 6.
+Owner decision relayed 2026-11-17: "Route A, agent sets boot". The owner then provisioned Wi-Fi on the C setup page; a recovery boot confirmed it (`sta ip: 172.25.6.102`).
+
+`devbench.py` gained `select-ota0 <branch> [--no-reset]`: lock check, `espflash board-info`, MAC check, then one `0x1000` sector to `0xD000` holding the 32-byte entry the firmware itself writes (`OtaSelectEntry::new_ota_0()`: sequence 1, `OTA_IMG_VALID`, CRC `0x4743989A`). It was run twice in this work order (first switch, and the way back in 8.5); each time the MAC read `ac:15:18:fd:93:9c` and espflash reported `Binary successfully written to flash!`.
+
+### 8.4 Baseline (plan Task 4 Step 3)
+
+Boot log of the Rust image, serial, 115200 baud. Left column is seconds since the reset pulse; bootloader lines arrive in one burst.
+
+```
+   0.444 rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+   0.444 I (27) boot: ESP-IDF v4.3.5-dirty 2nd stage bootloader
+   0.444 I (27) boot: chip revision: v3.1
+   0.444 I (36) boot.esp32: SPI Speed      : 80MHz
+   0.444 I (41) boot.esp32: SPI Mode       : QIO
+   0.444 I (45) boot.esp32: SPI Flash Size : 4MB
+   0.444 I (89) boot:  3 recovery         factory app      00 00 00010000 00140000
+   0.444 I (96) boot:  4 ota_0            OTA app          00 10 00150000 002a0000
+   0.444 I (115) esp_image: segment 0: paddr=00150020 vaddr=3f400020 size=46150h (287056) map
+   0.444 I (203) esp_image: segment 1: paddr=00196178 vaddr=3ffc0000 size=06440h ( 25664) load
+   0.444 I (211) esp_image: segment 2: paddr=0019c5c0 vaddr=40080000 size=03a58h ( 14936) load
+   0.444 I (216) esp_image: segment 3: paddr=001a0020 vaddr=400d0020 size=17dfdch (1564636) map
+   1.020 I (648) esp_image: segment 4: paddr=0031e004 vaddr=40083a58 size=1c00ch (114700) load
+   1.020 I (702) boot: Loaded app from partition at offset 0x150000
+   1.020 [ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)
+   1.020 [one line withheld by the capture filter: it matched the credential pattern]
+   1.409 [HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized
+   3.798 [DHCPv4] Acquired IP 172.25.6.102/24
+```
+
+Nothing more is printed on serial in the following 76 s. `GET /messages.json` on the module:
+
+```
+  601 WARN net: DHCPv4 lease deconfigured
+ 2862 INFO net: DHCPv4 lease acquired
+ 2868 INFO boot: ota_0 confirmed healthy; otadata pinned to ota_0
+85404 INFO psram_free=1441212 psram_used=2753092 core1_active=true core1_loops=287411 decode_us_max=0
+```
+
+`GET /status.json` at `uptime_ms` 64,023 (after the last reset of this run):
+
+| Field | Value |
+| :--- | :--- |
+| `version` / `recovery` / `rust_engine` | `I2S-4MFlash-Rust` / `0` / `true` |
+| `otadata_prearmed_factory` | `false` |
+| `psram_free_bytes` + `psram_used_bytes` | 1,441,164 + 2,753,140 = 4,194,304 |
+| `core1_active` / `core1_loops` | `true` / 215,151 |
+| `tas_pll_locked` / `i2c_nacks` | `true` / 0 |
+| `disconnect_count` / `rssi` | 0 / -70 dBm |
+| `host_name` in `/config.json` | `DEVBENCH` |
+| `vol_pct` / `tas_automuted` | 80 / `true` |
+
+Budget script on the DEVBENCH build: IRAM 129,636 B (limit 131,072), `.dram2_uninit` 98,520 B (limit 98,768), `.stack` 28,528 B (floor 28,000).
+
+**Not done, and why:**
+
+- **Internal heap figure.** The firmware prints PSRAM figures only; neither the serial log nor `/status.json` carries an internal-heap number. Nothing to record until a build exposes one (F3 Task 1 makes the heap floor a tested constant).
+- **Ten minutes of an LMS stream, and DEVBENCH and BASEMENT as two players in LMS.** The module is on `172.25.6.0/24`. The LMS (`10.0.0.50`) does not answer from this PC, and the module's own LMS target is the first-boot default `10.0.0.10`. No stream was possible on this network.
+- **One AirPlay session, one Bluetooth sink session.** Both need a person with a sending device next to the module.
+
+These three need the owner, or the module on the network where the LMS lives.
+
+### 8.5 Early reset inside the lease (plan Task 4 Step 4)
+
+Reset pulsed 1.8 s after the first reset, between the `otadata` erase (1.0 s) and DHCP (about 3.8 s):
+
+```
+   1.011 I (702) boot: Loaded app from partition at offset 0x150000
+   1.011 [ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)
+   1.412 [HIL 1/5..5/5] Hardware Peripherals (GPIO33/34, I2C0 0x2D, I2S0 26/25/22, UART2) Initialized
+   1.815 ### RESET PULSED BY TEST ###
+   2.482 rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+   2.482 I (115) boot: Defaulting to factory image
+   2.776 I (504) boot: Loaded app from partition at offset 0x10000
+   3.605 I (1054) cpu_start: App version:      I2S-4MFlash-1681
+   3.605 I (1204) esp_app_main: Recovery Reboot counter=1
+   4.980 RECOVERY APPLICATION
+  26.468 I (24214) esp_netif_handlers: sta ip: 172.25.6.102, mask: 255.255.255.0, gw: 172.25.6.2
+```
+
+`/status.json` then gave `"version":"I2S-4MFlash-1681"`, `"recovery":1`.
+
+The way back: `devbench.py select-ota0`, then a reset:
+
+```
+   1.019 I (702) boot: Loaded app from partition at offset 0x150000
+   1.019 [ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)
+   3.796 [DHCPv4] Acquired IP 172.25.6.102/24
+```
+
+A further reset after the pin (a late reset) loaded `0x150000` again, and `/status.json` returned to `"recovery":0`, `"version":"I2S-4MFlash-Rust"`.
+
+Finding for later work orders: on this build the window in which a reset drops to recovery ends when DHCP completes, about 3 to 4 s after reset here, not at a fixed 46 s. On a network where DHCP is slow or absent the window stays open for as long as that takes.
+
+### 8.6 State left behind
+
+- Module: running the Rust image `276d4494...dc402d` from `ota_0`, `otadata` pinned, on Wi-Fi. Lock released.
+- Flash attempts used in this check: 1 of 2.
+- Not written at any point: bootloader, partition table, recovery, `nvs`, `settings`.
+- `CLAUDE.md` is not yet updated with the DEVBENCH standing permissions (plan Task 4 Step 5). That edit waits for the owner's word in this session.
