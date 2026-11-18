@@ -483,12 +483,21 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 - Blocked on the core-1 owner hardware gate described in
   `louder-esp32-app/Cargo.toml` (feature `esp-rtos-core1`) and Invariant 47.
   Do not start without explicit go-ahead from the user.
-- Memory headroom to plan around (at `579ffcde`): IRAM 129,636 of 131,072 B,
-  `.dram2_uninit` 98,520 of 98,768 B, `.stack` 28,528 B. Core 1's entry function
-  must be in IRAM (Invariant 47), so D1 probably needs a re-budget first.
-- Stack floor: `.stack >= 28,000` B (Invariant 48, owner decision 2026-11-16;
-  previously 36,000 B). The certified build has 28,528 B, so 528 B of headroom.
-  CI enforces it.
+- Memory headroom to plan around (after the F3 re-budget, 2026-11-18): IRAM
+  119,720 of 131,072 B (11,352 free), `.dram2_uninit` 88,792 of 98,768 B (9,976
+  free), `.stack` 41,512 B, internal heap 65,536 B. Before F3 (`579ffcde`) the
+  figures were 129,636, 98,520, 28,528 and 64,512 B. Core 1's entry function
+  must be in IRAM (Invariant 47). D1's share is in the allowance table of the
+  design spec, section 7.
+- Hard limits (Invariant 48): `.stack >= 28,000` B (owner decision 2026-11-16;
+  previously 36,000 B), IRAM `<= 131,072` B, `.dram2_uninit <= 98,768` B,
+  internal heap `>= 65,536` B. CI enforces the tighter F3 figures with 256 B
+  of slack (`scripts/check_section_budget.py`); a branch moves a default only
+  by its allowance.
+- On the device the internal heap is nearly all in use: `/status.json`
+  `int_heap_free_bytes` reads about 13.4 KB idle with Wi-Fi and Bluetooth up,
+  and dipped to about 5 KB when an LMS-proxied stream started (DEVBENCH,
+  `WO-F3`). Features that allocate internal RAM at runtime have that much room.
 
 ---
 
