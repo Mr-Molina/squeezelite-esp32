@@ -10,6 +10,50 @@ Written at `MK5-Rust` = `f957e255` (equal to `origin/MK5-Rust`), from a Windows
 GitHub or the source. Everything else is taken from the project's own ledgers
 and is only as fresh as they are.
 
+## 0. Update, 2026-11-18 19:10 UTC (read this first)
+
+The rest of this file describes `f957e255`. Since then, checked against git and
+GitHub at the time above:
+
+- **`MK5-Rust` is at `e574cc0e`.** Merged after `f957e255`: PR `#12`
+  (`a2201ec9`, the flaky test in section 7.1 is fixed as that section
+  suggested, with the logged case as a regression test), PR `#11` (`ec407fcb`,
+  `rust-analyzer` added to the pinned toolchain components) and PR `#10`
+  (`e574cc0e`, this file). No pull request is open and `origin` has no branch
+  other than `MK5-Rust`.
+- **F3 is in progress, not "next; not started".** It lives in the local
+  worktree `.claude/worktrees/dazzling-yonath-8dd057`, branch
+  `claude/dazzling-yonath-8dd057`, 11 commits ahead of `f957e255`, **not
+  pushed**. Tasks 1, 2, 3 and 5 are committed there (heap constants at
+  65,536 B, DRAM reclaim, MP3 synthesis moved out of IRAM, tightened budget
+  script with a heap check, internal-heap figures in `/status.json`). It also
+  has uncommitted edits to `.agents/INFRASTRUCTURE_INVARIANTS.md`,
+  `docs/mk5-rust-todo.md` and the design spec, and no `WO-F3` work-order file
+  yet.
+- **Figures F3 records in those uncommitted edits (not re-measured here):**
+  IRAM 119,720 B (11,352 free), `.dram2_uninit` 88,792 B (9,976 free),
+  `.stack` 41,512 B, internal heap 65,536 B. All four F3 targets would be met.
+  On the device the internal heap is nearly all in use: about 13.4 KB free
+  idle, about 5 KB when a stream starts.
+- **The DEVBENCH lock is held** by `foundation/memory-rebudget` since
+  2026-11-18 18:12 UTC, one flash attempt used. Do not flash or reset DEVBENCH
+  and do not edit that worktree until its session has finished or the owner
+  says it has stopped.
+- **DEVBENCH now has an LMS to play from.** The owner gave
+  `http://172.25.8.40:9000/` on 2026-11-18 for audio checks, which removes the
+  F3 blocker described in section 6. Turn the volume down before the first
+  stream.
+- **Still to do for F3:** the one-hour soak (task 4) if it has not finished,
+  the work-order file, a session entry, rebase on `e574cc0e`, push, pull
+  request. F3 prepends to `.agents/sessions.md`; expect that file to conflict
+  if anything else prepends first.
+- The main checkout `S:\Github\squeezelite-esp32` was fast-forwarded to
+  `origin/MK5-Rust` when this update was merged.
+
+Section 10's three questions are answered: DEVBENCH has an LMS route, the
+flaky test is fixed, and the owner has not yet said what to do with commit
+`39799bd3`.
+
 ---
 
 ## 1. The project in one paragraph
