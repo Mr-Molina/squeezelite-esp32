@@ -5,7 +5,7 @@
 - **Plan**: `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, work order F1
 - **Spec**: `docs/superpowers/specs/2026-11-17-parity-branch-distribution-design.md`, section 8
 - **Target**: second Louder-ESP32 on `COM13` of the owner's Windows PC (CH340, `USB\VID_1A86&PID_7523`)
-- **Status**: Tasks 1 to 3 done. Owner confirmed **Route A** on 2026-11-17. Task 4: module installed and running the Rust image (section 8); early-reset markers recorded. **Open:** the LMS, AirPlay and Bluetooth baseline sessions (8.4).
+- **Status**: `CLOSED` by the owner on 2026-11-18. Tasks 1 to 4 done, except the baseline items listed as not done in section 8.4 (LMS stream, two-player check, AirPlay session, Bluetooth session, internal-heap figure). PR `#7`; only the owner merges.
 
 ## 0. Guardrails
 
