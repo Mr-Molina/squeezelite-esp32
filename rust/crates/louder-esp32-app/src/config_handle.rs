@@ -4,7 +4,7 @@
 //!
 //! Platform-free by design: no platform or cargo-feature gating here (that
 //! lives in
-//! `main.rs`/`tasks.rs`), so every rule is exercised by host tests.
+//! `main.rs`), so every rule is exercised by host tests.
 //!
 //! # Pieces
 //!

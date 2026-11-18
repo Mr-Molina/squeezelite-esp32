@@ -119,9 +119,8 @@ pub const fn can_send_mdns_multicast_reply(last_reply_ms: Option<u64>, now_ms: u
 /// Executes one integrated firmware tick across the CYD UART bridge,
 /// audio pipeline, and digital amplifier health monitor (`HALNET-409`).
 ///
-/// Host only: on the device the same steps now run as embassy phases
-/// (`tasks.rs`: `cyd_bridge` command poll, `i2s_feed` DMA-first top-up,
-/// `decode_pump` burst, `i2s_feed` final top-up).
+/// Host only: on the device the same steps run inside `pump_device_phase`
+/// (CYD command poll, DMA-first top-up, decode burst, final top-up).
 #[cfg(not(target_arch = "xtensa"))]
 pub fn run_firmware_tick<S, U, I>(
     coordinator: &mut PlayerCoordinator,
@@ -1882,7 +1881,8 @@ mod xtensa_hw {
         }
 
         /// Restarts APP_CPU after a runtime settings flash write
-        /// (`runtime-flash-persist` only; see `tasks::runtime_flash_commit`).
+        /// (`runtime-flash-persist` only; see the settings write in
+        /// `pump_device_phase`).
         /// Default build: the manual path's core 1 runs the IRAM NOP
         /// heartbeat, so it resumes where it was parked.
         pub(crate) fn unpark_after_flash_write(&mut self) {

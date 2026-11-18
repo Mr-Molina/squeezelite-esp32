@@ -27,7 +27,7 @@ esp-rtos-core1 = []
 # only on the certified pre-reboot path (WO-109: runtime flash I/O deadlocked this board). On: the
 # `config_writer` task also commits the journal to flash at runtime, hazard-gated (not while
 # audio plays, APP_CPU parked, no flash reads, DRAM-only buffers, ping-pong sectors); rules in
-# `tasks.rs` `runtime_flash_commit`. Requires the manual core-1 path (not `esp-rtos-core1`).
+# the settings write in `main.rs` `pump_device_phase`. Requires the manual core-1 path (not `esp-rtos-core1`).
 # Not hardware-certified: owner gate = power-cycle soak with settings churn idle + playing.
 runtime-flash-persist = []
 
@@ -43,7 +43,8 @@ squeezelite-cspot = { path = "../squeezelite-cspot", default-features = false, f
 embedded-hal = { workspace = true }
 heapless = { workspace = true }
 bytemuck = "1.25"
-# Control/event channels between the core-0 coordinator and the audio tasks (`tasks.rs`).
+# Control/event channels between the core-0 coordinator and the future core-1 audio tasks
+# (`tasks.rs`).
 # 0.8.0 is the version esp-rtos/esp-radio already pull (Spike S1); host builds compile it too so
 # the channel types stay testable off-target.
 embassy-sync = "0.8.0"

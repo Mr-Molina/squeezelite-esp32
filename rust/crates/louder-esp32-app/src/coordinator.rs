@@ -5957,7 +5957,7 @@ mod tests {
             *now += 10;
             rig.tick(pipeline, *now).unwrap();
             if rig.coord.external_audio_pump {
-                // The device ring's pump phases (tasks.rs: output, decode, output).
+                // The device loop's pump phases (main.rs: output, decode, output).
                 rig.coord.pump_output(pipeline, 16);
                 rig.coord.pump_decode(pipeline, 4);
                 rig.coord.pump_output(pipeline, 16);

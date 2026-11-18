@@ -36,7 +36,7 @@ fn pipeline_has_no_target_arch_cfg() {
 
 /// Task 10: the persistence logic is platform-free and fully host-tested; the
 /// device flash commit and its `runtime-flash-persist` gate live only in
-/// `tasks.rs` / `main.rs`.
+/// `main.rs`.
 const CONFIG_HANDLE_SRC: &str = include_str!("../src/config_handle.rs");
 
 #[test]
@@ -54,7 +54,7 @@ fn config_handle_has_no_platform_or_feature_cfg() {
 }
 
 #[test]
-fn runtime_flash_persist_gate_only_in_tasks_and_main() {
+fn runtime_flash_persist_gate_only_in_main() {
     let libs = [
         ("config_handle.rs", CONFIG_HANDLE_SRC),
         ("coordinator.rs", COORDINATOR_SRC),
@@ -62,6 +62,7 @@ fn runtime_flash_persist_gate_only_in_tasks_and_main() {
         ("http_control.rs", include_str!("../src/http_control.rs")),
         ("board.rs", include_str!("../src/board.rs")),
         ("lib.rs", include_str!("../src/lib.rs")),
+        ("tasks.rs", include_str!("../src/tasks.rs")),
     ];
     for (name, src) in libs {
         assert!(
@@ -69,5 +70,23 @@ fn runtime_flash_persist_gate_only_in_tasks_and_main() {
             "{name} gates on runtime-flash-persist"
         );
     }
-    assert!(include_str!("../src/tasks.rs").contains("feature = \"runtime-flash-persist\""));
+    assert!(include_str!("../src/main.rs").contains("feature = \"runtime-flash-persist\""));
+}
+
+/// F2 (single loop): `main.rs` is the only device path. `tasks.rs` keeps the
+/// core-1 executor and the `CTRL`/`EVT` channel types for D1a, nothing of the
+/// former core-0 task ring.
+#[test]
+fn tasks_has_no_core0_executor() {
+    let src = include_str!("../src/tasks.rs");
+    for gone in [
+        "run_core0_executor",
+        "fn run_ring",
+        "enum RingTask",
+        "enum Phase",
+        "fn http_serve",
+    ] {
+        assert!(!src.contains(gone), "tasks.rs still contains `{gone}`");
+    }
+    assert!(src.contains("fn run_core1_executor"));
 }
