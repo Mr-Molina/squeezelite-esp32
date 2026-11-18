@@ -61,3 +61,14 @@ fn config_statics_are_in_dram2() {
         );
     }
 }
+
+/// The AES decryption tables are read-only data in flash; they are not copied
+/// into internal RAM (`.dram1`) at boot.
+#[test]
+fn aes_tables_are_not_in_dram() {
+    const RAOP_CRYPTO_SRC: &str = include_str!("../../squeezelite-raop/src/crypto.rs");
+    assert!(
+        !RAOP_CRYPTO_SRC.contains("link_section"),
+        "squeezelite-raop/src/crypto.rs places a table in a RAM section"
+    );
+}
