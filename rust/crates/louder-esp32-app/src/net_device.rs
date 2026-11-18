@@ -5,7 +5,7 @@
 //! written against [`TcpSocketOps`], the small non-blocking subset of
 //! `smoltcp::socket::tcp::Socket`
 //! they need. The firmware implements it for a real smoltcp socket in
-//! `tasks.rs` (smoltcp is a
+//! `main.rs` (smoltcp is a
 //! device-only dependency); host tests implement it with an in-memory socket
 //! shim and run the
 //! shared conformance suite against the very code the device runs.

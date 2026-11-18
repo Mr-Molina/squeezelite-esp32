@@ -45,6 +45,12 @@ ESP32. All Rust lives under `rust/` (a Cargo workspace). Key crates:
 - Everything runs on core 0 in one superloop: `pump_device_phase`
   (`main.rs:4659` at `e409596d`). Core 1 only spins a heartbeat
   (`app_core_loop`, `main.rs:1248`).
+- `main.rs` is the only device path (work order F2, 2026-11-18). The embassy
+  task ring that `src/tasks.rs` used to hold was never started and has been
+  removed; `tasks.rs` now holds only the `CTRL`/`EVT` channel types and the
+  `esp-rtos-core1` executor that D1 builds on. `main.rs` uses the library's
+  `console`, `controls`, `dac_platform`, `display_gds`, `eth_w5500` and
+  `power_boards` modules instead of compiling second copies.
 - I2S DMA buffer is 16 KB = 2048 stereo frames ≈ 46 ms at 44.1 kHz
   (`I2S_DMA_BUFFER_BYTES`, `main.rs`). Anything that blocks the loop longer
   than that underruns audio.

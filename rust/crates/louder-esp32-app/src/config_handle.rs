@@ -4,7 +4,7 @@
 //!
 //! Platform-free by design: no platform or cargo-feature gating here (that
 //! lives in
-//! `main.rs`/`tasks.rs`), so every rule is exercised by host tests.
+//! `main.rs`), so every rule is exercised by host tests.
 //!
 //! # Pieces
 //!
@@ -13,7 +13,7 @@
 //!   mutex. The coordinator (`setd` name), the HTTP server, the CYD bridge and
 //!   the LMS volume path
 //!   change it through [`ConfigHandle::update`].
-//! - [`ConfigWriter`]: the debounce state machine of the `config_writer` task:
+//! - [`ConfigWriter`]: the debounce state machine of the device loop's config poll:
 //!   a change is
 //!   journaled once no further change has arrived for [`DEBOUNCE_MS`].
 //! - [`RamJournal`]: the serialized journal image (a DRAM sector buffer) plus
@@ -789,7 +789,7 @@ impl ConfigHandle {
     }
 }
 
-/// Debounce state of the `config_writer` task.
+/// Debounce state of the device loop's 100 ms config poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConfigWriter {
     seen_generation: u32,

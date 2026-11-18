@@ -29,7 +29,8 @@ esp-rtos-core1 = []
 # change has been quiet for the 2 s debounce, after `Core1Ctl::park_for_flash_write`, with no
 # playback guard. Off: always sector A (0x3FE000). On: dual-sector ping-pong at 0x3FE000 /
 # 0x3FF000, and the build requires the manual core-1 path (not `esp-rtos-core1`). The hazard-gated
-# `runtime_flash_commit` in `tasks.rs` belongs to the core-0 task half, which has no call site.
+# `runtime_flash_commit` belonged to the core-0 task ring in `tasks.rs`, which never ran and was
+# removed by F2 (last at `aed5c388`).
 # Not hardware-certified in either setting (WO-109: runtime flash I/O deadlocked this board).
 runtime-flash-persist = []
 
@@ -45,7 +46,8 @@ squeezelite-cspot = { path = "../squeezelite-cspot", default-features = false, f
 embedded-hal = { workspace = true }
 heapless = { workspace = true }
 bytemuck = "1.25"
-# Control/event channels between the core-0 coordinator and the audio tasks (`tasks.rs`).
+# Control/event channels between the core-0 coordinator and the future core-1 audio tasks
+# (`tasks.rs`).
 # 0.8.0 is the version esp-rtos/esp-radio already pull (Spike S1); host builds compile it too so
 # the channel types stay testable off-target.
 embassy-sync = "0.8.0"

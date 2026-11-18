@@ -2,6 +2,17 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-18 09:45 | Claude Code | [squeezelite-esp32] F2 Single Loop: Core-0 Task Ring Removed, Duplicate Modules Removed, Invariant 49 (`WO-F2`)
+**Scope**: Work order F2 (`foundation/single-loop`) of `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, on branch `claude/blissful-noether-5d05cd`, stacked on F1's branch (PR `#7`) because `MK5-Rust` did not hold F1 yet. BASEMENT was not contacted, flashed or rebooted.
+- **Key Outcomes**:
+  - **`tasks.rs` (`705a83a9`)**: the embassy core-0 phase ring that `main.rs` never started is gone (2,031 to 191 lines). Kept for D1: `StreamParams`, `CoordinatorCmd`, `AudioEvent`, `CTRL`, `EVT`, `CHANNEL_DEPTH`, and `device::{core1_heartbeat, run_core1_executor}` under `esp-rtos-core1`. `tests/no_cfg_invariant.rs` now fails if the ring comes back (`tasks_has_no_core0_executor`) and requires the `runtime-flash-persist` gate to live in `main.rs` only.
+  - **`main.rs` (`a4d19c47`)**: the six second copies of library modules (`console`, `controls`, `dac_platform`, `display_gds`, `eth_w5500`, `power_boards`) are no longer compiled into the bin. No import was needed; `main.rs` used none of them by path.
+  - **Invariant 49**: clause 1 names `main.rs` as the only device path; clause 3 forbids a second copy of the device loop in `tasks.rs` and keeps the `StaticMp3Decoder`/`Mp3Decoder` audit. Clause 2 and the figures are unchanged.
+  - **Gates**: host gates, Xtensa clippy, the `esp-rtos-core1` check, the release build and the budget script all pass. IRAM `129,636` B and `.dram2_uninit` `98,520` B unchanged; `.stack` `28,536` B (8 B more than F1). The image is 32 B larger than F1's (`.text` +48 B), where the plan expected no growth; cause not established, no budgeted section grew.
+  - **DEVBENCH check**: one flash attempt through `devbench.py`; boot log, Gate 1, DHCP, `otadata` pin, `/status.json` and the core-1 heartbeat rate match the F1 baseline. Log in `WO-F2-single-loop.md`.
+- **Not checked**: an LMS stream (no route from the module's network to the LMS; `frames_played` stayed 0), AirPlay, Bluetooth sink. The audio path of this image has not played on hardware.
+- **Next-Session Handoff Notes**: this PR merges after PR `#7`; only the owner merges. F3 (`foundation/memory-rebudget`) is next. `devbench.py` has no reset-and-capture command; F2 used a one-off pyserial script, and a `capture` subcommand would save the next work order the same step. `"BASEMENT"` (`172.22.1.15`) is unchanged: never flash, reboot or OTA it, never touch `/dev/ttyUSB0`, never call `POST /reboot_ota.json`.
+
 ## 2026-11-18 09:26 | Claude Code | [squeezelite-esp32] F1 Dev-Module Bring-Up: `SL_DEVICE_NAME`, DEVBENCH Install & Flash Helper (`WO-F1`, PR `#7`)
 **Scope**: Work order F1 (`foundation/dev-module-bringup`) of `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, on branch `claude/foundation-dev-module-bringup-a01186`. A second Louder-ESP32 on `COM13` of the owner's Windows PC is now the shared test board DEVBENCH. BASEMENT was not contacted, flashed or rebooted.
 - **Key Outcomes**:
