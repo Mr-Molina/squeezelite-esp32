@@ -16,6 +16,15 @@
   - **Repo & Hygiene Telemetry**: branch `MK5-Rust` (github_synced) | hygiene `0 secrets, 0 scratch`
 - **Next-Session Handoff Notes**: PRs #16-#23 are synced on GitHub against MK5-Rust; Draft PR #23 (audit/deep-remediation-2026-11-19 @ 9a6a354f) is ready for DEVBENCH (172.25.6.102 / COM13) espflash save-image + soak verification before promotion and merge into MK5-Rust. BASEMENT (172.22.1.15) untouched.
 
+## 2026-11-18 18:57 | Antigravity | [squeezelite-esp32] F3 Memory Rebudget Rebase, Baseline vs F3 Soak Comparison & Bisect Plan (`WO-F3`) — DO NOT MERGE
+**Scope**: Rebased F3 (`claude/dazzling-yonath-8dd057`) cleanly onto `MK5-Rust` (`3a3aab43`, 0 conflicts, 12 commits), archived pre-F3 soak baseline `soak-pre-f3.csv` into `.agents/knowledge/work_orders/WO-F3-evidence/`, authored `WO-F3-memory-rebudget.md`, and documented the live-soak merge blocker. Main working tree and hardware untouched.
+- **Static Budgets (4/4 PASS)**: IRAM `119,720 B` (`11,352 B` free), `.dram2_uninit` `88,792 B` (`9,976 B` free), `.stack` `41,512 B`, internal heap `65,536 B` (`47 + 17 KiB` split).
+- **1-Hour DEVBENCH Soak Comparison**:
+  - **Pre-F3 (`3283d457`, `soak-pre-f3.csv`)**: `0` resets, `23,963 us` decode peak, `0` `i2c_nacks`, `0` Bluetooth transitions; stalled at `t=2,769 s` when LMS (`172.25.8.40`) went unreachable.
+  - **F3 (`0f98b1d1` / rebased `4f36203f`, `soak-i1.csv`)**: `2` resets immediately after `codec=Bluetooth`, `52,301 us` FLAC decode spike, `13` FLAC FPS dips, `5,128 B` internal heap low-water mark (`0` `i2c_nacks`).
+- **AAC Zero-Frames Root Cause**: `HELO_CODECS` omits `aac` in the coordinator, so LMS never sends native AAC frames to the player.
+- **Bisect Shortlist & Status — DO NOT MERGE**: Hold F3 (`claude/dazzling-yonath-8dd057`) from merging until live bisect on DEVBENCH passes once LMS (`172.25.8.40`) returns online: (1) `ec5cb7f5` (rebased `bd108784`) BT sink state in PSRAM / `63179cdf` (`8b7409e5`) socket buffers in PSRAM, (2) `d0375428` (rebased `edff549e`) `47 + 17 KiB` internal heap split.
+
 ## 2026-11-18 09:45 | Claude Code | [squeezelite-esp32] F2 Single Loop: Core-0 Task Ring Removed, Duplicate Modules Removed, Invariant 49 (`WO-F2`)
 **Scope**: Work order F2 (`foundation/single-loop`) of `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, on branch `claude/blissful-noether-5d05cd`, stacked on F1's branch (PR `#7`) because `MK5-Rust` did not hold F1 yet. BASEMENT was not contacted, flashed or rebooted.
 - **Key Outcomes**:
