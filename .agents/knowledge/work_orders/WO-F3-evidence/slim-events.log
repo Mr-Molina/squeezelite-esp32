@@ -1,0 +1,86 @@
+13:11:56 --- SlimProto connection from ('172.25.6.102', 65514)
+13:11:56 dev HELO len=197
+13:11:56 dev SETD len=9
+13:11:56 dev DSCO len=1
+13:11:56 lms setd len=5
+13:11:56 lms setd len=5
+13:11:56 lms aude len=6
+13:11:56 dev SETD len=9
+13:11:58 dev STAT STMd
+13:12:04 dev STAT STMu
+13:12:23 lms strm q
+13:15:04 --- SlimProto connection from ('172.25.6.102', 64257)
+13:15:04 dev HELO len=197
+13:15:04 dev SETD len=9
+13:15:04 lms strm q
+13:15:04 lms strm q
+13:15:04 lms setd len=5
+13:15:04 lms setd len=5
+13:15:04 lms aude len=6
+13:15:04 dev SETD len=9
+=== soak i1 start 13:15:35
+13:15:35 lms strm q
+13:15:35 lms strm s fmt=m hdr=b'GET /soak.mp3 HTTP/1.0\r\nCache-Control: no-cache\r\nConnection: close\r\nAcce'
+13:15:36 dev STAT STMf
+13:15:36 dev STAT STMc
+13:15:36 dev RESP len=193
+13:15:36 lms cont len=11
+13:15:37 dev STAT STMs
+13:16:43 dev DSCO len=1
+13:16:44 dev STAT STMd
+13:16:44 lms strm s fmt=f hdr=b'GET /soak.flac HTTP/1.0\r\nCache-Control: no-cache\r\nConnection: close\r\nAcc'
+13:16:44 dev STAT STMf
+13:16:44 dev STAT STMc
+13:16:44 dev RESP len=195
+13:16:44 lms cont len=11
+13:16:46 dev STAT STMs
+13:22:49 --- SlimProto connection from ('172.25.6.102', 64782)
+13:22:49 dev HELO len=197
+13:22:49 dev SETD len=9
+13:22:49 lms strm q
+13:22:49 lms strm s fmt=f hdr=b'GET /stream.mp3?player=ac:15:18:fd:93:9c HTTP/1.0\r\n\r\n'
+13:22:49 lms setd len=5
+13:22:49 lms setd len=5
+13:22:49 lms aude len=6
+13:22:49 dev STAT STMf
+13:22:49 dev SETD len=9
+13:22:49 dev STAT STMc
+13:22:49 dev RESP len=482
+13:22:51 dev STAT STMs
+13:32:30 --- SlimProto connection from ('172.25.6.102', 61017)
+13:32:30 dev HELO len=197
+13:32:30 dev SETD len=9
+13:32:30 lms strm q
+13:32:30 lms strm s fmt=f hdr=b'GET /stream.mp3?player=ac:15:18:fd:93:9c HTTP/1.0\r\n\r\n'
+13:32:30 lms setd len=5
+13:32:30 lms setd len=5
+13:32:30 lms aude len=6
+13:32:30 dev STAT STMf
+13:32:30 dev SETD len=9
+13:32:30 dev STAT STMc
+13:32:30 dev RESP len=482
+13:32:32 dev STAT STMs
+13:35:56 dev DSCO len=1
+13:36:06 dev STAT STMd
+13:36:07 lms strm s fmt=f hdr=b'GET /stream.mp3?player=ac:15:18:fd:93:9c HTTP/1.0\r\n\r\n'
+13:36:07 dev STAT STMf
+13:36:07 dev STAT STMc
+13:36:07 dev RESP len=482
+13:36:12 dev STAT STMs
+13:56:01 dev DSCO len=1
+13:56:06 dev STAT STMd
+13:56:06 lms strm s fmt=m hdr=b'GET /soak.mp3 HTTP/1.0\r\nCache-Control: no-cache\r\nConnection: close\r\nAcce'
+13:56:07 dev STAT STMf
+13:56:07 dev STAT STMc
+13:56:07 dev RESP len=193
+13:56:07 lms cont len=11
+13:56:12 dev STAT STMs
+14:15:53 dev DSCO len=1
+14:16:06 dev STAT STMd
+14:16:07 lms strm s fmt=f hdr=b'GET /soak.flac HTTP/1.0\r\nCache-Control: no-cache\r\nConnection: close\r\nAcc'
+14:16:07 dev STAT STMf
+14:16:07 dev STAT STMc
+14:16:07 dev RESP len=195
+14:16:07 lms cont len=11
+14:16:12 dev STAT STMs
+=== soak i1 end 14:16:54

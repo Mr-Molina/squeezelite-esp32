@@ -10,49 +10,160 @@ Written at `MK5-Rust` = `f957e255` (equal to `origin/MK5-Rust`), from a Windows
 GitHub or the source. Everything else is taken from the project's own ledgers
 and is only as fresh as they are.
 
-## 0. Update, 2026-11-18 19:10 UTC (read this first)
+## 0. Current state, 2026-11-18 19:40 UTC (read this first)
 
-The rest of this file describes `f957e255`. Since then, checked against git and
-GitHub at the time above:
+Sections 1 to 10 were written at `f957e255` and are kept as background. Where
+they disagree with this section, this section is newer. Everything here was
+checked against git, GitHub and the files named, at the time above, unless it
+says otherwise.
 
-- **`MK5-Rust` is at `e574cc0e`.** Merged after `f957e255`: PR `#12`
-  (`a2201ec9`, the flaky test in section 7.1 is fixed as that section
-  suggested, with the logged case as a regression test), PR `#11` (`ec407fcb`,
-  `rust-analyzer` added to the pinned toolchain components) and PR `#10`
-  (`e574cc0e`, this file). No pull request is open and `origin` has no branch
-  other than `MK5-Rust`.
-- **F3 is in progress, not "next; not started".** It lives in the local
-  worktree `.claude/worktrees/dazzling-yonath-8dd057`, branch
-  `claude/dazzling-yonath-8dd057`, 11 commits ahead of `f957e255`, **not
-  pushed**. Tasks 1, 2, 3 and 5 are committed there (heap constants at
-  65,536 B, DRAM reclaim, MP3 synthesis moved out of IRAM, tightened budget
-  script with a heap check, internal-heap figures in `/status.json`). It also
-  has uncommitted edits to `.agents/INFRASTRUCTURE_INVARIANTS.md`,
-  `docs/mk5-rust-todo.md` and the design spec, and no `WO-F3` work-order file
-  yet.
-- **Figures F3 records in those uncommitted edits (not re-measured here):**
-  IRAM 119,720 B (11,352 free), `.dram2_uninit` 88,792 B (9,976 free),
-  `.stack` 41,512 B, internal heap 65,536 B. All four F3 targets would be met.
-  On the device the internal heap is nearly all in use: about 13.4 KB free
-  idle, about 5 KB when a stream starts.
-- **The DEVBENCH lock is held** by `foundation/memory-rebudget` since
-  2026-11-18 18:12 UTC, one flash attempt used. Do not flash or reset DEVBENCH
-  and do not edit that worktree until its session has finished or the owner
-  says it has stopped.
-- **DEVBENCH now has an LMS to play from.** The owner gave
-  `http://172.25.8.40:9000/` on 2026-11-18 for audio checks, which removes the
-  F3 blocker described in section 6. Turn the volume down before the first
-  stream.
-- **Still to do for F3:** the one-hour soak (task 4) if it has not finished,
-  the work-order file, a session entry, rebase on `e574cc0e`, push, pull
-  request. F3 prepends to `.agents/sessions.md`; expect that file to conflict
-  if anything else prepends first.
-- The main checkout `S:\Github\squeezelite-esp32` was fast-forwarded to
-  `origin/MK5-Rust` when this update was merged.
+### 0.1 Where things are
 
-Section 10's three questions are answered: DEVBENCH has an LMS route, the
-flaky test is fixed, and the owner has not yet said what to do with commit
-`39799bd3`.
+| Item | State |
+|---|---|
+| `origin/MK5-Rust` | `3283d457` plus the commit that carries this section. PRs `#2` to `#13` merged. No pull request open. |
+| Other branches on `origin` | `backup/f3-memory-rebudget-4bcf9486` only (see 0.3). |
+| Main checkout `S:\Github\squeezelite-esp32` | fast-forwarded to `origin/MK5-Rust`, clean. |
+| Merged since `f957e255` | `#12` flaky torn-write test fixed (section 7.1 is done); `#11` `rust-analyzer` in the pinned toolchain; `#10` and `#13` this file. |
+| Plan | F0, F1, F2 merged. **F3 in progress, not merged.** F4 and everything after it not started. |
+
+### 0.2 Local worktrees on the owner's PC
+
+All under `.claude/worktrees/`. "Merged" means the remote branch was deleted
+after its squash merge, so git shows the local branch as ahead although its
+content is in `MK5-Rust`.
+
+| Worktree | Branch | State |
+|---|---|---|
+| `dazzling-yonath-8dd057` | `claude/dazzling-yonath-8dd057` | **F3, live work.** 11 commits, not pushed under its own name; three uncommitted doc edits. See 0.3. |
+| `foundation-dev-module-bringup-a01186` | `claude/foundation-dev-module-bringup-a01186` | merged (`#7`), clean |
+| `blissful-noether-5d05cd` | `claude/blissful-noether-5d05cd` | merged (`#8`), clean |
+| `docs-parity-corrections-7166ab` | `claude/docs-parity-corrections-7166ab` | merged (`#6`), clean |
+| `github-repo-analysis-76cda3` | `claude/github-repo-analysis-76cda3` | merged (`#10`), clean |
+| `repo-setup-plugins-ea5237` | `claude/repo-setup-plugins-ea5237` | merged (`#11`), clean |
+| `jolly-kirch-b9dcf3` | `test/config-torn-write-flake` | merged (`#12`), clean |
+| `project-analysis-next-steps-a48b5c` | detached at `origin/MK5-Rust` | nothing of its own |
+
+The worktree `mk5-rust-focus-9f9a35` and its branch
+`claude/repo-state-report-9b30ad`, listed in section 2, no longer exist. Their
+one unpushed commit `39799bd3` ("add feature-parity audit and P01-P30
+follow-on backlog", `docs/mk5-rust-parity-audit.md`, 394 lines) is still in
+the object store but no branch points to it, so git will eventually discard
+it. Who removed the worktree, and whether that was a decision to drop the
+commit, is not known. To keep it: `git branch parity-audit 39799bd3`.
+
+The merged worktrees can be removed when the owner says so. Do not remove
+`dazzling-yonath-8dd057`.
+
+### 0.3 F3 (`foundation/memory-rebudget`): what exists and what is missing
+
+The work is in worktree `dazzling-yonath-8dd057`. Its 11 commits are also on
+`origin` as `backup/f3-memory-rebudget-4bcf9486`, pushed by another session
+as a safety copy; it is not the working branch and has no pull request.
+Delete it once F3 has its own branch on `origin`.
+
+Committed (tip `4bcf9486`):
+
+- Task 1: heap sizes as checked constants, total 65,536 B.
+- Task 2: PSRAM-absent fallback buffers dropped; socket buffers, web syslog
+  ring and Bluetooth sink state on PSRAM; `RAM_JOURNAL` and `CONFIG_HANDLE`
+  in `.dram2_uninit`; AES tables in flash.
+- Task 3: the MP3 synthesis granule and DCT run from flash, not IRAM.
+- Task 5: `check_section_budget.py` tightened to the F3 figures with 256 B of
+  slack, plus an internal-heap check and its own unit tests;
+  `tests/memory_budget_invariant.rs`.
+- Extra: `/status.json` reports internal heap free and its low-water mark.
+
+Measured by running the budget script on that worktree's release image
+(built 2026-11-18 18:18 UTC):
+
+| Measure | Before F3 | F3 image | F3 target |
+|---|---|---|---|
+| IRAM used | 129,636 B | 119,720 B (11,352 free) | >= 10,000 free |
+| `.dram2_uninit` used | 98,520 B | 88,792 B (9,976 free) | >= 8,000 free |
+| `.stack` | 28,536 B | 41,512 B | >= 40,000 B |
+| Internal heap | 64,512 B | 65,536 B | >= 65,536 B |
+
+All four static targets are met. `git merge-tree` shows the branch merges
+into `3283d457` without conflicts. Its gates were not re-run for this
+section.
+
+Not committed: edits to `.agents/INFRASTRUCTURE_INVARIANTS.md`,
+`docs/mk5-rust-todo.md` and the design spec (the allowance table: 1,148 B of
+DRAM each to P1, P2, P3 and P6; 4,592 B of DRAM and 11,352 B of IRAM to D1;
+2,304 B unallocated). No `WO-F3` work-order file and no session entry exist.
+
+### 0.4 The F3 soak is not clean: read this before merging F3
+
+F3's merge bar is a one-hour mixed-codec soak on DEVBENCH with no underruns
+and no resets. A soak ran on 2026-11-18 from 18:15 to 19:16 UTC. Its raw
+files were in a temporary folder and are copied to
+`.agents/knowledge/work_orders/WO-F3-evidence/`. Reading `soak-i1.csv`
+(361 samples, one every 10 s):
+
+- **The device restarted twice.** `uptime_ms` fell from 462,470 to 21,313
+  between t = 414 s and 439 s, and from 565,986 to 14,802 between t = 984 s
+  and 1,003 s. After the second restart it ran 44 minutes without another.
+- **Frame rate.** 15 of 358 samples are outside 44,000 to 44,200 frames/s.
+  Most are in the first minute (the codec column reads `Bluetooth`) and
+  around the two restarts; three are during FLAC playback at t = 404, 601
+  and 1,134 s (42,543 to 43,958).
+- **Codec coverage.** Samples: FLAC 232, MP3 120, Bluetooth 8, PCM 1. **No
+  AAC sample**, although `soak.m4a` was queued, and `base-aac.csv` shows
+  `frames_played` at 0 for 171 s. AAC has not been shown to play on DEVBENCH.
+- **Heap.** Internal heap low-water mark 5,128 B; idle about 13.4 KB.
+  `disconnects` and `i2c_nacks` stayed 0.
+
+What this does not tell you: why the device restarted. It may be the F3
+changes (code moved out of IRAM, state moved to PSRAM), the 5 KB heap
+low-water mark, or the test setup. Nobody has compared against a soak of the
+pre-F3 image, and no pre-F3 image has ever been soaked on DEVBENCH. This
+reading was made from the raw file by a session that did not run the soak;
+the session that ran it has not written its own conclusion.
+
+Do not merge F3 on the static figures alone. First establish whether the
+image before F3 (`3283d457`) also restarts under the same soak. If it does
+not, bisect F3's commits; task 3 (MP3 out of IRAM) and the Bluetooth sink
+move to PSRAM are the first suspects, and each is one commit.
+
+### 0.5 DEVBENCH as it stands
+
+- Lock: `dev-module.lock` in the shared git directory is held by
+  `foundation/memory-rebudget` since 2026-11-18 18:12 UTC, one flash attempt
+  used. It goes stale two hours after that. Check with the owner that the F3
+  session has stopped before taking it over.
+- The module runs the F3 image and is at `172.25.6.102` on the owner's
+  `172.25.6.0/24` network. The owner's PC is `172.25.6.122`.
+- LMS for audio checks: `http://172.25.8.40:9000/` (owner, 2026-11-18). The
+  F3 session reached it through a relay script on the PC (port 9000) and
+  served test files from the PC on port 8123. The relay, monitor and LMS
+  helper scripts are kept, unreviewed, in
+  `.agents/knowledge/work_orders/WO-F3-evidence/`; the audio test files and
+  the serial capture script are not.
+- Volume was set to 8 to 10 for the soak. Check it before playing anything.
+
+### 0.6 Next steps, in order
+
+1. Confirm with the owner that the earlier F3 session has stopped. Then work
+   in `dazzling-yonath-8dd057`, or branch from the backup.
+2. Resolve 0.4: soak the pre-F3 image, compare, bisect if needed. Stop and
+   report after two flash attempts per check.
+3. Get AAC playing on DEVBENCH, or record why it does not.
+4. Write `WO-F3-memory-rebudget.md` with the budget output before and after
+   each task and the soak result; commit the three doc edits; add a session
+   entry; rebase on `origin/MK5-Rust`; run all gates; push; open the PR.
+5. After F3 merges: F4 (`foundation/service-seams`) in the plan. Note the
+   5 KB runtime heap low-water mark when sizing anything that allocates
+   internal RAM.
+
+### 0.7 Owner decisions still open
+
+- Keep or drop commit `39799bd3` (0.2).
+- Assign the 2,304 B of unallocated DRAM, or leave it in reserve.
+- The three F2 review findings in section 7.2.
+- Usage: on 2026-11-18 the weekly limit for the top model stood at 85 %; the
+  owner asked sessions to stop and hand off at 95 %. A cheaper model is
+  enough for step 4; steps 2 and 3 are diagnosis.
 
 ---
 

@@ -4,6 +4,7 @@ Rust port of squeezelite (a Logitech Media Server player) for ESP32. The active 
 
 ## Read first
 
+- `docs/mk5-rust-handoff.md` — handoff for an agent with no earlier context. Section 0 is the current state and the next steps; read it before anything else.
 - `docs/mk5-rust-todo.md` — the task list and crate map. Start here for any Rust work.
 - `.agents/INFRASTRUCTURE_INVARIANTS.md` — binding guardrails. Read it before hardware, OTA, git-remote or multi-agent work; it is not auto-loaded because of its size.
 - `.agents/AGENTS.md` — agent roles and delegation structure.
