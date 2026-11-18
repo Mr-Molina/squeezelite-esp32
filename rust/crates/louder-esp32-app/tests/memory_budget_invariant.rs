@@ -104,6 +104,6 @@ fn iram_placements_are_the_allow_list() {
     assert_eq!(count(MAIN_SRC, "#[unsafe(link_section = \".iram1\")]"), 1);
     // `process_interleaved_iram`.
     assert_eq!(count(EQUALIZER_SRC, "link_section = \".iram1\""), 1);
-    // `mp3d_dct_ii`. The MP3 synthesis granule runs from flash.
-    assert_eq!(count(MINIMP3_SRC, "link_section = \".iram1\""), 1);
+    // The MP3 synthesis granule and its DCT run from flash.
+    assert_eq!(count(MINIMP3_SRC, "link_section"), 0);
 }
