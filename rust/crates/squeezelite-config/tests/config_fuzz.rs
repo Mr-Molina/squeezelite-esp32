@@ -155,9 +155,16 @@ proptest! {
         .unwrap();
         prop_assert!(wrote_b2);
 
-        // Simulate torn write to B by truncating or zeroing the tail after tear_pct
+        // Simulate a torn write to B: everything from the tear point on is
+        // left in the unprogrammed flash state (0xFF).
         let tear_point = (tear_pct * n_b) / 100;
-        sector_b[tear_point..].fill(0xFF); // Flash unprogrammed state is 0xFF
+        // A tear only loses data if at least one byte it skipped was not
+        // already 0xFF. When the whole skipped tail of the journal is 0xFF
+        // (e.g. a late tear over a value ending in 0xFF), sector B is
+        // byte-for-byte complete and the loader must return v2, which
+        // `test_dual_sector_tear_over_erased_bytes_keeps_newer_sector` covers.
+        prop_assume!(sector_b[tear_point..n_b].iter().any(|&b| b != 0xFF));
+        sector_b[tear_point..].fill(0xFF);
 
         // Dual sector load MUST recover v1 from Sector A without error
         let mut recovered = MemConfigStore::<16>::new();
@@ -173,6 +180,50 @@ proptest! {
         let len = recovered.get("data", &mut buf).unwrap();
         prop_assert_eq!(&buf[..len], &v1[..]);
     }
+}
+
+/// Regression for the input that made `fuzz_dual_sector_torn_write_recovery`
+/// fail at random (`v1 = [0]`, `v2 = [255]`, `tear_pct = 97`): the tear
+/// starts at the last journal byte, which is the value byte `0xFF`, so the
+/// "torn" sector B is identical to the fully written one. It is the newer
+/// valid sector and the loader must return v2 from it, not fall back to A.
+#[test]
+fn test_dual_sector_tear_over_erased_bytes_keeps_newer_sector() {
+    let v1 = [0u8];
+    let v2 = [0xFFu8];
+    let tear_pct = 97usize;
+
+    let mut store = MemConfigStore::<16>::new();
+    store.set("data", &v1).unwrap();
+
+    let mut sector_a = [0u8; 512];
+    let mut sector_b = [0u8; 512];
+
+    let (wrote_b, _) =
+        FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+    assert!(!wrote_b);
+
+    store.set("data", &v2).unwrap();
+    let (wrote_b2, n_b) =
+        FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
+    assert!(wrote_b2);
+
+    let intact_b = sector_b;
+    let tear_point = (tear_pct * n_b) / 100;
+    assert_eq!(tear_point, n_b - 1);
+    sector_b[tear_point..].fill(0xFF);
+
+    // The tear changed nothing inside the journal, so B is still valid.
+    assert_eq!(&sector_b[..n_b], &intact_b[..n_b]);
+    assert!(FlashJournal::validate_sector(&sector_b).is_ok());
+
+    let mut recovered = MemConfigStore::<16>::new();
+    let count = FlashJournal::load_from_dual_sectors(&sector_a, &sector_b, &mut recovered).unwrap();
+    assert_eq!(count, 1);
+
+    let mut buf = [0u8; 32];
+    let len = recovered.get("data", &mut buf).unwrap();
+    assert_eq!(&buf[..len], &v2[..]);
 }
 
 #[test]
