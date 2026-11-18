@@ -169,17 +169,29 @@ depend on.
    and reports, because that means a plug-in point is missing.
 3. Memory: no new `.data`, `.bss` or `.dram2_uninit` statics and no new
    `.iram1` or `#[ram]` code beyond the branch's allowance. State lives on the
-   PSRAM heap. F3 fills in this table when it merges; until then every
-   allowance is zero.
+   PSRAM heap. F3 filled in this table from its closing measurement
+   (`WO-F3-memory-rebudget.md`, 2026-11-18): 11,488 B of free DRAM, which is
+   9,976 B of `.dram2_uninit` below its 98,768 B ceiling plus 1,512 B of
+   `.stack` above the 40,000 B F3 target, and 11,352 B of free IRAM. DRAM is
+   split 40 % to D1, 10 % each to P1, P2, P3 and P6, 20 % unallocated; all
+   free IRAM goes to D1.
 
    | Branch | DRAM allowance | IRAM allowance | Sockets |
    |---|---|---|---|
-   | P1 | set by F3 | 0 | 1 TCP |
-   | P2 | set by F3 | 0 | 2 UDP (1 discovery, 1 DNS) |
-   | P3 | set by F3 | 0 | 2 UDP |
-   | P4 | set by F3 | 0 | 0 |
-   | P6 | set by F3 | 0 | 2 UDP |
-   | D1a, D1b | set by F3 | set by F3 | 0 |
+   | P1 | 1,148 B | 0 | 1 TCP |
+   | P2 | 1,148 B | 0 | 2 UDP (1 discovery, 1 DNS) |
+   | P3 | 1,148 B | 0 | 2 UDP |
+   | P4 | 0 | 0 | 0 |
+   | P6 | 1,148 B | 0 | 2 UDP |
+   | D1a, D1b (together) | 4,592 B | 11,352 B | 0 |
+   | Unallocated | 2,304 B | 0 | |
+
+   `rust/scripts/check_section_budget.py` enforces the F3 figures with 256 B
+   of slack. A branch that uses its allowance moves the script default
+   (`--max-dram2`, `--min-stack`, `--max-iram`) by at most that allowance in
+   the same pull request and says so in its work-order file. The internal
+   heap check (`--min-heap`, 65,536 B) has no allowance. The unallocated
+   share is the owner's to assign.
 
 4. Gates: the three host commands and the firmware job in
    `.github/workflows/rust-ci.yml`, all green.
