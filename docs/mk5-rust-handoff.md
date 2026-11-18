@@ -17,6 +17,37 @@ they disagree with this section, this section is newer. Everything here was
 checked against git, GitHub and the files named, at the time above, unless it
 says otherwise.
 
+### 0.0 Changes after 19:40 UTC (these override 0.1 to 0.7 where they differ)
+
+Done at about 20:00 UTC on the owner's instruction ("proceed with the
+recommendations"), which the owner gave knowing the earlier F3 session looked
+stopped:
+
+- **F3's three doc edits are committed** in its worktree as `0f98b1d1`,
+  unchanged. `claude/dazzling-yonath-8dd057` now has 12 commits and a clean
+  tree. The copy on `origin`, `backup/f3-memory-rebudget-4bcf9486`, was
+  fast-forwarded to `0f98b1d1` (the name still carries the old hash). There
+  is still no `WO-F3` file, no session entry and no pull request.
+- **The DEVBENCH lock is released.** No `dev-module.lock` exists. The module
+  still runs the F3 image.
+- **Commit `39799bd3` is kept**: local branch `parity-audit`, and on `origin`
+  as `backup/parity-audit-39799bd3`. Whether its content should be merged,
+  reworked or dropped is still the owner's decision.
+- **The six merged worktrees are removed** together with their local
+  branches. Two empty folders may remain under `.claude/worktrees/`
+  (`docs-parity-corrections-7166ab`, `foundation-dev-module-bringup-a01186`)
+  because their sessions still held them open; they are not worktrees any
+  more and can be deleted by hand.
+- **Worktrees now:** the main checkout, `dazzling-yonath-8dd057` (F3) and
+  `project-analysis-next-steps-a48b5c`.
+- **Branches on `origin` now:** `MK5-Rust`, `backup/f3-memory-rebudget-4bcf9486`
+  and `backup/parity-audit-39799bd3`.
+- **Usage:** the weekly limit for the top model reached 90 %, against the
+  owner's stop line of 95 %; work stopped here. Use a cheaper model, or wait
+  for the weekly reset (2026-11-24 14:00 UTC), before the F3 diagnosis in 0.4.
+
+Step 1 of 0.6 is therefore done; start at step 2.
+
 ### 0.1 Where things are
 
 | Item | State |
