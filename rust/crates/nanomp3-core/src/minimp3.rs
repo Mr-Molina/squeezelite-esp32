@@ -1428,11 +1428,8 @@ fn mp3d_synth_all<S: Sample, const NCH: usize>(
 /// `(18 + 15) * 2 * 32` floats).
 const SYN_ROWS: usize = (18 + 15) * 2 * 32 / 4;
 
-#[allow(unsafe_code)]
-// JUSTIFICATION: Hot MP3 synthesis DCT kernel placed in IRAM (.iram1) on
-// xtensa.
-// SAFETY: Static placement in valid IRAM text section.
-#[cfg_attr(target_arch = "xtensa", unsafe(link_section = ".iram1"))]
+// Runs from flash (F3 task 3): it is not interrupt code and never runs with
+// the flash cache off, and its 5 KiB of IRAM are needed elsewhere.
 fn mp3d_synth_granule<S: Sample>(
     qmf_state: &mut [f32; 960],
     grbuf: &mut [[f32; 576]; 2],

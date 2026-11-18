@@ -83,3 +83,27 @@ fn bt_sink_is_not_static() {
         "main.rs still has the static Bluetooth sink"
     );
 }
+
+fn count(src: &str, needle: &str) -> usize {
+    src.matches(needle).count()
+}
+
+/// Code placed in IRAM is an allow-list (Invariant 47 and F3 task 3): the
+/// core-1 entry, the two PSRAM bring-up routines that run while the flash
+/// cache is reconfigured, the DMA write path with the decode/output phase
+/// that feeds it, and the equalizer inner loop. Anything else needs its
+/// branch's IRAM allowance and a change to this test.
+#[test]
+fn iram_placements_are_the_allow_list() {
+    const MINIMP3_SRC: &str = include_str!("../../nanomp3-core/src/minimp3.rs");
+    const EQUALIZER_SRC: &str = include_str!("../../squeezelite-audio-core/src/equalizer.rs");
+    // `app_core_loop`, `psram_send_cmd_spi1`, `init_and_map_psram_4mb`,
+    // `output_decode_phase`.
+    assert_eq!(count(MAIN_SRC, "    #[esp_hal::ram]\n"), 4);
+    // `write_dma`.
+    assert_eq!(count(MAIN_SRC, "#[unsafe(link_section = \".iram1\")]"), 1);
+    // `process_interleaved_iram`.
+    assert_eq!(count(EQUALIZER_SRC, "link_section = \".iram1\""), 1);
+    // `mp3d_dct_ii`. The MP3 synthesis granule runs from flash.
+    assert_eq!(count(MINIMP3_SRC, "link_section = \".iram1\""), 1);
+}
