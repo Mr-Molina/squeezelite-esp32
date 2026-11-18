@@ -42,18 +42,6 @@ use squeezelite_config::AudioConfig;
 #[cfg(not(target_arch = "xtensa"))]
 use squeezelite_decoders::PcmDecoder;
 
-#[allow(dead_code, clippy::duplicated_attributes)]
-mod console;
-#[allow(dead_code, clippy::duplicated_attributes)]
-mod controls;
-#[allow(dead_code, clippy::duplicated_attributes)]
-mod dac_platform;
-#[allow(dead_code, clippy::duplicated_attributes)]
-mod display_gds;
-#[allow(dead_code, clippy::duplicated_attributes)]
-mod eth_w5500;
-#[allow(dead_code, clippy::duplicated_attributes)]
-mod power_boards;
 #[cfg_attr(target_arch = "xtensa", allow(dead_code))]
 mod tasks;
 
