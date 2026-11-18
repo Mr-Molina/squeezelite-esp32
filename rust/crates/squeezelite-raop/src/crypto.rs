@@ -1015,12 +1015,8 @@ const INV_S_BOX_INIT: [u8; 256] = [
     0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
 ];
 
-// JUSTIFICATION: Placing INV_S_BOX in internal .dram1 avoids SPI flash
-// cache stalls during real-time AirPlay RTP packet decryption.
-// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
-// script for plain [u8; 256] data with no alignment or init hazards.
-#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
-#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+// INV_S_BOX is read-only data in flash (F3): 256 entries are not worth internal
+// RAM, which comes out of the main stack.
 static INV_S_BOX: [u8; 256] = INV_S_BOX_INIT;
 
 /// AES Rcon array.
@@ -1074,12 +1070,8 @@ const fn compute_td0() -> [u32; 256] {
     table
 }
 
-// JUSTIFICATION: Placing TD0 in internal .dram1 avoids SPI flash cache
-// stalls during real-time AirPlay RTP packet decryption.
-// SAFETY: .dram1 is a valid initialized RWDATA section in esp-hal's linker
-// script for plain [u32; 256] data with no alignment or init hazards.
-#[cfg_attr(target_arch = "xtensa", allow(unsafe_code))]
-#[cfg_attr(target_arch = "xtensa", link_section = ".dram1")]
+// TD0 is read-only data in flash (F3): 256 entries are not worth internal
+// RAM, which comes out of the main stack.
 static TD0: [u32; 256] = compute_td0();
 
 #[inline(always)]
