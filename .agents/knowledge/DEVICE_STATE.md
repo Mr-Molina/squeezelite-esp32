@@ -28,3 +28,48 @@
 1. **NEVER touch `/dev/ttyUSB0`** on `pc-1` (connected to separate CYD display board: `ESP32-D0WDQ6-V3`, MAC `d4:d4:da:5a:e7:3c`).
 2. **NEVER call `POST http://172.22.1.15/reboot_ota.json`**.
 3. **NEVER flash OTA without `--stage-only` pre-flight image validation and user authorization**.
+
+---
+
+# Dev module: "DEVBENCH" (`COM13` on the owner's Windows PC)
+
+The shared test board. Recorded by `WO-F1-dev-module-bringup` on 2026-11-17. Everything above this line is BASEMENT and none of it applies here.
+
+- **Hardware**: Louder-ESP32, ESP32 revision v3.1, 16 MB flash (the partition table uses the first 4 MB), 4 MB PSRAM
+- **Port**: `COM13`, CH340 (`USB\VID_1A86&PID_7523`), serial log at 115200 baud
+- **Wi-Fi MAC**: `ac:15:18:fd:93:9c` (this is `DEVBENCH_MAC` in `rust/scripts/devbench.py`; no other MAC may be flashed)
+- **Network on 2026-11-17**: DHCP `172.25.6.102`. This network had no route to the LMS at `10.0.0.50`.
+- **Device name**: `DEVBENCH`, set at build time with `SL_DEVICE_NAME=DEVBENCH`
+
+## DEVBENCH partition layout (read from the module)
+
+| Name | Offset | Size |
+| :--- | :--- | :--- |
+| `nvs` | `0x9000` | `0x4000` |
+| `otadata` | `0xD000` | `0x2000` |
+| `phy_init` | `0xF000` | `0x1000` |
+| `recovery` (factory, C `I2S-4MFlash-1681`) | `0x10000` | `0x140000` |
+| `ota_0` (Rust app) | `0x150000` | `0x2A0000` |
+| `settings` | `0x3F0000` | `0x10000` |
+
+`ota_0` is 64 KiB lower than the `0x160000` recorded for BASEMENT. The firmware does not depend on that offset.
+
+## DEVBENCH install route and backup
+
+- **Route A (owner decision 2026-11-17)**: the C bootloader, partition table and recovery that were already on the module stay. Agents write only the Rust app to `ota_0` (`devbench.py flash`) and the `ota_0` select sector at `0xD000` (`devbench.py select-ota0`). Never the bootloader, partition table, recovery, `nvs` or `settings`.
+- **Original contents**: `C:\Users\jmolina\devbench-backup\devbench-original.bin`, 16,777,216 B, SHA-256 `aa579ae1375ffba9ee8b1a770da9ee7d791f6fc6ab900caf4d280db4466204c9`. Outside the repository; may hold credentials; never committed. Restores the module with `espflash write-bin --port COM13 0x0 <file>`.
+- **Serial speed**: reads at 921600 baud corrupt on this adapter. Use 460800 or lower.
+
+## DEVBENCH recovery markers
+
+The firmware erases `otadata` at about 1.0 s after reset and writes the `ota_0` entry back when DHCP completes (about 3 to 4 s on this network). A reset between those two moments leaves `otadata` blank and the next boot is C recovery. That is an early reset, not a firmware failure.
+
+| What happened | Serial log line |
+| :--- | :--- |
+| Rust image started | `boot: Loaded app from partition at offset 0x150000` |
+| Fall-back armed | `[ANTI-BRICK GATE 1] otadata (0xD000..0xF000) erased & verified 0xFF (Factory recovery pre-armed)` |
+| Past the risky window | `[DHCPv4] Acquired IP ...` on serial; `boot: ota_0 confirmed healthy; otadata pinned to ota_0` in `GET /messages.json` |
+| Came up in recovery | `boot: Defaulting to factory image`, then `boot: Loaded app from partition at offset 0x10000`, `App version: I2S-4MFlash-1681`, `RECOVERY APPLICATION` |
+| Over HTTP | Rust: `"recovery":0`, `"version":"I2S-4MFlash-Rust"`. Recovery: `"recovery":1`, `"version":"I2S-4MFlash-1681"` |
+
+Way back from recovery: `python rust/scripts/devbench.py select-ota0 <branch>` under the lock. No reflash is needed if the image in `ota_0` is good.

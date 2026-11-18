@@ -40,6 +40,10 @@ jobs:
         working-directory: rust
         run: cargo test --workspace
 
+      - name: Script Tests
+        working-directory: ${{ github.workspace }}
+        run: python3 -m unittest discover -s rust/scripts -p "test_*.py"
+
   # Builds the image that actually runs on the device. The host job above never
   # compiles the `cfg(target_arch = "xtensa")` code or links against the
   # ESP32 memory map.

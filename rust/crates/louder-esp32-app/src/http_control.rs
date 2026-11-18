@@ -288,7 +288,7 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             bt_status: 0,
             bt_sub_status: 0,
             eq_bands_db: [0; 10],
-            player_name: "BASEMENT",
+            player_name: crate::board::first_boot_defaults::PLAYER_NAME,
         }
     }
 }
@@ -522,7 +522,11 @@ pub const BOARD_GPIO_MAP: &[GpioPinDescriptor] = &[
 
 /// Default C-compatible NVS entries exposed in `GET /config.json`.
 pub const DEFAULT_NVS_CONFIG_ENTRIES: &[(&str, &str, u8)] = &[
-    ("host_name", "BASEMENT", crate::config_handle::NVS_TYPE_STR),
+    (
+        "host_name",
+        crate::board::first_boot_defaults::PLAYER_NAME,
+        crate::config_handle::NVS_TYPE_STR,
+    ),
     ("autoexec", "1", crate::config_handle::NVS_TYPE_U8),
     (
         "autoexec1",
@@ -666,7 +670,8 @@ pub fn write_config_json(
         )
         .ok()?;
     }
-    let host_name_val = find_override("host_name").unwrap_or("BASEMENT");
+    let host_name_val =
+        find_override("host_name").unwrap_or(crate::board::first_boot_defaults::PLAYER_NAME);
     let autoexec_val = find_override("autoexec").unwrap_or("1");
     let autoexec1_val =
         find_override("autoexec1").unwrap_or("squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W");
@@ -2440,7 +2445,7 @@ pub fn handle_http_request_streaming_impl(
         let remote_name = if !snapshot.player_name.is_empty() {
             snapshot.player_name
         } else {
-            "BASEMENT"
+            crate::board::first_boot_defaults::PLAYER_NAME
         };
 
         let mut zc = ZeroConfServer::new();

@@ -113,6 +113,23 @@ T01–T03 fix them):
 - `louder-esp32-app` bin test: `test_run_firmware_tick_with_network_recovers_amp_fault_and_syncs_rate`.
 - Xtensa clippy stops at `squeezelite-audio-core/src/ringbuffer.rs:118`.
 
+**Checking on hardware: the dev module DEVBENCH.** A second Louder-ESP32 on
+`COM13` of the owner's Windows PC is the test board (MAC `ac:15:18:fd:93:9c`,
+layout and recovery markers in `.agents/knowledge/DEVICE_STATE.md`). Build its
+image with `SL_DEVICE_NAME=DEVBENCH` (the name must be exactly 8 bytes) and
+flash only through the helper, one agent at a time, from the repository root:
+
+```bash
+python rust/scripts/devbench.py acquire <branch>
+espflash save-image --chip esp32 rust/target/xtensa-esp32-none-elf/release/louder-esp32-app rust/target/devbench/app.bin
+python rust/scripts/devbench.py flash <branch> rust/target/devbench/app.bin
+python rust/scripts/devbench.py select-ota0 <branch>   # only if it came up in C recovery
+python rust/scripts/devbench.py release <branch>
+```
+
+`flash` refuses any board whose MAC is not DEVBENCH's and refuses a third
+attempt under one lock. BASEMENT is never flashed.
+
 **Measuring on device.** The HTTP status page reports `decode_us_max` (worst
 decode step, µs, since the decoder was installed). Use it for before/after
 numbers on any decoder or DSP task; state in the commit whether a gain was

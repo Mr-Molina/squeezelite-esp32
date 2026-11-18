@@ -1131,7 +1131,7 @@ impl BtSecurityPolicy {
     #[must_use]
     pub fn device_name(&self) -> &str {
         let bytes = self.device_name_bytes();
-        core::str::from_utf8(bytes).unwrap_or("BASEMENT")
+        core::str::from_utf8(bytes).unwrap_or(crate::board::first_boot_defaults::PLAYER_NAME)
     }
 
     #[must_use]

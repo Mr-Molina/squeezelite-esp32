@@ -2,6 +2,19 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-18 09:26 | Claude Code | [squeezelite-esp32] F1 Dev-Module Bring-Up: `SL_DEVICE_NAME`, DEVBENCH Install & Flash Helper (`WO-F1`, PR `#7`)
+**Scope**: Work order F1 (`foundation/dev-module-bringup`) of `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, on branch `claude/foundation-dev-module-bringup-a01186`. A second Louder-ESP32 on `COM13` of the owner's Windows PC is now the shared test board DEVBENCH. BASEMENT was not contacted, flashed or rebooted.
+- **Key Outcomes**:
+  - **Compile-time device name**: `board::first_boot_defaults::PLAYER_NAME` comes from `SL_DEVICE_NAME` (default `"BASEMENT"`); literals replaced in `main.rs`, `bt_a2dp.rs`, `config_handle.rs` and the runtime fallbacks in `http_control.rs`; pinned by `tests/device_name_invariant.rs`. The name must be exactly 8 bytes (compile-time assert in `bt_a2dp.rs`).
+  - **DEVBENCH identified and backed up**: ESP32 rev v3.1, 16 MB flash, MAC `ac:15:18:fd:93:9c`. It already carried the C `I2S-4MFlash-1681` layout. Backup at `C:\Users\jmolina\devbench-backup\devbench-original.bin` (SHA-256 `aa579ae1375ffba9ee8b1a770da9ee7d791f6fc6ab900caf4d280db4466204c9`), outside the repository.
+  - **Install (owner decision: Route A, agent sets boot)**: the existing bootloader, partition table and recovery stay; the Rust app is in `ota_0` at `0x150000` (BASEMENT's is recorded at `0x160000`) and the `ota_0` select sector was written at `0xD000`. Module runs `I2S-4MFlash-Rust` as `DEVBENCH`, `recovery: 0`, `otadata` pinned.
+  - **Helper**: `rust/scripts/devbench.py` (`acquire`, `release`, `check-mac`, `flash`, `select-ota0`) with a lock in the shared git directory, a MAC check before every write and two flash attempts per lock; `rust/scripts/test_devbench.py` (11 tests) runs in the host CI job.
+  - **Recovery markers**: a reset between the `otadata` erase (about 1.0 s) and DHCP completion (about 3 to 4 s on that network) drops the module into C recovery; `select-ota0` brings it back without a reflash. The window ends at DHCP completion on this build, not at a fixed 46 s. Markers are in `DEVICE_STATE.md`.
+  - **Docs**: `DEVICE_STATE.md` (DEVBENCH section), `CLAUDE.md` (standing permissions), `docs/mk5-rust-todo.md` (how to flash it), work order `WO-F1-dev-module-bringup.md` (logs).
+  - **Verification**: host gates and the four firmware gates green locally (IRAM `129,636` B, `.dram2_uninit` `98,520` B, `.stack` `28,528` B); PR `#7` checks green.
+- **Closed with these baseline items not done (owner closed F1 on 2026-11-18)**: ten minutes of an LMS stream; DEVBENCH and BASEMENT as two players in LMS; one AirPlay session; one Bluetooth sink session; an internal-heap figure (the firmware prints PSRAM figures only). The module's network (`172.25.6.0/24`) had no route to the LMS and its LMS target is still the first-boot default `10.0.0.10`.
+- **Next-Session Handoff Notes**: PR `#7` is open against `MK5-Rust`; only the owner merges. F2 (`foundation/single-loop`) is next and its dev-module check uses `devbench.py`. An agent that needs audio on DEVBENCH must first have it on a network that reaches the LMS, and should turn the volume down before the first stream (`vol_pct` read 80). `"BASEMENT"` (`172.22.1.15`) is unchanged: never flash, reboot or OTA it, never touch `/dev/ttyUSB0`, never call `POST /reboot_ota.json`.
+
 ## 2026-11-16 17:17 | Claude Code | [squeezelite-esp32] Parity Doc Correction, Firmware CI Job, Stack-Floor Decision & Doc Cleanups
 **Scope**: Project analysis on `MK5-Rust`, then three documentation/CI changes. No Rust source under `rust/crates/*/src` changed. The device was not contacted, flashed or rebooted.
 - **Key Outcomes**:
