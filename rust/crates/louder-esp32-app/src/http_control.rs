@@ -15,6 +15,8 @@
 //! - `DeadManLeaseWatchdog`: 45-second boot connect/DHCP timeout and 60-second
 //!   link-drop timeout.
 
+extern crate alloc;
+
 use core::cell::RefCell;
 use core::fmt::Write;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -1190,15 +1192,26 @@ impl SyslogRingBuffer {
     }
 }
 
-static WEB_SYSLOG_RING: Mutex<CriticalSectionRawMutex, RefCell<SyslogRingBuffer>> =
-    Mutex::new(RefCell::new(SyslogRingBuffer::new()));
+/// The global web syslog ring. Only the pointer is static: the ring itself
+/// (about 3.3 KiB) is allocated on first use, which on the device is the PSRAM
+/// heap region, so it costs no internal RAM.
+static WEB_SYSLOG_RING: Mutex<
+    CriticalSectionRawMutex,
+    RefCell<Option<alloc::boxed::Box<SyslogRingBuffer>>>,
+> = Mutex::new(RefCell::new(None));
 
-/// Appends a runtime event to the global web syslog ring buffer without heap
-/// allocation.
-pub fn push_runtime_syslog(level: &str, msg_class: &str, msg: &str, timestamp_ms: u64) {
+/// Runs `f` on the global web syslog ring, allocating it on first use.
+fn with_syslog_ring<R>(f: impl FnOnce(&mut SyslogRingBuffer) -> R) -> R {
     WEB_SYSLOG_RING.lock(|cell| {
-        cell.borrow_mut().push(timestamp_ms, level, msg_class, msg);
-    });
+        let mut slot = cell.borrow_mut();
+        f(slot.get_or_insert_with(|| alloc::boxed::Box::new(SyslogRingBuffer::new())))
+    })
+}
+
+/// Appends a runtime event to the global web syslog ring buffer. Only the
+/// first call allocates (the ring itself); it must come after the heap is up.
+pub fn push_runtime_syslog(level: &str, msg_class: &str, msg: &str, timestamp_ms: u64) {
+    with_syslog_ring(|ring| ring.push(timestamp_ms, level, msg_class, msg));
 }
 
 /// Appends a runtime event to the web syslog ring buffer (alias for
@@ -1489,8 +1502,7 @@ pub fn dispatch_web_post_action(
     let payload = extract_query_or_body(raw_path, req_bytes);
     let mut new_wifi: Option<crate::ota_safety::WifiStaCredentials> = None;
 
-    WEB_SYSLOG_RING.lock(|cell| {
-        let mut syslog = cell.borrow_mut();
+    with_syslog_ring(|syslog| {
         let mut cfg_tmp = config.clone_handle();
         match action {
             HttpControlAction::UpdateConfig => {
@@ -1500,7 +1512,7 @@ pub fn dispatch_web_post_action(
                         upd.value,
                         snap.uptime_ms,
                         &mut cfg_tmp,
-                        &mut syslog,
+                        &mut *syslog,
                     );
                     let _ = config.sync_from(&cfg_tmp);
                 }
@@ -1510,7 +1522,7 @@ pub fn dispatch_web_post_action(
                 let cmd_str = extract_param_or_json_field(payload, "cmd")
                     .or_else(|| extract_param_or_json_field(payload, "command"))
                     .unwrap_or("");
-                if execute_web_cli_command(cmd_str, snap, &mut cfg_tmp, &mut syslog) {
+                if execute_web_cli_command(cmd_str, snap, &mut cfg_tmp, &mut *syslog) {
                     let _ = config.sync_from(&cfg_tmp);
                     let _ = config.flush_now(journal);
                 }
@@ -2953,8 +2965,7 @@ pub fn handle_http_request_streaming_impl(
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
-            let body_len = WEB_SYSLOG_RING.lock(|cell| {
-                let ring = cell.borrow();
+            let body_len = with_syslog_ring(|ring| {
                 let ring_opt = if ring.is_empty() { None } else { Some(&*ring) };
                 format_messages_json(snapshot, ring_opt, &mut out_buf[HEADER_ROOM..])
             })?;
@@ -4362,9 +4373,8 @@ mod tests {
         ));
         assert_eq!(cfg.host_name_str(), "VaultRoom");
 
-        WEB_SYSLOG_RING.lock(|cell| {
-            let mut ring = cell.borrow_mut();
-            let _ = execute_web_cli_command("version", &snap, &mut cfg, &mut ring);
+        with_syslog_ring(|ring| {
+            let _ = execute_web_cli_command("version", &snap, &mut cfg, ring);
         });
         let (mlen, _) = handle_http_control_request(
             b"GET /messages.json HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n",
@@ -4375,5 +4385,14 @@ mod tests {
         let mresp = core::str::from_utf8(&buf[..mlen]).unwrap();
         assert!(mresp.contains(RUST_OTA_FIRMWARE_VERSION));
         assert!(mresp.contains("\"MESSAGING_CLASS_STATS\""));
+    }
+
+    /// F3: the ring is on the heap; the static holds only the mutex and the
+    /// pointer, so it costs (next to) no internal RAM on the device.
+    #[test]
+    fn web_syslog_ring_static_is_pointer_sized() {
+        assert!(core::mem::size_of_val(&WEB_SYSLOG_RING) <= 32);
+        push_runtime_syslog("INFO", "MESSAGING_CLASS_SYSTEM", "f3 ring probe", 1);
+        assert!(with_syslog_ring(|ring| !ring.is_empty()));
     }
 }
