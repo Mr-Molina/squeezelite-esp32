@@ -22,3 +22,15 @@ fn no_psram_absent_fallback_buffers() {
         "main.rs must reset into recovery when PSRAM is missing"
     );
 }
+
+/// Every TCP socket buffer is allocated from the PSRAM heap region at
+/// bring-up; no static socket buffer lives in internal RAM.
+#[test]
+fn socket_buffers_are_not_static() {
+    for name in ["FirmwareBssBuffers", "BSS_BUFFERS"] {
+        assert!(
+            !MAIN_SRC.contains(name),
+            "main.rs still has the static socket buffers `{name}`"
+        );
+    }
+}

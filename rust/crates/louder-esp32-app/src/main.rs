@@ -1162,22 +1162,6 @@ mod xtensa_hw {
         }
     }
 
-    struct FirmwareBssBuffers {
-        http_rx_buf: [u8; 1024],
-        slim_tx_buf: [u8; 2048],
-        audio_tx_buf: [u8; 512],
-    }
-
-    impl FirmwareBssBuffers {
-        const fn new() -> Self {
-            Self {
-                http_rx_buf: [0u8; 1024],
-                slim_tx_buf: [0u8; 2048],
-                audio_tx_buf: [0u8; 512],
-            }
-        }
-    }
-
     #[allow(unsafe_code)]
     // JUSTIFICATION: Dedicated execution stack for Core 1 (APP_CPU) in DRAM2.
     // SAFETY: Accessed exclusively by Core 1 runner; stack bounds enforced by
@@ -1708,22 +1692,6 @@ mod xtensa_hw {
             }
             (&*config, journal)
         }
-    }
-
-    #[allow(unsafe_code)]
-    fn take_firmware_bss_buffers() -> &'static mut FirmwareBssBuffers {
-        static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        assert!(
-            !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
-            "FirmwareBssBuffers already taken"
-        );
-        // JUSTIFICATION: Static BSS buffers in DRAM2 to avoid stack exhaustion.
-        // SAFETY: Single caller on PRO_CPU guarded by atomic TAKEN.
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut BSS_BUFFERS: FirmwareBssBuffers = FirmwareBssBuffers::new();
-        // JUSTIFICATION: Access to global static firmware BSS buffer singleton.
-        // SAFETY: Only a single caller on PRO_CPU takes ownership of the buffers.
-        unsafe { &mut *core::ptr::addr_of_mut!(BSS_BUFFERS) }
     }
 
     pub(crate) type HwStreamPipeline =
@@ -2532,13 +2500,6 @@ mod xtensa_hw {
         let mut sta_mac = [0u8; 6];
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
 
-        let fw_bufs = take_firmware_bss_buffers();
-        let FirmwareBssBuffers {
-            ref mut http_rx_buf,
-            ref mut slim_tx_buf,
-            ref mut audio_tx_buf,
-        } = fw_bufs;
-
         // Boot config resolution (spec §3.4), each field independently:
         // settings FlashJournal, then (Wi-Fi only) the C firmware's NVS, then
         // the compile-time first-boot defaults.
@@ -2790,6 +2751,14 @@ mod xtensa_hw {
             alloc::boxed::Box::leak(alloc::vec![0u8; 8_192].into_boxed_slice()),
             alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
         );
+        // The small socket buffers (HTTP receive, SlimProto and audio
+        // transmit) come from the same PSRAM region (Region 0, Invariant 48).
+        let http_rx_buf: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 1_024].into_boxed_slice());
+        let slim_tx_buf: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 2_048].into_boxed_slice());
+        let audio_tx_buf: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 512].into_boxed_slice());
 
         let NetStack {
             smol_iface,
@@ -2807,9 +2776,9 @@ mod xtensa_hw {
             &mut sta_iface,
             sta_mac,
             [
-                (&mut http_rx_buf[..], &mut http_tx_buf[..]),
-                (slim_rx_slice, &mut slim_tx_buf[..]),
-                (audio_rx_slice, &mut audio_tx_buf[..]),
+                (http_rx_buf, &mut http_tx_buf[..]),
+                (slim_rx_slice, slim_tx_buf),
+                (audio_rx_slice, audio_tx_buf),
             ],
         );
 
