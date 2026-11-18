@@ -3545,6 +3545,23 @@ mod xtensa_hw {
                                 ),
                                 None => (s.coordinator.current_sample_rate, 64, true, false),
                             };
+                        let (int_heap_free_bytes, int_heap_min_free_bytes) = {
+                            static INT_HEAP_MIN_FREE: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(u32::MAX);
+                            let stats = esp_alloc::HEAP.stats();
+                            let free: u32 = stats
+                                .region_stats
+                                .iter()
+                                .flatten()
+                                .filter(|r| r.size <= 1024 * 1024)
+                                .map(|r| r.free as u32)
+                                .sum();
+                            let min = INT_HEAP_MIN_FREE
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                .min(free);
+                            INT_HEAP_MIN_FREE.store(min, core::sync::atomic::Ordering::Relaxed);
+                            (free, min)
+                        };
                         let (psram_free_bytes, psram_used_bytes) = {
                             let stats = esp_alloc::HEAP.stats();
                             let mut free = 0u32;
@@ -3622,6 +3639,8 @@ mod xtensa_hw {
                             uptime_ms: now_ms.saturating_sub(s.boot_ms),
                             psram_free_bytes,
                             psram_used_bytes,
+                            int_heap_free_bytes,
+                            int_heap_min_free_bytes,
                             core1_active: s.core1.is_active(),
                             core1_loops: CORE1_HEARTBEAT
                                 .load(core::sync::atomic::Ordering::Relaxed),
