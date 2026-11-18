@@ -60,9 +60,8 @@ pub enum AudioEvent {
 #[allow(dead_code)]
 pub const CHANNEL_DEPTH: usize = 8;
 
-/// Coordinator -> audio command channel. Unused while the audio tasks are ring
-/// members on core
-/// 0 (the linker drops it); wired by the core-1 audio migration.
+/// Coordinator -> audio command channel. Unused until the core-1 audio
+/// migration wires it (the linker drops it).
 #[allow(dead_code)]
 pub static CTRL: Channel<CriticalSectionRawMutex, CoordinatorCmd, CHANNEL_DEPTH> = Channel::new();
 

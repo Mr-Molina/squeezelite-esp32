@@ -1868,9 +1868,9 @@ mod xtensa_hw {
             }
         }
 
-        /// Restarts APP_CPU after a runtime settings flash write
-        /// (`runtime-flash-persist` only; see the settings write in
-        /// `pump_device_phase`).
+        /// Restarts APP_CPU after a runtime flash write (the settings
+        /// journal write in the device loop and the `otadata` pin; both run
+        /// in every build).
         /// Default build: the manual path's core 1 runs the IRAM NOP
         /// heartbeat, so it resumes where it was parked.
         pub(crate) fn unpark_after_flash_write(&mut self) {

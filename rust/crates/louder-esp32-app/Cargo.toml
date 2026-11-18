@@ -23,12 +23,14 @@ std-codecs = ["squeezelite-decoders/std"]
 # with an embassy executor on core 1 (heartbeat task only; the audio tasks stay on core 0 until
 # the S1 owner gate validates core-1 bring-up on hardware). Both paths must compile.
 esp-rtos-core1 = []
-# Task 10, default OFF. Off: settings changes are debounced into the RAM journal and reach flash
-# only on the certified pre-reboot path (WO-109: runtime flash I/O deadlocked this board). On: the
-# `config_writer` task also commits the journal to flash at runtime, hazard-gated (not while
-# audio plays, APP_CPU parked, no flash reads, DRAM-only buffers, ping-pong sectors); rules in
-# the settings write in `main.rs` `pump_device_phase`. Requires the manual core-1 path (not `esp-rtos-core1`).
-# Not hardware-certified: owner gate = power-cycle soak with settings churn idle + playing.
+# Task 10, default OFF. In `main.rs` this feature only selects the settings flash target: off =
+# sector A, on = dual-sector ping-pong. In BOTH builds `main.rs` writes the debounced journal to
+# flash at runtime (the 100 ms config poll in the device loop, APP_CPU parked), with no
+# play-state gate. The hazard-gated `runtime_flash_commit` this comment used to describe (not
+# while audio plays, result-checked, 60 s retry; WO-108/WO-109) existed only in the `tasks.rs`
+# ring that never ran and was removed by F2 (last at `aed5c388`); see `WO-F2-single-loop.md`.
+# Requires the manual core-1 path (not `esp-rtos-core1`). Not hardware-certified: owner gate =
+# power-cycle soak with settings churn idle + playing.
 runtime-flash-persist = []
 
 [dependencies]

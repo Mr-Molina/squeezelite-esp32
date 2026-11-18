@@ -35,8 +35,8 @@ fn pipeline_has_no_target_arch_cfg() {
 }
 
 /// Task 10: the persistence logic is platform-free and fully host-tested; the
-/// device flash commit and its `runtime-flash-persist` gate live only in
-/// `main.rs`.
+/// device flash write and every `runtime-flash-persist` cfg live only in
+/// `main.rs` (where the feature selects the flash target sector).
 const CONFIG_HANDLE_SRC: &str = include_str!("../src/config_handle.rs");
 
 #[test]
