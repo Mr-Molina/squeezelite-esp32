@@ -17,6 +17,15 @@ Rust port of squeezelite (a Logitech Media Server player) for ESP32. The active 
 - Do not flash, reboot or OTA the device without explicit owner approval in the current session.
 - `D1` (Core 1 decode/output migration) is owner-gated: do not start it without explicit authorization.
 
+## Dev module "DEVBENCH" (standing permissions, owner decision 2026-11-17)
+
+A second Louder-ESP32 on `COM13` of the owner's Windows PC (MAC `ac:15:18:fd:93:9c`) is the shared test board. Details are in `.agents/knowledge/DEVICE_STATE.md`. None of this applies to BASEMENT.
+
+- Agents may reset and flash DEVBENCH without asking each time, one agent at a time, and only through `rust/scripts/devbench.py` (`acquire`, `flash`, `select-ota0`, `release`). At most two flash attempts per check.
+- The helper writes only the app in `ota_0` and the `ota_0` select sector at `0xD000`. Never write the bootloader, partition table, recovery, `nvs` or `settings`.
+- Build its image with `SL_DEVICE_NAME=DEVBENCH`. Never type, print or commit Wi-Fi credentials.
+- Agents working a work order from `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md` may push their own branch and open a pull request against `MK5-Rust`. They never push to `MK5-Rust` and never merge.
+
 ## Rust workspace
 
 All Rust lives under `rust/` (Cargo workspace, toolchain pinned in `rust/rust-toolchain.toml`). Run from `rust/`; these are the CI gates in `.github/workflows/rust-ci.yml`:

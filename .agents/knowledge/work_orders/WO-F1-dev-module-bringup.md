@@ -5,7 +5,7 @@
 - **Plan**: `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, work order F1
 - **Spec**: `docs/superpowers/specs/2026-11-17-parity-branch-distribution-design.md`, section 8
 - **Target**: second Louder-ESP32 on `COM13` of the owner's Windows PC (CH340, `USB\VID_1A86&PID_7523`)
-- **Status**: Tasks 1 to 3 done. Owner confirmed **Route A** on 2026-11-17. Task 4: module installed and running the Rust image (section 8); early-reset markers recorded. **Open:** the LMS, AirPlay and Bluetooth baseline sessions (8.4) and the `CLAUDE.md` edit (8.6).
+- **Status**: Tasks 1 to 3 done. Owner confirmed **Route A** on 2026-11-17. Task 4: module installed and running the Rust image (section 8); early-reset markers recorded. **Open:** the LMS, AirPlay and Bluetooth baseline sessions (8.4).
 
 ## 0. Guardrails
 
@@ -293,4 +293,4 @@ Finding for later work orders: on this build the window in which a reset drops t
 - Module: running the Rust image `276d4494...dc402d` from `ota_0`, `otadata` pinned, on Wi-Fi. Lock released.
 - Flash attempts used in this check: 1 of 2.
 - Not written at any point: bootloader, partition table, recovery, `nvs`, `settings`.
-- `CLAUDE.md` is not yet updated with the DEVBENCH standing permissions (plan Task 4 Step 5). That edit waits for the owner's word in this session.
+- `CLAUDE.md` carries the DEVBENCH standing permissions (plan Task 4 Step 5), added on the owner's word on 2026-11-18.
