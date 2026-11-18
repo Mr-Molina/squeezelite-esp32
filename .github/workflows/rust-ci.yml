@@ -36,9 +36,17 @@ jobs:
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Cargo Clippy (all features)
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: Cargo Test
         working-directory: rust
         run: cargo test --workspace
+
+      - name: Cargo Test (all features)
+        working-directory: rust
+        run: cargo test --workspace --all-features
 
       - name: Script Tests
         working-directory: ${{ github.workspace }}
@@ -94,6 +102,15 @@ jobs:
 
       - name: Build release firmware
         run: cargo +esp build --release -p louder-esp32-app $XTENSA_ARGS
+
+      - name: Build release CYD controller firmware
+        run: cargo +esp build --release -p cyd-controller-app $XTENSA_ARGS
+
+      # Note: `louder-esp32-app` with `--no-default-features --features board-louder-esp32-s3`
+      # targeting `xtensa-esp32s3-none-elf` is intentionally omitted here because
+      # `crates/louder-esp32-app/Cargo.toml` currently pins `esp32` chip features on
+      # `esp-hal` and companion `esp-*` crates under `[target.'cfg(target_arch = "xtensa")'.dependencies]`,
+      # causing `esp-hal`'s build script to fail on `xtensa-esp32s3-none-elf`.
 
       - name: Check memory-section budgets
         run: python3 scripts/check_section_budget.py target/xtensa-esp32-none-elf/release/louder-esp32-app
