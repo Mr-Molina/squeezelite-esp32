@@ -169,6 +169,12 @@ pub struct HttpStatusSnapshot<'a> {
     pub psram_free_bytes: u32,
     /// Used PSRAM in external Quad-SPI RAM in bytes.
     pub psram_used_bytes: u32,
+    /// Free internal-RAM heap in bytes (all `MemoryCapability::Internal`
+    /// regions together; 0 where no heap statistics exist).
+    pub int_heap_free_bytes: u32,
+    /// Lowest `int_heap_free_bytes` seen since boot. It is sampled whenever a
+    /// status snapshot is built, so a dip between two snapshots is not seen.
+    pub int_heap_min_free_bytes: u32,
     /// Whether Core 1 (`APP_CPU`) audio/watchdog task is active.
     pub core1_active: bool,
     /// Core 1 monotonic loop execution counter.
@@ -260,6 +266,8 @@ impl<'a> Default for HttpStatusSnapshot<'a> {
             uptime_ms: 0,
             psram_free_bytes: DEFAULT_PSRAM_FREE_BYTES,
             psram_used_bytes: DEFAULT_PSRAM_USED_BYTES,
+            int_heap_free_bytes: 0,
+            int_heap_min_free_bytes: 0,
             core1_active: true,
             core1_loops: 0,
             codec: "PCM",
@@ -384,7 +392,7 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         \"lms_port\":{},\"lms_ip\":\"{}.{}.{}.{}\",\"frames_played\":{},\
         \"amp_mode\":\"{}\",\"vol_pct\":{},\"i2c_acks\":{},\"i2c_nacks\":{},\
         \"i2c_nack_by_op\":{{\"read\":{},\"write\":{},\"write_read\":{}}},\
-        \"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},\
+        \"uptime_ms\":{},\"psram_free_bytes\":{},\"psram_used_bytes\":{},        \"int_heap_free_bytes\":{},\"int_heap_min_free_bytes\":{},\
         \"core1_active\":{},\"core1_loops\":{},\"codec\":\"{}\",\
         \"codec_sample_rate\":{},\"codec_channels\":{},\"codec_bit_depth\":{},\
         \"eq_preset\":\"{}\",\"eq_enabled\":{},\"tas_fs_hz\":{},\
@@ -429,6 +437,8 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.uptime_ms,
         snapshot.psram_free_bytes,
         snapshot.psram_used_bytes,
+        snapshot.int_heap_free_bytes,
+        snapshot.int_heap_min_free_bytes,
         snapshot.core1_active,
         snapshot.core1_loops,
         JsonEscaped(snapshot.codec),
@@ -3188,6 +3198,7 @@ mod tests {
         assert!(resp.contains("\"vol_pct\":55"));
         assert!(resp.contains("\"psram_free_bytes\":1622016"));
         assert!(resp.contains("\"psram_used_bytes\":2572288"));
+        assert!(resp.contains("\"int_heap_free_bytes\":0,\"int_heap_min_free_bytes\":0"));
         assert!(resp.contains("\"core1_active\":true"));
         assert!(resp.contains("\"core1_loops\":0"));
         assert!(resp.contains("\"codec\":\"PCM\""));
@@ -3554,6 +3565,8 @@ mod tests {
             uptime_ms: u64::MAX,
             psram_free_bytes: u32::MAX,
             psram_used_bytes: u32::MAX,
+            int_heap_free_bytes: u32::MAX,
+            int_heap_min_free_bytes: u32::MAX,
             core1_loops: u32::MAX,
             codec: "Vorbis",
             codec_sample_rate: u32::MAX,
@@ -3614,6 +3627,8 @@ mod tests {
             uptime_ms: 98_765,
             psram_free_bytes: DEFAULT_PSRAM_FREE_BYTES,
             psram_used_bytes: DEFAULT_PSRAM_USED_BYTES,
+            int_heap_free_bytes: 0,
+            int_heap_min_free_bytes: 0,
             core1_active: true,
             core1_loops: 54_321,
             codec: "MP3",
