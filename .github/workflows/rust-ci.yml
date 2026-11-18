@@ -62,8 +62,13 @@ jobs:
       # Installs the `esp` toolchain (Xtensa rustc fork + xtensa-esp-elf GCC).
       # Every cargo call below uses `+esp`, so `rust/rust-toolchain.toml`
       # (host toolchain pin) does not apply to this job.
+      # GITHUB_TOKEN: espup queries the GitHub API for the release; without a
+      # token it is an anonymous caller and fails with "rate limit exceeded"
+      # when several runs start close together.
       - name: Install Espressif Rust toolchain
         uses: esp-rs/xtensa-toolchain@v1.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           version: "1.97.0.0"
           buildtargets: esp32
