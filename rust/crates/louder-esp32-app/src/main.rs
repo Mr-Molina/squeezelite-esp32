@@ -1639,8 +1639,12 @@ mod xtensa_hw {
         // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
         // and config handle.
         // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
+        #[unsafe(link_section = ".dram2_uninit")]
         static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> =
             core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Same DRAM2 placement for the config handle.
+        // SAFETY: Written once below (TAKEN) before any reference escapes.
+        #[unsafe(link_section = ".dram2_uninit")]
         static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> =
             core::mem::MaybeUninit::uninit();
         static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

@@ -34,3 +34,30 @@ fn socket_buffers_are_not_static() {
         );
     }
 }
+
+/// The line before a `static` declaration, i.e. its attribute if it has one.
+fn line_before_static(name: &str) -> &'static str {
+    let needle = format!("static mut {name}:");
+    let at = MAIN_SRC
+        .find(&needle)
+        .unwrap_or_else(|| panic!("main.rs has no `{needle}`"));
+    MAIN_SRC[..at]
+        .trim_end()
+        .lines()
+        .last()
+        .unwrap_or("")
+        .trim()
+}
+
+/// The settings journal state and the config handle sit in `.dram2_uninit`,
+/// not in `.bss`, where every byte comes out of the main stack.
+#[test]
+fn config_statics_are_in_dram2() {
+    for name in ["JOURNAL_IMAGE", "RAM_JOURNAL", "CONFIG_HANDLE"] {
+        assert_eq!(
+            line_before_static(name),
+            "#[unsafe(link_section = \".dram2_uninit\")]",
+            "`{name}` must be placed in .dram2_uninit"
+        );
+    }
+}
