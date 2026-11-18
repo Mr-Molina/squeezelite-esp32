@@ -1263,11 +1263,7 @@ fn mp3d_dct_ii_cols<T: Lanes>(grbuf: &mut [f32; 576], k: usize) {
     t[3][7].store(&mut grbuf[y + 3 * 18..]);
 }
 
-#[allow(unsafe_code)]
-// JUSTIFICATION: Hot MP3 synthesis DCT kernel placed in IRAM (.iram1) on
-// xtensa.
-// SAFETY: Static placement in valid IRAM text section.
-#[cfg_attr(target_arch = "xtensa", unsafe(link_section = ".iram1"))]
+// Runs from flash (F3 task 3), like `mp3d_synth_granule` which calls it.
 fn mp3d_dct_ii(grbuf: &mut [f32; 576], n: usize) {
     let mut k = 0;
     while k + 4 <= n {
