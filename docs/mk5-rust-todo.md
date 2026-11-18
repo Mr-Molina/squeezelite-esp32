@@ -453,3 +453,10 @@ Cost estimates below are reasoned from the code, not measured. Measure with
 
 Report back per task: commit hash, tests run (with any still-failing names),
 whether gains were measured (`decode_us_max`, cycles, size) or estimated.
+
+---
+
+## 5. What comes next
+
+This list is exhausted apart from `D1`. The follow-on backlog (`P01`-`P30`), with the feature-parity
+audit that produced it, is in [`mk5-rust-parity-audit.md`](mk5-rust-parity-audit.md).
