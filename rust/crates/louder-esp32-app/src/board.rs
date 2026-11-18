@@ -241,6 +241,27 @@ impl MemoryBudget {
     }
 }
 
+/// Internal-RAM heap region in `.bss` (`esp_alloc::HEAP` Region 1,
+/// `MemoryCapability::Internal`). Every byte here comes out of `.stack`.
+pub const INTERNAL_HEAP_BYTES: usize = 47 * 1024;
+
+/// Internal-RAM heap region in `.dram2_uninit` (Region 2, `STATIC_BT_HEAP`).
+/// Before the heap exists it is the scratch buffer of the boot-time flash
+/// reads, so it can never be smaller than [`BOOT_SCRATCH_BYTES`].
+pub const BT_HEAP_BYTES: usize = 17 * 1024;
+
+/// Scratch needed by the boot-time `nvs` and `settings` reads (Invariant 47).
+pub const BOOT_SCRATCH_BYTES: usize = 12_288;
+
+/// Invariant 48: the internal heap `esp-radio` needs with Wi-Fi and BTDM
+/// coexisting.
+pub const MIN_INTERNAL_HEAP_TOTAL_BYTES: usize = 65_536;
+
+const _: () = assert!(BT_HEAP_BYTES >= BOOT_SCRATCH_BYTES);
+// The heap floor is checked at compile time, on host and device builds alike:
+// a split that falls below it does not build.
+const _: () = assert!(INTERNAL_HEAP_BYTES + BT_HEAP_BYTES >= MIN_INTERNAL_HEAP_TOTAL_BYTES);
+
 #[cfg(test)]
 mod tests {
     use super::*;
