@@ -1173,8 +1173,9 @@ mod xtensa_hw {
     // in DRAM2.
     // SAFETY: Managed as singleton heap storage by single Bluetooth task context.
     #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 12 * 1024]> =
-        core::mem::MaybeUninit::uninit();
+    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<
+        [u8; louder_esp32_app::board::BT_HEAP_BYTES],
+    > = core::mem::MaybeUninit::uninit();
     pub(crate) struct Esp32VhciTransport<'d> {
         pub(crate) connector: esp_radio::ble::controller::BleConnector<'d>,
     }
@@ -2504,8 +2505,9 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
+                // `BT_HEAP_BYTES >= BOOT_SCRATCH_BYTES` is asserted in `board.rs`.
                 let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr();
-                &mut *ptr
+                &mut *ptr.cast::<[u8; 12_288]>()
             };
             init_config(&mut flash, boot_scratch)
         };
@@ -2516,8 +2518,9 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
+                // `BT_HEAP_BYTES >= BOOT_SCRATCH_BYTES` is asserted in `board.rs`.
                 let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr();
-                &mut *ptr
+                &mut *ptr.cast::<[u8; 12_288]>()
             };
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
         };
@@ -2535,8 +2538,9 @@ mod xtensa_hw {
         // Register 4 MB external PSRAM (`0x3F80_0000`) FIRST as Region 0 of
         // `esp_alloc::HEAP` (`MemoryCapability::External`) so all standard Rust
         // `GlobalAlloc` allocations (`Box::new`, `vec!`) allocate from PSRAM,
-        // preserving 100% of internal DRAM (`43 KB` Region 1 + `22 KB` Region
-        // 2 = `65 KB` `MemoryCapability::Internal`) for `esp-rtos` and
+        // preserving 100% of internal DRAM (`board::INTERNAL_HEAP_BYTES`
+        // Region 1 + `board::BT_HEAP_BYTES` Region 2, together at least
+        // 65,536 B of `MemoryCapability::Internal`) for `esp-rtos` and
         // `esp-radio` (`Wi-Fi` + `BLE`/`BTDM`).
         #[allow(unsafe_code)]
         let psram_avail_bytes = {
@@ -2564,8 +2568,8 @@ mod xtensa_hw {
             } else {
                 0
             };
-            esp_alloc::heap_allocator!(size: 51 * 1024);
-            // JUSTIFICATION: Register secondary 14 KB internal `.dram2_uninit`
+            esp_alloc::heap_allocator!(size: louder_esp32_app::board::INTERNAL_HEAP_BYTES);
+            // JUSTIFICATION: Register the secondary internal `.dram2_uninit`
             // region as Region 2 of `esp_alloc::HEAP`.
             // SAFETY: `STATIC_BT_HEAP` is an exclusive static uninitialized
             // buffer in `.dram2_uninit` registered exactly once at boot.
