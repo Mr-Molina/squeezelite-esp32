@@ -1175,15 +1175,6 @@ mod xtensa_hw {
     #[unsafe(link_section = ".dram2_uninit")]
     static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 12 * 1024]> =
         core::mem::MaybeUninit::uninit();
-    #[allow(unsafe_code)]
-    // JUSTIFICATION: Static allocation for Bluetooth A2DP sink state machine in
-    // DRAM2.
-    // SAFETY: Exclusive singleton access initialized once before starting
-    // Bluetooth runner.
-    #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_SINK: core::mem::MaybeUninit<BtA2dpSink> =
-        core::mem::MaybeUninit::uninit();
-
     pub(crate) struct Esp32VhciTransport<'d> {
         pub(crate) connector: esp_radio::ble::controller::BleConnector<'d>,
     }
@@ -2739,13 +2730,16 @@ mod xtensa_hw {
 
         let bt_periph = Some(peripherals.BT);
         #[allow(unsafe_code)]
-        // JUSTIFICATION: Initialize static BtA2dpSink in `.dram2_uninit`
-        // without creating a stack temporary.
-        // SAFETY: Called once during single-core bring-up on PRO_CPU.
+        // JUSTIFICATION: Allocate the BtA2dpSink zeroed on the heap (PSRAM
+        // region, like the coordinator) without a stack temporary.
+        // SAFETY: Every field of `BtA2dpSink` is valid when all-zero (the
+        // static it replaces was zero-filled the same way), and
+        // `reset_in_place` then sets every field. It holds no atomics, which
+        // do not work in PSRAM on the ESP32.
         let bt_sink: &'static mut BtA2dpSink = unsafe {
-            let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_SINK)).as_mut_ptr();
-            ptr.write_bytes(0, 1);
-            let sink = &mut *ptr;
+            let sink = alloc::boxed::Box::leak(
+                alloc::boxed::Box::<BtA2dpSink>::new_zeroed().assume_init(),
+            );
             sink.reset_in_place();
             sink
         };

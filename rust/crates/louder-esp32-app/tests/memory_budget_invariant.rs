@@ -72,3 +72,14 @@ fn aes_tables_are_not_in_dram() {
         "squeezelite-raop/src/crypto.rs places a table in a RAM section"
     );
 }
+
+/// The Bluetooth A2DP sink state (about 5.3 KiB, idle unless a phone is
+/// connected) is allocated from the PSRAM heap like the coordinator, not kept
+/// as a static in `.dram2_uninit`.
+#[test]
+fn bt_sink_is_not_static() {
+    assert!(
+        !MAIN_SRC.contains("STATIC_BT_SINK"),
+        "main.rs still has the static Bluetooth sink"
+    );
+}
