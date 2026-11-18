@@ -1163,22 +1163,16 @@ mod xtensa_hw {
     }
 
     struct FirmwareBssBuffers {
-        ring_storage: [u8; 4096],
         http_rx_buf: [u8; 1024],
-        slim_rx_buf: [u8; 2048],
         slim_tx_buf: [u8; 2048],
-        audio_rx_buf: [u8; 4096],
         audio_tx_buf: [u8; 512],
     }
 
     impl FirmwareBssBuffers {
         const fn new() -> Self {
             Self {
-                ring_storage: [0u8; 4096],
                 http_rx_buf: [0u8; 1024],
-                slim_rx_buf: [0u8; 2048],
                 slim_tx_buf: [0u8; 2048],
-                audio_rx_buf: [0u8; 4096],
                 audio_tx_buf: [0u8; 512],
             }
         }
@@ -2540,11 +2534,8 @@ mod xtensa_hw {
 
         let fw_bufs = take_firmware_bss_buffers();
         let FirmwareBssBuffers {
-            ref mut ring_storage,
             ref mut http_rx_buf,
-            ref mut slim_rx_buf,
             ref mut slim_tx_buf,
-            ref mut audio_rx_buf,
             ref mut audio_tx_buf,
         } = fw_bufs;
 
@@ -2583,7 +2574,6 @@ mod xtensa_hw {
                     .unwrap_or(first_boot_defaults::LMS_SERVER_PORT)
             }),
         );
-        ring_storage.fill(0);
         wdt.feed();
 
         // Register 4 MB external PSRAM (`0x3F80_0000`) FIRST as Region 0 of
@@ -2632,33 +2622,29 @@ mod xtensa_hw {
             }
             reg_size
         };
-        let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(2048);
+        // The board always has PSRAM, and nothing below fits without it (the
+        // rings, the TCP receive windows and every heap decoder live there).
+        // Internal RAM holds no stand-in buffers: a board whose PSRAM does not
+        // answer resets into recovery, which Gate 1 armed above.
+        if psram_avail_bytes < 1_048_576 {
+            println!("[ANTI-BRICK] PSRAM missing or too small -> resetting to recovery (0x10000)");
+            esp_hal::system::software_reset();
+        }
         // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream
         // buffer (512 KiB here) and a 2000 KiB output buffer. Both land in
         // the PSRAM region (the internal regions are far smaller); the 4 MiB
         // keeps ~1.2 MiB free for the FLAC/AAC/Vorbis/ALAC/Opus decoders and
         // the allocator.
-        let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) =
-            if psram_avail_bytes >= 1_048_576 {
-                (
-                    alloc::boxed::Box::leak(
-                        alloc::vec![
-                            0u8;
-                            louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES
-                        ]
-                        .into_boxed_slice(),
-                    ),
-                    alloc::boxed::Box::leak(
-                        alloc::vec![
-                            0u8;
-                            louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES
-                        ]
-                        .into_boxed_slice(),
-                    ),
-                )
-            } else {
-                (bss_stream_storage, bss_output_storage)
-            };
+        let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) = (
+            alloc::boxed::Box::leak(
+                alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES]
+                    .into_boxed_slice(),
+            ),
+            alloc::boxed::Box::leak(
+                alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES]
+                    .into_boxed_slice(),
+            ),
+        );
         wdt.feed();
         squeezelite_decoders::prewarm_opus();
         wdt.feed();
@@ -2799,15 +2785,11 @@ mod xtensa_hw {
             sink
         };
 
-        let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) =
-            if psram_avail_bytes >= 655_360 {
-                (
-                    alloc::boxed::Box::leak(alloc::vec![0u8; 8_192].into_boxed_slice()),
-                    alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
-                )
-            } else {
-                (&mut slim_rx_buf[..], &mut audio_rx_buf[..])
-            };
+        // Invariant 49: both TCP receive windows live in PSRAM.
+        let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) = (
+            alloc::boxed::Box::leak(alloc::vec![0u8; 8_192].into_boxed_slice()),
+            alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
+        );
 
         let NetStack {
             smol_iface,
