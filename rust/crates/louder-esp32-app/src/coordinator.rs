@@ -100,6 +100,103 @@ impl PcmDecoderExt for PcmDecoder {
     }
 }
 
+/// Object-safe outbound SlimProto frame sink used by [`SlimExtension`].
+pub trait SlimOutboundSink {
+    /// Frames `(opcode, payload)` into the SlimProto client-to-server wire
+    /// header (`[4B opcode][4B BE len][payload]`) and queues it for transmit.
+    fn send_slim_frame(&mut self, opcode: [u8; 4], payload: &[u8]) -> Result<(), TransportError>;
+}
+
+impl<T: SlimTransport> SlimOutboundSink for T {
+    fn send_slim_frame(&mut self, opcode: [u8; 4], payload: &[u8]) -> Result<(), TransportError> {
+        let total_len = 8usize
+            .checked_add(payload.len())
+            .ok_or(TransportError::Io)?;
+        let len_u32 = u32::try_from(payload.len()).map_err(|_| TransportError::Io)?;
+        if total_len <= 256 {
+            let mut buf = [0u8; 256];
+            buf[0..4].copy_from_slice(&opcode);
+            buf[4..8].copy_from_slice(&len_u32.to_be_bytes());
+            buf[8..total_len].copy_from_slice(payload);
+            self.send(&buf[..total_len])
+        } else {
+            let mut buf = Vec::with_capacity(total_len);
+            buf.extend_from_slice(&opcode);
+            buf.extend_from_slice(&len_u32.to_be_bytes());
+            buf.extend_from_slice(payload);
+            self.send(&buf)
+        }
+    }
+}
+
+/// Extension hook allowing device services to intercept inbound SlimProto
+/// frames and emit outbound SlimProto frames on the shared control socket.
+pub trait SlimExtension {
+    /// Inspects an inbound SlimProto frame `(opcode, payload)` received in
+    /// `receive_into`.
+    ///
+    /// Return `true` if handled exclusively (skipping default
+    /// `handle_command`), `false` otherwise.
+    fn on_frame(&mut self, opcode: [u8; 4], payload: &[u8]) -> bool;
+
+    /// Emits queued outbound SlimProto frames while the control connection is
+    /// up.
+    fn poll_outbound(
+        &mut self,
+        sink: &mut dyn SlimOutboundSink,
+        now_ms: u32,
+    ) -> Result<(), TransportError>;
+}
+
+struct NoopSlimExtension;
+
+impl SlimExtension for NoopSlimExtension {
+    fn on_frame(&mut self, _opcode: [u8; 4], _payload: &[u8]) -> bool {
+        false
+    }
+
+    fn poll_outbound(
+        &mut self,
+        _sink: &mut dyn SlimOutboundSink,
+        _now_ms: u32,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+fn extract_slim_frame_parts(buf: &[u8]) -> Option<([u8; 4], &[u8])> {
+    if buf.len() < 6 {
+        return None;
+    }
+    if !buf[0].is_ascii_alphabetic()
+        && (buf[2].is_ascii_alphanumeric() || buf[2] == b' ')
+        && (buf[3].is_ascii_alphanumeric() || buf[3] == b' ')
+        && (buf[4].is_ascii_alphanumeric() || buf[4] == b' ')
+        && (buf[5].is_ascii_alphanumeric() || buf[5] == b' ')
+    {
+        let length = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+        if length < 4 {
+            return None;
+        }
+        let total = 2usize.checked_add(length)?;
+        if buf.len() < total {
+            return None;
+        }
+        Some(([buf[2], buf[3], buf[4], buf[5]], &buf[6..total]))
+    } else {
+        if buf.len() < 8 {
+            return None;
+        }
+        let opcode = [buf[0], buf[1], buf[2], buf[3]];
+        let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let total = 8usize.checked_add(length)?;
+        if buf.len() < total {
+            return None;
+        }
+        Some((opcode, &buf[8..total]))
+    }
+}
+
 /// Playback operational state of the player.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
@@ -1035,13 +1132,33 @@ impl PlayerCoordinator {
         pipeline: &mut StreamPipeline<'_, S>,
         now_ms: u32,
     ) -> Result<(), TransportError> {
+        let mut noop = NoopSlimExtension;
+        self.tick_with_extension(transport, source, backend, pipeline, &mut noop, now_ms)
+    }
+
+    /// Runs one coordinator cycle with a [`SlimExtension`] hook for custom
+    /// inbound and outbound SlimProto frames.
+    pub fn tick_with_extension<
+        S: AudioOutputSink,
+        T: SlimTransport,
+        R: StreamSource,
+        B: AudioBackend,
+    >(
+        &mut self,
+        transport: &mut T,
+        source: &mut R,
+        backend: &mut B,
+        pipeline: &mut StreamPipeline<'_, S>,
+        ext: &mut dyn SlimExtension,
+        now_ms: u32,
+    ) -> Result<(), TransportError> {
         self.last_tick_frames = 0;
         self.dma_outstanding_frames = backend.dma_outstanding_frames();
         if let Some(rate) = self.crossed_rate.take() {
             let _ = backend.set_sample_rate(rate);
         }
         self.resume_stream_connect(transport, source, pipeline, now_ms)?;
-        let link_lost = self.receive_command(transport, source, backend, pipeline, now_ms)?;
+        let link_lost = self.receive_command(transport, source, backend, pipeline, ext, now_ms)?;
         let _ = self.poll_stream(source, pipeline);
         self.apply_output_deadlines(pipeline, backend, now_ms);
         self.last_tick_frames = if self.external_audio_pump || self.external_playback {
@@ -1066,6 +1183,7 @@ impl PlayerCoordinator {
         if link_lost {
             return Err(TransportError::Disconnected);
         }
+        ext.poll_outbound(transport, now_ms)?;
         self.check_heartbeat(transport, pipeline, now_ms)
     }
 
@@ -1080,16 +1198,17 @@ impl PlayerCoordinator {
         source: &mut R,
         backend: &mut B,
         pipeline: &mut StreamPipeline<'_, S>,
+        ext: &mut dyn SlimExtension,
         now_ms: u32,
     ) -> Result<bool, TransportError> {
         match self.frame_buffer.take() {
             Some(buffer) => {
                 let result =
-                    self.receive_into(buffer, transport, source, backend, pipeline, now_ms);
+                    self.receive_into(buffer, transport, source, backend, pipeline, ext, now_ms);
                 self.frame_buffer = Some(buffer);
                 result
             }
-            None => self.receive_on_stack(transport, source, backend, pipeline, now_ms),
+            None => self.receive_on_stack(transport, source, backend, pipeline, ext, now_ms),
         }
     }
 
@@ -1101,14 +1220,18 @@ impl PlayerCoordinator {
         source: &mut R,
         backend: &mut B,
         pipeline: &mut StreamPipeline<'_, S>,
+        ext: &mut dyn SlimExtension,
         now_ms: u32,
     ) -> Result<bool, TransportError> {
         let mut frame = [0u8; SERVER_FRAME_BUF_LEN];
-        self.receive_into(&mut frame, transport, source, backend, pipeline, now_ms)
+        self.receive_into(
+            &mut frame, transport, source, backend, pipeline, ext, now_ms,
+        )
     }
 
     /// Receives at most one server frame into `frame` and handles it.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn receive_into<S: AudioOutputSink, T: SlimTransport, R: StreamSource, B: AudioBackend>(
         &mut self,
         frame: &mut [u8],
@@ -1116,10 +1239,16 @@ impl PlayerCoordinator {
         source: &mut R,
         backend: &mut B,
         pipeline: &mut StreamPipeline<'_, S>,
+        ext: &mut dyn SlimExtension,
         now_ms: u32,
     ) -> Result<bool, TransportError> {
         match transport.poll_frame(frame) {
             Ok(Some(len)) => {
+                if let Some((opcode, payload)) = extract_slim_frame_parts(&frame[..len]) {
+                    if ext.on_frame(opcode, payload) {
+                        return Ok(false);
+                    }
+                }
                 if let Ok((cmd, _)) = SlimprotoParser::parse_frame(&frame[..len]) {
                     self.handle_command(cmd, transport, source, backend, pipeline, now_ms)?;
                 }
