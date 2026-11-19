@@ -103,6 +103,7 @@ git commit -m "refactor(cli): unify console and web CLI command tables in consol
 ### Task 2: Build Platform-Free `TelnetService` State Machine & `AutoexecRunner` Integration (`src/services/telnet.rs`)
 
 **Files:**
+- Modify: `rust/crates/louder-esp32-app/src/config_handle.rs` (expose `&self` interior-mutability helpers for `apply_key_value` / `set_host_name` / NVS key erase so `&ConfigHandle` from `ServiceCtx::config()` can apply CLI config mutations cleanly)
 - Create: `rust/crates/louder-esp32-app/src/services/telnet.rs`
 
 **Context:** Every `DeviceService` splits platform-free logic (host-testable under `cargo test`) from `#[cfg(target_arch = "xtensa")]` `smoltcp` socket I/O. In `src/services/telnet.rs`:
@@ -118,7 +119,7 @@ git commit -m "refactor(cli): unify console and web CLI command tables in consol
     - `PlayerCliAction::Volume(pct)` -> `ctx.set_local_volume(pct)` (via `ServiceAudioHost`), plus optional `ctx.send_slim_frame(...)` only if SlimProto notification is needed (`AudioSource::SlimProto`);
     - `PlayerCliAction::Play` / `Pause` / `Stop` / `Status` -> inspect `ctx.active_source()` / `ctx.is_audio_playing()` and format concise status or queue SlimProto `BUTN` / `IR` or local `ServiceAudioHost` state cleanly without panicking when detached.
   - `CliSideEffect::ConfigSet { key, value }` / `ConfigErase { key }`:
-    - Mutate via `ctx.config().update(...)` or `apply_key_value(...)` (note: check `ConfigHandle` mutability vs interior mutability — `ConfigHandle` uses internal mutex so `&ConfigHandle` supports `apply_key_value` / `update` cleanly!).
+    - `ServiceCtx::config(&self) -> &'a ConfigHandle` returns a shared `&ConfigHandle`, while `ConfigHandle::apply_key_value(&mut self, key: &str, value: &str) -> bool` (`src/config_handle.rs:533`) and `ConfigHandle::set_host_name(&mut self, name: &str) -> bool` (`src/config_handle.rs:270`) currently take `&mut self` (because `host_name` sits outside the internal `Mutex`). Update `src/config_handle.rs` first — either move `host_name` inside `HandleState`'s `Mutex` and convert `set_host_name` / `apply_autoexec1_flags` / `apply_key_value` to `&self` using `self.update(...)`, or add a `&self` helper (e.g. `apply_key_value_shared(&self, key, value)` via `clone_handle()` + `apply_key_value()` + `sync_from()`, plus an `&self` NVS-override erase helper for `ConfigErase`) — before calling them via `ctx.config()` from `TelnetService`.
   - `CliSideEffect::Disconnect`:
     - Set `self.close_requested = true`.
   - Informative side effects (`ConfigDump`, `ConfigGet`, `I2cScan`, `Reboot`, `RebootToRecovery`, `EnterSleep`, `WifiJoin`, `OtaUpdate`):
@@ -150,9 +151,9 @@ cargo test -p louder-esp32-app services::telnet::tests
 ```
 Expected: FAIL (`unresolved module` or unimplemented methods).
 
-- [ ] **Step 3: Implement platform-free state machine in `src/services/telnet.rs`**
+- [ ] **Step 3: Add `&self` config helpers in `src/config_handle.rs` and implement platform-free state machine in `src/services/telnet.rs`**
 
-Implement `TelnetService` (without `#[cfg(target_arch = "xtensa")]` socket I/O yet, or with clean helper boundaries):
+First update `rust/crates/louder-esp32-app/src/config_handle.rs` so `&ConfigHandle` (from `ctx.config()`) supports CLI config writes/erases cleanly (convert `set_host_name` / `apply_autoexec1_flags` / `apply_key_value` to `&self` using `HandleState`'s `Mutex`, or add `&self` interior-mutability helpers using `clone_handle()` / `update()` / `sync_from()` and NVS key erase). Then implement `TelnetService` (without `#[cfg(target_arch = "xtensa")]` socket I/O yet, or with clean helper boundaries):
 - `pub const TELNET_RX_BUF_BYTES: usize = 2048;`
 - `pub const TELNET_TX_BUF_BYTES: usize = 4096;`
 - `pub const TELNET_MAX_RX_PER_LAP: usize = 512;`
@@ -176,7 +177,7 @@ Expected: All PASS, 0 audit violations.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add rust/crates/louder-esp32-app/src/services/telnet.rs rust/crates/louder-esp32-app/src/services/mod.rs
+git add rust/crates/louder-esp32-app/src/config_handle.rs rust/crates/louder-esp32-app/src/services/telnet.rs rust/crates/louder-esp32-app/src/services/mod.rs
 git commit -m "feat(telnet): add PSRAM-backed TelnetService state machine, autoexec runner, and registry wiring"
 ```
 
