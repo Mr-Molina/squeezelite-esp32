@@ -3,6 +3,7 @@
 //! Each device network or background feature implements [`DeviceService`] and
 //! is registered exactly once inside [`register_all`].
 
+pub mod airplay;
 pub mod mdns;
 
 mod registry {
@@ -149,6 +150,18 @@ mod registry {
 
         /// Clamps `percent` to `0..=100`, applies volume, and notifies CYD.
         fn set_local_volume(&mut self, percent: u8) -> u8;
+
+        /// Requests source ownership without reconfiguring decoder or amp.
+        fn request_external_source(&mut self, source: AudioSource) -> bool;
+
+        /// Ingests raw 16-bit stereo PCM bytes into the stream buffer.
+        fn ingest_external_pcm(&mut self, bytes: &[u8]) -> bool;
+
+        /// Flushes pending stream and output audio buffers.
+        fn flush_external_buffers(&mut self);
+
+        /// Returns `true` while external audio samples remain buffered.
+        fn has_external_audio_queued(&self) -> bool;
     }
 
     /// Concrete [`ServiceAudioHost`] bridging [`PlayerCoordinator`],
@@ -257,6 +270,25 @@ mod registry {
                 cb(clamped);
             }
             clamped
+        }
+
+        fn request_external_source(&mut self, source: AudioSource) -> bool {
+            self.coordinator.request_source(source)
+        }
+
+        fn ingest_external_pcm(&mut self, bytes: &[u8]) -> bool {
+            self.pipeline.ingest_stream_data(bytes).is_ok()
+        }
+
+        fn flush_external_buffers(&mut self) {
+            self.pipeline.stream_buffer.flush();
+            self.pipeline.output_buffer.flush();
+        }
+
+        fn has_external_audio_queued(&self) -> bool {
+            self.pipeline.stream_buffer.available_read() > 0
+                || self.pipeline.output_buffer.available_read() > 0
+                || self.pipeline.has_pending_pcm()
         }
     }
 
@@ -540,6 +572,37 @@ mod registry {
                 .map(|audio| audio.set_local_volume(percent))
         }
 
+        /// Requests coordinator ownership for `source` without reconfiguring
+        /// the decoder or amplifier power state.
+        pub fn request_external_source(&mut self, source: AudioSource) -> bool {
+            self.audio
+                .as_deref_mut()
+                .is_some_and(|audio| audio.request_external_source(source))
+        }
+
+        /// Ingests raw PCM bytes into the pipeline stream buffer.
+        pub fn ingest_external_pcm(&mut self, bytes: &[u8]) -> bool {
+            self.audio
+                .as_deref_mut()
+                .is_some_and(|audio| audio.ingest_external_pcm(bytes))
+        }
+
+        /// Flushes both the stream and output ring buffers.
+        pub fn flush_external_buffers(&mut self) {
+            if let Some(audio) = self.audio.as_deref_mut() {
+                audio.flush_external_buffers();
+            }
+        }
+
+        /// Returns `true` when external PCM bytes remain queued in the
+        /// pipeline.
+        #[must_use]
+        pub fn has_external_audio_queued(&self) -> bool {
+            self.audio
+                .as_deref()
+                .is_some_and(ServiceAudioHost::has_external_audio_queued)
+        }
+
         /// Monotonic time in milliseconds since boot.
         #[must_use]
         pub fn now_ms(&self) -> u64 {
@@ -802,9 +865,11 @@ mod registry {
     /// Registers every device service in exactly one place.
     pub fn register_all(reg: &mut ServiceRegistry) {
         reg.register(super::mdns::MdnsService::new());
+        reg.register(super::airplay::AirPlayService::new());
     }
 }
 
+pub use airplay::AirPlayService;
 pub use mdns::{
     can_send_mdns_multicast_reply, is_mdns_service_query, MdnsService, MDNS_MULTICAST_COOLDOWN_MS,
 };
@@ -930,6 +995,10 @@ mod tests {
         assert!(!ctx.claim_external_pcm(AudioSource::Spotify, Some(44_100), AmpPower::EnsurePlay));
         assert!(!ctx.release_external(AudioSource::Spotify));
         assert_eq!(ctx.set_local_volume(55), None);
+        assert!(!ctx.request_external_source(AudioSource::AirPlay));
+        assert!(!ctx.ingest_external_pcm(&[1, 2, 3, 4]));
+        assert!(!ctx.has_external_audio_queued());
+        ctx.flush_external_buffers();
     }
 
     #[test]
@@ -980,6 +1049,12 @@ mod tests {
                 Some(44_100),
                 AmpPower::EnsurePlay,
             ));
+            assert!(ctx.request_external_source(AudioSource::AirPlay));
+            assert!(!ctx.has_external_audio_queued());
+            assert!(ctx.ingest_external_pcm(&[0u8; 64]));
+            assert!(ctx.has_external_audio_queued());
+            ctx.flush_external_buffers();
+            assert!(!ctx.has_external_audio_queued());
             // Lower-priority Spotify request is rejected while AirPlay is active.
             assert!(!ctx.claim_external_pcm(
                 AudioSource::Spotify,
