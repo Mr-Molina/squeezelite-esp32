@@ -13,9 +13,9 @@
 //!   mutex. The coordinator (`setd` name), the HTTP server, the CYD bridge and
 //!   the LMS volume path
 //!   change it through [`ConfigHandle::update`].
-//! - [`ConfigWriter`]: the debounce state machine of the device loop's config poll:
-//!   a change is
-//!   journaled once no further change has arrived for [`DEBOUNCE_MS`].
+//! - [`ConfigWriter`]: the debounce state machine of the device loop's config
+//!   poll: a change is journaled once no further change has arrived for
+//!   [`DEBOUNCE_MS`].
 //! - [`RamJournal`]: the serialized journal image (a DRAM sector buffer) plus
 //!   the flash
 //!   bookkeeping (target sector per [`FlashTargetPolicy`], sequence) carried in
@@ -86,25 +86,27 @@ pub const NVS_TYPE_STR: u8 = 33;
 /// be stripped from unauthenticated `GET /config.json` responses.
 #[must_use]
 pub fn is_secret_config_key(key: &str) -> bool {
-    matches!(
-        key,
-        "password"
-            | "pwd"
-            | "wifi.pass"
-            | "wifi_pass"
-            | "ap_pwd"
-            | "telnet_pwd"
-            | "a2dp_spin"
-            | "bt_sink_pin"
-            | "web_pwd"
-            | "secret"
-    )
+    let k = key.trim();
+    [
+        "password",
+        "pwd",
+        "wifi.pass",
+        "wifi_pass",
+        "ap_pwd",
+        "telnet_pwd",
+        "a2dp_spin",
+        "bt_sink_pin",
+        "web_pwd",
+        "secret",
+    ]
+    .iter()
+    .any(|s| k.eq_ignore_ascii_case(s))
 }
 
 /// Parses a comma-separated list of up to 10 equalizer bands, clamping each to
-/// `-15.0..=15.0`. Returns `Some([f32; 10])` if 1..=10 bands are parsed
+/// `-15.0..=15.0`. Returns `Some([f32; 10])` if 1..=10 finite bands are parsed
 /// (filling any omitted trailing bands with `0.0`), or `None` if `csv` is
-/// empty or contains non-numeric tokens.
+/// empty, exceeds 10 bands, or contains non-finite/non-numeric tokens.
 #[must_use]
 pub fn parse_equalizer_bands(csv: &str) -> Option<[f32; 10]> {
     let trimmed = csv.trim();
@@ -115,13 +117,16 @@ pub fn parse_equalizer_bands(csv: &str) -> Option<[f32; 10]> {
     let mut count = 0;
     for part in trimmed.split(',') {
         if count >= 10 {
-            break;
+            return None;
         }
         let p = part.trim();
         if p.is_empty() {
             return None;
         }
         let val: f32 = p.parse().ok()?;
+        if !val.is_finite() {
+            return None;
+        }
         bands[count] = val.clamp(-15.0, 15.0);
         count += 1;
     }
@@ -140,6 +145,13 @@ pub fn parse_ipv4_dotted(s: &str) -> Option<[u8; 4]> {
         if count >= 4 {
             return None;
         }
+        if part.is_empty()
+            || part.len() > 3
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
         octets[count] = part.parse::<u8>().ok()?;
         count += 1;
     }
@@ -150,10 +162,32 @@ pub fn parse_ipv4_dotted(s: &str) -> Option<[u8; 4]> {
     }
 }
 
+/// Parses `<ipv4>[:<port>]` from an `autoexec1` `-s` argument, rejecting
+/// invalid ports or unspecified `0.0.0.0`.
+fn parse_lms_server_arg(val: &str) -> Option<[u8; 4]> {
+    let ip_str = if let Some((ip_part, port_part)) = val.split_once(':') {
+        if port_part.is_empty()
+            || !port_part.bytes().all(|b| b.is_ascii_digit())
+            || port_part.parse::<u16>().is_err()
+        {
+            return None;
+        }
+        ip_part
+    } else {
+        val
+    };
+    let ip = parse_ipv4_dotted(ip_str)?;
+    if ip == [0, 0, 0, 0] {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
 /// Something that durably records a configuration snapshot (device:
 /// [`RamJournal`]).
 pub trait ConfigJournal {
-    /// Records `cfg`; `false` if it was not recorded (the snapshot stays dirty).
+    /// Records `cfg`; `false` if not recorded (the snapshot stays dirty).
     fn commit(&mut self, cfg: &AudioConfig) -> bool;
 
     /// Sets NVS override slots if supported by this journal.
@@ -161,11 +195,26 @@ pub trait ConfigJournal {
 }
 
 /// A slot storing an NVS key-value override.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NvsEntrySlot {
     pub used: bool,
     pub key: heapless::String<24>,
     pub value: heapless::String<64>,
+}
+
+impl core::fmt::Debug for NvsEntrySlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let display_val = if is_secret_config_key(self.key.as_str()) {
+            "<redacted>"
+        } else {
+            self.value.as_str()
+        };
+        f.debug_struct("NvsEntrySlot")
+            .field("used", &self.used)
+            .field("key", &self.key)
+            .field("value", &display_val)
+            .finish()
+    }
 }
 
 impl Default for NvsEntrySlot {
@@ -217,19 +266,21 @@ impl ConfigHandle {
         }
     }
 
-    /// Sets an NVS override key-value pair.
+    /// Sets an NVS override key-value pair. Rejects empty keys, keys over 24
+    /// bytes, or values over 64 bytes without silent truncation.
     pub fn set_nvs_override(&self, key: &str, value: &str) -> bool {
+        let k = key.trim();
+        if k.is_empty() || k.len() > 24 || value.len() > 64 {
+            return false;
+        }
         self.state.lock(|state| {
             let mut s = state.borrow_mut();
-            let k = key.trim();
-            if k.is_empty() || k.len() > 24 {
-                return false;
-            }
             for slot in &mut s.nvs_overrides {
                 if slot.used && slot.key.as_str() == k {
                     slot.value.clear();
-                    let max_len = value.floor_char_boundary(value.len().min(64));
-                    let _ = slot.value.push_str(&value[..max_len]);
+                    if slot.value.push_str(value).is_err() {
+                        return false;
+                    }
                     s.dirty = true;
                     s.generation = s.generation.wrapping_add(1);
                     return true;
@@ -237,12 +288,14 @@ impl ConfigHandle {
             }
             for slot in &mut s.nvs_overrides {
                 if !slot.used {
+                    let mut next_key = heapless::String::new();
+                    let mut next_val = heapless::String::new();
+                    if next_key.push_str(k).is_err() || next_val.push_str(value).is_err() {
+                        return false;
+                    }
                     slot.used = true;
-                    slot.key.clear();
-                    let _ = slot.key.push_str(k);
-                    slot.value.clear();
-                    let max_len = value.floor_char_boundary(value.len().min(64));
-                    let _ = slot.value.push_str(&value[..max_len]);
+                    slot.key = next_key;
+                    slot.value = next_val;
                     s.dirty = true;
                     s.generation = s.generation.wrapping_add(1);
                     return true;
@@ -274,8 +327,11 @@ impl ConfigHandle {
         }
         let max_len = trimmed.floor_char_boundary(trimmed.len().min(32));
         let clean = &trimmed[..max_len];
-        self.host_name.clear();
-        let _ = self.host_name.push_str(clean);
+        let mut next_host = heapless::String::new();
+        if next_host.push_str(clean).is_err() {
+            return false;
+        }
+        self.host_name = next_host;
         self.update(|c| {
             c.set_player_name(clean);
         })
@@ -296,7 +352,43 @@ impl ConfigHandle {
         })
     }
 
-    /// Returns the active LMS server IPv4 address from typed configuration, if set.
+    /// Looks up an NVS override value by key, returning `"<redacted>"` when
+    /// the key or matched secret slot satisfies [`is_secret_config_key`].
+    #[must_use]
+    pub fn nvs_override_redacted(&self, key: &str) -> Option<heapless::String<64>> {
+        let should_redact = if let Some(val) = self.nvs_override(key) {
+            if !is_secret_config_key(key) {
+                return Some(val);
+            }
+            true
+        } else {
+            let k = key.trim();
+            self.state.lock(|state| {
+                let s = state.borrow();
+                let mut matched = false;
+                for slot in &s.nvs_overrides {
+                    if slot.used
+                        && slot.key.as_str().trim().eq_ignore_ascii_case(k)
+                        && is_secret_config_key(slot.key.as_str())
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                matched
+            })
+        };
+        if should_redact {
+            let mut redacted = heapless::String::new();
+            let _ = redacted.push_str("<redacted>");
+            Some(redacted)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the active LMS server IPv4 address from typed configuration, if
+    /// set.
     #[must_use]
     pub fn lms_server_ip(&self) -> Option<[u8; 4]> {
         self.read(|c| c.lms_server_ip)
@@ -325,6 +417,10 @@ impl ConfigHandle {
     /// Returns the device / player name.
     #[must_use]
     pub fn device_name(&self) -> heapless::String<32> {
+        const _: () = assert!(
+            crate::board::first_boot_defaults::PLAYER_NAME.len() <= 32,
+            "first_boot_defaults::PLAYER_NAME must fit in heapless::String<32>"
+        );
         let mut s = heapless::String::new();
         if !self.host_name.is_empty() {
             let _ = s.push_str(self.host_name.as_str());
@@ -333,8 +429,11 @@ impl ConfigHandle {
                 if !c.player_name.is_empty() {
                     c.player_name.clone()
                 } else {
-                    heapless::String::try_from(crate::board::first_boot_defaults::PLAYER_NAME)
-                        .unwrap_or_default()
+                    let def_name = crate::board::first_boot_defaults::PLAYER_NAME;
+                    let max_len = def_name.floor_char_boundary(def_name.len().min(32));
+                    let mut fallback = heapless::String::new();
+                    let _ = fallback.push_str(&def_name[..max_len]);
+                    fallback
                 }
             });
             let _ = s.push_str(name.as_str());
@@ -350,20 +449,13 @@ impl ConfigHandle {
         while let Some(tok) = iter.next() {
             if tok == "-s" {
                 if let Some(val) = iter.next() {
-                    let ip_str = val.split(':').next().unwrap_or(val);
-                    if let Some(ip) = parse_ipv4_dotted(ip_str) {
-                        if ip != [0, 0, 0, 0] {
-                            let _ = self.update(|c| c.lms_server_ip = Some(ip));
-                        }
+                    if let Some(ip) = parse_lms_server_arg(val) {
+                        let _ = self.update(|c| c.lms_server_ip = Some(ip));
                     }
                 }
             } else if tok.starts_with("-s") && tok.len() > 2 {
-                let val = &tok[2..];
-                let ip_str = val.split(':').next().unwrap_or(val);
-                if let Some(ip) = parse_ipv4_dotted(ip_str) {
-                    if ip != [0, 0, 0, 0] {
-                        let _ = self.update(|c| c.lms_server_ip = Some(ip));
-                    }
+                if let Some(ip) = parse_lms_server_arg(&tok[2..]) {
+                    let _ = self.update(|c| c.lms_server_ip = Some(ip));
                 }
             } else if tok == "-n" {
                 if let Some(val) = iter.next() {
@@ -406,20 +498,13 @@ impl ConfigHandle {
             while let Some(tok) = iter.next() {
                 if tok == "-s" {
                     if let Some(val) = iter.next() {
-                        let ip_str = val.split(':').next().unwrap_or(val);
-                        if let Some(ip) = parse_ipv4_dotted(ip_str) {
-                            if ip != [0, 0, 0, 0] {
-                                return Some(ip);
-                            }
+                        if let Some(ip) = parse_lms_server_arg(val) {
+                            return Some(ip);
                         }
                     }
                 } else if tok.starts_with("-s") && tok.len() > 2 {
-                    let val = &tok[2..];
-                    let ip_str = val.split(':').next().unwrap_or(val);
-                    if let Some(ip) = parse_ipv4_dotted(ip_str) {
-                        if ip != [0, 0, 0, 0] {
-                            return Some(ip);
-                        }
+                    if let Some(ip) = parse_lms_server_arg(&tok[2..]) {
+                        return Some(ip);
                     }
                 }
             }
@@ -466,7 +551,8 @@ impl ConfigHandle {
         )
     }
 
-    /// Returns whether Bluetooth A2DP Sink service is enabled (defaults to true).
+    /// Returns whether Bluetooth A2DP Sink service is enabled
+    /// (defaults to true).
     #[must_use]
     pub fn is_bt_sink_enabled(&self) -> bool {
         !matches!(
@@ -485,7 +571,8 @@ impl ConfigHandle {
         )
     }
 
-    /// Returns whether `autoexec` script execution is enabled (defaults to true).
+    /// Returns whether `autoexec` script execution is enabled
+    /// (defaults to true).
     #[must_use]
     pub fn is_autoexec_enabled(&self) -> bool {
         !matches!(
@@ -713,10 +800,9 @@ impl ConfigHandle {
     pub fn flush_now(&self, journal: &mut impl ConfigJournal) -> bool {
         let overrides = self.nvs_overrides();
         journal.set_nvs_overrides(&overrides);
-        // The commit runs OUTSIDE the lock: it may be slow (serialization; on the
-        // device with
-        // `runtime-flash-persist`, a flash write follows), and `update` must never wait
-        // on it.
+        // The commit runs OUTSIDE the lock: it may be slow (serialization;
+        // with `runtime-flash-persist`, a flash write follows), and `update`
+        // must never wait on it.
         let Some(snapshot) = self.snapshot_if_dirty() else {
             return false;
         };
@@ -764,7 +850,8 @@ impl ConfigHandle {
         Ok(json)
     }
 
-    /// Exports the configuration as JSON with `KEY_WIFI_PASS` redacted to `"***"`.
+    /// Exports the configuration as JSON with `KEY_WIFI_PASS` redacted to
+    /// `"***"`.
     pub fn export_json_redacted(
         &self,
     ) -> Result<heapless::String<1024>, squeezelite_config::StorageError> {
@@ -829,7 +916,8 @@ impl ConfigWriter {
         journal.set_nvs_overrides(&handle.nvs_overrides());
         let committed = handle.flush_now(journal);
         if !committed {
-            // Never retry a refused commit in a tight loop: wait another quiet period.
+            // Never retry a refused commit in a tight loop: wait another quiet
+            // period.
             self.last_change_ms = now_ms;
         }
         committed
@@ -953,11 +1041,11 @@ impl JournalSlot {
 /// A journal image waiting for its flash write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingImage<'a> {
-    /// Sector to erase and write (never the one holding the newest valid journal).
+    /// Sector to erase and write (never the newest valid journal).
     pub slot: JournalSlot,
     /// The whole sector (image followed by `0xFF`).
     pub sector: &'a [u8; JOURNAL_SECTOR_SIZE],
-    /// Image length rounded up to a 4-byte word (what a NOR write needs to cover).
+    /// Image length rounded up to a 4-byte word (needed for NOR writes).
     pub used_len: usize,
     /// Sequence number of the image.
     pub sequence: u32,
@@ -976,10 +1064,9 @@ pub enum FlashTargetPolicy {
     /// partition,
     /// `components/platform_config/nvs_utilities.c:97-100`).
     FixedA,
-    /// Dual-sector ping-pong (`runtime-flash-persist` builds only): the target is
-    /// never the
-    /// sector holding the newest valid journal, so power loss mid-write keeps the
-    /// previous one.
+    /// Dual-sector ping-pong (`runtime-flash-persist` builds only): the target
+    /// is never the sector holding the newest valid journal, so power loss
+    /// mid-write keeps the previous one.
     PingPong,
 }
 
@@ -1008,9 +1095,8 @@ pub struct RamJournal<'a> {
 }
 
 impl<'a> RamJournal<'a> {
-    /// `boot`: the sector holding the newest valid journal and its sequence (`None`
-    /// when flash
-    /// held none). `policy`: where flash writes go.
+    /// `boot`: the sector holding the newest valid journal and its sequence
+    /// (`None` when flash held none). `policy`: where flash writes go.
     pub fn new(
         image: &'a mut JournalSector,
         boot: Option<(JournalSlot, u32)>,
@@ -1106,8 +1192,8 @@ impl<'a> RamJournal<'a> {
         Self::restore_sector_into(sector, &mut self.nvs_overrides)
     }
 
-    /// Restores journal's NVS overrides into `handle`, synchronizing key-values,
-    /// autoexec flags, LMS IP, host name, and sequence counter.
+    /// Restores journal's NVS overrides into `handle`, synchronizing
+    /// key-values, autoexec flags, LMS IP, host name, and sequence counter.
     pub fn restore_into_handle(&self, handle: &mut ConfigHandle) {
         for slot in self.nvs_overrides.iter() {
             if slot.used && !slot.key.is_empty() {
@@ -1202,7 +1288,7 @@ impl<'a> RamJournal<'a> {
         self.pending_wifi.as_ref()
     }
 
-    /// Sequence of the newest journal (RAM image, or the boot journal before any
+    /// Sequence of the newest journal (RAM image, or boot journal before any
     /// commit).
     pub fn sequence(&self) -> u32 {
         self.sequence
@@ -1213,7 +1299,7 @@ impl<'a> RamJournal<'a> {
         self.target
     }
 
-    /// The image awaiting a flash write, if the RAM journal is newer than flash.
+    /// Image awaiting a flash write, if the RAM journal is newer than flash.
     pub fn pending_image(&self) -> Option<PendingImage<'_>> {
         self.flash_pending.then(|| PendingImage {
             slot: self.target,
@@ -1223,10 +1309,9 @@ impl<'a> RamJournal<'a> {
         })
     }
 
-    /// Records that [`Self::pending_image`] reached flash: that sector now holds
-    /// the newest
-    /// journal. With [`FlashTargetPolicy::PingPong`] the next write targets the
-    /// other one.
+    /// Records that [`Self::pending_image`] reached flash: that sector now
+    /// holds the newest journal. With [`FlashTargetPolicy::PingPong`] the next
+    /// write targets the other one.
     pub fn mark_flash_written(&mut self) {
         if self.flash_pending {
             self.flash_pending = false;
@@ -1257,7 +1342,7 @@ impl<'a> RamJournal<'a> {
         if !write_fn(self.target, &self.image.0) {
             return false;
         }
-        // Reuse old_buf for read-back verification without a second 4 KiB buffer
+        // Reuse old_buf for read-back verification without a 2nd 4 KiB buffer.
         if !read_fn(self.target, old_buf) || old_buf != &self.image.0 {
             return false;
         }
@@ -1364,8 +1449,7 @@ pub fn resolve_boot_audio<S: KeyValueStorage>(
     if let Ok(Some(eq)) = j.get_u8(AudioConfig::KEY_EQ) {
         cfg.equalizer_preset = eq;
     }
-    // Analog gain: u32 since the AGAIN key was widened; legacy journals hold one
-    // byte.
+    // Analog gain: u32 since AGAIN was widened; legacy journals hold 1 byte.
     let again = match j.get_u32(AudioConfig::KEY_AGAIN) {
         Ok(Some(v)) => u8::try_from(v).ok(),
         Ok(None) => None,
@@ -1545,8 +1629,7 @@ mod tests {
         ram.mark_flash_written(); // idempotent without a pending image
         assert_eq!(ram.target(), JournalSlot::B);
 
-        // FixedA never leaves sector A, whatever the boot journal and however many
-        // writes.
+        // FixedA never leaves sector A regardless of boot journal or writes.
         let mut image = JournalSector::erased();
         let mut ram = RamJournal::new(
             &mut image,
@@ -1581,7 +1664,7 @@ mod tests {
             password: "DefPass".try_into().unwrap(),
         };
 
-        // 1. Journal present with non-empty SSID takes precedence over NVS and default
+        // 1. Journal present with non-empty SSID beats NVS and default.
         let (res_creds, src) = resolve_boot_wifi_with_journal(
             Some(&store),
             || Some(nvs_creds.clone()),
@@ -1651,7 +1734,7 @@ mod tests {
         };
         assert!(ram.commit(&updated_audio));
 
-        // Verify that wifi.ssid and wifi.pass were preserved in the serialized sector
+        // Verify that wifi.ssid and wifi.pass were preserved in the sector.
         let mut verified_store = MemConfigStore::<16>::new();
         squeezelite_config::FlashJournal::load_from_sector(&ram.image.0, &mut verified_store)
             .expect("load sector");
@@ -1843,5 +1926,97 @@ mod tests {
         );
         assert_eq!(restored_handle.device_name().as_str(), "BASEMENT");
         assert_eq!(restored_handle.sequence(), 1);
+    }
+
+    #[test]
+    fn test_parse_equalizer_bands_rejects_nan_inf_and_over_10_bands() {
+        assert_eq!(parse_equalizer_bands("NaN,0,0"), None);
+        assert_eq!(parse_equalizer_bands("0,nan,0"), None);
+        assert_eq!(parse_equalizer_bands("inf,0,0"), None);
+        assert_eq!(parse_equalizer_bands("-inf,0,0"), None);
+        assert_eq!(parse_equalizer_bands("infinity,0,0"), None);
+        assert_eq!(parse_equalizer_bands("1,2,3,4,5,6,7,8,9,10,11"), None);
+        assert_eq!(parse_equalizer_bands("1,2,3,4,5,6,7,8,9,10,bad"), None);
+        assert_eq!(parse_equalizer_bands("1,2,3,4,5,6,7,8,9,10,"), None);
+        let clamped = parse_equalizer_bands("20.0,-20.0").expect("finite clamp");
+        assert_eq!(clamped[0], 15.0);
+        assert_eq!(clamped[1], -15.0);
+    }
+
+    #[test]
+    fn test_parse_ipv4_dotted_and_autoexec1_port_validation() {
+        assert_eq!(parse_ipv4_dotted("192.168.1.50"), Some([192, 168, 1, 50]));
+        assert_eq!(parse_ipv4_dotted("0.0.0.0"), Some([0, 0, 0, 0]));
+        assert_eq!(parse_ipv4_dotted("+192.168.1.1"), None);
+        assert_eq!(parse_ipv4_dotted("192.+168.1.1"), None);
+        assert_eq!(parse_ipv4_dotted("010.001.000.001"), None);
+        assert_eq!(parse_ipv4_dotted("192.168.01.1"), None);
+        assert_eq!(parse_ipv4_dotted("256.1.1.1"), None);
+
+        let mut handle = ConfigHandle::new(AudioConfig::default());
+        handle.apply_autoexec1_flags("squeezelite -s 192.168.1.50:invalid");
+        assert_eq!(handle.lms_server_ip(), None);
+        handle.apply_autoexec1_flags("squeezelite -s 192.168.1.50:+3483");
+        assert_eq!(handle.lms_server_ip(), None);
+        handle.apply_autoexec1_flags("squeezelite -s 192.168.1.50:99999");
+        assert_eq!(handle.lms_server_ip(), None);
+        handle.apply_autoexec1_flags("squeezelite -s 192.168.1.50:3483");
+        assert_eq!(handle.lms_server_ip(), Some([192, 168, 1, 50]));
+    }
+
+    #[test]
+    fn test_set_nvs_override_rejects_over_64_bytes() {
+        let handle = ConfigHandle::new(AudioConfig::default());
+        assert!(handle.set_nvs_override("k1", "short"));
+        let too_long = "a".repeat(65);
+        assert!(!handle.set_nvs_override("k1", &too_long));
+        assert_eq!(handle.nvs_override("k1").as_deref(), Some("short"));
+        assert!(!handle.set_nvs_override("k2", &too_long));
+        assert_eq!(handle.nvs_override("k2"), None);
+        let exact_64 = "b".repeat(64);
+        assert!(handle.set_nvs_override("k2", &exact_64));
+        assert_eq!(
+            handle.nvs_override("k2").as_deref(),
+            Some(exact_64.as_str())
+        );
+    }
+
+    #[test]
+    fn test_nvs_entry_slot_debug_and_secret_key_redaction() {
+        assert!(is_secret_config_key("password"));
+        assert!(is_secret_config_key("  WIFI.PASS "));
+        assert!(is_secret_config_key("Web_Pwd"));
+        assert!(is_secret_config_key("TELNET_PWD"));
+        assert!(!is_secret_config_key("host_name"));
+
+        let mut secret_slot = NvsEntrySlot {
+            used: true,
+            ..Default::default()
+        };
+        secret_slot.key.push_str("WIFI.PASS").unwrap();
+        secret_slot.value.push_str("TopSecretPass123").unwrap();
+        let dbg = format!("{secret_slot:?}");
+        assert!(!dbg.contains("TopSecretPass123"));
+        assert!(dbg.contains("<redacted>"));
+
+        let mut plain_slot = NvsEntrySlot {
+            used: true,
+            ..Default::default()
+        };
+        plain_slot.key.push_str("host_name").unwrap();
+        plain_slot.value.push_str("LivingRoom").unwrap();
+        let plain_dbg = format!("{plain_slot:?}");
+        assert!(plain_dbg.contains("LivingRoom"));
+
+        let handle = ConfigHandle::new(AudioConfig::default());
+        assert!(handle.set_nvs_override("wifi.pass", "SuperSecret"));
+        assert_eq!(
+            handle.nvs_override_redacted("  WIFI.PASS ").as_deref(),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            handle.nvs_override("wifi.pass").as_deref(),
+            Some("SuperSecret")
+        );
     }
 }

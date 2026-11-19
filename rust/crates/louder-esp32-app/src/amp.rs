@@ -98,8 +98,9 @@ pub struct AmpConfig {
     pub i2c_addr: u8,
     /// Initial digital volume register value applied before entering Play mode.
     ///
-    /// Defaults to [`VOL_DEFAULT_M20DB`] (`0x58`, `-20.0 dB` startup attenuation)
-    /// to prevent unexpected high-SPL output bursts on boot (PERIPH-612).
+    /// Defaults to [`VOL_DEFAULT_M20DB`] (`0x58`, `-20.0 dB` startup
+    /// attenuation) to prevent unexpected high-SPL output bursts on boot
+    /// (PERIPH-612).
     pub initial_volume: u8,
     /// I2S audio word length in bits (16, 20, 24, or 32).
     pub word_length_bits: u8,
@@ -200,7 +201,8 @@ where
         &self.config
     }
 
-    /// Returns the currently applied analog gain attenuation code (`0x00..=0x1F`).
+    /// Returns the currently applied analog gain attenuation code
+    /// (`0x00..=0x1F`).
     pub fn analog_gain_code(&self) -> u8 {
         self.current_again_code
     }
@@ -433,12 +435,16 @@ where
         let safe_vol = volume.max(VOL_UNITY_0DB);
         match self.inner.as_mut() {
             Some(AmpInner::Play(driver)) => {
-                driver.set_digital_volume(safe_vol)?;
+                if !self.is_muted {
+                    driver.set_digital_volume(safe_vol)?;
+                }
                 self.current_volume = safe_vol;
                 Ok(())
             }
             Some(AmpInner::Standby(driver)) => {
-                driver.set_digital_volume(safe_vol)?;
+                if !self.is_muted {
+                    driver.set_digital_volume(safe_vol)?;
+                }
                 self.current_volume = safe_vol;
                 Ok(())
             }
@@ -450,16 +456,18 @@ where
     /// Preserves `self.current_volume` when muted so unmuting restores
     /// it (AUD13-001).
     pub fn set_mute(&mut self, mute: bool) -> Result<(), DriverError<E>> {
-        self.is_muted = mute;
-        if mute {
-            match self.inner.as_mut() {
-                Some(AmpInner::Play(driver)) => driver.set_digital_volume(VOL_MUTE),
-                Some(AmpInner::Standby(driver)) => driver.set_digital_volume(VOL_MUTE),
-                Some(AmpInner::PowerDown(_)) | None => Err(DriverError::InvalidParameter),
-            }
+        let target_vol = if mute {
+            VOL_MUTE
         } else {
-            self.set_volume(self.current_volume)
+            self.current_volume.max(VOL_UNITY_0DB)
+        };
+        match self.inner.as_mut() {
+            Some(AmpInner::Play(driver)) => driver.set_digital_volume(target_vol)?,
+            Some(AmpInner::Standby(driver)) => driver.set_digital_volume(target_vol)?,
+            Some(AmpInner::PowerDown(_)) | None => return Err(DriverError::InvalidParameter),
         }
+        self.is_muted = mute;
+        Ok(())
     }
 
     /// Checks fault status registers and silicon telemetry in a single
@@ -582,6 +590,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -590,7 +599,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL2, 0x00]),
             I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
-            // start_playback (program volume in Standby BEFORE unmuting to Play)
+            // start_playback (program volume in Standby BEFORE unmuting)
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -636,6 +645,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -646,7 +656,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // set_volume(0x50) in Standby
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x50]),
-            // start_playback (program volume in Standby BEFORE unmuting to Play)
+            // start_playback (program volume in Standby BEFORE unmuting)
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x50]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -681,6 +691,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -717,6 +728,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -727,7 +739,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
             // clear_faults in Standby
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x81]),
-            // start_playback (program volume in Standby BEFORE unmuting to Play)
+            // start_playback (program volume in Standby BEFORE unmuting)
             I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x58]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -791,6 +803,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -833,6 +846,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -848,7 +862,7 @@ mod tests {
         assert!(amp.initialize(32).is_err());
         assert_eq!(amp.mode(), AmpMode::PowerDown);
 
-        // Retry after transient error succeeds because self.inner was not dropped
+        // Retry after transient error succeeds (self.inner preserved)
         amp.initialize(32).unwrap();
         assert_eq!(amp.mode(), AmpMode::Standby);
         assert!(amp.into_inner().is_some());
@@ -870,6 +884,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -915,6 +930,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
             // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -962,5 +978,103 @@ mod tests {
         assert_eq!(telem.detected_sample_rate_hz(), 44_100);
         assert_eq!(telem.bck_ratio(), 64);
         assert!(telem.is_pll_locked());
+    }
+
+    #[test]
+    fn test_amp_manager_set_volume_while_muted_preserves_hw_mute() {
+        let addr = crate::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // init_into_standby
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            // reconfirm_book_page_and_clear_faults
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // configure_silicon_maximization(0x08)
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
+            I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
+            I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL2, 0x00]),
+            I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
+            I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
+            // set_mute(true) in Standby -> writes VOL_MUTE
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_MUTE]),
+            // start_playback while muted -> writes VOL_MUTE
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_MUTE]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x0B]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x03]),
+            // set_mute(false) restores updated 0x42 volume
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, 0x42]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut amp = AmpManager::new(&mut i2c);
+        amp.initialize(32).unwrap();
+        amp.set_mute(true).unwrap();
+        assert!(amp.is_muted());
+
+        // Adjusting volume while muted updates cached volume without I2C write
+        amp.set_volume(0x40).unwrap();
+        assert!(amp.is_muted());
+        assert_eq!(amp.current_volume(), 0x40);
+
+        amp.start_playback().unwrap();
+        amp.set_volume(0x42).unwrap();
+        assert!(amp.is_muted());
+        assert_eq!(amp.current_volume(), 0x42);
+
+        amp.set_mute(false).unwrap();
+        assert!(!amp.is_muted());
+        assert_eq!(amp.current_volume(), 0x42);
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_amp_manager_set_mute_preserves_flag_on_error() {
+        let addr = crate::board::pins::TAS58XX_I2C_ADDR;
+        let expectations = [
+            // init_into_standby
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_2, 0x01]),
+            // reconfirm_book_page_and_clear_faults
+            I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            // configure_audio_format(32)
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
+            I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
+            // configure_silicon_maximization(0x08)
+            I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
+            I2cTrans::write(addr, vec![registers::ANA_CTRL, 0x01]),
+            I2cTrans::write(addr, vec![registers::AGAIN, 0x08]),
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL2, 0x00]),
+            I2cTrans::write(addr, vec![registers::AUTO_MUTE_CTRL, 0x07]),
+            I2cTrans::write(addr, vec![registers::SS_CTRL0, 0x01]),
+            // set_mute(true) fails with I2C Bus error
+            I2cTrans::write(addr, vec![registers::DIG_VOL_CTRL, VOL_MUTE])
+                .with_error(ErrorKind::Bus),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut amp = AmpManager::new(&mut i2c);
+        // PowerDown rejects mute without mutating is_muted
+        assert_eq!(amp.set_mute(true), Err(DriverError::InvalidParameter));
+        assert!(!amp.is_muted());
+
+        amp.initialize(32).unwrap();
+        assert!(amp.set_mute(true).is_err());
+        assert!(!amp.is_muted());
+
+        i2c.done();
     }
 }

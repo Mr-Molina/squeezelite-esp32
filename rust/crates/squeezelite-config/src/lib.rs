@@ -266,9 +266,29 @@ impl DualSectorFlashStore {
     /// [`FlashJournal::validate_sector`]) so that a sector with corrupted
     /// entries falls back cleanly to the valid peer sector.
     pub fn active_sector(sector_a: &[u8], sector_b: &[u8]) -> Result<usize, StorageError> {
-        let val_a = FlashJournal::validate_sector(sector_a);
-        let val_b = FlashJournal::validate_sector(sector_b);
+        Self::active_sector_from_metas(
+            FlashJournal::validate_sector(sector_a),
+            FlashJournal::validate_sector(sector_b),
+        )
+    }
 
+    /// Capacity-checked variant of [`Self::active_sector`] enforcing at most
+    /// `MAX_ENTRIES` entries per sector (matching
+    /// [`FlashJournal::load_from_dual_sectors`]).
+    pub fn active_sector_for<const MAX_ENTRIES: usize>(
+        sector_a: &[u8],
+        sector_b: &[u8],
+    ) -> Result<usize, StorageError> {
+        Self::active_sector_from_metas(
+            FlashJournal::validate_sector_for::<MAX_ENTRIES>(sector_a),
+            FlashJournal::validate_sector_for::<MAX_ENTRIES>(sector_b),
+        )
+    }
+
+    fn active_sector_from_metas(
+        val_a: Result<(u32, usize, usize), StorageError>,
+        val_b: Result<(u32, usize, usize), StorageError>,
+    ) -> Result<usize, StorageError> {
         match (val_a, val_b) {
             (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
                 if FlashJournal::is_seq_newer_or_equal(seq_a, seq_b) {
@@ -341,13 +361,8 @@ impl FlashJournal {
             sector[offset] = key_bytes.len() as u8;
             sector[offset + 1..offset + 3].copy_from_slice(&(val_bytes.len() as u16).to_be_bytes());
 
-            // Compute robust, non-commutative entry CRC over lengths and payload
-            let mut crc = 0xFFFF_FFFF;
-            crc = crc32_update(crc, &[key_bytes.len() as u8]);
-            crc = crc32_update(crc, &(val_bytes.len() as u16).to_be_bytes());
-            crc = crc32_update(crc, key_bytes);
-            crc = crc32_update(crc, val_bytes);
-            let entry_crc = !crc;
+            // Compute non-commutative entry CRC over lengths and payload.
+            let entry_crc = Self::entry_crc(key_bytes, val_bytes);
             sector[offset + 3..offset + 7].copy_from_slice(&entry_crc.to_be_bytes());
 
             offset += 7;
@@ -455,13 +470,7 @@ impl FlashJournal {
             let val_slice = &sector[read_offset..read_offset + val_len];
             read_offset += val_len;
 
-            let mut crc = 0xFFFF_FFFF;
-            crc = crc32_update(crc, &[key_len as u8]);
-            crc = crc32_update(crc, &(val_len as u16).to_be_bytes());
-            crc = crc32_update(crc, key_slice);
-            crc = crc32_update(crc, val_slice);
-
-            if !crc != expected_entry_crc {
+            if Self::entry_crc(key_slice, val_slice) != expected_entry_crc {
                 return Err(StorageError::CorruptedData);
             }
 
@@ -516,9 +525,26 @@ impl FlashJournal {
     /// needs no `MemConfigStore` on the caller's stack. Returns
     /// `(sequence, entry_count, data_len)`.
     pub fn validate_sector(sector: &[u8]) -> Result<(u32, usize, usize), StorageError> {
+        Self::validate_sector_with_limit(sector, None)
+    }
+
+    /// Capacity-checked variant of [`Self::validate_sector`] enforcing at most
+    /// `MAX_ENTRIES` entries (matching [`Self::load_from_sector`]).
+    pub fn validate_sector_for<const MAX_ENTRIES: usize>(
+        sector: &[u8],
+    ) -> Result<(u32, usize, usize), StorageError> {
+        Self::validate_sector_with_limit(sector, Some(MAX_ENTRIES))
+    }
+
+    fn validate_sector_with_limit(
+        sector: &[u8],
+        max_entries: Option<usize>,
+    ) -> Result<(u32, usize, usize), StorageError> {
         let (sequence, entry_count, data_len) = Self::read_sector_meta(sector)?;
-        if entry_count > 64 {
-            return Err(StorageError::CapacityExceeded);
+        if let Some(limit) = max_entries {
+            if entry_count > limit {
+                return Err(StorageError::CapacityExceeded);
+            }
         }
         let mut offset = Self::HEADER_SIZE;
         for index in 0..entry_count {
@@ -549,8 +575,29 @@ impl FlashJournal {
     /// to the other one when the newer header hides a corrupt entry. `None`
     /// when neither sector holds a valid journal.
     pub fn select_dual_sector(sector_a: &[u8], sector_b: &[u8]) -> Option<(usize, u32)> {
-        let a = Self::validate_sector(sector_a).ok().map(|(seq, _, _)| seq);
-        let b = Self::validate_sector(sector_b).ok().map(|(seq, _, _)| seq);
+        Self::select_dual_from_seqs(
+            Self::validate_sector(sector_a).ok().map(|(seq, _, _)| seq),
+            Self::validate_sector(sector_b).ok().map(|(seq, _, _)| seq),
+        )
+    }
+
+    /// Capacity-checked variant of [`Self::select_dual_sector`] enforcing at
+    /// most `MAX_ENTRIES` entries per sector.
+    pub fn select_dual_sector_for<const MAX_ENTRIES: usize>(
+        sector_a: &[u8],
+        sector_b: &[u8],
+    ) -> Option<(usize, u32)> {
+        Self::select_dual_from_seqs(
+            Self::validate_sector_for::<MAX_ENTRIES>(sector_a)
+                .ok()
+                .map(|(seq, _, _)| seq),
+            Self::validate_sector_for::<MAX_ENTRIES>(sector_b)
+                .ok()
+                .map(|(seq, _, _)| seq),
+        )
+    }
+
+    fn select_dual_from_seqs(a: Option<u32>, b: Option<u32>) -> Option<(usize, u32)> {
         match (a, b) {
             (Some(seq_a), Some(seq_b)) => {
                 if Self::is_seq_newer_or_equal(seq_a, seq_b) {
@@ -606,8 +653,8 @@ impl FlashJournal {
         sector_a: &mut [u8],
         sector_b: &mut [u8],
     ) -> Result<(bool, usize), StorageError> {
-        let meta_a = Self::validate_sector(sector_a);
-        let meta_b = Self::validate_sector(sector_b);
+        let meta_a = Self::validate_sector_for::<MAX_ENTRIES>(sector_a);
+        let meta_b = Self::validate_sector_for::<MAX_ENTRIES>(sector_b);
 
         let (write_to_b, next_seq) = match (meta_a, meta_b) {
             (Ok((seq_a, _, _)), Ok((seq_b, _, _))) => {
@@ -671,8 +718,8 @@ impl<'a> JournalView<'a> {
         self.sequence
     }
 
-    /// Returns the stored maximum output sample rate (`"audio.maxrate"`, in Hz),
-    /// or `0` (unlimited) if not present or malformed.
+    /// Returns the stored maximum output sample rate (`"audio.maxrate"`,
+    /// in Hz), or `0` (unlimited) if not present or malformed.
     #[must_use]
     pub fn max_sample_rate(&self) -> u32 {
         self.get_u32(AudioConfig::KEY_MAXRATE)
@@ -733,7 +780,7 @@ pub struct SectorWriter<'a> {
 }
 
 impl<'a> SectorWriter<'a> {
-    /// Starts an empty journal image in `sector` (must hold at least the header).
+    /// Starts an empty journal image in `sector` (must hold the header).
     pub fn new(sector: &'a mut [u8]) -> Result<Self, StorageError> {
         if sector.len() < FlashJournal::HEADER_SIZE {
             return Err(StorageError::BufferTooSmall);
@@ -981,13 +1028,21 @@ impl WifiCredentials {
 
     /// Removes Wi-Fi credentials from `store`.
     pub fn clear<S: KeyValueStorage>(store: &mut S) -> Result<(), StorageError> {
-        let _ = store.remove(Self::KEY_SSID);
-        let _ = store.remove(Self::KEY_PASS);
-        let _ = store.remove(Self::KEY_AUTO);
-        let _ = store.remove(Self::KEY_IP);
-        let _ = store.remove(Self::KEY_GW);
-        let _ = store.remove(Self::KEY_MASK);
-        let _ = store.remove(Self::KEY_DNS);
+        let keys = [
+            Self::KEY_SSID,
+            Self::KEY_PASS,
+            Self::KEY_AUTO,
+            Self::KEY_IP,
+            Self::KEY_GW,
+            Self::KEY_MASK,
+            Self::KEY_DNS,
+        ];
+        for key in keys {
+            match store.remove(key) {
+                Ok(()) | Err(StorageError::KeyNotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 }
@@ -1342,7 +1397,7 @@ mod tests {
         sector_b[FlashJournal::HEADER_SIZE + 3] ^= 0xFF;
 
         // With validate_sector, sector B is detected as CorruptedData,
-        // falling back to valid sector A (seq 1) and overwriting sector B with seq 2
+        // falling back to valid sector A (seq 1) and writing sector B (seq 2).
         let (wrote_b, bytes) =
             FlashJournal::save_to_dual_sectors(&store, &mut sector_a, &mut sector_b).unwrap();
         assert!(wrote_b);
@@ -1461,7 +1516,7 @@ mod tests {
         let mut creds = WifiCredentials::new("SSID", "ValidPassword123").unwrap();
         assert!(creds.validate().is_ok());
 
-        // Passphrase validation: empty is allowed (open Wi-Fi), but 1..=7 is rejected
+        // Passphrase validation: empty is allowed, but 1..=7 is rejected.
         creds.passphrase.clear();
         assert!(creds.validate().is_ok());
         creds.passphrase.push_str("short").unwrap();
@@ -1512,7 +1567,7 @@ mod tests {
             Err(ConfigError::InvalidFormat)
         );
 
-        // Corrupt stored IP in store and verify load_from rejects it via validate()
+        // Corrupt stored IP in store and verify load_from rejects it.
         store
             .set_str(WifiCredentials::KEY_SSID, "ValidSSID")
             .unwrap();
@@ -1724,7 +1779,7 @@ mod tests {
             AudioConfig::default()
         );
 
-        // Out of space: nothing past the buffer, and the error is BufferTooSmall.
+        // Out of space: nothing past the buffer, returns BufferTooSmall.
         let mut tiny = [0xFFu8; FlashJournal::HEADER_SIZE + 8];
         let mut writer = SectorWriter::new(&mut tiny).unwrap();
         assert_eq!(
@@ -1777,7 +1832,7 @@ mod tests {
             Ok((5, store.len(), len))
         );
 
-        // Every single-bit flip inside the image is rejected by both validators.
+        // Every single-bit flip in the image is rejected by both validators.
         for byte in 0..len {
             for bit in 0..8 {
                 let mut bad = sector;
@@ -1790,7 +1845,7 @@ mod tests {
             }
         }
 
-        // A duplicate key (CRC-consistent) is rejected like load_from_sector does.
+        // Duplicate key (CRC-consistent) is rejected like load_from_sector.
         let mut dup = [0xFFu8; 256];
         let mut writer = SectorWriter::new(&mut dup).unwrap();
         writer.set("a", &[1]).unwrap();
@@ -1842,7 +1897,7 @@ mod tests {
             FlashJournal::select_dual_sector(&wrap_old, &wrap_new),
             Some((1, 0))
         );
-        // Newer header but a corrupt entry falls back to the older valid sector.
+        // Newer header with a corrupt entry falls back to the older sector.
         let mut bad4 = s4;
         bad4[FlashJournal::HEADER_SIZE + 3] ^= 0x01; // entry CRC byte
         assert_eq!(FlashJournal::select_dual_sector(&s3, &bad4), Some((0, 3)));
@@ -1900,5 +1955,50 @@ mod tests {
         let empty_len = empty_writer.finish(1).unwrap();
         let empty_view = JournalView::new(&empty_sector[..empty_len]).unwrap();
         assert_eq!(empty_view.max_sample_rate(), 0);
+    }
+
+    #[test]
+    fn test_validate_and_dual_sector_over_64_entries() {
+        let mut store = MemConfigStore::<80>::new();
+        for idx in 0..70u8 {
+            let mut key = String::<32>::new();
+            let _ = core::fmt::write(&mut key, format_args!("k{idx:02}"));
+            store.set_u8(key.as_str(), idx).unwrap();
+        }
+        let mut sector_a = [0xFFu8; 4096];
+        let mut sector_b = [0xFFu8; 4096];
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_a, 10).unwrap();
+        FlashJournal::save_to_sector_with_seq(&store, &mut sector_b, 11).unwrap();
+
+        let (seq_b, count_b, _) = FlashJournal::validate_sector(&sector_b).unwrap();
+        assert_eq!((seq_b, count_b), (11, 70));
+        assert_eq!(
+            FlashJournal::validate_sector_for::<80>(&sector_b)
+                .unwrap()
+                .1,
+            70
+        );
+        assert_eq!(
+            FlashJournal::validate_sector_for::<64>(&sector_b),
+            Err(StorageError::CapacityExceeded)
+        );
+        assert_eq!(
+            FlashJournal::select_dual_sector(&sector_a, &sector_b),
+            Some((1, 11))
+        );
+        assert_eq!(
+            FlashJournal::select_dual_sector_for::<80>(&sector_a, &sector_b),
+            Some((1, 11))
+        );
+        assert_eq!(
+            DualSectorFlashStore::active_sector_for::<80>(&sector_a, &sector_b),
+            Ok(1)
+        );
+
+        let (wrote_to_b, _) =
+            FlashJournal::save_to_dual_sectors::<80>(&store, &mut sector_a, &mut sector_b).unwrap();
+        assert!(!wrote_to_b);
+        let (next_seq, next_count, _) = FlashJournal::validate_sector_for::<80>(&sector_a).unwrap();
+        assert_eq!((next_seq, next_count), (12, 70));
     }
 }

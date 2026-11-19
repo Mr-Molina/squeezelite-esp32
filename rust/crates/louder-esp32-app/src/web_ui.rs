@@ -379,6 +379,8 @@ pub const WEB_UI_HTML: &str = concat!(
     "t.textContent=m;t.style.opacity='1';",
     "clearTimeout(t._tm);t._tm=setTimeout(function(){t.style.opacity='0'},3000);}",
     "function g(k,v){var e=D.getElementById(k);if(e)e.innerText=v;}",
+    "function mkTd(v){var td=D.createElement('td');",
+    "td.textContent=(v===undefined||v===null)?'':String(v);return td;}",
     "function showTab(id,btn){",
     "D.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));",
     "D.querySelectorAll('#main-nav button').forEach(b=>b.classList.remove('active'));",
@@ -414,11 +416,15 @@ pub const WEB_UI_HTML: &str = concat!(
     "g('tk-psram',(d.psram_free_bytes/1024|0)+' KB free');",
     "}).catch(()=>{});}",
     "function scanWifi(){fetch('/ap.json').then(r=>r.json()).then(aps=>{",
-    "var tb=D.getElementById('wifiTableBody');if(!tb)return;tb.innerHTML='';",
+    "var tb=D.getElementById('wifiTableBody');if(!tb)return;tb.textContent='';",
     "aps.forEach(a=>{var tr=D.createElement('tr');",
-    "tr.innerHTML='<td>'+a.ssid+'</td><td>'+a.chan+'</td><td>'+a.rssi+' dBm</td><td>'+",
-    "a.auth+'</td><td><button onclick=\"D.getElementById(\\'wifi-ssid\\').value=\\''+",
-    "a.ssid+'\\'\">Select</button></td>';tb.appendChild(tr);});}).catch(()=>{});}",
+    "tr.appendChild(mkTd(a.ssid));tr.appendChild(mkTd(a.chan));",
+    "tr.appendChild(mkTd((a.rssi===undefined||a.rssi===null?'':a.rssi)+' dBm'));",
+    "tr.appendChild(mkTd(a.auth));",
+    "var td=D.createElement('td'),btn=D.createElement('button');",
+    "btn.textContent='Select';btn.addEventListener('click',function(){",
+    "var i=D.getElementById('wifi-ssid');if(i)i.value=a.ssid||'';});",
+    "td.appendChild(btn);tr.appendChild(td);tb.appendChild(tr);});}).catch(()=>{});}",
     "function connectWifi(){var s=D.getElementById('wifi-ssid').value;",
     "var p=D.getElementById('wifi-pass').value;",
     "fetch('/connect.json',{method:'POST',",
@@ -428,18 +434,20 @@ pub const WEB_UI_HTML: &str = concat!(
     "function disconnectWifi(){if(confirm('Disconnect Wi-Fi?'))",
     "fetch('/connect.json',{method:'DELETE'}).then(()=>g('wifi-status','disconnected'));}",
     "function loadSyslog(){fetch('/messages.json').then(r=>r.json()).then(d=>{",
-    "var tb=D.getElementById('syslogBody');if(!tb||!d.messages)return;tb.innerHTML='';",
+    "var tb=D.getElementById('syslogBody');if(!tb||!d.messages)return;tb.textContent='';",
     "d.messages.forEach(m=>{var tr=D.createElement('tr');",
-    "tr.innerHTML='<td>'+m.seq+'</td><td>'+m.uptime_ms+'</td><td>'+m.level+'</td><td>'+",
-    "(m.class||'')+'</td><td>'+m.msg+'</td>';tb.appendChild(tr);});}).catch(()=>{});}",
-    "function clearSyslog(){var tb=D.getElementById('syslogBody');if(tb)tb.innerHTML='';}",
+    "tr.appendChild(mkTd(m.seq));tr.appendChild(mkTd(m.uptime_ms));",
+    "tr.appendChild(mkTd(m.level));tr.appendChild(mkTd(m.class||''));",
+    "tr.appendChild(mkTd(m.msg));tb.appendChild(tr);});}).catch(()=>{});}",
+    "function clearSyslog(){var tb=D.getElementById('syslogBody');if(tb)tb.textContent='';}",
     "function nvsVal(k){var v=nvsCache[k];",
     "return(v&&typeof v==='object'&&v.value!==undefined)?v.value:v;}",
     "function loadConfig(){apiFetch('/config.json').then(r=>r.json()).then(d=>{",
-    "if(d.gpio){var gb=D.getElementById('gpioBody');if(gb){gb.innerHTML='';",
+    "if(d.gpio){var gb=D.getElementById('gpioBody');if(gb){gb.textContent='';",
     "d.gpio.forEach(p=>{var tr=D.createElement('tr');",
-    "tr.innerHTML='<td>GPIO '+p.gpio+'</td><td>'+p.name+'</td><td>'+p.group+'</td><td>'+",
-    "(p.fixed?'Fixed':'User')+'</td>';gb.appendChild(tr);});}}",
+    "tr.appendChild(mkTd('GPIO '+p.gpio));tr.appendChild(mkTd(p.name));",
+    "tr.appendChild(mkTd(p.group));tr.appendChild(mkTd(p.fixed?'Fixed':'User'));",
+    "gb.appendChild(tr);});}}",
     "if(d.config){nvsCache=d.config;var hn=nvsVal('host_name');if(hn)g('navtitle',hn);",
     "renderNvsTable(d.config);",
     "function sV(id,k,c){var e=D.getElementById(id);if(!e||e===D.activeElement)return;",
@@ -471,16 +479,19 @@ pub const WEB_UI_HTML: &str = concat!(
     "var lb=D.getElementById('eq-v'+i);if(lb)lb.innerText=b+'dB';});}",
     "}).catch(()=>{});}",
     "function renderNvsTable(cfg){var nb=D.getElementById('nvsBody');",
-    "if(!nb)return;nb.innerHTML='';",
+    "if(!nb)return;nb.textContent='';",
     "Object.keys(cfg).forEach(k=>{var v=cfg[k];var val=(v&&typeof v==='object')?v.value:v;",
     "var typ=(v&&typeof v==='object'&&v.type)?v.type:33;",
     "var tr=D.createElement('tr');",
-    "tr.innerHTML='<td>'+k+'</td><td>'+typ+'</td><td><input id=\"nvs-val-'+k+\"",
-    "' data-nvs-key=\"'+k+'\" value=\"'+",
-    "String(val).replace(/\"/g,'&quot;')+'\"></td><td><button onclick=\"postConfigKey(\\''+",
-    "k+'\\',D.getElementById(\\'nvs-val-'+k+'\\').value).then(function(){",
-    "showToast(\\'Saved '+k+'\\')})\">Save</button></td>';",
-    "nb.appendChild(tr);});}",
+    "tr.appendChild(mkTd(k));tr.appendChild(mkTd(typ));",
+    "var tdI=D.createElement('td'),inp=D.createElement('input');",
+    "inp.id='nvs-val-'+k;inp.setAttribute('data-nvs-key',k);",
+    "inp.value=(val===undefined||val===null)?'':String(val);",
+    "tdI.appendChild(inp);tr.appendChild(tdI);",
+    "var tdB=D.createElement('td'),btn=D.createElement('button');",
+    "btn.textContent='Save';btn.addEventListener('click',function(){",
+    "postConfigKey(k,inp.value).then(function(){showToast('Saved '+k);});});",
+    "tdB.appendChild(btn);tr.appendChild(tdB);nb.appendChild(tr);});}",
     "function postConfigKey(k,v){nvsCache[k]=String(v);",
     "return apiFetch('/config.json',{method:'POST',",
     "headers:{'Content-Type':'application/x-www-form-urlencoded'},",
@@ -575,5 +586,98 @@ pub const WEB_UI_HTML: &str = concat!(
     "D.getElementById('nav-cmd').style.display=sc?'':'none';",
     "try{localStorage.setItem('show_nvs',sn?'1':'0');",
     "localStorage.setItem('show_cmd',sc?'1':'0');}catch(e){}}",
+    "(function(){try{var sn=localStorage.getItem('show_nvs');",
+    "var sc=localStorage.getItem('show_cmd');",
+    "var en=D.getElementById('show-nvs'),ec=D.getElementById('show-commands');",
+    "if(en&&sn!==null)en.checked=(sn!=='0');",
+    "if(ec&&sc!==null)ec.checked=(sc!=='0');",
+    "toggleAdvTabs();}catch(e){}})();",
     "u();setInterval(u,1500);</script></body></html>"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::WEB_UI_HTML;
+
+    fn extract_between<'a>(haystack: &'a str, start: &str, end: &str) -> &'a str {
+        let (_, tail) = haystack
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing start marker: {start}"));
+        let (slice, _) = tail
+            .split_once(end)
+            .unwrap_or_else(|| panic!("missing end marker: {end}"));
+        slice
+    }
+
+    #[test]
+    fn test_web_ui_has_no_inner_html_sinks() {
+        assert!(!WEB_UI_HTML.contains(".innerHTML"));
+        assert!(WEB_UI_HTML.contains("function mkTd("));
+        assert!(WEB_UI_HTML.contains("D.createElement('td')"));
+        assert!(WEB_UI_HTML.contains(".textContent"));
+    }
+
+    #[test]
+    fn test_scan_wifi_builds_safe_dom_without_inline_onclick() {
+        let body = extract_between(WEB_UI_HTML, "function scanWifi()", "function connectWifi()");
+        assert!(body.contains("mkTd(a.ssid)"));
+        assert!(body.contains("mkTd(a.chan)"));
+        assert!(body.contains("mkTd(a.auth)"));
+        assert!(body.contains("D.createElement('button')"));
+        assert!(body.contains("addEventListener('click'"));
+        assert!(!body.contains("onclick"));
+        assert!(!body.contains("innerHTML"));
+    }
+
+    #[test]
+    fn test_render_nvs_table_builds_safe_dom_without_inline_onclick() {
+        let body = extract_between(
+            WEB_UI_HTML,
+            "function renderNvsTable(cfg)",
+            "function postConfigKey(",
+        );
+        assert!(body.contains("mkTd(k)"));
+        assert!(body.contains("mkTd(typ)"));
+        assert!(body.contains("D.createElement('input')"));
+        assert!(body.contains("setAttribute('data-nvs-key',k)"));
+        assert!(body.contains("D.createElement('button')"));
+        assert!(body.contains("addEventListener('click'"));
+        assert!(!body.contains("onclick"));
+        assert!(!body.contains("innerHTML"));
+    }
+
+    #[test]
+    fn test_syslog_and_gpio_tables_use_safe_dom_cells() {
+        let syslog = extract_between(
+            WEB_UI_HTML,
+            "function loadSyslog()",
+            "function clearSyslog()",
+        );
+        assert!(syslog.contains("mkTd(m.msg)"));
+        assert!(syslog.contains("mkTd(m.class||'')"));
+        assert!(!syslog.contains("innerHTML"));
+
+        let gpio = extract_between(WEB_UI_HTML, "function loadConfig()", "function loadEq()");
+        assert!(gpio.contains("mkTd('GPIO '+p.gpio)"));
+        assert!(gpio.contains("mkTd(p.name)"));
+        assert!(gpio.contains("mkTd(p.group)"));
+        assert!(!gpio.contains("innerHTML"));
+    }
+
+    #[test]
+    fn test_adv_tab_visibility_restored_before_initial_poll() {
+        let script = extract_between(WEB_UI_HTML, "<script>", "</script>");
+        let restore_idx = script
+            .find("localStorage.getItem('show_nvs')")
+            .unwrap_or_else(|| panic!("missing show_nvs restore"));
+        let cmd_idx = script
+            .find("localStorage.getItem('show_cmd')")
+            .unwrap_or_else(|| panic!("missing show_cmd restore"));
+        let poll_idx = script
+            .find("u();setInterval(u,1500);")
+            .unwrap_or_else(|| panic!("missing initial poll"));
+        assert!(restore_idx < poll_idx);
+        assert!(cmd_idx < poll_idx);
+        assert!(script[restore_idx..poll_idx].contains("toggleAdvTabs()"));
+    }
+}

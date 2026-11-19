@@ -37,9 +37,9 @@ pub const MAX_CHUNK_SIZE: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChunkState {
-    /// Chunk-size line. `invalid` defers a bad digit until the line is complete (a
-    /// size line
-    /// split across reads is only judged once its newline arrived).
+    /// Chunk-size line. `invalid` defers a bad digit until the line is complete
+    /// (a size line split across reads is only judged once its newline
+    /// arrived).
     Size {
         acc: usize,
         digits: bool,
@@ -49,8 +49,8 @@ enum ChunkState {
     },
     /// Inside chunk data, this many payload bytes left.
     Data(usize),
-    /// After chunk data: expecting `\r\n` (or a bare `\n`); `cr` once the `\r` was
-    /// seen.
+    /// After chunk data: expecting `\r\n` (or a bare `\n`); `cr` once the
+    /// `\r` was seen.
     DataEnd { cr: bool },
     /// After the last (zero-size) chunk: trailer lines until an empty line.
     Trailer { line_len: usize },
@@ -95,12 +95,10 @@ impl ChunkedDecoder {
         self.state = CHUNK_START;
     }
 
-    /// Decodes the raw body bytes in `buf` in place: the chunk payload they carry
-    /// is moved to
-    /// the front of `buf` and its length returned. Every input byte is consumed
-    /// (bytes after the
-    /// terminating empty line are ignored). A framing error is
-    /// [`StreamError::BadResponse`].
+    /// Decodes the raw body bytes in `buf` in place: the chunk payload they
+    /// carry is moved to the front of `buf` and its length returned. Every
+    /// input byte is consumed (bytes after the terminating empty line are
+    /// ignored). A framing error is [`StreamError::BadResponse`].
     pub fn decode_in_place(&mut self, buf: &mut [u8]) -> Result<usize, StreamError> {
         let (mut r, mut w) = (0usize, 0usize);
         while r < buf.len() {
@@ -221,7 +219,8 @@ impl ChunkedDecoder {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IcyState {
-    /// Audio bytes; `IcyStripper::remaining` counts down to the next length byte.
+    /// Audio bytes; `IcyStripper::remaining` counts down to the next length
+    /// byte.
     Audio,
     /// The next byte is a metadata length (in 16-byte units).
     MetaLen,
@@ -281,9 +280,8 @@ impl IcyStripper {
         self.metaint
     }
 
-    /// Strips metadata from `buf` in place: the audio bytes are moved to the front
-    /// of `buf` and
-    /// their count returned.
+    /// Strips metadata from `buf` in place: the audio bytes are moved to the
+    /// front of `buf` and their count returned.
     pub fn strip_in_place(&mut self, buf: &mut [u8]) -> usize {
         if self.metaint == 0 {
             return buf.len();
@@ -415,9 +413,8 @@ impl RedirectPolicy {
     }
 
     /// Classifies a `Location` value (surrounding blanks and quotes ignored):
-    /// `/path` (not
-    /// `//...`) is same-origin, `http://...` (any case) is absolute, anything else is
-    /// [`StreamError::BadResponse`].
+    /// `/path` (not `//...`) is same-origin, `http://...` (any case) is
+    /// absolute, anything else is [`StreamError::BadResponse`].
     pub fn classify(location: &[u8]) -> Result<RedirectTarget<'_>, StreamError> {
         let loc = trim_quotes(trim(location));
         if loc.starts_with(b"/") && !loc.starts_with(b"//") {
@@ -437,13 +434,11 @@ impl RedirectPolicy {
         Err(StreamError::BadResponse)
     }
 
-    /// The request for the next hop: `template`'s request line with `path` as its
-    /// target, every
-    /// other non-empty line kept (trimmed) except `Host`, which becomes `Host:
-    /// host` (appended
-    /// when the template had none); lines joined by `\r\n` and ended by a blank
-    /// line. An empty
-    /// template yields `GET <path> HTTP/1.0` + `Host`.
+    /// The request for the next hop: `template`'s request line with `path` as
+    /// its target, every other non-empty line kept (trimmed) except `Host`,
+    /// which becomes `Host: host` (appended when the template had none); lines
+    /// joined by `\r\n` and ended by a blank line. An empty template yields
+    /// `GET <path> HTTP/1.0` + `Host`.
     pub fn rewrite_request(template: &[u8], host: &[u8], path: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(template.len() + host.len() + path.len() + 32);
         let push_host = |out: &mut Vec<u8>| {
@@ -663,8 +658,8 @@ mod tests {
     use crate::io_traits::MAX_ICY_METADATA;
     use std::vec;
 
-    /// Feeds `input` to a fresh decoder in pieces of `step` bytes, collecting the
-    /// payload.
+    /// Feeds `input` to a fresh decoder in pieces of `step` bytes, collecting
+    /// the payload.
     fn dechunk(input: &[u8], step: usize) -> (Result<Vec<u8>, StreamError>, ChunkedDecoder) {
         let mut d = ChunkedDecoder::new();
         let mut out = Vec::new();
@@ -889,7 +884,8 @@ mod tests {
             ),
             b"GET /new.pcm HTTP/1.1\r\nHost: 10.0.0.2:9000\r\nIcy-MetaData: 1\r\n\r\n".to_vec()
         );
-        // Missing Host is appended; blank lines dropped; bare-LF template accepted.
+        // Missing Host is appended; blank lines dropped; bare-LF template
+        // accepted.
         assert_eq!(
             RedirectPolicy::rewrite_request(b"GET /x HTTP/1.0\n\nUser-Agent: t\n", b"h:1", b"/y"),
             b"GET /y HTTP/1.0\r\nUser-Agent: t\r\nHost: h:1\r\n\r\n".to_vec()
@@ -985,7 +981,8 @@ mod tests {
         let n1 = chunked.decode_in_place(&mut wire1).unwrap();
         assert_eq!(&wire1[..n1], b"abcd");
 
-        // r == w path: chunk split across buffers keeps state in ChunkState::Data(4).
+        // r == w path: chunk split across buffers keeps state in
+        // ChunkState::Data(4).
         // First buffer ingests header and partial 4 bytes of 8-byte chunk.
         let mut wire2_part1 = b"8\r\n1234".to_vec();
         let n2_1 = chunked.decode_in_place(&mut wire2_part1).unwrap();

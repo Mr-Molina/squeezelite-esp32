@@ -232,9 +232,10 @@ impl MercuryHeader {
                     pos += 8;
                 }
                 2 => {
-                    let len = decode_varint(data, &mut pos)
-                        .map_err(|_| MercuryError::TruncatedPacket)?
-                        as usize;
+                    let raw_len =
+                        decode_varint(data, &mut pos).map_err(|_| MercuryError::TruncatedPacket)?;
+                    let len =
+                        usize::try_from(raw_len).map_err(|_| MercuryError::TruncatedPacket)?;
                     let end = pos.checked_add(len).ok_or(MercuryError::TruncatedPacket)?;
                     if end > data.len() {
                         return Err(MercuryError::TruncatedPacket);
@@ -328,29 +329,57 @@ impl MercuryPacket {
         Self::new(cmd, seq_id, header, payload_parts)
     }
 
-    /// Serializes the Mercury packet body into wire bytes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    /// Fallibly serializes the Mercury packet body into wire bytes.
+    pub fn try_encode(&self) -> Result<Vec<u8>, MercuryError> {
+        let total_parts = 1usize
+            .checked_add(self.payload_parts.len())
+            .ok_or(MercuryError::PacketTooLarge)?;
+        if total_parts > MAX_MERCURY_PARTS {
+            return Err(MercuryError::PacketTooLarge);
+        }
+        let part_count = u16::try_from(total_parts).map_err(|_| MercuryError::PacketTooLarge)?;
+
         let header_bytes = self.header.encode();
+        let header_len =
+            u16::try_from(header_bytes.len()).map_err(|_| MercuryError::PacketTooLarge)?;
+
         let mut out = Vec::with_capacity(32 + header_bytes.len());
 
         let seq_bytes = self.seq_id.to_be_bytes();
-        out.extend_from_slice(&(seq_bytes.len() as u16).to_be_bytes());
+        let seq_len = u16::try_from(seq_bytes.len()).map_err(|_| MercuryError::PacketTooLarge)?;
+        out.extend_from_slice(&seq_len.to_be_bytes());
         out.extend_from_slice(&seq_bytes);
         out.push(self.flags);
 
-        let part_count = (1 + self.payload_parts.len()) as u16;
         out.extend_from_slice(&part_count.to_be_bytes());
 
-        out.extend_from_slice(&(header_bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(&header_len.to_be_bytes());
         out.extend_from_slice(&header_bytes);
 
         for part in &self.payload_parts {
-            out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            let part_len = u16::try_from(part.len()).map_err(|_| MercuryError::PacketTooLarge)?;
+            out.extend_from_slice(&part_len.to_be_bytes());
             out.extend_from_slice(part);
         }
 
-        out
+        if out.len() > MAX_MULTIPART_BYTES {
+            return Err(MercuryError::PacketTooLarge);
+        }
+
+        Ok(out)
+    }
+
+    /// Serializes the Mercury packet body into wire bytes.
+    ///
+    /// Returns an empty buffer if the packet exceeds protocol limits.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        self.try_encode().unwrap_or_default()
+    }
+
+    /// Fallibly serializes as `(cmd_byte, body_bytes)` for AP transmission.
+    pub fn try_encode_ap_frame(&self) -> Result<(u8, Vec<u8>), MercuryError> {
+        Ok((self.cmd as u8, self.try_encode()?))
     }
 
     /// Serializes as `(cmd_byte, body_bytes)` for AP Shannon transmission.
@@ -492,7 +521,8 @@ impl MercuryPacket {
 /// `0x0E` `AesKeyError`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioKeyPacket {
-    /// `0x0C` `RequestKey`: 20-byte `file_id` + 16-byte `track_gid` + 4-byte `seq`.
+    /// `0x0C` `RequestKey`: 20-byte `file_id` + 16-byte `track_gid` + 4-byte
+    /// `seq`.
     RequestKey {
         /// 20-byte Spotify audio file ID.
         file_id: [u8; 20],
@@ -670,6 +700,7 @@ impl MercuryPacketBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn test_mercury_packet_too_large_parts() {
@@ -686,5 +717,57 @@ mod tests {
 
         let res = MercuryPacket::parse_raw_parts(&data);
         assert_eq!(res.err(), Some(MercuryError::PacketTooLarge));
+    }
+
+    #[test]
+    fn test_mercury_header_decode_rejects_oversized_varint_length() {
+        // Field 1, wire type 2, length = 0x1_0000_0005, plus 6 trailing bytes.
+        // Rejects truncation on 32-bit targets instead of wrapping to len 5.
+        let mut data = vec![0x0A, 0x85, 0x80, 0x80, 0x80, 0x10];
+        data.extend_from_slice(b"abcdef");
+        assert_eq!(
+            MercuryHeader::decode(&data),
+            Err(MercuryError::TruncatedPacket)
+        );
+    }
+
+    #[test]
+    fn test_mercury_packet_try_encode_bounds_and_roundtrip() {
+        let ok_pkt = MercuryPacket::request(
+            77,
+            "SEND",
+            "hm://remote/user/spotify/",
+            vec![b"hello".to_vec()],
+        );
+        let wire = ok_pkt.try_encode().expect("valid packet should encode");
+        assert_eq!(wire, ok_pkt.encode());
+        assert_eq!(
+            ok_pkt.try_encode_ap_frame().expect("valid frame"),
+            ok_pkt.encode_ap_frame()
+        );
+
+        let too_many_parts = MercuryPacket::new(
+            MercuryType::Send,
+            1,
+            MercuryHeader::new("hm://test", "SEND"),
+            vec![Vec::new(); MAX_MERCURY_PARTS],
+        );
+        assert_eq!(
+            too_many_parts.try_encode(),
+            Err(MercuryError::PacketTooLarge)
+        );
+        assert!(too_many_parts.encode().is_empty());
+
+        let oversized_part = MercuryPacket::new(
+            MercuryType::Send,
+            2,
+            MercuryHeader::new("hm://test", "SEND"),
+            vec![vec![0xABu8; usize::from(u16::MAX) + 1]],
+        );
+        assert_eq!(
+            oversized_part.try_encode(),
+            Err(MercuryError::PacketTooLarge)
+        );
+        assert!(oversized_part.encode().is_empty());
     }
 }

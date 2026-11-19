@@ -19,16 +19,13 @@ mod layer12;
 mod tables;
 use lanes::{Lanes, F4};
 use tables::{
-    HDR_BITRATE_KBPS_HALFRATE, HDR_SAMPLE_RATE_HZ_G_HZ, G_POW43,
-    L3_ANTIALIAS_G_AA, L3_DECODE_SCALEFACTORS_G_MOD,
-    L3_DECODE_SCALEFACTORS_G_PREAMP, L3_DECODE_SCALEFACTORS_G_SCFC_DECODE,
-    L3_DECODE_SCALEFACTORS_G_SCM_PARTITIONS, L3_HUFFMAN_G_LINBITS,
-    L3_HUFFMAN_TAB32, L3_HUFFMAN_TAB33, L3_HUFFMAN_TABINDEX,
-    L3_HUFFMAN_TABS, L3_IMDCT12_G_TWID3, L3_IMDCT36_G_TWID9,
-    L3_IMDCT_GR_G_MDCT_WINDOW, L3_LDEXP_Q2_G_EXPFRAC,
-    L3_READ_SIDE_INFO_G_SCF_LONG, L3_READ_SIDE_INFO_G_SCF_MIXED,
-    L3_READ_SIDE_INFO_G_SCF_SHORT, L3_STEREO_PROCESS_G_PAN,
-    MP3D_DCT_II_G_SEC, MP3D_SYNTH_G_WIN,
+    G_POW43, HDR_BITRATE_KBPS_HALFRATE, HDR_SAMPLE_RATE_HZ_G_HZ, L3_ANTIALIAS_G_AA,
+    L3_DECODE_SCALEFACTORS_G_MOD, L3_DECODE_SCALEFACTORS_G_PREAMP,
+    L3_DECODE_SCALEFACTORS_G_SCFC_DECODE, L3_DECODE_SCALEFACTORS_G_SCM_PARTITIONS,
+    L3_HUFFMAN_G_LINBITS, L3_HUFFMAN_TAB32, L3_HUFFMAN_TAB33, L3_HUFFMAN_TABINDEX, L3_HUFFMAN_TABS,
+    L3_IMDCT12_G_TWID3, L3_IMDCT36_G_TWID9, L3_IMDCT_GR_G_MDCT_WINDOW, L3_LDEXP_Q2_G_EXPFRAC,
+    L3_READ_SIDE_INFO_G_SCF_LONG, L3_READ_SIDE_INFO_G_SCF_MIXED, L3_READ_SIDE_INFO_G_SCF_SHORT,
+    L3_STEREO_PROCESS_G_PAN, MP3D_DCT_II_G_SEC, MP3D_SYNTH_G_WIN,
 };
 
 const HDR_SIZE: usize = 4;
@@ -278,7 +275,11 @@ struct Bs<'a> {
 
 impl<'a> Bs<'a> {
     fn new(buf: &'a [u8], bytes: i32) -> Self {
-        Self { buf, pos: 0, limit: bytes * 8 }
+        Self {
+            buf,
+            pos: 0,
+            limit: bytes * 8,
+        }
     }
 
     fn get_bits(&mut self, n: u32) -> u32 {
@@ -611,7 +612,10 @@ fn l3_decode_scalefactors(
             }
         }
     } else if gr.preflag != 0 {
-        for (v, &p) in iscf[11..21].iter_mut().zip(&L3_DECODE_SCALEFACTORS_G_PREAMP) {
+        for (v, &p) in iscf[11..21]
+            .iter_mut()
+            .zip(&L3_DECODE_SCALEFACTORS_G_PREAMP)
+        {
             *v = v.wrapping_add(p);
         }
     }
@@ -756,7 +760,12 @@ fn l3_huffman(
     let mut d = 0;
 
     let start = (bs.pos / 8) as usize;
-    let mut br = BitCache { buf: bs.buf, next: start + 4, cache: 0, sh: (bs.pos & 7) - 8 };
+    let mut br = BitCache {
+        buf: bs.buf,
+        next: start + 4,
+        cache: 0,
+        sh: (bs.pos & 7) - 8,
+    };
     br.cache = (((br.byte(start) * 256 + br.byte(start + 1)) * 256 + br.byte(start + 2)) * 256
         + br.byte(start + 3))
         << (bs.pos & 7);
@@ -802,14 +811,16 @@ fn l3_huffman(
         }
     }
 
-    let codebook_count1: &[u8] =
-        if gr_info.count1_table != 0 { &L3_HUFFMAN_TAB33 } else { &L3_HUFFMAN_TAB32 };
+    let codebook_count1: &[u8] = if gr_info.count1_table != 0 {
+        &L3_HUFFMAN_TAB33
+    } else {
+        &L3_HUFFMAN_TAB32
+    };
     let mut np = 1 - big_val_cnt;
     'count1: loop {
         let mut leaf = i32::from(codebook_count1[br.peek(4) as usize]);
         if leaf & 8 == 0 {
-            let offset = (leaf >> 3) as usize
-                + (br.cache << 4 >> (32 - (leaf & 3))) as usize;
+            let offset = (leaf >> 3) as usize + (br.cache << 4 >> (32 - (leaf & 3))) as usize;
             leaf = i32::from(codebook_count1[offset]);
         }
         br.flush(leaf & 7);
@@ -845,7 +856,10 @@ fn l3_huffman(
 
 fn l3_midside_stereo(buf: &mut [f32; 1152], start: usize, n: usize) {
     let (left, right) = buf.split_at_mut(576);
-    for (l, r) in left[start..start + n].iter_mut().zip(&mut right[start..start + n]) {
+    for (l, r) in left[start..start + n]
+        .iter_mut()
+        .zip(&mut right[start..start + n])
+    {
         let a = *l;
         let b = *r;
         *l = a + b;
@@ -855,7 +869,10 @@ fn l3_midside_stereo(buf: &mut [f32; 1152], start: usize, n: usize) {
 
 fn l3_intensity_stereo_band(buf: &mut [f32; 1152], start: usize, n: usize, kl: f32, kr: f32) {
     let (left, right) = buf.split_at_mut(576);
-    for (l, r) in left[start..start + n].iter_mut().zip(&mut right[start..start + n]) {
+    for (l, r) in left[start..start + n]
+        .iter_mut()
+        .zip(&mut right[start..start + n])
+    {
         *r = *l * kr;
         *l *= kl;
     }
@@ -867,7 +884,12 @@ fn l3_stereo_top_band(right: &[f32], sfb: &[u8], nbands: usize, max_band: &mut [
     for i in 0..nbands {
         let n = sfb[i] as usize;
         let band = &right[off..off + n];
-        if band.as_chunks::<2>().0.iter().any(|p| p[0] != 0.0 || p[1] != 0.0) {
+        if band
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|p| p[0] != 0.0 || p[1] != 0.0)
+        {
             max_band[i % 3] = i as i32;
         }
         off += n;
@@ -888,7 +910,11 @@ fn l3_stereo_process(
         let n = n as usize;
         let ipos = u32::from(ist_pos[i]);
         if i as i32 > max_band[i % 3] && ipos < max_pos {
-            let s = if hdr.test_ms_stereo() { 1.41421356 } else { 1.0 };
+            let s = if hdr.test_ms_stereo() {
+                1.41421356
+            } else {
+                1.0
+            };
             let (kl, kr);
             if hdr.test_mpeg1() {
                 kl = L3_STEREO_PROCESS_G_PAN[2 * ipos as usize];
@@ -918,7 +944,11 @@ fn l3_intensity_stereo(buf: &mut [f32; 1152], ist_pos: &mut [u8; 39], gr: &[GrIn
         let default_pos = if hdr.test_mpeg1() { 3 } else { 0 };
         let itop = n_sfb - max_blocks + i;
         let prev = itop - max_blocks;
-        ist_pos[itop] = if max_band[i] >= prev as i32 { default_pos } else { ist_pos[prev] };
+        ist_pos[itop] = if max_band[i] >= prev as i32 {
+            default_pos
+        } else {
+            ist_pos[prev]
+        };
     }
     let comp = u32::from(gr[1].scalefac_compress & 1);
     l3_stereo_process(buf, ist_pos, gr[0].sfbtab, hdr, &max_band, comp);
@@ -1106,7 +1136,12 @@ fn l3_imdct_gr(
     let (long_buf, rest_buf) = grbuf.split_at_mut(18 * n_long_bands);
     let (long_ovl, rest_ovl) = overlap.split_at_mut(9 * n_long_bands);
     if n_long_bands != 0 {
-        l3_imdct36(long_buf, long_ovl, &L3_IMDCT_GR_G_MDCT_WINDOW[0], n_long_bands);
+        l3_imdct36(
+            long_buf,
+            long_ovl,
+            &L3_IMDCT_GR_G_MDCT_WINDOW[0],
+            n_long_bands,
+        );
     }
     if block_type == SHORT_BLOCK_TYPE {
         l3_imdct_short(rest_buf, rest_ovl, 32 - n_long_bands);
@@ -1146,9 +1181,13 @@ fn l3_restore_reservoir<'a>(
     // Bounding the reader to the valid bytes makes Huffman over-reads on corrupt
     // streams see zeros without having to clear the buffer.
     let len = bytes_have + frame_bytes;
-    (Bs::new(&maindata[..len], len as i32), h.reserv >= main_data_begin)
+    (
+        Bs::new(&maindata[..len], len as i32),
+        h.reserv >= main_data_begin,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn l3_decode(
     h: &mut State,
     grbuf: &mut [[f32; 576]; 2],
@@ -1180,8 +1219,7 @@ fn l3_decode(
         let gr = &gr_info[ch];
         let mut aa_bands = 31;
         let shift = (hdr.get_my_sample_rate() == 2) as u32;
-        let n_long_bands: usize =
-            (if gr.mixed_block_flag != 0 { 2 } else { 0 }) << shift;
+        let n_long_bands: usize = (if gr.mixed_block_flag != 0 { 2 } else { 0 }) << shift;
 
         if gr.n_short_sfb != 0 {
             aa_bands = n_long_bands.saturating_sub(1);
@@ -1193,7 +1231,12 @@ fn l3_decode(
         }
 
         l3_antialias(&mut grbuf[ch], aa_bands);
-        l3_imdct_gr(&mut grbuf[ch], &mut h.mdct_overlap[ch], gr.block_type, n_long_bands);
+        l3_imdct_gr(
+            &mut grbuf[ch],
+            &mut h.mdct_overlap[ch],
+            gr.block_type,
+            n_long_bands,
+        );
         l3_change_sign(&mut grbuf[ch]);
     }
 }
@@ -1460,7 +1503,12 @@ fn mp3d_synth_granule<S: Sample>(
         // Standard (not MINIMP3_NONSTANDARD_BUT_LOGICAL) behavior: a mono frame
         // only advances the left channel's filterbank history, so a later
         // switch to stereo starts the right channel from its old state.
-        for (q, l) in qmf_state.as_chunks_mut::<2>().0.iter_mut().zip(tail.as_chunks::<2>().0) {
+        for (q, l) in qmf_state
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(tail.as_chunks::<2>().0)
+        {
             q[0] = l[0];
         }
     } else {
@@ -1518,8 +1566,7 @@ pub fn mp3d_find_frame(mp3: &[u8], free_format_bytes: &mut usize) -> (usize, usi
             let matched = frame_bytes != 0
                 && i + frame_and_padding <= mp3_bytes
                 && mp3d_match_frame(buf, frame_bytes);
-            if matched || (i == 0 && frame_and_padding == mp3_bytes)
-            {
+            if matched || (i == 0 && frame_and_padding == mp3_bytes) {
                 return (i, frame_and_padding);
             }
             *free_format_bytes = 0;
@@ -1543,7 +1590,10 @@ pub fn l3_side_info(frame: &[u8], frame_size: usize) -> Option<(i32, i32)> {
     let hdr = Header::read(frame);
     let body = &frame[HDR_SIZE..];
     // C trusts frame_size; clamp it so a truncated frame can't be over-read.
-    let mut bs = Bs::new(body, (frame_size as i32 - HDR_SIZE as i32).min(body.len() as i32));
+    let mut bs = Bs::new(
+        body,
+        (frame_size as i32 - HDR_SIZE as i32).min(body.len() as i32),
+    );
     if hdr.is_crc() {
         bs.get_bits(16);
     }
@@ -1561,7 +1611,11 @@ pub fn mp3dec_decode_frame<S: Sample>(
     info: &mut FrameInfo,
     compat: bool,
 ) -> usize {
-    let Mp3Dec { st: dec, scratch, maindata } = dec;
+    let Mp3Dec {
+        st: dec,
+        scratch,
+        maindata,
+    } = dec;
     let mp3_bytes = mp3.len();
     let mut i = 0;
     let mut frame_size = 0;
@@ -1615,9 +1669,19 @@ pub fn mp3dec_decode_frame<S: Sample>(
         #[cfg(feature = "layer12")]
         {
             let n = layer12::decode_frame(
-                dec, scratch, hdr, &mut bs_frame, pcm, info.channels as usize, compat,
+                dec,
+                scratch,
+                hdr,
+                &mut bs_frame,
+                pcm,
+                info.channels as usize,
+                compat,
             );
-            info.status = if n == 0 { Status::Corrupt } else { Status::Decoded };
+            info.status = if n == 0 {
+                Status::Corrupt
+            } else {
+                Status::Decoded
+            };
             return n;
         }
         #[cfg(not(feature = "layer12"))]
@@ -1656,12 +1720,22 @@ pub fn mp3dec_decode_frame<S: Sample>(
                 nch,
             );
             mp3d_synth_granule(
-                &mut dec.qmf_state, &mut scratch.grbuf, 18, nch, pcm, &mut scratch.syn, compat,
+                &mut dec.qmf_state,
+                &mut scratch.grbuf,
+                18,
+                nch,
+                pcm,
+                &mut scratch.syn,
+                compat,
             );
         }
     }
     l3_save_reservoir(dec, &bs);
-    info.status = if success { Status::Decoded } else { Status::ReservoirUnavailable };
+    info.status = if success {
+        Status::Decoded
+    } else {
+        Status::ReservoirUnavailable
+    };
     success as usize * Header(dec.header).frame_samples() as usize
 }
 
@@ -1675,13 +1749,8 @@ mod tests {
         let mut info = FrameInfo::default();
         let test_mp3 = include_bytes!("tests/The Washington Post.mp3");
         let mut tiny_pcm = [0i16; 10];
-        let samples = mp3dec_decode_frame(
-            &mut dec,
-            test_mp3,
-            Some(&mut tiny_pcm),
-            &mut info,
-            false,
-        );
+        let samples =
+            mp3dec_decode_frame(&mut dec, test_mp3, Some(&mut tiny_pcm), &mut info, false);
         assert_eq!(samples, 0);
         assert_eq!(info.status, Status::Corrupt);
     }
@@ -1692,9 +1761,11 @@ mod tests {
         let scf = [1.0f32; 40];
         let dummy_data = [0u8; 64];
         let mut bs = Bs::new(&dummy_data, 64);
-        let mut gr_info = GrInfo::default();
-        gr_info.big_values = 100;
-        gr_info.region_count = [10, 10, 10];
+        let gr_info = GrInfo {
+            big_values: 100,
+            region_count: [10, 10, 10],
+            ..Default::default()
+        };
         // Must not panic on out-of-bounds indexing or zero-width sfb
         l3_huffman(&mut dst, &mut bs, &gr_info, &scf, 500);
     }

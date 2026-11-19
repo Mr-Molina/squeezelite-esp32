@@ -12,6 +12,8 @@
 
 use core::fmt;
 use core::marker::PhantomData;
+use embedded_hal::i2c::Error as _;
+use embedded_hal::i2c::ErrorKind;
 use embedded_hal::i2c::I2c;
 
 /// Standard 7-bit I2C address for TAS5825M (Louder-ESP32-Plus).
@@ -243,7 +245,8 @@ pub struct Tas5805mTelemetry {
 pub type Tas58xxTelemetry = Tas5805mTelemetry;
 
 impl Tas5805mTelemetry {
-    /// Decodes `FS_MON` (`0x37` bits `3:0`) into the detected sample rate in Hz.
+    /// Decodes `FS_MON` (`0x37` bits `3:0`) into the detected sample rate
+    /// in Hz.
     #[must_use]
     pub const fn detected_sample_rate_hz(&self) -> u32 {
         self.detected_sample_rate_hz_with_hint(0)
@@ -352,9 +355,55 @@ impl<I2C, STATE> Tas58xx<I2C, STATE> {
     }
 }
 
-impl<I2C, E> Tas58xx<I2C, PowerDown>
+/// Maximum number of I2C NACK retries after `RESET_CTRL` before failing init.
+const POST_RESET_NACK_RETRIES: usize = 5;
+
+impl<I2C, E, STATE> Tas58xx<I2C, STATE>
 where
     I2C: I2c<Error = E>,
+{
+    fn read_faults_raw(&mut self) -> Result<FaultStatus, DriverError<E>> {
+        let mut status = [0u8; 4];
+        self.i2c
+            .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
+            .map_err(DriverError::I2cError)?;
+        Ok(FaultStatus {
+            chan_fault: status[0],
+            global_fault1: status[1],
+            global_fault2: status[2],
+            otw: status[3],
+        })
+    }
+
+    fn read_telemetry_raw(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
+        let mut clk_regs = [0u8; 3];
+        self.i2c
+            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
+            .map_err(DriverError::I2cError)?;
+        let mut automute = [0u8; 1];
+        self.i2c
+            .write_read(self.addr, &[registers::AUTOMUTE_STATE], &mut automute)
+            .map_err(DriverError::I2cError)?;
+
+        Ok(Tas5805mTelemetry {
+            fs_mon: clk_regs[0],
+            bck_mon: clk_regs[1],
+            clkdet_status: clk_regs[2],
+            automute_state: automute[0],
+        })
+    }
+}
+
+/// Error tuple returned by [`Tas58xx::try_init_into_standby`] so callers
+/// retain ownership of the uninitialized driver on I2C failure.
+pub type TryInitError<I2C> = (
+    Tas58xx<I2C, PowerDown>,
+    DriverError<<I2C as embedded_hal::i2c::ErrorType>::Error>,
+);
+
+impl<I2C> Tas58xx<I2C, PowerDown>
+where
+    I2C: I2c,
 {
     /// Creates a driver instance in the uninitialized `PowerDown` state.
     pub fn new(i2c: I2C, addr: u8) -> Self {
@@ -370,9 +419,10 @@ where
     /// Resets the TAS58xx and transitions it into `Standby` mode,
     /// returning `Self` on I2C error so the caller never loses ownership
     /// of the I2C peripheral (PERIPH-604).
-    pub fn try_init_into_standby(
-        mut self,
-    ) -> Result<Tas58xx<I2C, Standby>, (Self, DriverError<E>)> {
+    ///
+    /// Retries bounded I2C NACKs on `DEVICE_CTRL_2` right after `RESET_CTRL`
+    /// while the amplifier completes its internal reset reload.
+    pub fn try_init_into_standby(mut self) -> Result<Tas58xx<I2C, Standby>, TryInitError<I2C>> {
         if let Err(e) = self.i2c.write(self.addr, &[registers::PAGE_SELECT, 0x00]) {
             return Err((self, DriverError::I2cError(e)));
         }
@@ -382,11 +432,23 @@ where
         if let Err(e) = self.i2c.write(self.addr, &[registers::RESET_CTRL, 0x11]) {
             return Err((self, DriverError::I2cError(e)));
         }
-        if let Err(e) = self
-            .i2c
-            .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_STANDBY])
-        {
-            return Err((self, DriverError::I2cError(e)));
+        let mut retries_remaining = POST_RESET_NACK_RETRIES;
+        loop {
+            match self
+                .i2c
+                .write(self.addr, &[registers::DEVICE_CTRL_2, CTRL2_MODE_STANDBY])
+            {
+                Ok(()) => break,
+                Err(e)
+                    if retries_remaining > 0 && matches!(e.kind(), ErrorKind::NoAcknowledge(_)) =>
+                {
+                    retries_remaining -= 1;
+                    for _ in 0..64 {
+                        core::hint::spin_loop();
+                    }
+                }
+                Err(e) => return Err((self, DriverError::I2cError(e))),
+            }
         }
 
         Ok(Tas58xx {
@@ -399,13 +461,15 @@ where
     }
 
     /// Resets the TAS58xx and transitions it into `Standby` mode.
-    /// Selects Book 0 / Page 0, asserts digital/register reset, and enters Standby.
-    pub fn init_into_standby(self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
+    /// Selects Book 0 / Page 0, asserts digital/register reset, and enters
+    /// Standby with bounded post-reset NACK recovery. Prefer
+    /// `try_init_into_standby` when retaining `Self` on persistent error.
+    pub fn init_into_standby(self) -> Result<Tas58xx<I2C, Standby>, DriverError<I2C::Error>> {
         self.try_init_into_standby().map_err(|(_, e)| e)
     }
 
     /// Convenience alias for `init_into_standby`.
-    pub fn init(self) -> Result<Tas58xx<I2C, Standby>, DriverError<E>> {
+    pub fn init(self) -> Result<Tas58xx<I2C, Standby>, DriverError<I2C::Error>> {
         self.init_into_standby()
     }
 }
@@ -440,8 +504,10 @@ where
 
     /// Configures Texas Instruments TAS5805M silicon maximization registers:
     /// 1. Selects Page 0 / Book 0.
-    /// 2. Sets Hybrid-Pro 1SPW modulation, BTL stereo, 384 kHz FSW (`0x02 = 0x02`).
-    /// 3. Sets Class-D L/R out-of-phase PWM to halve PVDD ripple (`0x53 = 0x01`).
+    /// 2. Sets Hybrid-Pro 1SPW modulation, BTL stereo, 384 kHz FSW
+    ///    (`0x02 = 0x02`).
+    /// 3. Sets Class-D L/R out-of-phase PWM to halve PVDD ripple
+    ///    (`0x53 = 0x01`).
     /// 4. Sets analog gain attenuation (`0x54 = again_code.min(0x1F)`).
     /// 5. Configures smooth 0.5 dB ramp rate (`0x4E = 0x00`).
     /// 6. Enables hardware automute (`0x50 = 0x07`).
@@ -466,24 +532,11 @@ where
     /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69.
     pub fn read_telemetry(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
         self.ensure_page0_book0()?;
-        let mut clk_regs = [0u8; 3];
-        self.i2c
-            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
-            .map_err(DriverError::I2cError)?;
-        let mut automute = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::AUTOMUTE_STATE], &mut automute)
-            .map_err(DriverError::I2cError)?;
-
-        Ok(Tas5805mTelemetry {
-            fs_mon: clk_regs[0],
-            bck_mon: clk_regs[1],
-            clkdet_status: clk_regs[2],
-            automute_state: automute[0],
-        })
+        self.read_telemetry_raw()
     }
     /// Configures the I2S audio interface bit depth (16, 20, 24, or 32 bits).
-    /// Bits [1:0] WORD_LENGTH: 00 = 16-bit, 01 = 20-bit, 10 = 24-bit, 11 = 32-bit.
+    /// Bits [1:0] WORD_LENGTH: 00 = 16-bit, 01 = 20-bit, 10 = 24-bit,
+    /// 11 = 32-bit.
     pub fn configure_audio_format(&mut self, word_length_bits: u8) -> Result<(), DriverError<E>> {
         self.ensure_page0_book0()?;
         let val = match word_length_bits {
@@ -493,24 +546,20 @@ where
             32 => 0x03,
             _ => return Err(DriverError::InvalidParameter),
         };
+        let mut sap_ctrl_1 = [0u8; 1];
         self.i2c
-            .write(self.addr, &[registers::SAP_CTRL_1, val])
+            .write_read(self.addr, &[registers::SAP_CTRL_1], &mut sap_ctrl_1)
+            .map_err(DriverError::I2cError)?;
+        let updated = (sap_ctrl_1[0] & !0x03) | val;
+        self.i2c
+            .write(self.addr, &[registers::SAP_CTRL_1, updated])
             .map_err(DriverError::I2cError)
     }
 
     /// Reads hardware fault status registers (0x70..=0x73) during Standby.
     pub fn check_faults(&mut self) -> Result<FaultStatus, DriverError<E>> {
         self.ensure_page0_book0()?;
-        let mut status = [0u8; 4];
-        self.i2c
-            .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
-            .map_err(DriverError::I2cError)?;
-        Ok(FaultStatus {
-            chan_fault: status[0],
-            global_fault1: status[1],
-            global_fault2: status[2],
-            otw: status[3],
-        })
+        self.read_faults_raw()
     }
 
     /// Clears any latched hardware faults.
@@ -528,36 +577,8 @@ where
         &mut self,
     ) -> Result<(FaultStatus, Tas58xxTelemetry), DriverError<E>> {
         self.ensure_page0_book0()?;
-
-        let mut status = [0u8; 4];
-        self.i2c
-            .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
-            .map_err(DriverError::I2cError)?;
-
-        let mut clk_regs = [0u8; 3];
-        self.i2c
-            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
-            .map_err(DriverError::I2cError)?;
-
-        let mut automute = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::AUTOMUTE_STATE], &mut automute)
-            .map_err(DriverError::I2cError)?;
-
-        let faults = FaultStatus {
-            chan_fault: status[0],
-            global_fault1: status[1],
-            global_fault2: status[2],
-            otw: status[3],
-        };
-
-        let telemetry = Tas58xxTelemetry {
-            fs_mon: clk_regs[0],
-            bck_mon: clk_regs[1],
-            clkdet_status: clk_regs[2],
-            automute_state: automute[0],
-        };
-
+        let faults = self.read_faults_raw()?;
+        let telemetry = self.read_telemetry_raw()?;
         Ok((faults, telemetry))
     }
 
@@ -698,7 +719,8 @@ where
         self.try_start_playback_via_hiz().map_err(|(_, e)| e)
     }
 
-    /// Transitions into `Play` mode, returning `Self` on I2C error (PERIPH-604).
+    /// Transitions into `Play` mode, returning `Self` on I2C error
+    /// (PERIPH-604).
     pub fn try_start_playback(mut self) -> Result<Tas58xx<I2C, Play>, (Self, DriverError<E>)> {
         if let Err(e) = self.ensure_page0_book0() {
             return Err((self, e));
@@ -731,8 +753,8 @@ where
         })
     }
 
-    /// Transitions into `Play` mode, activating the Class-D PWM power stage with
-    /// soft-mute unmuting ramp to prevent acoustic pop/thump transients.
+    /// Transitions into `Play` mode, activating the Class-D PWM power stage
+    /// with soft-mute unmuting ramp to prevent acoustic pop/thump transients.
     pub fn start_playback(self) -> Result<Tas58xx<I2C, Play>, DriverError<E>> {
         self.try_start_playback().map_err(|(_, e)| e)
     }
@@ -784,16 +806,7 @@ where
     /// Reads hardware fault status registers (0x70..=0x73) during Play.
     pub fn check_faults(&mut self) -> Result<FaultStatus, DriverError<E>> {
         self.ensure_page0_book0()?;
-        let mut status = [0u8; 4];
-        self.i2c
-            .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
-            .map_err(DriverError::I2cError)?;
-        Ok(FaultStatus {
-            chan_fault: status[0],
-            global_fault1: status[1],
-            global_fault2: status[2],
-            otw: status[3],
-        })
+        self.read_faults_raw()
     }
 
     /// Clears any latched hardware faults during Play.
@@ -804,7 +817,8 @@ where
             .map_err(DriverError::I2cError)
     }
 
-    /// Executes the TI datasheet recovery sequence (PERIPH-603, SLASEH5B §7.4.2):
+    /// Executes the TI datasheet recovery sequence
+    /// (PERIPH-603, SLASEH5B §7.4.2):
     /// 1. Transition `DEVICE_CTRL_2 (0x03)` to `CTRL2_MODE_HIZ (0x02)`.
     /// 2. Clear analog/digital fault latches (`FAULT_CLEAR (0x78) = 0x81`).
     /// 3. Stage through `CTRL2_MODE_PLAY_MUTE (0x0B)`.
@@ -911,8 +925,10 @@ where
 
     /// Configures Texas Instruments TAS5805M silicon maximization registers:
     /// 1. Selects Page 0 / Book 0.
-    /// 2. Sets Hybrid-Pro 1SPW modulation, BTL stereo, 384 kHz FSW (`0x02 = 0x02`).
-    /// 3. Sets Class-D L/R out-of-phase PWM to halve PVDD ripple (`0x53 = 0x01`).
+    /// 2. Sets Hybrid-Pro 1SPW modulation, BTL stereo, 384 kHz FSW
+    ///    (`0x02 = 0x02`).
+    /// 3. Sets Class-D L/R out-of-phase PWM to halve PVDD ripple
+    ///    (`0x53 = 0x01`).
     /// 4. Sets analog gain attenuation (`0x54 = again_code.min(0x1F)`).
     /// 5. Configures smooth 0.5 dB ramp rate (`0x4E = 0x00`).
     /// 6. Enables hardware automute (`0x50 = 0x07`).
@@ -937,21 +953,7 @@ where
     /// Reads live silicon telemetry from registers 0x37..=0x39 and 0x69.
     pub fn read_telemetry(&mut self) -> Result<Tas5805mTelemetry, DriverError<E>> {
         self.ensure_page0_book0()?;
-        let mut clk_regs = [0u8; 3];
-        self.i2c
-            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
-            .map_err(DriverError::I2cError)?;
-        let mut automute = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::AUTOMUTE_STATE], &mut automute)
-            .map_err(DriverError::I2cError)?;
-
-        Ok(Tas5805mTelemetry {
-            fs_mon: clk_regs[0],
-            bck_mon: clk_regs[1],
-            clkdet_status: clk_regs[2],
-            automute_state: automute[0],
-        })
+        self.read_telemetry_raw()
     }
 
     /// Checks fault status registers (0x70..=0x73) and reads silicon telemetry
@@ -961,36 +963,8 @@ where
         &mut self,
     ) -> Result<(FaultStatus, Tas5805mTelemetry), DriverError<E>> {
         self.ensure_page0_book0()?;
-
-        let mut status = [0u8; 4];
-        self.i2c
-            .write_read(self.addr, &[registers::CHAN_FAULT], &mut status)
-            .map_err(DriverError::I2cError)?;
-
-        let mut clk_regs = [0u8; 3];
-        self.i2c
-            .write_read(self.addr, &[registers::FS_MON], &mut clk_regs)
-            .map_err(DriverError::I2cError)?;
-
-        let mut automute = [0u8; 1];
-        self.i2c
-            .write_read(self.addr, &[registers::AUTOMUTE_STATE], &mut automute)
-            .map_err(DriverError::I2cError)?;
-
-        let faults = FaultStatus {
-            chan_fault: status[0],
-            global_fault1: status[1],
-            global_fault2: status[2],
-            otw: status[3],
-        };
-
-        let telemetry = Tas5805mTelemetry {
-            fs_mon: clk_regs[0],
-            bck_mon: clk_regs[1],
-            clkdet_status: clk_regs[2],
-            automute_state: automute[0],
-        };
-
+        let faults = self.read_faults_raw()?;
+        let telemetry = self.read_telemetry_raw()?;
         Ok((faults, telemetry))
     }
 }
@@ -1033,7 +1007,8 @@ mod tests {
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
-            // 32-bit I2S (bits [1:0] = 11)
+            // 32-bit I2S (bits [1:0] = 11 via read-modify-write)
+            I2cTrans::write_read(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1, 0x03]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::FAULT_CLEAR, 0x80]),
             I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x0B]),
@@ -1081,7 +1056,8 @@ mod tests {
         let expectations = [I2cTrans::write_read(
             DEFAULT_I2C_ADDR,
             vec![registers::CHAN_FAULT],
-            vec![0x00, 0x00, 0x01, 0x00], // global_fault2 bit 0 = OTSD (overtemperature)
+            // global_fault2 bit 0 = OTSD (overtemperature)
+            vec![0x00, 0x00, 0x01, 0x00],
         )];
         let mut i2c = I2cMock::new(&expectations);
 
@@ -1420,7 +1396,8 @@ mod tests {
     #[test]
     fn test_select_book_page_writes_page_zero_before_book() {
         let expectations = [
-            // Standby call: PAGE_SELECT 0x00 -> BOOK_SELECT 0x8C -> PAGE_SELECT 0x2A
+            // Standby call:
+            // PAGE_SELECT 0x00 -> BOOK_SELECT 0x8C -> PAGE_SELECT 0x2A
             I2cTrans::write(
                 TAS5805M_I2C_ADDR_DEFAULT,
                 vec![registers::PAGE_SELECT, 0x00],
@@ -1433,7 +1410,8 @@ mod tests {
                 TAS5805M_I2C_ADDR_DEFAULT,
                 vec![registers::PAGE_SELECT, 0x2A],
             ),
-            // Play call: PAGE_SELECT 0x00 -> BOOK_SELECT 0x00 -> PAGE_SELECT 0x00
+            // Play call:
+            // PAGE_SELECT 0x00 -> BOOK_SELECT 0x00 -> PAGE_SELECT 0x00
             I2cTrans::write(
                 TAS5805M_I2C_ADDR_DEFAULT,
                 vec![registers::PAGE_SELECT, 0x00],
@@ -1934,5 +1912,101 @@ mod tests {
         f.global_fault2 = 0x02; // legacy OTSD test bit
         assert!(f.has_overtemp_shutdown());
         assert!(f.has_overtemperature());
+    }
+
+    #[test]
+    fn test_try_init_into_standby_retries_post_reset_nack_and_succeeds() {
+        use embedded_hal::i2c::NoAcknowledgeSource;
+
+        let expectations = [
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01])
+                .with_error(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Data)),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01])
+                .with_error(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address)),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let driver = Tas58xx::new(&mut i2c, DEFAULT_I2C_ADDR);
+        let _standby = driver.init_into_standby().unwrap();
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_try_init_into_standby_returns_self_on_nack_exhaustion() {
+        use embedded_hal::i2c::NoAcknowledgeSource;
+
+        let mut expectations = vec![
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
+        ];
+        for _ in 0..=POST_RESET_NACK_RETRIES {
+            expectations.push(
+                I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01])
+                    .with_error(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Data)),
+            );
+        }
+        let mut i2c = I2cMock::new(&expectations);
+
+        let driver = Tas58xx::new(&mut i2c, DEFAULT_I2C_ADDR);
+        let (returned, err) = driver.try_init_into_standby().err().unwrap();
+        assert!(matches!(err, DriverError::I2cError(_)));
+        assert_eq!(returned.address(), DEFAULT_I2C_ADDR);
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_try_init_into_standby_does_not_retry_non_nack_errors() {
+        let expectations = [
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::PAGE_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::BOOK_SELECT, 0x00]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::RESET_CTRL, 0x11]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::DEVICE_CTRL_2, 0x01])
+                .with_error(ErrorKind::Other),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let driver = Tas58xx::new(&mut i2c, DEFAULT_I2C_ADDR);
+        let (returned, err) = driver.try_init_into_standby().err().unwrap();
+        assert!(matches!(err, DriverError::I2cError(_)));
+        assert_eq!(returned.address(), DEFAULT_I2C_ADDR);
+
+        i2c.done();
+    }
+
+    #[test]
+    fn test_configure_audio_format_preserves_upper_sap_ctrl1_bits() {
+        let expectations = [
+            // Preserve upper bits 0x34 -> set 24-bit (0x02) -> 0x36
+            I2cTrans::write_read(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1], vec![0x34]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1, 0x36]),
+            // Preserve upper bits 0xFF -> set 16-bit (0x00) -> 0xFC
+            I2cTrans::write_read(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1], vec![0xFF]),
+            I2cTrans::write(DEFAULT_I2C_ADDR, vec![registers::SAP_CTRL_1, 0xFC]),
+        ];
+        let mut i2c = I2cMock::new(&expectations);
+
+        let mut standby = Tas58xx {
+            i2c: &mut i2c,
+            addr: DEFAULT_I2C_ADDR,
+            current_book: 0,
+            current_page: 0,
+            _state: PhantomData::<Standby>,
+        };
+
+        standby.configure_audio_format(24).unwrap();
+        standby.configure_audio_format(16).unwrap();
+        assert_eq!(
+            standby.configure_audio_format(18),
+            Err(DriverError::InvalidParameter)
+        );
+
+        i2c.done();
     }
 }

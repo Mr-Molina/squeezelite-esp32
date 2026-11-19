@@ -119,12 +119,14 @@ impl CydDisplayLink {
         Ok(buf)
     }
 
-    /// Enqueue touch command in C-firmware NDJSON format for transmission to host.
+    /// Enqueue a touch command in C-firmware NDJSON format for host
+    /// transmission.
     pub fn send_json_command(&mut self, cmd: CydCommand) -> Result<Vec<u8, 64>, LinkError> {
         let mut raw = [0u8; 64];
         let len = CydLinkProtocol::encode_json_command(&cmd, &mut raw)?;
+        let slice = raw.get(..len).ok_or(LinkError::BufferOverflow)?;
         let mut buf = Vec::new();
-        buf.extend_from_slice(&raw[..len])
+        buf.extend_from_slice(slice)
             .map_err(|_| LinkError::BufferOverflow)?;
         if self.tx_queue.is_full() {
             let _ = self.tx_queue.pop_front();
@@ -135,8 +137,8 @@ impl CydDisplayLink {
 
     /// Feed raw bytes received from UART into the line accumulator.
     ///
-    /// Strips `\r`, accumulates up to 256 bytes, handles overflow discard recovery,
-    /// and parses full frames terminated by `\n`.
+    /// Strips `\r`, accumulates up to 256 bytes, handles overflow discard
+    /// recovery, and parses full frames terminated by `\n`.
     /// Returns the number of events parsed and applied.
     pub fn feed_rx_bytes(&mut self, bytes: &[u8], now_us: i64) -> usize {
         let now_us = now_us.max(0);
@@ -211,7 +213,8 @@ impl CydDisplayLink {
                         }
                     } else {
                         self.state.artist = artist;
-                        // Preserve existing album on NDJSON TrackMetadata (AUD12-006)
+                        // Preserve existing album on NDJSON TrackMetadata
+                        // (AUD12-006).
                         self.state.title = title;
                     }
                 }
@@ -233,13 +236,13 @@ impl CydDisplayLink {
         }
 
         // 2. Try JSON line event parsing for legacy test & host compatibility
-        if self.rx_line.starts_with(b"{") {
-            if let Ok(line_str) = core::str::from_utf8(&self.rx_line) {
-                if parse_json_event(line_str, &mut self.state).is_ok() {
-                    self.state.link_active = true;
-                    self.last_rx_time_us = now_us;
-                    return true;
-                }
+        if let Ok(line_str) = core::str::from_utf8(&self.rx_line) {
+            if line_str.trim_start().starts_with('{')
+                && parse_json_event(line_str, &mut self.state).is_ok()
+            {
+                self.state.link_active = true;
+                self.last_rx_time_us = now_us;
+                return true;
             }
         }
 
@@ -249,8 +252,8 @@ impl CydDisplayLink {
 
     /// Periodic heartbeat and connection liveness monitor.
     ///
-    /// - If link is active: checks for timeout (> 5s since last RX). If timed out,
-    ///   marks link inactive and transmits `CMD=STATUS\n`.
+    /// - If link is active: checks for timeout (> 5s since last RX). If timed
+    ///   out, marks link inactive and transmits `CMD=STATUS\n`.
     /// - If link is inactive: periodically transmits `CMD=STATUS\n` every 3s.
     pub fn poll_heartbeat(&mut self, now_us: i64) -> Option<Vec<u8, 64>> {
         let now_us = now_us.max(0);
@@ -320,10 +323,10 @@ pub fn parse_json_event(json_str: &str, state: &mut CydTelemetryState) -> Result
                 };
             }
             if let Some(el) = extract_json_int(trimmed, "elapsed") {
-                state.elapsed_secs = el.max(0) as u32;
+                state.elapsed_secs = el.clamp(0, i64::from(u32::MAX)) as u32;
             }
             if let Some(dur) = extract_json_int(trimmed, "duration") {
-                state.duration_secs = dur.max(0) as u32;
+                state.duration_secs = dur.clamp(0, i64::from(u32::MAX)) as u32;
             }
             if let Some(v) = extract_json_int(trimmed, "vol") {
                 state.vol = v.clamp(0, 100) as u8;
@@ -362,18 +365,19 @@ pub fn format_command(cmd: &str, val: i32) -> Option<Vec<u8, 64>> {
     let mut out = Vec::new();
     match cmd {
         "toggle" | "play" | "pause" | "next" | "prev" | "sync" => {
-            let _ = writeln!(out, "{{\"cmd\":\"{}\"}}", cmd);
+            writeln!(out, "{{\"cmd\":\"{}\"}}", cmd).ok()?;
             Some(out)
         }
         "vol" => {
             if !(0..=100).contains(&val) {
                 return None;
             }
-            let _ = writeln!(out, "{{\"cmd\":\"vol\",\"val\":{}}}", val);
+            writeln!(out, "{{\"cmd\":\"vol\",\"val\":{}}}", val).ok()?;
             Some(out)
         }
         "vol_step" => {
-            let _ = writeln!(out, "{{\"cmd\":\"vol_step\",\"dir\":{}}}", val);
+            let dir = i8::try_from(val).ok()?;
+            writeln!(out, "{{\"cmd\":\"vol_step\",\"dir\":{}}}", dir).ok()?;
             Some(out)
         }
         _ => None,
@@ -680,7 +684,7 @@ mod tests {
     fn test_uart_heartbeat_and_timeout_resync() {
         let mut link = CydDisplayLink::new();
 
-        // 1. Initial state: link inactive. Polling at t=0 transmits sync command
+        // 1. Initial state: link inactive. Polling at t=0 transmits sync.
         let cmd = link.poll_heartbeat(0);
         assert_eq!(cmd.as_deref(), Some(&b"CMD=STATUS\n"[..]));
         assert!(!link.state.link_active);
@@ -701,7 +705,7 @@ mod tests {
         assert!(link.poll_heartbeat(7_000_000).is_none());
         assert!(link.state.link_active);
 
-        // 6. Polling at t=8.6s (5.1s elapsed > 5s timeout): link becomes inactive!
+        // 6. Polling at t=8.6s (5.1s > 5s timeout): link becomes inactive.
         let cmd = link.poll_heartbeat(8_600_000);
         assert!(!link.state.link_active);
         assert_eq!(cmd.as_deref(), Some(&b"CMD=STATUS\n"[..]));
@@ -748,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_json_unescaping_and_exact_key_matching() {
-        // COMMS-308: unescape \", \\, \/, \n, \t and stop only at unescaped quote
+        // COMMS-308: unescape \", \\, \/, \n, \t and stop at unescaped quote.
         let mut state = CydTelemetryState::default();
         let line = concat!(
             "{\"event\":\"meta\",",
@@ -811,5 +815,45 @@ mod tests {
         assert_eq!(link.last_sync_time_us, -1);
         assert!(link.tx_queue.is_empty());
         assert!(!link.state.link_active);
+    }
+
+    #[test]
+    fn test_remediation_clamping_vol_step_and_whitespace_json() {
+        // LOGIC-035: values above u32::MAX saturate instead of wrapping.
+        let mut state = CydTelemetryState::default();
+        let line = concat!(
+            "{\"event\":\"status\",\"state\":\"play\",",
+            "\"elapsed\":4294967296,\"duration\":9999999999,\"vol\":50}\n"
+        );
+        assert!(parse_json_event(line, &mut state).is_ok());
+        assert_eq!(state.elapsed_secs, u32::MAX);
+        assert_eq!(state.duration_secs, u32::MAX);
+
+        // LOGIC-045: vol_step validates i8 range (-128..=127).
+        assert_eq!(
+            &format_command("vol_step", -128).unwrap()[..],
+            b"{\"cmd\":\"vol_step\",\"dir\":-128}\n"
+        );
+        assert_eq!(
+            &format_command("vol_step", 127).unwrap()[..],
+            b"{\"cmd\":\"vol_step\",\"dir\":127}\n"
+        );
+        assert!(format_command("vol_step", -129).is_none());
+        assert!(format_command("vol_step", 128).is_none());
+        assert!(format_command("vol_step", i32::MIN).is_none());
+        assert!(format_command("vol_step", i32::MAX).is_none());
+
+        // LOGIC-046: leading ASCII whitespace does not break JSON fallback.
+        let mut link = CydDisplayLink::new();
+        let spaced = b"  \t{\"event\":\"meta\",\"title\":\"Spaced\"}\n";
+        assert_eq!(link.feed_rx_bytes(spaced, 500), 1);
+        assert_eq!(link.parse_error_count, 0);
+        assert_eq!(link.state.title.as_str(), "Spaced");
+
+        // QA-008: send_json_command handles VolumeStep without slice panic.
+        let step_frame = link
+            .send_json_command(CydCommand::VolumeStep { delta: -3 })
+            .unwrap();
+        assert_eq!(&step_frame[..], b"{\"cmd\":\"vol_step\",\"delta\":-3}\n");
     }
 }

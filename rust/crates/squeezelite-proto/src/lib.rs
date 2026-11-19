@@ -14,7 +14,7 @@ use core::fmt;
 /// Errors encountered during SlimProto packet parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
-    /// Buffer does not contain enough bytes to read the frame header or payload.
+    /// Buffer lacks enough bytes to read the frame header or payload.
     BufferTooShort,
     /// Packet length exceeds allowable bounded buffer size.
     PayloadTooLarge,
@@ -971,7 +971,8 @@ impl SlimprotoBuilder {
         out[0..4].copy_from_slice(b"STAT");
         out[4..8].copy_from_slice(&(STAT_PAYLOAD_SIZE as u32).to_be_bytes());
 
-        // Payload (53 bytes, offsets relative to frame start = 8 + payload_offset)
+        // Payload (53 bytes, offsets relative to frame start =
+        // 8 + payload_offset)
         out[8..12].copy_from_slice(&report.event.opcode_bytes());
         out[12] = 0; // num_crlf
         out[13] = 0; // mas_initialized
@@ -1243,7 +1244,8 @@ pub struct DiscoveredServer {
 pub struct DiscoveryBuilder;
 
 impl DiscoveryBuilder {
-    /// Formats the standard LMS UDP discovery query payload: `b"eJSON\0CLIP\0"`.
+    /// Formats the standard LMS UDP discovery query payload:
+    /// `b"eJSON\0CLIP\0"`.
     pub fn build_query(out: &mut [u8]) -> Result<usize, ParseError> {
         const QUERY: &[u8] = b"eJSON\0CLIP\0";
         if out.len() < QUERY.len() {
@@ -2074,7 +2076,8 @@ mod tests {
             u64::from_be_bytes(frame[23..31].try_into().unwrap()),
             bytes_received
         );
-        // elapsed_seconds at frame[45..49] (payload[37..41]) = 192000 / 96000 = 2
+        // elapsed_seconds at frame[45..49] (payload[37..41]) =
+        // 192000 / 96000 = 2
         assert_eq!(u32::from_be_bytes(frame[45..49].try_into().unwrap()), 2);
         // elapsed_ms at frame[51..55] (payload[43..47]) = 192000 * 1000 / 96000
         // = 2000
@@ -2236,7 +2239,8 @@ mod tests {
         assert_eq!(&buf[8..12], &654_321u32.to_be_bytes());
         assert_eq!(&buf[12..16], &0x0000_002Au32.to_be_bytes());
 
-        // Release: pressed = false -> raw_code = (button_code as u32) | 0x0001_0000
+        // Release: pressed = false ->
+        // raw_code = (button_code as u32) | 0x0001_0000
         let len_rel = SlimprotoBuilder::build_butn(654_400, 0x002A, false, &mut buf).unwrap();
         assert_eq!(len_rel, 16);
         assert_eq!(&buf[0..4], b"BUTN");

@@ -2949,16 +2949,6 @@ fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> 
     if audio_object_type > 5 {
         return Err(DecoderError::UnsupportedFeature);
     }
-    if audio_object_type == 5 {
-        let ext_freq_idx = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)?;
-        if ext_freq_idx == 0x0F {
-            let _ = reader.read_bits(24).ok_or(DecoderError::InvalidHeader)?;
-        }
-        let base_aot = reader.read_bits(5).ok_or(DecoderError::InvalidHeader)?;
-        if base_aot == 0 || base_aot > 4 {
-            return Err(DecoderError::UnsupportedFeature);
-        }
-    }
     let freq_idx = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)?;
     let (sample_rate, sampling_frequency_index) = if freq_idx == 0x0F {
         let sr = reader.read_bits(24).ok_or(DecoderError::InvalidHeader)?;
@@ -2980,11 +2970,20 @@ fn decode_asc_bytes(asc: &[u8]) -> Result<AacAudioSpecificConfig, DecoderError> 
     if channel_configuration != 1 && channel_configuration != 2 {
         return Err(DecoderError::UnsupportedFeature);
     }
-    let adts_profile = if audio_object_type == 5 {
-        1
+    let base_aot = if audio_object_type == 5 {
+        let ext_freq_idx = reader.read_bits(4).ok_or(DecoderError::InvalidHeader)?;
+        if ext_freq_idx == 0x0F {
+            let _ = reader.read_bits(24).ok_or(DecoderError::InvalidHeader)?;
+        }
+        let ext_base_aot = reader.read_bits(5).ok_or(DecoderError::InvalidHeader)?;
+        if ext_base_aot == 0 || ext_base_aot > 4 {
+            return Err(DecoderError::UnsupportedFeature);
+        }
+        ext_base_aot
     } else {
-        ((audio_object_type.saturating_sub(1)) & 0x03) as u8
+        audio_object_type
     };
+    let adts_profile = ((base_aot.saturating_sub(1)) & 0x03) as u8;
     Ok(AacAudioSpecificConfig {
         audio_object_type: audio_object_type as u8,
         adts_profile,
@@ -5294,8 +5293,9 @@ mod tests {
         assert_eq!(cfg.channel_configuration, 2);
         assert_eq!(cfg.adts_profile, 1);
 
-        // 2. Explicit SBR (AOT 5): AOT=5, ext_freq_idx=4, base_aot=2, freq_idx=4, ch=2
-        let asc_sbr = [0x2A, 0x09, 0x08];
+        // 2. Explicit SBR (AOT 5): AOT=5, freq_idx=4, ch=2, ext_freq_idx=4,
+        //    base_aot=2 (ISO/IEC 14496-3 bit order).
+        let asc_sbr = [0x2A, 0x12, 0x08];
         let cfg_sbr = decode_asc_bytes(&asc_sbr).unwrap();
         assert_eq!(cfg_sbr.audio_object_type, 5);
         assert_eq!(cfg_sbr.sample_rate, 44100);
@@ -5303,15 +5303,15 @@ mod tests {
         assert_eq!(cfg_sbr.channel_configuration, 2);
         assert_eq!(cfg_sbr.adts_profile, 1);
 
-        // 3. HE-AAC with explicit 24-bit extension frequency (0x0F)
+        // 3. HE-AAC with explicit 24-bit extension frequency (0x0F).
         let mut asc_bits = [0u8; 8];
         let vals: &[(u32, usize)] = &[
             (5, 5),      // AOT 5 (SBR)
+            (4, 4),      // samplingFrequencyIndex = 4 (44100 Hz)
+            (2, 4),      // channelConfiguration = 2 (stereo)
             (15, 4),     // extensionSamplingFrequencyIndex = 15
             (48000, 24), // 24-bit extension frequency
             (2, 5),      // base audioObjectType = 2 (AAC-LC)
-            (4, 4),      // samplingFrequencyIndex = 4 (44100 Hz)
-            (2, 4),      // channelConfiguration = 2 (stereo)
         ];
         let mut bit_pos = 0;
         for &(val, n) in vals {
@@ -5328,6 +5328,52 @@ mod tests {
         assert_eq!(cfg_sbr_24.audio_object_type, 5);
         assert_eq!(cfg_sbr_24.sample_rate, 44100);
         assert_eq!(cfg_sbr_24.channel_configuration, 2);
+        assert_eq!(cfg_sbr_24.adts_profile, 1);
+    }
+
+    #[test]
+    fn test_decode_asc_bytes_he_aac_sbr_iso_bit_order() {
+        // HE-AAC v1: AOT=5, core freq_idx=7 (22050 Hz), ch=2,
+        // ext_freq_idx=4 (44100 Hz), base_aot=2 -> 0x2B, 0x92, 0x08.
+        let he_aac = [0x2B, 0x92, 0x08];
+        let cfg = decode_asc_bytes(&he_aac).unwrap();
+        assert_eq!(cfg.audio_object_type, 5);
+        assert_eq!(cfg.sampling_frequency_index, 7);
+        assert_eq!(cfg.sample_rate, 22050);
+        assert_eq!(cfg.channel_configuration, 2);
+        assert_eq!(cfg.adts_profile, 1);
+
+        // Verify base_aot drives adts_profile (base_aot=1 -> profile 0) and
+        // explicit 24-bit core frequency precedes AOT=5 extension fields.
+        let mut bits = [0u8; 8];
+        let fields: &[(u32, usize)] = &[
+            (5, 5),      // AOT 5 (SBR)
+            (15, 4),     // samplingFrequencyIndex = 15 (explicit)
+            (22050, 24), // 24-bit core sample rate
+            (1, 4),      // channelConfiguration = 1 (mono)
+            (4, 4),      // extensionSamplingFrequencyIndex = 4 (44100 Hz)
+            (1, 5),      // base audioObjectType = 1 (AAC-Main)
+        ];
+        let mut pos = 0;
+        for &(val, width) in fields {
+            for shift in (0..width).rev() {
+                let bit = ((val >> shift) & 1) as u8;
+                bits[pos / 8] |= bit << (7 - (pos % 8));
+                pos += 1;
+            }
+        }
+        let cfg_main = decode_asc_bytes(&bits[..pos.div_ceil(8)]).unwrap();
+        assert_eq!(cfg_main.audio_object_type, 5);
+        assert_eq!(cfg_main.sampling_frequency_index, 7);
+        assert_eq!(cfg_main.sample_rate, 22050);
+        assert_eq!(cfg_main.channel_configuration, 1);
+        assert_eq!(cfg_main.adts_profile, 0);
+
+        // Truncated SBR header missing base_aot must fail with InvalidHeader.
+        assert_eq!(
+            decode_asc_bytes(&[0x2B, 0x92]),
+            Err(DecoderError::InvalidHeader)
+        );
     }
 
     #[test]

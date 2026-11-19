@@ -43,8 +43,6 @@ try:
     import argparse
     import collections
     import copy
-    import enum
-    import glob
     import uuid
 
     import json
@@ -54,23 +52,12 @@ try:
     import tempfile
     import zipfile
     from ast import literal_eval
-    from collections import namedtuple
     from datetime import datetime, timedelta, timezone
-    from json import JSONDecoder
-    from operator import contains
-    from platform import platform, release
-    from pydoc import describe
-    from time import strftime
-    from typing import OrderedDict
-    from urllib import response
     from urllib.parse import urlparse
-    from urllib.request import Request
-    from webbrowser import get
 
     import pygit2
-    from pygit2 import Commit, Repository, GitError, Reference, UserPass, Index, Signature, RemoteCallbacks, Remote
+    from pygit2 import Commit, Repository, GitError, Reference, Index, Signature, RemoteCallbacks, Remote
     import requests
-    from genericpath import isdir
 
 except ImportError as ex:
     Logger.error(
@@ -79,7 +66,7 @@ except ImportError as ex:
     installed_packages_list = sorted(
         ["%s==%s" % (i.key, i.version) for i in installed_packages])
     print(Logger.NEWLINE_CHAR.join(installed_packages_list))
-    print(f'Environment: ')
+    print('Environment: ')
     raise
 
 tool_version = "1.0.7"
@@ -313,7 +300,7 @@ class BinFile():
             os.makedirs(target_folder, exist_ok=True)
             shutil.copyfile(self.source_full_path,
                             self.target_fullpath, follow_symlinks=True)
-        except Exception as ex:
+        except Exception:
             Logger.error(f"Error while copying {self.source_full_path} to {self.target_fullpath}{Logger.NEWLINE_CHAR}Content of {os.path.dirname(self.source_full_path.rstrip())}:{Logger.NEWLINE_CHAR}{Logger.NEWLINE_CHAR.join(get_file_list(os.path.dirname(self.source_full_path.rstrip())))}")
             
                 
@@ -395,7 +382,7 @@ class PlatformRelease():
         flash_parms_file = os.path.relpath(
             os.path.join(self.tempfolder, self.flash_file_path.lstrip(r'\/')))
         line: str
-        with open(flash_parms_file) as fin:
+        with open(flash_parms_file, encoding="utf-8") as fin:
             for line in fin:
                 components = line.split()
                 if len(components) == 2:
@@ -442,7 +429,7 @@ class Releases():
 
     def count(self, value: PlatformRelease) -> int:
         content = self._dict.get(value.platform())
-        if content == None:
+        if content is None:
             return 0
         return len(content)
 
@@ -518,7 +505,6 @@ class Releases():
 
         head: Reference = loc_repo.head
         target = head.target
-        ref: Reference
         if cls.last_commit is None:
             try:
                 cls.last_commit = loc_repo[target]
@@ -550,7 +536,7 @@ class Releases():
 
     @classmethod
     def get_branch_name(cls) -> str:
-        return re.sub('[^a-zA-Z0-9\-~!@_\.]', '', cls.load_repository().head.shorthand)
+        return re.sub(r'[^a-zA-Z0-9\-~!@_\.]', '', cls.load_repository().head.shorthand)
 
     @classmethod
     def get_release_branch(cls, repo: Repository, platform_release) -> str:
@@ -624,16 +610,16 @@ class Releases():
         folder: str = os.path.abspath(os.path.dirname(fname))
         print(f'Opening changelog file {fname} from {folder}')
         try:
-            with open(fname) as f:
+            with open(fname, encoding="utf-8") as f:
                 content = f.read()
                 Logger.debug(f'Change Log:\n{content}')
                 return f'<<~EOD\n{content}\n~EOD'
-        except Exception as ex:
+        except Exception:
             Logger.error(
                 f"Unable to load change log file content. Content of {folder}:{Logger.NEWLINE_CHAR.join(get_file_list(folder))}")
             raise
 
-        return f'<<~EOD\n### Revision Log\n\n~EOD'
+        return '<<~EOD\n### Revision Log\n\n~EOD'
 
     def update(self, *args, **kwargs):
         if args:
@@ -662,13 +648,13 @@ def parse_json(filename: str):
     folder: str = os.path.abspath(os.path.dirname(filename))
     print(f'Opening json file {fname} from {folder}')
     try:
-        with open(fname) as f:
+        with open(fname, encoding="utf-8") as f:
             content = f.read()
             Logger.debug(f'Loading json\n{content}')
             return json.loads(content)
-    except JSONDecodeError as ex:
+    except JSONDecodeError:
         Logger.error(f'Error parsing {content}')
-    except Exception as ex:
+    except Exception:
         Logger.error(
             f"Unable to parse flasher args json file. Content of {folder}:{Logger.NEWLINE_CHAR.join(get_file_list(folder))}")
         raise
@@ -678,9 +664,9 @@ def write_github_env_file(values,env_file):
     env_file_stream = None
     if env_file is not None:
         print(f'Writing content to {env_file}...')
-        env_file_stream = open(env_file,  "w")
+        env_file_stream = open(env_file, "w", encoding="utf-8")
     else:
-        print(f'Writing content to console...')
+        print('Writing content to console...')
         env_file_stream = sys.stdout
     for attr in [attr for attr in dir(values) if not attr.startswith('_')]:
         val = str(getattr(values, attr))
@@ -705,7 +691,7 @@ def write_github_env_file(values,env_file):
         print(f'Done writing to {env_file}!')
         env_file_stream.close()
     else:
-        print(f'Done Writing content to console...')
+        print('Done Writing content to console...')
 
 
 
@@ -733,9 +719,9 @@ def write_version_number(file_path:str,env_details):
     #     echo "${app_name}">version.txt
     try:
         version:str = f'{env_details.TARGET_BUILD_NAME}.{env_details.DEPTH}.{env_details.major}.{env_details.BUILD_NUMBER}.{env_details.branch_name}'
-        with open(file_path,  "w") as version_file:
+        with open(file_path, "w", encoding="utf-8") as version_file:
             version_file.write(version)
-    except Exception as ex:
+    except Exception:
         Logger.error(f'Unable to set version string {version} in file {file_path}')
         raise Exception('Version error')
     Logger.notice(f'Firmware version set to {version}')
@@ -775,7 +761,7 @@ def handle_environment(args):
 
 def handle_artifacts(args):
     set_workdir(args)
-    print(f'Handling artifacts')
+    print('Handling artifacts')
     for attr in artifacts_formats:
         target: str = os.path.relpath(attr[1].replace(artifacts_formats_outdir, args.outdir).replace(
             artifacts_formats_prefix, format_artifact_name()))
@@ -785,7 +771,7 @@ def handle_artifacts(args):
         try:
             os.makedirs(target_dir, exist_ok=True)
             shutil.copyfile(source, target, follow_symlinks=True)
-        except Exception as ex:
+        except Exception:
             Logger.error(f"Error while copying {source} to {target}\nContent of {target_dir}:\n{Logger.NEWLINE_CHAR.join(get_file_list(os.path.dirname(attr[0].rstrip())))}")
             raise
 
@@ -845,7 +831,7 @@ def get_recursive_list(path) -> list:
 
 def handle_manifest(args):
     set_workdir(args)
-    print(f'Creating the web installer manifest')
+    print('Creating the web installer manifest')
     outdir: str = os.path.relpath(args.outdir)
     if not os.path.exists(outdir):
         print(f'Creating target folder {outdir}')
@@ -864,12 +850,12 @@ def handle_manifest(args):
         Logger.debug(f'Generated manifest: \n{json.dumps(man)}')
         fullpath = os.path.join(args.outdir, release.get_manifest_name())
         print(f'Writing manifest to {fullpath}')
-        with open(fullpath, "w") as f:
+        with open(fullpath, "w", encoding="utf-8") as f:
             json.dump(man, f, indent=4)
         release.cleanup()
     mainmanifest = os.path.join(args.outdir, args.manif_name)
     print(f'Writing main manifest {mainmanifest}')
-    with open(mainmanifest, 'w') as f:
+    with open(mainmanifest, 'w', encoding="utf-8") as f:
         json.dump(releases.get_attributes(), f, indent=4)
 
 
@@ -919,7 +905,7 @@ def push_with_method(auth_method:str,token:str,remote: Remote,reference):
 
 def push_if_change(repo: Repository, token: str, source_path: str, manif_json):
     if is_dirty(repo):
-        print(f'Changes found. Preparing commit')
+        print('Changes found. Preparing commit')
         index: Index = repo.index
         index.add_all()
         index.write()
@@ -941,7 +927,7 @@ def push_if_change(repo: Repository, token: str, source_path: str, manif_json):
         raise Exception('Unable to push web installer.')    
 
     else:
-        print(f'WARNING: No change found. Skipping update')
+        print('WARNING: No change found. Skipping update')
 
 
 def update_files(target_artifacts: str, manif_json, source: str):
@@ -1037,7 +1023,7 @@ def main():
     else:
         # No subcommand was provided, so call help
         parser.print_usage()
-    print(f'::endgroup::')
+    print('::endgroup::')
     sys.exit(exit_result_code)
 
 

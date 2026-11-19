@@ -408,6 +408,72 @@ fn copy_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, LinkError> {
     Ok(src.len())
 }
 
+fn find_json_string_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn is_single_json_object(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'{' || bytes[bytes.len() - 1] != b'}' {
+        return false;
+    }
+
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut brace_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_quotes = true;
+                escaped = false;
+            }
+            b'{' => brace_depth = brace_depth.saturating_add(1),
+            b'}' => {
+                if brace_depth == 0 {
+                    return false;
+                }
+                brace_depth -= 1;
+                if brace_depth == 0 && (bracket_depth != 0 || i + 1 != bytes.len()) {
+                    return false;
+                }
+            }
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => {
+                if bracket_depth == 0 {
+                    return false;
+                }
+                bracket_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    !in_quotes && brace_depth == 0 && bracket_depth == 0
+}
+
 fn find_json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let bytes = json.as_bytes();
     let k_bytes = key.as_bytes();
@@ -415,6 +481,8 @@ fn find_json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 
     let mut in_quotes = false;
     let mut escaped = false;
+    let mut brace_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -428,37 +496,75 @@ fn find_json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                 in_quotes = false;
             }
             i += 1;
-        } else if b == b'"' {
-            // Outside string quotes: check if this quote starts `"key":`
-            if i + pat_len <= bytes.len()
-                && &bytes[i + 1..i + 1 + k_bytes.len()] == k_bytes
-                && bytes[i + 1 + k_bytes.len()] == b'"'
-            {
-                // Check if followed by optional whitespace and ':'
-                let mut colon_idx = i + pat_len;
-                while colon_idx < bytes.len() && bytes[colon_idx].is_ascii_whitespace() {
-                    colon_idx += 1;
+        } else {
+            match b {
+                b'{' => {
+                    brace_depth = brace_depth.saturating_add(1);
+                    i += 1;
                 }
-                if colon_idx < bytes.len() && bytes[colon_idx] == b':' {
-                    let after_colon = &json[colon_idx + 1..];
-                    return Some(after_colon.trim_start());
+                b'}' => {
+                    if brace_depth == 0 {
+                        return None;
+                    }
+                    brace_depth -= 1;
+                    i += 1;
+                }
+                b'[' => {
+                    bracket_depth = bracket_depth.saturating_add(1);
+                    i += 1;
+                }
+                b']' => {
+                    if bracket_depth == 0 {
+                        return None;
+                    }
+                    bracket_depth -= 1;
+                    i += 1;
+                }
+                b'"' => {
+                    // Outside string quotes: match `"key":` only at top level.
+                    if brace_depth == 1
+                        && bracket_depth == 0
+                        && i + pat_len <= bytes.len()
+                        && &bytes[i + 1..i + 1 + k_bytes.len()] == k_bytes
+                        && bytes[i + 1 + k_bytes.len()] == b'"'
+                    {
+                        // Check if followed by optional whitespace and ':'.
+                        let mut colon_idx = i + pat_len;
+                        while colon_idx < bytes.len() && bytes[colon_idx].is_ascii_whitespace() {
+                            colon_idx += 1;
+                        }
+                        if colon_idx < bytes.len() && bytes[colon_idx] == b':' {
+                            let after_colon = &json[colon_idx + 1..];
+                            return Some(after_colon.trim_start());
+                        }
+                    }
+                    // Entered a string property or string value.
+                    in_quotes = true;
+                    escaped = false;
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
                 }
             }
-            // Entered a string property or string value
-            in_quotes = true;
-            escaped = false;
-            i += 1;
-        } else {
-            i += 1;
         }
     }
     None
 }
 
 fn parse_json_command(json: &str) -> Result<CydCommand, LinkError> {
-    let cmd_rest = find_json_field(json, "cmd").ok_or(LinkError::InvalidFrame)?;
+    let trimmed = json.trim();
+    if !is_single_json_object(trimmed) {
+        return Err(LinkError::InvalidFrame);
+    }
+
+    let cmd_rest = find_json_field(trimmed, "cmd").ok_or(LinkError::InvalidFrame)?;
     let cmd_inner = cmd_rest.strip_prefix('"').ok_or(LinkError::InvalidFrame)?;
-    let end_quote = cmd_inner.find('"').ok_or(LinkError::InvalidFrame)?;
+    let end_quote = find_json_string_end(cmd_inner).ok_or(LinkError::InvalidFrame)?;
+    let after_cmd = cmd_inner[end_quote + 1..].trim_start();
+    if !after_cmd.starts_with(',') && !after_cmd.starts_with('}') {
+        return Err(LinkError::InvalidFrame);
+    }
     let cmd_name = &cmd_inner[..end_quote];
 
     match cmd_name {
@@ -469,10 +575,14 @@ fn parse_json_command(json: &str) -> Result<CydCommand, LinkError> {
         "prev" => Ok(CydCommand::Previous),
         "sync" | "status" => Ok(CydCommand::QueryStatus),
         "vol" => {
-            let val_rest = find_json_field(json, "val").ok_or(LinkError::InvalidFrame)?;
+            let val_rest = find_json_field(trimmed, "val").ok_or(LinkError::InvalidFrame)?;
             let end = val_rest
                 .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
-                .unwrap_or(val_rest.len());
+                .ok_or(LinkError::InvalidFrame)?;
+            let trailing = val_rest[end..].trim_start();
+            if !trailing.starts_with(',') && !trailing.starts_with('}') {
+                return Err(LinkError::InvalidFrame);
+            }
             let num_str = &val_rest[..end];
             if num_str.is_empty() {
                 return Err(LinkError::InvalidFrame);
@@ -1102,6 +1212,71 @@ mod tests {
         assert_eq!(
             CydLinkProtocol::encode_json_command(&CydCommand::Toggle, &mut tiny),
             Err(LinkError::BufferOverflow)
+        );
+    }
+
+    #[test]
+    fn test_json_command_framing_and_nesting_regressions() {
+        // LOGIC-006: Reject truncated and unframed JSON command inputs.
+        assert_eq!(
+            parse_json_command("{\"cmd\":\"vol\",\"val\":5"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            parse_json_command("noise \"cmd\":\"play\""),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":5"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":5}}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"play\"}{\"cmd\":\"pause\"}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":5 foo}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"play\" garbage}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"vol\",\"val\":42 , \"x\":1}"),
+            Ok(CydCommand::SetVolume(42))
+        );
+
+        // SEC-034: Ignore nested objects/arrays when matching top-level keys.
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"meta\":{\"cmd\":\"next\"},\"cmd\":\"play\"}"),
+            Ok(CydCommand::Play)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"meta\":{\"cmd\":\"next\"}}"),
+            Err(LinkError::InvalidFrame)
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"arr\":[{\"val\":99}],\"cmd\":\"vol\",\"val\":10}"),
+            Ok(CydCommand::SetVolume(10))
+        );
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"arr\":[{\"val\":99}],\"cmd\":\"vol\"}"),
+            Err(LinkError::InvalidFrame)
+        );
+        // Escaped quotes in command value must not truncate prematurely.
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"cmd\":\"play\\\"\"}"),
+            Err(LinkError::InvalidFrame)
+        );
+        // Braces inside string literals must not break top-level depth.
+        assert_eq!(
+            CydLinkProtocol::parse_command("{\"note\":\"{unclosed\",\"cmd\":\"pause\"}"),
+            Ok(CydCommand::Pause)
         );
     }
 }

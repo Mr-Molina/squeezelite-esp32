@@ -1,4 +1,5 @@
-//! What is left of the embassy task skeleton after F2 (`foundation/single-loop`).
+//! What is left of the embassy task skeleton after F2
+//! (`foundation/single-loop`).
 //!
 //! The device firmware has one path: the loop in `main.rs`
 //! (`pump_device_phase`). The core-0 phase ring that used to live here was
@@ -75,15 +76,17 @@ pub(crate) use device::run_core1_executor;
 /// Device glue for the `esp-rtos-core1` build: the core-1 executor.
 #[cfg(all(target_arch = "xtensa", feature = "esp-rtos-core1"))]
 mod device {
+    use crate::xtensa_hw::service_core1_park_request;
     use crate::xtensa_hw::CORE1_HEARTBEAT;
     use esp_rtos::embassy::Executor;
     use static_cell::StaticCell;
 
-    /// Replaces the NOP heartbeat loop of the manual start path; the audio
-    /// tasks join this executor once the S1 owner gate passes.
+    /// Replaces the NOP heartbeat loop of the manual start path; polls
+    /// `CORE1_PARK_REQ`/`CORE1_PARKED` in IRAM outside critical sections.
     #[embassy_executor::task]
     async fn core1_heartbeat() -> ! {
         loop {
+            service_core1_park_request();
             CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             embassy_time::Timer::after_millis(1).await;
         }
