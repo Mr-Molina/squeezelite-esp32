@@ -5,6 +5,7 @@
 
 pub mod airplay;
 pub mod mdns;
+pub mod spotify_facade;
 
 mod registry {
     extern crate alloc;
@@ -162,6 +163,9 @@ mod registry {
 
         /// Returns `true` while external audio samples remain buffered.
         fn has_external_audio_queued(&self) -> bool;
+
+        /// Returns the currently active audio source on the coordinator.
+        fn active_source(&self) -> AudioSource;
     }
 
     /// Concrete [`ServiceAudioHost`] bridging [`PlayerCoordinator`],
@@ -289,6 +293,10 @@ mod registry {
             self.pipeline.stream_buffer.available_read() > 0
                 || self.pipeline.output_buffer.available_read() > 0
                 || self.pipeline.has_pending_pcm()
+        }
+
+        fn active_source(&self) -> AudioSource {
+            self.coordinator.active_source()
         }
     }
 
@@ -603,6 +611,12 @@ mod registry {
                 .is_some_and(ServiceAudioHost::has_external_audio_queued)
         }
 
+        /// Currently active audio source when an audio host is attached.
+        #[must_use]
+        pub fn active_source(&self) -> Option<AudioSource> {
+            self.audio.as_deref().map(ServiceAudioHost::active_source)
+        }
+
         /// Monotonic time in milliseconds since boot.
         #[must_use]
         pub fn now_ms(&self) -> u64 {
@@ -866,6 +880,7 @@ mod registry {
     pub fn register_all(reg: &mut ServiceRegistry) {
         reg.register(super::mdns::MdnsService::new());
         reg.register(super::airplay::AirPlayService::new());
+        reg.register(super::spotify_facade::SpotifyFacadeService::new());
     }
 }
 
@@ -878,6 +893,7 @@ pub use registry::{
     ServiceHttpOutcome, ServiceHttpRequest, ServiceRegistry, ServiceSlimExtension,
     SlimOutboundQueue, StatusExtras, StatusField, StatusValue, DEFAULT_SLIM_OUTBOUND_CAP,
 };
+pub use spotify_facade::SpotifyFacadeService;
 
 #[cfg(test)]
 mod tests {
