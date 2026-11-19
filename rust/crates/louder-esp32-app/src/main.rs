@@ -465,8 +465,8 @@ mod xtensa_hw {
     use louder_esp32_app::board::first_boot_defaults;
     use louder_esp32_app::bt_a2dp::BtA2dpSink;
     use louder_esp32_app::config_handle::{
-        resolve_boot_audio, resolve_boot_wifi, ConfigHandle, ConfigSource, ConfigWriter,
-        FlashTargetPolicy, JournalSector, JournalSlot, RamJournal,
+        can_commit_runtime_flash, resolve_boot_audio, resolve_boot_wifi, ConfigHandle,
+        ConfigSource, ConfigWriter, FlashTargetPolicy, JournalSector, JournalSlot, RamJournal,
     };
     use louder_esp32_app::hal::I2sDmaDriver;
     use louder_esp32_app::http_control::{
@@ -2418,6 +2418,7 @@ mod xtensa_hw {
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
         last_config_poll_ms: u64,
+        flash_retry_at_ms: u64,
         mdns_bound: bool,
         last_mdns_announce_ms: u64,
         last_mdns_reply_ms: Option<u64>,
@@ -2901,6 +2902,7 @@ mod xtensa_hw {
             latest_telemetry,
             last_cyd_progress_ms: 0,
             last_config_poll_ms: 0,
+            flash_retry_at_ms: 0,
             mdns_bound: false,
             last_mdns_announce_ms: 0,
             last_mdns_reply_ms: None,
@@ -3220,7 +3222,8 @@ mod xtensa_hw {
                                 .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback();
+                            s.coordinator
+                                .begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -3817,7 +3820,7 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4326,7 +4329,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 s.raop_streaming = true;
                                                 s.last_rtp_packet_ms = now_ms;
                                             }
@@ -4394,7 +4400,8 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator
+                                        .begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4481,7 +4488,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                                     let _ = s.amp.clear_faults();
                                                     let _ = s.amp.start_playback_via_hiz();
@@ -4589,10 +4599,12 @@ mod xtensa_hw {
             s.last_fault_check_ms = now_ms;
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
-                if (s.coordinator.state == PlayerState::Playing || s.coordinator.external_playback)
-                    && fault.has_critical_amp_fault()
-                    && now_ms.saturating_sub(s.last_fault_recovery_ms) >= 30_000
-                {
+                if louder_esp32_app::amp::should_recover_amp_fault(
+                    s.coordinator.state == PlayerState::Playing || s.coordinator.external_playback,
+                    fault.has_critical_amp_fault(),
+                    now_ms,
+                    s.last_fault_recovery_ms,
+                ) {
                     s.last_fault_recovery_ms = now_ms;
                     let _ = s.amp.recover_from_fault();
                     louder_esp32_app::http_control::push_runtime_syslog(
@@ -4621,23 +4633,43 @@ mod xtensa_hw {
 
         if now_ms.saturating_sub(s.last_config_poll_ms) >= 100 {
             s.last_config_poll_ms = now_ms;
-            if s.config_writer.poll(s.config, &mut *s.journal, now_ms) {
+            let _ = s.config_writer.poll(s.config, &mut *s.journal, now_ms);
+            let audio_active = matches!(
+                s.coordinator.state,
+                PlayerState::Playing | PlayerState::Buffering
+            ) || s.bt_audio_active
+                || s.raop_streaming
+                || s.spot_streaming;
+            if can_commit_runtime_flash(now_ms, s.flash_retry_at_ms, audio_active) {
                 if let Some(image) = s.journal.pending_image() {
                     s.core1.park_for_flash_write();
                     #[cfg(not(feature = "runtime-flash-persist"))]
                     let offset = SETTINGS_JOURNAL_OFFSET;
                     #[cfg(feature = "runtime-flash-persist")]
                     let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-                    let _ = s.flash.erase(offset, offset + 4096);
-                    if image.used_len > 16 {
-                        let _ = s
+                    let mut write_ok = s.flash.erase(offset, offset + 4096).is_ok();
+                    if write_ok && image.used_len > 16 {
+                        write_ok &= s
                             .flash
-                            .write_nor(offset + 16, &image.sector[16..image.used_len]);
+                            .write_nor(offset + 16, &image.sector[16..image.used_len])
+                            .is_ok();
                     }
-                    let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
-                    let _ = s.flash.write_nor(offset, &image.sector[..16]);
-                    s.journal.mark_flash_written();
+                    if write_ok {
+                        write_ok &= s
+                            .flash
+                            .write_nor(offset + 2048, &image.sector[2048..4096])
+                            .is_ok();
+                    }
+                    if write_ok {
+                        write_ok &= s.flash.write_nor(offset, &image.sector[..16]).is_ok();
+                    }
                     s.core1.unpark_after_flash_write();
+                    if write_ok {
+                        s.journal.mark_flash_written();
+                        s.flash_retry_at_ms = 0;
+                    } else {
+                        s.flash_retry_at_ms = now_ms.saturating_add(60_000);
+                    }
                 }
             }
         }
