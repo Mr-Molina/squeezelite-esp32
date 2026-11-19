@@ -3102,6 +3102,53 @@ enum Mp4DemuxState {
 
 #[cfg(feature = "alloc")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Mp4BoxHeader {
+    fourcc: [u8; 4],
+    header_len: usize,
+    box_len: Option<usize>,
+}
+
+#[cfg(feature = "alloc")]
+fn parse_mp4_box_header(buf: &[u8]) -> Result<Option<Mp4BoxHeader>, DecoderError> {
+    if buf.len() < 8 {
+        return Ok(None);
+    }
+    let raw_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let fourcc = [buf[4], buf[5], buf[6], buf[7]];
+    match raw_len {
+        0 => Ok(Some(Mp4BoxHeader {
+            fourcc,
+            header_len: 8,
+            box_len: None,
+        })),
+        1 => {
+            if buf.len() < 16 {
+                return Ok(None);
+            }
+            let len64 = u64::from_be_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]);
+            if len64 < 16 {
+                return Err(DecoderError::InvalidHeader);
+            }
+            let box_len = usize::try_from(len64).map_err(|_| DecoderError::InvalidHeader)?;
+            Ok(Some(Mp4BoxHeader {
+                fourcc,
+                header_len: 16,
+                box_len: Some(box_len),
+            }))
+        }
+        2..=7 => Err(DecoderError::InvalidHeader),
+        _ => Ok(Some(Mp4BoxHeader {
+            fourcc,
+            header_len: 8,
+            box_len: Some(raw_len as usize),
+        })),
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Mp4StscEntry {
     first_chunk: u32,
     samples_per_chunk: u32,
@@ -3115,11 +3162,17 @@ struct AacMp4Demuxer {
     sample_sizes: vec::Vec<usize>,
     stsc_entries: vec::Vec<Mp4StscEntry>,
     chunk_offsets: vec::Vec<usize>,
+    audio_tables_locked: bool,
     sample_idx: usize,
     current_chunk_idx: usize,
     sample_in_chunk_idx: usize,
     bytes_to_skip: usize,
     file_pos: usize,
+    moov_end_pos: Option<usize>,
+    deferred_mdat: vec::Vec<u8>,
+    deferred_mdat_data_start: usize,
+    deferred_mdat_remaining: usize,
+    using_deferred_mdat: bool,
     adts_frame_scratch: vec::Vec<u8>,
 }
 
@@ -3133,12 +3186,24 @@ impl AacMp4Demuxer {
             sample_sizes: vec::Vec::new(),
             stsc_entries: vec::Vec::new(),
             chunk_offsets: vec::Vec::new(),
+            audio_tables_locked: false,
             sample_idx: 0,
             current_chunk_idx: 0,
             sample_in_chunk_idx: 0,
             bytes_to_skip: 0,
             file_pos: 0,
+            moov_end_pos: None,
+            deferred_mdat: vec::Vec::new(),
+            deferred_mdat_data_start: 0,
+            deferred_mdat_remaining: 0,
+            using_deferred_mdat: false,
             adts_frame_scratch: vec::Vec::new(),
+        }
+    }
+
+    fn maybe_lock_audio_tables(&mut self) {
+        if self.asc.is_some() && !self.sample_sizes.is_empty() && !self.chunk_offsets.is_empty() {
+            self.audio_tables_locked = true;
         }
     }
 
@@ -3171,6 +3236,8 @@ pub struct AacDecoder {
     pub channels: u32,
     pending_pcm: vec::Vec<i32>,
     pending_offset: usize,
+    pending_error: Option<DecoderError>,
+    id3_skip_remaining: usize,
     is_mp4: Option<bool>,
     mp4: Option<Box<AacMp4Demuxer>>,
 }
@@ -3191,6 +3258,8 @@ impl AacDecoder {
             channels: 2,
             pending_pcm: vec::Vec::new(),
             pending_offset: 0,
+            pending_error: None,
+            id3_skip_remaining: 0,
             is_mp4: None,
             mp4: None,
         }
@@ -3223,6 +3292,8 @@ impl AacDecoder {
         self.decoder.reset();
         self.pending_pcm.clear();
         self.pending_offset = 0;
+        self.pending_error = None;
+        self.id3_skip_remaining = 0;
         self.is_mp4 = None;
         self.mp4 = None;
     }
@@ -3241,314 +3312,496 @@ impl AacDecoder {
             return Err(DecoderError::InvalidHeader);
         };
 
-        let max_buf = if demux.state == Mp4DemuxState::ReadingMdat {
-            MAX_STREAM_BUF
-        } else {
-            MAX_MP4_META_BUF
-        };
-
-        if demux.stream_buf.len().saturating_add(encoded_in.len()) > max_buf {
-            self.flush();
-            return Err(DecoderError::CorruptedFrame);
-        }
-
-        if demux.stream_buf.len().saturating_add(encoded_in.len()) < 4 {
-            if frames_out > 0 {
-                return Ok((0, frames_out));
+        if demux.state == Mp4DemuxState::Eof {
+            demux.stream_buf.clear();
+            demux.file_pos = demux.file_pos.saturating_add(encoded_in.len());
+            if frames_out == 0 && encoded_in.is_empty() {
+                return Err(DecoderError::NeedMoreData);
             }
-            return Err(DecoderError::NeedMoreData);
+            return Ok((encoded_in.len(), frames_out));
         }
 
-        let input_taken = encoded_in.len();
-        demux.stream_buf.extend_from_slice(encoded_in);
-
-        if demux.bytes_to_skip > 0 {
-            let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
-            demux.stream_buf.drain(..to_skip);
-            demux.bytes_to_skip -= to_skip;
-            demux.file_pos = demux.file_pos.saturating_add(to_skip);
-            if demux.bytes_to_skip > 0 {
-                if frames_out == 0 && input_taken == 0 {
-                    return Err(DecoderError::NeedMoreData);
-                }
-                return Ok((input_taken, frames_out));
-            }
-        }
+        let mut in_pos = 0usize;
 
         while demux.state == Mp4DemuxState::SearchingAtoms {
+            if in_pos < encoded_in.len() {
+                let used = demux
+                    .deferred_mdat
+                    .len()
+                    .saturating_add(demux.stream_buf.len());
+                let room = MAX_MP4_META_BUF.saturating_sub(used);
+                if room == 0 {
+                    let is_deferred =
+                        !demux.deferred_mdat.is_empty() || demux.deferred_mdat_remaining > 0;
+                    self.flush();
+                    return Err(if is_deferred {
+                        DecoderError::UnsupportedFeature
+                    } else {
+                        DecoderError::CorruptedFrame
+                    });
+                }
+                let take = core::cmp::min(room, encoded_in.len() - in_pos);
+                demux
+                    .stream_buf
+                    .extend_from_slice(&encoded_in[in_pos..in_pos + take]);
+                in_pos += take;
+            }
+
+            let mut made_progress = false;
+            loop {
+                if demux.bytes_to_skip > 0 {
+                    let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
+                    if to_skip > 0 {
+                        demux.stream_buf.drain(..to_skip);
+                        demux.bytes_to_skip -= to_skip;
+                        demux.file_pos = demux.file_pos.saturating_add(to_skip);
+                        made_progress = true;
+                    }
+                    if demux.bytes_to_skip > 0 {
+                        break;
+                    }
+                }
+
+                if demux.deferred_mdat_remaining > 0 {
+                    let avail =
+                        core::cmp::min(demux.deferred_mdat_remaining, demux.stream_buf.len());
+                    if demux.deferred_mdat.len().saturating_add(avail) > MAX_MP4_META_BUF {
+                        self.flush();
+                        return Err(DecoderError::UnsupportedFeature);
+                    }
+                    if avail > 0 {
+                        demux
+                            .deferred_mdat
+                            .extend_from_slice(&demux.stream_buf[..avail]);
+                        demux.stream_buf.drain(..avail);
+                        demux.deferred_mdat_remaining -= avail;
+                        demux.file_pos = demux.file_pos.saturating_add(avail);
+                        made_progress = true;
+                    }
+                    if demux.deferred_mdat_remaining > 0 {
+                        break;
+                    }
+                }
+
+                if !demux.deferred_mdat.is_empty()
+                    && demux.deferred_mdat_remaining == 0
+                    && demux.moov_end_pos.is_some_and(|end| demux.file_pos >= end)
+                {
+                    if demux.asc.is_none() || demux.sample_sizes.is_empty() {
+                        return Err(DecoderError::InvalidHeader);
+                    }
+                    demux.stream_buf = core::mem::take(&mut demux.deferred_mdat);
+                    demux.file_pos = demux.deferred_mdat_data_start;
+                    demux.using_deferred_mdat = true;
+                    if let Some(&first_off) = demux.chunk_offsets.first() {
+                        if first_off > demux.file_pos {
+                            let skip = first_off.saturating_sub(demux.file_pos);
+                            let to_skip = core::cmp::min(skip, demux.stream_buf.len());
+                            demux.stream_buf.drain(..to_skip);
+                            demux.file_pos = demux.file_pos.saturating_add(to_skip);
+                            demux.bytes_to_skip = skip - to_skip;
+                        }
+                    }
+                    demux.state = Mp4DemuxState::ReadingMdat;
+                    break;
+                }
+
+                let Some(hdr) = parse_mp4_box_header(&demux.stream_buf)? else {
+                    break;
+                };
+                let h = hdr.header_len;
+
+                match &hdr.fourcc {
+                    b"moov" => {
+                        if let Some(len) = hdr.box_len {
+                            if demux.moov_end_pos.is_none() {
+                                demux.moov_end_pos = Some(demux.file_pos.saturating_add(len));
+                            }
+                        }
+                        demux.stream_buf.drain(..h);
+                        demux.file_pos = demux.file_pos.saturating_add(h);
+                        made_progress = true;
+                    }
+                    b"trak" => {
+                        if demux.asc.is_some() && !demux.sample_sizes.is_empty() {
+                            demux.audio_tables_locked = true;
+                        }
+                        demux.stream_buf.drain(..h);
+                        demux.file_pos = demux.file_pos.saturating_add(h);
+                        made_progress = true;
+                    }
+                    b"mdia" | b"minf" | b"stbl" | b"wave" => {
+                        demux.stream_buf.drain(..h);
+                        demux.file_pos = demux.file_pos.saturating_add(h);
+                        made_progress = true;
+                    }
+                    b"stsd" => {
+                        if let Some(len) = hdr.box_len {
+                            if len < h + 8 {
+                                return Err(DecoderError::InvalidHeader);
+                            }
+                        }
+                        if demux.stream_buf.len() < h + 8 {
+                            break;
+                        }
+                        demux.stream_buf.drain(..h + 8);
+                        demux.file_pos = demux.file_pos.saturating_add(h + 8);
+                        made_progress = true;
+                    }
+                    b"mp4a" => {
+                        if let Some(len) = hdr.box_len {
+                            if len < h + 28 {
+                                return Err(DecoderError::InvalidHeader);
+                            }
+                        }
+                        if demux.stream_buf.len() < h + 28 {
+                            break;
+                        }
+                        let version =
+                            u16::from_be_bytes([demux.stream_buf[h + 8], demux.stream_buf[h + 9]]);
+                        let hdr_size = match version {
+                            1 if hdr.box_len.is_none_or(|l| l > h + 44) => h + 44,
+                            2 if hdr.box_len.is_none_or(|l| l > h + 64) => h + 64,
+                            _ => h + 28,
+                        };
+                        if demux.stream_buf.len() < hdr_size {
+                            break;
+                        }
+                        demux.stream_buf.drain(..hdr_size);
+                        demux.file_pos = demux.file_pos.saturating_add(hdr_size);
+                        made_progress = true;
+                    }
+                    b"esds" => {
+                        let Some(len) = hdr.box_len else {
+                            return Err(DecoderError::InvalidHeader);
+                        };
+                        if len < h + 6 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        if demux.stream_buf.len() < len {
+                            break;
+                        }
+                        if !demux.audio_tables_locked {
+                            let asc = parse_esds_audio_specific_config(&demux.stream_buf[h..len])?;
+                            self.sample_rate = asc.sample_rate;
+                            self.channels = asc.channel_configuration as u32;
+                            demux.asc = Some(asc);
+                            demux.maybe_lock_audio_tables();
+                        }
+                        demux.stream_buf.drain(..len);
+                        demux.file_pos = demux.file_pos.saturating_add(len);
+                        made_progress = true;
+                    }
+                    b"stsz" => {
+                        let Some(len) = hdr.box_len else {
+                            return Err(DecoderError::InvalidHeader);
+                        };
+                        if len < h + 12 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        if demux.stream_buf.len() < len {
+                            break;
+                        }
+                        if !demux.audio_tables_locked {
+                            let default_sz = u32::from_be_bytes([
+                                demux.stream_buf[h + 4],
+                                demux.stream_buf[h + 5],
+                                demux.stream_buf[h + 6],
+                                demux.stream_buf[h + 7],
+                            ]) as usize;
+                            let count = u32::from_be_bytes([
+                                demux.stream_buf[h + 8],
+                                demux.stream_buf[h + 9],
+                                demux.stream_buf[h + 10],
+                                demux.stream_buf[h + 11],
+                            ]) as usize;
+                            if count > MAX_MP4_SAMPLES {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            demux.sample_sizes.clear();
+                            if default_sz == 0 {
+                                if len < h + 12 + count * 4 {
+                                    return Err(DecoderError::InvalidHeader);
+                                }
+                                demux.sample_sizes.reserve(count);
+                                for i in 0..count {
+                                    let off = h + 12 + i * 4;
+                                    let sz = u32::from_be_bytes([
+                                        demux.stream_buf[off],
+                                        demux.stream_buf[off + 1],
+                                        demux.stream_buf[off + 2],
+                                        demux.stream_buf[off + 3],
+                                    ]) as usize;
+                                    demux.sample_sizes.push(sz);
+                                }
+                            } else {
+                                demux.sample_sizes = vec![default_sz; count];
+                            }
+                            demux.maybe_lock_audio_tables();
+                        }
+                        demux.stream_buf.drain(..len);
+                        demux.file_pos = demux.file_pos.saturating_add(len);
+                        made_progress = true;
+                    }
+                    b"stsc" => {
+                        let Some(len) = hdr.box_len else {
+                            return Err(DecoderError::InvalidHeader);
+                        };
+                        if len < h + 8 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        if demux.stream_buf.len() < len {
+                            break;
+                        }
+                        if !demux.audio_tables_locked {
+                            let count = u32::from_be_bytes([
+                                demux.stream_buf[h + 4],
+                                demux.stream_buf[h + 5],
+                                demux.stream_buf[h + 6],
+                                demux.stream_buf[h + 7],
+                            ]) as usize;
+                            if count > MAX_MP4_SAMPLES {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            if len < h + 8 + count * 12 {
+                                return Err(DecoderError::InvalidHeader);
+                            }
+                            demux.stsc_entries.clear();
+                            demux.stsc_entries.reserve(count);
+                            for i in 0..count {
+                                let off = h + 8 + i * 12;
+                                let first_chunk = u32::from_be_bytes([
+                                    demux.stream_buf[off],
+                                    demux.stream_buf[off + 1],
+                                    demux.stream_buf[off + 2],
+                                    demux.stream_buf[off + 3],
+                                ]);
+                                let samples_per_chunk = u32::from_be_bytes([
+                                    demux.stream_buf[off + 4],
+                                    demux.stream_buf[off + 5],
+                                    demux.stream_buf[off + 6],
+                                    demux.stream_buf[off + 7],
+                                ]);
+                                demux.stsc_entries.push(Mp4StscEntry {
+                                    first_chunk,
+                                    samples_per_chunk,
+                                });
+                            }
+                        }
+                        demux.stream_buf.drain(..len);
+                        demux.file_pos = demux.file_pos.saturating_add(len);
+                        made_progress = true;
+                    }
+                    b"stco" => {
+                        let Some(len) = hdr.box_len else {
+                            return Err(DecoderError::InvalidHeader);
+                        };
+                        if len < h + 8 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        if demux.stream_buf.len() < len {
+                            break;
+                        }
+                        if !demux.audio_tables_locked {
+                            let count = u32::from_be_bytes([
+                                demux.stream_buf[h + 4],
+                                demux.stream_buf[h + 5],
+                                demux.stream_buf[h + 6],
+                                demux.stream_buf[h + 7],
+                            ]) as usize;
+                            if count > MAX_MP4_SAMPLES {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            if len < h + 8 + count * 4 {
+                                return Err(DecoderError::InvalidHeader);
+                            }
+                            demux.chunk_offsets.clear();
+                            demux.chunk_offsets.reserve(count);
+                            for i in 0..count {
+                                let off = h + 8 + i * 4;
+                                let chunk_off = u32::from_be_bytes([
+                                    demux.stream_buf[off],
+                                    demux.stream_buf[off + 1],
+                                    demux.stream_buf[off + 2],
+                                    demux.stream_buf[off + 3],
+                                ]) as usize;
+                                demux.chunk_offsets.push(chunk_off);
+                            }
+                            demux.maybe_lock_audio_tables();
+                        }
+                        demux.stream_buf.drain(..len);
+                        demux.file_pos = demux.file_pos.saturating_add(len);
+                        made_progress = true;
+                    }
+                    b"co64" => {
+                        let Some(len) = hdr.box_len else {
+                            return Err(DecoderError::InvalidHeader);
+                        };
+                        if len < h + 8 {
+                            return Err(DecoderError::InvalidHeader);
+                        }
+                        if demux.stream_buf.len() < len {
+                            break;
+                        }
+                        if !demux.audio_tables_locked {
+                            let count = u32::from_be_bytes([
+                                demux.stream_buf[h + 4],
+                                demux.stream_buf[h + 5],
+                                demux.stream_buf[h + 6],
+                                demux.stream_buf[h + 7],
+                            ]) as usize;
+                            if count > MAX_MP4_SAMPLES {
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            if len < h + 8 + count * 8 {
+                                return Err(DecoderError::InvalidHeader);
+                            }
+                            demux.chunk_offsets.clear();
+                            demux.chunk_offsets.reserve(count);
+                            for i in 0..count {
+                                let off = h + 8 + i * 8;
+                                let chunk_off = u64::from_be_bytes([
+                                    demux.stream_buf[off],
+                                    demux.stream_buf[off + 1],
+                                    demux.stream_buf[off + 2],
+                                    demux.stream_buf[off + 3],
+                                    demux.stream_buf[off + 4],
+                                    demux.stream_buf[off + 5],
+                                    demux.stream_buf[off + 6],
+                                    demux.stream_buf[off + 7],
+                                ]) as usize;
+                                demux.chunk_offsets.push(chunk_off);
+                            }
+                            demux.maybe_lock_audio_tables();
+                        }
+                        demux.stream_buf.drain(..len);
+                        demux.file_pos = demux.file_pos.saturating_add(len);
+                        made_progress = true;
+                    }
+                    b"mdat" => {
+                        if demux.asc.is_none() || demux.sample_sizes.is_empty() {
+                            let Some(len) = hdr.box_len else {
+                                return Err(DecoderError::InvalidHeader);
+                            };
+                            if !demux.deferred_mdat.is_empty() || demux.deferred_mdat_remaining > 0
+                            {
+                                self.flush();
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            let payload_len = len - h;
+                            if payload_len > MAX_MP4_META_BUF {
+                                self.flush();
+                                return Err(DecoderError::UnsupportedFeature);
+                            }
+                            demux.stream_buf.drain(..h);
+                            demux.file_pos = demux.file_pos.saturating_add(h);
+                            demux.deferred_mdat_data_start = demux.file_pos;
+                            demux.deferred_mdat_remaining = payload_len;
+                            let avail = core::cmp::min(payload_len, demux.stream_buf.len());
+                            if avail > 0 {
+                                demux
+                                    .deferred_mdat
+                                    .extend_from_slice(&demux.stream_buf[..avail]);
+                                demux.stream_buf.drain(..avail);
+                                demux.deferred_mdat_remaining -= avail;
+                                demux.file_pos = demux.file_pos.saturating_add(avail);
+                            }
+                            made_progress = true;
+                            if demux.deferred_mdat_remaining > 0 {
+                                break;
+                            }
+                        } else {
+                            demux.stream_buf.drain(..h);
+                            demux.file_pos = demux.file_pos.saturating_add(h);
+                            if let Some(&first_off) = demux.chunk_offsets.first() {
+                                if first_off > demux.file_pos {
+                                    demux.bytes_to_skip = first_off.saturating_sub(demux.file_pos);
+                                    let to_skip =
+                                        core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
+                                    demux.stream_buf.drain(..to_skip);
+                                    demux.bytes_to_skip -= to_skip;
+                                    demux.file_pos = demux.file_pos.saturating_add(to_skip);
+                                }
+                            }
+                            demux.state = Mp4DemuxState::ReadingMdat;
+                            break;
+                        }
+                    }
+                    _ => match hdr.box_len {
+                        Some(len) => {
+                            if demux.stream_buf.len() >= len {
+                                demux.stream_buf.drain(..len);
+                                demux.file_pos = demux.file_pos.saturating_add(len);
+                                made_progress = true;
+                            } else {
+                                let avail = demux.stream_buf.len();
+                                demux.file_pos = demux.file_pos.saturating_add(avail);
+                                demux.bytes_to_skip = len.saturating_sub(avail);
+                                demux.stream_buf.clear();
+                                made_progress = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            // `size == 0` box extends to EOF; drain remaining buffer.
+                            demux.file_pos = demux.file_pos.saturating_add(demux.stream_buf.len());
+                            demux.stream_buf.clear();
+                            demux.state = Mp4DemuxState::Eof;
+                            break;
+                        }
+                    },
+                }
+            }
+
+            if demux.state != Mp4DemuxState::SearchingAtoms || in_pos >= encoded_in.len() {
+                break;
+            }
+            if !made_progress
+                && demux
+                    .deferred_mdat
+                    .len()
+                    .saturating_add(demux.stream_buf.len())
+                    >= MAX_MP4_META_BUF
+            {
+                let is_deferred =
+                    !demux.deferred_mdat.is_empty() || demux.deferred_mdat_remaining > 0;
+                self.flush();
+                return Err(if is_deferred {
+                    DecoderError::UnsupportedFeature
+                } else {
+                    DecoderError::CorruptedFrame
+                });
+            }
+        }
+
+        if demux.state == Mp4DemuxState::ReadingMdat {
+            if in_pos < encoded_in.len() {
+                if demux.using_deferred_mdat {
+                    in_pos = encoded_in.len();
+                } else {
+                    let remaining = &encoded_in[in_pos..];
+                    if demux.stream_buf.len().saturating_add(remaining.len()) > MAX_STREAM_BUF {
+                        self.flush();
+                        return Err(DecoderError::CorruptedFrame);
+                    }
+                    demux.stream_buf.extend_from_slice(remaining);
+                    in_pos = encoded_in.len();
+                }
+            }
+
             if demux.bytes_to_skip > 0 {
                 let to_skip = core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
                 demux.stream_buf.drain(..to_skip);
                 demux.bytes_to_skip -= to_skip;
                 demux.file_pos = demux.file_pos.saturating_add(to_skip);
                 if demux.bytes_to_skip > 0 {
-                    break;
+                    if frames_out == 0 && in_pos == 0 {
+                        return Err(DecoderError::NeedMoreData);
+                    }
+                    return Ok((in_pos, frames_out));
                 }
             }
 
-            if demux.stream_buf.len() < 8 {
-                break;
-            }
-
-            let len = u32::from_be_bytes([
-                demux.stream_buf[0],
-                demux.stream_buf[1],
-                demux.stream_buf[2],
-                demux.stream_buf[3],
-            ]) as usize;
-
-            let fourcc = [
-                demux.stream_buf[4],
-                demux.stream_buf[5],
-                demux.stream_buf[6],
-                demux.stream_buf[7],
-            ];
-
-            match &fourcc {
-                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"wave" => {
-                    demux.stream_buf.drain(..8);
-                    demux.file_pos = demux.file_pos.saturating_add(8);
-                }
-                b"stsd" => {
-                    if demux.stream_buf.len() < 16 {
-                        break;
-                    }
-                    demux.stream_buf.drain(..16);
-                    demux.file_pos = demux.file_pos.saturating_add(16);
-                }
-                b"mp4a" => {
-                    if len < 36 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() < 36 {
-                        break;
-                    }
-                    let version = u16::from_be_bytes([demux.stream_buf[16], demux.stream_buf[17]]);
-                    let hdr_size = match version {
-                        1 if len > 52 => 52,
-                        2 if len > 72 => 72,
-                        _ => 36,
-                    };
-                    if demux.stream_buf.len() < hdr_size {
-                        break;
-                    }
-                    demux.stream_buf.drain(..hdr_size);
-                    demux.file_pos = demux.file_pos.saturating_add(hdr_size);
-                }
-                b"esds" => {
-                    if len < 14 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() < len {
-                        break;
-                    }
-                    let asc = parse_esds_audio_specific_config(&demux.stream_buf[8..len])?;
-                    self.sample_rate = asc.sample_rate;
-                    self.channels = asc.channel_configuration as u32;
-                    demux.asc = Some(asc);
-                    demux.stream_buf.drain(..len);
-                    demux.file_pos = demux.file_pos.saturating_add(len);
-                }
-                b"stsz" => {
-                    if len < 20 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() < len {
-                        break;
-                    }
-                    let default_sz = u32::from_be_bytes([
-                        demux.stream_buf[12],
-                        demux.stream_buf[13],
-                        demux.stream_buf[14],
-                        demux.stream_buf[15],
-                    ]) as usize;
-                    let count = u32::from_be_bytes([
-                        demux.stream_buf[16],
-                        demux.stream_buf[17],
-                        demux.stream_buf[18],
-                        demux.stream_buf[19],
-                    ]) as usize;
-                    if count > MAX_MP4_SAMPLES {
-                        return Err(DecoderError::UnsupportedFeature);
-                    }
-                    demux.sample_sizes.clear();
-                    if default_sz == 0 {
-                        if len < 20 + count * 4 {
-                            return Err(DecoderError::InvalidHeader);
-                        }
-                        demux.sample_sizes.reserve(count);
-                        for i in 0..count {
-                            let off = 20 + i * 4;
-                            let sz = u32::from_be_bytes([
-                                demux.stream_buf[off],
-                                demux.stream_buf[off + 1],
-                                demux.stream_buf[off + 2],
-                                demux.stream_buf[off + 3],
-                            ]) as usize;
-                            demux.sample_sizes.push(sz);
-                        }
-                    } else {
-                        demux.sample_sizes = vec![default_sz; count];
-                    }
-                    demux.stream_buf.drain(..len);
-                    demux.file_pos = demux.file_pos.saturating_add(len);
-                }
-                b"stsc" => {
-                    if len < 16 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() < len {
-                        break;
-                    }
-                    let count = u32::from_be_bytes([
-                        demux.stream_buf[12],
-                        demux.stream_buf[13],
-                        demux.stream_buf[14],
-                        demux.stream_buf[15],
-                    ]) as usize;
-                    if count > MAX_MP4_SAMPLES {
-                        return Err(DecoderError::UnsupportedFeature);
-                    }
-                    if len < 16 + count * 12 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    demux.stsc_entries.clear();
-                    demux.stsc_entries.reserve(count);
-                    for i in 0..count {
-                        let off = 16 + i * 12;
-                        let first_chunk = u32::from_be_bytes([
-                            demux.stream_buf[off],
-                            demux.stream_buf[off + 1],
-                            demux.stream_buf[off + 2],
-                            demux.stream_buf[off + 3],
-                        ]);
-                        let samples_per_chunk = u32::from_be_bytes([
-                            demux.stream_buf[off + 4],
-                            demux.stream_buf[off + 5],
-                            demux.stream_buf[off + 6],
-                            demux.stream_buf[off + 7],
-                        ]);
-                        demux.stsc_entries.push(Mp4StscEntry {
-                            first_chunk,
-                            samples_per_chunk,
-                        });
-                    }
-                    demux.stream_buf.drain(..len);
-                    demux.file_pos = demux.file_pos.saturating_add(len);
-                }
-                b"stco" => {
-                    if len < 16 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() < len {
-                        break;
-                    }
-                    let count = u32::from_be_bytes([
-                        demux.stream_buf[12],
-                        demux.stream_buf[13],
-                        demux.stream_buf[14],
-                        demux.stream_buf[15],
-                    ]) as usize;
-                    if count > MAX_MP4_SAMPLES {
-                        return Err(DecoderError::UnsupportedFeature);
-                    }
-                    if len < 16 + count * 4 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    demux.chunk_offsets.clear();
-                    demux.chunk_offsets.reserve(count);
-                    for i in 0..count {
-                        let off = 16 + i * 4;
-                        let chunk_off = u32::from_be_bytes([
-                            demux.stream_buf[off],
-                            demux.stream_buf[off + 1],
-                            demux.stream_buf[off + 2],
-                            demux.stream_buf[off + 3],
-                        ]) as usize;
-                        demux.chunk_offsets.push(chunk_off);
-                    }
-                    demux.stream_buf.drain(..len);
-                    demux.file_pos = demux.file_pos.saturating_add(len);
-                }
-                b"co64" => {
-                    if len < 16 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() < len {
-                        break;
-                    }
-                    let count = u32::from_be_bytes([
-                        demux.stream_buf[12],
-                        demux.stream_buf[13],
-                        demux.stream_buf[14],
-                        demux.stream_buf[15],
-                    ]) as usize;
-                    if count > MAX_MP4_SAMPLES {
-                        return Err(DecoderError::UnsupportedFeature);
-                    }
-                    if len < 16 + count * 8 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    demux.chunk_offsets.clear();
-                    demux.chunk_offsets.reserve(count);
-                    for i in 0..count {
-                        let off = 16 + i * 8;
-                        let chunk_off = u64::from_be_bytes([
-                            demux.stream_buf[off],
-                            demux.stream_buf[off + 1],
-                            demux.stream_buf[off + 2],
-                            demux.stream_buf[off + 3],
-                            demux.stream_buf[off + 4],
-                            demux.stream_buf[off + 5],
-                            demux.stream_buf[off + 6],
-                            demux.stream_buf[off + 7],
-                        ]) as usize;
-                        demux.chunk_offsets.push(chunk_off);
-                    }
-                    demux.stream_buf.drain(..len);
-                    demux.file_pos = demux.file_pos.saturating_add(len);
-                }
-                b"mdat" => {
-                    if demux.asc.is_none() || demux.sample_sizes.is_empty() {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    let header_len = if len == 1 { 16 } else { 8 };
-                    if demux.stream_buf.len() < header_len {
-                        break;
-                    }
-                    demux.stream_buf.drain(..header_len);
-                    demux.file_pos = demux.file_pos.saturating_add(header_len);
-                    if let Some(&first_off) = demux.chunk_offsets.first() {
-                        if first_off > demux.file_pos {
-                            demux.bytes_to_skip = first_off.saturating_sub(demux.file_pos);
-                            let to_skip =
-                                core::cmp::min(demux.bytes_to_skip, demux.stream_buf.len());
-                            demux.stream_buf.drain(..to_skip);
-                            demux.bytes_to_skip -= to_skip;
-                            demux.file_pos = demux.file_pos.saturating_add(to_skip);
-                        }
-                    }
-                    demux.state = Mp4DemuxState::ReadingMdat;
-                }
-                _ => {
-                    if len < 8 {
-                        return Err(DecoderError::InvalidHeader);
-                    }
-                    if demux.stream_buf.len() >= len {
-                        demux.stream_buf.drain(..len);
-                        demux.file_pos = demux.file_pos.saturating_add(len);
-                    } else {
-                        let avail = demux.stream_buf.len();
-                        demux.file_pos = demux.file_pos.saturating_add(avail);
-                        demux.bytes_to_skip = len.saturating_sub(avail);
-                        demux.stream_buf.clear();
-                        break;
-                    }
-                }
-            }
-        }
-
-        if demux.state == Mp4DemuxState::ReadingMdat {
             let Some(asc) = demux.asc else {
                 return Err(DecoderError::InvalidHeader);
             };
@@ -3615,6 +3868,11 @@ impl AacDecoder {
                     Ok(())
                 });
 
+                if feed_res.is_err() && frames_out > 0 {
+                    self.pending_error = Some(DecoderError::CorruptedFrame);
+                    return Ok((in_pos, frames_out));
+                }
+
                 demux.stream_buf.drain(..pkt_len);
                 demux.file_pos = demux.file_pos.saturating_add(pkt_len);
                 demux.sample_idx += 1;
@@ -3636,25 +3894,31 @@ impl AacDecoder {
                     }
                 }
 
-                if feed_res.is_err() && frames_out == 0 {
+                if feed_res.is_err() {
                     return Err(DecoderError::CorruptedFrame);
                 }
 
                 if !(1..=2).contains(&self.channels)
                     || !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&self.sample_rate)
                 {
+                    if frames_out > 0 {
+                        self.pending_error = Some(DecoderError::UnsupportedSampleFormat);
+                        return Ok((in_pos, frames_out));
+                    }
                     return Err(DecoderError::UnsupportedSampleFormat);
                 }
             }
             if demux.sample_idx >= demux.sample_sizes.len() && !demux.sample_sizes.is_empty() {
                 demux.state = Mp4DemuxState::Eof;
+                demux.using_deferred_mdat = false;
+                demux.stream_buf.clear();
             }
         }
 
-        if frames_out == 0 && input_taken == 0 {
+        if frames_out == 0 && in_pos == 0 {
             Err(DecoderError::NeedMoreData)
         } else {
-            Ok((input_taken, frames_out))
+            Ok((in_pos, frames_out))
         }
     }
 }
@@ -3678,6 +3942,10 @@ impl AudioDecoder for AacDecoder {
             return Err(DecoderError::BufferOverflow);
         }
 
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
+
         let mut frames_out = 0;
         if self.pending_offset < self.pending_pcm.len() {
             let pending_samples = self.pending_pcm.len() - self.pending_offset;
@@ -3698,6 +3966,38 @@ impl AudioDecoder for AacDecoder {
             }
         }
 
+        if self.is_mp4 != Some(true) {
+            if self.id3_skip_remaining > 0 {
+                if encoded_in.is_empty() {
+                    if frames_out > 0 {
+                        return Ok((0, frames_out));
+                    }
+                    return Err(DecoderError::NeedMoreData);
+                }
+                let to_skip = core::cmp::min(encoded_in.len(), self.id3_skip_remaining);
+                self.id3_skip_remaining -= to_skip;
+                return Ok((to_skip, frames_out));
+            }
+
+            if encoded_in.starts_with(b"ID3") {
+                if encoded_in.len() < 10 {
+                    if frames_out > 0 {
+                        return Ok((0, frames_out));
+                    }
+                    return Err(DecoderError::NeedMoreData);
+                }
+                let tag_size = ((encoded_in[6] as usize & 0x7F) << 21)
+                    | ((encoded_in[7] as usize & 0x7F) << 14)
+                    | ((encoded_in[8] as usize & 0x7F) << 7)
+                    | (encoded_in[9] as usize & 0x7F);
+                let footer = if (encoded_in[5] & 0x10) != 0 { 10 } else { 0 };
+                let total_id3 = 10 + tag_size + footer;
+                let to_skip = core::cmp::min(encoded_in.len(), total_id3);
+                self.id3_skip_remaining = total_id3 - to_skip;
+                return Ok((to_skip, frames_out));
+            }
+        }
+
         if self.is_mp4.is_none() {
             if encoded_in.len() >= 2 && encoded_in[0] == 0xFF && (encoded_in[1] & 0xF0) == 0xF0 {
                 self.is_mp4 = Some(false);
@@ -3711,13 +4011,11 @@ impl AudioDecoder for AacDecoder {
                     || fourcc == b"wide"
                     || fourcc == b"mdat";
                 self.is_mp4 = Some(is_box);
-            } else if encoded_in.len() < 8 {
+            } else {
                 if frames_out > 0 {
                     return Ok((0, frames_out));
                 }
                 return Err(DecoderError::NeedMoreData);
-            } else {
-                self.is_mp4 = Some(false);
             }
         }
 
@@ -3804,6 +4102,7 @@ impl AudioDecoder for AacDecoder {
             }
             Err(_) => {
                 if frames_out > 0 {
+                    self.pending_error = Some(DecoderError::CorruptedFrame);
                     Ok((0, frames_out))
                 } else {
                     Err(DecoderError::CorruptedFrame)
@@ -6534,6 +6833,403 @@ mod tests {
             aac_dec.decode(&bad_m4a, &mut pcm_out),
             Err(DecodeError::UnsupportedFeature)
         );
+    }
+
+    fn make_mp4_box_64(fourcc: &[u8; 4], payload: &[u8]) -> std::vec::Vec<u8> {
+        let total = (16 + payload.len()) as u64;
+        let mut out = std::vec::Vec::with_capacity(total as usize);
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn make_mp4_box_eof(fourcc: &[u8; 4], payload: &[u8]) -> std::vec::Vec<u8> {
+        let mut out = std::vec::Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn extract_adts_aus(
+        adts_fixture: &[u8],
+        limit: usize,
+    ) -> (std::vec::Vec<u8>, std::vec::Vec<&[u8]>) {
+        let mut raw_aus = std::vec::Vec::new();
+        let mut adts_prefix = std::vec::Vec::new();
+        let mut pos = 0usize;
+        while pos + 7 <= adts_fixture.len() && raw_aus.len() < limit {
+            let frame_len = (((adts_fixture[pos + 3] as usize) & 0x03) << 11)
+                | ((adts_fixture[pos + 4] as usize) << 3)
+                | (((adts_fixture[pos + 5] as usize) >> 5) & 0x07);
+            assert!(frame_len > 7 && pos + frame_len <= adts_fixture.len());
+            adts_prefix.extend_from_slice(&adts_fixture[pos..pos + frame_len]);
+            raw_aus.push(&adts_fixture[pos + 7..pos + frame_len]);
+            pos += frame_len;
+        }
+        (adts_prefix, raw_aus)
+    }
+
+    fn decode_adts_ref(adts_stream: &[u8]) -> std::vec::Vec<i32> {
+        let mut dec = AacDecoder::new();
+        let mut pcm = std::vec::Vec::new();
+        let mut buf = [0i32; 2048];
+        let mut off = 0usize;
+        while off < adts_stream.len() || dec.has_pending_pcm() {
+            let end = (off + 512).min(adts_stream.len());
+            match dec.decode(&adts_stream[off..end], &mut buf) {
+                Ok((consumed, frames)) => {
+                    off += consumed;
+                    pcm.extend_from_slice(&buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && off >= adts_stream.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if off >= adts_stream.len() && !dec.has_pending_pcm() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("ADTS reference decode failed: {e:?}"),
+            }
+        }
+        pcm
+    }
+
+    fn build_aac_trak_box(raw_aus: &[&[u8]], chunk_offsets: &[u32], spc: u32) -> std::vec::Vec<u8> {
+        let esds_payload: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x03, 23, 0x00, 0x01, 0x00, 0x04, 15, 0x40, 0x15, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x05, 2, 0x12, 0x10,
+        ];
+        let esds_box = make_mp4_box(b"esds", esds_payload);
+        let mut mp4a_payload = std::vec![0u8; 28];
+        mp4a_payload[6..8].copy_from_slice(&1u16.to_be_bytes());
+        mp4a_payload[16..18].copy_from_slice(&2u16.to_be_bytes());
+        mp4a_payload[18..20].copy_from_slice(&16u16.to_be_bytes());
+        mp4a_payload[24..28].copy_from_slice(&(44100u32 << 16).to_be_bytes());
+        mp4a_payload.extend_from_slice(&esds_box);
+        let mp4a_box = make_mp4_box(b"mp4a", &mp4a_payload);
+
+        let mut stsd_payload = std::vec![0u8; 8];
+        stsd_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsd_payload.extend_from_slice(&mp4a_box);
+        let stsd_box = make_mp4_box(b"stsd", &stsd_payload);
+
+        let mut stsc_payload = std::vec![0u8; 8];
+        stsc_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&spc.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        let stsc_box = make_mp4_box(b"stsc", &stsc_payload);
+
+        let mut stsz_payload = std::vec![0u8; 12];
+        stsz_payload[8..12].copy_from_slice(&(raw_aus.len() as u32).to_be_bytes());
+        for au in raw_aus {
+            stsz_payload.extend_from_slice(&(au.len() as u32).to_be_bytes());
+        }
+        let stsz_box = make_mp4_box(b"stsz", &stsz_payload);
+
+        let mut stco_payload = std::vec![0u8; 8];
+        stco_payload[4..8].copy_from_slice(&(chunk_offsets.len() as u32).to_be_bytes());
+        for &off in chunk_offsets {
+            stco_payload.extend_from_slice(&off.to_be_bytes());
+        }
+        let stco_box = make_mp4_box(b"stco", &stco_payload);
+
+        let mut stbl_payload = std::vec::Vec::new();
+        stbl_payload.extend_from_slice(&stsd_box);
+        stbl_payload.extend_from_slice(&stsc_box);
+        stbl_payload.extend_from_slice(&stsz_box);
+        stbl_payload.extend_from_slice(&stco_box);
+        let stbl_box = make_mp4_box(b"stbl", &stbl_payload);
+        let minf_box = make_mp4_box(b"minf", &stbl_box);
+        let mdia_box = make_mp4_box(b"mdia", &minf_box);
+        make_mp4_box(b"trak", &mdia_box)
+    }
+
+    fn decode_aac_chunked(
+        stream: &[u8],
+        chunk_size: usize,
+    ) -> Result<(AacDecoder, std::vec::Vec<i32>), DecoderError> {
+        let mut dec = AacDecoder::new();
+        let mut pcm = std::vec::Vec::new();
+        let mut buf = [0i32; 2048];
+        let mut off = 0usize;
+        let mut window = chunk_size;
+        while off < stream.len() || dec.has_pending_pcm() {
+            let end = (off + window).min(stream.len());
+            match dec.decode(&stream[off..end], &mut buf) {
+                Ok((consumed, frames)) => {
+                    off += consumed;
+                    if consumed > 0 {
+                        window = chunk_size;
+                    }
+                    pcm.extend_from_slice(&buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && off >= stream.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if end >= stream.len() && !dec.has_pending_pcm() {
+                        break;
+                    }
+                    window = window.saturating_add(chunk_size);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((dec, pcm))
+    }
+
+    #[test]
+    fn test_aac_adts_skips_id3v2_header() {
+        warm_up_decoders();
+        let adts_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+        let (adts_prefix, _) = extract_adts_aus(adts_fixture, 8);
+        let ref_pcm = decode_adts_ref(&adts_prefix);
+
+        // ID3v2.4 header with 10-byte footer flag (0x10) and 200-byte tag body.
+        let tag_body_len = 200usize;
+        let mut stream = std::vec![
+            b'I',
+            b'D',
+            b'3',
+            0x04,
+            0x00,
+            0x10,
+            ((tag_body_len >> 21) & 0x7F) as u8,
+            ((tag_body_len >> 14) & 0x7F) as u8,
+            ((tag_body_len >> 7) & 0x7F) as u8,
+            (tag_body_len & 0x7F) as u8,
+        ];
+        // Include "ftyp" inside the ID3 body to prove ID3 skip runs before MP4 sniff.
+        stream.extend_from_slice(&[0x00; 4]);
+        stream.extend_from_slice(b"ftyp");
+        stream.resize(10 + tag_body_len + 10, 0x5A);
+        stream.extend_from_slice(&adts_prefix);
+
+        // Feed ID3v2 in 5-byte chunks (splitting header, body, and footer),
+        // then feed ADTS in 512-byte chunks to verify bit-exact PCM parity.
+        let mut dec = AacDecoder::new();
+        let mut pcm = std::vec::Vec::new();
+        let mut buf = [0i32; 2048];
+        let mut off = 0usize;
+        let mut window = 5usize;
+        while off < stream.len() || dec.has_pending_pcm() {
+            let step = if off < 220 { window } else { 512 };
+            let end = (off + step).min(stream.len());
+            match dec.decode(&stream[off..end], &mut buf) {
+                Ok((consumed, frames)) => {
+                    off += consumed;
+                    if consumed > 0 {
+                        window = 5;
+                    }
+                    pcm.extend_from_slice(&buf[..frames * 2]);
+                    if consumed == 0 && frames == 0 && off >= stream.len() {
+                        break;
+                    }
+                }
+                Err(DecoderError::NeedMoreData) => {
+                    if end >= stream.len() && !dec.has_pending_pcm() {
+                        break;
+                    }
+                    window = window.saturating_add(5);
+                }
+                Err(e) => panic!("ID3+ADTS decode failed: {e:?}"),
+            }
+        }
+        assert_eq!(dec.is_mp4, Some(false));
+        assert_eq!(pcm.len(), ref_pcm.len());
+        assert_eq!(pcm, ref_pcm);
+    }
+
+    #[test]
+    fn test_aac_mp4_64bit_and_eof_boxes() {
+        warm_up_decoders();
+        let adts_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+        let (adts_prefix, raw_aus) = extract_adts_aus(adts_fixture, 8);
+        let ref_pcm = decode_adts_ref(&adts_prefix);
+
+        let ftyp = make_mp4_box(b"ftyp", b"M4A \x00\x00\x02\x00M4A mp42isom");
+        let free64 = make_mp4_box_64(b"free", &[0x11u8; 24]);
+        let dummy_trak = build_aac_trak_box(&raw_aus, &[0], 8);
+        let moov_len = 8 + dummy_trak.len();
+        // mdat uses 64-bit size == 1 header (16 bytes).
+        let chunk0_off = (ftyp.len() + free64.len() + moov_len + 16) as u32;
+        let trak = build_aac_trak_box(&raw_aus, &[chunk0_off], 8);
+        let moov = make_mp4_box(b"moov", &trak);
+
+        let mut mdat_payload = std::vec::Vec::new();
+        for au in &raw_aus {
+            mdat_payload.extend_from_slice(au);
+        }
+        let mdat64 = make_mp4_box_64(b"mdat", &mdat_payload);
+
+        let mut stream64 = std::vec::Vec::new();
+        stream64.extend_from_slice(&ftyp);
+        stream64.extend_from_slice(&free64);
+        stream64.extend_from_slice(&moov);
+        stream64.extend_from_slice(&mdat64);
+        let (_, pcm64) = decode_aac_chunked(&stream64, 13).unwrap();
+        assert_eq!(pcm64, ref_pcm);
+
+        // Trailing size == 0 to-EOF mdat box must also decode bit-exact.
+        let chunk0_eof_off = (ftyp.len() + moov_len + 8) as u32;
+        let trak_eof = build_aac_trak_box(&raw_aus, &[chunk0_eof_off], 8);
+        let moov_eof = make_mp4_box(b"moov", &trak_eof);
+        let mdat_eof = make_mp4_box_eof(b"mdat", &mdat_payload);
+        let mut stream_eof = std::vec::Vec::new();
+        stream_eof.extend_from_slice(&ftyp);
+        stream_eof.extend_from_slice(&moov_eof);
+        stream_eof.extend_from_slice(&mdat_eof);
+        let (_, pcm_eof) = decode_aac_chunked(&stream_eof, 64).unwrap();
+        assert_eq!(pcm_eof, ref_pcm);
+
+        // Unknown trailing size == 0 to-EOF box skips cleanly without InvalidHeader.
+        let unknown_eof = make_mp4_box_eof(b"uuid", &[0xAAu8; 32]);
+        let mut probe_stream = std::vec::Vec::new();
+        probe_stream.extend_from_slice(&ftyp);
+        probe_stream.extend_from_slice(&unknown_eof);
+        let mut probe_dec = AacDecoder::new();
+        let mut pcm_out = [0i32; 64];
+        assert!(probe_dec.decode(&probe_stream, &mut pcm_out).is_ok());
+    }
+
+    #[test]
+    fn test_aac_mp4_non_faststart_handling() {
+        warm_up_decoders();
+        let adts_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+        let (adts_prefix, raw_aus) = extract_adts_aus(adts_fixture, 8);
+        let ref_pcm = decode_adts_ref(&adts_prefix);
+
+        let ftyp = make_mp4_box(b"ftyp", b"M4A \x00\x00\x02\x00M4A mp42isom");
+        let mut mdat_payload = std::vec![0xCCu8; 8];
+        for au in &raw_aus {
+            mdat_payload.extend_from_slice(au);
+        }
+        let mdat = make_mp4_box(b"mdat", &mdat_payload);
+
+        // mdat appears BEFORE moov; stco points to payload inside mdat.
+        let chunk0_off = (ftyp.len() + 8 + 8) as u32;
+        let trak = build_aac_trak_box(&raw_aus, &[chunk0_off], 8);
+        let moov = make_mp4_box(b"moov", &trak);
+
+        let mut non_faststart = std::vec::Vec::new();
+        non_faststart.extend_from_slice(&ftyp);
+        non_faststart.extend_from_slice(&mdat);
+        non_faststart.extend_from_slice(&moov);
+
+        let (_, pcm) = decode_aac_chunked(&non_faststart, 128).unwrap();
+        assert_eq!(pcm, ref_pcm);
+
+        // Oversized mdat before moov (> MAX_MP4_META_BUF) must return
+        // UnsupportedFeature.
+        let mut oversized = std::vec::Vec::new();
+        oversized.extend_from_slice(&ftyp);
+        oversized.extend_from_slice(&make_mp4_box(
+            b"mdat",
+            &std::vec![0u8; MAX_MP4_META_BUF + 16],
+        ));
+        oversized.extend_from_slice(&moov);
+        assert_eq!(
+            decode_aac_chunked(&oversized, 4096).err(),
+            Some(DecoderError::UnsupportedFeature)
+        );
+        assert_eq!(
+            decode_aac_chunked(&oversized, oversized.len()).err(),
+            Some(DecoderError::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn test_aac_mp4_second_trak_preserves_audio_tables() {
+        warm_up_decoders();
+        let adts_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+        let (adts_prefix, raw_aus) = extract_adts_aus(adts_fixture, 8);
+        let ref_pcm = decode_adts_ref(&adts_prefix);
+
+        let ftyp = make_mp4_box(b"ftyp", b"M4A \x00\x00\x02\x00M4A mp42isom");
+
+        // Second dummy trak (e.g., cover art / chapters) with different stsz/stco.
+        let mut dummy_stsz = std::vec![0u8; 12];
+        dummy_stsz[4..8].copy_from_slice(&999u32.to_be_bytes());
+        dummy_stsz[8..12].copy_from_slice(&1u32.to_be_bytes());
+        let mut dummy_stco = std::vec![0u8; 12];
+        dummy_stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+        dummy_stco[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let mut dummy_stbl = std::vec::Vec::new();
+        dummy_stbl.extend_from_slice(&make_mp4_box(b"stsz", &dummy_stsz));
+        dummy_stbl.extend_from_slice(&make_mp4_box(b"stco", &dummy_stco));
+        let dummy_trak = make_mp4_box(
+            b"trak",
+            &make_mp4_box(
+                b"mdia",
+                &make_mp4_box(b"minf", &make_mp4_box(b"stbl", &dummy_stbl)),
+            ),
+        );
+
+        let probe_trak = build_aac_trak_box(&raw_aus, &[0], 8);
+        let moov_len = 8 + probe_trak.len() + dummy_trak.len();
+        let chunk0_off = (ftyp.len() + moov_len + 8) as u32;
+        let audio_trak = build_aac_trak_box(&raw_aus, &[chunk0_off], 8);
+        let mut moov_payload = std::vec::Vec::new();
+        moov_payload.extend_from_slice(&audio_trak);
+        moov_payload.extend_from_slice(&dummy_trak);
+        let moov = make_mp4_box(b"moov", &moov_payload);
+
+        let mut mdat_payload = std::vec::Vec::new();
+        for au in &raw_aus {
+            mdat_payload.extend_from_slice(au);
+        }
+        let mdat = make_mp4_box(b"mdat", &mdat_payload);
+
+        let mut stream = std::vec::Vec::new();
+        stream.extend_from_slice(&ftyp);
+        stream.extend_from_slice(&moov);
+        stream.extend_from_slice(&mdat);
+
+        let (_, pcm) = decode_aac_chunked(&stream, 256).unwrap();
+        assert_eq!(pcm, ref_pcm);
+    }
+
+    #[test]
+    fn test_aac_partial_output_preserves_pending_error() {
+        warm_up_decoders();
+        let adts_fixture = include_bytes!("../tests/fixtures/sine_440_1000_stereo_44k1_lc.aac");
+        let (_, raw_aus) = extract_adts_aus(adts_fixture, 1);
+
+        let ftyp = make_mp4_box(b"ftyp", b"M4A \x00\x00\x02\x00M4A mp42isom");
+        // Sample 0 is valid; sample 1 is a truncated CPE frame that fails syom::feed.
+        let corrupt_au = [0x20u8, 0x00, 0x00, 0x00];
+        let aus: [&[u8]; 2] = [raw_aus[0], &corrupt_au];
+        let probe_trak = build_aac_trak_box(&aus, &[0], 2);
+        let moov_len = 8 + probe_trak.len();
+        let chunk0_off = (ftyp.len() + moov_len + 8) as u32;
+        let trak = build_aac_trak_box(&aus, &[chunk0_off], 2);
+        let moov = make_mp4_box(b"moov", &trak);
+        let mut mdat_payload = std::vec::Vec::new();
+        mdat_payload.extend_from_slice(aus[0]);
+        mdat_payload.extend_from_slice(aus[1]);
+        let mdat = make_mp4_box(b"mdat", &mdat_payload);
+
+        let mut stream = std::vec::Vec::new();
+        stream.extend_from_slice(&ftyp);
+        stream.extend_from_slice(&moov);
+        stream.extend_from_slice(&mdat);
+
+        let mut dec = AacDecoder::new();
+        // Large output buffer holds sample 0, then sample 1 fails in same call.
+        let mut out = [0i32; 4096];
+        let first = dec.decode(&stream, &mut out);
+        assert_eq!(first, Ok((stream.len(), 1024)));
+        // Next decode call must surface the stashed CorruptedFrame error.
+        assert_eq!(dec.decode(&[], &mut out), Err(DecoderError::CorruptedFrame));
+        // flush() clears any stashed pending_error.
+        dec.pending_error = Some(DecoderError::CorruptedFrame);
+        dec.flush();
+        assert_eq!(dec.pending_error, None);
     }
 
     #[test]
