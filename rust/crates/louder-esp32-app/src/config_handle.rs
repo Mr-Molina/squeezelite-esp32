@@ -864,7 +864,14 @@ impl ConfigHandle {
                     &mut ip_buf,
                     format_args!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]),
                 );
-                if !self.set_nvs_override("lms_server_ip", v)
+                let preserve_server_ip_port = k == "lms_ip"
+                    && port.is_none()
+                    && matches!(
+                        self.nvs_override("lms_server_ip")
+                            .and_then(|cur| parse_lms_server_endpoint(cur.as_str())),
+                        Some((cur_ip, Some(_))) if cur_ip == octets
+                    );
+                if (!preserve_server_ip_port && !self.set_nvs_override("lms_server_ip", v))
                     || !self.set_nvs_override("lms_ip", ip_buf.as_str())
                 {
                     return false;
@@ -873,6 +880,8 @@ impl ConfigHandle {
                     c.lms_server_ip = Some(octets);
                     if let Some(p) = port {
                         c.lms_server_port = Some(p);
+                    } else if k == "lms_server_ip" {
+                        c.lms_server_port = None;
                     }
                 });
                 true
@@ -2442,5 +2451,47 @@ mod tests {
         assert!(handle.flush_now(&mut ram));
         let parsed = ram.parsed_nvs_overrides();
         assert_eq!(parsed.value("autoexec1"), Some(long_val.as_str()));
+    }
+
+    #[test]
+    fn test_cold_boot_restore_preserves_lms_server_ip_port() {
+        let mut handle = ConfigHandle::new(AudioConfig::default());
+        assert!(handle.apply_key_value("lms_server_ip", "172.25.8.40:9000"));
+        assert!(handle.apply_key_value(
+            "autoexec1",
+            "squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W -s 172.25.8.40:9000 -n BASEMENT",
+        ));
+
+        let mut image = JournalSector::erased();
+        let mut ram = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
+        assert!(handle.flush_now(&mut ram));
+        let pending = ram.pending_image().expect("pending image");
+
+        let mut image2 = JournalSector::erased();
+        let mut restored_ram = RamJournal::new(&mut image2, None, FlashTargetPolicy::FixedA);
+        assert!(restored_ram.restore_from_sector(pending.sector));
+        let mut restored = ConfigHandle::new(AudioConfig::default());
+        restored_ram.restore_into_handle(&mut restored);
+
+        assert_eq!(
+            restored.nvs_override("lms_server_ip").as_deref(),
+            Some("172.25.8.40:9000"),
+            "cold-boot replay must preserve :port on lms_server_ip"
+        );
+        assert_eq!(
+            restored.nvs_override("lms_ip").as_deref(),
+            Some("172.25.8.40")
+        );
+        assert_eq!(
+            restored.read(|c| (c.lms_server_ip, c.lms_server_port)),
+            (Some([172, 25, 8, 40]), Some(9000))
+        );
+
+        assert!(restored.apply_key_value("lms_server_ip", "172.25.8.40"));
+        assert_eq!(
+            restored.nvs_override("lms_server_ip").as_deref(),
+            Some("172.25.8.40")
+        );
+        assert_eq!(restored.read(|c| c.lms_server_port), None);
     }
 }
