@@ -226,6 +226,56 @@ fn write_journal_sector_with_ctx<Ctx, E>(
     res
 }
 
+/// Polls debounced config commits and writes any pending journal image to NOR
+/// flash with [`DEBOUNCE_MS`] retry backoff on write failure.
+#[cfg(any(target_arch = "xtensa", test))]
+fn poll_and_persist_journal_with_ctx<Ctx, E>(
+    ctx: &mut Ctx,
+    (config, config_writer, journal): (
+        &louder_esp32_app::config_handle::ConfigHandle,
+        &mut louder_esp32_app::config_handle::ConfigWriter,
+        &mut louder_esp32_app::config_handle::RamJournal<'_>,
+    ),
+    (last_flash_retry_ms, now_ms, base_offset): (&mut Option<u64>, u64, u32),
+    park_fn: impl FnOnce(&mut Ctx) -> Result<(), Core1ParkError>,
+    erase_fn: impl FnMut(&mut Ctx, u32, u32) -> Result<(), E>,
+    write_fn: impl FnMut(&mut Ctx, u32, &[u8]) -> Result<(), E>,
+    unpark_fn: impl FnOnce(&mut Ctx),
+) -> bool {
+    let _ = config_writer.poll(config, journal, now_ms);
+    if let Some(prev_ms) = *last_flash_retry_ms {
+        if now_ms.saturating_sub(prev_ms) < u64::from(louder_esp32_app::config_handle::DEBOUNCE_MS)
+        {
+            return false;
+        }
+    }
+    let Some(image) = journal.pending_image() else {
+        return false;
+    };
+    let offset = if cfg!(feature = "runtime-flash-persist") {
+        image.slot.offset(base_offset)
+    } else {
+        base_offset
+    };
+    if write_journal_sector_with_ctx(
+        ctx,
+        (offset, image.sector, image.used_len),
+        park_fn,
+        erase_fn,
+        write_fn,
+        unpark_fn,
+    )
+    .is_ok()
+    {
+        journal.mark_flash_written();
+        *last_flash_retry_ms = None;
+        true
+    } else {
+        *last_flash_retry_ms = Some(now_ms);
+        false
+    }
+}
+
 #[cfg(test)]
 fn write_journal_sector_with<E>(
     offset: u32,
@@ -2988,6 +3038,7 @@ mod xtensa_hw {
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
         last_config_poll_ms: u64,
+        last_flash_retry_ms: Option<u64>,
         mdns_bound: bool,
         last_mdns_announce_ms: u64,
         last_mdns_reply_ms: Option<u64>,
@@ -3478,6 +3529,7 @@ mod xtensa_hw {
             latest_telemetry,
             last_cyd_progress_ms: 0,
             last_config_poll_ms: 0,
+            last_flash_retry_ms: None,
             mdns_bound: false,
             last_mdns_announce_ms: 0,
             last_mdns_reply_ms: None,
@@ -4311,16 +4363,15 @@ mod xtensa_hw {
                         let resp_buf = &mut s.http_resp_buf[..];
                         let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
                             "", "", "string",
-                        ); 20];
+                        );
+                            louder_esp32_app::config_handle::MAX_NVS_OVERRIDE_SLOTS];
                         let mut view_len = 0usize;
-                        let nvs_overrides = s.config.nvs_overrides();
-                        for slot in &nvs_overrides {
-                            if slot.used && view_len < extra_views.len() {
+                        let nvs_overrides = s.config.nvs_override_table();
+                        for (key, value) in nvs_overrides.iter() {
+                            if view_len < extra_views.len() {
                                 extra_views[view_len] =
                                     louder_esp32_app::http_control::ConfigEntryView::new(
-                                        slot.key.as_str(),
-                                        slot.value.as_str(),
-                                        "string",
+                                        key, value, "string",
                                     );
                                 view_len += 1;
                             }
@@ -5238,27 +5289,16 @@ mod xtensa_hw {
                 .min(u32::MAX as u64) as u32;
             s.last_bt_window_tick_ms = now_ms;
             sync_bt_security_from_config(s.bt_sink, s.config, &mut s.bt_sync_state, elapsed_ms);
-            if s.config_writer.poll(s.config, &mut *s.journal, now_ms) {
-                if let Some(image) = s.journal.pending_image() {
-                    #[cfg(not(feature = "runtime-flash-persist"))]
-                    let offset = SETTINGS_JOURNAL_OFFSET;
-                    #[cfg(feature = "runtime-flash-persist")]
-                    let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-                    let mut flash_ctx = (&mut s.core1, &mut s.flash);
-                    if write_journal_sector_with_ctx(
-                        &mut flash_ctx,
-                        (offset, image.sector, image.used_len),
-                        |ctx| ctx.0.park_for_flash_write(),
-                        |ctx, start, end| ctx.1.erase(start, end),
-                        |ctx, addr, data| ctx.1.write_nor(addr, data),
-                        |ctx| ctx.0.unpark_after_flash_write(),
-                    )
-                    .is_ok()
-                    {
-                        s.journal.mark_flash_written();
-                    }
-                }
-            }
+            let mut flash_ctx = (&mut s.core1, &mut s.flash);
+            let _ = poll_and_persist_journal_with_ctx(
+                &mut flash_ctx,
+                (s.config, &mut s.config_writer, &mut *s.journal),
+                (&mut s.last_flash_retry_ms, now_ms, SETTINGS_JOURNAL_OFFSET),
+                |ctx| ctx.0.park_for_flash_write(),
+                |ctx, start, end| ctx.1.erase(start, end),
+                |ctx, addr, data| ctx.1.write_nor(addr, data),
+                |ctx| ctx.0.unpark_after_flash_write(),
+            );
         }
     }
 
@@ -6020,5 +6060,102 @@ mod tests {
         sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
         assert_eq!(sink.pending_numeric_passkey(), None);
         assert_eq!(cfg.nvs_override("bt_confirm").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_flush_now_pending_journal_still_persists_to_flash() {
+        use louder_esp32_app::config_handle::{
+            ConfigHandle, ConfigWriter, FlashTargetPolicy, JournalSector, RamJournal, DEBOUNCE_MS,
+        };
+        use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
+
+        let mut config = ConfigHandle::new(first_boot_defaults::audio_config());
+        let mut image = JournalSector::erased();
+        let mut journal = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
+        let mut writer = ConfigWriter::new(&config, 0);
+        let mut last_flash_retry_ms: Option<u64> = None;
+
+        assert!(config.apply_key_value("lms_server_ip", "172.25.8.40:9000"));
+        assert!(config.flush_now(&mut journal));
+        assert!(!config.is_dirty());
+        assert!(journal.pending_image().is_some());
+
+        let mut fail_ctx = true;
+        let failed = poll_and_persist_journal_with_ctx(
+            &mut fail_ctx,
+            (&config, &mut writer, &mut journal),
+            (&mut last_flash_retry_ms, 100, SETTINGS_JOURNAL_OFFSET),
+            |fail| {
+                if *fail {
+                    Err(Core1ParkError::AckTimeout)
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| Ok::<(), ()>(()),
+            |_, _, _| Ok::<(), ()>(()),
+            |_| {},
+        );
+        assert!(!failed);
+        assert!(journal.pending_image().is_some());
+
+        let mut ok_ctx = ([0xFFu8; 4096], 0usize, 0usize, 0usize, 0usize);
+        let skipped = poll_and_persist_journal_with_ctx(
+            &mut ok_ctx,
+            (&config, &mut writer, &mut journal),
+            (&mut last_flash_retry_ms, 200, SETTINGS_JOURNAL_OFFSET),
+            |c| {
+                c.3 += 1;
+                Ok(())
+            },
+            |c, _, _| {
+                c.1 += 1;
+                c.0.fill(0xFF);
+                Ok::<(), ()>(())
+            },
+            |c, addr, data| {
+                c.2 += 1;
+                let off = (addr - SETTINGS_JOURNAL_OFFSET) as usize;
+                c.0[off..off + data.len()].copy_from_slice(data);
+                Ok::<(), ()>(())
+            },
+            |c| {
+                c.4 += 1;
+            },
+        );
+        assert!(!skipped);
+        assert_eq!((ok_ctx.1, ok_ctx.2, ok_ctx.3, ok_ctx.4), (0, 0, 0, 0));
+
+        let persisted = poll_and_persist_journal_with_ctx(
+            &mut ok_ctx,
+            (&config, &mut writer, &mut journal),
+            (
+                &mut last_flash_retry_ms,
+                100 + u64::from(DEBOUNCE_MS),
+                SETTINGS_JOURNAL_OFFSET,
+            ),
+            |c| {
+                c.3 += 1;
+                Ok(())
+            },
+            |c, _, _| {
+                c.1 += 1;
+                c.0.fill(0xFF);
+                Ok::<(), ()>(())
+            },
+            |c, addr, data| {
+                c.2 += 1;
+                let off = (addr - SETTINGS_JOURNAL_OFFSET) as usize;
+                c.0[off..off + data.len()].copy_from_slice(data);
+                Ok::<(), ()>(())
+            },
+            |c| {
+                c.4 += 1;
+            },
+        );
+        assert!(persisted);
+        assert!(journal.pending_image().is_none());
+        assert_eq!((ok_ctx.1, ok_ctx.2, ok_ctx.3, ok_ctx.4), (1, 3, 1, 1));
+        assert_eq!(&ok_ctx.0[2048..2052], b"NVS2");
     }
 }

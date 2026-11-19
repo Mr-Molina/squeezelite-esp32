@@ -599,6 +599,20 @@ pub fn write_config_json(
     let mut writer = BufferWriter::new(out_buf);
     let find_override =
         |k: &str| -> Option<&str> { extra_entries.iter().find(|e| e.key == k).map(|e| e.value) };
+    let (effective_lms_ip, effective_lms_port) = find_override("lms_server_ip")
+        .and_then(crate::config_handle::parse_lms_server_endpoint)
+        .map(|(ip, port_opt)| (ip, port_opt.unwrap_or(snapshot.lms_port)))
+        .or_else(|| {
+            find_override("lms_ip")
+                .and_then(crate::config_handle::parse_lms_server_endpoint)
+                .map(|(ip, _)| (ip, snapshot.lms_port))
+        })
+        .unwrap_or((snapshot.lms_ip, snapshot.lms_port));
+    let fallback_player_name = if !snapshot.player_name.is_empty() {
+        snapshot.player_name
+    } else {
+        crate::board::first_boot_defaults::PLAYER_NAME
+    };
     write!(
         writer,
         "{{\"settings_seq\":{},\"gpio\":[",
@@ -625,11 +639,11 @@ pub fn write_config_json(
          \"lms_ip\":\"{}.{}.{}.{}\",\"lms_port\":{},\"lms_cport\":{},\
          \"vol_pct\":{},\"eq_preset\":\"{}\",\"again_code\":{}",
         JsonEscaped(snapshot.ssid),
-        snapshot.lms_ip[0],
-        snapshot.lms_ip[1],
-        snapshot.lms_ip[2],
-        snapshot.lms_ip[3],
-        snapshot.lms_port,
+        effective_lms_ip[0],
+        effective_lms_ip[1],
+        effective_lms_ip[2],
+        effective_lms_ip[3],
+        effective_lms_port,
         snapshot.lms_cport,
         snapshot.vol_pct,
         JsonEscaped(snapshot.eq_preset),
@@ -640,7 +654,12 @@ pub fn write_config_json(
         if crate::config_handle::is_secret_config_key(key) {
             continue;
         }
-        let effective_val = find_override(key).unwrap_or(val);
+        let default_val = if key == "host_name" {
+            fallback_player_name
+        } else {
+            val
+        };
+        let effective_val = find_override(key).unwrap_or(default_val);
         write!(
             writer,
             ",\"{}\":{{\"value\":\"{}\",\"type\":{}}}",
@@ -670,8 +689,7 @@ pub fn write_config_json(
         )
         .ok()?;
     }
-    let host_name_val =
-        find_override("host_name").unwrap_or(crate::board::first_boot_defaults::PLAYER_NAME);
+    let host_name_val = find_override("host_name").unwrap_or(fallback_player_name);
     let autoexec_val = find_override("autoexec").unwrap_or("1");
     let autoexec1_val =
         find_override("autoexec1").unwrap_or("squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W");
@@ -1493,7 +1511,7 @@ pub fn apply_web_config_update(
     if decoded_key.is_empty() {
         return false;
     }
-    let Some(decoded_val_str) = percent_decode_str::<128>(value) else {
+    let Some(decoded_val_str) = percent_decode_str::<256>(value) else {
         return false;
     };
     let decoded_val = decoded_val_str.as_str().trim();
@@ -1525,7 +1543,7 @@ pub fn execute_web_cli_command(
     config: &mut crate::config_handle::ConfigHandle,
     syslog: &mut SyslogRingBuffer,
 ) -> bool {
-    let Some(decoded_cmd) = percent_decode_str::<128>(cmd) else {
+    let Some(decoded_cmd) = percent_decode_str::<256>(cmd) else {
         return false;
     };
     let clean = decoded_cmd.as_str().trim();
@@ -1539,6 +1557,31 @@ pub fn execute_web_cli_command(
     let mut msg: String<128> = String::new();
 
     match verb {
+        "squeezelite" => {
+            if config.apply_key_value("autoexec1", clean) {
+                let _ = write!(
+                    msg,
+                    "autoexec1: {} (host={})",
+                    SyslogSanitized(clean),
+                    SyslogSanitized(config.host_name_str())
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                true
+            } else {
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "squeezelite: rejected autoexec1 command",
+                );
+                false
+            }
+        }
         "free" | "heap" => {
             let _ = write!(
                 msg,
@@ -3776,27 +3819,36 @@ pub fn handle_http_request_streaming_impl(
             let payload = extract_query_or_body(raw_path, req_bytes);
             let decoded_upd = parse_config_update_query(payload).and_then(|upd| {
                 let dk = percent_decode_str::<64>(upd.key)?;
-                let dv = percent_decode_str::<128>(upd.value)?;
+                let dv = percent_decode_str::<256>(upd.value)?;
                 if dk.trim().is_empty() {
                     return None;
                 }
                 Some((dk, dv))
             });
             let (body_len, action) = if let Some((decoded_key, decoded_val)) = decoded_upd {
-                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
-                let display_val = if is_secret_config_key_ci(decoded_key.as_str()) {
-                    "********"
+                let mut probe = crate::config_handle::ConfigHandle::default();
+                if !probe.apply_key_value(decoded_key.as_str(), decoded_val.as_str()) {
+                    let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                    writer
+                        .write_str("{\"ok\":false,\"error\":\"invalid_config_value\"}")
+                        .ok()?;
+                    (writer.written_len(), HttpControlAction::None)
                 } else {
-                    decoded_val.as_str()
-                };
-                write!(
-                    writer,
-                    "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
-                    JsonEscaped(decoded_key.as_str()),
-                    JsonEscaped(display_val),
-                )
-                .ok()?;
-                (writer.written_len(), HttpControlAction::UpdateConfig)
+                    let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                    let display_val = if is_secret_config_key_ci(decoded_key.as_str()) {
+                        "********"
+                    } else {
+                        decoded_val.as_str()
+                    };
+                    write!(
+                        writer,
+                        "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
+                        JsonEscaped(decoded_key.as_str()),
+                        JsonEscaped(display_val),
+                    )
+                    .ok()?;
+                    (writer.written_len(), HttpControlAction::UpdateConfig)
+                }
             } else {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
                 writer
@@ -5839,5 +5891,177 @@ mod tests {
         let mut s = std::string::String::new();
         write_json_escaped_str(&mut s, "Café 🎵 \"Hi\"\n").unwrap();
         assert_eq!(s, "Café 🎵 \\\"Hi\\\"\\n");
+    }
+
+    #[test]
+    fn test_tdd_fix_b_lms_server_ip_roundtrip_and_snapshot_32_slots() {
+        use crate::config_handle::{
+            ConfigHandle, FlashTargetPolicy, JournalSector, RamJournal, MAX_NVS_OVERRIDE_SLOTS,
+        };
+
+        let snap = sample_snapshot();
+        let req = b"POST /config.json HTTP/1.1\r\n\r\nkey=lms_server_ip&value=172.25.8.40%3A9000";
+        let mut buf = [0u8; 4096];
+        let (len, act) =
+            handle_http_control_request(req, &snap, &mut buf).expect("POST /config.json");
+        assert_eq!(act, HttpControlAction::UpdateConfig);
+        let resp = core::str::from_utf8(&buf[..len]).expect("utf8");
+        assert!(resp.contains("\"ok\":true"));
+
+        let cfg = ConfigHandle::default();
+        let mut sector = JournalSector::erased();
+        let mut journal = RamJournal::new(&mut sector, None, FlashTargetPolicy::FixedA);
+        dispatch_web_post_action(act, req, &snap, &cfg, &mut journal);
+
+        assert_eq!(cfg.lms_server_ip(), Some([172, 25, 8, 40]));
+        assert_eq!(cfg.read(|c| c.lms_server_port), Some(9000));
+        assert!(journal.pending_image().is_some());
+
+        let overrides = cfg.nvs_overrides();
+        let mut views = [ConfigEntryView::new("", "", "string"); MAX_NVS_OVERRIDE_SLOTS];
+        let mut view_len = 0usize;
+        for slot in &overrides {
+            if slot.used && view_len < views.len() {
+                views[view_len] =
+                    ConfigEntryView::new(slot.key.as_str(), slot.value.as_str(), "string");
+                view_len += 1;
+            }
+        }
+        let mut snap_updated = snap.clone();
+        snap_updated.lms_ip = cfg.effective_lms_server_ip().unwrap_or(snap.lms_ip);
+        snap_updated.lms_port = cfg.read(|c| c.lms_server_port).unwrap_or(snap.lms_port);
+        snap_updated.player_name = "DEVBENCH";
+
+        let (glen, _, gact) = handle_http_request_streaming_with_entries(
+            b"GET /config.json HTTP/1.1\r\n\r\n",
+            &snap_updated,
+            &views[..view_len],
+            &mut buf,
+        )
+        .expect("GET /config.json");
+        assert_eq!(gact, HttpControlAction::None);
+        let gresp = core::str::from_utf8(&buf[..glen]).expect("utf8");
+        assert!(gresp.contains("\"lms_ip\":\"172.25.8.40\""));
+        assert!(gresp.contains("\"lms_port\":9000"));
+        assert!(gresp.contains("\"lms_server_ip\":{\"value\":\"172.25.8.40:9000\""));
+        assert!(gresp.contains("\"host_name\":{\"value\":\"DEVBENCH\""));
+
+        // Verify all 32 NVS override slots serialize cleanly via write_config_json.
+        let cfg32 = ConfigHandle::default();
+        let mut keys_owned = std::vec::Vec::with_capacity(MAX_NVS_OVERRIDE_SLOTS);
+        let mut vals_owned = std::vec::Vec::with_capacity(MAX_NVS_OVERRIDE_SLOTS);
+        for i in 0..MAX_NVS_OVERRIDE_SLOTS {
+            let k = format!("slot_k_{i:02}");
+            let v = format!("slot_v_{i:02}");
+            assert!(cfg32.set_nvs_override(&k, &v));
+            keys_owned.push(k);
+            vals_owned.push(v);
+        }
+        let slots32 = cfg32.nvs_overrides();
+        let mut views32 = [ConfigEntryView::new("", "", "string"); MAX_NVS_OVERRIDE_SLOTS];
+        for (i, slot) in slots32.iter().enumerate() {
+            assert!(slot.used, "slot {i} should be used");
+            views32[i] = ConfigEntryView::new(slot.key.as_str(), slot.value.as_str(), "string");
+        }
+        let wlen = write_config_json(&snap_updated, &views32, &mut buf)
+            .expect("32 NVS override slots fit in 4096B buffer");
+        let wjson = core::str::from_utf8(&buf[..wlen]).expect("utf8");
+        for (k, v) in keys_owned.iter().zip(vals_owned.iter()) {
+            let needle = format!("\"{k}\":{{\"value\":\"{v}\"");
+            assert!(wjson.contains(&needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn test_tdd_fix_b_percent_encoded_autoexec1_over_128_raw_bytes() {
+        use crate::config_handle::ConfigHandle;
+
+        let decoded = "squeezelite -o I2S -n BASEMENT_DEVBENCH -s 172.25.8.40:9000 \
+             -b 500:2000 -c flc,pcm,mp3 -d all=info -C 30 -W";
+        assert!((85..=125).contains(&decoded.len()));
+        let encoded = "squeezelite%20-o%20I2S%20-n%20BASEMENT_DEVBENCH%20-s%20172.25.8.40%3A9000\
+             %20-b%20500%3A2000%20-c%20flc%2Cpcm%2Cmp3%20-d%20all%3Dinfo%20-C%2030%20-W";
+        assert!(encoded.len() > 128);
+
+        let snap = sample_snapshot();
+        let req = format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={encoded}");
+        let mut buf = [0u8; 2048];
+        let (len, act) = handle_http_control_request(req.as_bytes(), &snap, &mut buf)
+            .expect("POST /config.json");
+        assert_eq!(act, HttpControlAction::UpdateConfig);
+        let resp = core::str::from_utf8(&buf[..len]).expect("utf8");
+        assert!(resp.contains("\"ok\":true"));
+
+        let mut cfg = ConfigHandle::default();
+        let mut local_syslog = SyslogRingBuffer::new();
+        assert!(apply_web_config_update(
+            "autoexec1",
+            encoded,
+            snap.uptime_ms,
+            &mut cfg,
+            &mut local_syslog,
+        ));
+        assert_eq!(cfg.nvs_override("autoexec1").as_deref(), Some(decoded));
+    }
+
+    #[test]
+    fn test_tdd_fix_b_rejects_invalid_config_value_instead_of_lying_ok() {
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 1024];
+
+        let req_bad_ip = b"POST /config.json HTTP/1.1\r\n\r\nkey=lms_server_ip&value=not_an_ip";
+        let (len1, act1) =
+            handle_http_control_request(req_bad_ip, &snap, &mut buf).expect("POST /config.json");
+        assert_eq!(act1, HttpControlAction::None);
+        let resp1 = core::str::from_utf8(&buf[..len1]).expect("utf8");
+        assert!(resp1.contains("\"ok\":false"));
+        assert!(resp1.contains("invalid_config_value"));
+
+        let too_long = "a".repeat(130);
+        let req_too_long =
+            format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={too_long}");
+        let (len2, act2) = handle_http_control_request(req_too_long.as_bytes(), &snap, &mut buf)
+            .expect("POST /config.json");
+        assert_eq!(act2, HttpControlAction::None);
+        let resp2 = core::str::from_utf8(&buf[..len2]).expect("utf8");
+        assert!(resp2.contains("\"ok\":false"));
+        assert!(resp2.contains("invalid_config_value"));
+    }
+
+    #[test]
+    fn test_tdd_fix_b_commands_json_accepts_squeezelite_autoexec1() {
+        use crate::config_handle::{ConfigHandle, FlashTargetPolicy, JournalSector, RamJournal};
+
+        let snap = sample_snapshot();
+        let req = b"POST /commands.json HTTP/1.1\r\n\r\n\
+            {\"command\":\"squeezelite -o I2S -s 172.25.8.40:9000 -n DEVBENCH\"}";
+        let mut buf = [0u8; 1024];
+        let (len, act) =
+            handle_http_control_request(req, &snap, &mut buf).expect("POST /commands.json");
+        assert_eq!(act, HttpControlAction::ExecuteCliCommand);
+        let resp = core::str::from_utf8(&buf[..len]).expect("utf8");
+        assert!(resp.contains("\"ok\":true"));
+
+        let mut cfg = ConfigHandle::default();
+        let mut syslog = SyslogRingBuffer::new();
+        assert!(execute_web_cli_command(
+            "squeezelite -o I2S -s 172.25.8.40:9000 -n DEVBENCH",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+
+        let cfg2 = ConfigHandle::default();
+        let mut sector = JournalSector::erased();
+        let mut journal = RamJournal::new(&mut sector, None, FlashTargetPolicy::FixedA);
+        dispatch_web_post_action(act, req, &snap, &cfg2, &mut journal);
+        assert_eq!(
+            cfg2.nvs_override("autoexec1").as_deref(),
+            Some("squeezelite -o I2S -s 172.25.8.40:9000 -n DEVBENCH")
+        );
+        assert_eq!(cfg2.lms_server_ip(), Some([172, 25, 8, 40]));
+        assert_eq!(cfg2.read(|c| c.lms_server_port), Some(9000));
+        assert_eq!(cfg2.device_name().as_str(), "DEVBENCH");
+        assert!(journal.pending_image().is_some());
     }
 }

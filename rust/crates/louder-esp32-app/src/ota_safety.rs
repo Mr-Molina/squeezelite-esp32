@@ -1965,7 +1965,14 @@ pub fn is_local_lan_host(host: &str) -> bool {
         return false;
     }
 
-    label.eq_ignore_ascii_case("localhost")
+    let is_single_label_lan = !label.contains('.')
+        && (1..=63).contains(&label.len())
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.bytes().any(|b| b.is_ascii_alphabetic());
+
+    is_single_label_lan
+        || label.eq_ignore_ascii_case("localhost")
         || ends_with_ascii_ci_label(label, ".localhost")
         || ends_with_ascii_ci_label(label, ".local")
 }
@@ -3025,5 +3032,21 @@ mod tests {
         let restored = CrashCounterPolicy::from_rtc_word(rtc, 70_000);
         assert_eq!(restored.crash_count(), 0xFFFF);
         assert!(restored.is_recovery_required());
+    }
+
+    #[test]
+    fn test_tdd_fix_b_single_label_lan_hostnames_allowed_and_public_domains_rejected() {
+        assert!(is_local_lan_host("devbench"));
+        assert!(is_local_lan_host("louder-esp32"));
+        assert!(is_local_lan_host("devbench:8000"));
+
+        for rejected in ["evil.com", "sub.example.org", "-bad", "bad-", "12345", "0"] {
+            assert!(
+                !is_local_lan_host(rejected),
+                "expected reject for {rejected}"
+            );
+        }
+        let too_long = "a".repeat(64);
+        assert!(!is_local_lan_host(&too_long));
     }
 }

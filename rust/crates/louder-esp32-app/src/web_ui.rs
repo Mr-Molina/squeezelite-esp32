@@ -387,7 +387,7 @@ pub const WEB_UI_HTML: &str = concat!(
     "var t=D.getElementById(id);if(t)t.classList.add('active');",
     "if(btn)btn.classList.add('active');",
     "if(id==='tab-syslog'){loadSyslog();loadConfig();}",
-    "if(id==='tab-nvs'||id==='tab-cfg-syst'||id==='tab-cfg-hw')loadConfig();",
+    "if(id==='tab-cfg-audio'||id==='tab-nvs'||id==='tab-cfg-syst'||id==='tab-cfg-hw')loadConfig();",
     "if(id==='tab-wifi')scanWifi();}",
     "function cmd(a){fetch('/cmd.json?act='+a).then(u).catch(()=>{});}",
     "function u(){if(apiBusy>0)return;var n=Date.now();",
@@ -462,16 +462,19 @@ pub const WEB_UI_HTML: &str = concat!(
     "sV('led-vu','led_vu_config');if(nvsVal('led_vu')!==undefined)sV('led-vu','led_vu');",
     "sV('led-brightness','led_brightness');",
     "sV('autoexec1-preview','autoexec1');",
-    "var a1=nvsVal('autoexec1');",
-    "if(a1){",
-    "var m=function(fl){var re=new RegExp('(?:^|\\\\s)'+fl+'\\\\s+([^\\\\s]+)');",
+    "var a1=nvsVal('autoexec1')||'';",
+    "var m=function(fl){if(!a1)return '';",
+    "var re=new RegExp('(?:^|\\\\s)'+fl+'\\\\s+([^\\\\s]+)');",
     "var x=a1.match(re);return x?x[1]:'';};",
     "var sF=function(id,val,isC){var el=D.getElementById(id);if(el&&el!==D.activeElement){",
     "if(isC)el.checked=!!val;else if(val)el.value=val;}};",
-    "sF('sq-name',m('-n'));sF('sq-server',m('-s'));sF('sq-buf',m('-b'));",
+    "sF('sq-name',m('-n')||nvsVal('host_name'));",
+    "sF('sq-server',m('-s')||nvsVal('lms_server_ip')||nvsVal('lms_ip'));",
+    "if(a1){",
+    "sF('sq-buf',m('-b'));",
     "sF('sq-codecs',m('-c'));sF('sq-rates',m('-r'));sF('sq-idle',m('-C'));",
     "sF('sq-debug',m('-d'));sF('sq-resample',m('-R')||m('-u'));",
-    "sF('sq-flac',/(?:^|\\s)-W(?:\\s|$)/.test(a1),true);}}",
+    "sF('sq-flac',/(?:^|\\s)-W(?:\\s|$)/.test(a1),true);}",
     "}).catch(()=>{});loadEq();}",
     "function loadEq(){apiFetch('/eq.json').then(r=>r.json()).then(d=>{",
     "if(d&&Array.isArray(d.bands)){d.bands.forEach(function(b,i){",
@@ -492,11 +495,13 @@ pub const WEB_UI_HTML: &str = concat!(
     "btn.textContent='Save';btn.addEventListener('click',function(){",
     "postConfigKey(k,inp.value).then(function(){showToast('Saved '+k);});});",
     "tdB.appendChild(btn);tr.appendChild(tdB);nb.appendChild(tr);});}",
-    "function postConfigKey(k,v){nvsCache[k]=String(v);",
+    "function postConfigKey(k,v){",
     "return apiFetch('/config.json',{method:'POST',",
     "headers:{'Content-Type':'application/x-www-form-urlencoded'},",
     "body:'key='+encodeURIComponent(k)+'&value='+encodeURIComponent(v)})",
-    ".then(function(r){return r.json();});}",
+    ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})",
+    ".then(function(d){if(d&&d.ok===false)throw new Error(d.error||'Save failed');",
+    "nvsCache[k]=String(v);return d;});}",
     "function postConfigBatch(pairs,msg){var p=Promise.resolve();",
     "pairs.forEach(function(kv){p=p.then(function(){return postConfigKey(kv[0],kv[1]);});});",
     "return p.then(function(){loadConfig();showToast(msg||'Configuration saved');})",
@@ -536,7 +541,11 @@ pub const WEB_UI_HTML: &str = concat!(
     "var Z=gV('sl-Z');if(Z)c+=' -Z '+Z;",
     "var W=D.getElementById('sq-flac');if(W&&W.checked)c+=' -W';",
     "D.getElementById('autoexec1-preview').value=c;}",
-    "function saveAudio(commit){var c=D.getElementById('autoexec1-preview').value;",
+    "function saveAudio(commit){",
+    "var dis=D.getElementById('sl-dis'),pre=D.getElementById('autoexec1-preview');",
+    "if(dis&&dis.checked){if(pre)pre.value='';}",
+    "else if(pre&&pre.value.trim()!==''){buildAutoexec1();}",
+    "var c=pre?pre.value:'';",
     "var pairs=[['autoexec1',c]];",
     "var srv=D.getElementById('sq-server');",
     "if(srv&&srv.value.trim())pairs.push(['lms_server_ip',srv.value.trim()]);",
@@ -592,7 +601,7 @@ pub const WEB_UI_HTML: &str = concat!(
     "if(en&&sn!==null)en.checked=(sn!=='0');",
     "if(ec&&sc!==null)ec.checked=(sc!=='0');",
     "toggleAdvTabs();}catch(e){}})();",
-    "u();setInterval(u,1500);</script></body></html>"
+    "loadConfig();u();setInterval(u,1500);</script></body></html>"
 );
 
 #[cfg(test)]
@@ -679,5 +688,79 @@ mod tests {
         assert!(restore_idx < poll_idx);
         assert!(cmd_idx < poll_idx);
         assert!(script[restore_idx..poll_idx].contains("toggleAdvTabs()"));
+    }
+
+    #[test]
+    fn test_tdd_fix_b_startup_and_audio_tab_invoke_load_config() {
+        let script = extract_between(WEB_UI_HTML, "<script>", "</script>");
+        let show_tab = extract_between(script, "function showTab(id,btn)", "function cmd(");
+        assert!(show_tab.contains("tab-cfg-audio"));
+        assert!(show_tab.contains("loadConfig()"));
+
+        let tail_start = script
+            .find("toggleAdvTabs();")
+            .unwrap_or_else(|| panic!("missing toggleAdvTabs startup call"));
+        let startup_tail = &script[tail_start..];
+        assert!(startup_tail.contains("loadConfig();"));
+    }
+
+    #[test]
+    fn test_tdd_fix_b_load_config_populates_server_and_name_fallbacks() {
+        let body = extract_between(WEB_UI_HTML, "function loadConfig()", "function loadEq()");
+        assert!(body.contains("m('-n')||nvsVal('host_name')"));
+        assert!(body.contains("m('-s')||nvsVal('lms_server_ip')||nvsVal('lms_ip')"));
+        let fallback_idx = body
+            .find("m('-s')||nvsVal('lms_server_ip')||nvsVal('lms_ip')")
+            .unwrap_or_else(|| panic!("missing lms_server_ip fallback"));
+        let a1_if_idx = body
+            .find("if(a1){")
+            .unwrap_or_else(|| panic!("missing if(a1) guard"));
+        assert!(fallback_idx < a1_if_idx);
+    }
+
+    #[test]
+    fn test_tdd_fix_b_post_config_key_validates_response_before_cache_mutation() {
+        let body = extract_between(
+            WEB_UI_HTML,
+            "function postConfigKey(k,v)",
+            "function postConfigBatch(",
+        );
+        assert!(body.contains("!r.ok"));
+        assert!(body.contains("d.ok===false"));
+        assert!(body.contains("throw new Error"));
+        let fetch_idx = body
+            .find("apiFetch('/config.json'")
+            .unwrap_or_else(|| panic!("missing apiFetch call"));
+        let cache_idx = body
+            .find("nvsCache[k]=String(v)")
+            .unwrap_or_else(|| panic!("missing nvsCache assignment"));
+        assert!(fetch_idx < cache_idx);
+    }
+
+    #[test]
+    fn test_tdd_fix_b_save_audio_syncs_autoexec1_and_applies_explicit_overrides_after() {
+        let body = extract_between(
+            WEB_UI_HTML,
+            "function saveAudio(commit)",
+            "var saveAutoexec1=saveAudio;",
+        );
+        let build_idx = body
+            .find("buildAutoexec1()")
+            .unwrap_or_else(|| panic!("missing buildAutoexec1() sync in saveAudio"));
+        let read_idx = body
+            .find("var c=")
+            .unwrap_or_else(|| panic!("missing preview value read"));
+        assert!(build_idx < read_idx);
+        let pairs_idx = body
+            .find("['autoexec1',c]")
+            .unwrap_or_else(|| panic!("missing autoexec1 pair"));
+        let srv_idx = body
+            .find("'lms_server_ip'")
+            .unwrap_or_else(|| panic!("missing lms_server_ip pair"));
+        let host_idx = body
+            .find("'host_name'")
+            .unwrap_or_else(|| panic!("missing host_name pair"));
+        assert!(pairs_idx < srv_idx);
+        assert!(pairs_idx < host_idx);
     }
 }
