@@ -5,6 +5,7 @@
 
 pub mod airplay;
 pub mod mdns;
+pub mod settings;
 pub mod spotify_facade;
 
 mod registry {
@@ -427,6 +428,15 @@ mod registry {
         },
     }
 
+    /// Host-testable settings persistence bridge attached to [`ServiceCtx`].
+    pub trait SettingsPersistHost {
+        /// Polls debounced configuration persistence and flushes dirty state to
+        /// backing storage when ready.
+        ///
+        /// Returns `true` when an image was written to storage.
+        fn poll_and_persist(&mut self, config: &ConfigHandle, now_ms: u64) -> bool;
+    }
+
     /// Per-call runtime context passed to [`DeviceService`] lifecycle hooks.
     pub struct ServiceCtx<'a> {
         now_ms: u64,
@@ -435,6 +445,7 @@ mod registry {
         config: &'a ConfigHandle,
         audio: Option<&'a mut dyn ServiceAudioHost>,
         slim_outbound: Option<&'a mut SlimOutboundQueue>,
+        settings_persist: Option<&'a mut dyn SettingsPersistHost>,
         #[cfg(target_arch = "xtensa")]
         sockets: Option<&'a mut SocketSet<'static>>,
     }
@@ -456,6 +467,7 @@ mod registry {
                 config,
                 audio: None,
                 slim_outbound: None,
+                settings_persist: None,
                 sockets: Some(sockets),
             }
         }
@@ -476,6 +488,7 @@ mod registry {
                 config,
                 audio: None,
                 slim_outbound: None,
+                settings_persist: None,
                 sockets: None,
             }
         }
@@ -491,6 +504,7 @@ mod registry {
                 config,
                 audio: None,
                 slim_outbound: None,
+                settings_persist: None,
             }
         }
 
@@ -525,6 +539,25 @@ mod registry {
         pub fn with_slim_outbound(mut self, queue: &'a mut SlimOutboundQueue) -> Self {
             self.slim_outbound = Some(queue);
             self
+        }
+
+        /// Attaches a settings persistence host to this service context.
+        #[must_use]
+        pub fn with_settings_persist(mut self, host: &'a mut dyn SettingsPersistHost) -> Self {
+            self.settings_persist = Some(host);
+            self
+        }
+
+        /// Polls the attached settings persistence host, if any.
+        ///
+        /// Returns `true` when an image was flushed to backing storage.
+        pub fn poll_settings_persist(&mut self) -> bool {
+            let now_ms = self.now_ms;
+            let config: &ConfigHandle = self.config;
+            match self.settings_persist.as_deref_mut() {
+                Some(host) => host.poll_and_persist(config, now_ms),
+                None => false,
+            }
         }
 
         /// Queues an outbound SlimProto frame `(opcode, payload)` for delivery
@@ -881,6 +914,7 @@ mod registry {
         reg.register(super::mdns::MdnsService::new());
         reg.register(super::airplay::AirPlayService::new());
         reg.register(super::spotify_facade::SpotifyFacadeService::new());
+        reg.register(super::settings::SettingsService::new());
     }
 }
 
@@ -891,8 +925,10 @@ pub use mdns::{
 pub use registry::{
     register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
     ServiceHttpOutcome, ServiceHttpRequest, ServiceRegistry, ServiceSlimExtension,
-    SlimOutboundQueue, StatusExtras, StatusField, StatusValue, DEFAULT_SLIM_OUTBOUND_CAP,
+    SettingsPersistHost, SlimOutboundQueue, StatusExtras, StatusField, StatusValue,
+    DEFAULT_SLIM_OUTBOUND_CAP,
 };
+pub use settings::SettingsService;
 pub use spotify_facade::SpotifyFacadeService;
 
 #[cfg(test)]
