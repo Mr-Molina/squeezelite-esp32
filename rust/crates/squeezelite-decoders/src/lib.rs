@@ -3776,14 +3776,14 @@ impl AacDecoder {
 
         if demux.state == Mp4DemuxState::ReadingMdat {
             if in_pos < encoded_in.len() {
-                let remaining = &encoded_in[in_pos..];
                 if demux.using_deferred_mdat {
-                    demux.file_pos = demux.file_pos.saturating_add(remaining.len());
                     in_pos = encoded_in.len();
-                } else if demux.stream_buf.len().saturating_add(remaining.len()) > MAX_STREAM_BUF {
-                    self.flush();
-                    return Err(DecoderError::CorruptedFrame);
                 } else {
+                    let remaining = &encoded_in[in_pos..];
+                    if demux.stream_buf.len().saturating_add(remaining.len()) > MAX_STREAM_BUF {
+                        self.flush();
+                        return Err(DecoderError::CorruptedFrame);
+                    }
                     demux.stream_buf.extend_from_slice(remaining);
                     in_pos = encoded_in.len();
                 }
@@ -7124,7 +7124,8 @@ mod tests {
         let (_, pcm) = decode_aac_chunked(&non_faststart, 128).unwrap();
         assert_eq!(pcm, ref_pcm);
 
-        // Oversized mdat before moov (> MAX_MP4_META_BUF) must return UnsupportedFeature.
+        // Oversized mdat before moov (> MAX_MP4_META_BUF) must return
+        // UnsupportedFeature.
         let mut oversized = std::vec::Vec::new();
         oversized.extend_from_slice(&ftyp);
         oversized.extend_from_slice(&make_mp4_box(
