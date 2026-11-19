@@ -47,7 +47,7 @@ Add a unit test `service_ctx_reports_audio_playing_state` in `src/services/mod.r
 
 Run (from `rust/`):
 ```powershell
-cargo test -p louder-esp32-app services::registry::tests::service_ctx_reports_audio_playing_state
+cargo test -p louder-esp32-app services::tests::service_ctx_reports_audio_playing_state
 ```
 Expected: FAIL (`no method named 'is_audio_playing' found for struct 'ServiceCtx'`).
 

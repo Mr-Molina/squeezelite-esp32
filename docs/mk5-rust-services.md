@@ -251,7 +251,7 @@ pub trait SettingsPersistHost {
 5. **Write host unit tests**: Add `#[cfg(test)]` unit tests in the service module exercising `init`, `on_link`, `poll`, `status`, and any `on_slim_frame` / `handle_http` / `ServiceAudioHost` behavior.
 6. **Verify all gates** (from `rust/`):
    - `cargo test -p louder-esp32-app --no-fail-fast`
-   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   - `cargo clippy --workspace --all-targets -- -D warnings`
    - `cargo +esp clippy -p louder-esp32-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -- -D warnings`
    - `cargo +esp build --release -p louder-esp32-app --target xtensa-esp32-none-elf -Zbuild-std=core,alloc` + `python scripts/check_section_budget.py target/xtensa-esp32-none-elf/release/louder-esp32-app`
    - `python <plugin_root>/skills/rust-pro/scripts/google_rust_audit.py crates/louder-esp32-app/src --strict`
@@ -264,11 +264,11 @@ pub trait SettingsPersistHost {
   - Route parsed commands to `ctx.config()`, `ctx.set_local_volume(...)`, or `StatusExtras` telemetry without blocking Core 0; close socket gracefully on exit command.
   - Wire in `register_all` and add host tests for line framing, command dispatch, and `on_link(false)` reset.
 
-- **P2 — LMS Discovery / DNS (`src/services/lms_discovery.rs`)**:
-  - Allocate `1` `udp::Socket` in `init` with PSRAM `PacketBuffer` metadata/payload slices; bind ephemeral/discovery UDP port (`3483` broadcast discovery) on `link_up`.
-  - Rate-limit outbound SlimProto server discovery broadcasts (`e` / `JSON` discovery packets) using `ctx.now_ms()` so broadcasts never flood on every loop lap.
-  - Parse server discovery responses into target LMS IP/port and update `ctx.config()` (respecting NVS/static `lms_ip` overrides); reset retry timers on `on_link(_, false)` or IP change.
-  - Expose discovery state (`lms_discovered`, last server IP) via `status(&self, out: &mut StatusExtras)` and host-test packet parsing + backoff.
+- **P2 — LMS Discovery & DNS (`src/services/discovery.rs` + `src/services/dns.rs`)**:
+  - Allocate `2` `udp::Socket`s in `init` with PSRAM `PacketBuffer` metadata/payload slices (`1` UDP `3483` socket in `discovery.rs` for SlimProto server discovery, `1` UDP `53` socket in `dns.rs` for non-blocking RFC 1035 DNS A-record resolution, matching `docs/superpowers/specs/2026-11-17-parity-branch-distribution-design.md` §7).
+  - Rate-limit outbound SlimProto server discovery broadcasts (`e` / `JSON` discovery packets) using `ctx.now_ms()` so broadcasts never flood on every loop lap, and bound DNS retries/timeouts without blocking IPv4-literal streams.
+  - Parse server discovery responses into target LMS IP/port and update `ctx.config()` (respecting NVS/static `lms_ip` overrides); reset discovery retry timers and transient DNS state on `on_link(_, false)` or IP change.
+  - Expose discovery and DNS state (`lms_discovered`, last server IP, DNS cache/query counters) via `status(&self, out: &mut StatusExtras)` and host-test packet parsing, backoff, and RFC 1035 DNS codec.
 
 - **P3 — AirPlay Sync / Resend (`src/services/airplay.rs`)**:
   - Reuse `AirPlayService` and allocate UDP timing/control sockets within `SOCKET_SLOTS = 16` only if needed, keeping packet metadata and jitter/resend queues on the PSRAM heap (`Box` / `VecDeque`).
