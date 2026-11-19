@@ -184,17 +184,21 @@ pub fn unpark_core1_cooperative<F>(
     }
 }
 
-/// Erases and writes a 4 KiB settings journal sector, bounding `used_len` to
-/// 2048 bytes and aborting on any flash error.
+/// Erases and writes a 4 KiB settings journal sector while Core 1 is parked,
+/// bounding `used_len` to `1..=4096` (body capped at 2048 bytes) and
+/// symmetrically unparking Core 1 across every post-park exit path.
 #[cfg(any(target_arch = "xtensa", test))]
 fn write_journal_sector_with_ctx<Ctx, E>(
     ctx: &mut Ctx,
-    offset: u32,
-    sector: &[u8],
-    used_len: usize,
+    (offset, sector, used_len): (u32, &[u8; 4096], usize),
+    park_fn: impl FnOnce(&mut Ctx) -> Result<(), Core1ParkError>,
     mut erase_fn: impl FnMut(&mut Ctx, u32, u32) -> Result<(), E>,
     mut write_fn: impl FnMut(&mut Ctx, u32, &[u8]) -> Result<(), E>,
+    unpark_fn: impl FnOnce(&mut Ctx),
 ) -> Result<(), ()> {
+    if used_len == 0 || used_len > 4096 {
+        return Err(());
+    }
     let body_end = used_len.min(2048);
     let header = sector.get(..16).ok_or(())?;
     let nvs_half = sector.get(2048..4096).ok_or(())?;
@@ -204,19 +208,28 @@ fn write_journal_sector_with_ctx<Ctx, E>(
         None
     };
 
-    erase_fn(ctx, offset, offset + 4096).map_err(|_| ())?;
-    if let Some(body_slice) = body {
-        write_fn(ctx, offset + 16, body_slice).map_err(|_| ())?;
+    if park_fn(ctx).is_err() {
+        return Err(());
     }
-    write_fn(ctx, offset + 2048, nvs_half).map_err(|_| ())?;
-    write_fn(ctx, offset, header).map_err(|_| ())?;
-    Ok(())
+
+    let res = (|| {
+        erase_fn(ctx, offset, offset + 4096).map_err(|_| ())?;
+        if let Some(body_slice) = body {
+            write_fn(ctx, offset + 16, body_slice).map_err(|_| ())?;
+        }
+        write_fn(ctx, offset + 2048, nvs_half).map_err(|_| ())?;
+        write_fn(ctx, offset, header).map_err(|_| ())?;
+        Ok(())
+    })();
+
+    unpark_fn(ctx);
+    res
 }
 
 #[cfg(test)]
 fn write_journal_sector_with<E>(
     offset: u32,
-    sector: &[u8],
+    sector: &[u8; 4096],
     used_len: usize,
     erase_fn: impl FnMut(u32, u32) -> Result<(), E>,
     write_fn: impl FnMut(u32, &[u8]) -> Result<(), E>,
@@ -224,11 +237,11 @@ fn write_journal_sector_with<E>(
     let mut fns = (erase_fn, write_fn);
     write_journal_sector_with_ctx(
         &mut fns,
-        offset,
-        sector,
-        used_len,
+        (offset, sector, used_len),
+        |_| Ok(()),
         |f, start, end| (f.0)(start, end),
         |f, addr, data| (f.1)(addr, data),
+        |_| {},
     )
 }
 
@@ -3626,22 +3639,20 @@ mod xtensa_hw {
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut DeviceRuntimeState) {
         let _ = s.amp.set_mute(true);
-        if s.core1.park_for_flash_write().is_err() {
-            return;
-        }
         s.config.flush_now(&mut *s.journal);
         if let Some(image) = s.journal.pending_image() {
             #[cfg(not(feature = "runtime-flash-persist"))]
             let offset = SETTINGS_JOURNAL_OFFSET;
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
+            let mut flash_ctx = (&mut s.core1, &mut s.flash);
             if write_journal_sector_with_ctx(
-                &mut s.flash,
-                offset,
-                image.sector,
-                image.used_len,
-                |flash: &mut FlashStorage<'static>, start, end| flash.erase(start, end),
-                |flash: &mut FlashStorage<'static>, addr, data| flash.write_nor(addr, data),
+                &mut flash_ctx,
+                (offset, image.sector, image.used_len),
+                |ctx| ctx.0.park_for_flash_write(),
+                |ctx, start, end| ctx.1.erase(start, end),
+                |ctx, addr, data| ctx.1.write_nor(addr, data),
+                |ctx| ctx.0.unpark_after_flash_write(),
             )
             .is_ok()
             {
@@ -4547,9 +4558,7 @@ mod xtensa_hw {
                         );
                     }
                 }
-                _ => {
-                    s.core1.unpark_after_flash_write();
-                }
+                _ => {}
             }
         }
     }
@@ -5231,26 +5240,22 @@ mod xtensa_hw {
             sync_bt_security_from_config(s.bt_sink, s.config, &mut s.bt_sync_state, elapsed_ms);
             if s.config_writer.poll(s.config, &mut *s.journal, now_ms) {
                 if let Some(image) = s.journal.pending_image() {
-                    if s.core1.park_for_flash_write().is_ok() {
-                        #[cfg(not(feature = "runtime-flash-persist"))]
-                        let offset = SETTINGS_JOURNAL_OFFSET;
-                        #[cfg(feature = "runtime-flash-persist")]
-                        let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-                        let ok = write_journal_sector_with_ctx(
-                            &mut s.flash,
-                            offset,
-                            image.sector,
-                            image.used_len,
-                            |flash: &mut FlashStorage<'static>, start, end| flash.erase(start, end),
-                            |flash: &mut FlashStorage<'static>, addr, data| {
-                                flash.write_nor(addr, data)
-                            },
-                        )
-                        .is_ok();
-                        s.core1.unpark_after_flash_write();
-                        if ok {
-                            s.journal.mark_flash_written();
-                        }
+                    #[cfg(not(feature = "runtime-flash-persist"))]
+                    let offset = SETTINGS_JOURNAL_OFFSET;
+                    #[cfg(feature = "runtime-flash-persist")]
+                    let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
+                    let mut flash_ctx = (&mut s.core1, &mut s.flash);
+                    if write_journal_sector_with_ctx(
+                        &mut flash_ctx,
+                        (offset, image.sector, image.used_len),
+                        |ctx| ctx.0.park_for_flash_write(),
+                        |ctx, start, end| ctx.1.erase(start, end),
+                        |ctx, addr, data| ctx.1.write_nor(addr, data),
+                        |ctx| ctx.0.unpark_after_flash_write(),
+                    )
+                    .is_ok()
+                    {
+                        s.journal.mark_flash_written();
                     }
                 }
             }
@@ -5786,6 +5791,69 @@ mod tests {
         );
         assert_eq!(res, Ok(()));
         assert_eq!(recorded, vec![(0x3FE800, 2048), (0x3FE000, 16)]);
+    }
+
+    #[test]
+    fn test_write_journal_sector_with_ctx_symmetric_park_unpark() {
+        struct MockCtx {
+            parks: usize,
+            erases: usize,
+            writes: usize,
+            unparks: usize,
+            fail_park: bool,
+            fail_write: bool,
+        }
+
+        let sector = [0x5Au8; 4096];
+        let run = |used_len: usize, fail_park: bool, fail_write: bool| {
+            let mut ctx = MockCtx {
+                parks: 0,
+                erases: 0,
+                writes: 0,
+                unparks: 0,
+                fail_park,
+                fail_write,
+            };
+            let res = write_journal_sector_with_ctx(
+                &mut ctx,
+                (0x3FE000, &sector, used_len),
+                |c| {
+                    c.parks += 1;
+                    if c.fail_park {
+                        Err(Core1ParkError::AckTimeout)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |c, _, _| {
+                    c.erases += 1;
+                    Ok::<(), ()>(())
+                },
+                |c, _, _| {
+                    c.writes += 1;
+                    if c.fail_write {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |c| {
+                    c.unparks += 1;
+                },
+            );
+            (res, ctx.parks, ctx.erases, ctx.writes, ctx.unparks)
+        };
+
+        // Invalid lengths abort before parking or touching flash.
+        assert_eq!(run(0, false, false), (Err(()), 0, 0, 0, 0));
+        assert_eq!(run(4097, false, false), (Err(()), 0, 0, 0, 0));
+
+        // Park timeout skips flash I/O and does not unpark.
+        assert_eq!(run(256, true, false), (Err(()), 1, 0, 0, 0));
+
+        // Both Ok and Err flash paths unpark symmetrically once.
+        assert_eq!(run(256, false, false), (Ok(()), 1, 1, 3, 1));
+        assert_eq!(run(256, false, true), (Err(()), 1, 1, 1, 1));
     }
 
     #[test]
