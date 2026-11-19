@@ -4599,10 +4599,12 @@ mod xtensa_hw {
             s.last_fault_check_ms = now_ms;
             if let Ok(Some((fault, telem))) = s.amp.check_faults_and_telemetry() {
                 s.latest_telemetry = Some(telem);
-                if (s.coordinator.state == PlayerState::Playing || s.coordinator.external_playback)
-                    && fault.has_critical_amp_fault()
-                    && now_ms.saturating_sub(s.last_fault_recovery_ms) >= 30_000
-                {
+                if louder_esp32_app::amp::should_recover_amp_fault(
+                    s.coordinator.state == PlayerState::Playing || s.coordinator.external_playback,
+                    fault.has_critical_amp_fault(),
+                    now_ms,
+                    s.last_fault_recovery_ms,
+                ) {
                     s.last_fault_recovery_ms = now_ms;
                     let _ = s.amp.recover_from_fault();
                     louder_esp32_app::http_control::push_runtime_syslog(
