@@ -1898,9 +1898,55 @@ fn ends_with_ascii_ci_label(host: &str, suffix: &str) -> bool {
     !prefix.is_empty() && !prefix.ends_with('.') && host[split..].eq_ignore_ascii_case(suffix)
 }
 
+/// Extracts the bare host (without brackets or `:port`) from an HTTP `Host`
+/// or URL authority string, returning `None` if malformed.
+#[must_use]
+pub fn strip_host_port(authority: &str) -> Option<&str> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty()
+        || trimmed.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'@' | b'/' | b'?' | b'#')
+        })
+    {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let end_bracket = rest.find(']')?;
+        let inner = &rest[..end_bracket];
+        if inner.is_empty() {
+            return None;
+        }
+        let suffix = &rest[end_bracket + 1..];
+        if !suffix.is_empty() {
+            let port_str = suffix.strip_prefix(':')?;
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return None;
+            }
+        }
+        return Some(inner);
+    }
+    if trimmed.contains('[') || trimmed.contains(']') {
+        return None;
+    }
+    let colon_count = trimmed.bytes().filter(|&b| b == b':').count();
+    if colon_count == 1 {
+        let (h, port_str) = trimmed.split_once(':')?;
+        if h.is_empty() || port_str.is_empty() || port_str.parse::<u16>().is_err() {
+            return None;
+        }
+        Some(h)
+    } else if colon_count == 0 {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
 /// Checks whether a hostname or IP literal (with optional brackets/port)
 /// belongs to a local LAN (RFC 1918, IPv4/IPv6 loopback, link-local, ULA,
-/// IPv4-mapped local, or `localhost`/`.localhost`/`.local`).
+/// IPv4-mapped local, or `localhost`/`.local`/`.lan`/`.home.arpa`).
 #[must_use]
 pub fn is_local_lan_host(host: &str) -> bool {
     if host.is_empty()
@@ -1975,6 +2021,10 @@ pub fn is_local_lan_host(host: &str) -> bool {
         || label.eq_ignore_ascii_case("localhost")
         || ends_with_ascii_ci_label(label, ".localhost")
         || ends_with_ascii_ci_label(label, ".local")
+        || ends_with_ascii_ci_label(label, ".lan")
+        || ends_with_ascii_ci_label(label, ".home")
+        || ends_with_ascii_ci_label(label, ".home.arpa")
+        || ends_with_ascii_ci_label(label, ".internal")
 }
 
 /// Derives a 768-bit (96-byte) ephemeral Diffie-Hellman private key using
@@ -3039,6 +3089,10 @@ mod tests {
         assert!(is_local_lan_host("devbench"));
         assert!(is_local_lan_host("louder-esp32"));
         assert!(is_local_lan_host("devbench:8000"));
+        assert!(is_local_lan_host("devbench.lan"));
+        assert!(is_local_lan_host("devbench.home.arpa:8080"));
+        assert_eq!(strip_host_port("devbench.lan:8080"), Some("devbench.lan"));
+        assert_eq!(strip_host_port("[::1]:8080"), Some("::1"));
 
         for rejected in ["evil.com", "sub.example.org", "-bad", "bad-", "12345", "0"] {
             assert!(

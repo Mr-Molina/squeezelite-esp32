@@ -680,12 +680,18 @@ pub fn write_config_json(
         {
             continue;
         }
+        let nvs_type_code: u8 = match entry.entry_type {
+            "u8" | "1" => crate::config_handle::NVS_TYPE_U8,
+            "u16" | "2" => 2,
+            "u32" | "4" => 4,
+            _ => crate::config_handle::NVS_TYPE_STR,
+        };
         write!(
             writer,
-            ",\"{}\":{{\"value\":\"{}\",\"type\":\"{}\"}}",
+            ",\"{}\":{{\"value\":\"{}\",\"type\":{}}}",
             JsonEscaped(entry.key),
             JsonEscaped(entry.value),
-            JsonEscaped(entry.entry_type),
+            nvs_type_code,
         )
         .ok()?;
     }
@@ -954,9 +960,41 @@ fn parse_nested_c_config_update(input: &str) -> Option<ParsedConfigUpdate<'_>> {
     Some(ParsedConfigUpdate { key, value })
 }
 
+fn extract_json_array<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let mut cur = input.trim_start().strip_prefix('{')?.trim_start();
+    while !cur.is_empty() && !cur.starts_with('}') {
+        let (key, after_key) = scan_json_string(cur)?;
+        let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+        let rest = if after_colon.starts_with('{') || after_colon.starts_with('[') {
+            let (composite, rest) = skip_json_composite(after_colon)?;
+            if key == name {
+                if composite.starts_with('[') && composite.ends_with(']') {
+                    return Some(&composite[1..composite.len() - 1]);
+                }
+                return None;
+            }
+            rest
+        } else {
+            let (_, rest) = scan_json_scalar(after_colon)?;
+            if key == name {
+                return None;
+            }
+            rest
+        };
+        cur = rest.trim_start();
+        if let Some(next) = cur.strip_prefix(',') {
+            cur = next.trim_start();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 /// Parses a `key=...&value=...` query/form, flat `{"key":"...","value":"..."}`,
-/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, or `{"fwurl":..}`
-/// JSON body for `/config.json`.
+/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, `{"fwurl":..}`,
+/// `equalizer=..`, or `{"bands":[b0,...,b9]}` JSON body for `/config.json` and
+/// `/eq.json`.
 #[must_use]
 pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> {
     if let Some(key) = extract_param_or_json_field(input, "key") {
@@ -982,6 +1020,15 @@ pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> 
             return Some(ParsedConfigUpdate {
                 key: "equalizer",
                 value: eq,
+            });
+        }
+    }
+    if let Some(bands_csv) = extract_json_array(input, "bands") {
+        let trimmed = bands_csv.trim();
+        if crate::config_handle::parse_equalizer_bands(trimmed).is_some() {
+            return Some(ParsedConfigUpdate {
+                key: "equalizer",
+                value: trimmed,
             });
         }
     }
@@ -2507,7 +2554,7 @@ pub const COMMANDS_JSON_CATALOG: &str = concat!(
     "{\"name\":\"cfg-hw-rotary\",\"argtable\":[{\"name\":\"A\"}],",
     "\"values\":{\"A\":\"-1\"}},",
     "{\"name\":\"cfg-hw-i2c\",\"argtable\":[{\"name\":\"sda\"},{\"name\":\"scl\"}],",
-    "\"values\":{\"sda\":\"21\",\"scl\":\"22\"}},",
+    "\"values\":{\"sda\":\"21\",\"scl\":\"27\"}},",
     "{\"name\":\"cfg-hw-spi\",\"argtable\":[{\"name\":\"mosi\"}],",
     "\"values\":{\"mosi\":\"-1\"}},",
     "{\"name\":\"cfg-hw-display\",\"argtable\":[{\"name\":\"type\"}],",
@@ -3090,6 +3137,111 @@ fn redact_command_password(cmd: &str) -> String<160> {
     redact_kv_and_flags(clean, is_cfg_dash)
 }
 
+fn format_cli_output_preview(
+    cmd_raw: &str,
+    redacted: &str,
+    snap: &HttpStatusSnapshot<'_>,
+) -> String<160> {
+    let mut out: String<160> = String::new();
+    let Some(decoded) = percent_decode_str::<256>(cmd_raw) else {
+        push_str_truncated(&mut out, redacted);
+        return out;
+    };
+    let clean = decoded.as_str().trim();
+    let Ok(Some((verb, rest))) = next_cli_token(clean) else {
+        push_str_truncated(&mut out, redacted);
+        return out;
+    };
+    let host_label = if !snap.player_name.is_empty() {
+        snap.player_name
+    } else {
+        crate::board::first_boot_defaults::PLAYER_NAME
+    };
+    match verb {
+        "version" => {
+            let _ = write!(
+                out,
+                "{} {} (seq {})",
+                REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION, snap.settings_seq
+            );
+        }
+        "free" | "heap" => {
+            let _ = write!(
+                out,
+                "PSRAM free: {} B, used: {} B",
+                snap.psram_free_bytes, snap.psram_used_bytes
+            );
+        }
+        "i2cdetect" => {
+            let _ = write!(
+                out,
+                "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
+                snap.i2c_acks, snap.i2c_nacks
+            );
+        }
+        "i2c" => {
+            let is_scan = matches!(next_cli_token(rest), Ok(Some(("scan", _))));
+            if is_scan {
+                let _ = write!(
+                    out,
+                    "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
+                    snap.i2c_acks, snap.i2c_nacks
+                );
+            } else {
+                let _ = out.push_str("i2c: hardware I2C bus transfer unsupported in web CLI");
+            }
+        }
+        "system" => {
+            let _ = write!(
+                out,
+                "system: up={}ms ip={}.{}.{}.{} PSRAM free: {} B",
+                snap.uptime_ms,
+                snap.ip[0],
+                snap.ip[1],
+                snap.ip[2],
+                snap.ip[3],
+                snap.psram_free_bytes
+            );
+        }
+        "status" | "player" => {
+            let _ = write!(
+                out,
+                "player: mode={} vol={}% frames={} codec={}",
+                SyslogSanitized(snap.amp_mode),
+                snap.vol_pct,
+                snap.frames_played,
+                SyslogSanitized(snap.codec)
+            );
+        }
+        "config" => {
+            let sub = match next_cli_token(rest) {
+                Ok(Some((s, _))) => s,
+                _ => "dump",
+            };
+            if sub == "dump" {
+                let _ = write!(
+                    out,
+                    "config: host={} seq={} vol={}% eq={}",
+                    SyslogSanitized(host_label),
+                    snap.settings_seq,
+                    snap.vol_pct,
+                    SyslogSanitized(snap.eq_preset)
+                );
+            } else {
+                let _ = write!(out, "OK: {}", SyslogSanitized(redacted));
+            }
+        }
+        "help" => {
+            let _ = out
+                .push_str("commands: system config join player free heap version i2cdetect cfg-*");
+        }
+        _ => {
+            let _ = write!(out, "OK: {}", SyslogSanitized(redacted));
+        }
+    }
+    out
+}
+
 fn constant_time_eq(provided: &[u8], expected: &[u8]) -> bool {
     if expected.is_empty() {
         return false;
@@ -3103,11 +3255,73 @@ fn constant_time_eq(provided: &[u8], expected: &[u8]) -> bool {
     core::hint::black_box(diff) == 0
 }
 
+fn parse_ascii_usize(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let start = i;
+    let mut val = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val
+            .checked_mul(10)?
+            .checked_add(usize::from(bytes[i] - b'0'))?;
+        i += 1;
+    }
+    if i == start {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+/// Returns `true` when `peek_bytes` (peeked from a TCP RX buffer of capacity
+/// `max_rx_buf`) does not yet contain a complete HTTP header block (`\r\n\r\n`
+/// or `\n\n`) or has fewer body bytes than declared by `Content-Length:` while
+/// the full request still fits in `max_rx_buf`.
+#[must_use]
+pub fn http_request_needs_more_bytes(peek_bytes: &[u8], max_rx_buf: usize) -> bool {
+    if peek_bytes.is_empty() || peek_bytes.len() >= max_rx_buf {
+        return false;
+    }
+    let hdr_end = if let Some(pos) = peek_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+        pos + 4
+    } else if let Some(pos) = peek_bytes.windows(2).position(|w| w == b"\n\n") {
+        pos + 2
+    } else {
+        return true;
+    };
+    let hdr_slice = &peek_bytes[..hdr_end];
+    const CL_HDR: &[u8] = b"\ncontent-length:";
+    if let Some(idx) = hdr_slice
+        .windows(CL_HDR.len())
+        .position(|w| w.eq_ignore_ascii_case(CL_HDR))
+    {
+        let after = &hdr_slice[idx + CL_HDR.len()..];
+        if let Some(clen) = parse_ascii_usize(after) {
+            let body_have = peek_bytes.len().saturating_sub(hdr_end);
+            if clen > 0 && body_have < clen && hdr_end.saturating_add(clen) <= max_rx_buf {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn http_request_headers(req_bytes: &[u8]) -> Option<&str> {
+    let hdr_end = req_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .or_else(|| req_bytes.windows(2).position(|w| w == b"\n\n"))
+        .unwrap_or(req_bytes.len());
+    core::str::from_utf8(&req_bytes[..hdr_end]).ok()
+}
+
 fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
     if expected_token.is_empty() {
         return false;
     }
-    let Ok(req_str) = core::str::from_utf8(req_bytes) else {
+    let Some(req_str) = http_request_headers(req_bytes) else {
         return false;
     };
     let mut lines = req_str.lines();
@@ -3300,22 +3514,64 @@ fn is_permitted_origin_value(val: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || crate::ota_safety::is_local_lan_host(host)
 }
 
+fn extract_origin_host(val: &str) -> Option<&str> {
+    if val.is_empty() || val == "null" {
+        return None;
+    }
+    let after_scheme = if val
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        &val[7..]
+    } else if val
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        &val[8..]
+    } else {
+        return None;
+    };
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let trailing = &after_scheme[auth_end..];
+    if !trailing.is_empty() && trailing != "/" {
+        return None;
+    }
+    crate::ota_safety::strip_host_port(&after_scheme[..auth_end])
+}
+
 fn is_permitted_origin(req_bytes: &[u8]) -> bool {
-    let Ok(req_str) = core::str::from_utf8(req_bytes) else {
+    let Some(req_str) = http_request_headers(req_bytes) else {
         return false;
     };
-    let mut lines = req_str.lines();
-    let _request_line = lines.next();
-    for line in lines {
+    let mut host_hdr: Option<&str> = None;
+    for line in req_str.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((hdr_name, hdr_val)) = trimmed.split_once(':') {
+            if hdr_name.trim().eq_ignore_ascii_case("host") {
+                host_hdr = crate::ota_safety::strip_host_port(hdr_val.trim());
+                break;
+            }
+        }
+    }
+    for line in req_str.lines().skip(1) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         if let Some((hdr_name, origin_val)) = trimmed.split_once(':') {
-            if hdr_name.trim().eq_ignore_ascii_case("origin")
-                && !is_permitted_origin_value(origin_val.trim())
-            {
-                return false;
+            if hdr_name.trim().eq_ignore_ascii_case("origin") {
+                let ov = origin_val.trim();
+                let same_host = extract_origin_host(ov).is_some_and(|oh| {
+                    host_hdr.is_some_and(|hh| !hh.is_empty() && oh.eq_ignore_ascii_case(hh))
+                });
+                if !same_host && !is_permitted_origin_value(ov) {
+                    return false;
+                }
             }
         }
     }
@@ -3476,14 +3732,18 @@ pub fn handle_http_request_streaming_impl(
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
             let body_bytes = DASHBOARD_HTML.as_bytes();
-            let mut header: String<160> = String::new();
-            let _ = write!(
+            let mut header: String<256> = String::new();
+            write!(
                 header,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                X-Content-Type-Options: nosniff\r\n\
+                X-Frame-Options: DENY\r\n\
+                Content-Security-Policy: frame-ancestors 'none'\r\n\
                 Content-Length: {}\r\nConnection: close\r\n\
                 Cache-Control: no-store\r\n\r\n",
                 body_bytes.len()
-            );
+            )
+            .ok()?;
             let header_bytes = header.as_bytes();
             if header_bytes.len() > out_buf.len() {
                 return None;
@@ -3525,35 +3785,12 @@ pub fn handle_http_request_streaming_impl(
         }
         ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
             let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let mut act = query
-                .split('&')
-                .find_map(|p| p.strip_prefix("act="))
+            let body_payload = extract_query_or_body("", req_bytes);
+            let act = extract_param_or_json_field(query, "act")
+                .or_else(|| extract_param_or_json_field(query, "c"))
+                .or_else(|| extract_param_or_json_field(body_payload, "act"))
+                .or_else(|| extract_param_or_json_field(body_payload, "c"))
                 .unwrap_or("");
-            if act.is_empty() {
-                let body_slice = req_bytes
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|p| &req_bytes[p + 4..])
-                    .or_else(|| {
-                        req_bytes
-                            .windows(2)
-                            .position(|w| w == b"\n\n")
-                            .map(|p| &req_bytes[p + 2..])
-                    })
-                    .unwrap_or(&[]);
-                if let Ok(body_str) = core::str::from_utf8(body_slice) {
-                    act = body_str
-                        .split('&')
-                        .find_map(|p| p.strip_prefix("act="))
-                        .unwrap_or("");
-                    if act.is_empty() {
-                        let trimmed = body_str.trim();
-                        if let Some(rest) = trimmed.strip_prefix("act=") {
-                            act = rest.split('&').next().unwrap_or(rest);
-                        }
-                    }
-                }
-            }
             let (action, ok) = match act {
                 "play" => (
                     HttpControlAction::PlayerIrCommand {
@@ -3796,11 +4033,27 @@ pub fn handle_http_request_streaming_impl(
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
+            let payload = extract_query_or_body(raw_path, req_bytes);
+            let valid_eq = payload.is_empty()
+                || parse_config_update_query(payload).is_some_and(|upd| {
+                    upd.key == "equalizer"
+                        && percent_decode_str::<256>(upd.value).is_some_and(|dv| {
+                            crate::config_handle::parse_equalizer_bands(dv.as_str()).is_some()
+                        })
+                });
             let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
-            writer.write_str("{\"ok\":true,\"result\":\"OK\"}").ok()?;
+            let action = if valid_eq {
+                writer.write_str("{\"ok\":true,\"result\":\"OK\"}").ok()?;
+                HttpControlAction::UpdateConfig
+            } else {
+                writer
+                    .write_str("{\"ok\":false,\"error\":\"invalid_eq_bands\"}")
+                    .ok()?;
+                HttpControlAction::None
+            };
             let body_len = writer.written_len();
             let total_len = write_json_http_response(body_len, out_buf)?;
-            Some((total_len, &[], HttpControlAction::UpdateConfig))
+            Some((total_len, &[], action))
         }
         ("GET", "/config.json") => {
             const HEADER_ROOM: usize = 160;
@@ -4001,10 +4254,12 @@ pub fn handle_http_request_streaming_impl(
             let (body_len, action) = if !cmd_str.is_empty() {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
                 let redacted = redact_command_password(cmd_str);
+                let out_preview = format_cli_output_preview(cmd_str, redacted.as_str(), snapshot);
                 write!(
                     writer,
-                    "{{\"ok\":true,\"cmd\":\"{}\",\"Result\":\"Success\"}}",
+                    "{{\"ok\":true,\"cmd\":\"{}\",\"output\":\"{}\",\"Result\":\"Success\"}}",
                     JsonEscaped(redacted.as_str()),
+                    JsonEscaped(out_preview.as_str()),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::ExecuteCliCommand)
@@ -6017,7 +6272,15 @@ mod tests {
         assert!(resp1.contains("\"ok\":false"));
         assert!(resp1.contains("invalid_config_value"));
 
-        let too_long = "a".repeat(130);
+        let ok_160 = "a".repeat(160);
+        let req_ok_160 = format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={ok_160}");
+        let (len_ok, act_ok) = handle_http_control_request(req_ok_160.as_bytes(), &snap, &mut buf)
+            .expect("POST /config.json 160B");
+        assert_eq!(act_ok, HttpControlAction::UpdateConfig);
+        let resp_ok = core::str::from_utf8(&buf[..len_ok]).expect("utf8");
+        assert!(resp_ok.contains("\"ok\":true"));
+
+        let too_long = "a".repeat(193);
         let req_too_long =
             format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={too_long}");
         let (len2, act2) = handle_http_control_request(req_too_long.as_bytes(), &snap, &mut buf)
@@ -6026,6 +6289,126 @@ mod tests {
         let resp2 = core::str::from_utf8(&buf[..len2]).expect("utf8");
         assert!(resp2.contains("\"ok\":false"));
         assert!(resp2.contains("invalid_config_value"));
+    }
+
+    #[test]
+    fn test_phase2_remediation_headers_origin_eq_json_and_cli_output() {
+        use crate::config_handle::ConfigHandle;
+
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 4096];
+
+        // 1. GET / security headers (nosniff, X-Frame-Options, frame-ancestors)
+        let (hlen, sbody, hact) = handle_http_request_streaming(
+            b"GET / HTTP/1.1\r\nHost: 172.25.6.102\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("GET /");
+        assert_eq!(hact, HttpControlAction::None);
+        assert!(!sbody.is_empty());
+        let hstr = core::str::from_utf8(&buf[..hlen]).expect("utf8");
+        assert!(hstr.contains("X-Content-Type-Options: nosniff\r\n"));
+        assert!(hstr.contains("X-Frame-Options: DENY\r\n"));
+        assert!(hstr.contains("Content-Security-Policy: frame-ancestors 'none'\r\n"));
+
+        // 2. Binary non-UTF8 body after \r\n\r\n + same-host split-DNS Origin
+        let mut bin_req = std::vec::Vec::from(
+            &b"POST /flash.json HTTP/1.1\r\nHost: devbench.lan\r\n\
+               Origin: http://devbench.lan\r\nContent-Length: 4\r\n\r\n"[..],
+        );
+        bin_req.extend_from_slice(&[0xE9, 0xFF, 0x80, 0x00]);
+        let (flen, fact) =
+            handle_http_control_request(&bin_req, &snap, &mut buf).expect("binary POST");
+        assert_eq!(fact, HttpControlAction::StartOtaFlash);
+        let fstr = core::str::from_utf8(&buf[..flen]).expect("utf8");
+        assert!(fstr.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        // Same-host Origin on custom corporate FQDN matches Host header
+        let corp_req = b"POST /config.json HTTP/1.1\r\nHost: devbench.corp.example.org:8080\r\n\
+            Origin: http://devbench.corp.example.org:8080\r\n\r\nkey=host_name&value=DEVBENCH";
+        let (clen, cact) =
+            handle_http_control_request(corp_req, &snap, &mut buf).expect("same-host POST");
+        assert_eq!(cact, HttpControlAction::UpdateConfig);
+        assert!(core::str::from_utf8(&buf[..clen])
+            .expect("utf8")
+            .contains("\"ok\":true"));
+
+        // Cross-origin mismatch is still rejected with 403
+        let evil_req = b"POST /config.json HTTP/1.1\r\nHost: devbench.lan\r\n\
+            Origin: https://evil.com\r\n\r\nkey=host_name&value=PWN";
+        let (elen, eact) =
+            handle_http_control_request(evil_req, &snap, &mut buf).expect("evil POST");
+        assert_eq!(eact, HttpControlAction::None);
+        assert!(core::str::from_utf8(&buf[..elen])
+            .expect("utf8")
+            .starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 3. POST /eq.json with {"bands":[1,2,3,4,5,0,-1,-2,-3,-4]}
+        let eq_req = b"POST /eq.json HTTP/1.1\r\nHost: 172.25.6.102\r\n\
+            Content-Type: application/json\r\n\r\n\
+            {\"bands\":[1,2,3,4,5,0,-1,-2,-3,-4]}";
+        let (qlen, qact) =
+            handle_http_control_request(eq_req, &snap, &mut buf).expect("POST /eq.json");
+        assert_eq!(qact, HttpControlAction::UpdateConfig);
+        assert!(core::str::from_utf8(&buf[..qlen])
+            .expect("utf8")
+            .contains("\"ok\":true"));
+        let mut cfg = ConfigHandle::default();
+        let mut local_syslog = SyslogRingBuffer::new();
+        let upd = parse_config_update_query("{\"bands\":[1,2,3,4,5,0,-1,-2,-3,-4]}").expect("eq");
+        assert!(apply_web_config_update(
+            upd.key,
+            upd.value,
+            snap.uptime_ms,
+            &mut cfg,
+            &mut local_syslog,
+        ));
+        assert_eq!(
+            cfg.nvs_override("equalizer").as_deref(),
+            Some("1,2,3,4,5,0,-1,-2,-3,-4")
+        );
+
+        // 4. /commands.json scl="27", POST /commands.json "output", "type":33
+        assert!(COMMANDS_JSON_CATALOG.contains("\"sda\":\"21\",\"scl\":\"27\""));
+        let cmd_req = b"POST /commands.json HTTP/1.1\r\n\r\n{\"command\":\"version\"}";
+        let (vlen, vact) =
+            handle_http_control_request(cmd_req, &snap, &mut buf).expect("POST /commands.json");
+        assert_eq!(vact, HttpControlAction::ExecuteCliCommand);
+        let vstr = core::str::from_utf8(&buf[..vlen]).expect("utf8");
+        assert!(vstr.contains("\"output\":\"Squeezelite-ESP32 I2S-4MFlash-Rust"));
+
+        let views = [ConfigEntryView::new(
+            "lms_server_ip",
+            "172.25.8.40:9000",
+            "string",
+        )];
+        let wlen = write_config_json(&snap, &views, &mut buf).expect("write_config_json");
+        let wjson = core::str::from_utf8(&buf[..wlen]).expect("utf8");
+        assert!(wjson.contains("\"lms_server_ip\":{\"value\":\"172.25.8.40:9000\",\"type\":33}"));
+
+        // 5. POST /cmd.json with c= body and ?c= query + split-packet detection
+        let post_cmd_req = b"POST /cmd.json HTTP/1.1\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\r\nc=vol70";
+        let (plen, pact) = handle_http_control_request(post_cmd_req, &snap, &mut buf)
+            .expect("POST /cmd.json c=vol70");
+        assert!(matches!(
+            pact,
+            HttpControlAction::PlayerIrCommand {
+                vol_pct: Some(70),
+                ..
+            }
+        ));
+        assert!(core::str::from_utf8(&buf[..plen])
+            .expect("utf8")
+            .contains("\"act\":\"vol70\""));
+
+        let mut split_hdr = std::vec::Vec::from(&b"POST /config.json HTTP/1.1\r\n"[..]);
+        split_hdr.extend_from_slice(&[b'X'; 400]);
+        split_hdr.extend_from_slice(b"\r\nContent-Length: 24\r\n\r\n");
+        assert!(http_request_needs_more_bytes(&split_hdr, 2048));
+        split_hdr.extend_from_slice(b"key=host_name&value=TEST");
+        assert!(!http_request_needs_more_bytes(&split_hdr, 2048));
     }
 
     #[test]

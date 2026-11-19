@@ -1736,7 +1736,6 @@ mod xtensa_hw {
 
     struct FirmwareBssBuffers {
         ring_storage: [u8; 4096],
-        http_rx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
         slim_tx_buf: [u8; 2048],
         audio_rx_buf: [u8; 4096],
@@ -2380,12 +2379,10 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).resample_tail_samples).write(0);
             core::ptr::addr_of_mut!((*ptr).resample_input_pending).write(0);
 
-            let http_resp_buf: &'static mut [u8; 4096] =
-                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 4096]));
-            let http_tx_buf: &'static mut [u8; 4096] =
-                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 4096]));
+            let http_req_buf: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_RX_BUF_BYTES].into_boxed_slice());
 
-            (&mut *ptr, http_resp_buf, http_tx_buf)
+            (&mut *ptr, http_req_buf)
         }
     }
 
@@ -2511,10 +2508,16 @@ mod xtensa_hw {
          it can not be combined with `esp-rtos-core1`"
     );
 
-    /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio, mDNS UDP
+    /// Concurrent Port 80 HTTP listener sockets in PSRAM.
+    const HTTP_LISTEN_SOCKETS: usize = 3;
+    const HTTP_RX_BUF_BYTES: usize = 2_048;
+    const HTTP_TX_BUF_BYTES: usize = 4_096;
+    const HTTP_RESP_BUF_BYTES: usize = 8_192;
+
+    /// Smoltcp socket slots: DHCP, 3x HTTP server, slimproto, audio, mDNS UDP
     /// (5353), AirPlay RTSP TCP (5000), AirPlay RTP UDP (6000), and Spotify
     /// Connect HTTP/Spirc TCP (4070).
-    const SOCKET_SLOTS: usize = 8;
+    const SOCKET_SLOTS: usize = 7 + HTTP_LISTEN_SOCKETS;
 
     /// Metadata/payload sizing for the mDNS responder UDP socket (port 5353).
     const MDNS_UDP_META: usize = 4;
@@ -2577,13 +2580,9 @@ mod xtensa_hw {
         )))
     }
 
-    /// Static pipeline + the static HTTP-server buffers handed out with it
+    /// Static pipeline + the PSRAM HTTP request buffer handed out with it
     /// (`init_static_pipeline`).
-    type PipelineStatics = (
-        &'static mut HwStreamPipeline,
-        &'static mut [u8; 4096],
-        &'static mut [u8; 4096],
-    );
+    type PipelineStatics = (&'static mut HwStreamPipeline, &'static mut [u8]);
 
     /// Bring-up stage: I2S0 TDM-Philips TX (BCK=26, WS=25, DOUT=22) with
     /// streaming DMA prefilled with silence, then the I2S sink and the static
@@ -2837,12 +2836,58 @@ mod xtensa_hw {
         sockets.add(socket())
     }
 
+    /// Per-socket Port 80 HTTP connection and streaming state in PSRAM.
+    struct HttpConnSlot {
+        handle: SocketHandle,
+        resp_buf: &'static mut [u8],
+        resp_len: usize,
+        resp_sent: usize,
+        pending_body: &'static [u8],
+        started_ms: u64,
+        established_since_ms: Option<u64>,
+        post_wait_since_ms: Option<u64>,
+        closing: bool,
+        close_deadline_ms: u64,
+    }
+
+    impl HttpConnSlot {
+        fn new(handle: SocketHandle) -> Self {
+            let resp_buf: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_RESP_BUF_BYTES].into_boxed_slice());
+            Self {
+                handle,
+                resp_buf,
+                resp_len: 0,
+                resp_sent: 0,
+                pending_body: &[],
+                started_ms: 0,
+                established_since_ms: None,
+                post_wait_since_ms: None,
+                closing: false,
+                close_deadline_ms: 0,
+            }
+        }
+
+        fn has_pending_tx(&self) -> bool {
+            self.resp_sent < self.resp_len || !self.pending_body.is_empty()
+        }
+
+        fn reset_transfer_state(&mut self) {
+            self.resp_len = 0;
+            self.resp_sent = 0;
+            self.pending_body = &[];
+            self.established_since_ms = None;
+            self.post_wait_since_ms = None;
+            self.closing = false;
+        }
+    }
+
     /// Output of [`init_net_stack`].
     struct NetStack {
         smol_iface: &'static mut SmolInterface,
         sockets: SocketSet<'static>,
         dhcp_handle: SocketHandle,
-        http_handle: SocketHandle,
+        http_handles: [SocketHandle; HTTP_LISTEN_SOCKETS],
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
         mdns_handle: SocketHandle,
@@ -2852,13 +2897,13 @@ mod xtensa_hw {
         local_port_counter: u16,
     }
 
-    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for HTTP,
-    /// slimproto, audio.
-    type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 3];
+    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for slimproto
+    /// and audio.
+    type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 2];
 
-    /// Bring-up stage: `smoltcp` Ethernet interface + DHCPv4 + TCP port 80 +
-    /// TCP SlimProto (3483) + audio socket + mDNS UDP (5353) + AirPlay RTSP
-    /// TCP (5000) + AirPlay RTP UDP (6000) + Spotify Connect HTTP/Spirc TCP
+    /// Bring-up stage: `smoltcp` Ethernet interface, DHCPv4, 3x TCP port 80,
+    /// TCP SlimProto (3483), audio socket, mDNS UDP (5353), AirPlay RTSP TCP
+    /// (5000), AirPlay RTP UDP (6000), and Spotify Connect HTTP/Spirc TCP
     /// (4070), allocated in external PSRAM.
     #[inline(never)]
     fn init_net_stack(
@@ -2866,8 +2911,7 @@ mod xtensa_hw {
         sta_mac: [u8; 6],
         tcp_bufs: TcpBuffers,
     ) -> NetStack {
-        let [(http_rx_buf, http_tx_buf), (slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] =
-            tcp_bufs;
+        let [(slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] = tcp_bufs;
         let hw_rng = Rng::new();
         let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
@@ -2891,11 +2935,14 @@ mod xtensa_hw {
 
         let dhcp_handle = add_socket(&mut sockets, dhcpv4::Socket::new);
 
-        let http_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(
-                tcp::SocketBuffer::new(http_rx_buf),
-                tcp::SocketBuffer::new(http_tx_buf),
-            )
+        let http_handles = core::array::from_fn(|_| {
+            let rx: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_RX_BUF_BYTES].into_boxed_slice());
+            let tx: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_TX_BUF_BYTES].into_boxed_slice());
+            add_socket(&mut sockets, || {
+                tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx))
+            })
         });
 
         let slim_handle = add_socket(&mut sockets, || {
@@ -2958,7 +3005,7 @@ mod xtensa_hw {
             smol_iface,
             sockets,
             dhcp_handle,
-            http_handle,
+            http_handles,
             slim_handle,
             audio_handle,
             mdns_handle,
@@ -2991,7 +3038,7 @@ mod xtensa_hw {
         smol_iface: &'static mut SmolInterface,
         sockets: SocketSet<'static>,
         dhcp_handle: SocketHandle,
-        http_handle: SocketHandle,
+        http_slots: [HttpConnSlot; HTTP_LISTEN_SOCKETS],
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
         mdns_handle: SocketHandle,
@@ -3007,7 +3054,7 @@ mod xtensa_hw {
         coordinator: &'static mut PlayerCoordinator,
         slim_link: SlimLinkState,
         stream_state: HttpStreamState,
-        http_resp_buf: &'static mut [u8; 4096],
+        http_req_buf: &'static mut [u8],
         config: &'static ConfigHandle,
         journal: &'static mut RamJournal<'static>,
         config_writer: ConfigWriter,
@@ -3025,10 +3072,6 @@ mod xtensa_hw {
         assigned_gw: [u8; 4],
         pending_http_action: HttpControlAction,
         pending_action_deadline_ms: u64,
-        pending_http_body: &'static [u8],
-        pending_http_started_ms: u64,
-        pending_http_closing: bool,
-        pending_close_deadline_ms: u64,
         helo_sent: bool,
         last_connect_attempt_ms: u64,
         slim_reconnect: SlimReconnect,
@@ -3164,7 +3207,6 @@ mod xtensa_hw {
         let fw_bufs = take_firmware_bss_buffers();
         let FirmwareBssBuffers {
             ref mut ring_storage,
-            ref mut http_rx_buf,
             ref mut slim_rx_buf,
             ref mut slim_tx_buf,
             ref mut audio_rx_buf,
@@ -3356,7 +3398,7 @@ mod xtensa_hw {
         #[cfg(not(feature = "board-louder-esp32-s3"))]
         let amp = init_amp_i2c(peripherals.I2C0, peripherals.GPIO21, peripherals.GPIO27);
         #[cfg(not(feature = "board-louder-esp32-s3"))]
-        let (pipeline, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
+        let (pipeline, http_req_buf) = init_i2s_pipeline(
             peripherals.I2S0,
             peripherals.DMA_I2S0,
             peripherals.GPIO26,
@@ -3441,7 +3483,7 @@ mod xtensa_hw {
             smol_iface,
             sockets,
             dhcp_handle,
-            http_handle,
+            http_handles,
             slim_handle,
             audio_handle,
             mdns_handle,
@@ -3453,7 +3495,6 @@ mod xtensa_hw {
             &mut sta_iface,
             sta_mac,
             [
-                (&mut http_rx_buf[..], &mut http_tx_buf[..]),
                 (slim_rx_slice, &mut slim_tx_buf[..]),
                 (audio_rx_slice, &mut audio_tx_buf[..]),
             ],
@@ -3470,6 +3511,7 @@ mod xtensa_hw {
         ));
         let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
         let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
+        let http_slots = http_handles.map(HttpConnSlot::new);
 
         let state = alloc::boxed::Box::leak(alloc::boxed::Box::new(DeviceRuntimeState {
             wdt,
@@ -3482,7 +3524,7 @@ mod xtensa_hw {
             smol_iface,
             sockets,
             dhcp_handle,
-            http_handle,
+            http_slots,
             slim_handle,
             audio_handle,
             mdns_handle,
@@ -3498,7 +3540,7 @@ mod xtensa_hw {
             coordinator,
             slim_link: SlimLinkState::new(),
             stream_state: HttpStreamState::new(),
-            http_resp_buf,
+            http_req_buf,
             config,
             journal,
             config_writer,
@@ -3516,10 +3558,6 @@ mod xtensa_hw {
             assigned_gw: [172, 22, 1, 1],
             pending_http_action: HttpControlAction::None,
             pending_action_deadline_ms: 0,
-            pending_http_body: &[],
-            pending_http_started_ms: 0,
-            pending_http_closing: false,
-            pending_close_deadline_ms: 0,
             helo_sent: false,
             last_connect_attempt_ms: 0,
             slim_reconnect: SlimReconnect::new(),
@@ -3998,7 +4036,10 @@ mod xtensa_hw {
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
-                    s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                    for slot in &mut s.http_slots {
+                        s.sockets.get_mut::<tcp::Socket>(slot.handle).abort();
+                        slot.reset_transfer_state();
+                    }
                     s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
                     s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
@@ -4009,8 +4050,6 @@ mod xtensa_hw {
                     s.spot_streaming = false;
                     s.rtsp_rx_acc.clear();
                     s.helo_sent = false;
-                    s.pending_http_body = &[];
-                    s.pending_http_closing = false;
                 }
                 s.assigned_ip = Some(ip_octets);
                 s.raop_rtsp.set_ip_address(ip_octets);
@@ -4057,7 +4096,10 @@ mod xtensa_hw {
                     .leave_multicast_group(Ipv4Address::new(224, 0, 0, 251));
                 s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
-                s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                for slot in &mut s.http_slots {
+                    s.sockets.get_mut::<tcp::Socket>(slot.handle).abort();
+                    slot.reset_transfer_state();
+                }
                 s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
                 s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
@@ -4067,8 +4109,6 @@ mod xtensa_hw {
                 s.spot_streaming = false;
                 s.rtsp_rx_acc.clear();
                 s.helo_sent = false;
-                s.pending_http_body = &[];
-                s.pending_http_closing = false;
             }
             None => {}
         }
@@ -4077,489 +4117,491 @@ mod xtensa_hw {
     #[inline(never)]
     fn http_serve_phase(s: &mut DeviceRuntimeState) {
         let now_ms = s.now_ms;
-        {
-            let http_sock = s.sockets.get_mut::<tcp::Socket>(s.http_handle);
+        for idx in 0..HTTP_LISTEN_SOCKETS {
+            let mut req_len = 0usize;
+            {
+                let slot = &mut s.http_slots[idx];
+                let http_sock = s.sockets.get_mut::<tcp::Socket>(slot.handle);
 
-            if !s.pending_http_body.is_empty() {
-                if now_ms.saturating_sub(s.pending_http_started_ms) >= 2_500
-                    || matches!(
-                        http_sock.state(),
-                        tcp::State::CloseWait
-                            | tcp::State::TimeWait
+                if slot.has_pending_tx() {
+                    if now_ms.saturating_sub(slot.started_ms) >= 5_000
+                        || matches!(
+                            http_sock.state(),
+                            tcp::State::TimeWait
+                                | tcp::State::Closing
+                                | tcp::State::LastAck
+                                | tcp::State::FinWait1
+                                | tcp::State::FinWait2
+                                | tcp::State::Closed
+                        )
+                        || !http_sock.may_send()
+                    {
+                        http_sock.abort();
+                        slot.reset_transfer_state();
+                    } else {
+                        if slot.resp_sent < slot.resp_len {
+                            if let Ok(sent) =
+                                http_sock.send_slice(&slot.resp_buf[slot.resp_sent..slot.resp_len])
+                            {
+                                slot.resp_sent += sent;
+                            }
+                        }
+                        if slot.resp_sent >= slot.resp_len && !slot.pending_body.is_empty() {
+                            if let Ok(sent) = http_sock.send_slice(slot.pending_body) {
+                                slot.pending_body = &slot.pending_body[sent..];
+                            }
+                        }
+                        if !slot.has_pending_tx() {
+                            http_sock.close();
+                            slot.closing = true;
+                            slot.close_deadline_ms = now_ms + 1_500;
+                        }
+                    }
+                }
+
+                if slot.closing
+                    && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                        || now_ms >= slot.close_deadline_ms)
+                {
+                    http_sock.abort();
+                    slot.reset_transfer_state();
+                }
+
+                if !slot.has_pending_tx() && !slot.closing && http_sock.is_open() {
+                    let st = http_sock.state();
+                    if matches!(
+                        st,
+                        tcp::State::TimeWait
                             | tcp::State::Closing
                             | tcp::State::LastAck
                             | tcp::State::FinWait1
                             | tcp::State::FinWait2
-                            | tcp::State::Closed
-                    )
-                {
-                    s.pending_http_body = &[];
-                    http_sock.abort();
-                    s.pending_http_closing = false;
-                } else if http_sock.may_send() {
-                    if let Ok(sent) = http_sock.send_slice(s.pending_http_body) {
-                        s.pending_http_body = &s.pending_http_body[sent..];
+                    ) || (st == tcp::State::CloseWait && !http_sock.can_recv())
+                    {
+                        http_sock.abort();
+                        slot.reset_transfer_state();
                     }
-                    if s.pending_http_body.is_empty() {
-                        http_sock.close();
-                        s.pending_http_closing = true;
-                        s.pending_close_deadline_ms = now_ms + 500;
-                    }
-                } else {
-                    s.pending_http_body = &[];
-                    http_sock.abort();
-                    s.pending_http_closing = false;
                 }
-            }
 
-            if s.pending_http_closing
-                && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
-                    || now_ms >= s.pending_close_deadline_ms)
-            {
-                http_sock.abort();
-                s.pending_http_closing = false;
-            }
+                if !slot.has_pending_tx()
+                    && !slot.closing
+                    && http_sock.state() == tcp::State::Established
+                    && http_sock.recv_queue() == 0
+                {
+                    let since = *slot.established_since_ms.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(since) >= 2_000 {
+                        http_sock.close();
+                        slot.closing = true;
+                        slot.close_deadline_ms = now_ms + 500;
+                        slot.established_since_ms = None;
+                    }
+                } else if http_sock.recv_queue() > 0 || http_sock.state() != tcp::State::Established
+                {
+                    slot.established_since_ms = None;
+                }
 
-            if s.pending_http_body.is_empty()
-                && !s.pending_http_closing
-                && http_sock.is_open()
-                && matches!(
-                    http_sock.state(),
-                    tcp::State::CloseWait
-                        | tcp::State::TimeWait
-                        | tcp::State::Closing
-                        | tcp::State::LastAck
-                        | tcp::State::FinWait1
-                        | tcp::State::FinWait2
-                )
-            {
-                http_sock.abort();
-            }
+                if !http_sock.is_open() {
+                    slot.reset_transfer_state();
+                    let _ = http_sock.listen(80);
+                }
 
-            if !http_sock.is_open() {
-                s.pending_http_body = &[];
-                s.pending_http_closing = false;
-                let _ = http_sock.listen(80);
-            }
-
-            if s.pending_http_body.is_empty()
-                && !s.pending_http_closing
-                && http_sock.can_recv()
-                && http_sock.may_send()
-            {
-                static POST_WAIT_MS: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-
-                let mut should_wait = false;
-                let mut peek_buf = [0u8; 256];
-                if let Ok(peek_n) = http_sock.peek_slice(&mut peek_buf) {
-                    let peek_bytes = &peek_buf[..peek_n];
-                    if peek_bytes.starts_with(b"POST ") {
-                        if let Some(pos) = peek_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let hdr_end = pos + 4;
-                            let mut cl = 0usize;
-                            if let Some(cl_idx) = peek_bytes[..hdr_end]
-                                .windows(16)
-                                .position(|w| w.eq_ignore_ascii_case(b"content-length: "))
-                            {
-                                for &b in &peek_bytes[cl_idx + 16..hdr_end] {
-                                    if b.is_ascii_digit() {
-                                        cl = cl
-                                            .saturating_mul(10)
-                                            .saturating_add((b - b'0') as usize);
-                                    } else if b == b'\r' || b == b'\n' {
-                                        break;
-                                    }
-                                }
-                            }
-                            if cl > 0 && http_sock.recv_queue() < hdr_end + cl {
-                                let start =
-                                    POST_WAIT_MS.load(core::sync::atomic::Ordering::Relaxed);
-                                if start == 0 {
-                                    POST_WAIT_MS.store(
-                                        now_ms as u32,
-                                        core::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    should_wait = true;
-                                } else if (now_ms as u32).wrapping_sub(start) < 250 {
+                if !slot.has_pending_tx()
+                    && !slot.closing
+                    && http_sock.can_recv()
+                    && http_sock.may_send()
+                {
+                    let mut should_wait = false;
+                    if http_sock.state() == tcp::State::Established {
+                        if let Ok(peek_n) = http_sock.peek_slice(&mut s.http_req_buf[..]) {
+                            if louder_esp32_app::http_control::http_request_needs_more_bytes(
+                                &s.http_req_buf[..peek_n],
+                                HTTP_RX_BUF_BYTES,
+                            ) {
+                                let wait_start = *slot.post_wait_since_ms.get_or_insert(now_ms);
+                                if now_ms.saturating_sub(wait_start) < 500 {
                                     should_wait = true;
                                 }
                             }
                         }
                     }
-                }
 
-                if !should_wait {
-                    POST_WAIT_MS.store(0, core::sync::atomic::Ordering::Relaxed);
-                    let mut req_buf = [0u8; 1024];
-                    let mut req_len = 0;
-                    while req_len < req_buf.len() && http_sock.can_recv() {
-                        let chunk = http_sock.recv_slice(&mut req_buf[req_len..]).unwrap_or(0);
-                        if chunk == 0 {
+                    if !should_wait {
+                        slot.post_wait_since_ms = None;
+                        while req_len < s.http_req_buf.len() && http_sock.can_recv() {
+                            let chunk = http_sock
+                                .recv_slice(&mut s.http_req_buf[req_len..])
+                                .unwrap_or(0);
+                            if chunk == 0 {
+                                break;
+                            }
+                            req_len += chunk;
+                        }
+                        while http_sock.can_recv() {
+                            let _ = http_sock.recv(|buf| (buf.len(), ()));
+                        }
+                    }
+                }
+            }
+
+            if req_len > 0 {
+                let amp_mode_str = match s.amp.mode() {
+                    louder_esp32_app::AmpMode::Play => "Play",
+                    louder_esp32_app::AmpMode::Standby => "Standby",
+                    louder_esp32_app::AmpMode::PowerDown => "PowerDown",
+                };
+                let codec_name = match s.coordinator.active_source() {
+                    AudioSource::AirPlay => "AirPlay",
+                    AudioSource::Bluetooth => "Bluetooth",
+                    AudioSource::Spotify => "Spotify",
+                    _ => {
+                        if s.raop_streaming {
+                            "AirPlay"
+                        } else if s.spot_streaming {
+                            "Spotify"
+                        } else {
+                            match s.pipeline.decoder {
+                                ActiveDecoder::Mp3(_) => "MP3",
+                                ActiveDecoder::Flac(_) => "FLAC",
+                                ActiveDecoder::Pcm(_) => "PCM",
+                                ActiveDecoder::Aac(_) => "AAC",
+                                ActiveDecoder::Vorbis(_) => "Vorbis",
+                                ActiveDecoder::Alac(_) => "ALAC",
+                                ActiveDecoder::Opus(_) => "Opus",
+                            }
+                        }
+                    }
+                };
+                let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
+                    match s.latest_telemetry {
+                        Some(t) => (
+                            t.detected_sample_rate_hz_with_hint(s.coordinator.current_sample_rate),
+                            t.bck_ratio(),
+                            t.is_pll_locked(),
+                            t.is_automuted(),
+                        ),
+                        None => (s.coordinator.current_sample_rate, 64, true, false),
+                    };
+                let (psram_free_bytes, psram_used_bytes) = {
+                    let stats = esp_alloc::HEAP.stats();
+                    let mut free = 0u32;
+                    let mut used = 0u32;
+                    for r in stats.region_stats.iter().flatten() {
+                        if r.size > 1024 * 1024 {
+                            free = r.free as u32;
+                            used = r.used as u32;
                             break;
                         }
-                        req_len += chunk;
                     }
-                    while http_sock.can_recv() {
-                        let _ = http_sock.recv(|buf| (buf.len(), ()));
+                    if free.saturating_add(used) > 200_000 {
+                        (free, used)
+                    } else {
+                        (
+                            louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
+                            louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
+                        )
                     }
-                    if req_len > 0 {
-                        let amp_mode_str = match s.amp.mode() {
-                            louder_esp32_app::AmpMode::Play => "Play",
-                            louder_esp32_app::AmpMode::Standby => "Standby",
-                            louder_esp32_app::AmpMode::PowerDown => "PowerDown",
-                        };
-                        let codec_name = match s.coordinator.active_source() {
-                            AudioSource::AirPlay => "AirPlay",
-                            AudioSource::Bluetooth => "Bluetooth",
-                            AudioSource::Spotify => "Spotify",
-                            _ => {
-                                if s.raop_streaming {
-                                    "AirPlay"
-                                } else if s.spot_streaming {
-                                    "Spotify"
-                                } else {
-                                    match s.pipeline.decoder {
-                                        ActiveDecoder::Mp3(_) => "MP3",
-                                        ActiveDecoder::Flac(_) => "FLAC",
-                                        ActiveDecoder::Pcm(_) => "PCM",
-                                        ActiveDecoder::Aac(_) => "AAC",
-                                        ActiveDecoder::Vorbis(_) => "Vorbis",
-                                        ActiveDecoder::Alac(_) => "ALAC",
-                                        ActiveDecoder::Opus(_) => "Opus",
-                                    }
-                                }
-                            }
-                        };
-                        let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
-                            match s.latest_telemetry {
-                                Some(t) => (
-                                    t.detected_sample_rate_hz_with_hint(
-                                        s.coordinator.current_sample_rate,
-                                    ),
-                                    t.bck_ratio(),
-                                    t.is_pll_locked(),
-                                    t.is_automuted(),
-                                ),
-                                None => (s.coordinator.current_sample_rate, 64, true, false),
-                            };
-                        let (psram_free_bytes, psram_used_bytes) = {
-                            let stats = esp_alloc::HEAP.stats();
-                            let mut free = 0u32;
-                            let mut used = 0u32;
-                            for r in stats.region_stats.iter().flatten() {
-                                if r.size > 1024 * 1024 {
-                                    free = r.free as u32;
-                                    used = r.used as u32;
-                                    break;
-                                }
-                            }
-                            if free.saturating_add(used) > 200_000 {
-                                (free, used)
-                            } else {
-                                (
-                                    louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
-                                    louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
-                                )
-                            }
-                        };
-                        let mut eq_bands_db = [0i8; 10];
-                        for (dst, &gain) in
-                            eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
-                        {
-                            let rounded = if gain >= 0.0 {
-                                (gain + 0.5) as i8
-                            } else {
-                                (gain - 0.5) as i8
-                            };
-                            *dst = rounded.clamp(-15, 15);
+                };
+                let mut eq_bands_db = [0i8; 10];
+                for (dst, &gain) in eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter()) {
+                    let rounded = if gain >= 0.0 {
+                        (gain + 0.5) as i8
+                    } else {
+                        (gain - 0.5) as i8
+                    };
+                    *dst = rounded.clamp(-15, 15);
+                }
+                let player_name_val = s
+                    .config
+                    .nvs_override("host_name")
+                    .and_then(|h| {
+                        let t = h.trim();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            let mut out = heapless::String::<32>::new();
+                            let max_len = t.floor_char_boundary(t.len().min(32));
+                            let _ = out.push_str(&t[..max_len]);
+                            Some(out)
                         }
-                        let player_name_val = s
-                            .config
-                            .nvs_override("host_name")
-                            .and_then(|h| {
-                                let t = h.trim();
-                                if t.is_empty() {
-                                    None
-                                } else {
-                                    let mut out = heapless::String::<32>::new();
-                                    let max_len = t.floor_char_boundary(t.len().min(32));
-                                    let _ = out.push_str(&t[..max_len]);
-                                    Some(out)
-                                }
-                            })
-                            .unwrap_or_else(|| {
-                                s.config.read(|c| {
-                                    if !c.player_name.is_empty() {
-                                        c.player_name.clone()
-                                    } else {
-                                        s.config.device_name()
-                                    }
-                                })
-                            });
-                        let i2c_acks = Esp32I2cBus::hw_ack_count();
-                        let i2c_nacks = Esp32I2cBus::hw_nack_count();
-                        let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
-                        let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
-                        let snap = HttpStatusSnapshot {
-                            ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
-                            netmask: s.assigned_mask,
-                            gw: s.assigned_gw,
-                            ssid: s.wifi_sta_creds.ssid.as_str(),
-                            rssi: s.wifi_controller.rssi().unwrap_or(-50),
-                            lms_ip: s.lms_ip,
-                            lms_port: 9000,
-                            lms_cport: 9090,
-                            otadata_prearmed_factory: !s.boot_ota0_confirmed,
-                            frames_played: s.pipeline.frames_played,
-                            amp_mode: amp_mode_str,
-                            vol_pct: s.current_vol_pct,
-                            i2c_acks,
-                            i2c_nacks,
-                            i2c_nack_by_op,
-                            uptime_ms: now_ms.saturating_sub(s.boot_ms),
-                            psram_free_bytes,
-                            psram_used_bytes,
-                            core1_active: s.core1.is_active(),
-                            core1_loops: CORE1_HEARTBEAT
-                                .load(core::sync::atomic::Ordering::Relaxed),
-                            codec: codec_name,
-                            codec_sample_rate: s.coordinator.current_sample_rate,
-                            codec_channels: 2,
-                            codec_bit_depth: 16,
-                            eq_preset: s.pipeline.current_eq_preset.as_str(),
-                            eq_enabled: s.pipeline.equalizer.enabled,
-                            tas_fs_hz,
-                            tas_bck_ratio,
-                            tas_pll_locked,
-                            tas_automuted,
-                            again_code: s.amp.analog_gain_code(),
-                            settings_seq: s.journal.sequence(),
-                            bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
-                            bt_connected: s.bt_sink.is_connected(),
-                            bt_streaming: s.bt_sink.is_streaming(),
-                            bt_rx_pkts: s.bt_sink.rx_packets,
-                            bt_frames: s.bt_sink.decoded_frames,
-                            decode_us_max: s.pipeline.decode_us_max,
-                            decode_us_first: s.pipeline.decode_us_first,
-                            jack_inserted: false,
-                            voltage_mv: 0,
-                            disconnect_count: s.disconnect_count,
-                            avg_conn_time_ms: 0,
-                            is_i2c_locked,
-                            urc: if s.assigned_ip.is_some() { 0 } else { 2 },
-                            bt_status: if s.bt_sink.is_streaming() {
-                                2
-                            } else if s.bt_sink.is_connected() {
-                                1
+                    })
+                    .unwrap_or_else(|| {
+                        s.config.read(|c| {
+                            if !c.player_name.is_empty() {
+                                c.player_name.clone()
                             } else {
-                                0
-                            },
-                            bt_sub_status: 0,
-                            eq_bands_db,
-                            player_name: player_name_val.as_str(),
-                        };
-                        let snapshot = snap.clone();
-                        let resp_buf = &mut s.http_resp_buf[..];
-                        let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
-                            "", "", "string",
-                        );
-                            louder_esp32_app::config_handle::MAX_NVS_OVERRIDE_SLOTS];
-                        let mut view_len = 0usize;
-                        let nvs_overrides = s.config.nvs_override_table();
-                        for (key, value) in nvs_overrides.iter() {
-                            if view_len < extra_views.len() {
-                                extra_views[view_len] =
-                                    louder_esp32_app::http_control::ConfigEntryView::new(
-                                        key, value, "string",
-                                    );
-                                view_len += 1;
+                                s.config.device_name()
                             }
-                        }
-                        if let Some((hdr_or_resp_len, static_body, action)) =
+                        })
+                    });
+                let effective_lms_port = s.config.read(|c| c.lms_server_port).unwrap_or(9000);
+                let i2c_acks = Esp32I2cBus::hw_ack_count();
+                let i2c_nacks = Esp32I2cBus::hw_nack_count();
+                let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
+                let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
+                let snap = HttpStatusSnapshot {
+                    ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
+                    netmask: s.assigned_mask,
+                    gw: s.assigned_gw,
+                    ssid: s.wifi_sta_creds.ssid.as_str(),
+                    rssi: s.wifi_controller.rssi().unwrap_or(-50),
+                    lms_ip: s.lms_ip,
+                    lms_port: effective_lms_port,
+                    lms_cport: 9090,
+                    otadata_prearmed_factory: !s.boot_ota0_confirmed,
+                    frames_played: s.pipeline.frames_played,
+                    amp_mode: amp_mode_str,
+                    vol_pct: s.current_vol_pct,
+                    i2c_acks,
+                    i2c_nacks,
+                    i2c_nack_by_op,
+                    uptime_ms: now_ms.saturating_sub(s.boot_ms),
+                    psram_free_bytes,
+                    psram_used_bytes,
+                    core1_active: s.core1.is_active(),
+                    core1_loops: CORE1_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed),
+                    codec: codec_name,
+                    codec_sample_rate: s.coordinator.current_sample_rate,
+                    codec_channels: 2,
+                    codec_bit_depth: 16,
+                    eq_preset: s.pipeline.current_eq_preset.as_str(),
+                    eq_enabled: s.pipeline.equalizer.enabled,
+                    tas_fs_hz,
+                    tas_bck_ratio,
+                    tas_pll_locked,
+                    tas_automuted,
+                    again_code: s.amp.analog_gain_code(),
+                    settings_seq: s.journal.sequence(),
+                    bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
+                    bt_connected: s.bt_sink.is_connected(),
+                    bt_streaming: s.bt_sink.is_streaming(),
+                    bt_rx_pkts: s.bt_sink.rx_packets,
+                    bt_frames: s.bt_sink.decoded_frames,
+                    decode_us_max: s.pipeline.decode_us_max,
+                    decode_us_first: s.pipeline.decode_us_first,
+                    jack_inserted: false,
+                    voltage_mv: 0,
+                    disconnect_count: s.disconnect_count,
+                    avg_conn_time_ms: 0,
+                    is_i2c_locked,
+                    urc: if s.assigned_ip.is_some() { 0 } else { 2 },
+                    bt_status: if s.bt_sink.is_streaming() {
+                        2
+                    } else if s.bt_sink.is_connected() {
+                        1
+                    } else {
+                        0
+                    },
+                    bt_sub_status: 0,
+                    eq_bands_db,
+                    player_name: player_name_val.as_str(),
+                };
+                let snapshot = snap.clone();
+                let mut extra_views =
+                    [louder_esp32_app::http_control::ConfigEntryView::new("", "", "string");
+                        louder_esp32_app::config_handle::MAX_NVS_OVERRIDE_SLOTS];
+                let mut view_len = 0usize;
+                let nvs_overrides = s.config.nvs_override_table();
+                for (key, value) in nvs_overrides.iter() {
+                    if view_len < extra_views.len() {
+                        extra_views[view_len] =
+                            louder_esp32_app::http_control::ConfigEntryView::new(
+                                key, value, "string",
+                            );
+                        view_len += 1;
+                    }
+                }
+
+                let action_opt = {
+                    let slot = &mut s.http_slots[idx];
+                    let http_sock = s.sockets.get_mut::<tcp::Socket>(slot.handle);
+                    if let Some((hdr_or_resp_len, static_body, action)) =
                         louder_esp32_app::http_control::handle_http_request_streaming_with_entries(
-                            &req_buf[..req_len],
+                            &s.http_req_buf[..req_len],
                             &snapshot,
                             &extra_views[..view_len],
-                            resp_buf,
+                            &mut slot.resp_buf[..],
                         )
                     {
-                        let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
-                        if !static_body.is_empty() {
-                            s.pending_http_body = static_body;
-                            s.pending_http_started_ms = now_ms;
-                            if let Ok(sent) = http_sock.send_slice(s.pending_http_body) {
-                                s.pending_http_body = &s.pending_http_body[sent..];
+                        slot.resp_len = hdr_or_resp_len;
+                        slot.resp_sent = 0;
+                        slot.pending_body = static_body;
+                        slot.started_ms = now_ms;
+
+                        if slot.resp_sent < slot.resp_len {
+                            if let Ok(sent) =
+                                http_sock.send_slice(&slot.resp_buf[slot.resp_sent..slot.resp_len])
+                            {
+                                slot.resp_sent += sent;
                             }
-                            if s.pending_http_body.is_empty() {
-                                http_sock.close();
-                                s.pending_http_closing = true;
-                                s.pending_close_deadline_ms = now_ms + 80;
+                        }
+                        if slot.resp_sent >= slot.resp_len && !slot.pending_body.is_empty() {
+                            if let Ok(sent) = http_sock.send_slice(slot.pending_body) {
+                                slot.pending_body = &slot.pending_body[sent..];
                             }
-                        } else {
+                        }
+                        if !slot.has_pending_tx() {
                             http_sock.close();
-                            s.pending_http_closing = true;
-                            s.pending_close_deadline_ms = now_ms + 80;
+                            slot.closing = true;
+                            slot.close_deadline_ms = now_ms + 1_500;
                         }
-                        match action {
-                            HttpControlAction::SetEqPreset(preset_id) => {
-                                let preset = EqPreset::from_u8(preset_id);
-                                s.pipeline.apply_eq_preset(preset);
-                                s.config.update(|c| c.equalizer_preset = preset_id);
-                                let _ = s.config.set_nvs_override("equalizer", "");
-                                let _ = s.config.flush_now(&mut *s.journal);
-                            }
-                            HttpControlAction::SetAnalogGain(again_code) => {
-                                let clamped = again_code.min(31);
-                                let _ = s.amp.set_analog_gain(clamped);
-                                s.config.update(|c| c.analog_gain_code = clamped);
-                                let _ = s.config.flush_now(&mut *s.journal);
-                            }
-                            HttpControlAction::PlayerIrCommand {
-                                ir_code,
-                                vol_pct,
-                                mute,
-                            } => {
-                                if let Some(pct) = vol_pct {
-                                    let clamped = pct.min(100);
-                                    s.current_vol_pct = clamped;
-                                    let mut backend = Esp32AudioBackend::new(
-                                        s.amp,
-                                        DeviceClockRegs,
-                                        &DMA_OUTSTANDING_FRAMES,
-                                    );
-                                    s.coordinator
-                                        .set_volume_percent(clamped, &mut backend, s.pipeline);
-                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(clamped));
-                                    s.config.update(|c| c.volume = clamped);
-                                    let _ = s.config.flush_now(&mut *s.journal);
-                                }
-                                if let Some(m) = mute {
-                                    s.pipeline.set_mute(m);
-                                }
-                                if ir_code != 0 && s.helo_sent {
-                                    let mut ir_buf = [0u8; 32];
-                                    if let Ok(ir_len) = SlimprotoBuilder::build_ir(
-                                        now_ms as u32,
-                                        ir_code,
-                                        &mut ir_buf,
-                                    ) {
-                                        let slim_sock =
-                                            s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                        let mut link = SmoltcpSlimTransport::new(
-                                            DeviceSmolTcp::new(slim_sock),
-                                            &mut s.slim_link,
-                                        );
-                                        let _ = link.send(&ir_buf[..ir_len]);
-                                    }
-                                }
-                            }
-                            HttpControlAction::SpotifyPlay => {
-                                if s.coordinator.request_source(AudioSource::Spotify) {
-                                    if s.coordinator.current_sample_rate != 44_100
-                                        || s.pipeline.sample_rate != 44_100
-                                    {
-                                        s.coordinator.current_sample_rate = 44_100;
-                                        let _ = s.pipeline.set_sample_rate(44_100);
-                                    }
-                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                        16, 2, false,
-                                    )));
-                                    s.pipeline.begin_external_audio();
-                                    s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
-                                    if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                        let _ = s.amp.clear_faults();
-                                        let _ = s.amp.start_playback_via_hiz();
-                                    }
-                                    s.spot_streaming = true;
-                                }
-                            }
-                            HttpControlAction::SpotifyStop => {
-                                s.spot_streaming = false;
-                                s.coordinator.release_source(AudioSource::Spotify);
-                                restore_suspended_or_stop(s);
-                            }
-                            HttpControlAction::RebootToRecovery
-                            | HttpControlAction::PersistOta0AndReboot => {
-                                s.pending_http_action = action;
-                                s.pending_action_deadline_ms = now_ms + 250;
-                            }
-                            HttpControlAction::UpdateConfig
-                            | HttpControlAction::ExecuteCliCommand => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snapshot,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                                sync_config_to_runtime(s);
-                            }
-                            HttpControlAction::TriggerWifiScan => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snapshot,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                            }
-                            HttpControlAction::ConnectWifi => {
-                                if let Some(creds) = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snapshot,
-                                    s.config,
-                                    &mut *s.journal,
-                                ) {
-                                    if let Ok(ssid_cfg) = creds.ssid.as_str().try_into() {
-                                        let auth_cfg = if creds.password.is_empty() {
-                                            AuthenticationMethodConfig::Open
-                                        } else if let Ok(pw) = creds.password.as_str().try_into() {
-                                            AuthenticationMethodConfig::WpaWpa2Personal(pw)
-                                        } else {
-                                            AuthenticationMethodConfig::Open
-                                        };
-                                        let sta_cfg = WifiModeConfig::Station(
-                                            StationConfig::default()
-                                                .with_ssid(ssid_cfg)
-                                                .with_authentication(auth_cfg),
-                                        );
-                                        let _ = s.wifi_controller.set_config(&sta_cfg);
-                                        s.last_connect_attempt_ms = 0;
-                                    }
-                                }
-                            }
-                            HttpControlAction::DisconnectWifi => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snap,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                                s.assigned_ip = None;
-                                s.last_connect_attempt_ms = now_ms;
-                            }
-                            HttpControlAction::StartOtaFlash => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snap,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                                s.pending_http_action = HttpControlAction::PersistOta0AndReboot;
-                                s.pending_action_deadline_ms = now_ms + 250;
-                            }
-                            _ => {}
-                        }
+                        Some(action)
                     } else {
                         http_sock.close();
-                        s.pending_http_closing = true;
-                        s.pending_close_deadline_ms = now_ms + 250;
+                        slot.closing = true;
+                        slot.close_deadline_ms = now_ms + 500;
+                        None
                     }
+                };
+
+                if let Some(action) = action_opt {
+                    match action {
+                        HttpControlAction::SetEqPreset(preset_id) => {
+                            let preset = EqPreset::from_u8(preset_id);
+                            s.pipeline.apply_eq_preset(preset);
+                            s.config.update(|c| c.equalizer_preset = preset_id);
+                            let _ = s.config.set_nvs_override("equalizer", "");
+                            let _ = s.config.flush_now(&mut *s.journal);
+                        }
+                        HttpControlAction::SetAnalogGain(again_code) => {
+                            let clamped = again_code.min(31);
+                            let _ = s.amp.set_analog_gain(clamped);
+                            s.config.update(|c| c.analog_gain_code = clamped);
+                            let _ = s.config.flush_now(&mut *s.journal);
+                        }
+                        HttpControlAction::PlayerIrCommand {
+                            ir_code,
+                            vol_pct,
+                            mute,
+                        } => {
+                            if let Some(pct) = vol_pct {
+                                let clamped = pct.min(100);
+                                s.current_vol_pct = clamped;
+                                let mut backend = Esp32AudioBackend::new(
+                                    s.amp,
+                                    DeviceClockRegs,
+                                    &DMA_OUTSTANDING_FRAMES,
+                                );
+                                s.coordinator
+                                    .set_volume_percent(clamped, &mut backend, s.pipeline);
+                                let _ = s.cyd_bridge.send_message(&CydMessage::Volume(clamped));
+                                s.config.update(|c| c.volume = clamped);
+                                let _ = s.config.flush_now(&mut *s.journal);
+                            }
+                            if let Some(m) = mute {
+                                s.pipeline.set_mute(m);
+                            }
+                            if ir_code != 0 && s.helo_sent {
+                                let mut ir_buf = [0u8; 32];
+                                if let Ok(ir_len) =
+                                    SlimprotoBuilder::build_ir(now_ms as u32, ir_code, &mut ir_buf)
+                                {
+                                    let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+                                    let mut link = SmoltcpSlimTransport::new(
+                                        DeviceSmolTcp::new(slim_sock),
+                                        &mut s.slim_link,
+                                    );
+                                    let _ = link.send(&ir_buf[..ir_len]);
+                                }
+                            }
+                        }
+                        HttpControlAction::SpotifyPlay => {
+                            if s.coordinator.request_source(AudioSource::Spotify) {
+                                if s.coordinator.current_sample_rate != 44_100
+                                    || s.pipeline.sample_rate != 44_100
+                                {
+                                    s.coordinator.current_sample_rate = 44_100;
+                                    let _ = s.pipeline.set_sample_rate(44_100);
+                                }
+                                s.pipeline
+                                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                                s.pipeline.begin_external_audio();
+                                s.pipeline.set_mute(false);
+                                s.coordinator.begin_external_playback();
+                                if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                    let _ = s.amp.clear_faults();
+                                    let _ = s.amp.start_playback_via_hiz();
+                                }
+                                s.spot_streaming = true;
+                            }
+                        }
+                        HttpControlAction::SpotifyStop => {
+                            s.spot_streaming = false;
+                            s.coordinator.release_source(AudioSource::Spotify);
+                            restore_suspended_or_stop(s);
+                        }
+                        HttpControlAction::RebootToRecovery
+                        | HttpControlAction::PersistOta0AndReboot => {
+                            s.pending_http_action = action;
+                            s.pending_action_deadline_ms = now_ms + 250;
+                        }
+                        HttpControlAction::UpdateConfig | HttpControlAction::ExecuteCliCommand => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snapshot,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                            sync_config_to_runtime(s);
+                        }
+                        HttpControlAction::TriggerWifiScan => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snapshot,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                        }
+                        HttpControlAction::ConnectWifi => {
+                            if let Some(creds) = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snapshot,
+                                s.config,
+                                &mut *s.journal,
+                            ) {
+                                if let Ok(ssid_cfg) = creds.ssid.as_str().try_into() {
+                                    let auth_cfg = if creds.password.is_empty() {
+                                        AuthenticationMethodConfig::Open
+                                    } else if let Ok(pw) = creds.password.as_str().try_into() {
+                                        AuthenticationMethodConfig::WpaWpa2Personal(pw)
+                                    } else {
+                                        AuthenticationMethodConfig::Open
+                                    };
+                                    let sta_cfg = WifiModeConfig::Station(
+                                        StationConfig::default()
+                                            .with_ssid(ssid_cfg)
+                                            .with_authentication(auth_cfg),
+                                    );
+                                    let _ = s.wifi_controller.set_config(&sta_cfg);
+                                    s.last_connect_attempt_ms = 0;
+                                }
+                            }
+                        }
+                        HttpControlAction::DisconnectWifi => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snap,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                            s.assigned_ip = None;
+                            s.last_connect_attempt_ms = now_ms;
+                        }
+                        HttpControlAction::StartOtaFlash => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snap,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                            s.pending_http_action = HttpControlAction::PersistOta0AndReboot;
+                            s.pending_action_deadline_ms = now_ms + 250;
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -163,7 +163,7 @@ pub fn parse_ipv4_dotted(s: &str) -> Option<[u8; 4]> {
 }
 
 /// Maximum byte length of an NVS override value stored in [`NvsEntrySlot`].
-pub const MAX_NVS_VALUE_LEN: usize = 128;
+pub const MAX_NVS_VALUE_LEN: usize = 192;
 
 /// Maximum number of NVS override slots tracked by [`ConfigHandle`] and
 /// [`RamJournal`].
@@ -2269,19 +2269,20 @@ mod tests {
     }
 
     #[test]
-    fn test_set_nvs_override_rejects_over_128_bytes() {
+    fn test_set_nvs_override_rejects_over_192_bytes() {
+        assert_eq!(MAX_NVS_VALUE_LEN, 192);
         let handle = ConfigHandle::new(AudioConfig::default());
         assert!(handle.set_nvs_override("k1", "short"));
-        let too_long = "a".repeat(129);
+        let too_long = "a".repeat(193);
         assert!(!handle.set_nvs_override("k1", &too_long));
         assert_eq!(handle.nvs_override("k1").as_deref(), Some("short"));
         assert!(!handle.set_nvs_override("k2", &too_long));
         assert_eq!(handle.nvs_override("k2"), None);
-        let exact_128 = "b".repeat(128);
-        assert!(handle.set_nvs_override("k2", &exact_128));
+        let exact_192 = "b".repeat(192);
+        assert!(handle.set_nvs_override("k2", &exact_192));
         assert_eq!(
             handle.nvs_override("k2").as_deref(),
-            Some(exact_128.as_str())
+            Some(exact_192.as_str())
         );
     }
 
@@ -2373,7 +2374,7 @@ mod tests {
         assert_eq!(restored.lms_server_ip(), Some([172, 25, 8, 40]));
         assert_eq!(restored.read(|c| c.lms_server_port), Some(9000));
 
-        let too_long = "x".repeat(129);
+        let too_long = "x".repeat(MAX_NVS_VALUE_LEN + 1);
         assert!(!handle.apply_key_value("autoexec1", &too_long));
         assert!(!handle.apply_key_value("custom_key", &too_long));
         assert!(!handle.apply_key_value("host_name", &too_long));
@@ -2429,9 +2430,10 @@ mod tests {
 
         // Pool overflow on a new entry must fail without corrupting existing
         // keys; failed update on an existing key must preserve its prior value.
+        let chunk_128 = "x".repeat(128);
         let mut full = NvsOverrideTable::new();
         for i in 0..8 {
-            assert!(full.set(&format!("big_{i}"), &long_val));
+            assert!(full.set(&format!("big_{i}"), &chunk_128));
         }
         assert_eq!(full.pool_used(), 1024);
         assert!(!full.set("overflow_new", "a"));
@@ -2439,9 +2441,9 @@ mod tests {
         assert_eq!(full.value("big_0"), Some("tiny"));
         assert!(full.set("extra", &"z".repeat(124)));
         assert_eq!(full.pool_used(), 1024);
-        assert!(!full.set("big_0", &long_val));
+        assert!(!full.set("big_0", &chunk_128));
         assert_eq!(full.value("big_0"), Some("tiny"));
-        assert_eq!(full.value("big_7"), Some(long_val.as_str()));
+        assert_eq!(full.value("big_7"), Some(chunk_128.as_str()));
 
         // RamJournal::parsed_nvs_overrides parses directly from sector bytes.
         let mut handle = ConfigHandle::new(AudioConfig::default());
