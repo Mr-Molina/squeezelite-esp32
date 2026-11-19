@@ -2243,7 +2243,6 @@ mod xtensa_hw {
         last_fault_check_ms: u64,
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
-        last_config_poll_ms: u64,
         now_ms: u64,
         wifi_connected_logged: bool,
         last_fault_recovery_ms: u64,
@@ -2688,7 +2687,6 @@ mod xtensa_hw {
             last_fault_check_ms: 0,
             latest_telemetry,
             last_cyd_progress_ms: 0,
-            last_config_poll_ms: 0,
             now_ms: 0,
             wifi_connected_logged: false,
             last_fault_recovery_ms: 0,
@@ -3931,9 +3929,6 @@ mod xtensa_hw {
     }
 
     #[inline(never)]
-    fn multi_proto_poll(_s: &mut DeviceRuntimeState) {}
-
-    #[inline(never)]
     fn cyd_command_phase(s: &mut DeviceRuntimeState) {
         if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
             let mut backend =
@@ -4018,28 +4013,40 @@ mod xtensa_hw {
                 });
             }
         }
+    }
 
-        if now_ms.saturating_sub(s.last_config_poll_ms) >= 100 {
-            s.last_config_poll_ms = now_ms;
-            if s.config_writer.poll(s.config, &mut *s.journal, now_ms) {
-                if let Some(image) = s.journal.pending_image() {
-                    s.core1.park_for_flash_write();
+    struct DeviceSettingsPersistHost<'a> {
+        config_writer: &'a mut ConfigWriter,
+        journal: &'a mut RamJournal<'static>,
+        flash: &'a mut FlashStorage<'static>,
+        core1: &'a mut Core1Ctl,
+    }
+
+    impl louder_esp32_app::services::SettingsPersistHost for DeviceSettingsPersistHost<'_> {
+        fn poll_and_persist(&mut self, config: &ConfigHandle, now_ms: u64) -> bool {
+            if self.config_writer.poll(config, self.journal, now_ms) {
+                if let Some(image) = self.journal.pending_image() {
+                    self.core1.park_for_flash_write();
                     #[cfg(not(feature = "runtime-flash-persist"))]
                     let offset = SETTINGS_JOURNAL_OFFSET;
                     #[cfg(feature = "runtime-flash-persist")]
                     let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-                    let _ = s.flash.erase(offset, offset + 4096);
+                    let _ = self.flash.erase(offset, offset + 4096);
                     if image.used_len > 16 {
-                        let _ = s
+                        let _ = self
                             .flash
                             .write_nor(offset + 16, &image.sector[16..image.used_len]);
                     }
-                    let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
-                    let _ = s.flash.write_nor(offset, &image.sector[..16]);
-                    s.journal.mark_flash_written();
-                    s.core1.unpark_after_flash_write();
+                    let _ = self
+                        .flash
+                        .write_nor(offset + 2048, &image.sector[2048..4096]);
+                    let _ = self.flash.write_nor(offset, &image.sector[..16]);
+                    self.journal.mark_flash_written();
+                    self.core1.unpark_after_flash_write();
+                    return true;
                 }
             }
+            false
         }
     }
 
@@ -4054,6 +4061,12 @@ mod xtensa_hw {
                 *current_vol_pct = pct;
                 let _ = cyd_bridge.send_message(&CydMessage::Volume(pct));
             });
+        let mut settings_host = DeviceSettingsPersistHost {
+            config_writer: &mut s.config_writer,
+            journal: s.journal,
+            flash: &mut s.flash,
+            core1: &mut s.core1,
+        };
         let mut ctx = louder_esp32_app::services::ServiceCtx::new(
             s.now_ms,
             s.assigned_ip,
@@ -4062,7 +4075,8 @@ mod xtensa_hw {
         )
         .with_sta_mac(s.sta_mac)
         .with_audio(&mut audio)
-        .with_slim_outbound(&mut s.slim_outbound);
+        .with_slim_outbound(&mut s.slim_outbound)
+        .with_settings_persist(&mut settings_host);
         if link_up != s.services_link_up {
             s.services_link_up = link_up;
             s.services.on_link_all(&mut ctx, link_up);
@@ -4081,7 +4095,6 @@ mod xtensa_hw {
         slim_session_phase(s);
         let _ = s.coordinator.pump_output(s.pipeline, 2);
         poll_smoltcp_bounded(s);
-        multi_proto_poll(s);
         services_poll_phase(s);
         cyd_command_phase(s);
         output_decode_phase(s);

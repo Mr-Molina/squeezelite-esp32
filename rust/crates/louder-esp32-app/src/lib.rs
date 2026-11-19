@@ -77,7 +77,8 @@ pub use power_boards::{BoardProfile, SleepManager, SleepState};
 pub use services::{
     register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
     ServiceHttpOutcome, ServiceHttpRequest, ServiceRegistry, ServiceSlimExtension,
-    SlimOutboundQueue, StatusExtras, StatusField, StatusValue,
+    SettingsPersistHost, SettingsService, SlimOutboundQueue, StatusExtras, StatusField,
+    StatusValue,
 };
 pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
