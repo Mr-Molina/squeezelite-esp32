@@ -458,7 +458,7 @@ mod xtensa_hw {
         PollIngressSingleResult, SocketHandle, SocketSet, SocketStorage,
     };
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-    use smoltcp::socket::{dhcpv4, tcp, udp, AnySocket};
+    use smoltcp::socket::{dhcpv4, tcp, AnySocket};
     use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
     use squeezelite_audio_core::output::OutputError;
@@ -468,9 +468,6 @@ mod xtensa_hw {
     use squeezelite_cyd_link::CydMessage;
     use squeezelite_decoders::PcmDecoder;
     use squeezelite_proto::SlimprotoBuilder;
-    use squeezelite_raop::crypto::airport_express_key;
-    use squeezelite_raop::rtp::RtpAudioReceiver;
-    use squeezelite_raop::rtsp::{RtspMethod, RtspRequest, RtspServer, ServerState};
     use squeezelite_tas58xx::{registers, VOL_UNITY_0DB};
 
     // Mandatory Squeezelite-ESP32 OTA binary descriptor (`squeezelite-ota.c`).
@@ -1817,27 +1814,9 @@ mod xtensa_hw {
     /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio, mDNS UDP
     /// (5353), AirPlay RTSP TCP (5000), AirPlay RTP UDP (6000), Spotify
     /// Connect HTTP/Spirc TCP (4070), and headroom for plug-in `DeviceService`
-    /// sockets (allocated on PSRAM heap in `init_net_stack`).
+    /// Maximum simultaneous smoltcp sockets across core network features and
+    /// registered services (`SOCKET_SLOTS = 16`).
     const SOCKET_SLOTS: usize = 16;
-
-    /// Metadata/payload sizing for the AirPlay RTP audio UDP socket (port
-    /// 6000).
-    const RTP_UDP_RX_META: usize = 8;
-    const RTP_UDP_TX_META: usize = 2;
-
-    struct UdpRtpMetaBuffers {
-        rx_meta: [udp::PacketMetadata; RTP_UDP_RX_META],
-        tx_meta: [udp::PacketMetadata; RTP_UDP_TX_META],
-    }
-
-    impl UdpRtpMetaBuffers {
-        const fn new() -> Self {
-            Self {
-                rx_meta: [udp::PacketMetadata::EMPTY; RTP_UDP_RX_META],
-                tx_meta: [udp::PacketMetadata::EMPTY; RTP_UDP_TX_META],
-            }
-        }
-    }
 
     /// Bring-up stage: I2C0 (SDA=21, SCL=27, 400 kHz) and the TAS58xx manager
     /// over it, allocated in external PSRAM. Construction only; the HIL amp
@@ -2127,8 +2106,6 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        rtsp_handle: SocketHandle,
-        rtp_handle: SocketHandle,
         spot_handle: SocketHandle,
         local_port_counter: u16,
     }
@@ -2193,29 +2170,6 @@ mod xtensa_hw {
             )
         });
 
-        let rtsp_rx: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::vec![0u8; 4096].into_boxed_slice());
-        let rtsp_tx: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::vec![0u8; 2048].into_boxed_slice());
-        let rtsp_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(
-                tcp::SocketBuffer::new(rtsp_rx),
-                tcp::SocketBuffer::new(rtsp_tx),
-            )
-        });
-
-        let rtp_meta = alloc::boxed::Box::leak(alloc::boxed::Box::new(UdpRtpMetaBuffers::new()));
-        let rtp_rx_payload: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::vec![0u8; 16_384].into_boxed_slice());
-        let rtp_tx_payload: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::vec![0u8; 512].into_boxed_slice());
-        let rtp_handle = add_socket(&mut sockets, || {
-            udp::Socket::new(
-                udp::PacketBuffer::new(&mut rtp_meta.rx_meta[..], rtp_rx_payload),
-                udp::PacketBuffer::new(&mut rtp_meta.tx_meta[..], rtp_tx_payload),
-            )
-        });
-
         let spot_rx: &'static mut [u8] =
             alloc::boxed::Box::leak(alloc::vec![0u8; 4096].into_boxed_slice());
         let spot_tx: &'static mut [u8] =
@@ -2234,8 +2188,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            rtsp_handle,
-            rtp_handle,
             spot_handle,
             local_port_counter,
         }
@@ -2266,8 +2218,6 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        rtsp_handle: SocketHandle,
-        rtp_handle: SocketHandle,
         spot_handle: SocketHandle,
         bt_periph: Option<esp_hal::peripherals::BT<'static>>,
         bt_transport: Option<Esp32VhciTransport<'static>>,
@@ -2309,11 +2259,6 @@ mod xtensa_hw {
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
         last_config_poll_ms: u64,
-        raop_rtsp: alloc::boxed::Box<RtspServer>,
-        raop_rtp: alloc::boxed::Box<RtpAudioReceiver>,
-        raop_streaming: bool,
-        last_rtp_packet_ms: u64,
-        rtsp_rx_acc: alloc::vec::Vec<u8>,
         spot_spirc: alloc::boxed::Box<SpircStateMachine>,
         spot_streaming: bool,
         now_ms: u64,
@@ -2683,8 +2628,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            rtsp_handle,
-            rtp_handle,
             spot_handle,
             local_port_counter,
         } = init_net_stack(
@@ -2701,12 +2644,6 @@ mod xtensa_hw {
         pipeline.sink.driver.pump_silence_if_needed(false, false);
         let latest_telemetry = amp_start_playback(amp);
         let config_writer = ConfigWriter::new(config, boot_ms);
-        let raop_rtsp = alloc::boxed::Box::new(RtspServer::new(
-            airport_express_key(),
-            sta_mac,
-            [0, 0, 0, 0],
-        ));
-        let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
         let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
         let mut services = louder_esp32_app::services::ServiceRegistry::new();
         louder_esp32_app::services::register_all(&mut services);
@@ -2731,8 +2668,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            rtsp_handle,
-            rtp_handle,
             spot_handle,
             bt_periph,
             bt_transport: None,
@@ -2774,11 +2709,6 @@ mod xtensa_hw {
             latest_telemetry,
             last_cyd_progress_ms: 0,
             last_config_poll_ms: 0,
-            raop_rtsp,
-            raop_rtp,
-            raop_streaming: false,
-            last_rtp_packet_ms: 0,
-            rtsp_rx_acc: alloc::vec::Vec::with_capacity(2048),
             spot_spirc,
             spot_streaming: false,
             now_ms: 0,
@@ -3250,18 +3180,13 @@ mod xtensa_hw {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
-                    s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
-                    s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
-                    s.raop_streaming = false;
                     s.spot_streaming = false;
-                    s.rtsp_rx_acc.clear();
                     s.helo_sent = false;
                     s.pending_http_body = &[];
                     s.pending_http_closing = false;
                 }
                 s.assigned_ip = Some(ip_octets);
-                s.raop_rtsp.set_ip_address(ip_octets);
                 let _ = s
                     .smol_iface
                     .join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
@@ -3306,12 +3231,8 @@ mod xtensa_hw {
                 s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
-                s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
-                s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
-                s.raop_streaming = false;
                 s.spot_streaming = false;
-                s.rtsp_rx_acc.clear();
                 s.helo_sent = false;
                 s.pending_http_body = &[];
                 s.pending_http_closing = false;
@@ -3511,9 +3432,7 @@ mod xtensa_hw {
                     AudioSource::Bluetooth => "Bluetooth",
                     AudioSource::Spotify => "Spotify",
                     _ => {
-                        if s.raop_streaming {
-                            "AirPlay"
-                        } else if s.spot_streaming {
+                        if s.spot_streaming {
                             "Spotify"
                         } else {
                             match s.pipeline.decoder {
@@ -4048,192 +3967,14 @@ mod xtensa_hw {
 
     #[inline(never)]
     fn multi_proto_poll(s: &mut DeviceRuntimeState) {
-        let Some(local_ip) = s.assigned_ip else {
+        if s.assigned_ip.is_none() {
             return;
-        };
-        let now_ms = s.now_ms;
-        let airplay_enabled = s.config.is_airplay_enabled();
+        }
         let cspot_enabled = s.config.is_cspot_enabled();
         let mut cspot_name = s.config.effective_cspot_name();
         if cspot_name.trim().is_empty() {
             cspot_name.clear();
             let _ = cspot_name.push_str(louder_esp32_app::board::first_boot_defaults::PLAYER_NAME);
-        }
-
-        // 2. AirPlay 1 RAOP RTSP Control (`TCP 5000`) & RTP Audio (`UDP 6000`)
-        if airplay_enabled {
-            s.raop_rtsp.set_ip_address(local_ip);
-            let rtsp_sock = s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle);
-            if rtsp_sock.is_open()
-                && matches!(
-                    rtsp_sock.state(),
-                    tcp::State::CloseWait
-                        | tcp::State::TimeWait
-                        | tcp::State::Closing
-                        | tcp::State::LastAck
-                        | tcp::State::FinWait1
-                        | tcp::State::FinWait2
-                )
-            {
-                rtsp_sock.abort();
-                s.rtsp_rx_acc.clear();
-            }
-            if !rtsp_sock.is_open() {
-                let _ = rtsp_sock.listen(5000);
-                s.rtsp_rx_acc.clear();
-            }
-            if rtsp_sock.can_recv() && rtsp_sock.may_send() {
-                let mut chunk = [0u8; 512];
-                if let Ok(n) = rtsp_sock.recv_slice(&mut chunk) {
-                    if n > 0 {
-                        s.rtsp_rx_acc.extend_from_slice(&chunk[..n]);
-                        if s.rtsp_rx_acc.len() > 4096 {
-                            s.rtsp_rx_acc.clear();
-                        }
-                        if s.rtsp_rx_acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                            let parsed = if let Ok(req) = RtspRequest::parse(&s.rtsp_rx_acc) {
-                                let body_start = if req.body.is_empty() {
-                                    s.rtsp_rx_acc.len()
-                                } else {
-                                    req.body.as_ptr() as usize - s.rtsp_rx_acc.as_ptr() as usize
-                                };
-                                if s.rtsp_rx_acc.len() >= body_start + req.content_length {
-                                    let method = req.method;
-                                    let resp_res = s.raop_rtsp.handle_request(&req);
-                                    Some((method, resp_res))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some((method, resp_res)) = parsed {
-                                if let Ok(resp) = resp_res {
-                                    let resp_bytes = resp.to_bytes();
-                                    let _ = rtsp_sock.send_slice(&resp_bytes);
-                                    match method {
-                                        RtspMethod::Announce => {
-                                            if let (Some(key), Some(iv)) =
-                                                (s.raop_rtsp.session_key(), s.raop_rtsp.aes_iv())
-                                            {
-                                                s.raop_rtp.configure_crypto(key, iv);
-                                            } else {
-                                                s.raop_rtp.disable_crypto();
-                                            }
-                                            if let Some(sdp) = s.raop_rtsp.sdp_session() {
-                                                if let Some(ref fmtp) = sdp.fmtp {
-                                                    let _ = s.raop_rtp.configure_alac(fmtp);
-                                                }
-                                            }
-                                        }
-                                        RtspMethod::Record => {
-                                            if claim_device_external_pcm(
-                                                s.coordinator,
-                                                s.pipeline,
-                                                s.amp,
-                                                AudioSource::AirPlay,
-                                                None,
-                                                AmpPower::KeepCurrent,
-                                            ) {
-                                                if let (Some(key), Some(iv)) = (
-                                                    s.raop_rtsp.session_key(),
-                                                    s.raop_rtsp.aes_iv(),
-                                                ) {
-                                                    s.raop_rtp.configure_crypto(key, iv);
-                                                }
-                                                if let Some(sdp) = s.raop_rtsp.sdp_session() {
-                                                    if let Some(ref fmtp) = sdp.fmtp {
-                                                        let _ = s.raop_rtp.configure_alac(fmtp);
-                                                    }
-                                                }
-                                                s.raop_streaming = true;
-                                                s.last_rtp_packet_ms = now_ms;
-                                            }
-                                        }
-                                        RtspMethod::SetParameter => {
-                                            let raw_pct = (s.raop_rtsp.volume() * 100.0) as u8;
-                                            let pct = apply_device_volume(
-                                                s.coordinator,
-                                                s.pipeline,
-                                                s.amp,
-                                                s.cyd_bridge,
-                                                &mut s.current_vol_pct,
-                                                raw_pct,
-                                            );
-                                            s.config.update(|c| c.volume = pct);
-                                        }
-                                        RtspMethod::Flush => {
-                                            s.pipeline.stream_buffer.flush();
-                                            s.pipeline.output_buffer.flush();
-                                        }
-                                        RtspMethod::Teardown => {
-                                            s.raop_streaming = false;
-                                            release_device_external(
-                                                s.coordinator,
-                                                s.pipeline,
-                                                s.amp,
-                                                AudioSource::AirPlay,
-                                            );
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                s.rtsp_rx_acc.clear();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if airplay_enabled {
-            let rtp_sock = s.sockets.get_mut::<udp::Socket>(s.rtp_handle);
-            if !rtp_sock.is_open() {
-                let _ = rtp_sock.bind(6000);
-            }
-            if rtp_sock.can_recv() {
-                let mut pkt_buf = [0u8; 1536];
-                let mut bursts = 0u8;
-                while bursts < 4 && rtp_sock.can_recv() {
-                    bursts += 1;
-                    if let Ok((n, _ep)) = rtp_sock.recv_slice(&mut pkt_buf) {
-                        s.last_rtp_packet_ms = now_ms;
-                        if let Ok((pcm_i16, _hdr)) = s.raop_rtp.process_packet(&pkt_buf[..n]) {
-                            let granted = if s.raop_streaming {
-                                s.coordinator.request_source(AudioSource::AirPlay)
-                            } else {
-                                let ok = claim_device_external_pcm(
-                                    s.coordinator,
-                                    s.pipeline,
-                                    s.amp,
-                                    AudioSource::AirPlay,
-                                    Some(44_100),
-                                    AmpPower::EnsurePlay,
-                                );
-                                if ok {
-                                    s.raop_streaming = true;
-                                }
-                                ok
-                            };
-                            if granted {
-                                let pcm_bytes: &[u8] = bytemuck::cast_slice(pcm_i16);
-                                let _ = s.pipeline.ingest_stream_data(pcm_bytes);
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if s.raop_streaming
-                && (s.raop_rtsp.state() != ServerState::Streaming
-                    || now_ms.saturating_sub(s.last_rtp_packet_ms) >= 3_000)
-                && s.pipeline.stream_buffer.available_read() == 0
-                && s.pipeline.output_buffer.available_read() == 0
-                && !s.pipeline.has_pending_pcm()
-            {
-                s.raop_streaming = false;
-                release_device_external(s.coordinator, s.pipeline, s.amp, AudioSource::AirPlay);
-            }
         }
 
         // 3. Spotify Connect ZeroConf HTTP & Spirc (`TCP 4070`)
