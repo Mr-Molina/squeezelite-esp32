@@ -150,6 +150,13 @@ pub fn parse_ipv4_dotted(s: &str) -> Option<[u8; 4]> {
     }
 }
 
+/// Returns `true` when runtime flash persistence is safe and due:
+/// no audio stream is active and the retry backoff deadline has elapsed.
+#[must_use]
+pub fn can_commit_runtime_flash(now_ms: u64, retry_at_ms: u64, audio_active: bool) -> bool {
+    !audio_active && now_ms >= retry_at_ms
+}
+
 /// Something that durably records a configuration snapshot (device:
 /// [`RamJournal`]).
 pub trait ConfigJournal {
@@ -1843,5 +1850,15 @@ mod tests {
         );
         assert_eq!(restored_handle.device_name().as_str(), "BASEMENT");
         assert_eq!(restored_handle.sequence(), 1);
+    }
+
+    #[test]
+    fn can_commit_runtime_flash_guards_active_audio_and_backoff() {
+        assert!(!can_commit_runtime_flash(10_000, 0, true));
+        assert!(!can_commit_runtime_flash(70_000, 70_000, true));
+        assert!(!can_commit_runtime_flash(69_999, 70_000, false));
+        assert!(can_commit_runtime_flash(0, 0, false));
+        assert!(can_commit_runtime_flash(70_000, 70_000, false));
+        assert!(can_commit_runtime_flash(75_000, 70_000, false));
     }
 }
