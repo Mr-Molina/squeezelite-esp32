@@ -4,8 +4,8 @@
 - **Date**: 2026-11-18
 - **Plan**: `docs/superpowers/plans/2026-11-17-parity-branch-distribution.md`, work order F3
 - **Spec**: `docs/superpowers/specs/2026-11-17-parity-branch-distribution-design.md`, section 7
-- **Branch**: `claude/dazzling-yonath-8dd057` (rebased onto `MK5-Rust` at `3a3aab43`; zero conflicts)
-- **Merge Status**: **DO NOT MERGE** — static section budgets pass, but the 1-hour DEVBENCH soak failed with 2 resets after `codec=Bluetooth` transitions, a `52,301 us` FLAC decode spike, and 13 FLAC FPS dips. Live bisect on DEVBENCH is required once LMS (`172.25.8.40`) is back online.
+- **Branch**: `claude/dazzling-yonath-8dd057` (rebased onto `MK5-Rust` at `3a3aab43`, zero conflicts; Step D1 fix `3eeae094`)
+- **Merge Status**: **PASS — Ready for PR #17 Promotion** (pending local CI/ELF gates & review pass). Step D1 fixes in `3eeae094` resolved the BT zeroed UB, stack spike, and external preemption stream leak; the 1-hour `DEVBENCH` verification soak (`soak-f3-fixed.csv`) passed with `0` resets/reboots, `0` disconnects, `0` `i2c_nacks`, `0 B` PSRAM net delta, and `0` warnings/errors in `syslog.json`. `BASEMENT` (`172.22.1.15`) was untouched.
 
 ## 0. Guardrails
 
@@ -62,10 +62,25 @@ Evidence files are stored in `.agents/knowledge/work_orders/WO-F3-evidence/` (`s
 - Both baseline (`base-aac.csv`: `frames_played = 0` for 171 s) and F3 soak (`soak-i1.csv`: 0 AAC samples despite `soak.m4a` queued) failed to receive native AAC streams.
 - **Root cause**: `HELO_CODECS` in the coordinator omits `aac`, so LMS does not advertise/dispatch AAC to the Rust player.
 
-## 5. Bisect Shortlist & Merge Gate (DO NOT MERGE)
+## 5. Bisect Shortlist & Resolution (Resolved by `3eeae094`)
 
-**F3 is explicitly marked DO NOT MERGE** until a live bisect on DEVBENCH isolates and resolves the resets, FLAC decode spike (`52,301 us`), and FLAC FPS dips once LMS (`172.25.8.40`) is back online:
+Originally marked **DO NOT MERGE** pending live bisect for the resets, `52,301 us` FLAC decode spike, and FLAC FPS dips:
 
 1. **Suspect #1 — `ec5cb7f5` (rebased `bd108784`) & `63179cdf` (rebased `8b7409e5`)**: Moving Bluetooth sink state (`bd108784`) and remaining socket buffers (`8b7409e5`) from internal DRAM to PSRAM — directly correlates with resets occurring immediately after `codec=Bluetooth` transitions and increased cache/PSRAM contention during FLAC decoding.
 2. **Suspect #2 — `d0375428` (rebased `edff549e`)**: `47 + 17 KiB` internal heap split (`INTERNAL_HEAP_BYTES` + `BT_HEAP_BYTES` totaling `65,536 B`) — correlates with the `5,128 B` internal heap low-water mark under concurrent Wi-Fi/BT/stream pressure.
 3. **Secondary check (Task 3)**: `1371c297` / `50473fab` (rebased `9ba77c47` / `f2b72306`) moving MP3 synthesis granule/DCT from IRAM to flash (verify no regression once #1 and #2 are bisected).
+
+**Resolution**: Step D1 fix commit `3eeae094` (`fix(f3): eliminate BT zeroed UB, stack spike, and external preemption stream leak`) resolved the root causes on `claude/dazzling-yonath-8dd057`.
+
+## 6. Post-Fix 1-Hour `DEVBENCH` Verification Soak (`3eeae094`, PASS)
+
+- **Date / Target**: `2026-11-19`, **`DEVBENCH`** (`COM13`, `172.25.6.102`, MAC `ac:15:18:fd:93:9c`), **`BASEMENT` (`172.22.1.15`) untouched**.
+- **Boot / Partition**: `3eeae094` in `ota_0` (`0x150000`), `[ANTI-BRICK GATE 1]` cleared, DHCP IP `172.25.6.102/24` acquired at `16.02s` (`net: DHCPv4 lease acquired` `15099 ms`, `boot: ota_0 confirmed healthy; otadata pinned to ota_0` `15105 ms`, `recovery: 0`), connected via local `soak_relay.py` (`172.25.6.122:3483/9000` -> LMS `172.25.8.40:9000`).
+- **Soak CSV (`soak-f3-fixed.csv`, 10s cadence)**:
+  - `357` samples (`t_s = 0..3591`, `duration_s = 3591` s / 59m 51s across 3600s monitor capture), `0` misses.
+  - `uptime_ms` strictly monotonic `501674` -> `4092181` (`+3,590,507 ms`), **`0` resets/reboots**.
+  - `disconnects`: `min = 0, max = 0`; `i2c_nacks`: `min = 0, max = 0` (`6272` ACKs before stop, `6276` after stop), `tas_pll_locked = true`.
+  - **Audio / FLAC**: `FLAC` (`357/357` rows, `44100 Hz`, 16-bit stereo) at `vol_pct = 10` (`mixer volume 8`), `326` positive-delta intervals (`0` zero-delta intervals), `30` clean track loop boundaries (`dev_STAT_STMd = 30`, `STMu = 0`, `STMn = 0`, `STMo = 0`), effective `44099.675 fps` (`uptime_ms` dt) / `44099.755 fps` wrap-adjusted (`fps_10s` `min = 44073.7`, `median = 44100.1`, `max = 44125.7`), `decode_us_max` `min = 14563`, `median = 22238`, `max = 22238`.
+  - **Memory**: `int_heap_free` `start = 13500`, `min = 3352`, `max = 13500`, `end = 13312`; `int_heap_min_free` low-water `3352 B` (zero OOM); `psram_free` `start = 1314644`, `min = 1313792`, `max = 1314664`, `end = 1314644` (`net_delta = 0 B`).
+  - **`syslog.json`**: `7` messages (`INFO` only; `0` warnings/errors/panics/WDT resets).
+- **Promotion Readiness**: `3eeae094` soak blocker cleared; PR #17 ready to promote after all 8 local CI/ELF gates and review pass. `BASEMENT` (`172.22.1.15`) remains untouched.
