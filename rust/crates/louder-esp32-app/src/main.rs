@@ -2733,20 +2733,8 @@ mod xtensa_hw {
         wdt.feed();
 
         let bt_periph = Some(peripherals.BT);
-        #[allow(unsafe_code)]
-        // JUSTIFICATION: Allocate the BtA2dpSink zeroed on the heap (PSRAM
-        // region, like the coordinator) without a stack temporary.
-        // SAFETY: Every field of `BtA2dpSink` is valid when all-zero (the
-        // static it replaces was zero-filled the same way), and
-        // `reset_in_place` then sets every field. It holds no atomics, which
-        // do not work in PSRAM on the ESP32.
-        let bt_sink: &'static mut BtA2dpSink = unsafe {
-            let sink = alloc::boxed::Box::leak(
-                alloc::boxed::Box::<BtA2dpSink>::new_zeroed().assume_init(),
-            );
-            sink.reset_in_place();
-            sink
-        };
+        let bt_sink: &'static mut BtA2dpSink =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(BtA2dpSink::new()));
 
         // Invariant 49: both TCP receive windows live in PSRAM.
         let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) = (
@@ -3037,6 +3025,10 @@ mod xtensa_hw {
                 s.coordinator.end_external_playback();
             }
             AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth => {
+                s.pipeline
+                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                let _ = s.pipeline.set_sample_rate(44_100);
+                s.pipeline.set_mute(false);
                 s.pipeline.stream_buffer.flush();
             }
         }
@@ -3173,7 +3165,8 @@ mod xtensa_hw {
                                 .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback();
+                            s.coordinator
+                                .begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -3789,7 +3782,7 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4298,7 +4291,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 s.raop_streaming = true;
                                                 s.last_rtp_packet_ms = now_ms;
                                             }
@@ -4366,7 +4362,8 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator
+                                        .begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4453,7 +4450,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                                     let _ = s.amp.clear_faults();
                                                     let _ = s.amp.start_playback_via_hiz();

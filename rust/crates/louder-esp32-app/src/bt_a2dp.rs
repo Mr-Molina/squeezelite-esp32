@@ -1392,6 +1392,8 @@ pub struct SbcDecoder {
     pub v: [[i32; 170]; 2],
     pub offset: [[usize; 16]; 2],
     pub subbands: usize,
+    pub sb_sample: [[[i32; 8]; 2]; 16],
+    pub ch_pcm: [[i16; 128]; 2],
 }
 
 impl SbcDecoder {
@@ -1402,16 +1404,28 @@ impl SbcDecoder {
                 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
             ]; 2],
             subbands: 0,
+            sb_sample: [[[0; 8]; 2]; 16],
+            ch_pcm: [[0; 128]; 2],
         }
     }
 
     pub fn reset(&mut self, subbands: usize) {
         self.subbands = subbands;
-        self.v = [[0; 170]; 2];
+        for ch in &mut self.v {
+            ch.fill(0);
+        }
         for ch in 0..2 {
             for i in 0..(subbands * 2) {
                 self.offset[ch][i] = 10 * i + 10;
             }
+        }
+        for blk in &mut self.sb_sample {
+            for ch in blk.iter_mut() {
+                ch.fill(0);
+            }
+        }
+        for ch in &mut self.ch_pcm {
+            ch.fill(0);
         }
     }
 
@@ -1526,14 +1540,13 @@ impl SbcDecoder {
             }
         }
 
-        // Unpack subband samples
-        let mut sb_sample = [[[0i32; 8]; 2]; 16];
+        // Unpack subband samples into pre-allocated decoder scratch buffer
         for blk in 0..blocks {
             for ch in 0..channels {
                 for sb in 0..subbands {
                     let lvl = levels[ch][sb];
                     if lvl == 0 {
-                        sb_sample[blk][ch][sb] = 0;
+                        self.sb_sample[blk][ch][sb] = 0;
                         continue;
                     }
 
@@ -1552,7 +1565,7 @@ impl SbcDecoder {
 
                     let numerator = (((audio_sample as u64) << 1) | 1) << shift;
                     let val = (numerator / (lvl as u64)) as i32 - (1 << shift);
-                    sb_sample[blk][ch][sb] = val;
+                    self.sb_sample[blk][ch][sb] = val;
                 }
             }
         }
@@ -1562,10 +1575,10 @@ impl SbcDecoder {
             for blk in 0..blocks {
                 for sb in 0..subbands {
                     if (joint & (1 << sb)) != 0 {
-                        let mid = sb_sample[blk][0][sb];
-                        let side = sb_sample[blk][1][sb];
-                        sb_sample[blk][0][sb] = mid + side;
-                        sb_sample[blk][1][sb] = mid - side;
+                        let mid = self.sb_sample[blk][0][sb];
+                        let side = self.sb_sample[blk][1][sb];
+                        self.sb_sample[blk][0][sb] = mid + side;
+                        self.sb_sample[blk][1][sb] = mid - side;
                     }
                 }
             }
@@ -1577,18 +1590,31 @@ impl SbcDecoder {
         }
         let bytes_consumed = consumed_bits >> 3;
 
-        // Synthesis filterbank
-        let mut ch_pcm = [[0i16; 128]; 2];
+        // Synthesis filterbank into pre-allocated per-channel PCM buffer
         if subbands == 4 {
             for ch in 0..channels {
                 for blk in 0..blocks {
-                    self.synthesize_four(&sb_sample, ch, blk, &mut ch_pcm[ch]);
+                    Self::synthesize_four_channel(
+                        &mut self.offset[ch],
+                        &mut self.v[ch],
+                        &self.sb_sample,
+                        ch,
+                        blk,
+                        &mut self.ch_pcm[ch],
+                    );
                 }
             }
         } else {
             for ch in 0..channels {
                 for blk in 0..blocks {
-                    self.synthesize_eight(&sb_sample, ch, blk, &mut ch_pcm[ch]);
+                    Self::synthesize_eight_channel(
+                        &mut self.offset[ch],
+                        &mut self.v[ch],
+                        &self.sb_sample,
+                        ch,
+                        blk,
+                        &mut self.ch_pcm[ch],
+                    );
                 }
             }
         }
@@ -1601,14 +1627,14 @@ impl SbcDecoder {
         if channels == 1 {
             // Mono: duplicate to L & R
             for i in 0..total_frames {
-                pcm_out[i * 2] = ch_pcm[0][i];
-                pcm_out[i * 2 + 1] = ch_pcm[0][i];
+                pcm_out[i * 2] = self.ch_pcm[0][i];
+                pcm_out[i * 2 + 1] = self.ch_pcm[0][i];
             }
         } else {
             // Stereo
             for i in 0..total_frames {
-                pcm_out[i * 2] = ch_pcm[0][i];
-                pcm_out[i * 2 + 1] = ch_pcm[1][i];
+                pcm_out[i * 2] = self.ch_pcm[0][i];
+                pcm_out[i * 2 + 1] = self.ch_pcm[1][i];
             }
         }
 
@@ -1849,9 +1875,24 @@ impl SbcDecoder {
         blk: usize,
         pcm_out: &mut [i16],
     ) {
-        let offset = &mut self.offset[ch];
-        let v = &mut self.v[ch];
+        Self::synthesize_four_channel(
+            &mut self.offset[ch],
+            &mut self.v[ch],
+            sb_sample,
+            ch,
+            blk,
+            pcm_out,
+        );
+    }
 
+    fn synthesize_four_channel(
+        offset: &mut [usize; 16],
+        v: &mut [i32; 170],
+        sb_sample: &[[[i32; 8]; 2]; 16],
+        ch: usize,
+        blk: usize,
+        pcm_out: &mut [i16],
+    ) {
         for i in 0..8 {
             if offset[i] == 0 {
                 offset[i] = 79;
@@ -1902,9 +1943,24 @@ impl SbcDecoder {
         blk: usize,
         pcm_out: &mut [i16],
     ) {
-        let offset = &mut self.offset[ch];
-        let v = &mut self.v[ch];
+        Self::synthesize_eight_channel(
+            &mut self.offset[ch],
+            &mut self.v[ch],
+            sb_sample,
+            ch,
+            blk,
+            pcm_out,
+        );
+    }
 
+    fn synthesize_eight_channel(
+        offset: &mut [usize; 16],
+        v: &mut [i32; 170],
+        sb_sample: &[[[i32; 8]; 2]; 16],
+        ch: usize,
+        blk: usize,
+        pcm_out: &mut [i16],
+    ) {
         for i in 0..16 {
             if offset[i] == 0 {
                 offset[i] = 159;
@@ -2879,6 +2935,110 @@ impl BtA2dpSourceState {
 // ============================================================================
 
 pub struct BtA2dpSink {
+    state: BtA2dpSinkState,
+    pub rx_buf: [u8; 1024],
+    pub reassembled_buf: [u8; 1024],
+}
+
+impl core::ops::Deref for BtA2dpSink {
+    type Target = BtA2dpSinkState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl core::ops::DerefMut for BtA2dpSink {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl BtA2dpSink {
+    pub const fn new() -> Self {
+        Self {
+            state: BtA2dpSinkState::new(),
+            rx_buf: [0; 1024],
+            reassembled_buf: [0; 1024],
+        }
+    }
+
+    pub fn reset_in_place(&mut self) {
+        self.state.reset_in_place();
+        self.rx_buf.fill(0);
+        self.reassembled_buf.fill(0);
+    }
+
+    pub fn send_cmd<T: HciTransport>(transport: &mut T, opcode: u16, params: &[u8]) -> bool {
+        BtA2dpSinkState::send_cmd(transport, opcode, params)
+    }
+
+    pub fn send_l2cap<T: HciTransport>(
+        transport: &mut T,
+        handle: u16,
+        cid: u16,
+        payload: &[u8],
+    ) -> bool {
+        BtA2dpSinkState::send_l2cap(transport, handle, cid, payload)
+    }
+
+    /// Process a received HCI packet (Event or ACL).
+    pub fn process_packet<T: HciTransport, F: FnMut(&[u8], u32)>(
+        &mut self,
+        transport: &mut T,
+        pkt: &[u8],
+        mut on_pcm: F,
+    ) {
+        self.state
+            .process_packet_with_buf(transport, pkt, &mut self.reassembled_buf, &mut on_pcm);
+    }
+
+    /// Polls the Bluetooth transport: drains up to 16 packets and steps
+    /// the HCI init sequence.
+    pub fn poll<T: HciTransport, F: FnMut(&[u8], u32)>(
+        &mut self,
+        transport: &mut T,
+        now_ms: u64,
+        mut on_pcm: F,
+    ) -> bool {
+        let mut had_activity = false;
+
+        if transport.can_read() {
+            for _ in 0..16 {
+                let n = transport.read_packet(&mut self.rx_buf);
+                if n == 0 {
+                    break;
+                }
+                self.state.rx_packets = self.state.rx_packets.wrapping_add(1);
+                self.state.process_packet_with_buf(
+                    transport,
+                    &self.rx_buf[..n],
+                    &mut self.reassembled_buf,
+                    &mut on_pcm,
+                );
+                had_activity = true;
+                if !transport.can_read() {
+                    break;
+                }
+            }
+        }
+
+        if self.state.init_step != InitStep::Completed
+            && (self.state.last_init_step_sent != Some(self.state.init_step)
+                || now_ms.saturating_sub(self.state.last_init_sent_ms) >= 250)
+        {
+            if self.state.step_init(transport) {
+                self.state.last_init_step_sent = Some(self.state.init_step);
+                self.state.last_init_sent_ms = now_ms;
+                had_activity = true;
+            }
+        }
+
+        had_activity
+    }
+}
+
+pub struct BtA2dpSinkState {
     pub init_step: InitStep,
     pub last_init_step_sent: Option<InitStep>,
     pub last_init_sent_ms: u64,
@@ -2908,7 +3068,7 @@ pub struct BtA2dpSink {
     pub pcm_bytes: [u8; 1024],
 }
 
-impl BtA2dpSink {
+impl BtA2dpSinkState {
     pub const fn new() -> Self {
         Self {
             init_step: InitStep::Reset,
@@ -3278,12 +3438,14 @@ impl BtA2dpSink {
         transport.write_packet(&buf[..total_len])
     }
 
-    /// Process a received HCI packet (Event or ACL).
-    pub fn process_packet<T: HciTransport, F: FnMut(&[u8], u32)>(
+    /// Process a received HCI packet (Event or ACL) using a caller-supplied
+    /// reassembly scratch buffer (kept out of stack frames).
+    fn process_packet_with_buf<T: HciTransport, F: FnMut(&[u8], u32)>(
         &mut self,
         transport: &mut T,
         pkt: &[u8],
-        mut on_pcm: F,
+        reassembled_buf: &mut [u8; 1024],
+        on_pcm: &mut F,
     ) {
         if pkt.is_empty() {
             return;
@@ -3291,7 +3453,7 @@ impl BtA2dpSink {
 
         match pkt[0] {
             HCI_PKT_EVENT => self.handle_hci_event(transport, &pkt[1..]),
-            HCI_PKT_ACL => self.handle_hci_acl(transport, &pkt[1..], &mut on_pcm),
+            HCI_PKT_ACL => self.handle_hci_acl(transport, &pkt[1..], reassembled_buf, on_pcm),
             _ => {}
         }
     }
@@ -3485,6 +3647,7 @@ impl BtA2dpSink {
         &mut self,
         transport: &mut T,
         acl_pkt: &[u8],
+        reassembled_buf: &mut [u8; 1024],
         on_pcm: &mut F,
     ) {
         if acl_pkt.len() < 4 {
@@ -3544,15 +3707,14 @@ impl BtA2dpSink {
                         self.acl_reassembly.buf[3],
                     ]);
                     self.acl_reassembly.active = false;
-                    let mut reassembled = [0u8; 1024];
                     let pdu_data_len = total_pdu_len.saturating_sub(4);
-                    reassembled[..pdu_data_len]
+                    reassembled_buf[..pdu_data_len]
                         .copy_from_slice(&self.acl_reassembly.buf[4..total_pdu_len]);
                     self.handle_l2cap_frame(
                         transport,
                         handle,
                         l2cap_cid,
-                        &reassembled[..pdu_data_len],
+                        &reassembled_buf[..pdu_data_len],
                         on_pcm,
                     );
                 }
@@ -4586,47 +4748,6 @@ impl BtA2dpSink {
                 }
             }
         }
-    }
-
-    /// Polls the Bluetooth transport: drains up to 16 packets and steps
-    /// the HCI init sequence.
-    pub fn poll<T: HciTransport, F: FnMut(&[u8], u32)>(
-        &mut self,
-        transport: &mut T,
-        now_ms: u64,
-        mut on_pcm: F,
-    ) -> bool {
-        let mut had_activity = false;
-
-        if transport.can_read() {
-            let mut rx = [0u8; 1024];
-
-            for _ in 0..16 {
-                let n = transport.read_packet(&mut rx);
-                if n == 0 {
-                    break;
-                }
-                self.rx_packets = self.rx_packets.wrapping_add(1);
-                self.process_packet(transport, &rx[..n], &mut on_pcm);
-                had_activity = true;
-                if !transport.can_read() {
-                    break;
-                }
-            }
-        }
-
-        if self.init_step != InitStep::Completed
-            && (self.last_init_step_sent != Some(self.init_step)
-                || now_ms.saturating_sub(self.last_init_sent_ms) >= 250)
-        {
-            if self.step_init(transport) {
-                self.last_init_step_sent = Some(self.init_step);
-                self.last_init_sent_ms = now_ms;
-                had_activity = true;
-            }
-        }
-
-        had_activity
     }
 }
 
