@@ -464,7 +464,6 @@ mod xtensa_hw {
     use squeezelite_audio_core::output::OutputError;
     use squeezelite_audio_core::EqPreset;
     use squeezelite_config::{FlashJournal, JournalView};
-    use squeezelite_cspot::spirc::{SpircEvent, SpircFrame, SpircStateMachine};
     use squeezelite_cyd_link::CydMessage;
     use squeezelite_decoders::PcmDecoder;
     use squeezelite_proto::SlimprotoBuilder;
@@ -2106,7 +2105,6 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        spot_handle: SocketHandle,
         local_port_counter: u16,
     }
 
@@ -2170,17 +2168,6 @@ mod xtensa_hw {
             )
         });
 
-        let spot_rx: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::vec![0u8; 4096].into_boxed_slice());
-        let spot_tx: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::vec![0u8; 2048].into_boxed_slice());
-        let spot_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(
-                tcp::SocketBuffer::new(spot_rx),
-                tcp::SocketBuffer::new(spot_tx),
-            )
-        });
-
         NetStack {
             smol_iface,
             sockets,
@@ -2188,7 +2175,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            spot_handle,
             local_port_counter,
         }
     }
@@ -2218,7 +2204,6 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        spot_handle: SocketHandle,
         bt_periph: Option<esp_hal::peripherals::BT<'static>>,
         bt_transport: Option<Esp32VhciTransport<'static>>,
         bt_sink: &'static mut BtA2dpSink,
@@ -2259,8 +2244,6 @@ mod xtensa_hw {
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
         last_config_poll_ms: u64,
-        spot_spirc: alloc::boxed::Box<SpircStateMachine>,
-        spot_streaming: bool,
         now_ms: u64,
         wifi_connected_logged: bool,
         last_fault_recovery_ms: u64,
@@ -2628,7 +2611,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            spot_handle,
             local_port_counter,
         } = init_net_stack(
             &mut sta_iface,
@@ -2644,7 +2626,6 @@ mod xtensa_hw {
         pipeline.sink.driver.pump_silence_if_needed(false, false);
         let latest_telemetry = amp_start_playback(amp);
         let config_writer = ConfigWriter::new(config, boot_ms);
-        let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
         let mut services = louder_esp32_app::services::ServiceRegistry::new();
         louder_esp32_app::services::register_all(&mut services);
         {
@@ -2668,7 +2649,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            spot_handle,
             bt_periph,
             bt_transport: None,
             bt_sink,
@@ -2709,8 +2689,6 @@ mod xtensa_hw {
             latest_telemetry,
             last_cyd_progress_ms: 0,
             last_config_poll_ms: 0,
-            spot_spirc,
-            spot_streaming: false,
             now_ms: 0,
             wifi_connected_logged: false,
             last_fault_recovery_ms: 0,
@@ -3180,8 +3158,6 @@ mod xtensa_hw {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
-                    s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
-                    s.spot_streaming = false;
                     s.helo_sent = false;
                     s.pending_http_body = &[];
                     s.pending_http_closing = false;
@@ -3231,8 +3207,6 @@ mod xtensa_hw {
                 s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
-                s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
-                s.spot_streaming = false;
                 s.helo_sent = false;
                 s.pending_http_body = &[];
                 s.pending_http_closing = false;
@@ -3431,21 +3405,15 @@ mod xtensa_hw {
                     AudioSource::AirPlay => "AirPlay",
                     AudioSource::Bluetooth => "Bluetooth",
                     AudioSource::Spotify => "Spotify",
-                    _ => {
-                        if s.spot_streaming {
-                            "Spotify"
-                        } else {
-                            match s.pipeline.decoder {
-                                ActiveDecoder::Mp3(_) => "MP3",
-                                ActiveDecoder::Flac(_) => "FLAC",
-                                ActiveDecoder::Pcm(_) => "PCM",
-                                ActiveDecoder::Aac(_) => "AAC",
-                                ActiveDecoder::Vorbis(_) => "Vorbis",
-                                ActiveDecoder::Alac(_) => "ALAC",
-                                ActiveDecoder::Opus(_) => "Opus",
-                            }
-                        }
-                    }
+                    _ => match s.pipeline.decoder {
+                        ActiveDecoder::Mp3(_) => "MP3",
+                        ActiveDecoder::Flac(_) => "FLAC",
+                        ActiveDecoder::Pcm(_) => "PCM",
+                        ActiveDecoder::Aac(_) => "AAC",
+                        ActiveDecoder::Vorbis(_) => "Vorbis",
+                        ActiveDecoder::Alac(_) => "ALAC",
+                        ActiveDecoder::Opus(_) => "Opus",
+                    },
                 };
                 let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
                     match s.latest_telemetry {
@@ -3691,19 +3659,16 @@ mod xtensa_hw {
                             }
                         }
                         HttpControlAction::SpotifyPlay => {
-                            if claim_device_external_pcm(
+                            let _ = claim_device_external_pcm(
                                 s.coordinator,
                                 s.pipeline,
                                 s.amp,
                                 AudioSource::Spotify,
                                 Some(44_100),
                                 AmpPower::EnsurePlay,
-                            ) {
-                                s.spot_streaming = true;
-                            }
+                            );
                         }
                         HttpControlAction::SpotifyStop => {
-                            s.spot_streaming = false;
                             release_device_external(
                                 s.coordinator,
                                 s.pipeline,
@@ -3966,123 +3931,7 @@ mod xtensa_hw {
     }
 
     #[inline(never)]
-    fn multi_proto_poll(s: &mut DeviceRuntimeState) {
-        if s.assigned_ip.is_none() {
-            return;
-        }
-        let cspot_enabled = s.config.is_cspot_enabled();
-        let mut cspot_name = s.config.effective_cspot_name();
-        if cspot_name.trim().is_empty() {
-            cspot_name.clear();
-            let _ = cspot_name.push_str(louder_esp32_app::board::first_boot_defaults::PLAYER_NAME);
-        }
-
-        // 3. Spotify Connect ZeroConf HTTP & Spirc (`TCP 4070`)
-        if cspot_enabled {
-            let spot_sock = s.sockets.get_mut::<tcp::Socket>(s.spot_handle);
-            if spot_sock.is_open()
-                && matches!(
-                    spot_sock.state(),
-                    tcp::State::CloseWait
-                        | tcp::State::TimeWait
-                        | tcp::State::Closing
-                        | tcp::State::LastAck
-                        | tcp::State::FinWait1
-                        | tcp::State::FinWait2
-                )
-            {
-                spot_sock.abort();
-            }
-            if !spot_sock.is_open() {
-                let _ = spot_sock.listen(4070);
-            }
-            if spot_sock.can_recv() && spot_sock.may_send() {
-                let mut req_buf = [0u8; 1024];
-                if let Ok(n) = spot_sock.recv_slice(&mut req_buf) {
-                    if n > 0 {
-                        if req_buf[..n].starts_with(b"GET ") || req_buf[..n].starts_with(b"POST ") {
-                            let body_prefix = b"{\"status\":101,\"statusString\":\"OK\",\
-                                \"spotifyError\":0,\"version\":\"2.9.0\",\
-                                \"deviceID\":\"c82e18beb8340000000000000000000000000000\",\
-                                \"remoteName\":\"";
-                            let body_suffix = b"\",\"activeUser\":\"\",\
-                                \"publicKey\":\"\",\"deviceType\":\"SPEAKER\",\
-                                \"libraryVersion\":\"0.1.0\",\"accountReq\":\"PREMIUM\",\
-                                \"brandDisplayName\":\"Squeezelite\",\
-                                \"modelDisplayName\":\"ESP32\"}";
-                            let hdr = b"HTTP/1.1 200 OK\r\n\
-                                Content-Type: application/json\r\n\
-                                Connection: close\r\n\r\n";
-                            let _ = spot_sock.send_slice(hdr);
-                            let _ = spot_sock.send_slice(body_prefix);
-                            let _ = spot_sock.send_slice(cspot_name.as_bytes());
-                            let _ = spot_sock.send_slice(body_suffix);
-                            spot_sock.close();
-                        } else if let Ok(frame) = SpircFrame::parse(&req_buf[..n]) {
-                            if let Some(evt) = s.spot_spirc.handle_frame(&frame) {
-                                match evt {
-                                    SpircEvent::Play | SpircEvent::LoadTrack { .. } => {
-                                        let granted = if s.spot_streaming {
-                                            s.coordinator.request_source(AudioSource::Spotify)
-                                        } else {
-                                            let ok = claim_device_external_pcm(
-                                                s.coordinator,
-                                                s.pipeline,
-                                                s.amp,
-                                                AudioSource::Spotify,
-                                                Some(44_100),
-                                                AmpPower::EnsurePlay,
-                                            );
-                                            if ok {
-                                                s.spot_streaming = true;
-                                            }
-                                            ok
-                                        };
-                                        if granted {
-                                            let notify = s.spot_spirc.build_notify_frame(
-                                                frame.seq_nr,
-                                                cspot_name.as_str(),
-                                            );
-                                            let _ = spot_sock.send_slice(&notify);
-                                        }
-                                    }
-                                    SpircEvent::Pause => {
-                                        s.spot_streaming = false;
-                                        release_device_external(
-                                            s.coordinator,
-                                            s.pipeline,
-                                            s.amp,
-                                            AudioSource::Spotify,
-                                        );
-                                    }
-                                    SpircEvent::SetVolume(vol_u32) => {
-                                        let raw_pct = ((vol_u32.min(65_536) * 100) / 65_536) as u8;
-                                        let pct = apply_device_volume(
-                                            s.coordinator,
-                                            s.pipeline,
-                                            s.amp,
-                                            s.cyd_bridge,
-                                            &mut s.current_vol_pct,
-                                            raw_pct,
-                                        );
-                                        s.config.update(|c| c.volume = pct);
-                                    }
-                                    SpircEvent::Next
-                                    | SpircEvent::Prev
-                                    | SpircEvent::Seek(_)
-                                    | SpircEvent::Notify
-                                    | SpircEvent::TrackEnded
-                                    | SpircEvent::MetadataUpdated(_) => {}
-                                }
-                            }
-                        } else if s.spot_streaming {
-                            let _ = s.pipeline.ingest_stream_data(&req_buf[..n]);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    fn multi_proto_poll(_s: &mut DeviceRuntimeState) {}
 
     #[inline(never)]
     fn cyd_command_phase(s: &mut DeviceRuntimeState) {
