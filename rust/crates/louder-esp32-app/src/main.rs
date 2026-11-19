@@ -4848,6 +4848,7 @@ mod tests {
         )));
         assert!(caps.contains(",pcm,"), "Capabilities must advertise pcm");
         assert!(caps.contains(",mp3"), "Capabilities must advertise mp3");
+        assert!(caps.contains(",aac"), "Capabilities must advertise aac");
         assert!(!caps.contains("HasDigitalOut"));
         assert!(caps.starts_with("Model=squeezeesp32,"));
         assert!(
