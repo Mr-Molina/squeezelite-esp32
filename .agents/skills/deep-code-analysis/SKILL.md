@@ -1,6 +1,6 @@
 ---
 name: deep-code-analysis
-description: Project-specialized deep code analysis engine for squeezelite-esp32 (Profile 1: Embedded IoT & MCU + Profile 6: Polyglot Rust Workspace).
+description: "Use when running project-specialized deep code analysis on squeezelite-esp32 (Profile 1: Embedded IoT & MCU + Profile 6: Polyglot Rust Workspace)."
 ---
 
 <!-- GENERATOR_VERSION: 1.0.0 -->
@@ -12,7 +12,7 @@ description: Project-specialized deep code analysis engine for squeezelite-esp32
 ## Overview
 
 Specialized analytical engine tailored for **squeezelite-esp32** running **Profile 1: Embedded IoT & MCU (ESP32/ESP32-S3, FreeRTOS, bare-metal `esp-hal`)** and **Profile 6: Pure-Rust Cargo Workspace (`rust/`)**.
-Anchored to workspace root: [`/home/console-admin/Github/squeezelite-esp32`](file:///home/console-admin/Github/squeezelite-esp32)
+Anchored to workspace root: [`S:\Github\squeezelite-esp32`](file:///S:/Github/squeezelite-esp32)
 
 ---
 
@@ -20,10 +20,10 @@ Anchored to workspace root: [`/home/console-admin/Github/squeezelite-esp32`](fil
 
 | Ledger | Path | Description |
 | :--- | :--- | :--- |
-| **Device & System State** | [`DEVICE_STATE.md`](file:///home/console-admin/Github/squeezelite-esp32/.agents/knowledge/DEVICE_STATE.md) | Hardware configurations, offsets, and board variants |
-| **Active Bug Tracker** | [`ACTIVE_BUGS.md`](file:///home/console-admin/Github/squeezelite-esp32/.agents/knowledge/ACTIVE_BUGS.md) | Active failure reports, panics, and bug hypotheses |
-| **Diagnostic Scratchpad** | [`DIAGNOSTIC_LOG.md`](file:///home/console-admin/Github/squeezelite-esp32/.agents/knowledge/DIAGNOSTIC_LOG.md) | Persistent empirical tool findings (Rule 11/17 scratchpad) |
-| **Pattern Library** | [`PATTERN_LIBRARY.yaml`](file:///home/console-admin/Github/squeezelite-esp32/.agents/PATTERN_LIBRARY.yaml) | Verified architectural patterns and legacy shims |
+| **Device & System State** | [`DEVICE_STATE.md`](file:///S:/Github/squeezelite-esp32/.agents/knowledge/DEVICE_STATE.md) | Hardware configurations, offsets, and board variants |
+| **Active Bug Tracker** | [`ACTIVE_BUGS.md`](file:///S:/Github/squeezelite-esp32/.agents/knowledge/ACTIVE_BUGS.md) | Active failure reports, panics, and bug hypotheses |
+| **Diagnostic Scratchpad** | [`DIAGNOSTIC_LOG.md`](file:///S:/Github/squeezelite-esp32/.agents/knowledge/DIAGNOSTIC_LOG.md) | Persistent empirical tool findings (Rule 11/17 scratchpad) |
+| **Pattern Library** | [`PATTERN_LIBRARY.yaml`](file:///S:/Github/squeezelite-esp32/.agents/PATTERN_LIBRARY.yaml) | Verified architectural patterns and legacy shims |
 
 ---
 
@@ -42,7 +42,7 @@ Audit ringbuffer bounds, decoder frame resync, non-blocking socket state transit
 Execute `cargo check`, `cargo clippy`, `cargo test`, `cargo tree`, and `git diff`/`git log` against upstream branches.
 
 ### Phase 5: Synthesis & Artifact Delivery
-* Output final synthesis to: [`code_analysis_report.md`](file:///home/console-admin/Github/squeezelite-esp32/.agents/knowledge/code_analysis_report.md)
+* Output final synthesis to: [`code_analysis_report.md`](file:///S:/Github/squeezelite-esp32/.agents/knowledge/code_analysis_report.md)
 
 ---
 

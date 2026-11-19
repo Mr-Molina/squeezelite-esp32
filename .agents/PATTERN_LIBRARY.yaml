@@ -380,6 +380,50 @@ patterns:
   - session: conversation://6b63bd01-ad40-4ba9-a8fa-687005ed880f
     date: '2026-11-01'
     postmortem_ref: PM-2026-1101-003
-
-
-
+- id: PAT-2026-1119-001
+  name: ESP-IDF Save-Image & Pre-Flash 0xE9/0xABCD5432 Header Validation
+  failure_type: build
+  scope: project
+  root_cause_category: raw_elf_flashed_without_save_image_or_magic_byte_validation
+  description: Passing a raw cargo ELF (\x7fELF) directly to devbench.py flash writes
+    an unbootable image to ota_0 (0x150000), triggering 2nd-stage bootloader invalid
+    magic byte rollback and wasting a flash attempt. Always package via espflash
+    save-image --chip esp32 and validate size % 4 == 0, byte 0x00 == 0xE9, and LE
+    u32 0x20..0x24 == 0xABCD5432 prior to flashing.
+  imp_id: IMP-2026-1119-001
+  escalation_level: 1
+  mitigation_level: 1
+  mitigation_type: advisory
+  current_mitigation: advisory — verify ESP-IDF .bin via espflash save-image --chip esp32
+    and 0xE9/0xABCD5432 magic header check before invoking devbench.py flash
+  mitigation_target: rust/scripts/devbench.py
+  postmortem_ids:
+  - PM-2026-1119-001
+  occurrences:
+  - session: conversation://b0930bd3-f324-444d-a3e5-db69a945e664
+    date: '2026-11-19'
+    postmortem_ref: PM-2026-1119-001
+- id: PAT-2026-1119-002
+  name: DEVBENCH Firmware HTTP Schema vs Soak CSV Alias & Wrap-Adjusted FPS Reference
+  failure_type: logic
+  scope: project
+  root_cause_category: unverified_firmware_http_schema_and_soak_csv_aliases
+  description: Live DEVBENCH firmware serves /status.json (using disconnect_count, not
+    disconnects) and /syslog.json (using messages, not entries/logs), while the soak
+    monitor lives at .agents/knowledge/work_orders/WO-F3-evidence/monitor.py and exports
+    CSV aliases (disconnects, int_heap_free). Looping tracks reset frames_played to 0 on
+    strm s, requiring positive-interval wrap-adjusted FPS calculation.
+  imp_id: IMP-2026-1119-002
+  escalation_level: 1
+  mitigation_level: 1
+  mitigation_type: advisory
+  current_mitigation: advisory — query /status.json (disconnect_count) and /syslog.json
+    (messages), invoke .agents/knowledge/work_orders/WO-F3-evidence/monitor.py, and compute
+    wrap-adjusted FPS across positive frame deltas
+  mitigation_target: .agents/knowledge/work_orders/WO-F3-evidence/monitor.py
+  postmortem_ids:
+  - PM-2026-1119-002
+  occurrences:
+  - session: conversation://b0930bd3-f324-444d-a3e5-db69a945e664
+    date: '2026-11-19'
+    postmortem_ref: PM-2026-1119-002
