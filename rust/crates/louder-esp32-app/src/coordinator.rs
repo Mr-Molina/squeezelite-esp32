@@ -6936,4 +6936,25 @@ mod tests {
         verify_ogg_1728_pump(b'o', VORBIS_OGG, 22_080, 44_100);
         verify_ogg_1728_pump(b'u', OPUS_OGG, 24_648, 48_000);
     }
+
+    #[test]
+    fn test_begin_external_playback_with_pipeline_flushes_stream_buffer() {
+        let mut rig = gapless_rig(&[track_bytes(1, 32)]);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        let ingested = pipeline
+            .ingest_stream_data(&[0xAB; 128])
+            .expect("stream buffer accepts compressed bytes");
+        assert_eq!(ingested, 128);
+        assert_eq!(pipeline.stream_buffer.available_read(), 128);
+
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
+
+        assert_eq!(pipeline.stream_buffer.available_read(), 0);
+        assert!(rig.coord.external_playback);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+    }
 }

@@ -3222,7 +3222,8 @@ mod xtensa_hw {
                                 .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback();
+                            s.coordinator
+                                .begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -3819,7 +3820,7 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4328,7 +4329,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 s.raop_streaming = true;
                                                 s.last_rtp_packet_ms = now_ms;
                                             }
@@ -4396,7 +4400,8 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator
+                                        .begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4483,7 +4488,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                                     let _ = s.amp.clear_faults();
                                                     let _ = s.amp.start_playback_via_hiz();
