@@ -483,6 +483,7 @@ mod xtensa_hw {
         OtaSafetyError, OtaSelectEntry, WifiStaCredentials, OTADATA_PARTITION_END,
         OTADATA_PARTITION_OFFSET, OTADATA_SECTOR_1_OFFSET, SETTINGS_JOURNAL_OFFSET,
     };
+    use louder_esp32_app::services::{AmpPower, ServiceAudioAdapter, ServiceAudioHost};
     use louder_esp32_app::PlayerState;
     use smoltcp::iface::{
         Config as SmolIfaceConfig, Context as SmolContext, Interface as SmolInterface,
@@ -3026,24 +3027,48 @@ mod xtensa_hw {
         (now_ms as u32).wrapping_mul(0x9E37_79B9) ^ (now_ms >> 32) as u32
     }
 
-    fn restore_suspended_or_stop(s: &mut DeviceRuntimeState) {
-        match s.coordinator.active_source() {
-            AudioSource::SlimProto => {
-                s.coordinator.end_external_playback_and_restore(s.pipeline);
-                s.pipeline.set_mute(false);
-            }
-            AudioSource::None => {
-                s.pipeline.use_mp3_decoder();
-                s.coordinator.end_external_playback();
-            }
-            AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth => {
-                s.pipeline
-                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                let _ = s.pipeline.set_sample_rate(44_100);
-                s.pipeline.set_mute(false);
-                s.pipeline.stream_buffer.flush();
-            }
-        }
+    fn claim_device_external_pcm(
+        coordinator: &mut PlayerCoordinator,
+        pipeline: &mut HwStreamPipeline,
+        amp: &mut AmpManager<Esp32I2cBus<'static>>,
+        source: AudioSource,
+        sample_rate_hz: Option<u32>,
+        amp_power: AmpPower,
+    ) -> bool {
+        let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        ServiceAudioAdapter::new(coordinator, pipeline, &mut backend).claim_external_pcm(
+            source,
+            sample_rate_hz,
+            amp_power,
+        )
+    }
+
+    fn release_device_external(
+        coordinator: &mut PlayerCoordinator,
+        pipeline: &mut HwStreamPipeline,
+        amp: &mut AmpManager<Esp32I2cBus<'static>>,
+        source: AudioSource,
+    ) {
+        let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        ServiceAudioAdapter::new(coordinator, pipeline, &mut backend).release_external(source);
+    }
+
+    fn apply_device_volume(
+        coordinator: &mut PlayerCoordinator,
+        pipeline: &mut HwStreamPipeline,
+        amp: &mut AmpManager<Esp32I2cBus<'static>>,
+        cyd_bridge: &mut CydUartBridge<Esp32Uart2Port<'static>>,
+        current_vol_pct: &mut u8,
+        percent: u8,
+    ) -> u8 {
+        let mut backend = Esp32AudioBackend::new(amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        let mut adapter =
+            ServiceAudioAdapter::with_cyd_volume(coordinator, pipeline, &mut backend, |pct| {
+                let _ = cyd_bridge.send_message(&CydMessage::Volume(pct));
+            });
+        let pct = adapter.set_local_volume(percent);
+        *current_vol_pct = pct;
+        pct
     }
 
     #[inline(never)]
@@ -3093,14 +3118,14 @@ mod xtensa_hw {
         let cfg_snap = s.config.read(|c| c.clone());
         let target_vol = cfg_snap.volume.min(100);
         if target_vol != s.current_vol_pct {
-            s.current_vol_pct = target_vol;
-            let mut backend =
-                Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
-            s.coordinator
-                .set_volume_percent(s.current_vol_pct, &mut backend, s.pipeline);
-            let _ = s
-                .cyd_bridge
-                .send_message(&CydMessage::Volume(s.current_vol_pct));
+            apply_device_volume(
+                s.coordinator,
+                s.pipeline,
+                s.amp,
+                s.cyd_bridge,
+                &mut s.current_vol_pct,
+                target_vol,
+            );
         }
 
         let target_again = cfg_snap.analog_gain_code.min(31);
@@ -3165,25 +3190,33 @@ mod xtensa_hw {
 
             s.bt_sink
                 .poll(transport, now_ms, |pcm_bytes, sample_rate_hz| {
-                    if s.coordinator.request_source(AudioSource::Bluetooth) {
-                        if s.coordinator.current_sample_rate != sample_rate_hz
-                            || s.pipeline.sample_rate != sample_rate_hz
-                        {
-                            s.coordinator.current_sample_rate = sample_rate_hz;
-                            let _ = s.pipeline.set_sample_rate(sample_rate_hz);
-                        }
-                        if !s.bt_audio_active {
-                            s.pipeline
-                                .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
-                            s.pipeline.begin_external_audio();
-                            s.pipeline.set_mute(false);
-                            s.coordinator
-                                .begin_external_playback_with_pipeline(s.pipeline);
-                            if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                let _ = s.amp.start_playback_via_hiz();
+                    let granted = if s.bt_audio_active {
+                        if s.coordinator.request_source(AudioSource::Bluetooth) {
+                            if s.coordinator.current_sample_rate != sample_rate_hz
+                                || s.pipeline.sample_rate != sample_rate_hz
+                            {
+                                s.coordinator.current_sample_rate = sample_rate_hz;
+                                let _ = s.pipeline.set_sample_rate(sample_rate_hz);
                             }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        let ok = claim_device_external_pcm(
+                            s.coordinator,
+                            s.pipeline,
+                            s.amp,
+                            AudioSource::Bluetooth,
+                            Some(sample_rate_hz),
+                            AmpPower::EnsurePlay,
+                        );
+                        if ok {
                             s.bt_audio_active = true;
                         }
+                        ok
+                    };
+                    if granted {
                         let avail = s.pipeline.stream_buffer.available_write() & !3;
                         let aligned_len = (pcm_bytes.len() & !3).min(avail);
                         if aligned_len > 0 {
@@ -3202,8 +3235,7 @@ mod xtensa_hw {
                     s.pipeline.stream_buffer.flush();
                 }
                 s.bt_audio_active = false;
-                s.coordinator.release_source(AudioSource::Bluetooth);
-                restore_suspended_or_stop(s);
+                release_device_external(s.coordinator, s.pipeline, s.amp, AudioSource::Bluetooth);
             }
         }
     }
@@ -3748,16 +3780,14 @@ mod xtensa_hw {
                                 mute,
                             } => {
                                 if let Some(pct) = vol_pct {
-                                    let clamped = pct.min(100);
-                                    s.current_vol_pct = clamped;
-                                    let mut backend = Esp32AudioBackend::new(
+                                    let clamped = apply_device_volume(
+                                        s.coordinator,
+                                        s.pipeline,
                                         s.amp,
-                                        DeviceClockRegs,
-                                        &DMA_OUTSTANDING_FRAMES,
+                                        s.cyd_bridge,
+                                        &mut s.current_vol_pct,
+                                        pct,
                                     );
-                                    s.coordinator
-                                        .set_volume_percent(clamped, &mut backend, s.pipeline);
-                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(clamped));
                                     s.config.update(|c| c.volume = clamped);
                                     let _ = s.config.flush_now(&mut *s.journal);
                                 }
@@ -3782,30 +3812,25 @@ mod xtensa_hw {
                                 }
                             }
                             HttpControlAction::SpotifyPlay => {
-                                if s.coordinator.request_source(AudioSource::Spotify) {
-                                    if s.coordinator.current_sample_rate != 44_100
-                                        || s.pipeline.sample_rate != 44_100
-                                    {
-                                        s.coordinator.current_sample_rate = 44_100;
-                                        let _ = s.pipeline.set_sample_rate(44_100);
-                                    }
-                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                        16, 2, false,
-                                    )));
-                                    s.pipeline.begin_external_audio();
-                                    s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
-                                    if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                        let _ = s.amp.clear_faults();
-                                        let _ = s.amp.start_playback_via_hiz();
-                                    }
+                                if claim_device_external_pcm(
+                                    s.coordinator,
+                                    s.pipeline,
+                                    s.amp,
+                                    AudioSource::Spotify,
+                                    Some(44_100),
+                                    AmpPower::EnsurePlay,
+                                ) {
                                     s.spot_streaming = true;
                                 }
                             }
                             HttpControlAction::SpotifyStop => {
                                 s.spot_streaming = false;
-                                s.coordinator.release_source(AudioSource::Spotify);
-                                restore_suspended_or_stop(s);
+                                release_device_external(
+                                    s.coordinator,
+                                    s.pipeline,
+                                    s.amp,
+                                    AudioSource::Spotify,
+                                );
                             }
                             HttpControlAction::RebootToRecovery
                             | HttpControlAction::PersistOta0AndReboot => {
@@ -4286,7 +4311,14 @@ mod xtensa_hw {
                                             }
                                         }
                                         RtspMethod::Record => {
-                                            if s.coordinator.request_source(AudioSource::AirPlay) {
+                                            if claim_device_external_pcm(
+                                                s.coordinator,
+                                                s.pipeline,
+                                                s.amp,
+                                                AudioSource::AirPlay,
+                                                None,
+                                                AmpPower::KeepCurrent,
+                                            ) {
                                                 if let (Some(key), Some(iv)) = (
                                                     s.raop_rtsp.session_key(),
                                                     s.raop_rtsp.aes_iv(),
@@ -4298,35 +4330,20 @@ mod xtensa_hw {
                                                         let _ = s.raop_rtp.configure_alac(fmtp);
                                                     }
                                                 }
-                                                s.pipeline.set_decoder(ActiveDecoder::Pcm(
-                                                    PcmDecoder::new(16, 2, false),
-                                                ));
-                                                s.pipeline.begin_external_audio();
-                                                s.pipeline.set_mute(false);
-                                                s.coordinator
-                                                    .begin_external_playback_with_pipeline(
-                                                        s.pipeline,
-                                                    );
                                                 s.raop_streaming = true;
                                                 s.last_rtp_packet_ms = now_ms;
                                             }
                                         }
                                         RtspMethod::SetParameter => {
-                                            let pct =
-                                                ((s.raop_rtsp.volume() * 100.0) as u8).min(100);
-                                            s.current_vol_pct = pct;
-                                            let mut backend = Esp32AudioBackend::new(
-                                                s.amp,
-                                                DeviceClockRegs,
-                                                &DMA_OUTSTANDING_FRAMES,
-                                            );
-                                            s.coordinator.set_volume_percent(
-                                                pct,
-                                                &mut backend,
+                                            let raw_pct = (s.raop_rtsp.volume() * 100.0) as u8;
+                                            let pct = apply_device_volume(
+                                                s.coordinator,
                                                 s.pipeline,
+                                                s.amp,
+                                                s.cyd_bridge,
+                                                &mut s.current_vol_pct,
+                                                raw_pct,
                                             );
-                                            let _ =
-                                                s.cyd_bridge.send_message(&CydMessage::Volume(pct));
                                             s.config.update(|c| c.volume = pct);
                                         }
                                         RtspMethod::Flush => {
@@ -4335,8 +4352,12 @@ mod xtensa_hw {
                                         }
                                         RtspMethod::Teardown => {
                                             s.raop_streaming = false;
-                                            s.coordinator.release_source(AudioSource::AirPlay);
-                                            restore_suspended_or_stop(s);
+                                            release_device_external(
+                                                s.coordinator,
+                                                s.pipeline,
+                                                s.amp,
+                                                AudioSource::AirPlay,
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -4361,27 +4382,23 @@ mod xtensa_hw {
                     if let Ok((n, _ep)) = rtp_sock.recv_slice(&mut pkt_buf) {
                         s.last_rtp_packet_ms = now_ms;
                         if let Ok((pcm_i16, _hdr)) = s.raop_rtp.process_packet(&pkt_buf[..n]) {
-                            if s.coordinator.request_source(AudioSource::AirPlay) {
-                                if !s.raop_streaming {
-                                    if s.coordinator.current_sample_rate != 44_100
-                                        || s.pipeline.sample_rate != 44_100
-                                    {
-                                        s.coordinator.current_sample_rate = 44_100;
-                                        let _ = s.pipeline.set_sample_rate(44_100);
-                                    }
-                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                        16, 2, false,
-                                    )));
-                                    s.pipeline.begin_external_audio();
-                                    s.pipeline.set_mute(false);
-                                    s.coordinator
-                                        .begin_external_playback_with_pipeline(s.pipeline);
-                                    if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                        let _ = s.amp.clear_faults();
-                                        let _ = s.amp.start_playback_via_hiz();
-                                    }
+                            let granted = if s.raop_streaming {
+                                s.coordinator.request_source(AudioSource::AirPlay)
+                            } else {
+                                let ok = claim_device_external_pcm(
+                                    s.coordinator,
+                                    s.pipeline,
+                                    s.amp,
+                                    AudioSource::AirPlay,
+                                    Some(44_100),
+                                    AmpPower::EnsurePlay,
+                                );
+                                if ok {
                                     s.raop_streaming = true;
                                 }
+                                ok
+                            };
+                            if granted {
                                 let pcm_bytes: &[u8] = bytemuck::cast_slice(pcm_i16);
                                 let _ = s.pipeline.ingest_stream_data(pcm_bytes);
                             }
@@ -4399,8 +4416,7 @@ mod xtensa_hw {
                 && !s.pipeline.has_pending_pcm()
             {
                 s.raop_streaming = false;
-                s.coordinator.release_source(AudioSource::AirPlay);
-                restore_suspended_or_stop(s);
+                release_device_external(s.coordinator, s.pipeline, s.amp, AudioSource::AirPlay);
             }
         }
 
@@ -4449,29 +4465,23 @@ mod xtensa_hw {
                             if let Some(evt) = s.spot_spirc.handle_frame(&frame) {
                                 match evt {
                                     SpircEvent::Play | SpircEvent::LoadTrack { .. } => {
-                                        if s.coordinator.request_source(AudioSource::Spotify) {
-                                            if !s.spot_streaming {
-                                                if s.coordinator.current_sample_rate != 44_100
-                                                    || s.pipeline.sample_rate != 44_100
-                                                {
-                                                    s.coordinator.current_sample_rate = 44_100;
-                                                    let _ = s.pipeline.set_sample_rate(44_100);
-                                                }
-                                                s.pipeline.set_decoder(ActiveDecoder::Pcm(
-                                                    PcmDecoder::new(16, 2, false),
-                                                ));
-                                                s.pipeline.begin_external_audio();
-                                                s.pipeline.set_mute(false);
-                                                s.coordinator
-                                                    .begin_external_playback_with_pipeline(
-                                                        s.pipeline,
-                                                    );
-                                                if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                                    let _ = s.amp.clear_faults();
-                                                    let _ = s.amp.start_playback_via_hiz();
-                                                }
+                                        let granted = if s.spot_streaming {
+                                            s.coordinator.request_source(AudioSource::Spotify)
+                                        } else {
+                                            let ok = claim_device_external_pcm(
+                                                s.coordinator,
+                                                s.pipeline,
+                                                s.amp,
+                                                AudioSource::Spotify,
+                                                Some(44_100),
+                                                AmpPower::EnsurePlay,
+                                            );
+                                            if ok {
                                                 s.spot_streaming = true;
                                             }
+                                            ok
+                                        };
+                                        if granted {
                                             let notify = s.spot_spirc.build_notify_frame(
                                                 frame.seq_nr,
                                                 cspot_name.as_str(),
@@ -4481,23 +4491,23 @@ mod xtensa_hw {
                                     }
                                     SpircEvent::Pause => {
                                         s.spot_streaming = false;
-                                        s.coordinator.release_source(AudioSource::Spotify);
-                                        restore_suspended_or_stop(s);
+                                        release_device_external(
+                                            s.coordinator,
+                                            s.pipeline,
+                                            s.amp,
+                                            AudioSource::Spotify,
+                                        );
                                     }
                                     SpircEvent::SetVolume(vol_u32) => {
-                                        let pct = ((vol_u32.min(65_536) * 100) / 65_536) as u8;
-                                        s.current_vol_pct = pct;
-                                        let mut backend = Esp32AudioBackend::new(
-                                            s.amp,
-                                            DeviceClockRegs,
-                                            &DMA_OUTSTANDING_FRAMES,
-                                        );
-                                        s.coordinator.set_volume_percent(
-                                            pct,
-                                            &mut backend,
+                                        let raw_pct = ((vol_u32.min(65_536) * 100) / 65_536) as u8;
+                                        let pct = apply_device_volume(
+                                            s.coordinator,
                                             s.pipeline,
+                                            s.amp,
+                                            s.cyd_bridge,
+                                            &mut s.current_vol_pct,
+                                            raw_pct,
                                         );
-                                        let _ = s.cyd_bridge.send_message(&CydMessage::Volume(pct));
                                         s.config.update(|c| c.volume = pct);
                                     }
                                     SpircEvent::Next
@@ -4630,12 +4640,21 @@ mod xtensa_hw {
     #[inline(never)]
     fn services_poll_phase(s: &mut DeviceRuntimeState) {
         let link_up = s.assigned_ip.is_some();
+        let mut backend = Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
+        let cyd_bridge = &mut *s.cyd_bridge;
+        let current_vol_pct = &mut s.current_vol_pct;
+        let mut audio =
+            ServiceAudioAdapter::with_cyd_volume(s.coordinator, s.pipeline, &mut backend, |pct| {
+                *current_vol_pct = pct;
+                let _ = cyd_bridge.send_message(&CydMessage::Volume(pct));
+            });
         let mut ctx = louder_esp32_app::services::ServiceCtx::new(
             s.now_ms,
             s.assigned_ip,
             s.config,
             &mut s.sockets,
-        );
+        )
+        .with_audio(&mut audio);
         if link_up != s.services_link_up {
             s.services_link_up = link_up;
             s.services.on_link_all(&mut ctx, link_up);

@@ -16,6 +16,13 @@ mod registry {
     use smoltcp::socket::AnySocket;
 
     use crate::config_handle::ConfigHandle;
+    use crate::coordinator::AudioSource;
+    use crate::coordinator::PlayerCoordinator;
+    use crate::io_traits::AudioBackend;
+    use crate::pipeline::ActiveDecoder;
+    use crate::pipeline::StreamPipeline;
+    use squeezelite_audio_core::AudioOutputSink;
+    use squeezelite_decoders::PcmDecoder;
 
     /// Typed value appended to [`StatusExtras`] by a [`DeviceService`].
     #[non_exhaustive]
@@ -110,11 +117,149 @@ mod registry {
         }
     }
 
+    /// Whether claiming external PCM should also power on the amplifier.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AmpPower {
+        /// Ensure the amplifier clears faults and enters `Play` mode.
+        EnsurePlay,
+        /// Leave amplifier power state unchanged.
+        KeepCurrent,
+    }
+
+    /// Host-testable audio and volume control surface attached to [`ServiceCtx`].
+    pub trait ServiceAudioHost {
+        /// Claims external 16-bit stereo PCM playback for `source`.
+        ///
+        /// Returns `true` when `source` holds pipeline ownership.
+        fn claim_external_pcm(
+            &mut self,
+            source: AudioSource,
+            sample_rate_hz: Option<u32>,
+            amp_power: AmpPower,
+        ) -> bool;
+
+        /// Releases `source` and restores any suspended source or stops playback.
+        fn release_external(&mut self, source: AudioSource);
+
+        /// Clamps `percent` to `0..=100`, applies volume, and notifies CYD.
+        fn set_local_volume(&mut self, percent: u8) -> u8;
+    }
+
+    /// Concrete [`ServiceAudioHost`] bridging [`PlayerCoordinator`],
+    /// [`StreamPipeline`], and [`AudioBackend`] with an optional CYD volume hook.
+    pub struct ServiceAudioAdapter<'a, 'p, S: AudioOutputSink, B: AudioBackend, F = fn(u8)> {
+        coordinator: &'a mut PlayerCoordinator,
+        pipeline: &'a mut StreamPipeline<'p, S>,
+        backend: &'a mut B,
+        on_cyd_volume: Option<F>,
+    }
+
+    impl<'a, 'p, S: AudioOutputSink, B: AudioBackend> ServiceAudioAdapter<'a, 'p, S, B, fn(u8)> {
+        /// Creates an adapter without a CYD volume notification callback.
+        #[must_use]
+        pub fn new(
+            coordinator: &'a mut PlayerCoordinator,
+            pipeline: &'a mut StreamPipeline<'p, S>,
+            backend: &'a mut B,
+        ) -> Self {
+            Self {
+                coordinator,
+                pipeline,
+                backend,
+                on_cyd_volume: None,
+            }
+        }
+    }
+
+    impl<'a, 'p, S: AudioOutputSink, B: AudioBackend, F: FnMut(u8)>
+        ServiceAudioAdapter<'a, 'p, S, B, F>
+    {
+        /// Creates an adapter with a CYD volume notification callback.
+        #[must_use]
+        pub fn with_cyd_volume(
+            coordinator: &'a mut PlayerCoordinator,
+            pipeline: &'a mut StreamPipeline<'p, S>,
+            backend: &'a mut B,
+            on_cyd_volume: F,
+        ) -> Self {
+            Self {
+                coordinator,
+                pipeline,
+                backend,
+                on_cyd_volume: Some(on_cyd_volume),
+            }
+        }
+    }
+
+    impl<S: AudioOutputSink, B: AudioBackend, F: FnMut(u8)> ServiceAudioHost
+        for ServiceAudioAdapter<'_, '_, S, B, F>
+    {
+        fn claim_external_pcm(
+            &mut self,
+            source: AudioSource,
+            sample_rate_hz: Option<u32>,
+            amp_power: AmpPower,
+        ) -> bool {
+            if !self.coordinator.request_source(source) {
+                return false;
+            }
+            if let Some(hz) = sample_rate_hz {
+                if self.coordinator.current_sample_rate != hz || self.pipeline.sample_rate != hz {
+                    self.coordinator.current_sample_rate = hz;
+                    let _ = self.pipeline.set_sample_rate(hz);
+                }
+            }
+            self.pipeline
+                .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+            self.pipeline.begin_external_audio();
+            self.pipeline.set_mute(false);
+            self.coordinator
+                .begin_external_playback_with_pipeline(self.pipeline);
+            if matches!(amp_power, AmpPower::EnsurePlay) {
+                self.backend.set_power(true);
+            }
+            true
+        }
+
+        fn release_external(&mut self, source: AudioSource) {
+            self.coordinator.release_source(source);
+            match self.coordinator.active_source() {
+                AudioSource::SlimProto => {
+                    self.coordinator
+                        .end_external_playback_and_restore(self.pipeline);
+                    self.pipeline.set_mute(false);
+                }
+                AudioSource::None => {
+                    self.pipeline.use_mp3_decoder();
+                    self.coordinator.end_external_playback();
+                }
+                AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth => {
+                    self.pipeline
+                        .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                    let _ = self.pipeline.set_sample_rate(44_100);
+                    self.pipeline.set_mute(false);
+                    self.pipeline.stream_buffer.flush();
+                }
+            }
+        }
+
+        fn set_local_volume(&mut self, percent: u8) -> u8 {
+            let clamped = percent.min(100);
+            self.coordinator
+                .set_volume_percent(clamped, self.backend, self.pipeline);
+            if let Some(cb) = self.on_cyd_volume.as_mut() {
+                cb(clamped);
+            }
+            clamped
+        }
+    }
+
     /// Per-call runtime context passed to [`DeviceService`] lifecycle hooks.
     pub struct ServiceCtx<'a> {
         now_ms: u64,
         link_ip: Option<[u8; 4]>,
         config: &'a ConfigHandle,
+        audio: Option<&'a mut dyn ServiceAudioHost>,
         #[cfg(target_arch = "xtensa")]
         sockets: &'a mut SocketSet<'static>,
     }
@@ -133,6 +278,7 @@ mod registry {
                 now_ms,
                 link_ip,
                 config,
+                audio: None,
                 sockets,
             }
         }
@@ -145,7 +291,57 @@ mod registry {
                 now_ms,
                 link_ip,
                 config,
+                audio: None,
             }
+        }
+
+        /// Attaches an audio/volume host to this service context.
+        #[must_use]
+        pub fn with_audio(mut self, audio: &'a mut dyn ServiceAudioHost) -> Self {
+            self.audio = Some(audio);
+            self
+        }
+
+        /// Returns `true` when an audio host is attached to this context.
+        #[must_use]
+        pub fn has_audio(&self) -> bool {
+            self.audio.is_some()
+        }
+
+        /// Claims external 16-bit stereo PCM playback for `source`.
+        ///
+        /// Returns `false` if no audio host is attached or if a higher-priority
+        /// source currently owns the pipeline.
+        pub fn claim_external_pcm(
+            &mut self,
+            source: AudioSource,
+            sample_rate_hz: Option<u32>,
+            amp_power: AmpPower,
+        ) -> bool {
+            self.audio
+                .as_deref_mut()
+                .is_some_and(|audio| audio.claim_external_pcm(source, sample_rate_hz, amp_power))
+        }
+
+        /// Releases `source` and restores any suspended source or stops playback.
+        ///
+        /// Returns `false` when no audio host is attached.
+        pub fn release_external(&mut self, source: AudioSource) -> bool {
+            match self.audio.as_deref_mut() {
+                Some(audio) => {
+                    audio.release_external(source);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// Applies a clamped `0..=100` local volume percentage via the attached
+        /// audio host, returning the normalized percentage or `None` if detached.
+        pub fn set_local_volume(&mut self, percent: u8) -> Option<u8> {
+            self.audio
+                .as_deref_mut()
+                .map(|audio| audio.set_local_volume(percent))
         }
 
         /// Monotonic time in milliseconds since boot.
@@ -289,8 +485,8 @@ mod registry {
 }
 
 pub use registry::{
-    register_all, DeviceService, ServiceCtx, ServiceRegistry, StatusExtras, StatusField,
-    StatusValue,
+    register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
+    ServiceRegistry, StatusExtras, StatusField, StatusValue,
 };
 
 #[cfg(test)]
@@ -303,9 +499,17 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use squeezelite_config::AudioConfig;
+    use squeezelite_decoders::PcmDecoder;
 
     use super::*;
     use crate::config_handle::ConfigHandle;
+    use crate::coordinator::AudioSource;
+    use crate::coordinator::PlayerCoordinator;
+    use crate::coordinator::PlayerState;
+    use crate::io_traits::MockBackend;
+    use crate::pipeline::ActiveDecoder;
+    use crate::pipeline::StreamPipeline;
+    use crate::sink::SimulatedSink;
 
     struct RecordingService {
         name: &'static str,
@@ -389,5 +593,141 @@ mod tests {
         assert_eq!(extras.fields()[0].value, StatusValue::Bool(true));
         assert_eq!(extras.fields()[1].key, "beta");
         assert_eq!(extras.fields()[1].value, StatusValue::Bool(true));
+    }
+
+    #[test]
+    fn service_ctx_detached_audio_returns_defaults() {
+        let cfg = ConfigHandle::new(AudioConfig::default());
+        let mut ctx = ServiceCtx::new(0, None, &cfg);
+        assert!(!ctx.has_audio());
+        assert!(!ctx.claim_external_pcm(AudioSource::Spotify, Some(44_100), AmpPower::EnsurePlay));
+        assert!(!ctx.release_external(AudioSource::Spotify));
+        assert_eq!(ctx.set_local_volume(55), None);
+    }
+
+    #[test]
+    fn service_ctx_claim_and_release_external_pcm_transitions_pipeline_and_arbiter() {
+        let cfg = ConfigHandle::new(AudioConfig::default());
+        let mut coord = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0, 0, 1], "test");
+        let mut stream_mem = vec![0u8; 4096];
+        let mut out_mem = vec![0u8; 4096];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            SimulatedSink::new(44_100),
+            44_100,
+        );
+        let mut backend = MockBackend::new();
+
+        // Simulate suspended SlimProto stream before Bluetooth preempts it.
+        assert!(coord.request_source(AudioSource::SlimProto));
+
+        {
+            let mut adapter = ServiceAudioAdapter::new(&mut coord, &mut pipeline, &mut backend);
+            let mut ctx = ServiceCtx::new(100, Some([10, 0, 0, 2]), &cfg).with_audio(&mut adapter);
+            assert!(ctx.has_audio());
+
+            // KeepCurrent leaves backend.powered false.
+            assert!(ctx.claim_external_pcm(
+                AudioSource::Bluetooth,
+                Some(48_000),
+                AmpPower::KeepCurrent,
+            ));
+        }
+
+        assert_eq!(coord.active_source(), AudioSource::Bluetooth);
+        assert_eq!(coord.current_sample_rate, 48_000);
+        assert_eq!(pipeline.sample_rate, 48_000);
+        assert!(coord.external_playback);
+        assert_eq!(coord.state, PlayerState::Playing);
+        assert!(!backend.powered);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
+
+        // Higher-priority AirPlay preempts Bluetooth and powers the amp.
+        {
+            let mut adapter = ServiceAudioAdapter::new(&mut coord, &mut pipeline, &mut backend);
+            let mut ctx = ServiceCtx::new(200, Some([10, 0, 0, 2]), &cfg).with_audio(&mut adapter);
+            assert!(ctx.claim_external_pcm(
+                AudioSource::AirPlay,
+                Some(44_100),
+                AmpPower::EnsurePlay,
+            ));
+            // Lower-priority Spotify request is rejected while AirPlay is active.
+            assert!(!ctx.claim_external_pcm(
+                AudioSource::Spotify,
+                Some(44_100),
+                AmpPower::EnsurePlay,
+            ));
+        }
+        assert_eq!(coord.active_source(), AudioSource::AirPlay);
+        assert!(backend.powered);
+
+        // Releasing AirPlay drops back to suspended Spotify (stays on 44.1 kHz PCM).
+        {
+            let mut adapter = ServiceAudioAdapter::new(&mut coord, &mut pipeline, &mut backend);
+            let mut ctx = ServiceCtx::new(300, Some([10, 0, 0, 2]), &cfg).with_audio(&mut adapter);
+            assert!(ctx.release_external(AudioSource::AirPlay));
+        }
+        assert_eq!(coord.active_source(), AudioSource::Spotify);
+        assert_eq!(pipeline.sample_rate, 44_100);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
+
+        // Releasing Spotify and Bluetooth drops to SlimProto -> none.
+        {
+            let mut adapter = ServiceAudioAdapter::new(&mut coord, &mut pipeline, &mut backend);
+            let mut ctx = ServiceCtx::new(400, Some([10, 0, 0, 2]), &cfg).with_audio(&mut adapter);
+            assert!(ctx.release_external(AudioSource::Spotify));
+        }
+        assert_eq!(coord.active_source(), AudioSource::Bluetooth);
+        {
+            let mut adapter = ServiceAudioAdapter::new(&mut coord, &mut pipeline, &mut backend);
+            let mut ctx = ServiceCtx::new(450, Some([10, 0, 0, 2]), &cfg).with_audio(&mut adapter);
+            assert!(ctx.release_external(AudioSource::Bluetooth));
+        }
+        assert_eq!(coord.active_source(), AudioSource::SlimProto);
+        assert!(!coord.external_playback);
+
+        // Releasing SlimProto transitions to AudioSource::None and MP3 decoder.
+        {
+            let mut adapter = ServiceAudioAdapter::new(&mut coord, &mut pipeline, &mut backend);
+            let mut ctx = ServiceCtx::new(500, Some([10, 0, 0, 2]), &cfg).with_audio(&mut adapter);
+            assert!(ctx.release_external(AudioSource::SlimProto));
+        }
+        assert_eq!(coord.active_source(), AudioSource::None);
+        assert_eq!(coord.state, PlayerState::Stopped);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Mp3(_)));
+    }
+
+    #[test]
+    fn service_ctx_set_local_volume_clamps_and_notifies_cyd() {
+        let cfg = ConfigHandle::new(AudioConfig::default());
+        let mut coord = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0, 0, 1], "test");
+        let mut stream_mem = vec![0u8; 4096];
+        let mut out_mem = vec![0u8; 4096];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            SimulatedSink::new(44_100),
+            44_100,
+        );
+        let mut backend = MockBackend::new();
+        let mut notified = Vec::new();
+
+        {
+            let mut adapter = ServiceAudioAdapter::with_cyd_volume(
+                &mut coord,
+                &mut pipeline,
+                &mut backend,
+                |pct| notified.push(pct),
+            );
+            let mut ctx = ServiceCtx::new(600, None, &cfg).with_audio(&mut adapter);
+            assert_eq!(ctx.set_local_volume(150), Some(100));
+            assert_eq!(ctx.set_local_volume(42), Some(42));
+        }
+
+        assert_eq!(notified, vec![100, 42]);
+        assert_ne!(backend.hw_vol, (0, 0));
     }
 }

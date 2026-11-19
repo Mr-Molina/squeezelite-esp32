@@ -73,8 +73,8 @@ pub use hal::{
 pub use pipeline::{ActiveDecoder, StreamPipeline};
 pub use power_boards::{BoardProfile, SleepManager, SleepState};
 pub use services::{
-    register_all, DeviceService, ServiceCtx, ServiceRegistry, StatusExtras, StatusField,
-    StatusValue,
+    register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
+    ServiceRegistry, StatusExtras, StatusField, StatusValue,
 };
 pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
