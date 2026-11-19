@@ -1850,9 +1850,10 @@ mod xtensa_hw {
     );
 
     /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio, mDNS UDP
-    /// (5353), AirPlay RTSP TCP (5000), AirPlay RTP UDP (6000), and Spotify
-    /// Connect HTTP/Spirc TCP (4070).
-    const SOCKET_SLOTS: usize = 8;
+    /// (5353), AirPlay RTSP TCP (5000), AirPlay RTP UDP (6000), Spotify
+    /// Connect HTTP/Spirc TCP (4070), and headroom for plug-in `DeviceService`
+    /// sockets (allocated on PSRAM heap in `init_net_stack`).
+    const SOCKET_SLOTS: usize = 16;
 
     /// Metadata/payload sizing for the mDNS responder UDP socket (port 5353).
     const MDNS_UDP_META: usize = 4;
@@ -2401,6 +2402,8 @@ mod xtensa_hw {
         cached_mdns_ip: [u8; 4],
         cached_mdns_raop_name: heapless::String<32>,
         cached_mdns_cspot_name: heapless::String<32>,
+        services: louder_esp32_app::services::ServiceRegistry,
+        services_link_up: bool,
     }
 
     /// Device entry: bring-up, then the Phase 0+1 + Multi-Protocol runtime
@@ -2752,7 +2755,7 @@ mod xtensa_hw {
 
         let NetStack {
             smol_iface,
-            sockets,
+            mut sockets,
             dhcp_handle,
             http_handle,
             slim_handle,
@@ -2783,6 +2786,13 @@ mod xtensa_hw {
         ));
         let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
         let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
+        let mut services = louder_esp32_app::services::ServiceRegistry::new();
+        louder_esp32_app::services::register_all(&mut services);
+        {
+            let mut ctx =
+                louder_esp32_app::services::ServiceCtx::new(boot_ms, None, config, &mut sockets);
+            services.init_all(&mut ctx);
+        }
 
         let state = alloc::boxed::Box::leak(alloc::boxed::Box::new(DeviceRuntimeState {
             wdt,
@@ -2867,6 +2877,8 @@ mod xtensa_hw {
             cached_mdns_ip: [0u8; 4],
             cached_mdns_raop_name: heapless::String::new(),
             cached_mdns_cspot_name: heapless::String::new(),
+            services,
+            services_link_up: false,
         }));
         sync_config_to_runtime(state);
         state
@@ -4616,6 +4628,22 @@ mod xtensa_hw {
     }
 
     #[inline(never)]
+    fn services_poll_phase(s: &mut DeviceRuntimeState) {
+        let link_up = s.assigned_ip.is_some();
+        let mut ctx = louder_esp32_app::services::ServiceCtx::new(
+            s.now_ms,
+            s.assigned_ip,
+            s.config,
+            &mut s.sockets,
+        );
+        if link_up != s.services_link_up {
+            s.services_link_up = link_up;
+            s.services.on_link_all(&mut ctx, link_up);
+        }
+        s.services.poll_all(&mut ctx);
+    }
+
+    #[inline(never)]
     fn pump_device_phase(s: &mut DeviceRuntimeState) {
         s.wdt.feed();
         s.now_ms = now_millis();
@@ -4627,6 +4655,7 @@ mod xtensa_hw {
         let _ = s.coordinator.pump_output(s.pipeline, 2);
         poll_smoltcp_bounded(s);
         multi_proto_poll(s);
+        services_poll_phase(s);
         cyd_command_phase(s);
         output_decode_phase(s);
         amp_and_cyd_health_phase(s);
