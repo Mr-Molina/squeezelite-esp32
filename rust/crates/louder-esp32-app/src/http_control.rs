@@ -29,6 +29,7 @@ use squeezelite_cspot::zeroconf::ZeroConfServer;
 
 use crate::ota_safety::{REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION};
 use crate::pipeline::{PSRAM_HEAP_BYTES, PSRAM_OUTPUT_RING_BYTES, PSRAM_STREAM_RING_BYTES};
+use crate::services::{StatusExtras, StatusValue};
 
 /// `psram_used_bytes` reported when no PSRAM heap statistics exist: the
 /// firmware's two PSRAM rings (512 KiB stream + 2000 KiB output = 2,572,288 B).
@@ -372,6 +373,16 @@ impl<'a> core::fmt::Display for JsonEscaped<'a> {
 /// Formats the `/status.json` payload into `out_buf` (up to 2048 bytes).
 /// Returns the number of bytes written, or `None` if `out_buf` is too small.
 pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
+    write_status_json_with_extras(snapshot, &StatusExtras::new(), out_buf)
+}
+
+/// Formats the `/status.json` payload into `out_buf`, appending any
+/// service-contributed [`StatusExtras`] fields before the closing brace.
+pub fn write_status_json_with_extras(
+    snapshot: &HttpStatusSnapshot<'_>,
+    extras: &StatusExtras,
+    out_buf: &mut [u8],
+) -> Option<usize> {
     let mut writer = BufferWriter::new(out_buf);
     let jack_str = if snapshot.jack_inserted { "1" } else { "0" };
     let bt_status = if snapshot.bt_status != 0 {
@@ -402,7 +413,7 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         \"bt_frames\":{},\"decode_us_max\":{},\"decode_us_first\":{},\
         \"Jack\":\"{}\",\"Voltage\":{},\"disconnect_count\":{},\
         \"avg_conn_time\":{},\"is_i2c_locked\":{},\"urc\":{},\
-        \"bt_status\":{},\"bt_sub_status\":{}}}",
+        \"bt_status\":{},\"bt_sub_status\":{}",
         JsonEscaped(REQUIRED_OTA_PROJECT_NAME),
         JsonEscaped(RUST_OTA_FIRMWARE_VERSION),
         snapshot.otadata_prearmed_factory,
@@ -470,6 +481,16 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
         snapshot.bt_sub_status,
     )
     .ok()?;
+    for field in extras.fields() {
+        write!(writer, ",\"{}\":", JsonEscaped(&field.key)).ok()?;
+        match &field.value {
+            StatusValue::Str(s) => write!(writer, "\"{}\"", JsonEscaped(s)).ok()?,
+            StatusValue::Bool(b) => write!(writer, "{b}").ok()?,
+            StatusValue::U64(n) => write!(writer, "{n}").ok()?,
+            StatusValue::I64(n) => write!(writer, "{n}").ok()?,
+        }
+    }
+    writer.write_str("}").ok()?;
     Some(writer.written_len())
 }
 
@@ -477,6 +498,16 @@ pub fn write_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) 
 #[inline]
 pub fn format_status_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> Option<usize> {
     write_status_json(snapshot, out_buf)
+}
+
+/// Formats the `/status.json` payload with service [`StatusExtras`] fields.
+#[inline]
+pub fn format_status_json_with_extras(
+    snapshot: &HttpStatusSnapshot<'_>,
+    extras: &StatusExtras,
+    out_buf: &mut [u8],
+) -> Option<usize> {
+    write_status_json_with_extras(snapshot, extras, out_buf)
 }
 
 /// Fixed hardware GPIO pin descriptor exposed in `GET /config.json`.
@@ -2292,7 +2323,7 @@ impl HttpControlRouter {
                 return Some((resp_bytes.len(), &[], HttpControlAction::None));
             }
         }
-        handle_http_request_streaming_impl(req_bytes, snapshot, &[], out_buf)
+        handle_http_request_streaming_impl(req_bytes, snapshot, &[], &StatusExtras::new(), out_buf)
     }
 
     /// Handles an HTTP request into `out_buf`.
@@ -2357,6 +2388,7 @@ pub fn handle_http_request_streaming_impl(
     req_bytes: &[u8],
     snapshot: &HttpStatusSnapshot<'_>,
     extra_entries: &[ConfigEntryView<'_>],
+    status_extras: &StatusExtras,
     out_buf: &mut [u8],
 ) -> Option<(usize, &'static [u8], HttpControlAction)> {
     let line_end = req_bytes.iter().position(|&b| b == b'\n')?;
@@ -2527,7 +2559,11 @@ pub fn handle_http_request_streaming_impl(
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
-            let body_len = write_status_json(snapshot, &mut out_buf[HEADER_ROOM..])?;
+            let body_len = write_status_json_with_extras(
+                snapshot,
+                status_extras,
+                &mut out_buf[HEADER_ROOM..],
+            )?;
 
             let mut header: String<HEADER_ROOM> = String::new();
             write!(
@@ -3071,7 +3107,7 @@ pub fn handle_http_request_streaming(
     snapshot: &HttpStatusSnapshot<'_>,
     out_buf: &mut [u8],
 ) -> Option<(usize, &'static [u8], HttpControlAction)> {
-    handle_http_request_streaming_impl(req_bytes, snapshot, &[], out_buf)
+    handle_http_request_streaming_impl(req_bytes, snapshot, &[], &StatusExtras::new(), out_buf)
 }
 
 /// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
@@ -3083,7 +3119,21 @@ pub fn handle_http_request_streaming_with_entries(
     extra_entries: &[ConfigEntryView<'_>],
     out_buf: &mut [u8],
 ) -> Option<(usize, &'static [u8], HttpControlAction)> {
-    handle_http_request_streaming_impl(req_bytes, snapshot, extra_entries, out_buf)
+    let extras = StatusExtras::new();
+    handle_http_request_streaming_impl(req_bytes, snapshot, extra_entries, &extras, out_buf)
+}
+
+/// Parses an HTTP request from `req_bytes` and writes the HTTP header (or full
+/// response for JSON) into `out_buf`, including caller-supplied configuration
+/// entries and service [`StatusExtras`] in `GET /status.json`.
+pub fn handle_http_request_streaming_with_services(
+    req_bytes: &[u8],
+    snapshot: &HttpStatusSnapshot<'_>,
+    extra_entries: &[ConfigEntryView<'_>],
+    status_extras: &StatusExtras,
+    out_buf: &mut [u8],
+) -> Option<(usize, &'static [u8], HttpControlAction)> {
+    handle_http_request_streaming_impl(req_bytes, snapshot, extra_entries, status_extras, out_buf)
 }
 
 /// Parses an HTTP request from `req_bytes` and writes a complete HTTP/1.1
@@ -3523,6 +3573,51 @@ mod tests {
         assert!(s.contains("\"core1_active\":true"));
         assert!(s.contains("\"tas_fs_hz\":44100"));
         assert!(s.contains("\"eq_preset\":\"Flat\""));
+    }
+
+    #[test]
+    fn test_format_status_json_with_extras_escaping_and_types() {
+        let snap = RuntimeStatusSnapshot::default();
+        let mut base_buf = [0u8; 2048];
+        let base_len = format_status_json(&snap, &mut base_buf).expect("base format ok");
+
+        let mut empty_buf = [0u8; 2048];
+        let empty_extras = StatusExtras::new();
+        let empty_len = format_status_json_with_extras(&snap, &empty_extras, &mut empty_buf)
+            .expect("empty extras format ok");
+        assert_eq!(&empty_buf[..empty_len], &base_buf[..base_len]);
+
+        let mut extras = StatusExtras::new();
+        extras.push_str("svc_note", "a\"b\\c");
+        extras.push_bool("svc_ok", true);
+        extras.push_u64("svc_u64", 42);
+        extras.push_i64("svc_i64", -7);
+
+        let mut ext_buf = [0u8; 4096];
+        let ext_len =
+            format_status_json_with_extras(&snap, &extras, &mut ext_buf).expect("extras format ok");
+        let s = core::str::from_utf8(&ext_buf[..ext_len]).expect("valid utf8");
+        assert!(s.starts_with('{'));
+        assert!(s.ends_with('}'));
+        assert!(s.contains("\"svc_note\":\"a\\\"b\\\\c\""));
+        assert!(s.contains("\"svc_ok\":true"));
+        assert!(s.contains("\"svc_u64\":42"));
+        assert!(s.contains("\"svc_i64\":-7"));
+
+        let mut http_buf = [0u8; 4096];
+        let (resp_len, static_body, action) = handle_http_request_streaming_with_services(
+            b"GET /status.json HTTP/1.1\r\n\r\n",
+            &snap,
+            &[],
+            &extras,
+            &mut http_buf,
+        )
+        .expect("status.json request succeeds");
+        assert!(static_body.is_empty());
+        assert_eq!(action, HttpControlAction::None);
+        let resp_str = core::str::from_utf8(&http_buf[..resp_len]).expect("valid http utf8");
+        assert!(resp_str.contains("\"svc_u64\":42"));
+        assert!(resp_str.contains("\"svc_i64\":-7"));
     }
 
     #[test]

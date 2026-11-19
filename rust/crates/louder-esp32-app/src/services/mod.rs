@@ -7,6 +7,7 @@ mod registry {
     extern crate alloc;
 
     use alloc::boxed::Box;
+    use alloc::collections::VecDeque;
     use alloc::string::String;
     use alloc::vec::Vec;
 
@@ -18,7 +19,10 @@ mod registry {
     use crate::config_handle::ConfigHandle;
     use crate::coordinator::AudioSource;
     use crate::coordinator::PlayerCoordinator;
+    use crate::coordinator::SlimExtension;
+    use crate::coordinator::SlimOutboundSink;
     use crate::io_traits::AudioBackend;
+    use crate::io_traits::TransportError;
     use crate::pipeline::ActiveDecoder;
     use crate::pipeline::StreamPipeline;
     use squeezelite_audio_core::AudioOutputSink;
@@ -254,14 +258,142 @@ mod registry {
         }
     }
 
+    /// Default maximum number of queued outbound SlimProto frames.
+    pub const DEFAULT_SLIM_OUTBOUND_CAP: usize = 32;
+
+    /// PSRAM-heap-backed outbound SlimProto frame queue shared between
+    /// [`DeviceService`] callbacks and [`SlimExtension::poll_outbound`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SlimOutboundQueue {
+        frames: VecDeque<([u8; 4], Vec<u8>)>,
+        capacity: usize,
+    }
+
+    impl Default for SlimOutboundQueue {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SlimOutboundQueue {
+        /// Creates an empty queue with [`DEFAULT_SLIM_OUTBOUND_CAP`].
+        #[must_use]
+        pub fn new() -> Self {
+            Self::with_capacity(DEFAULT_SLIM_OUTBOUND_CAP)
+        }
+
+        /// Creates an empty queue capped at `capacity` frames (`>= 1`).
+        #[must_use]
+        pub fn with_capacity(capacity: usize) -> Self {
+            Self {
+                frames: VecDeque::new(),
+                capacity: capacity.max(1),
+            }
+        }
+
+        /// Queues `(opcode, payload)` onto the heap if below capacity.
+        pub fn push(&mut self, opcode: [u8; 4], payload: &[u8]) -> bool {
+            if self.frames.len() >= self.capacity {
+                return false;
+            }
+            self.frames.push_back((opcode, payload.to_vec()));
+            true
+        }
+
+        /// Number of queued outbound frames.
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.frames.len()
+        }
+
+        /// Returns `true` when no frames are queued.
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.frames.is_empty()
+        }
+
+        /// Flushes queued frames to `sink`, preserving any unsent frame on
+        /// error so it can be retried on the next tick.
+        pub fn drain_to(&mut self, sink: &mut dyn SlimOutboundSink) -> Result<(), TransportError> {
+            while let Some((opcode, payload)) = self.frames.front() {
+                sink.send_slim_frame(*opcode, payload)?;
+                let _ = self.frames.pop_front();
+            }
+            Ok(())
+        }
+    }
+
+    /// Parsed HTTP request metadata passed to [`DeviceService::handle_http`].
+    #[non_exhaustive]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ServiceHttpRequest<'a> {
+        /// HTTP method (e.g. `"GET"`, `"POST"`).
+        pub method: &'a str,
+        /// Request path without query string (e.g. `"/status.json"`).
+        pub path: &'a str,
+        /// Request body bytes following the header terminator.
+        pub body: &'a [u8],
+    }
+
+    impl<'a> ServiceHttpRequest<'a> {
+        /// Constructs a [`ServiceHttpRequest`].
+        #[must_use]
+        pub const fn new(method: &'a str, path: &'a str, body: &'a [u8]) -> Self {
+            Self { method, path, body }
+        }
+
+        /// Parses method, path (query stripped), and body from raw HTTP bytes.
+        ///
+        /// Returns `None` when the request line is incomplete or non-UTF-8.
+        #[must_use]
+        pub fn parse(req_bytes: &'a [u8]) -> Option<Self> {
+            let line_end = req_bytes.iter().position(|&b| b == b'\n')?;
+            let first_line = core::str::from_utf8(&req_bytes[..line_end])
+                .ok()?
+                .trim_end_matches('\r');
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next()?;
+            let raw_path = parts.next()?;
+            let path = raw_path.split('?').next().unwrap_or(raw_path);
+            let body = req_bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| &req_bytes[p + 4..])
+                .or_else(|| {
+                    req_bytes
+                        .windows(2)
+                        .position(|w| w == b"\n\n")
+                        .map(|p| &req_bytes[p + 2..])
+                })
+                .unwrap_or(&[]);
+            Some(Self { method, path, body })
+        }
+    }
+
+    /// Outcome returned by [`DeviceService::handle_http`].
+    #[non_exhaustive]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ServiceHttpOutcome {
+        /// This service does not handle the request; continue dispatch.
+        Unhandled,
+        /// This service wrote an HTTP response into `resp_buf`.
+        Responded {
+            /// Number of bytes written to `resp_buf`.
+            response_len: usize,
+            /// Whether the socket should abort immediately rather than linger.
+            close_immediately: bool,
+        },
+    }
+
     /// Per-call runtime context passed to [`DeviceService`] lifecycle hooks.
     pub struct ServiceCtx<'a> {
         now_ms: u64,
         link_ip: Option<[u8; 4]>,
         config: &'a ConfigHandle,
         audio: Option<&'a mut dyn ServiceAudioHost>,
+        slim_outbound: Option<&'a mut SlimOutboundQueue>,
         #[cfg(target_arch = "xtensa")]
-        sockets: &'a mut SocketSet<'static>,
+        sockets: Option<&'a mut SocketSet<'static>>,
     }
 
     impl<'a> ServiceCtx<'a> {
@@ -279,7 +411,27 @@ mod registry {
                 link_ip,
                 config,
                 audio: None,
-                sockets,
+                slim_outbound: None,
+                sockets: Some(sockets),
+            }
+        }
+
+        /// Creates a device context without socket-set access (used during
+        /// SlimProto frame callbacks while sockets are borrowed).
+        #[cfg(target_arch = "xtensa")]
+        #[must_use]
+        pub fn without_sockets(
+            now_ms: u64,
+            link_ip: Option<[u8; 4]>,
+            config: &'a ConfigHandle,
+        ) -> Self {
+            Self {
+                now_ms,
+                link_ip,
+                config,
+                audio: None,
+                slim_outbound: None,
+                sockets: None,
             }
         }
 
@@ -292,7 +444,20 @@ mod registry {
                 link_ip,
                 config,
                 audio: None,
+                slim_outbound: None,
             }
+        }
+
+        /// Creates a context without socket-set access (host mirror of device
+        /// SlimProto callback contexts).
+        #[cfg(not(target_arch = "xtensa"))]
+        #[must_use]
+        pub fn without_sockets(
+            now_ms: u64,
+            link_ip: Option<[u8; 4]>,
+            config: &'a ConfigHandle,
+        ) -> Self {
+            Self::new(now_ms, link_ip, config)
         }
 
         /// Attaches an audio/volume host to this service context.
@@ -300,6 +465,24 @@ mod registry {
         pub fn with_audio(mut self, audio: &'a mut dyn ServiceAudioHost) -> Self {
             self.audio = Some(audio);
             self
+        }
+
+        /// Attaches an outbound SlimProto frame queue to this service context.
+        #[must_use]
+        pub fn with_slim_outbound(mut self, queue: &'a mut SlimOutboundQueue) -> Self {
+            self.slim_outbound = Some(queue);
+            self
+        }
+
+        /// Queues an outbound SlimProto frame `(opcode, payload)` for delivery
+        /// on the active SlimProto control connection.
+        ///
+        /// Returns `false` if no outbound queue is attached or the queue is
+        /// full.
+        pub fn send_slim_frame(&mut self, opcode: [u8; 4], payload: &[u8]) -> bool {
+            self.slim_outbound
+                .as_deref_mut()
+                .is_some_and(|queue| queue.push(opcode, payload))
         }
 
         /// Returns `true` when an audio host is attached to this context.
@@ -362,23 +545,39 @@ mod registry {
             self.config
         }
 
+        /// Returns `true` when socket-set access is attached to this context.
+        #[cfg(target_arch = "xtensa")]
+        #[must_use]
+        pub fn has_sockets(&self) -> bool {
+            self.sockets.is_some()
+        }
+
         /// Registers a smoltcp socket in the shared socket set.
         #[cfg(target_arch = "xtensa")]
         pub fn add_socket<T: AnySocket<'static>>(&mut self, socket: T) -> SocketHandle {
-            self.sockets.add(socket)
+            self.sockets
+                .as_deref_mut()
+                .expect("ServiceCtx has no SocketSet attached")
+                .add(socket)
         }
 
         /// Returns a shared reference to a registered socket by handle.
         #[cfg(target_arch = "xtensa")]
         #[must_use]
         pub fn socket<T: AnySocket<'static>>(&self, handle: SocketHandle) -> &T {
-            self.sockets.get::<T>(handle)
+            self.sockets
+                .as_deref()
+                .expect("ServiceCtx has no SocketSet attached")
+                .get::<T>(handle)
         }
 
         /// Returns a mutable reference to a registered socket by handle.
         #[cfg(target_arch = "xtensa")]
         pub fn socket_mut<T: AnySocket<'static>>(&mut self, handle: SocketHandle) -> &mut T {
-            self.sockets.get_mut::<T>(handle)
+            self.sockets
+                .as_deref_mut()
+                .expect("ServiceCtx has no SocketSet attached")
+                .get_mut::<T>(handle)
         }
 
         /// Returns a shared reference to the underlying smoltcp socket set.
@@ -386,12 +585,16 @@ mod registry {
         #[must_use]
         pub fn sockets(&self) -> &SocketSet<'static> {
             self.sockets
+                .as_deref()
+                .expect("ServiceCtx has no SocketSet attached")
         }
 
         /// Returns a mutable reference to the underlying smoltcp socket set.
         #[cfg(target_arch = "xtensa")]
         pub fn sockets_mut(&mut self) -> &mut SocketSet<'static> {
             self.sockets
+                .as_deref_mut()
+                .expect("ServiceCtx has no SocketSet attached")
         }
     }
 
@@ -407,6 +610,29 @@ mod registry {
         fn poll(&mut self, ctx: &mut ServiceCtx<'_>);
         /// Appends this service's fields to the status report.
         fn status(&self, out: &mut StatusExtras);
+
+        /// Handles an inbound SlimProto frame `(opcode, payload)`.
+        ///
+        /// Return `true` when handled exclusively (suppressing default
+        /// coordinator handling), `false` otherwise.
+        fn on_slim_frame(
+            &mut self,
+            _ctx: &mut ServiceCtx<'_>,
+            _opcode: [u8; 4],
+            _payload: &[u8],
+        ) -> bool {
+            false
+        }
+
+        /// Handles an incoming HTTP request if owned by this service.
+        fn handle_http(
+            &mut self,
+            _ctx: &mut ServiceCtx<'_>,
+            _req: &ServiceHttpRequest<'_>,
+            _resp_buf: &mut [u8],
+        ) -> ServiceHttpOutcome {
+            ServiceHttpOutcome::Unhandled
+        }
     }
 
     /// Heap-backed registry driving all wired [`DeviceService`] instances.
@@ -473,6 +699,85 @@ mod registry {
                 service.status(out);
             }
         }
+
+        /// Routes an inbound SlimProto frame across registered services,
+        /// stopping at the first service that returns `true`.
+        pub fn on_slim_frame_all(
+            &mut self,
+            ctx: &mut ServiceCtx<'_>,
+            opcode: [u8; 4],
+            payload: &[u8],
+        ) -> bool {
+            for service in &mut self.services {
+                if service.on_slim_frame(ctx, opcode, payload) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// Dispatches an HTTP request across registered services, stopping at
+        /// the first service that returns [`ServiceHttpOutcome::Responded`].
+        pub fn handle_http_all(
+            &mut self,
+            ctx: &mut ServiceCtx<'_>,
+            req: &ServiceHttpRequest<'_>,
+            resp_buf: &mut [u8],
+        ) -> ServiceHttpOutcome {
+            for service in &mut self.services {
+                match service.handle_http(ctx, req, resp_buf) {
+                    ServiceHttpOutcome::Unhandled => {}
+                    outcome @ ServiceHttpOutcome::Responded { .. } => return outcome,
+                }
+            }
+            ServiceHttpOutcome::Unhandled
+        }
+    }
+
+    /// Bridges [`ServiceRegistry`] and [`SlimOutboundQueue`] to
+    /// [`PlayerCoordinator::tick_with_extension`] via [`SlimExtension`].
+    pub struct ServiceSlimExtension<'a> {
+        services: &'a mut ServiceRegistry,
+        outbound: &'a mut SlimOutboundQueue,
+        now_ms: u64,
+        link_ip: Option<[u8; 4]>,
+        config: &'a ConfigHandle,
+    }
+
+    impl<'a> ServiceSlimExtension<'a> {
+        /// Creates a [`SlimExtension`] bridge for a single coordinator tick.
+        #[must_use]
+        pub fn new(
+            services: &'a mut ServiceRegistry,
+            outbound: &'a mut SlimOutboundQueue,
+            now_ms: u64,
+            link_ip: Option<[u8; 4]>,
+            config: &'a ConfigHandle,
+        ) -> Self {
+            Self {
+                services,
+                outbound,
+                now_ms,
+                link_ip,
+                config,
+            }
+        }
+    }
+
+    impl SlimExtension for ServiceSlimExtension<'_> {
+        fn on_frame(&mut self, opcode: [u8; 4], payload: &[u8]) -> bool {
+            let mut ctx = ServiceCtx::without_sockets(self.now_ms, self.link_ip, self.config)
+                .with_slim_outbound(self.outbound);
+            self.services.on_slim_frame_all(&mut ctx, opcode, payload)
+        }
+
+        fn poll_outbound(
+            &mut self,
+            sink: &mut dyn SlimOutboundSink,
+            _now_ms: u32,
+        ) -> Result<(), TransportError> {
+            self.outbound.drain_to(sink)
+        }
     }
 
     /// Registers every device service in exactly one place.
@@ -486,7 +791,8 @@ mod registry {
 
 pub use registry::{
     register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
-    ServiceRegistry, StatusExtras, StatusField, StatusValue,
+    ServiceHttpOutcome, ServiceHttpRequest, ServiceRegistry, ServiceSlimExtension,
+    SlimOutboundQueue, StatusExtras, StatusField, StatusValue, DEFAULT_SLIM_OUTBOUND_CAP,
 };
 
 #[cfg(test)]
@@ -506,7 +812,9 @@ mod tests {
     use crate::coordinator::AudioSource;
     use crate::coordinator::PlayerCoordinator;
     use crate::coordinator::PlayerState;
-    use crate::io_traits::MockBackend;
+    use crate::io_traits::{
+        MockBackend, NetAddr, SlimTransport, StreamError, StreamSource, TransportError,
+    };
     use crate::pipeline::ActiveDecoder;
     use crate::pipeline::StreamPipeline;
     use crate::sink::SimulatedSink;
@@ -729,5 +1037,330 @@ mod tests {
 
         assert_eq!(notified, vec![100, 42]);
         assert_ne!(backend.hw_vol, (0, 0));
+    }
+
+    struct MockSlimTransport {
+        inbound: alloc::collections::VecDeque<Vec<u8>>,
+        outbound: Vec<Vec<u8>>,
+        fail_send: Option<TransportError>,
+        connected: bool,
+    }
+
+    impl MockSlimTransport {
+        fn new() -> Self {
+            Self {
+                inbound: alloc::collections::VecDeque::new(),
+                outbound: Vec::new(),
+                fail_send: None,
+                connected: true,
+            }
+        }
+    }
+
+    impl SlimTransport for MockSlimTransport {
+        fn poll_frame(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+            let Some(frame) = self.inbound.pop_front() else {
+                return Ok(None);
+            };
+            if frame.len() > buf.len() {
+                return Err(TransportError::Io);
+            }
+            buf[..frame.len()].copy_from_slice(&frame);
+            Ok(Some(frame.len()))
+        }
+
+        fn send(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+            if let Some(ref err) = self.fail_send {
+                return Err(match err {
+                    TransportError::Disconnected => TransportError::Disconnected,
+                    TransportError::WouldBlock => TransportError::WouldBlock,
+                    TransportError::Io => TransportError::Io,
+                });
+            }
+            self.outbound.push(frame.to_vec());
+            Ok(())
+        }
+
+        fn connected(&self) -> bool {
+            self.connected
+        }
+    }
+
+    struct DummyStreamSource;
+
+    impl StreamSource for DummyStreamSource {
+        fn connect(&mut self, _addr: NetAddr, _http_request: &[u8]) -> Result<(), StreamError> {
+            Ok(())
+        }
+
+        fn poll_bytes(&mut self, _out: &mut [u8]) -> Result<usize, StreamError> {
+            Ok(0)
+        }
+
+        fn take_response_headers(&mut self) -> Option<crate::io_traits::HeaderBuf> {
+            None
+        }
+
+        fn take_icy_metadata(&mut self) -> Option<crate::io_traits::MetaBuf> {
+            None
+        }
+
+        fn set_icy_metaint(&mut self, _interval: usize) {}
+
+        fn is_eof(&self) -> bool {
+            false
+        }
+
+        fn abort(&mut self) {}
+    }
+
+    type SeenFrameLog = Rc<RefCell<Vec<([u8; 4], Vec<u8>)>>>;
+
+    struct CustomSlimService {
+        seen_frames: SeenFrameLog,
+        intercept_opcode: [u8; 4],
+        reply_opcode: Option<[u8; 4]>,
+    }
+
+    impl DeviceService for CustomSlimService {
+        fn name(&self) -> &'static str {
+            "custom-slim"
+        }
+
+        fn init(&mut self, _ctx: &mut ServiceCtx<'_>) {}
+
+        fn on_link(&mut self, _ctx: &mut ServiceCtx<'_>, _up: bool) {}
+
+        fn poll(&mut self, _ctx: &mut ServiceCtx<'_>) {}
+
+        fn status(&self, _out: &mut StatusExtras) {}
+
+        fn on_slim_frame(
+            &mut self,
+            ctx: &mut ServiceCtx<'_>,
+            opcode: [u8; 4],
+            payload: &[u8],
+        ) -> bool {
+            self.seen_frames
+                .borrow_mut()
+                .push((opcode, payload.to_vec()));
+            if opcode == self.intercept_opcode {
+                if let Some(reply) = self.reply_opcode {
+                    assert!(ctx.send_slim_frame(reply, b"pong"));
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn slim_extension_intercepts_custom_frame_bypasses_others_and_drains_outbound() {
+        let cfg = ConfigHandle::new(AudioConfig::default());
+        let mut coord = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0, 0, 1], "test");
+        let mut stream_mem = vec![0u8; 4096];
+        let mut out_mem = vec![0u8; 4096];
+        let mut pipeline = StreamPipeline::new(
+            &mut stream_mem,
+            &mut out_mem,
+            ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)),
+            SimulatedSink::new(44_100),
+            44_100,
+        );
+        let mut backend = MockBackend::new();
+        let mut source = DummyStreamSource;
+        let mut transport = MockSlimTransport::new();
+
+        // 6-byte header: len=8 (4 opcode + 4 payload), "XTND", payload="ping".
+        transport
+            .inbound
+            .push_back(vec![0, 8, b'X', b'T', b'N', b'D', b'p', b'i', b'n', b'g']);
+        // Standard "serv" frame falls through when on_frame returns false.
+        transport
+            .inbound
+            .push_back(vec![0, 8, b's', b'e', b'r', b'v', 10, 0, 0, 99]);
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut reg = ServiceRegistry::new();
+        reg.register(CustomSlimService {
+            seen_frames: Rc::clone(&seen),
+            intercept_opcode: *b"XTND",
+            reply_opcode: Some(*b"PONG"),
+        });
+        let mut outbound = SlimOutboundQueue::new();
+
+        // Tick 1: processes XTND exclusively and queues PONG reply.
+        {
+            let mut ext = ServiceSlimExtension::new(
+                &mut reg,
+                &mut outbound,
+                100,
+                Some([172, 22, 1, 15]),
+                &cfg,
+            );
+            coord
+                .tick_with_extension(
+                    &mut transport,
+                    &mut source,
+                    &mut backend,
+                    &mut pipeline,
+                    &mut ext,
+                    100,
+                )
+                .expect("tick 1 should succeed");
+        }
+        assert!(outbound.is_empty());
+        assert_eq!(
+            transport.outbound,
+            vec![vec![
+                b'P', b'O', b'N', b'G', 0, 0, 0, 4, b'p', b'o', b'n', b'g'
+            ]]
+        );
+
+        // Tick 2: queue outbound from ServiceCtx; "vers" passes to coord.
+        {
+            let mut ctx = ServiceCtx::new(200, Some([172, 22, 1, 15]), &cfg)
+                .with_slim_outbound(&mut outbound);
+            assert!(ctx.send_slim_frame(*b"INFO", b"hi"));
+        }
+        {
+            let mut ext = ServiceSlimExtension::new(
+                &mut reg,
+                &mut outbound,
+                200,
+                Some([172, 22, 1, 15]),
+                &cfg,
+            );
+            coord
+                .tick_with_extension(
+                    &mut transport,
+                    &mut source,
+                    &mut backend,
+                    &mut pipeline,
+                    &mut ext,
+                    200,
+                )
+                .expect("tick 2 should succeed");
+        }
+        assert_eq!(
+            *seen.borrow(),
+            vec![(*b"XTND", b"ping".to_vec()), (*b"serv", vec![10, 0, 0, 99]),]
+        );
+        assert_eq!(
+            transport.outbound[1],
+            vec![b'I', b'N', b'F', b'O', 0, 0, 0, 2, b'h', b'i']
+        );
+        assert_eq!(coord.take_server_switch(), Some([10, 0, 0, 99]));
+    }
+
+    struct HttpRouteService {
+        prefix: &'static str,
+        body: &'static [u8],
+        close_immediately: bool,
+        calls: Rc<RefCell<usize>>,
+    }
+
+    impl DeviceService for HttpRouteService {
+        fn name(&self) -> &'static str {
+            self.prefix
+        }
+
+        fn init(&mut self, _ctx: &mut ServiceCtx<'_>) {}
+
+        fn on_link(&mut self, _ctx: &mut ServiceCtx<'_>, _up: bool) {}
+
+        fn poll(&mut self, _ctx: &mut ServiceCtx<'_>) {}
+
+        fn status(&self, _out: &mut StatusExtras) {}
+
+        fn handle_http(
+            &mut self,
+            _ctx: &mut ServiceCtx<'_>,
+            req: &ServiceHttpRequest<'_>,
+            resp_buf: &mut [u8],
+        ) -> ServiceHttpOutcome {
+            *self.calls.borrow_mut() += 1;
+            if req.path == self.prefix {
+                let len = self.body.len().min(resp_buf.len());
+                resp_buf[..len].copy_from_slice(&self.body[..len]);
+                ServiceHttpOutcome::Responded {
+                    response_len: len,
+                    close_immediately: self.close_immediately,
+                }
+            } else {
+                ServiceHttpOutcome::Unhandled
+            }
+        }
+    }
+
+    #[test]
+    fn http_service_hook_dispatches_fallthrough_and_short_circuits() {
+        let parsed = ServiceHttpRequest::parse(
+            b"POST /api/pair?v=1 HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n{\"pin\":1234}",
+        )
+        .expect("valid HTTP request should parse");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/api/pair");
+        assert_eq!(parsed.body, b"{\"pin\":1234}");
+
+        let first_calls = Rc::new(RefCell::new(0usize));
+        let second_calls = Rc::new(RefCell::new(0usize));
+        let mut reg = ServiceRegistry::new();
+        reg.register(HttpRouteService {
+            prefix: "/api/first",
+            body: b"HTTP/1.1 200 OK\r\n\r\nfirst",
+            close_immediately: true,
+            calls: Rc::clone(&first_calls),
+        });
+        reg.register(HttpRouteService {
+            prefix: "/api/second",
+            body: b"HTTP/1.1 200 OK\r\n\r\nsecond",
+            close_immediately: false,
+            calls: Rc::clone(&second_calls),
+        });
+
+        let cfg = ConfigHandle::new(AudioConfig::default());
+        let mut ctx = ServiceCtx::new(10, Some([172, 22, 1, 15]), &cfg);
+        let mut resp = [0u8; 128];
+
+        // First returns Unhandled -> falls through to second, which responds.
+        let req2 = ServiceHttpRequest::parse(b"GET /api/second HTTP/1.1\r\n\r\n")
+            .expect("GET request parses");
+        let out2 = reg.handle_http_all(&mut ctx, &req2, &mut resp);
+        assert_eq!(
+            out2,
+            ServiceHttpOutcome::Responded {
+                response_len: 25,
+                close_immediately: false,
+            }
+        );
+        assert_eq!(&resp[..25], b"HTTP/1.1 200 OK\r\n\r\nsecond");
+        assert_eq!(*first_calls.borrow(), 1);
+        assert_eq!(*second_calls.borrow(), 1);
+
+        // First matches -> short-circuits before second is invoked.
+        let req1 = ServiceHttpRequest::parse(b"GET /api/first HTTP/1.1\r\n\r\n")
+            .expect("GET request parses");
+        let out1 = reg.handle_http_all(&mut ctx, &req1, &mut resp);
+        assert_eq!(
+            out1,
+            ServiceHttpOutcome::Responded {
+                response_len: 24,
+                close_immediately: true,
+            }
+        );
+        assert_eq!(*first_calls.borrow(), 2);
+        assert_eq!(*second_calls.borrow(), 1);
+
+        // Unmatched route returns Unhandled after visiting both services.
+        let req_miss = ServiceHttpRequest::parse(b"GET /status.json HTTP/1.1\r\n\r\n")
+            .expect("GET request parses");
+        assert_eq!(
+            reg.handle_http_all(&mut ctx, &req_miss, &mut resp),
+            ServiceHttpOutcome::Unhandled
+        );
+        assert_eq!(*first_calls.borrow(), 3);
+        assert_eq!(*second_calls.borrow(), 2);
     }
 }

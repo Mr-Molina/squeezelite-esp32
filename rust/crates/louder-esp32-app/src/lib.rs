@@ -51,7 +51,9 @@ pub use controls::{
     ButtonGesture, ControlAction, EncoderMode, GpioExpanderKind, IrDecoder, IrFrame, IrProtocol,
     LedStripVisualizer, RotaryEncoder, RotaryEvent, StatusLedState,
 };
-pub use coordinator::{AudioSource, PlayerCoordinator, PlayerState, SourceArbiter};
+pub use coordinator::{
+    AudioSource, PlayerCoordinator, PlayerState, SlimExtension, SlimOutboundSink, SourceArbiter,
+};
 pub use cyd::CydController;
 pub use dac_platform::{
     AudioOutputPolicy, DacConfigSpec, DacModel, SpdifBmcEncoder, SpdifConfigSpec, SpdifPreamble,
@@ -74,12 +76,16 @@ pub use pipeline::{ActiveDecoder, StreamPipeline};
 pub use power_boards::{BoardProfile, SleepManager, SleepState};
 pub use services::{
     register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
-    ServiceRegistry, StatusExtras, StatusField, StatusValue,
+    ServiceHttpOutcome, ServiceHttpRequest, ServiceRegistry, ServiceSlimExtension,
+    SlimOutboundQueue, StatusExtras, StatusField, StatusValue,
 };
 pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
 
-pub use http_control::handle_http_request_streaming_with_entries;
+pub use http_control::{
+    format_status_json_with_extras, handle_http_request_streaming_with_entries,
+    handle_http_request_streaming_with_services,
+};
 #[cfg(not(target_arch = "xtensa"))]
 pub use network::{HttpAudioStream, LmsDiscovery, RaopStreamClient, SlimprotoClient};
 pub use squeezelite_audio_core::{AudioOutputSink, AudioRingBuffer, Equalizer, VolumeScale};
