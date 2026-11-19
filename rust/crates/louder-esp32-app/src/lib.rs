@@ -32,6 +32,7 @@ pub mod network;
 pub mod ota_safety;
 pub mod pipeline;
 pub mod power_boards;
+pub mod services;
 pub mod sink;
 pub mod stream_codec;
 pub mod web_ui;
@@ -71,6 +72,10 @@ pub use hal::{
 };
 pub use pipeline::{ActiveDecoder, StreamPipeline};
 pub use power_boards::{BoardProfile, SleepManager, SleepState};
+pub use services::{
+    register_all, DeviceService, ServiceCtx, ServiceRegistry, StatusExtras, StatusField,
+    StatusValue,
+};
 pub use sink::{NullAudioSink, SimulatedSink};
 pub use wifi::{WifiConfig, WifiManager, WifiState};
 
