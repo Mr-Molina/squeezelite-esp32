@@ -3,6 +3,8 @@
 //! Each device network or background feature implements [`DeviceService`] and
 //! is registered exactly once inside [`register_all`].
 
+pub mod mdns;
+
 mod registry {
     extern crate alloc;
 
@@ -389,6 +391,7 @@ mod registry {
     pub struct ServiceCtx<'a> {
         now_ms: u64,
         link_ip: Option<[u8; 4]>,
+        sta_mac: [u8; 6],
         config: &'a ConfigHandle,
         audio: Option<&'a mut dyn ServiceAudioHost>,
         slim_outbound: Option<&'a mut SlimOutboundQueue>,
@@ -409,6 +412,7 @@ mod registry {
             Self {
                 now_ms,
                 link_ip,
+                sta_mac: [0; 6],
                 config,
                 audio: None,
                 slim_outbound: None,
@@ -428,6 +432,7 @@ mod registry {
             Self {
                 now_ms,
                 link_ip,
+                sta_mac: [0; 6],
                 config,
                 audio: None,
                 slim_outbound: None,
@@ -442,6 +447,7 @@ mod registry {
             Self {
                 now_ms,
                 link_ip,
+                sta_mac: [0; 6],
                 config,
                 audio: None,
                 slim_outbound: None,
@@ -458,6 +464,13 @@ mod registry {
             config: &'a ConfigHandle,
         ) -> Self {
             Self::new(now_ms, link_ip, config)
+        }
+
+        /// Attaches the station Wi-Fi MAC address to this service context.
+        #[must_use]
+        pub fn with_sta_mac(mut self, sta_mac: [u8; 6]) -> Self {
+            self.sta_mac = sta_mac;
+            self
         }
 
         /// Attaches an audio/volume host to this service context.
@@ -537,6 +550,12 @@ mod registry {
         #[must_use]
         pub fn link_ip(&self) -> Option<[u8; 4]> {
             self.link_ip
+        }
+
+        /// Station Wi-Fi MAC address associated with the network interface.
+        #[must_use]
+        pub fn sta_mac(&self) -> [u8; 6] {
+            self.sta_mac
         }
 
         /// Read access to the shared configuration handle.
@@ -781,14 +800,14 @@ mod registry {
     }
 
     /// Registers every device service in exactly one place.
-    ///
-    /// Task 1 leaves this empty until Task 4 migrates the inline protocol
-    /// services out of `main.rs`.
     pub fn register_all(reg: &mut ServiceRegistry) {
-        let _ = reg;
+        reg.register(super::mdns::MdnsService::new());
     }
 }
 
+pub use mdns::{
+    can_send_mdns_multicast_reply, is_mdns_service_query, MdnsService, MDNS_MULTICAST_COOLDOWN_MS,
+};
 pub use registry::{
     register_all, AmpPower, DeviceService, ServiceAudioAdapter, ServiceAudioHost, ServiceCtx,
     ServiceHttpOutcome, ServiceHttpRequest, ServiceRegistry, ServiceSlimExtension,

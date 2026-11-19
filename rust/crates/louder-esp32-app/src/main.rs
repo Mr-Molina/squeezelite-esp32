@@ -69,41 +69,6 @@ pub const fn encode_i2s0_clkm_conf(orig: u32, div_num: u32, div_b: u32, div_a: u
     louder_esp32_app::backend_device::encode_clkm_conf(orig, &cfg)
 }
 
-/// Minimum interval between multicast mDNS replies in milliseconds.
-pub const MDNS_MULTICAST_COOLDOWN_MS: u64 = 1_000;
-
-/// Returns `true` when `payload` is an mDNS service query (`QR == 0`,
-/// non-zero `QDCOUNT`) targeting AirPlay or Spotify Connect labels.
-#[must_use]
-pub fn is_mdns_service_query(payload: &[u8]) -> bool {
-    if payload.len() < 12 {
-        return false;
-    }
-    if (payload[2] & 0x80) != 0 {
-        return false;
-    }
-    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
-    if qdcount == 0 {
-        return false;
-    }
-    let body = &payload[12..];
-    body.windows(5).any(|w| w.eq_ignore_ascii_case(b"_raop"))
-        || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_airplay"))
-        || body
-            .windows(16)
-            .any(|w| w.eq_ignore_ascii_case(b"_spotify-connect"))
-        || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_spotify"))
-}
-
-/// Returns `true` if a multicast mDNS reply may be sent at `now_ms`.
-#[must_use]
-pub const fn can_send_mdns_multicast_reply(last_reply_ms: Option<u64>, now_ms: u64) -> bool {
-    match last_reply_ms {
-        None => true,
-        Some(prev_ms) => now_ms.saturating_sub(prev_ms) >= MDNS_MULTICAST_COOLDOWN_MS,
-    }
-}
-
 /// Executes one integrated firmware tick across the CYD UART bridge,
 /// audio pipeline, and digital amplifier health monitor (`HALNET-409`).
 ///
@@ -495,19 +460,15 @@ mod xtensa_hw {
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
     use smoltcp::socket::{dhcpv4, tcp, udp, AnySocket};
     use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-    use smoltcp::wire::{
-        EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
-    };
+    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
     use squeezelite_audio_core::output::OutputError;
     use squeezelite_audio_core::EqPreset;
     use squeezelite_config::{FlashJournal, JournalView};
     use squeezelite_cspot::spirc::{SpircEvent, SpircFrame, SpircStateMachine};
-    use squeezelite_cspot::zeroconf::{SpotifyMdnsBuilder, SpotifyMdnsConfig};
     use squeezelite_cyd_link::CydMessage;
     use squeezelite_decoders::PcmDecoder;
     use squeezelite_proto::SlimprotoBuilder;
     use squeezelite_raop::crypto::airport_express_key;
-    use squeezelite_raop::mdns::{MdnsBuilder, MdnsConfig};
     use squeezelite_raop::rtp::RtpAudioReceiver;
     use squeezelite_raop::rtsp::{RtspMethod, RtspRequest, RtspServer, ServerState};
     use squeezelite_tas58xx::{registers, VOL_UNITY_0DB};
@@ -1859,32 +1820,10 @@ mod xtensa_hw {
     /// sockets (allocated on PSRAM heap in `init_net_stack`).
     const SOCKET_SLOTS: usize = 16;
 
-    /// Metadata/payload sizing for the mDNS responder UDP socket (port 5353).
-    const MDNS_UDP_META: usize = 4;
-    const MDNS_UDP_PAYLOAD: usize = 1024;
-
     /// Metadata/payload sizing for the AirPlay RTP audio UDP socket (port
     /// 6000).
     const RTP_UDP_RX_META: usize = 8;
     const RTP_UDP_TX_META: usize = 2;
-
-    struct UdpMdnsBuffers {
-        rx_meta: [udp::PacketMetadata; MDNS_UDP_META],
-        rx_payload: [u8; MDNS_UDP_PAYLOAD],
-        tx_meta: [udp::PacketMetadata; MDNS_UDP_META],
-        tx_payload: [u8; MDNS_UDP_PAYLOAD],
-    }
-
-    impl UdpMdnsBuffers {
-        const fn new() -> Self {
-            Self {
-                rx_meta: [udp::PacketMetadata::EMPTY; MDNS_UDP_META],
-                rx_payload: [0u8; MDNS_UDP_PAYLOAD],
-                tx_meta: [udp::PacketMetadata::EMPTY; MDNS_UDP_META],
-                tx_payload: [0u8; MDNS_UDP_PAYLOAD],
-            }
-        }
-    }
 
     struct UdpRtpMetaBuffers {
         rx_meta: [udp::PacketMetadata; RTP_UDP_RX_META],
@@ -2188,7 +2127,6 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        mdns_handle: SocketHandle,
         rtsp_handle: SocketHandle,
         rtp_handle: SocketHandle,
         spot_handle: SocketHandle,
@@ -2255,14 +2193,6 @@ mod xtensa_hw {
             )
         });
 
-        let mdns_bufs = alloc::boxed::Box::leak(alloc::boxed::Box::new(UdpMdnsBuffers::new()));
-        let mdns_handle = add_socket(&mut sockets, || {
-            udp::Socket::new(
-                udp::PacketBuffer::new(&mut mdns_bufs.rx_meta[..], &mut mdns_bufs.rx_payload[..]),
-                udp::PacketBuffer::new(&mut mdns_bufs.tx_meta[..], &mut mdns_bufs.tx_payload[..]),
-            )
-        });
-
         let rtsp_rx: &'static mut [u8] =
             alloc::boxed::Box::leak(alloc::vec![0u8; 4096].into_boxed_slice());
         let rtsp_tx: &'static mut [u8] =
@@ -2304,7 +2234,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            mdns_handle,
             rtsp_handle,
             rtp_handle,
             spot_handle,
@@ -2337,7 +2266,6 @@ mod xtensa_hw {
         http_handle: SocketHandle,
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
-        mdns_handle: SocketHandle,
         rtsp_handle: SocketHandle,
         rtp_handle: SocketHandle,
         spot_handle: SocketHandle,
@@ -2381,9 +2309,6 @@ mod xtensa_hw {
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
         last_config_poll_ms: u64,
-        mdns_bound: bool,
-        last_mdns_announce_ms: u64,
-        last_mdns_reply_ms: Option<u64>,
         raop_rtsp: alloc::boxed::Box<RtspServer>,
         raop_rtp: alloc::boxed::Box<RtpAudioReceiver>,
         raop_streaming: bool,
@@ -2399,13 +2324,6 @@ mod xtensa_hw {
         was_wifi_connected: bool,
         disconnect_count: u32,
         last_wifi_reconnect_ms: u64,
-        cached_raop_mdns: [u8; 512],
-        cached_raop_mdns_len: usize,
-        cached_spot_mdns: [u8; 384],
-        cached_spot_mdns_len: usize,
-        cached_mdns_ip: [u8; 4],
-        cached_mdns_raop_name: heapless::String<32>,
-        cached_mdns_cspot_name: heapless::String<32>,
         services: louder_esp32_app::services::ServiceRegistry,
         services_link_up: bool,
         slim_outbound: SlimOutboundQueue,
@@ -2765,7 +2683,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            mdns_handle,
             rtsp_handle,
             rtp_handle,
             spot_handle,
@@ -2795,7 +2712,8 @@ mod xtensa_hw {
         louder_esp32_app::services::register_all(&mut services);
         {
             let mut ctx =
-                louder_esp32_app::services::ServiceCtx::new(boot_ms, None, config, &mut sockets);
+                louder_esp32_app::services::ServiceCtx::new(boot_ms, None, config, &mut sockets)
+                    .with_sta_mac(sta_mac);
             services.init_all(&mut ctx);
         }
 
@@ -2813,7 +2731,6 @@ mod xtensa_hw {
             http_handle,
             slim_handle,
             audio_handle,
-            mdns_handle,
             rtsp_handle,
             rtp_handle,
             spot_handle,
@@ -2857,9 +2774,6 @@ mod xtensa_hw {
             latest_telemetry,
             last_cyd_progress_ms: 0,
             last_config_poll_ms: 0,
-            mdns_bound: false,
-            last_mdns_announce_ms: 0,
-            last_mdns_reply_ms: None,
             raop_rtsp,
             raop_rtp,
             raop_streaming: false,
@@ -2875,13 +2789,6 @@ mod xtensa_hw {
             was_wifi_connected: false,
             disconnect_count: 0,
             last_wifi_reconnect_ms: 0,
-            cached_raop_mdns: [0u8; 512],
-            cached_raop_mdns_len: 0,
-            cached_spot_mdns: [0u8; 384],
-            cached_spot_mdns_len: 0,
-            cached_mdns_ip: [0u8; 4],
-            cached_mdns_raop_name: heapless::String::new(),
-            cached_mdns_cspot_name: heapless::String::new(),
             services,
             services_link_up: false,
             slim_outbound: SlimOutboundQueue::new(),
@@ -3345,10 +3252,7 @@ mod xtensa_hw {
                     s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
-                    s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
                     s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
-                    s.mdns_bound = false;
-                    s.last_mdns_reply_ms = None;
                     s.raop_streaming = false;
                     s.spot_streaming = false;
                     s.rtsp_rx_acc.clear();
@@ -3404,9 +3308,7 @@ mod xtensa_hw {
                 s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
-                s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
                 s.sockets.get_mut::<udp::Socket>(s.rtp_handle).close();
-                s.mdns_bound = false;
                 s.raop_streaming = false;
                 s.spot_streaming = false;
                 s.rtsp_rx_acc.clear();
@@ -3573,6 +3475,7 @@ mod xtensa_hw {
                     s.config,
                     &mut s.sockets,
                 )
+                .with_sta_mac(s.sta_mac)
                 .with_audio(&mut audio)
                 .with_slim_outbound(&mut s.slim_outbound);
                 if let ServiceHttpOutcome::Responded {
@@ -4156,159 +4059,6 @@ mod xtensa_hw {
             cspot_name.clear();
             let _ = cspot_name.push_str(louder_esp32_app::board::first_boot_defaults::PLAYER_NAME);
         }
-        let mut raop_name = s
-            .config
-            .nvs_override("host_name")
-            .and_then(|h| {
-                let t = h.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    let mut out = heapless::String::<32>::new();
-                    let max_len = t.floor_char_boundary(t.len().min(32));
-                    let _ = out.push_str(&t[..max_len]);
-                    Some(out)
-                }
-            })
-            .unwrap_or_else(|| {
-                s.config.read(|c| {
-                    let t = c.player_name.trim();
-                    if !t.is_empty() {
-                        let mut out = heapless::String::<32>::new();
-                        let max_len = t.floor_char_boundary(t.len().min(32));
-                        let _ = out.push_str(&t[..max_len]);
-                        out
-                    } else {
-                        s.config.device_name()
-                    }
-                })
-            });
-        if raop_name.trim().is_empty() {
-            raop_name.clear();
-            let _ = raop_name.push_str(louder_esp32_app::board::first_boot_defaults::PLAYER_NAME);
-        }
-
-        // 1. mDNS responder (`UDP 5353`) for AirPlay `_raop._tcp.local` &
-        // Spotify `_spotify-connect._tcp.local`
-        if airplay_enabled || cspot_enabled {
-            let mdns_sock = s.sockets.get_mut::<udp::Socket>(s.mdns_handle);
-            if !s.mdns_bound && mdns_sock.bind(5353).is_ok() {
-                s.mdns_bound = true;
-            }
-            if s.mdns_bound {
-                let multicast_ep = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
-                let mut should_announce_raop = false;
-                let mut should_announce_spotify = false;
-                let mut raop_ep = multicast_ep;
-                let mut spot_ep = multicast_ep;
-
-                if s.last_mdns_announce_ms == 0
-                    || now_ms.saturating_sub(s.last_mdns_announce_ms) >= 30_000
-                {
-                    s.last_mdns_announce_ms = now_ms.max(1);
-                    should_announce_raop = airplay_enabled;
-                    should_announce_spotify = cspot_enabled;
-                }
-
-                for _ in 0..4 {
-                    if !mdns_sock.can_recv() {
-                        break;
-                    }
-                    let Ok((payload, meta)) = mdns_sock.recv() else {
-                        break;
-                    };
-                    if !is_mdns_service_query(payload) {
-                        continue;
-                    }
-                    let body = &payload[12..];
-                    if airplay_enabled
-                        && (body.windows(5).any(|w| w.eq_ignore_ascii_case(b"_raop"))
-                            || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_airplay")))
-                    {
-                        should_announce_raop = true;
-                        if meta.endpoint.port != 5353 {
-                            raop_ep = meta.endpoint;
-                        }
-                    }
-                    if cspot_enabled
-                        && (body
-                            .windows(16)
-                            .any(|w| w.eq_ignore_ascii_case(b"_spotify-connect"))
-                            || body.windows(8).any(|w| w.eq_ignore_ascii_case(b"_spotify")))
-                    {
-                        should_announce_spotify = true;
-                        if meta.endpoint.port != 5353 {
-                            spot_ep = meta.endpoint;
-                        }
-                    }
-                }
-
-                let ip_or_name_changed = local_ip != s.cached_mdns_ip
-                    || raop_name.as_str() != s.cached_mdns_raop_name.as_str()
-                    || cspot_name.as_str() != s.cached_mdns_cspot_name.as_str();
-                if ip_or_name_changed {
-                    s.cached_raop_mdns_len = 0;
-                    s.cached_spot_mdns_len = 0;
-                    s.cached_mdns_ip = local_ip;
-                    s.cached_mdns_raop_name = raop_name.clone();
-                    s.cached_mdns_cspot_name = cspot_name.clone();
-                }
-                if airplay_enabled && s.cached_raop_mdns_len == 0 {
-                    let mcfg = MdnsConfig {
-                        player_name: alloc::string::String::from(raop_name.as_str()),
-                        mac_address: s.sta_mac,
-                        ip_address: local_ip,
-                        port: 5000,
-                    };
-                    let rpkt = MdnsBuilder::build_announcement(&mcfg);
-                    let rlen = rpkt.len().min(s.cached_raop_mdns.len());
-                    s.cached_raop_mdns[..rlen].copy_from_slice(&rpkt[..rlen]);
-                    s.cached_raop_mdns_len = rlen;
-                }
-                if cspot_enabled && s.cached_spot_mdns_len == 0 {
-                    let scfg = SpotifyMdnsConfig {
-                        player_name: alloc::string::String::from(cspot_name.as_str()),
-                        mac_address: s.sta_mac,
-                        ip_address: local_ip,
-                        port: 80,
-                    };
-                    let spkt = SpotifyMdnsBuilder::build_announcement(&scfg);
-                    let slen = spkt.len().min(s.cached_spot_mdns.len());
-                    s.cached_spot_mdns[..slen].copy_from_slice(&spkt[..slen]);
-                    s.cached_spot_mdns_len = slen;
-                }
-
-                let multicast_allowed = can_send_mdns_multicast_reply(s.last_mdns_reply_ms, now_ms);
-                let mut sent_multicast = false;
-                if airplay_enabled
-                    && should_announce_raop
-                    && s.cached_raop_mdns_len > 0
-                    && mdns_sock.can_send()
-                    && (raop_ep != multicast_ep || multicast_allowed)
-                    && mdns_sock
-                        .send_slice(&s.cached_raop_mdns[..s.cached_raop_mdns_len], raop_ep)
-                        .is_ok()
-                    && raop_ep == multicast_ep
-                {
-                    sent_multicast = true;
-                }
-                if cspot_enabled
-                    && should_announce_spotify
-                    && s.cached_spot_mdns_len > 0
-                    && mdns_sock.can_send()
-                    && (spot_ep != multicast_ep || multicast_allowed)
-                    && mdns_sock
-                        .send_slice(&s.cached_spot_mdns[..s.cached_spot_mdns_len], spot_ep)
-                        .is_ok()
-                    && spot_ep == multicast_ep
-                {
-                    sent_multicast = true;
-                }
-                if sent_multicast {
-                    s.last_mdns_reply_ms = Some(now_ms);
-                }
-            }
-        }
 
         // 2. AirPlay 1 RAOP RTSP Control (`TCP 5000`) & RTP Audio (`UDP 6000`)
         if airplay_enabled {
@@ -4720,6 +4470,7 @@ mod xtensa_hw {
             s.config,
             &mut s.sockets,
         )
+        .with_sta_mac(s.sta_mac)
         .with_audio(&mut audio)
         .with_slim_outbound(&mut s.slim_outbound);
         if link_up != s.services_link_up {
@@ -4966,61 +4717,5 @@ mod tests {
         assert_eq!(coordinator.active_source(), AudioSource::SlimProto);
         coordinator.release_source(AudioSource::SlimProto);
         assert_eq!(coordinator.active_source(), AudioSource::None);
-    }
-
-    #[test]
-    fn test_mdns_service_query_drops_short_payloads() {
-        assert!(!is_mdns_service_query(&[]));
-        assert!(!is_mdns_service_query(&[0u8; 11]));
-    }
-
-    #[test]
-    fn test_mdns_service_query_drops_qr1_responses() {
-        let mut pkt = vec![
-            0x00, 0x00, 0x84, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        pkt.extend_from_slice(b"\x05_raop\x04_tcp\x05local\x00");
-        assert!(
-            !is_mdns_service_query(&pkt),
-            "mDNS response with QR=1 must be dropped"
-        );
-    }
-
-    #[test]
-    fn test_mdns_service_query_accepts_qr0_service_queries() {
-        let mut raop_q = vec![
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        raop_q.extend_from_slice(b"\x05_raop\x04_tcp\x05local\x00");
-        assert!(
-            is_mdns_service_query(&raop_q),
-            "mDNS query with QR=0 and QDCOUNT=1 for _raop must pass"
-        );
-
-        let mut spot_q = vec![
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        spot_q.extend_from_slice(b"\x10_spotify-connect\x04_tcp\x05local\x00");
-        assert!(
-            is_mdns_service_query(&spot_q),
-            "mDNS query with QR=0 and QDCOUNT=1 for _spotify-connect must pass"
-        );
-
-        // Zero QDCOUNT must still be dropped even with matching label.
-        raop_q[5] = 0x00;
-        assert!(
-            !is_mdns_service_query(&raop_q),
-            "mDNS query with QDCOUNT=0 must be dropped"
-        );
-    }
-
-    #[test]
-    fn test_mdns_multicast_reply_rate_limit_1000ms() {
-        assert!(can_send_mdns_multicast_reply(None, 0));
-        assert!(can_send_mdns_multicast_reply(None, 500));
-        assert!(!can_send_mdns_multicast_reply(Some(1_000), 1_000));
-        assert!(!can_send_mdns_multicast_reply(Some(1_000), 1_999));
-        assert!(can_send_mdns_multicast_reply(Some(1_000), 2_000));
-        assert!(can_send_mdns_multicast_reply(Some(1_000), 5_000));
     }
 }
