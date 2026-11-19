@@ -187,12 +187,13 @@ pub fn unpark_core1_cooperative<F>(
 /// Erases and writes a 4 KiB settings journal sector, bounding `used_len` to
 /// 2048 bytes and aborting on any flash error.
 #[cfg(any(target_arch = "xtensa", test))]
-fn write_journal_sector_with<E>(
+fn write_journal_sector_with_ctx<Ctx, E>(
+    ctx: &mut Ctx,
     offset: u32,
     sector: &[u8],
     used_len: usize,
-    mut erase_fn: impl FnMut(u32, u32) -> Result<(), E>,
-    mut write_fn: impl FnMut(u32, &[u8]) -> Result<(), E>,
+    mut erase_fn: impl FnMut(&mut Ctx, u32, u32) -> Result<(), E>,
+    mut write_fn: impl FnMut(&mut Ctx, u32, &[u8]) -> Result<(), E>,
 ) -> Result<(), ()> {
     let body_end = used_len.min(2048);
     let header = sector.get(..16).ok_or(())?;
@@ -203,13 +204,32 @@ fn write_journal_sector_with<E>(
         None
     };
 
-    erase_fn(offset, offset + 4096).map_err(|_| ())?;
+    erase_fn(ctx, offset, offset + 4096).map_err(|_| ())?;
     if let Some(body_slice) = body {
-        write_fn(offset + 16, body_slice).map_err(|_| ())?;
+        write_fn(ctx, offset + 16, body_slice).map_err(|_| ())?;
     }
-    write_fn(offset + 2048, nvs_half).map_err(|_| ())?;
-    write_fn(offset, header).map_err(|_| ())?;
+    write_fn(ctx, offset + 2048, nvs_half).map_err(|_| ())?;
+    write_fn(ctx, offset, header).map_err(|_| ())?;
     Ok(())
+}
+
+#[cfg(test)]
+fn write_journal_sector_with<E>(
+    offset: u32,
+    sector: &[u8],
+    used_len: usize,
+    erase_fn: impl FnMut(u32, u32) -> Result<(), E>,
+    write_fn: impl FnMut(u32, &[u8]) -> Result<(), E>,
+) -> Result<(), ()> {
+    let mut fns = (erase_fn, write_fn);
+    write_journal_sector_with_ctx(
+        &mut fns,
+        offset,
+        sector,
+        used_len,
+        |f, start, end| (f.0)(start, end),
+        |f, addr, data| (f.1)(addr, data),
+    )
 }
 
 /// Clamps `pct` to `0..=100` and synchronizes both `current_vol_pct` and
@@ -240,7 +260,8 @@ pub fn amp_fault_recovery_syslog<E>(res: Result<(), E>) -> (&'static str, &'stat
 /// Persists `ota_0` select entry only while Core 1 is cooperatively parked,
 /// unparking on write/read/verify failure and aborting cleanly on `AckTimeout`.
 #[cfg(any(target_arch = "xtensa", test))]
-pub fn persist_ota0_if_parked<P, W, R, U>(
+fn persist_ota0_if_parked_ctx<Ctx, P, W, R, U>(
+    ctx: &mut Ctx,
     entry_bytes: &[u8; 32],
     mut park_fn: P,
     mut write_fn: W,
@@ -248,22 +269,49 @@ pub fn persist_ota0_if_parked<P, W, R, U>(
     mut unpark_fn: U,
 ) -> bool
 where
+    P: FnMut(&mut Ctx) -> Result<(), Core1ParkError>,
+    W: FnMut(&mut Ctx, &[u8; 32]) -> Result<(), ()>,
+    R: FnMut(&mut Ctx, &mut [u8; 32]) -> Result<(), ()>,
+    U: FnMut(&mut Ctx),
+{
+    if park_fn(ctx).is_err() {
+        return false;
+    }
+    let mut verify_buf = [0u8; 32];
+    let ok = write_fn(ctx, entry_bytes).is_ok()
+        && read_fn(ctx, &mut verify_buf).is_ok()
+        && verify_buf == *entry_bytes;
+    if !ok {
+        unpark_fn(ctx);
+    }
+    ok
+}
+
+/// Persists `ota_0` select entry only while Core 1 is cooperatively parked,
+/// unparking on write/read/verify failure and aborting cleanly on `AckTimeout`.
+#[cfg(test)]
+pub fn persist_ota0_if_parked<P, W, R, U>(
+    entry_bytes: &[u8; 32],
+    park_fn: P,
+    write_fn: W,
+    read_fn: R,
+    unpark_fn: U,
+) -> bool
+where
     P: FnMut() -> Result<(), Core1ParkError>,
     W: FnMut(&[u8; 32]) -> Result<(), ()>,
     R: FnMut(&mut [u8; 32]) -> Result<(), ()>,
     U: FnMut(),
 {
-    if park_fn().is_err() {
-        return false;
-    }
-    let mut verify_buf = [0u8; 32];
-    let ok = write_fn(entry_bytes).is_ok()
-        && read_fn(&mut verify_buf).is_ok()
-        && verify_buf == *entry_bytes;
-    if !ok {
-        unpark_fn();
-    }
-    ok
+    let mut fns = (park_fn, write_fn, read_fn, unpark_fn);
+    persist_ota0_if_parked_ctx(
+        &mut fns,
+        entry_bytes,
+        |f| (f.0)(),
+        |f, bytes| (f.1)(bytes),
+        |f, buf| (f.2)(buf),
+        |f| (f.3)(),
+    )
 }
 
 #[cfg(any(target_arch = "xtensa", test))]
@@ -3587,12 +3635,13 @@ mod xtensa_hw {
             let offset = SETTINGS_JOURNAL_OFFSET;
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-            if write_journal_sector_with(
+            if write_journal_sector_with_ctx(
+                &mut s.flash,
                 offset,
                 image.sector,
                 image.used_len,
-                |start, end| s.flash.erase(start, end),
-                |addr, data| s.flash.write_nor(addr, data),
+                |flash: &mut FlashStorage<'static>, start, end| flash.erase(start, end),
+                |flash: &mut FlashStorage<'static>, addr, data| flash.write_nor(addr, data),
             )
             .is_ok()
             {
@@ -4470,20 +4519,21 @@ mod xtensa_hw {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    if persist_ota0_if_parked(
+                    if persist_ota0_if_parked_ctx(
+                        s,
                         &entry_bytes,
-                        || s.core1.park_for_flash_write(),
-                        |bytes| {
+                        |s: &mut DeviceRuntimeState| s.core1.park_for_flash_write(),
+                        |s: &mut DeviceRuntimeState, bytes| {
                             s.flash
                                 .write_nor(OTADATA_PARTITION_OFFSET, bytes)
                                 .map_err(|_| ())
                         },
-                        |buf| {
+                        |s: &mut DeviceRuntimeState, buf| {
                             s.flash
                                 .read_nor(OTADATA_PARTITION_OFFSET, buf)
                                 .map_err(|_| ())
                         },
-                        || s.core1.unpark_after_flash_write(),
+                        |s: &mut DeviceRuntimeState| s.core1.unpark_after_flash_write(),
                     ) {
                         println!(
                             "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
@@ -5186,12 +5236,15 @@ mod xtensa_hw {
                         let offset = SETTINGS_JOURNAL_OFFSET;
                         #[cfg(feature = "runtime-flash-persist")]
                         let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-                        let ok = write_journal_sector_with(
+                        let ok = write_journal_sector_with_ctx(
+                            &mut s.flash,
                             offset,
                             image.sector,
                             image.used_len,
-                            |start, end| s.flash.erase(start, end),
-                            |addr, data| s.flash.write_nor(addr, data),
+                            |flash: &mut FlashStorage<'static>, start, end| flash.erase(start, end),
+                            |flash: &mut FlashStorage<'static>, addr, data| {
+                                flash.write_nor(addr, data)
+                            },
                         )
                         .is_ok();
                         s.core1.unpark_after_flash_write();
