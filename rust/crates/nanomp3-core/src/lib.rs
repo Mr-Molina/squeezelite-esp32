@@ -48,9 +48,7 @@
 mod decoder;
 mod minimp3;
 
-pub use decoder::{
-    Channels, DecodeError, Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME, __private,
-};
+pub use decoder::{__private, Channels, DecodeError, Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME};
 pub use minimp3::Sample;
 
 #[cfg(test)]

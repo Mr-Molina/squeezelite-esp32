@@ -585,7 +585,10 @@ fn url_decode(s: &str) -> String {
     while i < s_bytes.len() {
         match s_bytes[i] {
             b'%' => {
-                if i + 2 < s_bytes.len() {
+                if i + 2 < s_bytes.len()
+                    && s_bytes[i + 1].is_ascii_hexdigit()
+                    && s_bytes[i + 2].is_ascii_hexdigit()
+                {
                     if let Ok(hex_str) = core::str::from_utf8(&s_bytes[i + 1..i + 3]) {
                         if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
                             bytes.push(byte);
@@ -864,5 +867,13 @@ mod tests {
         let uri = "/?action=addUser&userName=alice";
         let res = server.handle_request(uri, "", &dh, "dev1", "living");
         assert_eq!(res.err(), Some(ZeroConfError::NotFound));
+    }
+
+    #[test]
+    fn test_url_decode_rejects_signed_hex_escapes() {
+        assert_eq!(url_decode("%+A"), "% A");
+        assert_eq!(url_decode("%+0"), "% 0");
+        assert_eq!(url_decode("%-A"), "%-A");
+        assert_eq!(url_decode("%20%0A"), " \n");
     }
 }

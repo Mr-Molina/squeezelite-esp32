@@ -5,10 +5,7 @@
 //! digital amplifier.
 #![cfg_attr(target_arch = "xtensa", no_std)]
 #![cfg_attr(target_arch = "xtensa", no_main)]
-#![cfg_attr(
-    all(target_arch = "xtensa", not(feature = "esp-rtos-core1")),
-    feature(asm_experimental_arch)
-)]
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 #![cfg_attr(not(target_arch = "xtensa"), forbid(unsafe_code))]
 #![cfg_attr(target_arch = "xtensa", deny(unsafe_code))]
 #![allow(unknown_lints)]
@@ -104,6 +101,580 @@ pub const fn can_send_mdns_multicast_reply(last_reply_ms: Option<u64>, now_ms: u
     }
 }
 
+/// Error returned when APP_CPU fails to acknowledge cooperative parking.
+#[cfg(any(target_arch = "xtensa", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Core1ParkError {
+    AckTimeout,
+}
+
+/// Coordinates the PRO_CPU <-> APP_CPU cooperative park handshake before
+/// invoking `park_core_hw`.
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn park_core1_cooperative<F>(
+    active: bool,
+    parked_hw: &mut bool,
+    park_req: &core::sync::atomic::AtomicBool,
+    parked: &core::sync::atomic::AtomicBool,
+    spin_limit: usize,
+    park_core_hw: F,
+) -> Result<(), Core1ParkError>
+where
+    F: FnOnce(),
+{
+    if !active || *parked_hw {
+        return Ok(());
+    }
+    let drain_limit = spin_limit.clamp(1, 1_000);
+    for _ in 0..drain_limit {
+        if !parked.load(core::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if parked.load(core::sync::atomic::Ordering::Acquire) {
+        return Err(Core1ParkError::AckTimeout);
+    }
+    park_req.store(true, core::sync::atomic::Ordering::Release);
+    for _ in 0..spin_limit {
+        if parked.load(core::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !parked.load(core::sync::atomic::Ordering::Acquire) {
+        park_req.store(false, core::sync::atomic::Ordering::Release);
+        for _ in 0..drain_limit {
+            if !parked.load(core::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        return Err(Core1ParkError::AckTimeout);
+    }
+    park_core_hw();
+    *parked_hw = true;
+    Ok(())
+}
+
+/// Symmetrically unparks APP_CPU after a flash write when
+/// [`park_core1_cooperative`] parked it.
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn unpark_core1_cooperative<F>(
+    active: bool,
+    parked_hw: &mut bool,
+    park_req: &core::sync::atomic::AtomicBool,
+    parked: &core::sync::atomic::AtomicBool,
+    spin_limit: usize,
+    unpark_core_hw: F,
+) where
+    F: FnOnce(),
+{
+    park_req.store(false, core::sync::atomic::Ordering::Release);
+    if !active || !*parked_hw {
+        return;
+    }
+    *parked_hw = false;
+    unpark_core_hw();
+    for _ in 0..spin_limit {
+        if !parked.load(core::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Erases and writes a 4 KiB settings journal sector while Core 1 is parked,
+/// bounding `used_len` to `1..=4096` (body capped at 2048 bytes) and
+/// symmetrically unparking Core 1 across every post-park exit path.
+#[cfg(any(target_arch = "xtensa", test))]
+fn write_journal_sector_with_ctx<Ctx, E>(
+    ctx: &mut Ctx,
+    (offset, sector, used_len): (u32, &[u8; 4096], usize),
+    park_fn: impl FnOnce(&mut Ctx) -> Result<(), Core1ParkError>,
+    mut erase_fn: impl FnMut(&mut Ctx, u32, u32) -> Result<(), E>,
+    mut write_fn: impl FnMut(&mut Ctx, u32, &[u8]) -> Result<(), E>,
+    unpark_fn: impl FnOnce(&mut Ctx),
+) -> Result<(), ()> {
+    if used_len == 0 || used_len > 4096 {
+        return Err(());
+    }
+    let body_end = used_len.min(2048);
+    let header = sector.get(..16).ok_or(())?;
+    let nvs_half = sector.get(2048..4096).ok_or(())?;
+    let body = if body_end > 16 {
+        Some(sector.get(16..body_end).ok_or(())?)
+    } else {
+        None
+    };
+
+    if park_fn(ctx).is_err() {
+        return Err(());
+    }
+
+    let res = (|| {
+        erase_fn(ctx, offset, offset + 4096).map_err(|_| ())?;
+        if let Some(body_slice) = body {
+            write_fn(ctx, offset + 16, body_slice).map_err(|_| ())?;
+        }
+        write_fn(ctx, offset + 2048, nvs_half).map_err(|_| ())?;
+        write_fn(ctx, offset, header).map_err(|_| ())?;
+        Ok(())
+    })();
+
+    unpark_fn(ctx);
+    res
+}
+
+/// Polls debounced config commits and writes any pending journal image to NOR
+/// flash with [`DEBOUNCE_MS`] retry backoff on write failure.
+#[cfg(any(target_arch = "xtensa", test))]
+fn poll_and_persist_journal_with_ctx<Ctx, E>(
+    ctx: &mut Ctx,
+    (config, config_writer, journal): (
+        &louder_esp32_app::config_handle::ConfigHandle,
+        &mut louder_esp32_app::config_handle::ConfigWriter,
+        &mut louder_esp32_app::config_handle::RamJournal<'_>,
+    ),
+    (last_flash_retry_ms, now_ms, base_offset): (&mut Option<u64>, u64, u32),
+    park_fn: impl FnOnce(&mut Ctx) -> Result<(), Core1ParkError>,
+    erase_fn: impl FnMut(&mut Ctx, u32, u32) -> Result<(), E>,
+    write_fn: impl FnMut(&mut Ctx, u32, &[u8]) -> Result<(), E>,
+    unpark_fn: impl FnOnce(&mut Ctx),
+) -> bool {
+    let _ = config_writer.poll(config, journal, now_ms);
+    if let Some(prev_ms) = *last_flash_retry_ms {
+        if now_ms.saturating_sub(prev_ms) < u64::from(louder_esp32_app::config_handle::DEBOUNCE_MS)
+        {
+            return false;
+        }
+    }
+    let Some(image) = journal.pending_image() else {
+        return false;
+    };
+    let offset = if cfg!(feature = "runtime-flash-persist") {
+        image.slot.offset(base_offset)
+    } else {
+        base_offset
+    };
+    if write_journal_sector_with_ctx(
+        ctx,
+        (offset, image.sector, image.used_len),
+        park_fn,
+        erase_fn,
+        write_fn,
+        unpark_fn,
+    )
+    .is_ok()
+    {
+        journal.mark_flash_written();
+        *last_flash_retry_ms = None;
+        true
+    } else {
+        *last_flash_retry_ms = Some(now_ms);
+        false
+    }
+}
+
+#[cfg(test)]
+fn write_journal_sector_with<E>(
+    offset: u32,
+    sector: &[u8; 4096],
+    used_len: usize,
+    erase_fn: impl FnMut(u32, u32) -> Result<(), E>,
+    write_fn: impl FnMut(u32, &[u8]) -> Result<(), E>,
+) -> Result<(), ()> {
+    let mut fns = (erase_fn, write_fn);
+    write_journal_sector_with_ctx(
+        &mut fns,
+        (offset, sector, used_len),
+        |_| Ok(()),
+        |f, start, end| (f.0)(start, end),
+        |f, addr, data| (f.1)(addr, data),
+        |_| {},
+    )
+}
+
+/// Clamps `pct` to `0..=100` and synchronizes both `current_vol_pct` and
+/// `config.volume`.
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn sync_volume_percent(
+    pct: u8,
+    current_vol_pct: &mut u8,
+    config: &louder_esp32_app::config_handle::ConfigHandle,
+) -> u8 {
+    let clamped = pct.min(100);
+    *current_vol_pct = clamped;
+    config.update(|c| c.volume = clamped);
+    clamped
+}
+
+/// Returns the runtime syslog `(level, message)` for a TAS5805M fault
+/// recovery attempt.
+#[cfg(any(target_arch = "xtensa", test))]
+#[must_use]
+pub fn amp_fault_recovery_syslog<E>(res: Result<(), E>) -> (&'static str, &'static str) {
+    match res {
+        Ok(()) => ("WARN", "amp: TAS5805M fault detected and cleared"),
+        Err(_) => ("ERROR", "amp: TAS5805M fault recovery failed"),
+    }
+}
+
+/// Persists `ota_0` select entry only while Core 1 is cooperatively parked,
+/// unparking on write/read/verify failure and aborting cleanly on `AckTimeout`.
+#[cfg(any(target_arch = "xtensa", test))]
+fn persist_ota0_if_parked_ctx<Ctx, P, W, R, U>(
+    ctx: &mut Ctx,
+    entry_bytes: &[u8; 32],
+    mut park_fn: P,
+    mut write_fn: W,
+    mut read_fn: R,
+    mut unpark_fn: U,
+) -> bool
+where
+    P: FnMut(&mut Ctx) -> Result<(), Core1ParkError>,
+    W: FnMut(&mut Ctx, &[u8; 32]) -> Result<(), ()>,
+    R: FnMut(&mut Ctx, &mut [u8; 32]) -> Result<(), ()>,
+    U: FnMut(&mut Ctx),
+{
+    if park_fn(ctx).is_err() {
+        return false;
+    }
+    let mut verify_buf = [0u8; 32];
+    let ok = write_fn(ctx, entry_bytes).is_ok()
+        && read_fn(ctx, &mut verify_buf).is_ok()
+        && verify_buf == *entry_bytes;
+    if !ok {
+        unpark_fn(ctx);
+    }
+    ok
+}
+
+/// Persists `ota_0` select entry only while Core 1 is cooperatively parked,
+/// unparking on write/read/verify failure and aborting cleanly on `AckTimeout`.
+#[cfg(test)]
+pub fn persist_ota0_if_parked<P, W, R, U>(
+    entry_bytes: &[u8; 32],
+    park_fn: P,
+    write_fn: W,
+    read_fn: R,
+    unpark_fn: U,
+) -> bool
+where
+    P: FnMut() -> Result<(), Core1ParkError>,
+    W: FnMut(&[u8; 32]) -> Result<(), ()>,
+    R: FnMut(&mut [u8; 32]) -> Result<(), ()>,
+    U: FnMut(),
+{
+    let mut fns = (park_fn, write_fn, read_fn, unpark_fn);
+    persist_ota0_if_parked_ctx(
+        &mut fns,
+        entry_bytes,
+        |f| (f.0)(),
+        |f, bytes| (f.1)(bytes),
+        |f, buf| (f.2)(buf),
+        |f| (f.3)(),
+    )
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+const BT_BONDS_SLOTS: [&str; 4] = ["bt.bonds", "bt.bonds.1", "bt.bonds.2", "bt.bonds.3"];
+
+#[cfg(any(target_arch = "xtensa", test))]
+const BT_PAIRING_WINDOW_MS: u32 = 180_000;
+
+/// Tracks persisted BT bond state and edge-triggered discoverable overrides.
+#[cfg(any(target_arch = "xtensa", test))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BtConfigSyncState {
+    pub last_persisted_bonds: louder_esp32_app::bt_a2dp::BondingStore,
+    pub last_discoverable_override: Option<bool>,
+    pub last_pending_numeric_passkey: Option<([u8; 6], u32)>,
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+impl BtConfigSyncState {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_persisted_bonds: louder_esp32_app::bt_a2dp::BondingStore::new(),
+            last_discoverable_override: None,
+            last_pending_numeric_passkey: None,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+impl Default for BtConfigSyncState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+fn parse_nvs_bool(val: &str) -> Option<bool> {
+    let t = val.trim();
+    if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on") {
+        Some(true)
+    } else if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Encodes `store` as hex into `"bt.bonds"` (chunked across `bt.bonds.1..3`
+/// when > 1 peer exceeds the 64-byte `NvsEntrySlot` limit).
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn save_bt_bonds_to_config(
+    store: &louder_esp32_app::bt_a2dp::BondingStore,
+    config: &louder_esp32_app::config_handle::ConfigHandle,
+) {
+    let mut hex_buf = [0u8; 200];
+    let hex_len = store.encode_hex(&mut hex_buf);
+    let hex_str = core::str::from_utf8(&hex_buf[..hex_len]).unwrap_or("");
+    let mut offset = 0usize;
+    for (idx, key) in BT_BONDS_SLOTS.iter().enumerate() {
+        if offset < hex_str.len() || idx == 0 {
+            let end = (offset + 64).min(hex_str.len());
+            let chunk = if offset < end {
+                &hex_str[offset..end]
+            } else {
+                ""
+            };
+            let _ = config.set_nvs_override(key, chunk);
+            offset = end;
+        } else if config.nvs_override(key).is_some() {
+            let _ = config.set_nvs_override(key, "");
+        }
+    }
+}
+
+/// Loads persisted BT bonds from `"bt.bonds"` (and overflow chunks if used).
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn load_bt_bonds_from_config(
+    config: &louder_esp32_app::config_handle::ConfigHandle,
+) -> Option<louder_esp32_app::bt_a2dp::BondingStore> {
+    let first = config.nvs_override(BT_BONDS_SLOTS[0])?;
+    let first_trimmed = first.trim();
+    if first_trimmed.is_empty() {
+        return None;
+    }
+    let mut hex = heapless::String::<200>::new();
+    if hex.push_str(first_trimmed).is_err() {
+        return None;
+    }
+    if first_trimmed.len() == 64 {
+        for key in &BT_BONDS_SLOTS[1..] {
+            if let Some(part) = config.nvs_override(key) {
+                let t = part.trim();
+                if t.is_empty() {
+                    break;
+                }
+                if hex.push_str(t).is_err() {
+                    return None;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    louder_esp32_app::bt_a2dp::BondingStore::decode_hex(hex.as_str()).ok()
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+fn parse_bt_pair_command(val: &str) -> Option<(u32, louder_esp32_app::bt_a2dp::BtPairingPolicy)> {
+    let trimmed = val.trim();
+    if trimmed.eq_ignore_ascii_case("numeric") {
+        return Some((
+            BT_PAIRING_WINDOW_MS,
+            louder_esp32_app::bt_a2dp::BtPairingPolicy::SspNumericComparison,
+        ));
+    }
+    if let Some((prefix, secs_str)) = trimmed.split_once(':') {
+        if prefix.eq_ignore_ascii_case("numeric") {
+            if let Ok(secs) = secs_str.trim().parse::<u32>() {
+                if secs > 0 {
+                    return Some((
+                        secs.saturating_mul(1_000),
+                        louder_esp32_app::bt_a2dp::BtPairingPolicy::SspNumericComparison,
+                    ));
+                }
+            }
+        }
+        return None;
+    }
+    if parse_nvs_bool(trimmed) == Some(true) {
+        Some((
+            BT_PAIRING_WINDOW_MS,
+            louder_esp32_app::bt_a2dp::BtPairingPolicy::SspJustWorks,
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+fn parse_bt_confirm_command(val: &str, passkey: u32) -> Option<bool> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("yes") || trimmed.eq_ignore_ascii_case("true") || trimmed == "1"
+    {
+        return Some(true);
+    }
+    if trimmed.eq_ignore_ascii_case("no") || trimmed.eq_ignore_ascii_case("false") || trimmed == "0"
+    {
+        return Some(false);
+    }
+    if trimmed.len() == 6 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(entered) = trimmed.parse::<u32>() {
+            if entered == passkey {
+                return Some(true);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "xtensa")]
+fn log_pending_numeric_passkey(bd_addr: [u8; 6], passkey: u32) {
+    esp_println::println!(
+        "[BT] SSP numeric comparison pending {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} \
+         passkey={:06}",
+        bd_addr[0],
+        bd_addr[1],
+        bd_addr[2],
+        bd_addr[3],
+        bd_addr[4],
+        bd_addr[5],
+        passkey
+    );
+}
+
+#[cfg(all(not(target_arch = "xtensa"), test))]
+fn log_pending_numeric_passkey(bd_addr: [u8; 6], passkey: u32) {
+    println!(
+        "[BT] SSP numeric comparison pending {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} \
+         passkey={:06}",
+        bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4], bd_addr[5], passkey
+    );
+}
+
+/// Applies persisted bonds, PIN override, and out-of-box pairing window at
+/// boot.
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn init_bt_sink_security_from_config(
+    bt_sink: &mut louder_esp32_app::bt_a2dp::BtA2dpSink,
+    config: &louder_esp32_app::config_handle::ConfigHandle,
+) -> BtConfigSyncState {
+    if let Some(store) = load_bt_bonds_from_config(config) {
+        bt_sink.load_bonding_store(store);
+    }
+    if let Some(pin) = config
+        .nvs_override("bt_sink_pin")
+        .or_else(|| config.nvs_override("a2dp_spin"))
+    {
+        let trimmed = pin.trim();
+        if trimmed.is_empty() {
+            bt_sink.security_policy.clear_pin_code();
+        } else {
+            bt_sink.security_policy.update_pin_code(trimmed.as_bytes());
+        }
+    }
+    let explicit_disc = config
+        .nvs_override("bt_discoverable")
+        .and_then(|v| parse_nvs_bool(v.as_str()));
+    if explicit_disc == Some(true)
+        || (bt_sink.bonded_peer_count() == 0 && explicit_disc != Some(false))
+    {
+        bt_sink.open_pairing_window(
+            BT_PAIRING_WINDOW_MS,
+            louder_esp32_app::bt_a2dp::BtPairingPolicy::SspJustWorks,
+        );
+    }
+    BtConfigSyncState {
+        last_persisted_bonds: bt_sink.bonding_store,
+        last_discoverable_override: explicit_disc,
+        last_pending_numeric_passkey: bt_sink.pending_numeric_passkey(),
+    }
+}
+
+/// Advances the pairing timer, syncs PIN/pairing overrides, and saves bonds.
+#[cfg(any(target_arch = "xtensa", test))]
+pub fn sync_bt_security_from_config(
+    bt_sink: &mut louder_esp32_app::bt_a2dp::BtA2dpSink,
+    config: &louder_esp32_app::config_handle::ConfigHandle,
+    sync_state: &mut BtConfigSyncState,
+    elapsed_ms: u32,
+) {
+    if elapsed_ms > 0 {
+        bt_sink.tick_pairing_window(elapsed_ms);
+    }
+    if let Some(pin) = config
+        .nvs_override("bt_sink_pin")
+        .or_else(|| config.nvs_override("a2dp_spin"))
+    {
+        let trimmed = pin.trim();
+        if trimmed.is_empty() {
+            bt_sink.security_policy.clear_pin_code();
+        } else if bt_sink.security_policy.pin_code() != trimmed.as_bytes() {
+            bt_sink.security_policy.update_pin_code(trimmed.as_bytes());
+        }
+    }
+    if let Some(pair_val) = config.nvs_override("bt_pair") {
+        if let Some((duration_ms, policy)) = parse_bt_pair_command(pair_val.as_str()) {
+            bt_sink.open_pairing_window(duration_ms, policy);
+            let _ = config.set_nvs_override("bt_pair", "0");
+        }
+    }
+    let disc_opt = config
+        .nvs_override("bt_discoverable")
+        .and_then(|v| parse_nvs_bool(v.as_str()));
+    match disc_opt {
+        Some(true) if sync_state.last_discoverable_override != Some(true) => {
+            bt_sink.open_pairing_window(
+                BT_PAIRING_WINDOW_MS,
+                louder_esp32_app::bt_a2dp::BtPairingPolicy::SspJustWorks,
+            );
+            sync_state.last_discoverable_override = Some(true);
+        }
+        Some(false) if sync_state.last_discoverable_override != Some(false) => {
+            bt_sink.close_pairing_window();
+            sync_state.last_discoverable_override = Some(false);
+        }
+        Some(true) if !bt_sink.is_pairing_window_open() => {
+            let _ = config.set_nvs_override("bt_discoverable", "0");
+            sync_state.last_discoverable_override = Some(false);
+        }
+        None => {
+            sync_state.last_discoverable_override = None;
+        }
+        _ => {}
+    }
+    let pending = bt_sink.pending_numeric_passkey();
+    if pending != sync_state.last_pending_numeric_passkey {
+        sync_state.last_pending_numeric_passkey = pending;
+        if let Some((bd_addr, passkey)) = pending {
+            log_pending_numeric_passkey(bd_addr, passkey);
+        }
+    }
+    if let Some((bd_addr, passkey)) = pending {
+        if let Some(confirm_val) = config.nvs_override("bt_confirm") {
+            if let Some(accept) = parse_bt_confirm_command(confirm_val.as_str(), passkey) {
+                let _ = bt_sink.confirm_numeric_comparison(bd_addr, accept);
+                let _ = config.set_nvs_override("bt_confirm", "");
+                sync_state.last_pending_numeric_passkey = bt_sink.pending_numeric_passkey();
+            }
+        }
+    }
+    if bt_sink.bonding_store != sync_state.last_persisted_bonds {
+        save_bt_bonds_to_config(&bt_sink.bonding_store, config);
+        sync_state.last_persisted_bonds = bt_sink.bonding_store;
+    }
+}
+
 /// Executes one integrated firmware tick across the CYD UART bridge,
 /// audio pipeline, and digital amplifier health monitor (`HALNET-409`).
 ///
@@ -152,8 +723,9 @@ where
     I: I2c,
 {
     if let Ok(Some(cmd)) = cyd_bridge.poll_command() {
-        // The host backend when there is one, else a stand-in with no hardware
-        // volume, so the level goes into the software gain (C output_embedded.c).
+        // The host backend when there is one, else a stand-in with no
+        // hardware volume, so the level goes into the software gain
+        // (C output_embedded.c).
         let mut no_hw = MockBackend {
             hw_volume: false,
             ..MockBackend::default()
@@ -1164,25 +1736,15 @@ mod xtensa_hw {
 
     struct FirmwareBssBuffers {
         ring_storage: [u8; 4096],
-        http_rx_buf: [u8; 1024],
         slim_rx_buf: [u8; 2048],
         slim_tx_buf: [u8; 2048],
         audio_rx_buf: [u8; 4096],
         audio_tx_buf: [u8; 512],
     }
 
-    impl FirmwareBssBuffers {
-        const fn new() -> Self {
-            Self {
-                ring_storage: [0u8; 4096],
-                http_rx_buf: [0u8; 1024],
-                slim_rx_buf: [0u8; 2048],
-                slim_tx_buf: [0u8; 2048],
-                audio_rx_buf: [0u8; 4096],
-                audio_tx_buf: [0u8; 512],
-            }
-        }
-    }
+    // Zero-initialized in-place inside `take_firmware_bss_buffers` via
+    // `MaybeUninit::uninit()` + `write_bytes(0, 1)` to avoid stack temporaries
+    // and `.dram2_uninit` NOLOAD uninitialized UB.
 
     #[allow(unsafe_code)]
     // JUSTIFICATION: Dedicated execution stack for Core 1 (APP_CPU) in DRAM2.
@@ -1230,28 +1792,33 @@ mod xtensa_hw {
     pub(crate) static CORE1_PARKED: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    #[esp_hal::ram]
+    pub(crate) fn service_core1_park_request() {
+        if CORE1_PARK_REQ.load(core::sync::atomic::Ordering::Acquire) {
+            CORE1_PARKED.store(true, core::sync::atomic::Ordering::Release);
+            while CORE1_PARK_REQ.load(core::sync::atomic::Ordering::Acquire) {
+                #[allow(unsafe_code)]
+                // JUSTIFICATION: Cooperative park wait loop in IRAM during
+                // flash erase and write.
+                // SAFETY: `nop` has no memory or register side effects.
+                unsafe {
+                    core::arch::asm!("nop");
+                }
+            }
+            CORE1_PARKED.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+
     #[cfg(not(feature = "esp-rtos-core1"))]
     #[esp_hal::ram]
     fn app_core_loop() {
         loop {
-            if CORE1_PARK_REQ.load(core::sync::atomic::Ordering::Acquire) {
-                CORE1_PARKED.store(true, core::sync::atomic::Ordering::Release);
-                while CORE1_PARK_REQ.load(core::sync::atomic::Ordering::Acquire) {
-                    #[allow(unsafe_code)]
-                    // JUSTIFICATION: Cooperative park wait loop for Core 1 during flash
-                    // erase and write.
-                    // SAFETY: Nop instruction has no memory or register side effects.
-                    unsafe {
-                        core::arch::asm!("nop");
-                    }
-                }
-                CORE1_PARKED.store(false, core::sync::atomic::Ordering::Release);
-            }
+            service_core1_park_request();
             CORE1_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             for _ in 0..10_000 {
                 #[allow(unsafe_code)]
                 // JUSTIFICATION: Inline assembly required for nop delay loop.
-                // SAFETY: nop instruction has no memory or register side effects.
+                // SAFETY: `nop` has no memory or register side effects.
                 unsafe {
                     core::arch::asm!("nop");
                 }
@@ -1723,13 +2290,22 @@ mod xtensa_hw {
             !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
             "FirmwareBssBuffers already taken"
         );
-        // JUSTIFICATION: Static BSS buffers in DRAM2 to avoid stack exhaustion.
-        // SAFETY: Single caller on PRO_CPU guarded by atomic TAKEN.
+        // JUSTIFICATION: Static BSS buffers in `.dram2_uninit` via MaybeUninit
+        // to avoid stack exhaustion and uninitialized NOLOAD UB.
+        // SAFETY: Single caller on PRO_CPU guarded by atomic `TAKEN`.
         #[unsafe(link_section = ".dram2_uninit")]
-        static mut BSS_BUFFERS: FirmwareBssBuffers = FirmwareBssBuffers::new();
-        // JUSTIFICATION: Access to global static firmware BSS buffer singleton.
-        // SAFETY: Only a single caller on PRO_CPU takes ownership of the buffers.
-        unsafe { &mut *core::ptr::addr_of_mut!(BSS_BUFFERS) }
+        static mut BSS_BUFFERS: core::mem::MaybeUninit<FirmwareBssBuffers> =
+            core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Zero-initialize uninitialized `.dram2_uninit`
+        // buffer singleton before returning exclusive `&'static mut` access.
+        // SAFETY: Exclusive access is guaranteed by `TAKEN`; `ptr` is valid,
+        // aligned, and all fields of `FirmwareBssBuffers` are zero-initializable
+        // `[u8; N]` arrays written in full by `write_bytes(0, 1)`.
+        unsafe {
+            let ptr = (*core::ptr::addr_of_mut!(BSS_BUFFERS)).as_mut_ptr();
+            ptr.write_bytes(0, 1);
+            &mut *ptr
+        }
     }
 
     pub(crate) type HwStreamPipeline =
@@ -1803,12 +2379,10 @@ mod xtensa_hw {
             core::ptr::addr_of_mut!((*ptr).resample_tail_samples).write(0);
             core::ptr::addr_of_mut!((*ptr).resample_input_pending).write(0);
 
-            let http_resp_buf: &'static mut [u8; 4096] =
-                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 4096]));
-            let http_tx_buf: &'static mut [u8; 4096] =
-                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 4096]));
+            let http_req_buf: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_RX_BUF_BYTES].into_boxed_slice());
 
-            (&mut *ptr, http_resp_buf, http_tx_buf)
+            (&mut *ptr, http_req_buf)
         }
     }
 
@@ -1826,6 +2400,7 @@ mod xtensa_hw {
         #[cfg(not(feature = "esp-rtos-core1"))]
         _guard: Result<esp_hal::system::AppCoreGuard<'static>, esp_hal::system::Error>,
         active: bool,
+        parked_hw: bool,
     }
 
     impl Core1Ctl {
@@ -1834,49 +2409,91 @@ mod xtensa_hw {
             self.active
         }
 
-        /// Parks APP_CPU before the reboot-time settings flash write (Core-1
-        /// parking rule).
-        pub(crate) fn park_for_flash_write(&mut self) {
-            CORE1_PARK_REQ.store(true, core::sync::atomic::Ordering::Release);
-            for _ in 0..100_000 {
-                if CORE1_PARKED.load(core::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+        /// Cooperatively parks APP_CPU in IRAM before a flash erase/write,
+        /// gating `park_core` on `CORE1_PARKED` acknowledgment.
+        pub(crate) fn park_for_flash_write(&mut self) -> Result<(), Core1ParkError> {
             #[cfg(not(feature = "esp-rtos-core1"))]
-            #[allow(unsafe_code)]
-            // JUSTIFICATION: Parking APP_CPU before SPI flash erase/write to
-            // prevent XIP cache fetch collisions on shared SPI0/SPI1 bus.
-            // SAFETY: APP_CPU executes an IRAM-resident loop (`app_core_loop`)
-            // holding no locks.
-            unsafe {
-                self.cpu_ctrl.park_core(esp_hal::system::Cpu::AppCpu);
+            {
+                let cpu_ctrl = &mut self.cpu_ctrl;
+                park_core1_cooperative(
+                    self.active,
+                    &mut self.parked_hw,
+                    &CORE1_PARK_REQ,
+                    &CORE1_PARKED,
+                    500_000,
+                    || {
+                        #[allow(unsafe_code)]
+                        // JUSTIFICATION: Park APP_CPU before SPI flash I/O to
+                        // prevent XIP cache collisions on SPI0/SPI1.
+                        // SAFETY: `CORE1_PARKED` confirmed APP_CPU is in its
+                        // lock-free IRAM `nop` loop (`app_core_loop`).
+                        unsafe {
+                            cpu_ctrl.park_core(esp_hal::system::Cpu::AppCpu);
+                        }
+                    },
+                )
             }
-            // `CPU_CTRL` was handed to `esp_rtos::start_second_core`; this
-            // runs only right before `software_reset()`, so a stolen handle
-            // can not race another owner.
             #[cfg(feature = "esp-rtos-core1")]
-            #[allow(unsafe_code)]
-            // JUSTIFICATION: Steal CPU_CTRL right before software_reset() to
-            // park APP_CPU during pre-reboot flash write.
-            // SAFETY: Executed immediately prior to software_reset() on
-            // PRO_CPU with no concurrent CPU_CTRL access.
-            unsafe {
-                CpuControl::new(esp_hal::peripherals::CPU_CTRL::steal())
-                    .park_core(esp_hal::system::Cpu::AppCpu);
+            {
+                park_core1_cooperative(
+                    self.active,
+                    &mut self.parked_hw,
+                    &CORE1_PARK_REQ,
+                    &CORE1_PARKED,
+                    500_000,
+                    || {
+                        #[allow(unsafe_code)]
+                        // JUSTIFICATION: Steal `CPU_CTRL` on PRO_CPU to park
+                        // APP_CPU after cooperative IRAM acknowledgment.
+                        // SAFETY: `CORE1_PARKED` confirmed APP_CPU is in its
+                        // lock-free IRAM `nop` loop; `CPU_CTRL` is idle.
+                        unsafe {
+                            CpuControl::new(esp_hal::peripherals::CPU_CTRL::steal())
+                                .park_core(esp_hal::system::Cpu::AppCpu);
+                        }
+                    },
+                )
             }
         }
 
-        /// Restarts APP_CPU after a runtime flash write (the settings
-        /// journal write in the device loop and the `otadata` pin; both run
-        /// in every build).
-        /// Default build: the manual path's core 1 runs the IRAM NOP
-        /// heartbeat, so it resumes where it was parked.
+        /// Symmetrically unparks APP_CPU after a flash write when
+        /// `park_for_flash_write` parked it.
         pub(crate) fn unpark_after_flash_write(&mut self) {
-            CORE1_PARK_REQ.store(false, core::sync::atomic::Ordering::Release);
             #[cfg(not(feature = "esp-rtos-core1"))]
-            self.cpu_ctrl.unpark_core(esp_hal::system::Cpu::AppCpu);
+            {
+                let cpu_ctrl = &mut self.cpu_ctrl;
+                unpark_core1_cooperative(
+                    self.active,
+                    &mut self.parked_hw,
+                    &CORE1_PARK_REQ,
+                    &CORE1_PARKED,
+                    100_000,
+                    || {
+                        cpu_ctrl.unpark_core(esp_hal::system::Cpu::AppCpu);
+                    },
+                );
+            }
+            #[cfg(feature = "esp-rtos-core1")]
+            {
+                unpark_core1_cooperative(
+                    self.active,
+                    &mut self.parked_hw,
+                    &CORE1_PARK_REQ,
+                    &CORE1_PARKED,
+                    100_000,
+                    || {
+                        #[allow(unsafe_code)]
+                        // JUSTIFICATION: Symmetrically unpark APP_CPU after
+                        // PRO_CPU flash write under `esp-rtos-core1`.
+                        // SAFETY: Only invoked when `park_for_flash_write`
+                        // parked APP_CPU; PRO_CPU has sole `CPU_CTRL` access.
+                        unsafe {
+                            CpuControl::new(esp_hal::peripherals::CPU_CTRL::steal())
+                                .unpark_core(esp_hal::system::Cpu::AppCpu);
+                        }
+                    },
+                );
+            }
         }
     }
 
@@ -1891,10 +2508,16 @@ mod xtensa_hw {
          it can not be combined with `esp-rtos-core1`"
     );
 
-    /// Smoltcp socket slots: DHCP, HTTP server, slimproto, audio, mDNS UDP
+    /// Concurrent Port 80 HTTP listener sockets in PSRAM.
+    const HTTP_LISTEN_SOCKETS: usize = 3;
+    const HTTP_RX_BUF_BYTES: usize = 2_048;
+    const HTTP_TX_BUF_BYTES: usize = 4_096;
+    const HTTP_RESP_BUF_BYTES: usize = 8_192;
+
+    /// Smoltcp socket slots: DHCP, 3x HTTP server, slimproto, audio, mDNS UDP
     /// (5353), AirPlay RTSP TCP (5000), AirPlay RTP UDP (6000), and Spotify
     /// Connect HTTP/Spirc TCP (4070).
-    const SOCKET_SLOTS: usize = 8;
+    const SOCKET_SLOTS: usize = 7 + HTTP_LISTEN_SOCKETS;
 
     /// Metadata/payload sizing for the mDNS responder UDP socket (port 5353).
     const MDNS_UDP_META: usize = 4;
@@ -1957,13 +2580,9 @@ mod xtensa_hw {
         )))
     }
 
-    /// Static pipeline + the static HTTP-server buffers handed out with it
+    /// Static pipeline + the PSRAM HTTP request buffer handed out with it
     /// (`init_static_pipeline`).
-    type PipelineStatics = (
-        &'static mut HwStreamPipeline,
-        &'static mut [u8; 4096],
-        &'static mut [u8; 4096],
-    );
+    type PipelineStatics = (&'static mut HwStreamPipeline, &'static mut [u8]);
 
     /// Bring-up stage: I2S0 TDM-Philips TX (BCK=26, WS=25, DOUT=22) with
     /// streaming DMA prefilled with silence, then the I2S sink and the static
@@ -2217,12 +2836,58 @@ mod xtensa_hw {
         sockets.add(socket())
     }
 
+    /// Per-socket Port 80 HTTP connection and streaming state in PSRAM.
+    struct HttpConnSlot {
+        handle: SocketHandle,
+        resp_buf: &'static mut [u8],
+        resp_len: usize,
+        resp_sent: usize,
+        pending_body: &'static [u8],
+        started_ms: u64,
+        established_since_ms: Option<u64>,
+        post_wait_since_ms: Option<u64>,
+        closing: bool,
+        close_deadline_ms: u64,
+    }
+
+    impl HttpConnSlot {
+        fn new(handle: SocketHandle) -> Self {
+            let resp_buf: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_RESP_BUF_BYTES].into_boxed_slice());
+            Self {
+                handle,
+                resp_buf,
+                resp_len: 0,
+                resp_sent: 0,
+                pending_body: &[],
+                started_ms: 0,
+                established_since_ms: None,
+                post_wait_since_ms: None,
+                closing: false,
+                close_deadline_ms: 0,
+            }
+        }
+
+        fn has_pending_tx(&self) -> bool {
+            self.resp_sent < self.resp_len || !self.pending_body.is_empty()
+        }
+
+        fn reset_transfer_state(&mut self) {
+            self.resp_len = 0;
+            self.resp_sent = 0;
+            self.pending_body = &[];
+            self.established_since_ms = None;
+            self.post_wait_since_ms = None;
+            self.closing = false;
+        }
+    }
+
     /// Output of [`init_net_stack`].
     struct NetStack {
         smol_iface: &'static mut SmolInterface,
         sockets: SocketSet<'static>,
         dhcp_handle: SocketHandle,
-        http_handle: SocketHandle,
+        http_handles: [SocketHandle; HTTP_LISTEN_SOCKETS],
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
         mdns_handle: SocketHandle,
@@ -2232,13 +2897,13 @@ mod xtensa_hw {
         local_port_counter: u16,
     }
 
-    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for HTTP,
-    /// slimproto, audio.
-    type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 3];
+    /// TCP socket buffers handed to [`init_net_stack`]: (rx, tx) for slimproto
+    /// and audio.
+    type TcpBuffers = [(&'static mut [u8], &'static mut [u8]); 2];
 
-    /// Bring-up stage: `smoltcp` Ethernet interface + DHCPv4 + TCP port 80 +
-    /// TCP SlimProto (3483) + audio socket + mDNS UDP (5353) + AirPlay RTSP
-    /// TCP (5000) + AirPlay RTP UDP (6000) + Spotify Connect HTTP/Spirc TCP
+    /// Bring-up stage: `smoltcp` Ethernet interface, DHCPv4, 3x TCP port 80,
+    /// TCP SlimProto (3483), audio socket, mDNS UDP (5353), AirPlay RTSP TCP
+    /// (5000), AirPlay RTP UDP (6000), and Spotify Connect HTTP/Spirc TCP
     /// (4070), allocated in external PSRAM.
     #[inline(never)]
     fn init_net_stack(
@@ -2246,8 +2911,7 @@ mod xtensa_hw {
         sta_mac: [u8; 6],
         tcp_bufs: TcpBuffers,
     ) -> NetStack {
-        let [(http_rx_buf, http_tx_buf), (slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] =
-            tcp_bufs;
+        let [(slim_rx_buf, slim_tx_buf), (audio_rx_buf, audio_tx_buf)] = tcp_bufs;
         let hw_rng = Rng::new();
         let rng_seed = (u64::from(hw_rng.random()) << 32) | u64::from(hw_rng.random());
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(sta_mac));
@@ -2271,11 +2935,14 @@ mod xtensa_hw {
 
         let dhcp_handle = add_socket(&mut sockets, dhcpv4::Socket::new);
 
-        let http_handle = add_socket(&mut sockets, || {
-            tcp::Socket::new(
-                tcp::SocketBuffer::new(http_rx_buf),
-                tcp::SocketBuffer::new(http_tx_buf),
-            )
+        let http_handles = core::array::from_fn(|_| {
+            let rx: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_RX_BUF_BYTES].into_boxed_slice());
+            let tx: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::vec![0u8; HTTP_TX_BUF_BYTES].into_boxed_slice());
+            add_socket(&mut sockets, || {
+                tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx))
+            })
         });
 
         let slim_handle = add_socket(&mut sockets, || {
@@ -2338,7 +3005,7 @@ mod xtensa_hw {
             smol_iface,
             sockets,
             dhcp_handle,
-            http_handle,
+            http_handles,
             slim_handle,
             audio_handle,
             mdns_handle,
@@ -2371,7 +3038,7 @@ mod xtensa_hw {
         smol_iface: &'static mut SmolInterface,
         sockets: SocketSet<'static>,
         dhcp_handle: SocketHandle,
-        http_handle: SocketHandle,
+        http_slots: [HttpConnSlot; HTTP_LISTEN_SOCKETS],
         slim_handle: SocketHandle,
         audio_handle: SocketHandle,
         mdns_handle: SocketHandle,
@@ -2387,7 +3054,7 @@ mod xtensa_hw {
         coordinator: &'static mut PlayerCoordinator,
         slim_link: SlimLinkState,
         stream_state: HttpStreamState,
-        http_resp_buf: &'static mut [u8; 4096],
+        http_req_buf: &'static mut [u8],
         config: &'static ConfigHandle,
         journal: &'static mut RamJournal<'static>,
         config_writer: ConfigWriter,
@@ -2405,10 +3072,6 @@ mod xtensa_hw {
         assigned_gw: [u8; 4],
         pending_http_action: HttpControlAction,
         pending_action_deadline_ms: u64,
-        pending_http_body: &'static [u8],
-        pending_http_started_ms: u64,
-        pending_http_closing: bool,
-        pending_close_deadline_ms: u64,
         helo_sent: bool,
         last_connect_attempt_ms: u64,
         slim_reconnect: SlimReconnect,
@@ -2418,6 +3081,7 @@ mod xtensa_hw {
         latest_telemetry: Option<squeezelite_tas58xx::Tas5805mTelemetry>,
         last_cyd_progress_ms: u64,
         last_config_poll_ms: u64,
+        last_flash_retry_ms: Option<u64>,
         mdns_bound: bool,
         last_mdns_announce_ms: u64,
         last_mdns_reply_ms: Option<u64>,
@@ -2432,6 +3096,8 @@ mod xtensa_hw {
         wifi_connected_logged: bool,
         last_fault_recovery_ms: u64,
         last_bt_idle_poll_ms: u64,
+        last_bt_window_tick_ms: u64,
+        bt_sync_state: BtConfigSyncState,
         boot_ota0_confirmed: bool,
         was_wifi_connected: bool,
         disconnect_count: u32,
@@ -2541,7 +3207,6 @@ mod xtensa_hw {
         let fw_bufs = take_firmware_bss_buffers();
         let FirmwareBssBuffers {
             ref mut ring_storage,
-            ref mut http_rx_buf,
             ref mut slim_rx_buf,
             ref mut slim_tx_buf,
             ref mut audio_rx_buf,
@@ -2712,6 +3377,7 @@ mod xtensa_hw {
                 cpu_ctrl,
                 _guard: guard,
                 active,
+                parked_hw: false,
             }
         };
 
@@ -2732,7 +3398,7 @@ mod xtensa_hw {
         #[cfg(not(feature = "board-louder-esp32-s3"))]
         let amp = init_amp_i2c(peripherals.I2C0, peripherals.GPIO21, peripherals.GPIO27);
         #[cfg(not(feature = "board-louder-esp32-s3"))]
-        let (pipeline, http_resp_buf, http_tx_buf) = init_i2s_pipeline(
+        let (pipeline, http_req_buf) = init_i2s_pipeline(
             peripherals.I2S0,
             peripherals.DMA_I2S0,
             peripherals.GPIO26,
@@ -2778,7 +3444,10 @@ mod xtensa_hw {
             esp_rtos::start_second_core(cpu_ctrl_periph, peripherals.FROM_CPU_INTR1, stack, || {
                 crate::tasks::run_core1_executor()
             });
-            Core1Ctl { active: true }
+            Core1Ctl {
+                active: true,
+                parked_hw: false,
+            }
         };
 
         // Initialize `esp-radio` Wi-Fi Controller & Station Interface
@@ -2798,6 +3467,7 @@ mod xtensa_hw {
             sink.reset_in_place();
             sink
         };
+        let bt_sync_state = init_bt_sink_security_from_config(bt_sink, config);
 
         let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) =
             if psram_avail_bytes >= 655_360 {
@@ -2813,7 +3483,7 @@ mod xtensa_hw {
             smol_iface,
             sockets,
             dhcp_handle,
-            http_handle,
+            http_handles,
             slim_handle,
             audio_handle,
             mdns_handle,
@@ -2825,7 +3495,6 @@ mod xtensa_hw {
             &mut sta_iface,
             sta_mac,
             [
-                (&mut http_rx_buf[..], &mut http_tx_buf[..]),
                 (slim_rx_slice, &mut slim_tx_buf[..]),
                 (audio_rx_slice, &mut audio_tx_buf[..]),
             ],
@@ -2842,6 +3511,7 @@ mod xtensa_hw {
         ));
         let raop_rtp = alloc::boxed::Box::new(RtpAudioReceiver::new());
         let spot_spirc = alloc::boxed::Box::new(SpircStateMachine::new());
+        let http_slots = http_handles.map(HttpConnSlot::new);
 
         let state = alloc::boxed::Box::leak(alloc::boxed::Box::new(DeviceRuntimeState {
             wdt,
@@ -2854,7 +3524,7 @@ mod xtensa_hw {
             smol_iface,
             sockets,
             dhcp_handle,
-            http_handle,
+            http_slots,
             slim_handle,
             audio_handle,
             mdns_handle,
@@ -2870,7 +3540,7 @@ mod xtensa_hw {
             coordinator,
             slim_link: SlimLinkState::new(),
             stream_state: HttpStreamState::new(),
-            http_resp_buf,
+            http_req_buf,
             config,
             journal,
             config_writer,
@@ -2888,10 +3558,6 @@ mod xtensa_hw {
             assigned_gw: [172, 22, 1, 1],
             pending_http_action: HttpControlAction::None,
             pending_action_deadline_ms: 0,
-            pending_http_body: &[],
-            pending_http_started_ms: 0,
-            pending_http_closing: false,
-            pending_close_deadline_ms: 0,
             helo_sent: false,
             last_connect_attempt_ms: 0,
             slim_reconnect: SlimReconnect::new(),
@@ -2901,6 +3567,7 @@ mod xtensa_hw {
             latest_telemetry,
             last_cyd_progress_ms: 0,
             last_config_poll_ms: 0,
+            last_flash_retry_ms: None,
             mdns_bound: false,
             last_mdns_announce_ms: 0,
             last_mdns_reply_ms: None,
@@ -2915,6 +3582,8 @@ mod xtensa_hw {
             wifi_connected_logged: false,
             last_fault_recovery_ms: 0,
             last_bt_idle_poll_ms: 0,
+            last_bt_window_tick_ms: boot_ms,
+            bt_sync_state,
             boot_ota0_confirmed: false,
             was_wifi_connected: false,
             disconnect_count: 0,
@@ -3030,8 +3699,10 @@ mod xtensa_hw {
 
     #[inline(never)]
     fn persist_ota_0_boot_partition(s: &mut DeviceRuntimeState) -> bool {
+        if s.core1.park_for_flash_write().is_err() {
+            return false;
+        }
         let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-        s.core1.park_for_flash_write();
         let ok = s
             .flash
             .write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes)
@@ -3042,15 +3713,21 @@ mod xtensa_hw {
 
     #[inline(never)]
     fn erase_otadata_for_factory_recovery(s: &mut DeviceRuntimeState) -> bool {
-        s.core1.park_for_flash_write();
-        s.flash
+        if s.core1.park_for_flash_write().is_err() {
+            return false;
+        }
+        let ok = s
+            .flash
             .erase(OTADATA_PARTITION_OFFSET, OTADATA_PARTITION_END)
-            .is_ok()
+            .is_ok();
+        if !ok {
+            s.core1.unpark_after_flash_write();
+        }
+        ok
     }
 
     #[inline(never)]
     fn flush_settings_before_reboot(s: &mut DeviceRuntimeState) {
-        s.core1.park_for_flash_write();
         let _ = s.amp.set_mute(true);
         s.config.flush_now(&mut *s.journal);
         if let Some(image) = s.journal.pending_image() {
@@ -3058,14 +3735,19 @@ mod xtensa_hw {
             let offset = SETTINGS_JOURNAL_OFFSET;
             #[cfg(feature = "runtime-flash-persist")]
             let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-            let _ = s.flash.erase(offset, offset + 4096);
-            if image.used_len > 16 {
-                let _ = s
-                    .flash
-                    .write_nor(offset + 16, &image.sector[16..image.used_len]);
+            let mut flash_ctx = (&mut s.core1, &mut s.flash);
+            if write_journal_sector_with_ctx(
+                &mut flash_ctx,
+                (offset, image.sector, image.used_len),
+                |ctx| ctx.0.park_for_flash_write(),
+                |ctx, start, end| ctx.1.erase(start, end),
+                |ctx, addr, data| ctx.1.write_nor(addr, data),
+                |ctx| ctx.0.unpark_after_flash_write(),
+            )
+            .is_ok()
+            {
+                s.journal.mark_flash_written();
             }
-            let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
-            let _ = s.flash.write_nor(offset, &image.sector[..16]);
         }
     }
 
@@ -3178,6 +3860,7 @@ mod xtensa_hw {
         s.bt_sink
             .security_policy
             .update_device_name(bt_name.as_str());
+        sync_bt_security_from_config(s.bt_sink, s.config, &mut s.bt_sync_state, 0);
     }
 
     #[inline(never)]
@@ -3186,6 +3869,11 @@ mod xtensa_hw {
             return;
         }
         let now_ms = s.now_ms;
+        let elapsed_ms = now_ms
+            .saturating_sub(s.last_bt_window_tick_ms)
+            .min(u32::MAX as u64) as u32;
+        s.last_bt_window_tick_ms = now_ms;
+        sync_bt_security_from_config(s.bt_sink, s.config, &mut s.bt_sync_state, elapsed_ms);
         if s.assigned_ip.is_some() && s.bt_transport.is_none() {
             if let Some(bt_p) = s.bt_periph.take() {
                 s.wdt.feed();
@@ -3233,6 +3921,7 @@ mod xtensa_hw {
                         }
                     }
                 });
+            sync_bt_security_from_config(s.bt_sink, s.config, &mut s.bt_sync_state, 0);
 
             if s.bt_audio_active
                 && !s.bt_sink.is_streaming()
@@ -3347,7 +4036,10 @@ mod xtensa_hw {
                 if ip_changed {
                     s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
-                    s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                    for slot in &mut s.http_slots {
+                        s.sockets.get_mut::<tcp::Socket>(slot.handle).abort();
+                        slot.reset_transfer_state();
+                    }
                     s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                     s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
                     s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
@@ -3358,8 +4050,6 @@ mod xtensa_hw {
                     s.spot_streaming = false;
                     s.rtsp_rx_acc.clear();
                     s.helo_sent = false;
-                    s.pending_http_body = &[];
-                    s.pending_http_closing = false;
                 }
                 s.assigned_ip = Some(ip_octets);
                 s.raop_rtsp.set_ip_address(ip_octets);
@@ -3406,7 +4096,10 @@ mod xtensa_hw {
                     .leave_multicast_group(Ipv4Address::new(224, 0, 0, 251));
                 s.sockets.get_mut::<tcp::Socket>(s.slim_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.audio_handle).abort();
-                s.sockets.get_mut::<tcp::Socket>(s.http_handle).abort();
+                for slot in &mut s.http_slots {
+                    s.sockets.get_mut::<tcp::Socket>(slot.handle).abort();
+                    slot.reset_transfer_state();
+                }
                 s.sockets.get_mut::<tcp::Socket>(s.rtsp_handle).abort();
                 s.sockets.get_mut::<tcp::Socket>(s.spot_handle).abort();
                 s.sockets.get_mut::<udp::Socket>(s.mdns_handle).close();
@@ -3416,8 +4109,6 @@ mod xtensa_hw {
                 s.spot_streaming = false;
                 s.rtsp_rx_acc.clear();
                 s.helo_sent = false;
-                s.pending_http_body = &[];
-                s.pending_http_closing = false;
             }
             None => {}
         }
@@ -3426,490 +4117,491 @@ mod xtensa_hw {
     #[inline(never)]
     fn http_serve_phase(s: &mut DeviceRuntimeState) {
         let now_ms = s.now_ms;
-        {
-            let http_sock = s.sockets.get_mut::<tcp::Socket>(s.http_handle);
+        for idx in 0..HTTP_LISTEN_SOCKETS {
+            let mut req_len = 0usize;
+            {
+                let slot = &mut s.http_slots[idx];
+                let http_sock = s.sockets.get_mut::<tcp::Socket>(slot.handle);
 
-            if !s.pending_http_body.is_empty() {
-                if now_ms.saturating_sub(s.pending_http_started_ms) >= 2_500
-                    || matches!(
-                        http_sock.state(),
-                        tcp::State::CloseWait
-                            | tcp::State::TimeWait
+                if slot.has_pending_tx() {
+                    if now_ms.saturating_sub(slot.started_ms) >= 5_000
+                        || matches!(
+                            http_sock.state(),
+                            tcp::State::TimeWait
+                                | tcp::State::Closing
+                                | tcp::State::LastAck
+                                | tcp::State::FinWait1
+                                | tcp::State::FinWait2
+                                | tcp::State::Closed
+                        )
+                        || !http_sock.may_send()
+                    {
+                        http_sock.abort();
+                        slot.reset_transfer_state();
+                    } else {
+                        if slot.resp_sent < slot.resp_len {
+                            if let Ok(sent) =
+                                http_sock.send_slice(&slot.resp_buf[slot.resp_sent..slot.resp_len])
+                            {
+                                slot.resp_sent += sent;
+                            }
+                        }
+                        if slot.resp_sent >= slot.resp_len && !slot.pending_body.is_empty() {
+                            if let Ok(sent) = http_sock.send_slice(slot.pending_body) {
+                                slot.pending_body = &slot.pending_body[sent..];
+                            }
+                        }
+                        if !slot.has_pending_tx() {
+                            http_sock.close();
+                            slot.closing = true;
+                            slot.close_deadline_ms = now_ms + 1_500;
+                        }
+                    }
+                }
+
+                if slot.closing
+                    && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
+                        || now_ms >= slot.close_deadline_ms)
+                {
+                    http_sock.abort();
+                    slot.reset_transfer_state();
+                }
+
+                if !slot.has_pending_tx() && !slot.closing && http_sock.is_open() {
+                    let st = http_sock.state();
+                    if matches!(
+                        st,
+                        tcp::State::TimeWait
                             | tcp::State::Closing
                             | tcp::State::LastAck
                             | tcp::State::FinWait1
                             | tcp::State::FinWait2
-                            | tcp::State::Closed
-                    )
-                {
-                    s.pending_http_body = &[];
-                    http_sock.abort();
-                    s.pending_http_closing = false;
-                } else if http_sock.may_send() {
-                    if let Ok(sent) = http_sock.send_slice(s.pending_http_body) {
-                        s.pending_http_body = &s.pending_http_body[sent..];
+                    ) || (st == tcp::State::CloseWait && !http_sock.can_recv())
+                    {
+                        http_sock.abort();
+                        slot.reset_transfer_state();
                     }
-                    if s.pending_http_body.is_empty() {
-                        http_sock.close();
-                        s.pending_http_closing = true;
-                        s.pending_close_deadline_ms = now_ms + 500;
-                    }
-                } else {
-                    s.pending_http_body = &[];
-                    http_sock.abort();
-                    s.pending_http_closing = false;
                 }
-            }
 
-            if s.pending_http_closing
-                && (matches!(http_sock.state(), tcp::State::TimeWait | tcp::State::Closed)
-                    || now_ms >= s.pending_close_deadline_ms)
-            {
-                http_sock.abort();
-                s.pending_http_closing = false;
-            }
+                if !slot.has_pending_tx()
+                    && !slot.closing
+                    && http_sock.state() == tcp::State::Established
+                    && http_sock.recv_queue() == 0
+                {
+                    let since = *slot.established_since_ms.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(since) >= 2_000 {
+                        http_sock.close();
+                        slot.closing = true;
+                        slot.close_deadline_ms = now_ms + 500;
+                        slot.established_since_ms = None;
+                    }
+                } else if http_sock.recv_queue() > 0 || http_sock.state() != tcp::State::Established
+                {
+                    slot.established_since_ms = None;
+                }
 
-            if s.pending_http_body.is_empty()
-                && !s.pending_http_closing
-                && http_sock.is_open()
-                && matches!(
-                    http_sock.state(),
-                    tcp::State::CloseWait
-                        | tcp::State::TimeWait
-                        | tcp::State::Closing
-                        | tcp::State::LastAck
-                        | tcp::State::FinWait1
-                        | tcp::State::FinWait2
-                )
-            {
-                http_sock.abort();
-            }
+                if !http_sock.is_open() {
+                    slot.reset_transfer_state();
+                    let _ = http_sock.listen(80);
+                }
 
-            if !http_sock.is_open() {
-                s.pending_http_body = &[];
-                s.pending_http_closing = false;
-                let _ = http_sock.listen(80);
-            }
-
-            if s.pending_http_body.is_empty()
-                && !s.pending_http_closing
-                && http_sock.can_recv()
-                && http_sock.may_send()
-            {
-                static POST_WAIT_MS: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-
-                let mut should_wait = false;
-                let mut peek_buf = [0u8; 256];
-                if let Ok(peek_n) = http_sock.peek_slice(&mut peek_buf) {
-                    let peek_bytes = &peek_buf[..peek_n];
-                    if peek_bytes.starts_with(b"POST ") {
-                        if let Some(pos) = peek_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let hdr_end = pos + 4;
-                            let mut cl = 0usize;
-                            if let Some(cl_idx) = peek_bytes[..hdr_end]
-                                .windows(16)
-                                .position(|w| w.eq_ignore_ascii_case(b"content-length: "))
-                            {
-                                for &b in &peek_bytes[cl_idx + 16..hdr_end] {
-                                    if b.is_ascii_digit() {
-                                        cl = cl
-                                            .saturating_mul(10)
-                                            .saturating_add((b - b'0') as usize);
-                                    } else if b == b'\r' || b == b'\n' {
-                                        break;
-                                    }
-                                }
-                            }
-                            if cl > 0 && http_sock.recv_queue() < hdr_end + cl {
-                                let start =
-                                    POST_WAIT_MS.load(core::sync::atomic::Ordering::Relaxed);
-                                if start == 0 {
-                                    POST_WAIT_MS.store(
-                                        now_ms as u32,
-                                        core::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    should_wait = true;
-                                } else if (now_ms as u32).wrapping_sub(start) < 250 {
+                if !slot.has_pending_tx()
+                    && !slot.closing
+                    && http_sock.can_recv()
+                    && http_sock.may_send()
+                {
+                    let mut should_wait = false;
+                    if http_sock.state() == tcp::State::Established {
+                        if let Ok(peek_n) = http_sock.peek_slice(&mut s.http_req_buf[..]) {
+                            if louder_esp32_app::http_control::http_request_needs_more_bytes(
+                                &s.http_req_buf[..peek_n],
+                                HTTP_RX_BUF_BYTES,
+                            ) {
+                                let wait_start = *slot.post_wait_since_ms.get_or_insert(now_ms);
+                                if now_ms.saturating_sub(wait_start) < 500 {
                                     should_wait = true;
                                 }
                             }
                         }
                     }
-                }
 
-                if !should_wait {
-                    POST_WAIT_MS.store(0, core::sync::atomic::Ordering::Relaxed);
-                    let mut req_buf = [0u8; 1024];
-                    let mut req_len = 0;
-                    while req_len < req_buf.len() && http_sock.can_recv() {
-                        let chunk = http_sock.recv_slice(&mut req_buf[req_len..]).unwrap_or(0);
-                        if chunk == 0 {
+                    if !should_wait {
+                        slot.post_wait_since_ms = None;
+                        while req_len < s.http_req_buf.len() && http_sock.can_recv() {
+                            let chunk = http_sock
+                                .recv_slice(&mut s.http_req_buf[req_len..])
+                                .unwrap_or(0);
+                            if chunk == 0 {
+                                break;
+                            }
+                            req_len += chunk;
+                        }
+                        while http_sock.can_recv() {
+                            let _ = http_sock.recv(|buf| (buf.len(), ()));
+                        }
+                    }
+                }
+            }
+
+            if req_len > 0 {
+                let amp_mode_str = match s.amp.mode() {
+                    louder_esp32_app::AmpMode::Play => "Play",
+                    louder_esp32_app::AmpMode::Standby => "Standby",
+                    louder_esp32_app::AmpMode::PowerDown => "PowerDown",
+                };
+                let codec_name = match s.coordinator.active_source() {
+                    AudioSource::AirPlay => "AirPlay",
+                    AudioSource::Bluetooth => "Bluetooth",
+                    AudioSource::Spotify => "Spotify",
+                    _ => {
+                        if s.raop_streaming {
+                            "AirPlay"
+                        } else if s.spot_streaming {
+                            "Spotify"
+                        } else {
+                            match s.pipeline.decoder {
+                                ActiveDecoder::Mp3(_) => "MP3",
+                                ActiveDecoder::Flac(_) => "FLAC",
+                                ActiveDecoder::Pcm(_) => "PCM",
+                                ActiveDecoder::Aac(_) => "AAC",
+                                ActiveDecoder::Vorbis(_) => "Vorbis",
+                                ActiveDecoder::Alac(_) => "ALAC",
+                                ActiveDecoder::Opus(_) => "Opus",
+                            }
+                        }
+                    }
+                };
+                let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
+                    match s.latest_telemetry {
+                        Some(t) => (
+                            t.detected_sample_rate_hz_with_hint(s.coordinator.current_sample_rate),
+                            t.bck_ratio(),
+                            t.is_pll_locked(),
+                            t.is_automuted(),
+                        ),
+                        None => (s.coordinator.current_sample_rate, 64, true, false),
+                    };
+                let (psram_free_bytes, psram_used_bytes) = {
+                    let stats = esp_alloc::HEAP.stats();
+                    let mut free = 0u32;
+                    let mut used = 0u32;
+                    for r in stats.region_stats.iter().flatten() {
+                        if r.size > 1024 * 1024 {
+                            free = r.free as u32;
+                            used = r.used as u32;
                             break;
                         }
-                        req_len += chunk;
                     }
-                    while http_sock.can_recv() {
-                        let _ = http_sock.recv(|buf| (buf.len(), ()));
+                    if free.saturating_add(used) > 200_000 {
+                        (free, used)
+                    } else {
+                        (
+                            louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
+                            louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
+                        )
                     }
-                    if req_len > 0 {
-                        let amp_mode_str = match s.amp.mode() {
-                            louder_esp32_app::AmpMode::Play => "Play",
-                            louder_esp32_app::AmpMode::Standby => "Standby",
-                            louder_esp32_app::AmpMode::PowerDown => "PowerDown",
-                        };
-                        let codec_name = match s.coordinator.active_source() {
-                            AudioSource::AirPlay => "AirPlay",
-                            AudioSource::Bluetooth => "Bluetooth",
-                            AudioSource::Spotify => "Spotify",
-                            _ => {
-                                if s.raop_streaming {
-                                    "AirPlay"
-                                } else if s.spot_streaming {
-                                    "Spotify"
-                                } else {
-                                    match s.pipeline.decoder {
-                                        ActiveDecoder::Mp3(_) => "MP3",
-                                        ActiveDecoder::Flac(_) => "FLAC",
-                                        ActiveDecoder::Pcm(_) => "PCM",
-                                        ActiveDecoder::Aac(_) => "AAC",
-                                        ActiveDecoder::Vorbis(_) => "Vorbis",
-                                        ActiveDecoder::Alac(_) => "ALAC",
-                                        ActiveDecoder::Opus(_) => "Opus",
-                                    }
-                                }
-                            }
-                        };
-                        let (tas_fs_hz, tas_bck_ratio, tas_pll_locked, tas_automuted) =
-                            match s.latest_telemetry {
-                                Some(t) => (
-                                    t.detected_sample_rate_hz_with_hint(
-                                        s.coordinator.current_sample_rate,
-                                    ),
-                                    t.bck_ratio(),
-                                    t.is_pll_locked(),
-                                    t.is_automuted(),
-                                ),
-                                None => (s.coordinator.current_sample_rate, 64, true, false),
-                            };
-                        let (psram_free_bytes, psram_used_bytes) = {
-                            let stats = esp_alloc::HEAP.stats();
-                            let mut free = 0u32;
-                            let mut used = 0u32;
-                            for r in stats.region_stats.iter().flatten() {
-                                if r.size > 1024 * 1024 {
-                                    free = r.free as u32;
-                                    used = r.used as u32;
-                                    break;
-                                }
-                            }
-                            if free.saturating_add(used) > 200_000 {
-                                (free, used)
-                            } else {
-                                (
-                                    louder_esp32_app::http_control::DEFAULT_PSRAM_FREE_BYTES,
-                                    louder_esp32_app::http_control::DEFAULT_PSRAM_USED_BYTES,
-                                )
-                            }
-                        };
-                        let mut eq_bands_db = [0i8; 10];
-                        for (dst, &gain) in
-                            eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter())
-                        {
-                            let rounded = if gain >= 0.0 {
-                                (gain + 0.5) as i8
-                            } else {
-                                (gain - 0.5) as i8
-                            };
-                            *dst = rounded.clamp(-15, 15);
+                };
+                let mut eq_bands_db = [0i8; 10];
+                for (dst, &gain) in eq_bands_db.iter_mut().zip(s.pipeline.eq_gains_db().iter()) {
+                    let rounded = if gain >= 0.0 {
+                        (gain + 0.5) as i8
+                    } else {
+                        (gain - 0.5) as i8
+                    };
+                    *dst = rounded.clamp(-15, 15);
+                }
+                let player_name_val = s
+                    .config
+                    .nvs_override("host_name")
+                    .and_then(|h| {
+                        let t = h.trim();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            let mut out = heapless::String::<32>::new();
+                            let max_len = t.floor_char_boundary(t.len().min(32));
+                            let _ = out.push_str(&t[..max_len]);
+                            Some(out)
                         }
-                        let player_name_val = s
-                            .config
-                            .nvs_override("host_name")
-                            .and_then(|h| {
-                                let t = h.trim();
-                                if t.is_empty() {
-                                    None
-                                } else {
-                                    let mut out = heapless::String::<32>::new();
-                                    let max_len = t.floor_char_boundary(t.len().min(32));
-                                    let _ = out.push_str(&t[..max_len]);
-                                    Some(out)
-                                }
-                            })
-                            .unwrap_or_else(|| {
-                                s.config.read(|c| {
-                                    if !c.player_name.is_empty() {
-                                        c.player_name.clone()
-                                    } else {
-                                        s.config.device_name()
-                                    }
-                                })
-                            });
-                        let i2c_acks = Esp32I2cBus::hw_ack_count();
-                        let i2c_nacks = Esp32I2cBus::hw_nack_count();
-                        let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
-                        let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
-                        let snap = HttpStatusSnapshot {
-                            ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
-                            netmask: s.assigned_mask,
-                            gw: s.assigned_gw,
-                            ssid: s.wifi_sta_creds.ssid.as_str(),
-                            rssi: s.wifi_controller.rssi().unwrap_or(-50),
-                            lms_ip: s.lms_ip,
-                            lms_port: 9000,
-                            lms_cport: 9090,
-                            otadata_prearmed_factory: !s.boot_ota0_confirmed,
-                            frames_played: s.pipeline.frames_played,
-                            amp_mode: amp_mode_str,
-                            vol_pct: s.current_vol_pct,
-                            i2c_acks,
-                            i2c_nacks,
-                            i2c_nack_by_op,
-                            uptime_ms: now_ms.saturating_sub(s.boot_ms),
-                            psram_free_bytes,
-                            psram_used_bytes,
-                            core1_active: s.core1.is_active(),
-                            core1_loops: CORE1_HEARTBEAT
-                                .load(core::sync::atomic::Ordering::Relaxed),
-                            codec: codec_name,
-                            codec_sample_rate: s.coordinator.current_sample_rate,
-                            codec_channels: 2,
-                            codec_bit_depth: 16,
-                            eq_preset: s.pipeline.current_eq_preset.as_str(),
-                            eq_enabled: s.pipeline.equalizer.enabled,
-                            tas_fs_hz,
-                            tas_bck_ratio,
-                            tas_pll_locked,
-                            tas_automuted,
-                            again_code: s.amp.analog_gain_code(),
-                            settings_seq: s.journal.sequence(),
-                            bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
-                            bt_connected: s.bt_sink.is_connected(),
-                            bt_streaming: s.bt_sink.is_streaming(),
-                            bt_rx_pkts: s.bt_sink.rx_packets,
-                            bt_frames: s.bt_sink.decoded_frames,
-                            decode_us_max: s.pipeline.decode_us_max,
-                            decode_us_first: s.pipeline.decode_us_first,
-                            jack_inserted: false,
-                            voltage_mv: 0,
-                            disconnect_count: s.disconnect_count,
-                            avg_conn_time_ms: 0,
-                            is_i2c_locked,
-                            urc: if s.assigned_ip.is_some() { 0 } else { 2 },
-                            bt_status: if s.bt_sink.is_streaming() {
-                                2
-                            } else if s.bt_sink.is_connected() {
-                                1
+                    })
+                    .unwrap_or_else(|| {
+                        s.config.read(|c| {
+                            if !c.player_name.is_empty() {
+                                c.player_name.clone()
                             } else {
-                                0
-                            },
-                            bt_sub_status: 0,
-                            eq_bands_db,
-                            player_name: player_name_val.as_str(),
-                        };
-                        let snapshot = snap.clone();
-                        let resp_buf = &mut s.http_resp_buf[..];
-                        let mut extra_views = [louder_esp32_app::http_control::ConfigEntryView::new(
-                            "", "", "string",
-                        ); 20];
-                        let mut view_len = 0usize;
-                        let nvs_overrides = s.config.nvs_overrides();
-                        for slot in &nvs_overrides {
-                            if slot.used && view_len < extra_views.len() {
-                                extra_views[view_len] =
-                                    louder_esp32_app::http_control::ConfigEntryView::new(
-                                        slot.key.as_str(),
-                                        slot.value.as_str(),
-                                        "string",
-                                    );
-                                view_len += 1;
+                                s.config.device_name()
                             }
-                        }
-                        if let Some((hdr_or_resp_len, static_body, action)) =
+                        })
+                    });
+                let effective_lms_port = s.config.read(|c| c.lms_server_port).unwrap_or(9000);
+                let i2c_acks = Esp32I2cBus::hw_ack_count();
+                let i2c_nacks = Esp32I2cBus::hw_nack_count();
+                let i2c_nack_by_op = Esp32I2cBus::hw_nack_by_op();
+                let is_i2c_locked = i2c_nacks > 0 && i2c_acks == 0;
+                let snap = HttpStatusSnapshot {
+                    ip: s.assigned_ip.unwrap_or([172, 22, 1, 15]),
+                    netmask: s.assigned_mask,
+                    gw: s.assigned_gw,
+                    ssid: s.wifi_sta_creds.ssid.as_str(),
+                    rssi: s.wifi_controller.rssi().unwrap_or(-50),
+                    lms_ip: s.lms_ip,
+                    lms_port: effective_lms_port,
+                    lms_cport: 9090,
+                    otadata_prearmed_factory: !s.boot_ota0_confirmed,
+                    frames_played: s.pipeline.frames_played,
+                    amp_mode: amp_mode_str,
+                    vol_pct: s.current_vol_pct,
+                    i2c_acks,
+                    i2c_nacks,
+                    i2c_nack_by_op,
+                    uptime_ms: now_ms.saturating_sub(s.boot_ms),
+                    psram_free_bytes,
+                    psram_used_bytes,
+                    core1_active: s.core1.is_active(),
+                    core1_loops: CORE1_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed),
+                    codec: codec_name,
+                    codec_sample_rate: s.coordinator.current_sample_rate,
+                    codec_channels: 2,
+                    codec_bit_depth: 16,
+                    eq_preset: s.pipeline.current_eq_preset.as_str(),
+                    eq_enabled: s.pipeline.equalizer.enabled,
+                    tas_fs_hz,
+                    tas_bck_ratio,
+                    tas_pll_locked,
+                    tas_automuted,
+                    again_code: s.amp.analog_gain_code(),
+                    settings_seq: s.journal.sequence(),
+                    bt_enabled: s.bt_transport.is_some() && s.bt_sink.is_initialized(),
+                    bt_connected: s.bt_sink.is_connected(),
+                    bt_streaming: s.bt_sink.is_streaming(),
+                    bt_rx_pkts: s.bt_sink.rx_packets,
+                    bt_frames: s.bt_sink.decoded_frames,
+                    decode_us_max: s.pipeline.decode_us_max,
+                    decode_us_first: s.pipeline.decode_us_first,
+                    jack_inserted: false,
+                    voltage_mv: 0,
+                    disconnect_count: s.disconnect_count,
+                    avg_conn_time_ms: 0,
+                    is_i2c_locked,
+                    urc: if s.assigned_ip.is_some() { 0 } else { 2 },
+                    bt_status: if s.bt_sink.is_streaming() {
+                        2
+                    } else if s.bt_sink.is_connected() {
+                        1
+                    } else {
+                        0
+                    },
+                    bt_sub_status: 0,
+                    eq_bands_db,
+                    player_name: player_name_val.as_str(),
+                };
+                let snapshot = snap.clone();
+                let mut extra_views =
+                    [louder_esp32_app::http_control::ConfigEntryView::new("", "", "string");
+                        louder_esp32_app::config_handle::MAX_NVS_OVERRIDE_SLOTS];
+                let mut view_len = 0usize;
+                let nvs_overrides = s.config.nvs_override_table();
+                for (key, value) in nvs_overrides.iter() {
+                    if view_len < extra_views.len() {
+                        extra_views[view_len] =
+                            louder_esp32_app::http_control::ConfigEntryView::new(
+                                key, value, "string",
+                            );
+                        view_len += 1;
+                    }
+                }
+
+                let action_opt = {
+                    let slot = &mut s.http_slots[idx];
+                    let http_sock = s.sockets.get_mut::<tcp::Socket>(slot.handle);
+                    if let Some((hdr_or_resp_len, static_body, action)) =
                         louder_esp32_app::http_control::handle_http_request_streaming_with_entries(
-                            &req_buf[..req_len],
+                            &s.http_req_buf[..req_len],
                             &snapshot,
                             &extra_views[..view_len],
-                            resp_buf,
+                            &mut slot.resp_buf[..],
                         )
                     {
-                        let _ = http_sock.send_slice(&s.http_resp_buf[..hdr_or_resp_len]);
-                        if !static_body.is_empty() {
-                            s.pending_http_body = static_body;
-                            s.pending_http_started_ms = now_ms;
-                            if let Ok(sent) = http_sock.send_slice(s.pending_http_body) {
-                                s.pending_http_body = &s.pending_http_body[sent..];
+                        slot.resp_len = hdr_or_resp_len;
+                        slot.resp_sent = 0;
+                        slot.pending_body = static_body;
+                        slot.started_ms = now_ms;
+
+                        if slot.resp_sent < slot.resp_len {
+                            if let Ok(sent) =
+                                http_sock.send_slice(&slot.resp_buf[slot.resp_sent..slot.resp_len])
+                            {
+                                slot.resp_sent += sent;
                             }
-                            if s.pending_http_body.is_empty() {
-                                http_sock.close();
-                                s.pending_http_closing = true;
-                                s.pending_close_deadline_ms = now_ms + 80;
+                        }
+                        if slot.resp_sent >= slot.resp_len && !slot.pending_body.is_empty() {
+                            if let Ok(sent) = http_sock.send_slice(slot.pending_body) {
+                                slot.pending_body = &slot.pending_body[sent..];
                             }
-                        } else {
+                        }
+                        if !slot.has_pending_tx() {
                             http_sock.close();
-                            s.pending_http_closing = true;
-                            s.pending_close_deadline_ms = now_ms + 80;
+                            slot.closing = true;
+                            slot.close_deadline_ms = now_ms + 1_500;
                         }
-                        match action {
-                            HttpControlAction::SetEqPreset(preset_id) => {
-                                let preset = EqPreset::from_u8(preset_id);
-                                s.pipeline.apply_eq_preset(preset);
-                                s.config.update(|c| c.equalizer_preset = preset_id);
-                                let _ = s.config.set_nvs_override("equalizer", "");
-                                let _ = s.config.flush_now(&mut *s.journal);
-                            }
-                            HttpControlAction::SetAnalogGain(again_code) => {
-                                let clamped = again_code.min(31);
-                                let _ = s.amp.set_analog_gain(clamped);
-                                s.config.update(|c| c.analog_gain_code = clamped);
-                                let _ = s.config.flush_now(&mut *s.journal);
-                            }
-                            HttpControlAction::PlayerIrCommand {
-                                ir_code,
-                                vol_pct,
-                                mute,
-                            } => {
-                                if let Some(pct) = vol_pct {
-                                    let clamped = pct.min(100);
-                                    s.current_vol_pct = clamped;
-                                    let mut backend = Esp32AudioBackend::new(
-                                        s.amp,
-                                        DeviceClockRegs,
-                                        &DMA_OUTSTANDING_FRAMES,
-                                    );
-                                    s.coordinator
-                                        .set_volume_percent(clamped, &mut backend, s.pipeline);
-                                    let _ = s.cyd_bridge.send_message(&CydMessage::Volume(clamped));
-                                    s.config.update(|c| c.volume = clamped);
-                                    let _ = s.config.flush_now(&mut *s.journal);
-                                }
-                                if let Some(m) = mute {
-                                    s.pipeline.set_mute(m);
-                                }
-                                if ir_code != 0 && s.helo_sent {
-                                    let mut ir_buf = [0u8; 32];
-                                    if let Ok(ir_len) = SlimprotoBuilder::build_ir(
-                                        now_ms as u32,
-                                        ir_code,
-                                        &mut ir_buf,
-                                    ) {
-                                        let slim_sock =
-                                            s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
-                                        let mut link = SmoltcpSlimTransport::new(
-                                            DeviceSmolTcp::new(slim_sock),
-                                            &mut s.slim_link,
-                                        );
-                                        let _ = link.send(&ir_buf[..ir_len]);
-                                    }
-                                }
-                            }
-                            HttpControlAction::SpotifyPlay => {
-                                if s.coordinator.request_source(AudioSource::Spotify) {
-                                    if s.coordinator.current_sample_rate != 44_100
-                                        || s.pipeline.sample_rate != 44_100
-                                    {
-                                        s.coordinator.current_sample_rate = 44_100;
-                                        let _ = s.pipeline.set_sample_rate(44_100);
-                                    }
-                                    s.pipeline.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(
-                                        16, 2, false,
-                                    )));
-                                    s.pipeline.begin_external_audio();
-                                    s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
-                                    if s.amp.mode() != louder_esp32_app::AmpMode::Play {
-                                        let _ = s.amp.clear_faults();
-                                        let _ = s.amp.start_playback_via_hiz();
-                                    }
-                                    s.spot_streaming = true;
-                                }
-                            }
-                            HttpControlAction::SpotifyStop => {
-                                s.spot_streaming = false;
-                                s.coordinator.release_source(AudioSource::Spotify);
-                                restore_suspended_or_stop(s);
-                            }
-                            HttpControlAction::RebootToRecovery
-                            | HttpControlAction::PersistOta0AndReboot => {
-                                s.pending_http_action = action;
-                                s.pending_action_deadline_ms = now_ms + 250;
-                            }
-                            HttpControlAction::UpdateConfig
-                            | HttpControlAction::ExecuteCliCommand => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snapshot,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                                sync_config_to_runtime(s);
-                            }
-                            HttpControlAction::TriggerWifiScan => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snapshot,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                            }
-                            HttpControlAction::ConnectWifi => {
-                                if let Some(creds) = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snapshot,
-                                    s.config,
-                                    &mut *s.journal,
-                                ) {
-                                    if let Ok(ssid_cfg) = creds.ssid.as_str().try_into() {
-                                        let auth_cfg = if creds.password.is_empty() {
-                                            AuthenticationMethodConfig::Open
-                                        } else if let Ok(pw) = creds.password.as_str().try_into() {
-                                            AuthenticationMethodConfig::WpaWpa2Personal(pw)
-                                        } else {
-                                            AuthenticationMethodConfig::Open
-                                        };
-                                        let sta_cfg = WifiModeConfig::Station(
-                                            StationConfig::default()
-                                                .with_ssid(ssid_cfg)
-                                                .with_authentication(auth_cfg),
-                                        );
-                                        let _ = s.wifi_controller.set_config(&sta_cfg);
-                                        s.last_connect_attempt_ms = 0;
-                                    }
-                                }
-                            }
-                            HttpControlAction::DisconnectWifi => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snap,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                                s.assigned_ip = None;
-                                s.last_connect_attempt_ms = now_ms;
-                            }
-                            HttpControlAction::StartOtaFlash => {
-                                let _ = dispatch_web_post_action(
-                                    action,
-                                    &req_buf[..req_len],
-                                    &snap,
-                                    s.config,
-                                    &mut *s.journal,
-                                );
-                                s.pending_http_action = HttpControlAction::PersistOta0AndReboot;
-                                s.pending_action_deadline_ms = now_ms + 250;
-                            }
-                            _ => {}
-                        }
+                        Some(action)
                     } else {
                         http_sock.close();
-                        s.pending_http_closing = true;
-                        s.pending_close_deadline_ms = now_ms + 250;
+                        slot.closing = true;
+                        slot.close_deadline_ms = now_ms + 500;
+                        None
                     }
+                };
+
+                if let Some(action) = action_opt {
+                    match action {
+                        HttpControlAction::SetEqPreset(preset_id) => {
+                            let preset = EqPreset::from_u8(preset_id);
+                            s.pipeline.apply_eq_preset(preset);
+                            s.config.update(|c| c.equalizer_preset = preset_id);
+                            let _ = s.config.set_nvs_override("equalizer", "");
+                            let _ = s.config.flush_now(&mut *s.journal);
+                        }
+                        HttpControlAction::SetAnalogGain(again_code) => {
+                            let clamped = again_code.min(31);
+                            let _ = s.amp.set_analog_gain(clamped);
+                            s.config.update(|c| c.analog_gain_code = clamped);
+                            let _ = s.config.flush_now(&mut *s.journal);
+                        }
+                        HttpControlAction::PlayerIrCommand {
+                            ir_code,
+                            vol_pct,
+                            mute,
+                        } => {
+                            if let Some(pct) = vol_pct {
+                                let clamped = pct.min(100);
+                                s.current_vol_pct = clamped;
+                                let mut backend = Esp32AudioBackend::new(
+                                    s.amp,
+                                    DeviceClockRegs,
+                                    &DMA_OUTSTANDING_FRAMES,
+                                );
+                                s.coordinator
+                                    .set_volume_percent(clamped, &mut backend, s.pipeline);
+                                let _ = s.cyd_bridge.send_message(&CydMessage::Volume(clamped));
+                                s.config.update(|c| c.volume = clamped);
+                                let _ = s.config.flush_now(&mut *s.journal);
+                            }
+                            if let Some(m) = mute {
+                                s.pipeline.set_mute(m);
+                            }
+                            if ir_code != 0 && s.helo_sent {
+                                let mut ir_buf = [0u8; 32];
+                                if let Ok(ir_len) =
+                                    SlimprotoBuilder::build_ir(now_ms as u32, ir_code, &mut ir_buf)
+                                {
+                                    let slim_sock = s.sockets.get_mut::<tcp::Socket>(s.slim_handle);
+                                    let mut link = SmoltcpSlimTransport::new(
+                                        DeviceSmolTcp::new(slim_sock),
+                                        &mut s.slim_link,
+                                    );
+                                    let _ = link.send(&ir_buf[..ir_len]);
+                                }
+                            }
+                        }
+                        HttpControlAction::SpotifyPlay => {
+                            if s.coordinator.request_source(AudioSource::Spotify) {
+                                if s.coordinator.current_sample_rate != 44_100
+                                    || s.pipeline.sample_rate != 44_100
+                                {
+                                    s.coordinator.current_sample_rate = 44_100;
+                                    let _ = s.pipeline.set_sample_rate(44_100);
+                                }
+                                s.pipeline
+                                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                                s.pipeline.begin_external_audio();
+                                s.pipeline.set_mute(false);
+                                s.coordinator.begin_external_playback();
+                                if s.amp.mode() != louder_esp32_app::AmpMode::Play {
+                                    let _ = s.amp.clear_faults();
+                                    let _ = s.amp.start_playback_via_hiz();
+                                }
+                                s.spot_streaming = true;
+                            }
+                        }
+                        HttpControlAction::SpotifyStop => {
+                            s.spot_streaming = false;
+                            s.coordinator.release_source(AudioSource::Spotify);
+                            restore_suspended_or_stop(s);
+                        }
+                        HttpControlAction::RebootToRecovery
+                        | HttpControlAction::PersistOta0AndReboot => {
+                            s.pending_http_action = action;
+                            s.pending_action_deadline_ms = now_ms + 250;
+                        }
+                        HttpControlAction::UpdateConfig | HttpControlAction::ExecuteCliCommand => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snapshot,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                            sync_config_to_runtime(s);
+                        }
+                        HttpControlAction::TriggerWifiScan => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snapshot,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                        }
+                        HttpControlAction::ConnectWifi => {
+                            if let Some(creds) = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snapshot,
+                                s.config,
+                                &mut *s.journal,
+                            ) {
+                                if let Ok(ssid_cfg) = creds.ssid.as_str().try_into() {
+                                    let auth_cfg = if creds.password.is_empty() {
+                                        AuthenticationMethodConfig::Open
+                                    } else if let Ok(pw) = creds.password.as_str().try_into() {
+                                        AuthenticationMethodConfig::WpaWpa2Personal(pw)
+                                    } else {
+                                        AuthenticationMethodConfig::Open
+                                    };
+                                    let sta_cfg = WifiModeConfig::Station(
+                                        StationConfig::default()
+                                            .with_ssid(ssid_cfg)
+                                            .with_authentication(auth_cfg),
+                                    );
+                                    let _ = s.wifi_controller.set_config(&sta_cfg);
+                                    s.last_connect_attempt_ms = 0;
+                                }
+                            }
+                        }
+                        HttpControlAction::DisconnectWifi => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snap,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                            s.assigned_ip = None;
+                            s.last_connect_attempt_ms = now_ms;
+                        }
+                        HttpControlAction::StartOtaFlash => {
+                            let _ = dispatch_web_post_action(
+                                action,
+                                &s.http_req_buf[..req_len],
+                                &snap,
+                                s.config,
+                                &mut *s.journal,
+                            );
+                            s.pending_http_action = HttpControlAction::PersistOta0AndReboot;
+                            s.pending_action_deadline_ms = now_ms + 250;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3931,20 +4623,32 @@ mod xtensa_hw {
                 }
                 HttpControlAction::PersistOta0AndReboot => {
                     let entry_bytes = OtaSelectEntry::new_ota_0().to_bytes();
-                    let mut verify_buf = [0u8; 32];
-                    if s.flash
-                        .write_nor(OTADATA_PARTITION_OFFSET, &entry_bytes)
-                        .is_ok()
-                        && s.flash
-                            .read_nor(OTADATA_PARTITION_OFFSET, &mut verify_buf)
-                            .is_ok()
-                        && verify_buf == entry_bytes
-                    {
+                    if persist_ota0_if_parked_ctx(
+                        s,
+                        &entry_bytes,
+                        |s: &mut DeviceRuntimeState| s.core1.park_for_flash_write(),
+                        |s: &mut DeviceRuntimeState, bytes| {
+                            s.flash
+                                .write_nor(OTADATA_PARTITION_OFFSET, bytes)
+                                .map_err(|_| ())
+                        },
+                        |s: &mut DeviceRuntimeState, buf| {
+                            s.flash
+                                .read_nor(OTADATA_PARTITION_OFFSET, buf)
+                                .map_err(|_| ())
+                        },
+                        |s: &mut DeviceRuntimeState| s.core1.unpark_after_flash_write(),
+                    ) {
                         println!(
                             "[ANTI-BRICK GATE 4] HTTP /reboot.json or /reboot_ota.json -> \
                              wrote ota_0 select entry & resetting"
                         );
                         esp_hal::system::software_reset();
+                    } else {
+                        println!(
+                            "[ANTI-BRICK GATE 4] PersistOta0AndReboot aborted \
+                             (Core 1 park timeout or verify failed)"
+                        );
                     }
                 }
                 _ => {}
@@ -4066,10 +4770,10 @@ mod xtensa_hw {
             *slim_switch_to = Some(ip);
         }
 
-        while let Some(msg) = coordinator.take_cyd_message() {
+        while let Some(mut msg) = coordinator.take_cyd_message() {
             if let CydMessage::Volume(pct) = msg {
-                *current_vol_pct = pct;
-                config.update(|c| c.volume = pct);
+                let clamped = sync_volume_percent(pct, current_vol_pct, config);
+                msg = CydMessage::Volume(clamped);
             }
             let _ = cyd_bridge.send_message(&msg);
         }
@@ -4538,12 +5242,13 @@ mod xtensa_hw {
         if let Ok(Some(cmd)) = s.cyd_bridge.poll_command() {
             let mut backend =
                 Esp32AudioBackend::new(s.amp, DeviceClockRegs, &DMA_OUTSTANDING_FRAMES);
-            if let Some(reply) = s
+            if let Some(mut reply) = s
                 .coordinator
                 .handle_cyd_command(cmd, &mut backend, s.pipeline)
             {
                 if let CydMessage::Volume(pct) = reply {
-                    s.config.update(|c| c.volume = pct.min(100));
+                    let clamped = sync_volume_percent(pct, &mut s.current_vol_pct, s.config);
+                    reply = CydMessage::Volume(clamped);
                 }
                 let _ = s.cyd_bridge.flush_outbound(&reply);
             }
@@ -4594,11 +5299,11 @@ mod xtensa_hw {
                     && now_ms.saturating_sub(s.last_fault_recovery_ms) >= 30_000
                 {
                     s.last_fault_recovery_ms = now_ms;
-                    let _ = s.amp.recover_from_fault();
+                    let (level, msg) = amp_fault_recovery_syslog(s.amp.recover_from_fault());
                     louder_esp32_app::http_control::push_runtime_syslog(
-                        "WARN",
+                        level,
                         "MESSAGING_CLASS_SYSTEM",
-                        "amp: TAS5805M fault detected and cleared",
+                        msg,
                         now_ms,
                     );
                 }
@@ -4621,25 +5326,21 @@ mod xtensa_hw {
 
         if now_ms.saturating_sub(s.last_config_poll_ms) >= 100 {
             s.last_config_poll_ms = now_ms;
-            if s.config_writer.poll(s.config, &mut *s.journal, now_ms) {
-                if let Some(image) = s.journal.pending_image() {
-                    s.core1.park_for_flash_write();
-                    #[cfg(not(feature = "runtime-flash-persist"))]
-                    let offset = SETTINGS_JOURNAL_OFFSET;
-                    #[cfg(feature = "runtime-flash-persist")]
-                    let offset = image.slot.offset(SETTINGS_JOURNAL_OFFSET);
-                    let _ = s.flash.erase(offset, offset + 4096);
-                    if image.used_len > 16 {
-                        let _ = s
-                            .flash
-                            .write_nor(offset + 16, &image.sector[16..image.used_len]);
-                    }
-                    let _ = s.flash.write_nor(offset + 2048, &image.sector[2048..4096]);
-                    let _ = s.flash.write_nor(offset, &image.sector[..16]);
-                    s.journal.mark_flash_written();
-                    s.core1.unpark_after_flash_write();
-                }
-            }
+            let elapsed_ms = now_ms
+                .saturating_sub(s.last_bt_window_tick_ms)
+                .min(u32::MAX as u64) as u32;
+            s.last_bt_window_tick_ms = now_ms;
+            sync_bt_security_from_config(s.bt_sink, s.config, &mut s.bt_sync_state, elapsed_ms);
+            let mut flash_ctx = (&mut s.core1, &mut s.flash);
+            let _ = poll_and_persist_journal_with_ctx(
+                &mut flash_ctx,
+                (s.config, &mut s.config_writer, &mut *s.journal),
+                (&mut s.last_flash_retry_ms, now_ms, SETTINGS_JOURNAL_OFFSET),
+                |ctx| ctx.0.park_for_flash_write(),
+                |ctx, start, end| ctx.1.erase(start, end),
+                |ctx, addr, data| ctx.1.write_nor(addr, data),
+                |ctx| ctx.0.unpark_after_flash_write(),
+            );
         }
     }
 
@@ -4688,6 +5389,7 @@ mod tests {
         );
 
         let mut coordinator = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
+        coordinator.state = PlayerState::Paused;
         let mut cyd_bridge = CydUartBridge::new(LoopbackUartPort::new());
         let mut amp = AmpManager::for_active_board(TargetI2cBus::new());
         amp.initialize(32).unwrap();
@@ -4723,6 +5425,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
@@ -4935,5 +5638,566 @@ mod tests {
         assert!(!can_send_mdns_multicast_reply(Some(1_000), 1_999));
         assert!(can_send_mdns_multicast_reply(Some(1_000), 2_000));
         assert!(can_send_mdns_multicast_reply(Some(1_000), 5_000));
+    }
+
+    #[test]
+    fn test_core1_park_timeout_skips_hw_park_and_clears_req() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let req = AtomicBool::new(false);
+        let parked = AtomicBool::new(false);
+        let mut parked_hw = false;
+        let mut hw_park_called = false;
+
+        let res = park_core1_cooperative(true, &mut parked_hw, &req, &parked, 8, || {
+            hw_park_called = true;
+        });
+
+        assert_eq!(res, Err(Core1ParkError::AckTimeout));
+        assert!(!hw_park_called);
+        assert!(!parked_hw);
+        assert!(!req.load(Ordering::Acquire));
+
+        let mut hw_unpark_called = false;
+        unpark_core1_cooperative(true, &mut parked_hw, &req, &parked, 8, || {
+            hw_unpark_called = true;
+        });
+        assert!(!hw_unpark_called);
+    }
+
+    #[test]
+    fn test_core1_park_and_unpark_handshake_symmetry() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let req = AtomicBool::new(false);
+        let parked = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let mut parked_hw = false;
+        let mut hw_park_called = false;
+
+        let res = std::thread::scope(|scope| {
+            let core1 = scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    if req.load(Ordering::Acquire) {
+                        parked.store(true, Ordering::Release);
+                        while req.load(Ordering::Acquire) {
+                            core::hint::spin_loop();
+                        }
+                        parked.store(false, Ordering::Release);
+                    }
+                    core::hint::spin_loop();
+                }
+            });
+            let res = park_core1_cooperative(true, &mut parked_hw, &req, &parked, 200_000, || {
+                hw_park_called = true;
+            });
+            assert_eq!(res, Ok(()));
+            assert!(hw_park_called);
+            assert!(parked_hw);
+            assert!(req.load(Ordering::Acquire));
+
+            let mut hw_unpark_called = false;
+            unpark_core1_cooperative(true, &mut parked_hw, &req, &parked, 200_000, || {
+                hw_unpark_called = true;
+            });
+            stop.store(true, Ordering::Release);
+            let _ = core1.join();
+            assert!(hw_unpark_called);
+            res
+        });
+        assert_eq!(res, Ok(()));
+        assert!(!parked_hw);
+        assert!(!req.load(Ordering::Acquire));
+        assert!(!parked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_core1_park_rejects_stuck_parked_and_drains_late_ack() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let req = AtomicBool::new(false);
+        let parked = AtomicBool::new(true);
+        let mut parked_hw = false;
+        let mut hw_called = false;
+
+        // Stuck CORE1_PARKED=true while !parked_hw aborts without setting req.
+        let res = park_core1_cooperative(true, &mut parked_hw, &req, &parked, 8, || {
+            hw_called = true;
+        });
+        assert_eq!(res, Err(Core1ParkError::AckTimeout));
+        assert!(!hw_called);
+        assert!(!parked_hw);
+        assert!(!req.load(Ordering::Acquire));
+
+        // Post-timeout drain clears transient late CORE1_PARKED ack cleanly.
+        let req2 = AtomicBool::new(false);
+        let parked2 = AtomicBool::new(false);
+        let ready = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let res2 = std::thread::scope(|scope| {
+            let late_core1 = scope.spawn(|| {
+                ready.store(true, Ordering::Release);
+                while !req2.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                // Wait until park_req drops, then briefly pulse parked2=true.
+                while req2.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                parked2.store(true, Ordering::Release);
+                std::thread::yield_now();
+                parked2.store(false, Ordering::Release);
+            });
+            while !ready.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            let out = park_core1_cooperative(true, &mut parked_hw, &req2, &parked2, 50_000, || {
+                hw_called = true;
+            });
+            stop.store(true, Ordering::Release);
+            let _ = late_core1.join();
+            out
+        });
+        assert_eq!(res2, Err(Core1ParkError::AckTimeout));
+        assert!(!hw_called);
+        assert!(!parked2.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_core1_park_idempotent_when_already_parked_or_inactive() {
+        use core::sync::atomic::AtomicBool;
+        let req = AtomicBool::new(false);
+        let parked = AtomicBool::new(false);
+        let mut parked_hw = false;
+        let mut hw_calls = 0usize;
+
+        assert_eq!(
+            park_core1_cooperative(false, &mut parked_hw, &req, &parked, 8, || {
+                hw_calls += 1;
+            }),
+            Ok(())
+        );
+        assert_eq!(hw_calls, 0);
+
+        parked_hw = true;
+        assert_eq!(
+            park_core1_cooperative(true, &mut parked_hw, &req, &parked, 8, || {
+                hw_calls += 1;
+            }),
+            Ok(())
+        );
+        assert_eq!(hw_calls, 0);
+    }
+
+    #[test]
+    fn test_write_journal_sector_aborts_on_erase_or_write_errors() {
+        let sector = [0xA5u8; 4096];
+        let mut writes = 0usize;
+        let err_erase = write_journal_sector_with(
+            0x3FE000,
+            &sector,
+            256,
+            |_, _| Err::<(), ()>(()),
+            |_, _| {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(err_erase, Err(()));
+        assert_eq!(writes, 0);
+
+        for fail_at in 1..=3 {
+            let mut seen = 0usize;
+            let res = write_journal_sector_with(
+                0x3FE000,
+                &sector,
+                256,
+                |_, _| Ok::<(), ()>(()),
+                |_, _| {
+                    seen += 1;
+                    if seen == fail_at {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(res, Err(()));
+            assert_eq!(seen, fail_at);
+        }
+    }
+
+    #[test]
+    fn test_write_journal_sector_clamps_used_len_to_2048() {
+        let mut sector = [0u8; 4096];
+        sector[..16].fill(0x11);
+        sector[16..2048].fill(0x22);
+        sector[2048..4096].fill(0x33);
+        let mut recorded: Vec<(u32, usize)> = Vec::new();
+        let res = write_journal_sector_with(
+            0x3FE000,
+            &sector,
+            3500,
+            |start, end| {
+                assert_eq!((start, end), (0x3FE000, 0x3FF000));
+                Ok::<(), ()>(())
+            },
+            |addr, data| {
+                recorded.push((addr, data.len()));
+                Ok(())
+            },
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(
+            recorded,
+            vec![(0x3FE010, 2032), (0x3FE800, 2048), (0x3FE000, 16)]
+        );
+    }
+
+    #[test]
+    fn test_write_journal_sector_skips_body_when_used_len_le_16() {
+        let sector = [0x5Au8; 4096];
+        let mut recorded: Vec<(u32, usize)> = Vec::new();
+        let res = write_journal_sector_with(
+            0x3FE000,
+            &sector,
+            16,
+            |_, _| Ok::<(), ()>(()),
+            |addr, data| {
+                recorded.push((addr, data.len()));
+                Ok(())
+            },
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(recorded, vec![(0x3FE800, 2048), (0x3FE000, 16)]);
+    }
+
+    #[test]
+    fn test_write_journal_sector_with_ctx_symmetric_park_unpark() {
+        struct MockCtx {
+            parks: usize,
+            erases: usize,
+            writes: usize,
+            unparks: usize,
+            fail_park: bool,
+            fail_write: bool,
+        }
+
+        let sector = [0x5Au8; 4096];
+        let run = |used_len: usize, fail_park: bool, fail_write: bool| {
+            let mut ctx = MockCtx {
+                parks: 0,
+                erases: 0,
+                writes: 0,
+                unparks: 0,
+                fail_park,
+                fail_write,
+            };
+            let res = write_journal_sector_with_ctx(
+                &mut ctx,
+                (0x3FE000, &sector, used_len),
+                |c| {
+                    c.parks += 1;
+                    if c.fail_park {
+                        Err(Core1ParkError::AckTimeout)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |c, _, _| {
+                    c.erases += 1;
+                    Ok::<(), ()>(())
+                },
+                |c, _, _| {
+                    c.writes += 1;
+                    if c.fail_write {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |c| {
+                    c.unparks += 1;
+                },
+            );
+            (res, ctx.parks, ctx.erases, ctx.writes, ctx.unparks)
+        };
+
+        // Invalid lengths abort before parking or touching flash.
+        assert_eq!(run(0, false, false), (Err(()), 0, 0, 0, 0));
+        assert_eq!(run(4097, false, false), (Err(()), 0, 0, 0, 0));
+
+        // Park timeout skips flash I/O and does not unpark.
+        assert_eq!(run(256, true, false), (Err(()), 1, 0, 0, 0));
+
+        // Both Ok and Err flash paths unpark symmetrically once.
+        assert_eq!(run(256, false, false), (Ok(()), 1, 1, 3, 1));
+        assert_eq!(run(256, false, true), (Err(()), 1, 1, 1, 1));
+    }
+
+    #[test]
+    fn test_sync_volume_percent_clamps_and_updates_both_targets() {
+        let cfg =
+            louder_esp32_app::config_handle::ConfigHandle::new(first_boot_defaults::audio_config());
+        let mut current_vol_pct = 10u8;
+        let clamped = sync_volume_percent(150, &mut current_vol_pct, &cfg);
+        assert_eq!(clamped, 100);
+        assert_eq!(current_vol_pct, 100);
+        assert_eq!(cfg.read(|c| c.volume), 100);
+
+        let exact = sync_volume_percent(42, &mut current_vol_pct, &cfg);
+        assert_eq!(exact, 42);
+        assert_eq!(current_vol_pct, 42);
+        assert_eq!(cfg.read(|c| c.volume), 42);
+    }
+
+    #[test]
+    fn test_amp_fault_recovery_syslog_only_cleared_on_ok() {
+        assert_eq!(
+            amp_fault_recovery_syslog::<()>(Ok(())),
+            ("WARN", "amp: TAS5805M fault detected and cleared")
+        );
+        assert_eq!(
+            amp_fault_recovery_syslog(Err("i2c")),
+            ("ERROR", "amp: TAS5805M fault recovery failed")
+        );
+    }
+
+    #[test]
+    fn test_persist_ota0_aborts_on_core1_park_timeout_and_unparks_on_verify_fail() {
+        let entry = [0x5Au8; 32];
+        let mut writes = 0usize;
+        let mut reads = 0usize;
+        let mut unparks = 0usize;
+
+        let aborted = persist_ota0_if_parked(
+            &entry,
+            || Err(Core1ParkError::AckTimeout),
+            |_| {
+                writes += 1;
+                Ok(())
+            },
+            |_| {
+                reads += 1;
+                Ok(())
+            },
+            || {
+                unparks += 1;
+            },
+        );
+        assert!(!aborted);
+        assert_eq!(writes, 0);
+        assert_eq!(reads, 0);
+        assert_eq!(unparks, 0);
+
+        // Verification mismatch must unpark Core 1 instead of leaving it frozen.
+        let verify_failed = persist_ota0_if_parked(
+            &entry,
+            || Ok(()),
+            |_| {
+                writes += 1;
+                Ok(())
+            },
+            |buf| {
+                reads += 1;
+                buf.fill(0xFF);
+                Ok(())
+            },
+            || {
+                unparks += 1;
+            },
+        );
+        assert!(!verify_failed);
+        assert_eq!(writes, 1);
+        assert_eq!(reads, 1);
+        assert_eq!(unparks, 1);
+    }
+
+    #[test]
+    fn test_bt_boot_init_and_runtime_config_pairing_window_and_bonds_persist() {
+        let cfg =
+            louder_esp32_app::config_handle::ConfigHandle::new(first_boot_defaults::audio_config());
+        let mut sink = louder_esp32_app::bt_a2dp::BtA2dpSink::new();
+
+        // Fresh unbonded speaker opens 180s Just Works pairing window at boot.
+        let mut sync_state = init_bt_sink_security_from_config(&mut sink, &cfg);
+        assert!(sink.is_pairing_window_open());
+        assert_eq!(
+            sink.security_policy.pairing_policy,
+            louder_esp32_app::bt_a2dp::BtPairingPolicy::SspJustWorks
+        );
+        assert_eq!(sink.pairing_window_remaining_ms, 180_000);
+
+        // Runtime PIN override and forced bt_discoverable="0" close window.
+        assert!(cfg.set_nvs_override("bt_sink_pin", "4321"));
+        assert!(cfg.set_nvs_override("bt_discoverable", "0"));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert_eq!(sink.security_policy.pin_code(), b"4321");
+        assert!(!sink.is_pairing_window_open());
+
+        // bt_pair="1" re-opens 180s pairing window and clears back to "0".
+        assert!(cfg.set_nvs_override("bt_pair", "1"));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert!(sink.is_pairing_window_open());
+        assert_eq!(cfg.nvs_override("bt_pair").as_deref(), Some("0"));
+
+        // Save 4 peers (exceeds single 64-byte slot) and reload cleanly.
+        for i in 1u8..=4 {
+            sink.save_bond_key_with_type(&[0xA0, 0x00, 0x00, 0x00, 0x00, i], &[i; 16], 0x05);
+        }
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        let mut reloaded = louder_esp32_app::bt_a2dp::BtA2dpSink::new();
+        let _ = init_bt_sink_security_from_config(&mut reloaded, &cfg);
+        assert_eq!(reloaded.bonded_peer_count(), 4);
+        assert!(!reloaded.is_pairing_window_open());
+        assert_eq!(
+            reloaded.find_bond_key(&[0xA0, 0x00, 0x00, 0x00, 0x00, 4]),
+            Some([4u8; 16])
+        );
+    }
+
+    #[test]
+    fn test_bt_numeric_pair_and_confirm_config_overrides() {
+        let cfg =
+            louder_esp32_app::config_handle::ConfigHandle::new(first_boot_defaults::audio_config());
+        let mut sink = louder_esp32_app::bt_a2dp::BtA2dpSink::new();
+        sink.init_step = louder_esp32_app::bt_a2dp::InitStep::Completed;
+        let mut sync_state = init_bt_sink_security_from_config(&mut sink, &cfg);
+
+        // bt_pair="numeric:120" opens SspNumericComparison for 120s.
+        assert!(cfg.set_nvs_override("bt_pair", "numeric:120"));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert!(sink.is_pairing_window_open());
+        assert_eq!(
+            sink.security_policy.pairing_policy,
+            louder_esp32_app::bt_a2dp::BtPairingPolicy::SspNumericComparison
+        );
+        assert_eq!(sink.pairing_window_remaining_ms, 120_000);
+        assert_eq!(cfg.nvs_override("bt_pair").as_deref(), Some("0"));
+
+        // Matching 6-digit passkey accepts pending numeric confirmation.
+        let peer_addr = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        sink.pending_numeric_confirmation = Some((peer_addr, 298));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert_eq!(
+            sync_state.last_pending_numeric_passkey,
+            Some((peer_addr, 298))
+        );
+
+        assert!(cfg.set_nvs_override("bt_confirm", "000298"));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert_eq!(sink.pending_numeric_passkey(), None);
+        assert_eq!(sync_state.last_pending_numeric_passkey, None);
+        assert_eq!(cfg.nvs_override("bt_confirm").as_deref(), Some(""));
+
+        // bt_pair="numeric" opens default 180s window; bt_confirm="no" rejects.
+        assert!(cfg.set_nvs_override("bt_pair", "numeric"));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert_eq!(sink.pairing_window_remaining_ms, 180_000);
+        sink.pending_numeric_confirmation = Some((peer_addr, 654_321));
+        assert!(cfg.set_nvs_override("bt_confirm", "no"));
+        sync_bt_security_from_config(&mut sink, &cfg, &mut sync_state, 0);
+        assert_eq!(sink.pending_numeric_passkey(), None);
+        assert_eq!(cfg.nvs_override("bt_confirm").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_flush_now_pending_journal_still_persists_to_flash() {
+        use louder_esp32_app::config_handle::{
+            ConfigHandle, ConfigWriter, FlashTargetPolicy, JournalSector, RamJournal, DEBOUNCE_MS,
+        };
+        use louder_esp32_app::ota_safety::SETTINGS_JOURNAL_OFFSET;
+
+        let mut config = ConfigHandle::new(first_boot_defaults::audio_config());
+        let mut image = JournalSector::erased();
+        let mut journal = RamJournal::new(&mut image, None, FlashTargetPolicy::FixedA);
+        let mut writer = ConfigWriter::new(&config, 0);
+        let mut last_flash_retry_ms: Option<u64> = None;
+
+        assert!(config.apply_key_value("lms_server_ip", "172.25.8.40:9000"));
+        assert!(config.flush_now(&mut journal));
+        assert!(!config.is_dirty());
+        assert!(journal.pending_image().is_some());
+
+        let mut fail_ctx = true;
+        let failed = poll_and_persist_journal_with_ctx(
+            &mut fail_ctx,
+            (&config, &mut writer, &mut journal),
+            (&mut last_flash_retry_ms, 100, SETTINGS_JOURNAL_OFFSET),
+            |fail| {
+                if *fail {
+                    Err(Core1ParkError::AckTimeout)
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| Ok::<(), ()>(()),
+            |_, _, _| Ok::<(), ()>(()),
+            |_| {},
+        );
+        assert!(!failed);
+        assert!(journal.pending_image().is_some());
+
+        let mut ok_ctx = ([0xFFu8; 4096], 0usize, 0usize, 0usize, 0usize);
+        let skipped = poll_and_persist_journal_with_ctx(
+            &mut ok_ctx,
+            (&config, &mut writer, &mut journal),
+            (&mut last_flash_retry_ms, 200, SETTINGS_JOURNAL_OFFSET),
+            |c| {
+                c.3 += 1;
+                Ok(())
+            },
+            |c, _, _| {
+                c.1 += 1;
+                c.0.fill(0xFF);
+                Ok::<(), ()>(())
+            },
+            |c, addr, data| {
+                c.2 += 1;
+                let off = (addr - SETTINGS_JOURNAL_OFFSET) as usize;
+                c.0[off..off + data.len()].copy_from_slice(data);
+                Ok::<(), ()>(())
+            },
+            |c| {
+                c.4 += 1;
+            },
+        );
+        assert!(!skipped);
+        assert_eq!((ok_ctx.1, ok_ctx.2, ok_ctx.3, ok_ctx.4), (0, 0, 0, 0));
+
+        let persisted = poll_and_persist_journal_with_ctx(
+            &mut ok_ctx,
+            (&config, &mut writer, &mut journal),
+            (
+                &mut last_flash_retry_ms,
+                100 + u64::from(DEBOUNCE_MS),
+                SETTINGS_JOURNAL_OFFSET,
+            ),
+            |c| {
+                c.3 += 1;
+                Ok(())
+            },
+            |c, _, _| {
+                c.1 += 1;
+                c.0.fill(0xFF);
+                Ok::<(), ()>(())
+            },
+            |c, addr, data| {
+                c.2 += 1;
+                let off = (addr - SETTINGS_JOURNAL_OFFSET) as usize;
+                c.0[off..off + data.len()].copy_from_slice(data);
+                Ok::<(), ()>(())
+            },
+            |c| {
+                c.4 += 1;
+            },
+        );
+        assert!(persisted);
+        assert!(journal.pending_image().is_none());
+        assert_eq!((ok_ctx.1, ok_ctx.2, ok_ctx.3, ok_ctx.4), (1, 3, 1, 1));
+        assert_eq!(&ok_ctx.0[2048..2052], b"NVS2");
     }
 }

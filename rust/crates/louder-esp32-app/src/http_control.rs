@@ -21,7 +21,6 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use heapless::String;
 
-use squeezelite_cspot::crypto::hmac_sha1;
 use squeezelite_cspot::crypto::OakleyGroup1Dh;
 use squeezelite_cspot::zeroconf::ZeroConfServer;
 
@@ -326,16 +325,17 @@ impl<'a> core::fmt::Write for BufferWriter<'a> {
 }
 
 /// Writes a string slice escaped for JSON output (escaping `"`, `\`, and
-/// ASCII control chars < 0x20).
+/// ASCII control chars < 0x20) while preserving multi-byte UTF-8 characters.
 pub fn write_json_escaped_str<W: core::fmt::Write>(mut writer: W, s: &str) -> core::fmt::Result {
-    for b in s.bytes() {
-        match b {
-            b'"' => writer.write_str("\\\"")?,
-            b'\\' => writer.write_str("\\\\")?,
-            b'\n' => writer.write_str("\\n")?,
-            b'\r' => writer.write_str("\\r")?,
-            b'\t' => writer.write_str("\\t")?,
-            0x00..=0x1F => {
+    for ch in s.chars() {
+        match ch {
+            '"' => writer.write_str("\\\"")?,
+            '\\' => writer.write_str("\\\\")?,
+            '\n' => writer.write_str("\\n")?,
+            '\r' => writer.write_str("\\r")?,
+            '\t' => writer.write_str("\\t")?,
+            '\x00'..='\x1F' => {
+                let b = ch as u8;
                 let hex_digits = b"0123456789abcdef";
                 let hi = hex_digits[(b >> 4) as usize] as char;
                 let lo = hex_digits[(b & 0x0F) as usize] as char;
@@ -343,7 +343,7 @@ pub fn write_json_escaped_str<W: core::fmt::Write>(mut writer: W, s: &str) -> co
                 writer.write_char(hi)?;
                 writer.write_char(lo)?;
             }
-            _ => writer.write_char(b as char)?,
+            _ => writer.write_char(ch)?,
         }
     }
     Ok(())
@@ -599,6 +599,20 @@ pub fn write_config_json(
     let mut writer = BufferWriter::new(out_buf);
     let find_override =
         |k: &str| -> Option<&str> { extra_entries.iter().find(|e| e.key == k).map(|e| e.value) };
+    let (effective_lms_ip, effective_lms_port) = find_override("lms_server_ip")
+        .and_then(crate::config_handle::parse_lms_server_endpoint)
+        .map(|(ip, port_opt)| (ip, port_opt.unwrap_or(snapshot.lms_port)))
+        .or_else(|| {
+            find_override("lms_ip")
+                .and_then(crate::config_handle::parse_lms_server_endpoint)
+                .map(|(ip, _)| (ip, snapshot.lms_port))
+        })
+        .unwrap_or((snapshot.lms_ip, snapshot.lms_port));
+    let fallback_player_name = if !snapshot.player_name.is_empty() {
+        snapshot.player_name
+    } else {
+        crate::board::first_boot_defaults::PLAYER_NAME
+    };
     write!(
         writer,
         "{{\"settings_seq\":{},\"gpio\":[",
@@ -625,11 +639,11 @@ pub fn write_config_json(
          \"lms_ip\":\"{}.{}.{}.{}\",\"lms_port\":{},\"lms_cport\":{},\
          \"vol_pct\":{},\"eq_preset\":\"{}\",\"again_code\":{}",
         JsonEscaped(snapshot.ssid),
-        snapshot.lms_ip[0],
-        snapshot.lms_ip[1],
-        snapshot.lms_ip[2],
-        snapshot.lms_ip[3],
-        snapshot.lms_port,
+        effective_lms_ip[0],
+        effective_lms_ip[1],
+        effective_lms_ip[2],
+        effective_lms_ip[3],
+        effective_lms_port,
         snapshot.lms_cport,
         snapshot.vol_pct,
         JsonEscaped(snapshot.eq_preset),
@@ -640,7 +654,12 @@ pub fn write_config_json(
         if crate::config_handle::is_secret_config_key(key) {
             continue;
         }
-        let effective_val = find_override(key).unwrap_or(val);
+        let default_val = if key == "host_name" {
+            fallback_player_name
+        } else {
+            val
+        };
+        let effective_val = find_override(key).unwrap_or(default_val);
         write!(
             writer,
             ",\"{}\":{{\"value\":\"{}\",\"type\":{}}}",
@@ -661,17 +680,22 @@ pub fn write_config_json(
         {
             continue;
         }
+        let nvs_type_code: u8 = match entry.entry_type {
+            "u8" | "1" => crate::config_handle::NVS_TYPE_U8,
+            "u16" | "2" => 2,
+            "u32" | "4" => 4,
+            _ => crate::config_handle::NVS_TYPE_STR,
+        };
         write!(
             writer,
-            ",\"{}\":{{\"value\":\"{}\",\"type\":\"{}\"}}",
+            ",\"{}\":{{\"value\":\"{}\",\"type\":{}}}",
             JsonEscaped(entry.key),
             JsonEscaped(entry.value),
-            JsonEscaped(entry.entry_type),
+            nvs_type_code,
         )
         .ok()?;
     }
-    let host_name_val =
-        find_override("host_name").unwrap_or(crate::board::first_boot_defaults::PLAYER_NAME);
+    let host_name_val = find_override("host_name").unwrap_or(fallback_player_name);
     let autoexec_val = find_override("autoexec").unwrap_or("1");
     let autoexec1_val =
         find_override("autoexec1").unwrap_or("squeezelite -o I2S -b 500:2000 -d all=info -C 30 -W");
@@ -750,7 +774,158 @@ pub fn percent_decode_str<const N: usize>(src: &str) -> Option<String<N>> {
     Some(out)
 }
 
+fn scan_json_string(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix('"')?;
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return Some((&rest[..i], &rest[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_json_composite(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let first = *bytes.first()?;
+    if first != b'{' && first != b'[' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let (_, after) = scan_json_string(&s[i..])?;
+                i = s.len() - after.len();
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+                if depth == 0 {
+                    return Some((&s[..i], &s[i..]));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn is_valid_json_primitive(s: &str) -> bool {
+    if matches!(s, "true" | "false" | "null") {
+        return true;
+    }
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = usize::from(bytes[0] == b'-');
+    if i >= bytes.len() {
+        return false;
+    }
+    if bytes[i] == b'0' {
+        i += 1;
+    } else if bytes[i].is_ascii_digit() {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else {
+        return false;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == frac_start {
+            return false;
+        }
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
+fn scan_json_scalar(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.starts_with('"') {
+        return scan_json_string(s);
+    }
+    let end = s
+        .bytes()
+        .position(|b| matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n'))
+        .unwrap_or(s.len());
+    let prim = &s[..end];
+    if is_valid_json_primitive(prim) {
+        Some((prim, &s[end..]))
+    } else {
+        None
+    }
+}
+
+fn extract_json_member<'a>(input: &'a str, name: &str, want_object: bool) -> Option<&'a str> {
+    let mut cur = input.trim_start().strip_prefix('{')?.trim_start();
+    while !cur.is_empty() && !cur.starts_with('}') {
+        let (key, after_key) = scan_json_string(cur)?;
+        let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+        let rest = if after_colon.starts_with('{') || after_colon.starts_with('[') {
+            let (composite, rest) = skip_json_composite(after_colon)?;
+            if key == name {
+                if want_object && composite.starts_with('{') {
+                    return Some(composite);
+                }
+                return None;
+            }
+            rest
+        } else {
+            let (val, rest) = scan_json_scalar(after_colon)?;
+            if key == name {
+                if want_object {
+                    return None;
+                }
+                return Some(val);
+            }
+            rest
+        };
+        cur = rest.trim_start();
+        if let Some(next) = cur.strip_prefix(',') {
+            cur = next.trim_start();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 fn extract_param_or_json_field<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    if input.trim_start().starts_with('{') {
+        return extract_json_member(input, name, false);
+    }
     for part in input.split('&') {
         let trimmed = part.trim();
         if let Some(rest) = trimmed.strip_prefix(name) {
@@ -760,56 +935,72 @@ fn extract_param_or_json_field<'a>(input: &'a str, name: &str) -> Option<&'a str
             }
         }
     }
-    // Minimal JSON string field fallback with optional whitespace around `:`
-    // e.g. `"name":"value"`, `"name": "value"`, `"name" : "value"`
-    let mut search_from = 0;
-    while let Some(idx) = input[search_from..].find('"') {
-        let key_start = search_from + idx + 1;
-        if input[key_start..].starts_with(name) {
-            let after_name = key_start + name.len();
-            if input[after_name..].starts_with('"') {
-                let rest = &input[after_name + 1..];
-                let rest_trimmed = rest.trim_start();
-                if let Some(after_colon) = rest_trimmed.strip_prefix(':') {
-                    let after_colon_trimmed = after_colon.trim_start();
-                    if let Some(after_quote) = after_colon_trimmed.strip_prefix('"') {
-                        let end = after_quote.find('"')?;
-                        return Some(&after_quote[..end]);
-                    }
-                }
-            }
-        }
-        search_from = key_start;
-    }
     None
 }
 
 fn parse_nested_c_config_update(input: &str) -> Option<ParsedConfigUpdate<'_>> {
-    let cfg_idx = input.find("\"config\"")?;
-    let after_cfg = input[cfg_idx + "\"config\"".len()..].trim_start();
-    let after_colon = after_cfg.strip_prefix(':')?.trim_start();
-    let inner = after_colon.strip_prefix('{')?.trim_start();
-    let after_quote = inner.strip_prefix('"')?;
-    let key_end = after_quote.find('"')?;
-    let key = &after_quote[..key_end];
+    if !input.trim_start().starts_with('{') {
+        return None;
+    }
+    let config_obj = extract_json_member(input, "config", true)?;
+    let inner = config_obj.strip_prefix('{')?.trim_start();
+    if inner.starts_with('}') {
+        return None;
+    }
+    let (key, after_key) = scan_json_string(inner)?;
     if key.is_empty() {
         return None;
     }
-    let entry_rest = &after_quote[key_end + 1..];
-    let value = extract_param_or_json_field(entry_rest, "value").unwrap_or("");
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let (entry_obj, _) = skip_json_composite(after_colon)?;
+    if !entry_obj.starts_with('{') {
+        return None;
+    }
+    let value = extract_json_member(entry_obj, "value", false)?;
     Some(ParsedConfigUpdate { key, value })
 }
 
+fn extract_json_array<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let mut cur = input.trim_start().strip_prefix('{')?.trim_start();
+    while !cur.is_empty() && !cur.starts_with('}') {
+        let (key, after_key) = scan_json_string(cur)?;
+        let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+        let rest = if after_colon.starts_with('{') || after_colon.starts_with('[') {
+            let (composite, rest) = skip_json_composite(after_colon)?;
+            if key == name {
+                if composite.starts_with('[') && composite.ends_with(']') {
+                    return Some(&composite[1..composite.len() - 1]);
+                }
+                return None;
+            }
+            rest
+        } else {
+            let (_, rest) = scan_json_scalar(after_colon)?;
+            if key == name {
+                return None;
+            }
+            rest
+        };
+        cur = rest.trim_start();
+        if let Some(next) = cur.strip_prefix(',') {
+            cur = next.trim_start();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 /// Parses a `key=...&value=...` query/form, flat `{"key":"...","value":"..."}`,
-/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, or `{"fwurl":..}`
-/// JSON body for `/config.json`.
+/// nested C `{"config":{"<key>":{"value":"...","type":33}}}`, `{"fwurl":..}`,
+/// `equalizer=..`, or `{"bands":[b0,...,b9]}` JSON body for `/config.json` and
+/// `/eq.json`.
 #[must_use]
 pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> {
     if let Some(key) = extract_param_or_json_field(input, "key") {
         if !key.is_empty() {
             let value = extract_param_or_json_field(input, "value")
-                .or_else(|| extract_param_or_json_field(input, "val"))
-                .unwrap_or("");
+                .or_else(|| extract_param_or_json_field(input, "val"))?;
             return Some(ParsedConfigUpdate { key, value });
         }
     }
@@ -829,6 +1020,15 @@ pub fn parse_config_update_query(input: &str) -> Option<ParsedConfigUpdate<'_>> 
             return Some(ParsedConfigUpdate {
                 key: "equalizer",
                 value: eq,
+            });
+        }
+    }
+    if let Some(bands_csv) = extract_json_array(input, "bands") {
+        let trimmed = bands_csv.trim();
+        if crate::config_handle::parse_equalizer_bands(trimmed).is_some() {
+            return Some(ParsedConfigUpdate {
+                key: "equalizer",
+                value: trimmed,
             });
         }
     }
@@ -1135,11 +1335,11 @@ impl SyslogRingBuffer {
     /// Appends a message to the ring buffer, overwriting the oldest when full.
     pub fn push(&mut self, uptime_ms: u64, level: &str, msg_class: &str, msg: &str) {
         let mut lvl = String::new();
-        let _ = lvl.push_str(level);
+        push_sanitized_syslog_str(&mut lvl, level);
         let mut cls = String::new();
-        let _ = cls.push_str(msg_class);
+        push_sanitized_syslog_str(&mut cls, msg_class);
         let mut text = String::new();
-        let _ = text.push_str(msg);
+        push_sanitized_syslog_str(&mut text, msg);
         let entry = SyslogRingEntry {
             seq: self.next_seq,
             uptime_ms,
@@ -1207,6 +1407,141 @@ pub fn push_syslog_entry(level: &str, msg_class: &str, msg: &str, timestamp_ms: 
     push_runtime_syslog(level, msg_class, msg, timestamp_ms);
 }
 
+fn is_safe_syslog_char(ch: char) -> bool {
+    (ch as u32) >= 0x20 && ch != '\x7F'
+}
+
+fn push_sanitized_syslog_str<const N: usize>(out: &mut String<N>, src: &str) {
+    for ch in src.chars() {
+        if is_safe_syslog_char(ch) {
+            if out.len() + ch.len_utf8() > N {
+                break;
+            }
+            let _ = out.push(ch);
+        }
+    }
+}
+
+struct SyslogSanitized<'a>(&'a str);
+
+impl<'a> core::fmt::Display for SyslogSanitized<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for ch in self.0.chars() {
+            if is_safe_syslog_char(ch) {
+                f.write_char(ch)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+const ALLOWED_CFG_VERBS: &[&str] = &[
+    "cfg-audio-general",
+    "cfg-audio-tmpl",
+    "cfg-syst-services",
+    "cfg-syst-name",
+    "cfg-hw-preset",
+    "cfg-hw-dac",
+    "cfg-hw-spdif",
+    "cfg-hw-rotary",
+    "cfg-hw-i2c",
+    "cfg-hw-spi",
+    "cfg-hw-display",
+];
+
+fn is_secret_config_key_ci(key: &str) -> bool {
+    let k = key.trim();
+    crate::config_handle::is_secret_config_key(k)
+        || k.eq_ignore_ascii_case("password")
+        || k.eq_ignore_ascii_case("pwd")
+        || k.eq_ignore_ascii_case("pass")
+        || k.eq_ignore_ascii_case("wifi.pass")
+        || k.eq_ignore_ascii_case("wifi_pass")
+        || k.eq_ignore_ascii_case("ap_pwd")
+        || k.eq_ignore_ascii_case("telnet_pwd")
+        || k.eq_ignore_ascii_case("a2dp_spin")
+        || k.eq_ignore_ascii_case("bt_sink_pin")
+        || k.eq_ignore_ascii_case("web_pwd")
+        || k.eq_ignore_ascii_case("psk")
+        || k.eq_ignore_ascii_case("secret")
+}
+
+fn next_cli_token(input: &str) -> Result<Option<(&str, &str)>, ()> {
+    let rest = input.trim_start();
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let bytes = rest.as_bytes();
+    if bytes[0] == b'"' || bytes[0] == b'\'' {
+        let q = bytes[0];
+        let after_open = &rest[1..];
+        let Some(end) = after_open.bytes().position(|b| b == q) else {
+            return Err(());
+        };
+        return Ok(Some((&after_open[..end], &after_open[end + 1..])));
+    }
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_quote {
+            Some(q) => {
+                if b == q {
+                    in_quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if b.is_ascii_whitespace() {
+                    break;
+                }
+                if i > 0 && bytes[i - 1] == b'=' && (b == b'"' || b == b'\'') {
+                    in_quote = Some(b);
+                }
+                i += 1;
+            }
+        }
+    }
+    if in_quote.is_some() {
+        return Err(());
+    }
+    Ok(Some((&rest[..i], &rest[i..])))
+}
+
+fn unquote_cli_val(val: &str) -> &str {
+    let trimmed = val.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
+fn apply_cli_kv(config: &mut crate::config_handle::ConfigHandle, k: &str, v: &str) -> bool {
+    let key = k.trim();
+    let val = v.trim();
+    if matches!(key, "host_name" | "player_name" | "name") && val.is_empty() {
+        return false;
+    }
+    config.apply_key_value(key, val)
+}
+
+fn append_masked_audit(audit: &mut String<80>, key: &str, val: &str) {
+    if !audit.is_empty() {
+        let _ = audit.push(' ');
+    }
+    let shown = if is_secret_config_key_ci(key) {
+        "***"
+    } else {
+        val
+    };
+    let _ = write!(audit, "{}={}", SyslogSanitized(key), SyslogSanitized(shown));
+}
+
 /// Applies a configuration key-value mutation from `/config.json` to
 /// [`crate::config_handle::ConfigHandle`] and logs the update to `syslog`.
 pub fn apply_web_config_update(
@@ -1216,55 +1551,84 @@ pub fn apply_web_config_update(
     config: &mut crate::config_handle::ConfigHandle,
     syslog: &mut SyslogRingBuffer,
 ) -> bool {
-    let mut k_buf = [0u8; 64];
-    let decoded_key = percent_decode_into(key, &mut k_buf)
-        .and_then(|n| core::str::from_utf8(&k_buf[..n]).ok())
-        .unwrap_or(key)
-        .trim();
+    let Some(decoded_key_str) = percent_decode_str::<64>(key) else {
+        return false;
+    };
+    let decoded_key = decoded_key_str.as_str().trim();
     if decoded_key.is_empty() {
         return false;
     }
-    let mut v_buf = [0u8; 128];
-    let decoded_val = percent_decode_into(value, &mut v_buf)
-        .and_then(|n| core::str::from_utf8(&v_buf[..n]).ok())
-        .unwrap_or(value)
-        .trim();
+    let Some(decoded_val_str) = percent_decode_str::<256>(value) else {
+        return false;
+    };
+    let decoded_val = decoded_val_str.as_str().trim();
 
     let applied = config.apply_key_value(decoded_key, decoded_val);
-    let shown = if crate::config_handle::is_secret_config_key(decoded_key) {
+    let shown = if is_secret_config_key_ci(decoded_key) {
         "***"
     } else {
         decoded_val
     };
     let mut msg: String<128> = String::new();
-    let _ = write!(msg, "config: {}={}", decoded_key, shown);
-    syslog.push(uptime_ms, "INFO", "MESSAGING_CLASS_SYSTEM", msg.as_str());
+    let _ = write!(
+        msg,
+        "config: {}={}",
+        SyslogSanitized(decoded_key),
+        SyslogSanitized(shown)
+    );
+    let level = if applied { "INFO" } else { "WARN" };
+    syslog.push(uptime_ms, level, "MESSAGING_CLASS_SYSTEM", msg.as_str());
     applied
 }
 
 /// Executes a web console CLI command (`/commands.json`), updating `config`
-/// when `cfg-*` or `config set` mutations are invoked and appending diagnostic
-/// output to `syslog`.
+/// when `cfg-*`, `config set`, or `join` mutations are invoked and appending
+/// diagnostic output to `syslog`.
 pub fn execute_web_cli_command(
     cmd: &str,
     snap: &HttpStatusSnapshot<'_>,
     config: &mut crate::config_handle::ConfigHandle,
     syslog: &mut SyslogRingBuffer,
 ) -> bool {
-    let mut decoded_buf = [0u8; 128];
-    let clean = percent_decode_into(cmd, &mut decoded_buf)
-        .and_then(|n| core::str::from_utf8(&decoded_buf[..n]).ok())
-        .unwrap_or(cmd)
-        .trim();
+    let Some(decoded_cmd) = percent_decode_str::<256>(cmd) else {
+        return false;
+    };
+    let clean = decoded_cmd.as_str().trim();
     if clean.is_empty() {
         return false;
     }
 
-    let mut parts = clean.split_whitespace();
-    let verb = parts.next().unwrap_or("");
+    let Ok(Some((verb, mut rest))) = next_cli_token(clean) else {
+        return false;
+    };
     let mut msg: String<128> = String::new();
 
     match verb {
+        "squeezelite" => {
+            if config.apply_key_value("autoexec1", clean) {
+                let _ = write!(
+                    msg,
+                    "autoexec1: {} (host={})",
+                    SyslogSanitized(clean),
+                    SyslogSanitized(config.host_name_str())
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                true
+            } else {
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "squeezelite: rejected autoexec1 command",
+                );
+                false
+            }
+        }
         "free" | "heap" => {
             let _ = write!(
                 msg,
@@ -1308,112 +1672,390 @@ pub fn execute_web_cli_command(
             true
         }
         "i2cget" | "i2cset" | "i2cdump" | "i2c" => {
-            let _ = write!(
-                msg,
-                "I2C0 0x2D: mode={} again=0x{:02X} ACK={} NACK={}",
-                snap.amp_mode, snap.again_code, snap.i2c_acks, snap.i2c_nacks
-            );
-            syslog.push(
-                snap.uptime_ms,
-                "INFO",
-                "MESSAGING_CLASS_SYSTEM",
-                msg.as_str(),
-            );
-            true
-        }
-        "system" | "restart" | "recovery" | "restart_ota" => {
-            let _ = write!(
-                msg,
-                "system: up={}ms ip={}.{}.{}.{} PSRAM free: {} B",
-                snap.uptime_ms,
-                snap.ip[0],
-                snap.ip[1],
-                snap.ip[2],
-                snap.ip[3],
-                snap.psram_free_bytes
-            );
-            syslog.push(
-                snap.uptime_ms,
-                "INFO",
-                "MESSAGING_CLASS_SYSTEM",
-                msg.as_str(),
-            );
-            true
-        }
-        "config" => {
-            let sub = parts.next().unwrap_or("dump");
-            if sub == "set" {
-                let k = parts.next().unwrap_or("");
-                let v = parts.next().unwrap_or("");
-                if !k.is_empty() {
-                    let _ = config.apply_key_value(k, v);
-                }
+            let sub = match next_cli_token(rest) {
+                Ok(Some((tok, _))) => tok,
+                Ok(None) => "",
+                Err(()) => return false,
+            };
+            if verb == "i2c" && sub == "scan" {
+                let _ = write!(
+                    msg,
+                    "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
+                    snap.i2c_acks, snap.i2c_nacks
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                return true;
             }
             let _ = write!(
                 msg,
-                "config: host={} seq={} vol={}% eq={}",
-                config.host_name_str(),
-                snap.settings_seq,
-                snap.vol_pct,
-                snap.eq_preset
+                "{}: hardware I2C bus transfer unsupported in web CLI",
+                SyslogSanitized(verb)
             );
             syslog.push(
                 snap.uptime_ms,
-                "INFO",
+                "WARN",
                 "MESSAGING_CLASS_SYSTEM",
                 msg.as_str(),
             );
-            true
+            false
         }
-        "join" => {
-            let target_ssid = parts.next().unwrap_or(snap.ssid);
-            let _ = write!(msg, "join: ssid={} (credentials staged)", target_ssid);
-            syslog.push(
-                snap.uptime_ms,
-                "INFO",
-                "MESSAGING_CLASS_SYSTEM",
-                msg.as_str(),
-            );
-            true
-        }
-        "update" => {
-            let _ = write!(msg, "update: OTA target ota_0_0x160000 ready");
-            syslog.push(
-                snap.uptime_ms,
-                "INFO",
-                "MESSAGING_CLASS_SYSTEM",
-                msg.as_str(),
-            );
-            true
-        }
-        "player" => {
+        "restart" | "recovery" | "restart_ota" => {
             let _ = write!(
                 msg,
-                "player: mode={} vol={}% frames={} codec={}",
-                snap.amp_mode, snap.vol_pct, snap.frames_played, snap.codec
+                "{}: unsupported in web CLI; use POST /reboot.json or /recovery.json",
+                SyslogSanitized(verb)
             );
             syslog.push(
                 snap.uptime_ms,
-                "INFO",
+                "WARN",
                 "MESSAGING_CLASS_SYSTEM",
                 msg.as_str(),
             );
-            true
+            false
+        }
+        "system" => {
+            let sub = match next_cli_token(rest) {
+                Ok(Some((tok, _))) => tok,
+                Ok(None) => "info",
+                Err(()) => return false,
+            };
+            match sub {
+                "info" | "heap" => {
+                    let _ = write!(
+                        msg,
+                        "system: up={}ms ip={}.{}.{}.{} PSRAM free: {} B",
+                        snap.uptime_ms,
+                        snap.ip[0],
+                        snap.ip[1],
+                        snap.ip[2],
+                        snap.ip[3],
+                        snap.psram_free_bytes
+                    );
+                    syslog.push(
+                        snap.uptime_ms,
+                        "INFO",
+                        "MESSAGING_CLASS_SYSTEM",
+                        msg.as_str(),
+                    );
+                    true
+                }
+                _ => {
+                    let _ = write!(
+                        msg,
+                        "system {}: unsupported in web CLI",
+                        SyslogSanitized(sub)
+                    );
+                    syslog.push(
+                        snap.uptime_ms,
+                        "WARN",
+                        "MESSAGING_CLASS_SYSTEM",
+                        msg.as_str(),
+                    );
+                    false
+                }
+            }
+        }
+        "config" => {
+            let Ok(sub_opt) = next_cli_token(rest) else {
+                return false;
+            };
+            let (sub, after_sub) = match sub_opt {
+                Some((s, r)) => (s, r),
+                None => ("dump", ""),
+            };
+            match sub {
+                "dump" => {
+                    let _ = write!(
+                        msg,
+                        "config: host={} seq={} vol={}% eq={}",
+                        SyslogSanitized(config.host_name_str()),
+                        snap.settings_seq,
+                        snap.vol_pct,
+                        SyslogSanitized(snap.eq_preset)
+                    );
+                    syslog.push(
+                        snap.uptime_ms,
+                        "INFO",
+                        "MESSAGING_CLASS_SYSTEM",
+                        msg.as_str(),
+                    );
+                    true
+                }
+                "get" => {
+                    let Ok(Some((k, after_k))) = next_cli_token(after_sub) else {
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            "config get: missing key",
+                        );
+                        return false;
+                    };
+                    if !matches!(next_cli_token(after_k), Ok(None)) {
+                        return false;
+                    }
+                    if is_secret_config_key_ci(k) {
+                        let _ = write!(msg, "config: {}=***", SyslogSanitized(k));
+                        syslog.push(
+                            snap.uptime_ms,
+                            "INFO",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
+                        return true;
+                    }
+                    if let Some(val) = config.nvs_override(k) {
+                        let _ = write!(
+                            msg,
+                            "config: {}={}",
+                            SyslogSanitized(k),
+                            SyslogSanitized(val.as_str())
+                        );
+                        syslog.push(
+                            snap.uptime_ms,
+                            "INFO",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
+                        true
+                    } else if matches!(k, "host_name" | "player_name" | "name") {
+                        let _ = write!(
+                            msg,
+                            "config: {}={}",
+                            SyslogSanitized(k),
+                            SyslogSanitized(config.host_name_str())
+                        );
+                        syslog.push(
+                            snap.uptime_ms,
+                            "INFO",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
+                        true
+                    } else {
+                        let _ = write!(msg, "config get: unknown key {}", SyslogSanitized(k));
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
+                        false
+                    }
+                }
+                "set" => {
+                    let Ok(Some((k, after_k))) = next_cli_token(after_sub) else {
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            "config set: missing key or value",
+                        );
+                        return false;
+                    };
+                    let Ok(Some((v, after_v))) = next_cli_token(after_k) else {
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            "config set: missing value",
+                        );
+                        return false;
+                    };
+                    if !matches!(next_cli_token(after_v), Ok(None)) {
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            "config set: unexpected trailing argument",
+                        );
+                        return false;
+                    }
+                    let applied = apply_cli_kv(config, k, v);
+                    let shown = if is_secret_config_key_ci(k) { "***" } else { v };
+                    if applied {
+                        let _ = write!(
+                            msg,
+                            "config: {}={} (host={})",
+                            SyslogSanitized(k),
+                            SyslogSanitized(shown),
+                            SyslogSanitized(config.host_name_str())
+                        );
+                        syslog.push(
+                            snap.uptime_ms,
+                            "INFO",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
+                    } else {
+                        let _ = write!(
+                            msg,
+                            "config set: rejected {}={}",
+                            SyslogSanitized(k),
+                            SyslogSanitized(shown)
+                        );
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
+                    }
+                    applied
+                }
+                _ => {
+                    let _ = write!(
+                        msg,
+                        "config: unsupported subcommand {}",
+                        SyslogSanitized(sub)
+                    );
+                    syslog.push(
+                        snap.uptime_ms,
+                        "WARN",
+                        "MESSAGING_CLASS_SYSTEM",
+                        msg.as_str(),
+                    );
+                    false
+                }
+            }
+        }
+        "join" => {
+            let Ok(Some((target_ssid, after_ssid))) = next_cli_token(rest) else {
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "join: missing ssid",
+                );
+                return false;
+            };
+            if target_ssid.is_empty() || target_ssid.len() > 32 {
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "join: invalid ssid length",
+                );
+                return false;
+            }
+            let pass_opt = match next_cli_token(after_ssid) {
+                Ok(Some((pass, after_pass))) => {
+                    if !matches!(next_cli_token(after_pass), Ok(None)) {
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            "join: unexpected trailing argument",
+                        );
+                        return false;
+                    }
+                    if pass.len() > 64 {
+                        syslog.push(
+                            snap.uptime_ms,
+                            "WARN",
+                            "MESSAGING_CLASS_SYSTEM",
+                            "join: password exceeds 64 bytes",
+                        );
+                        return false;
+                    }
+                    Some(pass)
+                }
+                Ok(None) => None,
+                Err(()) => return false,
+            };
+            let mut staged = config.apply_key_value("wifi.ssid", target_ssid);
+            if staged {
+                if let Some(pass) = pass_opt {
+                    staged = config.apply_key_value("wifi.pass", pass);
+                }
+            }
+            if staged {
+                let _ = write!(
+                    msg,
+                    "join: ssid={} (credentials staged in config)",
+                    SyslogSanitized(target_ssid)
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                true
+            } else {
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    "join: failed to stage credentials",
+                );
+                false
+            }
+        }
+        "update" => {
+            syslog.push(
+                snap.uptime_ms,
+                "WARN",
+                "MESSAGING_CLASS_SYSTEM",
+                "update: streaming OTA unsupported in web CLI; use POST /flash.json",
+            );
+            false
+        }
+        "player" => {
+            let sub = match next_cli_token(rest) {
+                Ok(Some((tok, _))) => tok,
+                Ok(None) => "status",
+                Err(()) => return false,
+            };
+            if matches!(sub, "status" | "info") {
+                let _ = write!(
+                    msg,
+                    "player: mode={} vol={}% frames={} codec={}",
+                    SyslogSanitized(snap.amp_mode),
+                    snap.vol_pct,
+                    snap.frames_played,
+                    SyslogSanitized(snap.codec)
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                true
+            } else {
+                let _ = write!(
+                    msg,
+                    "player {}: unsupported in web CLI; use /cmd.json",
+                    SyslogSanitized(sub)
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                false
+            }
         }
         "sleep" => {
-            let _ = write!(msg, "sleep: standby armed (amp={})", snap.amp_mode);
             syslog.push(
                 snap.uptime_ms,
-                "INFO",
+                "WARN",
                 "MESSAGING_CLASS_SYSTEM",
-                msg.as_str(),
+                "sleep: low-power standby unsupported in web CLI",
             );
-            true
+            false
         }
         "help" => {
             let _ = write!(
                 msg,
-                "commands: system i2c config join update player sleep free heap version i2cdetect"
+                "commands: system config join player free heap version i2cdetect cfg-*"
             );
             syslog.push(
                 snap.uptime_ms,
@@ -1424,34 +2066,105 @@ pub fn execute_web_cli_command(
             true
         }
         v if v.starts_with("cfg-") => {
+            if !ALLOWED_CFG_VERBS.contains(&v) {
+                let _ = write!(msg, "unknown command: {}", SyslogSanitized(v));
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                return false;
+            }
             let mut prev_flag: Option<&str> = None;
-            for tok in parts {
+            let mut any_applied = false;
+            let mut any_failed = false;
+            let mut audit: String<80> = String::new();
+            loop {
+                let tok = match next_cli_token(rest) {
+                    Ok(Some((t, r))) => {
+                        rest = r;
+                        t
+                    }
+                    Ok(None) => break,
+                    Err(()) => {
+                        any_failed = true;
+                        break;
+                    }
+                };
                 if let Some(flag) = tok.strip_prefix("--") {
-                    if let Some((k, val)) = flag.split_once('=') {
-                        let _ = config.apply_key_value(k, val);
-                        prev_flag = None;
+                    if prev_flag.is_some() {
+                        any_failed = true;
+                        break;
+                    }
+                    if let Some((k, raw_val)) = flag.split_once('=') {
+                        let val = unquote_cli_val(raw_val);
+                        if apply_cli_kv(config, k, val) {
+                            any_applied = true;
+                            append_masked_audit(&mut audit, k, val);
+                        } else {
+                            any_failed = true;
+                        }
+                    } else if flag.is_empty() {
+                        any_failed = true;
                     } else {
                         prev_flag = Some(flag);
                     }
                 } else if let Some(flag) = prev_flag.take() {
-                    let _ = config.apply_key_value(flag, tok);
-                } else if let Some((k, val)) = tok.split_once('=') {
-                    let _ = config.apply_key_value(k, val);
+                    if apply_cli_kv(config, flag, tok) {
+                        any_applied = true;
+                        append_masked_audit(&mut audit, flag, tok);
+                    } else {
+                        any_failed = true;
+                    }
+                } else if let Some((k, raw_val)) = tok.split_once('=') {
+                    let val = unquote_cli_val(raw_val);
+                    if apply_cli_kv(config, k, val) {
+                        any_applied = true;
+                        append_masked_audit(&mut audit, k, val);
+                    } else {
+                        any_failed = true;
+                    }
                 } else if v == "cfg-syst-name" {
-                    let _ = config.set_host_name(tok);
+                    if config.set_host_name(tok) {
+                        any_applied = true;
+                        append_masked_audit(&mut audit, "host_name", tok);
+                    } else {
+                        any_failed = true;
+                    }
+                } else {
+                    any_failed = true;
                 }
             }
-            let _ = write!(msg, "{}: OK (host_name={})", v, config.host_name_str());
-            syslog.push(
-                snap.uptime_ms,
-                "INFO",
-                "MESSAGING_CLASS_SYSTEM",
-                msg.as_str(),
-            );
-            true
+            if prev_flag.is_some() {
+                any_failed = true;
+            }
+            if any_failed || !any_applied {
+                let _ = write!(
+                    msg,
+                    "{}: rejected or incomplete arguments",
+                    SyslogSanitized(v)
+                );
+                syslog.push(
+                    snap.uptime_ms,
+                    "WARN",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                false
+            } else {
+                let _ = write!(msg, "{}: OK ({})", SyslogSanitized(v), audit.as_str());
+                syslog.push(
+                    snap.uptime_ms,
+                    "INFO",
+                    "MESSAGING_CLASS_SYSTEM",
+                    msg.as_str(),
+                );
+                true
+            }
         }
         _ => {
-            let _ = write!(msg, "unknown command: {}", verb);
+            let _ = write!(msg, "unknown command: {}", SyslogSanitized(verb));
             syslog.push(
                 snap.uptime_ms,
                 "WARN",
@@ -1495,16 +2208,17 @@ pub fn dispatch_web_post_action(
         match action {
             HttpControlAction::UpdateConfig => {
                 if let Some(upd) = parse_config_update_query(payload) {
-                    let _ = apply_web_config_update(
+                    if apply_web_config_update(
                         upd.key,
                         upd.value,
                         snap.uptime_ms,
                         &mut cfg_tmp,
                         &mut syslog,
-                    );
-                    let _ = config.sync_from(&cfg_tmp);
+                    ) {
+                        let _ = config.sync_from(&cfg_tmp);
+                        let _ = config.flush_now(journal);
+                    }
                 }
-                let _ = config.flush_now(journal);
             }
             HttpControlAction::ExecuteCliCommand => {
                 let cmd_str = extract_param_or_json_field(payload, "cmd")
@@ -1520,7 +2234,8 @@ pub fn dispatch_web_post_action(
                 let _ = write!(
                     msg,
                     "wifi scan: active ssid={} rssi={} dBm",
-                    snap.ssid, snap.rssi
+                    SyslogSanitized(snap.ssid),
+                    snap.rssi
                 );
                 syslog.push(
                     snap.uptime_ms,
@@ -1531,37 +2246,38 @@ pub fn dispatch_web_post_action(
             }
             HttpControlAction::ConnectWifi => {
                 if let Some(req) = parse_connect_request(payload) {
-                    let mut s_buf = [0u8; 64];
-                    let dec_ssid = percent_decode_into(req.ssid, &mut s_buf)
-                        .and_then(|n| core::str::from_utf8(&s_buf[..n]).ok())
-                        .unwrap_or(req.ssid);
-                    let mut p_buf = [0u8; 64];
-                    let dec_pass = percent_decode_into(req.password, &mut p_buf)
-                        .and_then(|n| core::str::from_utf8(&p_buf[..n]).ok())
-                        .unwrap_or(req.password);
-                    if let Some(hn) = req.host_name {
-                        let _ = cfg_tmp.set_host_name(hn);
-                        let _ = config.sync_from(&cfg_tmp);
+                    if let (Some(dec_ssid), Some(dec_pass)) = (
+                        percent_decode_str::<64>(req.ssid),
+                        percent_decode_str::<64>(req.password),
+                    ) {
+                        if let Some(hn) = req.host_name {
+                            let _ = cfg_tmp.set_host_name(hn);
+                            let _ = config.sync_from(&cfg_tmp);
+                        }
+                        let mut creds = crate::ota_safety::WifiStaCredentials {
+                            ssid: String::new(),
+                            password: String::new(),
+                        };
+                        let s_len = dec_ssid.floor_char_boundary(dec_ssid.len().min(32));
+                        let p_len = dec_pass.floor_char_boundary(dec_pass.len().min(64));
+                        let _ = creds.ssid.push_str(&dec_ssid[..s_len]);
+                        let _ = creds.password.push_str(&dec_pass[..p_len]);
+                        journal.set_pending_wifi(Some(creds.clone()));
+                        let _ = config.flush_now(journal);
+                        new_wifi = Some(creds);
+                        let mut msg: String<128> = String::new();
+                        let _ = write!(
+                            msg,
+                            "wifi connect: ssid={}",
+                            SyslogSanitized(&dec_ssid[..s_len])
+                        );
+                        syslog.push(
+                            snap.uptime_ms,
+                            "INFO",
+                            "MESSAGING_CLASS_SYSTEM",
+                            msg.as_str(),
+                        );
                     }
-                    let mut creds = crate::ota_safety::WifiStaCredentials {
-                        ssid: String::new(),
-                        password: String::new(),
-                    };
-                    let s_len = dec_ssid.floor_char_boundary(dec_ssid.len().min(32));
-                    let p_len = dec_pass.floor_char_boundary(dec_pass.len().min(64));
-                    let _ = creds.ssid.push_str(&dec_ssid[..s_len]);
-                    let _ = creds.password.push_str(&dec_pass[..p_len]);
-                    journal.set_pending_wifi(Some(creds.clone()));
-                    let _ = config.flush_now(journal);
-                    new_wifi = Some(creds);
-                    let mut msg: String<128> = String::new();
-                    let _ = write!(msg, "wifi connect: ssid={}", &dec_ssid[..s_len]);
-                    syslog.push(
-                        snap.uptime_ms,
-                        "INFO",
-                        "MESSAGING_CLASS_SYSTEM",
-                        msg.as_str(),
-                    );
                 }
             }
             HttpControlAction::DisconnectWifi => {
@@ -1838,7 +2554,7 @@ pub const COMMANDS_JSON_CATALOG: &str = concat!(
     "{\"name\":\"cfg-hw-rotary\",\"argtable\":[{\"name\":\"A\"}],",
     "\"values\":{\"A\":\"-1\"}},",
     "{\"name\":\"cfg-hw-i2c\",\"argtable\":[{\"name\":\"sda\"},{\"name\":\"scl\"}],",
-    "\"values\":{\"sda\":\"21\",\"scl\":\"22\"}},",
+    "\"values\":{\"sda\":\"21\",\"scl\":\"27\"}},",
     "{\"name\":\"cfg-hw-spi\",\"argtable\":[{\"name\":\"mosi\"}],",
     "\"values\":{\"mosi\":\"-1\"}},",
     "{\"name\":\"cfg-hw-display\",\"argtable\":[{\"name\":\"type\"}],",
@@ -1998,71 +2714,96 @@ fn write_json_http_response(body_len: usize, out_buf: &mut [u8]) -> Option<usize
 type ZeroconfDhCell = RefCell<Option<([u8; 4], OakleyGroup1Dh)>>;
 static ZEROCONF_DH_CACHE: Mutex<CriticalSectionRawMutex, ZeroconfDhCell> =
     Mutex::new(RefCell::new(None));
+static ZEROCONF_BOOT_ENTROPY: Mutex<CriticalSectionRawMutex, RefCell<Option<[u8; 8]>>> =
+    Mutex::new(RefCell::new(None));
 
-/// Derives a deterministic 768-bit Diffie-Hellman private key from the assigned
-/// IP address without volatile metrics (uptime, volume, i2c ACKs) so the
-/// keypair remains invariant across `getInfo` and `addUser` requests
-/// (`NET-403`).
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k_pad = [0u8; 64];
+    if key.len() > 64 {
+        let mut hasher = crate::ota_safety::Sha256Incremental::new();
+        hasher.update(key);
+        let hashed = hasher.finalize();
+        k_pad[..32].copy_from_slice(&hashed);
+    } else {
+        k_pad[..key.len()].copy_from_slice(key);
+    }
+
+    let mut i_key_pad = [0x36u8; 64];
+    let mut o_key_pad = [0x5Cu8; 64];
+    for i in 0..64 {
+        i_key_pad[i] ^= k_pad[i];
+        o_key_pad[i] ^= k_pad[i];
+    }
+
+    let mut inner = crate::ota_safety::Sha256Incremental::new();
+    inner.update(&i_key_pad);
+    inner.update(msg);
+    let inner_hash = inner.finalize();
+
+    let mut outer = crate::ota_safety::Sha256Incremental::new();
+    outer.update(&o_key_pad);
+    outer.update(&inner_hash);
+    outer.finalize()
+}
+
+fn boot_zeroconf_entropy() -> [u8; 8] {
+    ZEROCONF_BOOT_ENTROPY.lock(|cell| {
+        let mut opt = cell.borrow_mut();
+        if let Some(existing) = *opt {
+            return existing;
+        }
+        let mut out = [0u8; 8];
+        #[cfg(target_arch = "xtensa")]
+        {
+            let hw_rng = esp_hal::rng::Rng::new();
+            out[..4].copy_from_slice(&hw_rng.random().to_le_bytes());
+            out[4..8].copy_from_slice(&hw_rng.random().to_le_bytes());
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            use core::hash::{BuildHasher, Hasher};
+            let mut h1 = std::collections::hash_map::RandomState::new().build_hasher();
+            h1.write_u64(0x9e37_79b9_7f4a_7c15);
+            let mut h2 = std::collections::hash_map::RandomState::new().build_hasher();
+            h2.write_u64(0xbf58_476d_1ce4_e5b9);
+            let mut sha = crate::ota_safety::Sha256Incremental::new();
+            sha.update(&h1.finish().to_le_bytes());
+            sha.update(&h2.finish().to_le_bytes());
+            let digest = sha.finalize();
+            out.copy_from_slice(&digest[..8]);
+        }
+        *opt = Some(out);
+        out
+    })
+}
+
+/// Derives a per-boot 768-bit Diffie-Hellman private key from the assigned IPv4
+/// address and cached hardware/OS CSPRNG entropy so the keypair remains stable
+/// across `getInfo` and `addUser` requests (`NET-403`).
 #[must_use]
 pub fn derive_zeroconf_dh_private_key(status: &HttpStatusSnapshot<'_>) -> [u8; 96] {
-    const SEED_PREFIX: &[u8] = b"louder-esp32-zeroconf-dh-v1";
-    let mut key = [0u8; 96];
-    let mut material = [0u8; 4];
-    material.copy_from_slice(&status.ip);
-
-    for (counter, chunk) in key.chunks_mut(20).enumerate() {
-        let mut msg = [0u8; 5];
-        msg[0..4].copy_from_slice(&material);
-        msg[4] = counter as u8;
-        let digest = hmac_sha1(SEED_PREFIX, &msg);
-        let len = chunk.len().min(digest.len());
-        chunk[..len].copy_from_slice(&digest[..len]);
-    }
-
-    // SplitMix64 / FNV-1a nonlinear permutation across all 96 bytes
-    let mut state: u64 = 0xcbf29ce484222325;
-    for &b in &status.ip {
-        state ^= b as u64;
-        state = state.wrapping_mul(0x100000001b3);
-    }
-    for chunk in key.chunks_mut(8) {
-        state = state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        let val = z ^ (z >> 31);
-        let b = val.to_le_bytes();
-        for (i, byte) in chunk.iter_mut().enumerate() {
-            *byte ^= b[i % 8];
-        }
-    }
-
-    key[0] |= 0x01;
-    key[95] &= 0x7F;
-    key[95] |= 0x40;
-    key
+    derive_zeroconf_dh_private_key_with_entropy(status.ip, boot_zeroconf_entropy())
 }
 
 /// Derives a 768-bit Diffie-Hellman private key from the assigned IP address
-/// and an explicit entropy source (such as hardware RNG or device MAC address).
+/// and explicit CSPRNG / hardware RNG entropy (`[u8; 8]`) via HMAC-SHA256.
 #[must_use]
 pub fn derive_zeroconf_dh_private_key_with_entropy(ip: [u8; 4], entropy: [u8; 8]) -> [u8; 96] {
-    const SEED_PREFIX: &[u8] = b"louder-esp32-zeroconf-dh-v1";
+    const SEED_PREFIX: &[u8] = b"louder-esp32-zeroconf-dh-v2";
     let mut key = [0u8; 96];
-    let mut material = [0u8; 12];
-    material[0..4].copy_from_slice(&ip);
-    material[4..12].copy_from_slice(&entropy);
+    let mut msg = [0u8; 13];
+    msg[0..4].copy_from_slice(&ip);
+    msg[4..12].copy_from_slice(&entropy);
 
-    for (counter, chunk) in key.chunks_mut(20).enumerate() {
-        let mut msg = [0u8; 13];
-        msg[0..12].copy_from_slice(&material);
+    for (counter, chunk) in key.chunks_mut(32).enumerate() {
         msg[12] = counter as u8;
-        let digest = hmac_sha1(SEED_PREFIX, &msg);
+        let digest = hmac_sha256(SEED_PREFIX, &msg);
         let len = chunk.len().min(digest.len());
         chunk[..len].copy_from_slice(&digest[..len]);
     }
 
-    key[95] |= 0x01;
+    key[0] |= 0x01;
+    key[95] = (key[95] & 0x7F) | 0x41;
     key
 }
 
@@ -2102,118 +2843,513 @@ pub fn write_eq_json(snapshot: &HttpStatusSnapshot<'_>, out_buf: &mut [u8]) -> O
     Some(writer.written_len())
 }
 
-fn redact_command_password(cmd: &str) -> String<160> {
+fn push_str_truncated<const N: usize>(out: &mut String<N>, s: &str) {
+    let avail = N.saturating_sub(out.len());
+    let take = s.floor_char_boundary(s.len().min(avail));
+    let _ = out.push_str(&s[..take]);
+}
+
+fn fail_closed_redacted() -> String<160> {
     let mut out: String<160> = String::new();
-    let is_urlencoded = cmd.contains("%20");
-    let sep = if is_urlencoded { "%20" } else { " " };
-    let parts: heapless::Vec<&str, 8> = cmd.split(sep).collect();
-    let ws_parts: heapless::Vec<&str, 8> = cmd.split_whitespace().collect();
-    if (parts.first() == Some(&"join") || parts.first() == Some(&"connect")) && parts.len() >= 3 {
-        let mask = if parts.first() == Some(&"connect") {
-            "<redacted>"
-        } else {
-            "***"
-        };
-        let _ = write!(out, "{}{}{}{}{}", parts[0], sep, parts[1], sep, mask);
-        for extra in &parts[3..] {
-            let _ = write!(out, "{}{}", sep, extra);
+    let _ = out.push_str("<redacted>");
+    out
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn is_redact_secret_key(key: &str) -> bool {
+    let trimmed = key.trim_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed == "-p" {
+        return true;
+    }
+    let k = trimmed.strip_prefix("--").unwrap_or(trimmed);
+    is_secret_config_key_ci(k)
+        || k.eq_ignore_ascii_case("pin")
+        || k.eq_ignore_ascii_case("token")
+        || k.eq_ignore_ascii_case("psk")
+        || k.eq_ignore_ascii_case("pass")
+        || k.eq_ignore_ascii_case("password")
+}
+
+fn scan_quoted_end(bytes: &[u8], open_idx: usize, quote: u8) -> Option<usize> {
+    let mut i = open_idx + 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] < 0x80 {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
         }
-    } else if (ws_parts.first() == Some(&"join") || ws_parts.first() == Some(&"connect"))
-        && ws_parts.len() >= 3
-    {
-        let mask = if ws_parts.first() == Some(&"connect") {
-            "<redacted>"
-        } else {
-            "***"
-        };
-        let _ = write!(out, "{}{}{}{}{}", ws_parts[0], sep, ws_parts[1], sep, mask);
-        for extra in &ws_parts[3..] {
-            let _ = write!(out, "{}{}", sep, extra);
+        if b == quote {
+            return Some(i + 1);
         }
-    } else if parts.first() == Some(&"config")
-        && parts.get(1) == Some(&"set")
-        && parts
-            .get(2)
-            .is_some_and(|k| crate::config_handle::is_secret_config_key(k))
-        && parts.len() >= 4
-    {
-        let _ = write!(out, "config{}set{}{}{}***", sep, sep, parts[2], sep);
-    } else if ws_parts.first() == Some(&"config")
-        && ws_parts.get(1) == Some(&"set")
-        && ws_parts
-            .get(2)
-            .is_some_and(|k| crate::config_handle::is_secret_config_key(k))
-        && ws_parts.len() >= 4
-    {
-        let _ = write!(out, "config set {} ***", ws_parts[2]);
-    } else if let Some(idx) = cmd.find("wifi.pass=") {
-        let prefix = &cmd[..idx + "wifi.pass=".len()];
-        let rest = &cmd[idx + "wifi.pass=".len()..];
-        let end_idx = rest
-            .find('&')
-            .or_else(|| rest.find(' '))
-            .unwrap_or(rest.len());
-        let _ = write!(out, "{}***{}", prefix, &rest[end_idx..]);
-    } else if let Some(idx) = cmd.find("password=") {
-        let prefix = &cmd[..idx + "password=".len()];
-        let rest = &cmd[idx + "password=".len()..];
-        let end_idx = rest
-            .find('&')
-            .or_else(|| rest.find(' '))
-            .unwrap_or(rest.len());
-        let _ = write!(out, "{}***{}", prefix, &rest[end_idx..]);
+        i += 1;
+    }
+    None
+}
+
+fn scan_cli_token(s: &str, start: usize) -> Result<Option<(usize, usize, &str)>, ()> {
+    let bytes = s.as_bytes();
+    let tok_start = skip_ascii_ws(bytes, start);
+    if tok_start >= bytes.len() {
+        return Ok(None);
+    }
+    let first = bytes[tok_start];
+    if first == b'"' || first == b'\'' {
+        let tok_end = scan_quoted_end(bytes, tok_start, first).ok_or(())?;
+        return Ok(Some((tok_start, tok_end, &s[tok_start + 1..tok_end - 1])));
+    }
+    let mut i = tok_start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            break;
+        }
+        if i > tok_start && bytes[i - 1] == b'=' && (b == b'"' || b == b'\'') {
+            i = scan_quoted_end(bytes, i, b).ok_or(())?;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(Some((tok_start, i, &s[tok_start..i])))
+}
+
+fn is_seg_delim(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'&' | b';' | b'?')
+}
+
+fn has_kv_prefix_before_delim(bytes: &[u8], start: usize) -> bool {
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'=' {
+            return i > start;
+        }
+        if is_seg_delim(b) {
+            return false;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn scan_secret_val_end(bytes: &[u8], val_start: usize, is_cfg_dash: bool) -> Result<usize, ()> {
+    let mut i = val_start;
+    if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+        i = scan_quoted_end(bytes, i, bytes[i]).ok_or(())?;
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            break;
+        }
+        if !is_cfg_dash
+            && matches!(b, b'&' | b';' | b'?')
+            && has_kv_prefix_before_delim(bytes, i + 1)
+        {
+            break;
+        }
+        i += 1;
+    }
+    Ok(i)
+}
+
+fn scan_non_secret_val_end(bytes: &[u8], val_start: usize) -> Result<usize, ()> {
+    let mut i = val_start;
+    if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+        i = scan_quoted_end(bytes, i, bytes[i]).ok_or(())?;
+    }
+    while i < bytes.len() && !is_seg_delim(bytes[i]) {
+        i += 1;
+    }
+    Ok(i)
+}
+
+fn redact_kv_and_flags(clean: &str, is_cfg_dash: bool) -> String<160> {
+    let bytes = clean.as_bytes();
+    let mut out: String<160> = String::new();
+    let mut copied = 0usize;
+    let mut pos = 0usize;
+    let mut expect_secret_value = false;
+
+    while pos < bytes.len() {
+        if expect_secret_value {
+            match scan_cli_token(clean, pos) {
+                Err(()) => return fail_closed_redacted(),
+                Ok(None) => break,
+                Ok(Some((tok_start, mut tok_end, _))) => {
+                    while tok_end < bytes.len() && !bytes[tok_end].is_ascii_whitespace() {
+                        tok_end += 1;
+                    }
+                    push_str_truncated(&mut out, &clean[copied..tok_start]);
+                    push_str_truncated(&mut out, "***");
+                    copied = tok_end;
+                    pos = tok_end;
+                    expect_secret_value = false;
+                    continue;
+                }
+            }
+        }
+
+        while pos < bytes.len() && is_seg_delim(bytes[pos]) {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        let b0 = bytes[pos];
+        if b0 == b'"' || b0 == b'\'' {
+            let Some(seg_end) = scan_quoted_end(bytes, pos, b0) else {
+                return fail_closed_redacted();
+            };
+            let inner = &clean[pos + 1..seg_end - 1];
+            if let Some((k, _)) = inner.split_once('=') {
+                if is_redact_secret_key(k) {
+                    let eq_abs = pos + 1 + k.len();
+                    push_str_truncated(&mut out, &clean[copied..eq_abs + 1]);
+                    push_str_truncated(&mut out, "***");
+                    push_str_truncated(&mut out, &clean[seg_end - 1..seg_end]);
+                    copied = seg_end;
+                }
+            } else if is_redact_secret_key(inner) {
+                expect_secret_value = true;
+            }
+            pos = seg_end;
+            continue;
+        }
+
+        let seg_start = pos;
+        let mut eq_pos = None;
+        while pos < bytes.len() && !is_seg_delim(bytes[pos]) {
+            if bytes[pos] == b'=' {
+                eq_pos = Some(pos);
+                break;
+            }
+            pos += 1;
+        }
+
+        if let Some(eq) = eq_pos {
+            let key = &clean[seg_start..eq];
+            let val_start = eq + 1;
+            let secret = is_redact_secret_key(key);
+            let val_end = if secret {
+                let Ok(end) = scan_secret_val_end(bytes, val_start, is_cfg_dash) else {
+                    return fail_closed_redacted();
+                };
+                end
+            } else {
+                let Ok(end) = scan_non_secret_val_end(bytes, val_start) else {
+                    return fail_closed_redacted();
+                };
+                end
+            };
+            if secret {
+                push_str_truncated(&mut out, &clean[copied..val_start]);
+                push_str_truncated(&mut out, "***");
+                copied = val_end;
+            }
+            pos = val_end;
+        } else {
+            let tok = &clean[seg_start..pos];
+            if is_redact_secret_key(tok) {
+                expect_secret_value = true;
+            }
+        }
+    }
+
+    push_str_truncated(&mut out, &clean[copied..]);
+    out
+}
+
+fn redact_command_password(cmd: &str) -> String<160> {
+    let mut decoded_buf = [0u8; 256];
+    let Some(decoded_len) = percent_decode_into(cmd, &mut decoded_buf) else {
+        return fail_closed_redacted();
+    };
+    let Ok(decoded) = core::str::from_utf8(&decoded_buf[..decoded_len]) else {
+        return fail_closed_redacted();
+    };
+    let clean = decoded.trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+    let (t0_end, tok0) = match scan_cli_token(clean, 0) {
+        Ok(Some((_, end, tok))) => (end, tok),
+        Ok(None) => return String::new(),
+        Err(()) => return fail_closed_redacted(),
+    };
+
+    if tok0.eq_ignore_ascii_case("join") || tok0.eq_ignore_ascii_case("connect") {
+        match scan_cli_token(clean, t0_end) {
+            Err(()) => return fail_closed_redacted(),
+            Ok(Some((_, t1_end, _))) => {
+                let rest_start = skip_ascii_ws(clean.as_bytes(), t1_end);
+                if rest_start < clean.len() {
+                    let mask = if tok0.eq_ignore_ascii_case("connect") {
+                        "<redacted>"
+                    } else {
+                        "***"
+                    };
+                    let mut out: String<160> = String::new();
+                    push_str_truncated(&mut out, &clean[..rest_start]);
+                    push_str_truncated(&mut out, mask);
+                    return out;
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+
+    if tok0.eq_ignore_ascii_case("config") {
+        match scan_cli_token(clean, t0_end) {
+            Err(()) => return fail_closed_redacted(),
+            Ok(Some((_, t1_end, tok1))) if tok1.eq_ignore_ascii_case("set") => {
+                match scan_cli_token(clean, t1_end) {
+                    Err(()) => return fail_closed_redacted(),
+                    Ok(Some((_, t2_end, tok2))) => {
+                        if is_redact_secret_key(tok2) {
+                            let rest_start = skip_ascii_ws(clean.as_bytes(), t2_end);
+                            if rest_start < clean.len() {
+                                let mut out: String<160> = String::new();
+                                push_str_truncated(&mut out, &clean[..rest_start]);
+                                push_str_truncated(&mut out, "***");
+                                return out;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let is_cfg_dash = tok0
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cfg-"));
+    redact_kv_and_flags(clean, is_cfg_dash)
+}
+
+fn format_cli_output_preview(
+    cmd_raw: &str,
+    redacted: &str,
+    snap: &HttpStatusSnapshot<'_>,
+) -> String<160> {
+    let mut out: String<160> = String::new();
+    let Some(decoded) = percent_decode_str::<256>(cmd_raw) else {
+        push_str_truncated(&mut out, redacted);
+        return out;
+    };
+    let clean = decoded.as_str().trim();
+    let Ok(Some((verb, rest))) = next_cli_token(clean) else {
+        push_str_truncated(&mut out, redacted);
+        return out;
+    };
+    let host_label = if !snap.player_name.is_empty() {
+        snap.player_name
     } else {
-        let _ = out.push_str(cmd);
+        crate::board::first_boot_defaults::PLAYER_NAME
+    };
+    match verb {
+        "version" => {
+            let _ = write!(
+                out,
+                "{} {} (seq {})",
+                REQUIRED_OTA_PROJECT_NAME, RUST_OTA_FIRMWARE_VERSION, snap.settings_seq
+            );
+        }
+        "free" | "heap" => {
+            let _ = write!(
+                out,
+                "PSRAM free: {} B, used: {} B",
+                snap.psram_free_bytes, snap.psram_used_bytes
+            );
+        }
+        "i2cdetect" => {
+            let _ = write!(
+                out,
+                "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
+                snap.i2c_acks, snap.i2c_nacks
+            );
+        }
+        "i2c" => {
+            let is_scan = matches!(next_cli_token(rest), Ok(Some(("scan", _))));
+            if is_scan {
+                let _ = write!(
+                    out,
+                    "I2C0 scan: 0x2D (TAS5805M) ACK={} NACK={}",
+                    snap.i2c_acks, snap.i2c_nacks
+                );
+            } else {
+                let _ = out.push_str("i2c: hardware I2C bus transfer unsupported in web CLI");
+            }
+        }
+        "system" => {
+            let _ = write!(
+                out,
+                "system: up={}ms ip={}.{}.{}.{} PSRAM free: {} B",
+                snap.uptime_ms,
+                snap.ip[0],
+                snap.ip[1],
+                snap.ip[2],
+                snap.ip[3],
+                snap.psram_free_bytes
+            );
+        }
+        "status" | "player" => {
+            let _ = write!(
+                out,
+                "player: mode={} vol={}% frames={} codec={}",
+                SyslogSanitized(snap.amp_mode),
+                snap.vol_pct,
+                snap.frames_played,
+                SyslogSanitized(snap.codec)
+            );
+        }
+        "config" => {
+            let sub = match next_cli_token(rest) {
+                Ok(Some((s, _))) => s,
+                _ => "dump",
+            };
+            if sub == "dump" {
+                let _ = write!(
+                    out,
+                    "config: host={} seq={} vol={}% eq={}",
+                    SyslogSanitized(host_label),
+                    snap.settings_seq,
+                    snap.vol_pct,
+                    SyslogSanitized(snap.eq_preset)
+                );
+            } else {
+                let _ = write!(out, "OK: {}", SyslogSanitized(redacted));
+            }
+        }
+        "help" => {
+            let _ = out
+                .push_str("commands: system config join player free heap version i2cdetect cfg-*");
+        }
+        _ => {
+            let _ = write!(out, "OK: {}", SyslogSanitized(redacted));
+        }
     }
     out
 }
 
-fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
-    let Ok(req_str) = core::str::from_utf8(req_bytes) else {
+fn constant_time_eq(provided: &[u8], expected: &[u8]) -> bool {
+    if expected.is_empty() {
         return false;
+    }
+    let mut diff = provided.len() ^ expected.len();
+    for (i, &exp_b) in expected.iter().enumerate() {
+        let in_bounds = usize::from(i < provided.len());
+        let prov_b = if in_bounds != 0 { provided[i] } else { 0 };
+        diff |= usize::from(core::hint::black_box(exp_b) ^ core::hint::black_box(prov_b));
+    }
+    core::hint::black_box(diff) == 0
+}
+
+fn parse_ascii_usize(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let start = i;
+    let mut val = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val
+            .checked_mul(10)?
+            .checked_add(usize::from(bytes[i] - b'0'))?;
+        i += 1;
+    }
+    if i == start {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+/// Returns `true` when `peek_bytes` (peeked from a TCP RX buffer of capacity
+/// `max_rx_buf`) does not yet contain a complete HTTP header block (`\r\n\r\n`
+/// or `\n\n`) or has fewer body bytes than declared by `Content-Length:` while
+/// the full request still fits in `max_rx_buf`.
+#[must_use]
+pub fn http_request_needs_more_bytes(peek_bytes: &[u8], max_rx_buf: usize) -> bool {
+    if peek_bytes.is_empty() || peek_bytes.len() >= max_rx_buf {
+        return false;
+    }
+    let hdr_end = if let Some(pos) = peek_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+        pos + 4
+    } else if let Some(pos) = peek_bytes.windows(2).position(|w| w == b"\n\n") {
+        pos + 2
+    } else {
+        return true;
     };
-    if let Some(first_line) = req_str.lines().next() {
-        if let Some(path_and_query) = first_line.split_whitespace().nth(1) {
-            if let Some((_, query)) = path_and_query.split_once('?') {
-                for param in query.split('&') {
-                    if let Some(val) = param.strip_prefix("auth=") {
-                        if val == expected_token {
-                            return true;
-                        }
-                    }
-                    if let Some(val) = param.strip_prefix("token=") {
-                        if val == expected_token {
-                            return true;
-                        }
-                    }
-                }
+    let hdr_slice = &peek_bytes[..hdr_end];
+    const CL_HDR: &[u8] = b"\ncontent-length:";
+    if let Some(idx) = hdr_slice
+        .windows(CL_HDR.len())
+        .position(|w| w.eq_ignore_ascii_case(CL_HDR))
+    {
+        let after = &hdr_slice[idx + CL_HDR.len()..];
+        if let Some(clen) = parse_ascii_usize(after) {
+            let body_have = peek_bytes.len().saturating_sub(hdr_end);
+            if clen > 0 && body_have < clen && hdr_end.saturating_add(clen) <= max_rx_buf {
+                return true;
             }
         }
     }
-    for line in req_str.lines() {
+    false
+}
+
+fn http_request_headers(req_bytes: &[u8]) -> Option<&str> {
+    let hdr_end = req_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .or_else(|| req_bytes.windows(2).position(|w| w == b"\n\n"))
+        .unwrap_or(req_bytes.len());
+    core::str::from_utf8(&req_bytes[..hdr_end]).ok()
+}
+
+fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
+    if expected_token.is_empty() {
+        return false;
+    }
+    let Some(req_str) = http_request_headers(req_bytes) else {
+        return false;
+    };
+    let mut lines = req_str.lines();
+    let _request_line = lines.next();
+    for line in lines {
         let trimmed = line.trim();
-        if let Some(auth_val) = trimmed
-            .strip_prefix("Authorization:")
-            .or_else(|| trimmed.strip_prefix("authorization:"))
-        {
-            let auth_val = auth_val.trim();
-            if let Some(bearer_val) = auth_val
-                .strip_prefix("Bearer ")
-                .or_else(|| auth_val.strip_prefix("bearer "))
-            {
-                if bearer_val.trim() == expected_token {
+        if trimmed.is_empty() {
+            break;
+        }
+        let Some((hdr_name, hdr_val)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let hdr_name = hdr_name.trim();
+        let hdr_val = hdr_val.trim();
+        if hdr_name.eq_ignore_ascii_case("authorization") {
+            if let Some((scheme, rest)) = hdr_val.split_once(char::is_whitespace) {
+                if scheme.eq_ignore_ascii_case("bearer")
+                    && constant_time_eq(rest.trim().as_bytes(), expected_token.as_bytes())
+                {
                     return true;
                 }
-            } else if auth_val == expected_token {
+            } else if constant_time_eq(hdr_val.as_bytes(), expected_token.as_bytes()) {
                 return true;
             }
-        } else if let Some(token_val) = trimmed
-            .strip_prefix("X-Auth-Token:")
-            .or_else(|| trimmed.strip_prefix("x-auth-token:"))
+        } else if hdr_name.eq_ignore_ascii_case("x-auth-token")
+            && constant_time_eq(hdr_val.as_bytes(), expected_token.as_bytes())
         {
-            if token_val.trim() == expected_token {
-                return true;
-            }
+            return true;
         }
     }
     false
@@ -2223,24 +3359,44 @@ fn is_authorized(req_bytes: &[u8], expected_token: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HttpControlRouter {
     /// Optional authentication token required for HTTP requests.
-    pub auth_token: Option<String<32>>,
+    pub auth_token: Option<String<128>>,
+    auth_required: bool,
 }
 
 impl HttpControlRouter {
     /// Creates a new unauthenticated router (`auth_token: None`).
     #[must_use]
     pub const fn new() -> Self {
-        Self { auth_token: None }
+        Self {
+            auth_token: None,
+            auth_required: false,
+        }
     }
 
-    /// Creates a router with an authentication token.
+    /// Attempts to create an authenticated router, returning `None` if `token`
+    /// is empty or exceeds 128 bytes.
+    #[must_use]
+    pub fn try_with_auth_token(token: &str) -> Option<Self> {
+        if token.is_empty() {
+            return None;
+        }
+        let mut s = String::new();
+        s.push_str(token).ok()?;
+        Some(Self {
+            auth_token: Some(s),
+            auth_required: true,
+        })
+    }
+
+    /// Creates a router with an authentication token. Rejects empty or
+    /// oversized (`> 128` byte) tokens by never storing `Some("")` and failing
+    /// closed (`401 Unauthorized`).
     #[must_use]
     pub fn with_auth_token(token: &str) -> Self {
-        let mut s = String::new();
-        let _ = s.push_str(token);
-        Self {
-            auth_token: Some(s),
-        }
+        Self::try_with_auth_token(token).unwrap_or(Self {
+            auth_token: None,
+            auth_required: true,
+        })
     }
 
     /// Handles an HTTP request with streaming support.
@@ -2250,15 +3406,19 @@ impl HttpControlRouter {
         snapshot: &HttpStatusSnapshot<'_>,
         out_buf: &mut [u8],
     ) -> Option<(usize, &'static [u8], HttpControlAction)> {
-        if let Some(ref token) = self.auth_token {
-            if !is_authorized(req_bytes, token.as_str()) {
+        if self.auth_required || self.auth_token.is_some() {
+            let authorized = self
+                .auth_token
+                .as_ref()
+                .is_some_and(|token| is_authorized(req_bytes, token.as_str()));
+            if !authorized {
                 const BODY: &str = "{\"error\":\"unauthorized\"}";
                 let mut response: String<256> = String::new();
                 let _ = write!(
                     response,
                     "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
-                    Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\
-                    Connection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                    Content-Length: {}\r\nConnection: close\r\n\
+                    Cache-Control: no-store\r\n\r\n{}",
                     BODY.len(),
                     BODY
                 );
@@ -2295,27 +3455,124 @@ impl HttpControlRouter {
     }
 }
 
-fn is_permitted_origin(req_bytes: &[u8]) -> bool {
-    let Ok(req_str) = core::str::from_utf8(req_bytes) else {
+fn is_permitted_origin_value(val: &str) -> bool {
+    if val.is_empty() || val == "null" {
+        return false;
+    }
+    let after_scheme = if val
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        &val[7..]
+    } else if val
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        &val[8..]
+    } else {
         return false;
     };
-    for line in req_str.lines() {
-        let trimmed = line.trim();
-        if let Some(origin_val) = trimmed
-            .strip_prefix("Origin:")
-            .or_else(|| trimmed.strip_prefix("origin:"))
-        {
-            let val = origin_val.trim();
-            if val.is_empty() || val == "null" {
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let trailing = &after_scheme[auth_end..];
+    if !trailing.is_empty() && trailing != "/" {
+        return false;
+    }
+    let authority = &after_scheme[..auth_end];
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let Some(close_idx) = after_open.find(']') else {
+            return false;
+        };
+        let ipv6_host = &after_open[..close_idx];
+        let after_close = &after_open[close_idx + 1..];
+        if !after_close.is_empty() {
+            let Some(port) = after_close.strip_prefix(':') else {
+                return false;
+            };
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
                 return false;
             }
-            let host_part = val
-                .strip_prefix("http://")
-                .or_else(|| val.strip_prefix("https://"))
-                .unwrap_or(val);
-            let host_end = host_part.find(&['/', ':'][..]).unwrap_or(host_part.len());
-            let host = &host_part[..host_end];
-            return crate::ota_safety::is_local_lan_host(host);
+        }
+        return ipv6_host == "::1" || ipv6_host == "0:0:0:0:0:0:0:1";
+    }
+    if authority.contains(']') {
+        return false;
+    }
+    let (host, port_opt) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if let Some(port) = port_opt {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    host.eq_ignore_ascii_case("localhost") || crate::ota_safety::is_local_lan_host(host)
+}
+
+fn extract_origin_host(val: &str) -> Option<&str> {
+    if val.is_empty() || val == "null" {
+        return None;
+    }
+    let after_scheme = if val
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        &val[7..]
+    } else if val
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        &val[8..]
+    } else {
+        return None;
+    };
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let trailing = &after_scheme[auth_end..];
+    if !trailing.is_empty() && trailing != "/" {
+        return None;
+    }
+    crate::ota_safety::strip_host_port(&after_scheme[..auth_end])
+}
+
+fn is_permitted_origin(req_bytes: &[u8]) -> bool {
+    let Some(req_str) = http_request_headers(req_bytes) else {
+        return false;
+    };
+    let mut host_hdr: Option<&str> = None;
+    for line in req_str.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((hdr_name, hdr_val)) = trimmed.split_once(':') {
+            if hdr_name.trim().eq_ignore_ascii_case("host") {
+                host_hdr = crate::ota_safety::strip_host_port(hdr_val.trim());
+                break;
+            }
+        }
+    }
+    for line in req_str.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((hdr_name, origin_val)) = trimmed.split_once(':') {
+            if hdr_name.trim().eq_ignore_ascii_case("origin") {
+                let ov = origin_val.trim();
+                let same_host = extract_origin_host(ov).is_some_and(|oh| {
+                    host_hdr.is_some_and(|hh| !hh.is_empty() && oh.eq_ignore_ascii_case(hh))
+                });
+                if !same_host && !is_permitted_origin_value(ov) {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -2429,7 +3686,6 @@ pub fn handle_http_request_streaming_impl(
             })
             .unwrap_or(&[]);
         let body_str = core::str::from_utf8(body_slice).unwrap_or("");
-        let priv_key = derive_zeroconf_dh_private_key(snapshot);
         let dh = ZEROCONF_DH_CACHE.lock(|cell| {
             let mut opt = cell.borrow_mut();
             if let Some((cached_ip, ref dh)) = *opt {
@@ -2437,6 +3693,8 @@ pub fn handle_http_request_streaming_impl(
                     return Some(dh.clone());
                 }
             }
+            let priv_key =
+                derive_zeroconf_dh_private_key_with_entropy(snapshot.ip, boot_zeroconf_entropy());
             let new_dh = OakleyGroup1Dh::from_private_key(priv_key).ok()?;
             *opt = Some((snapshot.ip, new_dh.clone()));
             Some(new_dh)
@@ -2474,14 +3732,18 @@ pub fn handle_http_request_streaming_impl(
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
             let body_bytes = DASHBOARD_HTML.as_bytes();
-            let mut header: String<160> = String::new();
-            let _ = write!(
+            let mut header: String<256> = String::new();
+            write!(
                 header,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                X-Content-Type-Options: nosniff\r\n\
+                X-Frame-Options: DENY\r\n\
+                Content-Security-Policy: frame-ancestors 'none'\r\n\
                 Content-Length: {}\r\nConnection: close\r\n\
                 Cache-Control: no-store\r\n\r\n",
                 body_bytes.len()
-            );
+            )
+            .ok()?;
             let header_bytes = header.as_bytes();
             if header_bytes.len() > out_buf.len() {
                 return None;
@@ -2523,35 +3785,12 @@ pub fn handle_http_request_streaming_impl(
         }
         ("GET", "/cmd.json") | ("POST", "/cmd.json") => {
             let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let mut act = query
-                .split('&')
-                .find_map(|p| p.strip_prefix("act="))
+            let body_payload = extract_query_or_body("", req_bytes);
+            let act = extract_param_or_json_field(query, "act")
+                .or_else(|| extract_param_or_json_field(query, "c"))
+                .or_else(|| extract_param_or_json_field(body_payload, "act"))
+                .or_else(|| extract_param_or_json_field(body_payload, "c"))
                 .unwrap_or("");
-            if act.is_empty() {
-                let body_slice = req_bytes
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|p| &req_bytes[p + 4..])
-                    .or_else(|| {
-                        req_bytes
-                            .windows(2)
-                            .position(|w| w == b"\n\n")
-                            .map(|p| &req_bytes[p + 2..])
-                    })
-                    .unwrap_or(&[]);
-                if let Ok(body_str) = core::str::from_utf8(body_slice) {
-                    act = body_str
-                        .split('&')
-                        .find_map(|p| p.strip_prefix("act="))
-                        .unwrap_or("");
-                    if act.is_empty() {
-                        let trimmed = body_str.trim();
-                        if let Some(rest) = trimmed.strip_prefix("act=") {
-                            act = rest.split('&').next().unwrap_or(rest);
-                        }
-                    }
-                }
-            }
             let (action, ok) = match act {
                 "play" => (
                     HttpControlAction::PlayerIrCommand {
@@ -2794,11 +4033,27 @@ pub fn handle_http_request_streaming_impl(
             if out_buf.len() <= HEADER_ROOM {
                 return None;
             }
+            let payload = extract_query_or_body(raw_path, req_bytes);
+            let valid_eq = payload.is_empty()
+                || parse_config_update_query(payload).is_some_and(|upd| {
+                    upd.key == "equalizer"
+                        && percent_decode_str::<256>(upd.value).is_some_and(|dv| {
+                            crate::config_handle::parse_equalizer_bands(dv.as_str()).is_some()
+                        })
+                });
             let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
-            writer.write_str("{\"ok\":true,\"result\":\"OK\"}").ok()?;
+            let action = if valid_eq {
+                writer.write_str("{\"ok\":true,\"result\":\"OK\"}").ok()?;
+                HttpControlAction::UpdateConfig
+            } else {
+                writer
+                    .write_str("{\"ok\":false,\"error\":\"invalid_eq_bands\"}")
+                    .ok()?;
+                HttpControlAction::None
+            };
             let body_len = writer.written_len();
             let total_len = write_json_http_response(body_len, out_buf)?;
-            Some((total_len, &[], HttpControlAction::UpdateConfig))
+            Some((total_len, &[], action))
         }
         ("GET", "/config.json") => {
             const HEADER_ROOM: usize = 160;
@@ -2815,30 +4070,38 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             let payload = extract_query_or_body(raw_path, req_bytes);
-            let (body_len, action) = if let Some(upd) = parse_config_update_query(payload) {
-                let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
-                let mut decoded_key_buf = [0u8; 64];
-                let decoded_key = percent_decode_into(upd.key, &mut decoded_key_buf)
-                    .and_then(|len| core::str::from_utf8(&decoded_key_buf[..len]).ok())
-                    .unwrap_or(upd.key);
-                let mut decoded_val_buf = [0u8; 128];
-                let decoded_val = percent_decode_into(upd.value, &mut decoded_val_buf)
-                    .and_then(|len| core::str::from_utf8(&decoded_val_buf[..len]).ok())
-                    .unwrap_or(upd.value);
-                let display_val = if crate::config_handle::is_secret_config_key(decoded_key.trim())
-                {
-                    "********"
+            let decoded_upd = parse_config_update_query(payload).and_then(|upd| {
+                let dk = percent_decode_str::<64>(upd.key)?;
+                let dv = percent_decode_str::<256>(upd.value)?;
+                if dk.trim().is_empty() {
+                    return None;
+                }
+                Some((dk, dv))
+            });
+            let (body_len, action) = if let Some((decoded_key, decoded_val)) = decoded_upd {
+                let mut probe = crate::config_handle::ConfigHandle::default();
+                if !probe.apply_key_value(decoded_key.as_str(), decoded_val.as_str()) {
+                    let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                    writer
+                        .write_str("{\"ok\":false,\"error\":\"invalid_config_value\"}")
+                        .ok()?;
+                    (writer.written_len(), HttpControlAction::None)
                 } else {
-                    decoded_val
-                };
-                write!(
-                    writer,
-                    "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
-                    JsonEscaped(decoded_key),
-                    JsonEscaped(display_val),
-                )
-                .ok()?;
-                (writer.written_len(), HttpControlAction::UpdateConfig)
+                    let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
+                    let display_val = if is_secret_config_key_ci(decoded_key.as_str()) {
+                        "********"
+                    } else {
+                        decoded_val.as_str()
+                    };
+                    write!(
+                        writer,
+                        "{{\"ok\":true,\"key\":\"{}\",\"value\":\"{}\",\"result\":\"OK\"}}",
+                        JsonEscaped(decoded_key.as_str()),
+                        JsonEscaped(display_val),
+                    )
+                    .ok()?;
+                    (writer.written_len(), HttpControlAction::UpdateConfig)
+                }
             } else {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
                 writer
@@ -2921,20 +4184,20 @@ pub fn handle_http_request_streaming_impl(
                 return None;
             }
             let payload = extract_query_or_body(raw_path, req_bytes);
-            let (body_len, action) = if let Some(req) = parse_connect_request(payload) {
+            let decoded_conn = parse_connect_request(payload).and_then(|req| {
+                let ssid = percent_decode_str::<64>(req.ssid)?;
+                let _pass = percent_decode_str::<64>(req.password)?;
+                if ssid.trim().is_empty() {
+                    return None;
+                }
+                Some(ssid)
+            });
+            let (body_len, action) = if let Some(decoded_ssid) = decoded_conn {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
-                let mut decoded_buf = [0u8; 64];
-                let decoded_ssid = percent_decode_into(req.ssid, &mut decoded_buf)
-                    .and_then(|len| core::str::from_utf8(&decoded_buf[..len]).ok())
-                    .unwrap_or(req.ssid);
-                let mut decoded_pass_buf = [0u8; 64];
-                let _decoded_password = percent_decode_into(req.password, &mut decoded_pass_buf)
-                    .and_then(|len| core::str::from_utf8(&decoded_pass_buf[..len]).ok())
-                    .unwrap_or(req.password);
                 write!(
                     writer,
                     "{{\"ok\":true,\"status\":\"connecting\",\"ssid\":\"{}\"}}",
-                    JsonEscaped(decoded_ssid),
+                    JsonEscaped(decoded_ssid.as_str()),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::ConnectWifi)
@@ -2991,10 +4254,12 @@ pub fn handle_http_request_streaming_impl(
             let (body_len, action) = if !cmd_str.is_empty() {
                 let mut writer = BufferWriter::new(&mut out_buf[HEADER_ROOM..]);
                 let redacted = redact_command_password(cmd_str);
+                let out_preview = format_cli_output_preview(cmd_str, redacted.as_str(), snapshot);
                 write!(
                     writer,
-                    "{{\"ok\":true,\"cmd\":\"{}\",\"Result\":\"Success\"}}",
+                    "{{\"ok\":true,\"cmd\":\"{}\",\"output\":\"{}\",\"Result\":\"Success\"}}",
                     JsonEscaped(redacted.as_str()),
+                    JsonEscaped(out_preview.as_str()),
                 )
                 .ok()?;
                 (writer.written_len(), HttpControlAction::ExecuteCliCommand)
@@ -3375,7 +4640,7 @@ mod tests {
     #[test]
     fn serves_html_dashboard_on_root_and_index_html() {
         let snap = HttpStatusSnapshot::default();
-        let mut buf = [0u8; 32768];
+        let mut buf = std::vec![0u8; 65536];
 
         let req1 = b"GET / HTTP/1.1\r\nHost: 172.22.1.15\r\n\r\n";
         let (len1, act1) = handle_http_control_request(req1, &snap, &mut buf).unwrap();
@@ -3773,7 +5038,7 @@ mod tests {
         .expect("POST /commands.json");
         assert_eq!(eact, HttpControlAction::ExecuteCliCommand);
         let estr = core::str::from_utf8(&buf[..elen]).expect("utf8");
-        assert!(estr.contains("\"ok\":true,\"cmd\":\"system%20info\""));
+        assert!(estr.contains("\"ok\":true,\"cmd\":\"system info\""));
 
         // 6. POST /flash.json
         let (flen, fact) =
@@ -4003,7 +5268,7 @@ mod tests {
         let (len, act) = handle_http_control_request(req, &snap, &mut buf).unwrap();
         assert_eq!(act, HttpControlAction::ExecuteCliCommand);
         let resp = core::str::from_utf8(&buf[..len]).unwrap();
-        assert!(resp.contains("\"cmd\":\"join%20MyWiFi%20***\""));
+        assert!(resp.contains("\"cmd\":\"join MyWiFi ***\""));
 
         let req2 = b"POST /commands.json HTTP/1.1\r\n\r\ncmd=config set wifi.pass SuperSecretPass";
         let (len2, act2) = handle_http_control_request(req2, &snap, &mut buf).unwrap();
@@ -4021,7 +5286,7 @@ mod tests {
         snap: &HttpStatusSnapshot<'_>,
         router_opt: Option<&HttpControlRouter>,
     ) -> (std::string::String, HttpControlAction) {
-        let mut buf = [0u8; 32768];
+        let mut buf = std::vec![0u8; 65536];
         let res = if let Some(r) = router_opt {
             r.handle_request(req, snap, &mut buf)
         } else {
@@ -4375,5 +5640,811 @@ mod tests {
         let mresp = core::str::from_utf8(&buf[..mlen]).unwrap();
         assert!(mresp.contains(RUST_OTA_FIRMWARE_VERSION));
         assert!(mresp.contains("\"MESSAGING_CLASS_STATS\""));
+    }
+
+    #[test]
+    fn test_sec_002_and_sec_020_auth_token_hardening() {
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 2048];
+
+        // Empty and >128-byte tokens must never yield Some("") and must fail closed
+        assert!(HttpControlRouter::try_with_auth_token("").is_none());
+        let empty_router = HttpControlRouter::with_auth_token("");
+        assert!(empty_router.auth_token.is_none());
+        let (elen, _) = empty_router
+            .handle_request(
+                b"GET /status.json?auth= HTTP/1.1\r\nAuthorization: Bearer \r\n\r\n",
+                &snap,
+                &mut buf,
+            )
+            .unwrap();
+        let eresp = core::str::from_utf8(&buf[..elen]).unwrap();
+        assert!(eresp.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(!eresp.contains("Access-Control-Allow-Origin: *"));
+
+        let oversized = "x".repeat(129);
+        assert!(HttpControlRouter::try_with_auth_token(&oversized).is_none());
+        let over_router = HttpControlRouter::with_auth_token(&oversized);
+        assert!(over_router.auth_token.is_none());
+        let (olen, _) = over_router
+            .handle_request(b"GET /status.json HTTP/1.1\r\n\r\n", &snap, &mut buf)
+            .unwrap();
+        assert!(core::str::from_utf8(&buf[..olen])
+            .unwrap()
+            .starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+
+        // Valid 64-char hex token: case-insensitive headers, no query/body bypass
+        let tok64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let router = HttpControlRouter::try_with_auth_token(tok64).expect("valid 64-byte token");
+
+        let req_ci = format!(
+            "GET /status.json HTTP/1.1\r\nauthorization: bearer {}\r\n\r\n",
+            tok64
+        );
+        let (len_ok, _) = router
+            .handle_request(req_ci.as_bytes(), &snap, &mut buf)
+            .unwrap();
+        assert!(core::str::from_utf8(&buf[..len_ok])
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let req_x = format!(
+            "GET /status.json HTTP/1.1\r\nX-AUTH-TOKEN: {}\r\n\r\n",
+            tok64
+        );
+        let (len_x, _) = router
+            .handle_request(req_x.as_bytes(), &snap, &mut buf)
+            .unwrap();
+        assert!(core::str::from_utf8(&buf[..len_x])
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let req_q = format!("GET /status.json?auth={} HTTP/1.1\r\n\r\n", tok64);
+        let (len_q, _) = router
+            .handle_request(req_q.as_bytes(), &snap, &mut buf)
+            .unwrap();
+        assert!(core::str::from_utf8(&buf[..len_q])
+            .unwrap()
+            .starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+
+        let req_body = format!(
+            "POST /status.json HTTP/1.1\r\n\r\nAuthorization: Bearer {}\r\n",
+            tok64
+        );
+        let (len_b, _) = router
+            .handle_request(req_body.as_bytes(), &snap, &mut buf)
+            .unwrap();
+        assert!(core::str::from_utf8(&buf[..len_b])
+            .unwrap()
+            .starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+    }
+
+    #[test]
+    fn test_sec_003_and_sec_036_zeroconf_dh_hmac_sha256_and_clamping() {
+        let ip = [10, 0, 0, 5];
+        let ent1 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let ent2 = [9, 8, 7, 6, 5, 4, 3, 2];
+        let k1 = derive_zeroconf_dh_private_key_with_entropy(ip, ent1);
+        let k2 = derive_zeroconf_dh_private_key_with_entropy(ip, ent2);
+        let k3 = derive_zeroconf_dh_private_key_with_entropy([10, 0, 0, 6], ent1);
+        assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
+        assert_eq!(k1[0] & 0x01, 1);
+        assert_eq!(k1[95] & 0xC1, 0x41);
+        assert!(OakleyGroup1Dh::from_private_key(k1).is_ok());
+
+        let snap = sample_snapshot();
+        let boot_key = derive_zeroconf_dh_private_key(&snap);
+        assert_eq!(boot_key[0] & 0x01, 1);
+        assert_eq!(boot_key[95] & 0xC1, 0x41);
+        assert!(OakleyGroup1Dh::from_private_key(boot_key).is_ok());
+    }
+
+    #[test]
+    fn test_sec_007_redact_command_password_hardened() {
+        let many_tokens = "echo 1 2 3 4 5 6 7 8 9 10 password=TopSecret1";
+        let red1 = redact_command_password(many_tokens);
+        assert!(!red1.contains("TopSecret1"));
+        assert!(red1.contains("password=***"));
+
+        let multi_join = redact_command_password("JOIN MyWifi pass1 pass2 extra");
+        assert_eq!(multi_join.as_str(), "JOIN MyWifi ***");
+
+        let multi_conn = redact_command_password("connect MyWifi p1 p2");
+        assert_eq!(multi_conn.as_str(), "connect MyWifi <redacted>");
+
+        let multi_kv = redact_command_password("cfg wifi.pass=abc&PASSWORD=def&Pwd=ghi");
+        assert_eq!(multi_kv.as_str(), "cfg wifi.pass=***&PASSWORD=***&Pwd=***");
+
+        let long_cmd = "x".repeat(200);
+        let trunc = redact_command_password(&long_cmd);
+        assert_eq!(trunc.len(), 160);
+    }
+
+    #[test]
+    fn test_sec_007_r1_redact_command_password_utf8_and_bypasses() {
+        let utf8_only = redact_command_password("Café");
+        assert_eq!(utf8_only.as_str(), "Café");
+
+        let utf8_join = redact_command_password("join Café CaféPass");
+        assert!(!utf8_join.contains("CaféPass"));
+        assert_eq!(utf8_join.as_str(), "join Café ***");
+
+        let utf8_kv = redact_command_password("password=CaféPass");
+        assert!(!utf8_kv.contains("CaféPass"));
+        assert_eq!(utf8_kv.as_str(), "password=***");
+
+        let plus_join = redact_command_password("join+MyWifi+SecretPass");
+        assert!(!plus_join.contains("Secret"));
+        assert_eq!(plus_join.as_str(), "join MyWifi ***");
+
+        let plus_cfg = redact_command_password("config+set+wifi.pass+SecretPass");
+        assert!(!plus_cfg.contains("Secret"));
+        assert_eq!(plus_cfg.as_str(), "config set wifi.pass ***");
+
+        let lead_ws_join = redact_command_password(" join MyWifi SecretPass");
+        assert!(!lead_ws_join.contains("Secret"));
+        assert_eq!(lead_ws_join.as_str(), "join MyWifi ***");
+
+        let pct_cfg = redact_command_password("%20config%20set%20wifi.pass%20SecretPass");
+        assert!(!pct_cfg.contains("Secret"));
+        assert_eq!(pct_cfg.as_str(), "config set wifi.pass ***");
+
+        let space_flag = redact_command_password("cfg-syst-services --password MySecret");
+        assert!(!space_flag.contains("Secret"));
+        assert_eq!(space_flag.as_str(), "cfg-syst-services --password ***");
+
+        let quoted_space_flag =
+            redact_command_password("cfg-syst-services --wifi.pass \"My Secret\"");
+        assert!(!quoted_space_flag.contains("Secret"));
+        assert_eq!(
+            quoted_space_flag.as_str(),
+            "cfg-syst-services --wifi.pass ***"
+        );
+
+        let multi_quoted_eq = redact_command_password(
+            "cfg-syst-services --password=\"My Secret\" --ap_pwd='Other Secret'",
+        );
+        assert!(!multi_quoted_eq.contains("Secret"));
+        assert_eq!(
+            multi_quoted_eq.as_str(),
+            "cfg-syst-services --password=*** --ap_pwd=***"
+        );
+
+        let pct_eq = redact_command_password("cfg-syst-services password%3DSecretPass");
+        assert!(!pct_eq.contains("Secret"));
+        assert_eq!(pct_eq.as_str(), "cfg-syst-services password=***");
+
+        let pct_verb = redact_command_password("%6aoin%20MyWifi%20SecretPass");
+        assert!(!pct_verb.contains("Secret"));
+        assert_eq!(pct_verb.as_str(), "join MyWifi ***");
+
+        let quoted_ssid = redact_command_password("join \"Café WiFi\" SecretPass");
+        assert!(!quoted_ssid.contains("Secret"));
+        assert_eq!(quoted_ssid.as_str(), "join \"Café WiFi\" ***");
+
+        let escaped_quote =
+            redact_command_password("cfg-syst-services --password=\"My \\\"Inner\\\" Secret\"");
+        assert!(!escaped_quote.contains("Secret"));
+        assert_eq!(escaped_quote.as_str(), "cfg-syst-services --password=***");
+
+        let cfg_flag_key = redact_command_password("config set --token MySecret");
+        assert!(!cfg_flag_key.contains("Secret"));
+        assert_eq!(cfg_flag_key.as_str(), "config set --token ***");
+
+        let malformed_pct = redact_command_password("join MyWifi Secret%ZZ");
+        assert!(!malformed_pct.contains("Secret"));
+        assert_eq!(malformed_pct.as_str(), "<redacted>");
+
+        let invalid_utf8 = redact_command_password("%FF%FEpassword=Secret");
+        assert!(!invalid_utf8.contains("Secret"));
+        assert_eq!(invalid_utf8.as_str(), "<redacted>");
+
+        let mut oversized = std::string::String::from("password=Secret ");
+        oversized.push_str(&"x".repeat(250));
+        let over_redacted = redact_command_password(&oversized);
+        assert!(!over_redacted.contains("Secret"));
+        assert_eq!(over_redacted.as_str(), "<redacted>");
+
+        let unclosed_q = redact_command_password("cfg-syst-services --password \"My Secret");
+        assert!(!unclosed_q.contains("Secret"));
+        assert_eq!(unclosed_q.as_str(), "<redacted>");
+
+        let bare_pin_plus = redact_command_password("bt_sink_pin+9876");
+        assert!(!bare_pin_plus.contains("9876"));
+        assert_eq!(bare_pin_plus.as_str(), "bt_sink_pin ***");
+
+        let bare_pin_space = redact_command_password("bt_sink_pin 9876");
+        assert!(!bare_pin_space.contains("9876"));
+        assert_eq!(bare_pin_space.as_str(), "bt_sink_pin ***");
+
+        let short_p_space = redact_command_password("-p Secret");
+        assert!(!short_p_space.contains("Secret"));
+        assert_eq!(short_p_space.as_str(), "-p ***");
+
+        let short_p_eq = redact_command_password("-p=Secret");
+        assert!(!short_p_eq.contains("Secret"));
+        assert_eq!(short_p_eq.as_str(), "-p=***");
+
+        let wifi_psk = redact_command_password("wifi_join --psk Secret");
+        assert!(!wifi_psk.contains("Secret"));
+        assert_eq!(wifi_psk.as_str(), "wifi_join --psk ***");
+
+        let wifi_set_utf8 = redact_command_password("wifi set --ssid Café --password Secret");
+        assert!(!wifi_set_utf8.contains("Secret"));
+        assert_eq!(
+            wifi_set_utf8.as_str(),
+            "wifi set --ssid Café --password ***"
+        );
+
+        let plus_wifi_set = redact_command_password("+wifi+set+--ssid+Home+--password+Secret");
+        assert!(!plus_wifi_set.contains("Secret"));
+        assert_eq!(
+            plus_wifi_set.as_str(),
+            "wifi set --ssid Home --password ***"
+        );
+
+        assert_eq!(redact_command_password("%C3").as_str(), "<redacted>");
+        assert_eq!(redact_command_password("%2").as_str(), "<redacted>");
+
+        assert_eq!(redact_command_password("status").as_str(), "status");
+        assert_eq!(redact_command_password("volume 50").as_str(), "volume 50");
+        assert_eq!(redact_command_password("reboot").as_str(), "reboot");
+        assert_eq!(redact_command_password("p 1").as_str(), "p 1");
+    }
+
+    #[test]
+    fn test_sec_021_origin_validation_hardened() {
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 1024];
+
+        let userinfo_req = b"POST /config.json HTTP/1.1\r\n\
+            Origin: http://127.0.0.1:80@evil.com\r\n\r\nkey=vol&value=10";
+        let (u_len, u_act) = handle_http_control_request(userinfo_req, &snap, &mut buf).unwrap();
+        assert_eq!(u_act, HttpControlAction::None);
+        assert!(core::str::from_utf8(&buf[..u_len])
+            .unwrap()
+            .starts_with("HTTP/1.1 403 Forbidden"));
+
+        let upper_req = b"POST /config.json HTTP/1.1\r\n\
+            ORIGIN: http://evil.example.com\r\n\r\nkey=vol&value=10";
+        let (up_len, up_act) = handle_http_control_request(upper_req, &snap, &mut buf).unwrap();
+        assert_eq!(up_act, HttpControlAction::None);
+        assert!(core::str::from_utf8(&buf[..up_len])
+            .unwrap()
+            .starts_with("HTTP/1.1 403 Forbidden"));
+
+        let bad_scheme = b"POST /config.json HTTP/1.1\r\n\
+            Origin: ftp://127.0.0.1\r\n\r\nkey=vol&value=10";
+        let (bs_len, _) = handle_http_control_request(bad_scheme, &snap, &mut buf).unwrap();
+        assert!(core::str::from_utf8(&buf[..bs_len])
+            .unwrap()
+            .starts_with("HTTP/1.1 403 Forbidden"));
+
+        let pub_v6 = b"POST /config.json HTTP/1.1\r\n\
+            Origin: http://[2001:db8::1]:8080\r\n\r\nkey=vol&value=10";
+        let (pv_len, _) = handle_http_control_request(pub_v6, &snap, &mut buf).unwrap();
+        assert!(core::str::from_utf8(&buf[..pv_len])
+            .unwrap()
+            .starts_with("HTTP/1.1 403 Forbidden"));
+
+        let lo_v6 = b"POST /config.json HTTP/1.1\r\n\
+            Origin: http://[::1]:8080\r\n\r\nkey=vol_pct&value=50";
+        let (lv_len, lv_act) = handle_http_control_request(lo_v6, &snap, &mut buf).unwrap();
+        assert_eq!(lv_act, HttpControlAction::UpdateConfig);
+        assert!(core::str::from_utf8(&buf[..lv_len])
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+
+        let body_origin = b"POST /config.json HTTP/1.1\r\n\
+            Origin: http://172.22.1.15\r\n\r\nOrigin: http://evil.com&key=vol_pct&value=50";
+        let (bo_len, bo_act) = handle_http_control_request(body_origin, &snap, &mut buf).unwrap();
+        assert_eq!(bo_act, HttpControlAction::UpdateConfig);
+        assert!(core::str::from_utf8(&buf[..bo_len])
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn test_logic_002_and_sec_022_web_cli_commands_and_cfg_validation() {
+        let snap = sample_snapshot();
+        let mut cfg = crate::config_handle::ConfigHandle::default();
+        let mut syslog = SyslogRingBuffer::new();
+
+        for stub in [
+            "restart",
+            "recovery",
+            "restart_ota",
+            "i2cget 0x2d 0x00",
+            "i2cset 0x2d 0x00 0x01",
+            "i2cdump 0x2d",
+            "update http://example.com/fw.bin",
+            "sleep 10",
+        ] {
+            assert!(
+                !execute_web_cli_command(stub, &snap, &mut cfg, &mut syslog),
+                "stubbed CLI verb must return false: {stub}"
+            );
+            assert!(syslog.latest_message().contains("unsupported"));
+        }
+
+        // join: missing args fails, valid args stage in config with pass masked
+        assert!(!execute_web_cli_command(
+            "join",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(execute_web_cli_command(
+            "join \"Home Net\" \"Super Pass\"",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert_eq!(cfg.nvs_override("wifi.ssid").as_deref(), Some("Home Net"));
+        assert_eq!(cfg.nvs_override("wifi.pass").as_deref(), Some("Super Pass"));
+        assert!(!syslog.latest_message().contains("Super Pass"));
+
+        // config set propagates validation errors and masks secret values
+        assert!(!execute_web_cli_command(
+            "config set lms_ip not_an_ip",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(execute_web_cli_command(
+            "config set wifi.pass SecretPass99",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!syslog.latest_message().contains("SecretPass99"));
+        assert!(syslog.latest_message().contains("wifi.pass=***"));
+
+        // cfg-* enforces allowlist, supports quoted spaces, rejects bad flags
+        assert!(!execute_web_cli_command(
+            "cfg-evil --foo bar",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!execute_web_cli_command(
+            "cfg-syst-name --host_name",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(execute_web_cli_command(
+            "cfg-syst-name --host_name \"Studio Room\"",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert_eq!(cfg.host_name_str(), "Studio Room");
+        assert!(execute_web_cli_command(
+            "cfg-syst-services --password MySecret",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!syslog.latest_message().contains("MySecret"));
+        assert!(syslog.latest_message().contains("password=***"));
+    }
+
+    #[test]
+    fn test_sec_023_percent_decode_rejection() {
+        let snap = sample_snapshot();
+        let mut cfg = crate::config_handle::ConfigHandle::default();
+        let mut syslog = SyslogRingBuffer::new();
+
+        assert!(!apply_web_config_update(
+            "player_name",
+            "Bad%ZZ",
+            snap.uptime_ms,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!apply_web_config_update(
+            "player_name",
+            "Bad%FF",
+            snap.uptime_ms,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!execute_web_cli_command(
+            "free%2",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+
+        let mut buf = [0u8; 1024];
+        let (len, act) = handle_http_control_request(
+            b"POST /config.json HTTP/1.1\r\n\r\nkey=player_name&value=Bad%ZZ",
+            &snap,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(act, HttpControlAction::None);
+        assert!(core::str::from_utf8(&buf[..len])
+            .unwrap()
+            .contains("\"ok\":false"));
+
+        let (clen, cact) = handle_http_control_request(
+            b"POST /connect.json HTTP/1.1\r\n\r\nssid=Bad%FF&password=ok",
+            &snap,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(cact, HttpControlAction::None);
+        assert!(core::str::from_utf8(&buf[..clen])
+            .unwrap()
+            .contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn test_sec_024_query_and_json_parser_hardened() {
+        let injected = "{\"command\":\"echo a&cmd=evil\"}";
+        assert_eq!(extract_param_or_json_field(injected, "cmd"), None);
+        assert_eq!(
+            extract_param_or_json_field(injected, "command"),
+            Some("echo a&cmd=evil")
+        );
+
+        let escaped = "{\"note\":\"\\\"key\\\":\\\"evil\\\"\",\"key\":\"good\"}";
+        assert_eq!(extract_param_or_json_field(escaped, "key"), Some("good"));
+
+        let numeric = parse_config_update_query("{\"key\":\"vol\",\"value\":50}")
+            .expect("numeric json value");
+        assert_eq!(numeric.key, "vol");
+        assert_eq!(numeric.value, "50");
+
+        assert_eq!(parse_config_update_query("{\"key\":\"vol\"}"), None);
+        assert_eq!(
+            parse_config_update_query(
+                "{\"config\":{\"first\":{\"type\":1},\"second\":{\"value\":\"leak\"}}}"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sec_037_syslog_control_char_sanitization() {
+        let snap = sample_snapshot();
+        let mut cfg = crate::config_handle::ConfigHandle::default();
+        let mut syslog = SyslogRingBuffer::new();
+
+        assert!(apply_web_config_update(
+            "player_name",
+            "Good%0AFAKE%0D%7F",
+            snap.uptime_ms,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!syslog
+            .latest_message()
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7F));
+
+        assert!(!execute_web_cli_command(
+            "unknown%0AFAKE",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+        assert!(!syslog
+            .latest_message()
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7F));
+
+        syslog.push(1, "INFO", "SYS", "line1\nline2\r\x07\x7F");
+        assert_eq!(syslog.latest_message(), "line1line2");
+    }
+
+    #[test]
+    fn test_logic_013_write_json_escaped_str_utf8() {
+        let mut s = std::string::String::new();
+        write_json_escaped_str(&mut s, "Café 🎵 \"Hi\"\n").unwrap();
+        assert_eq!(s, "Café 🎵 \\\"Hi\\\"\\n");
+    }
+
+    #[test]
+    fn test_tdd_fix_b_lms_server_ip_roundtrip_and_snapshot_32_slots() {
+        use crate::config_handle::{
+            ConfigHandle, FlashTargetPolicy, JournalSector, RamJournal, MAX_NVS_OVERRIDE_SLOTS,
+        };
+
+        let snap = sample_snapshot();
+        let req = b"POST /config.json HTTP/1.1\r\n\r\nkey=lms_server_ip&value=172.25.8.40%3A9000";
+        let mut buf = [0u8; 4096];
+        let (len, act) =
+            handle_http_control_request(req, &snap, &mut buf).expect("POST /config.json");
+        assert_eq!(act, HttpControlAction::UpdateConfig);
+        let resp = core::str::from_utf8(&buf[..len]).expect("utf8");
+        assert!(resp.contains("\"ok\":true"));
+
+        let cfg = ConfigHandle::default();
+        let mut sector = JournalSector::erased();
+        let mut journal = RamJournal::new(&mut sector, None, FlashTargetPolicy::FixedA);
+        dispatch_web_post_action(act, req, &snap, &cfg, &mut journal);
+
+        assert_eq!(cfg.lms_server_ip(), Some([172, 25, 8, 40]));
+        assert_eq!(cfg.read(|c| c.lms_server_port), Some(9000));
+        assert!(journal.pending_image().is_some());
+
+        let overrides = cfg.nvs_overrides();
+        let mut views = [ConfigEntryView::new("", "", "string"); MAX_NVS_OVERRIDE_SLOTS];
+        let mut view_len = 0usize;
+        for slot in &overrides {
+            if slot.used && view_len < views.len() {
+                views[view_len] =
+                    ConfigEntryView::new(slot.key.as_str(), slot.value.as_str(), "string");
+                view_len += 1;
+            }
+        }
+        let mut snap_updated = snap.clone();
+        snap_updated.lms_ip = cfg.effective_lms_server_ip().unwrap_or(snap.lms_ip);
+        snap_updated.lms_port = cfg.read(|c| c.lms_server_port).unwrap_or(snap.lms_port);
+        snap_updated.player_name = "DEVBENCH";
+
+        let (glen, _, gact) = handle_http_request_streaming_with_entries(
+            b"GET /config.json HTTP/1.1\r\n\r\n",
+            &snap_updated,
+            &views[..view_len],
+            &mut buf,
+        )
+        .expect("GET /config.json");
+        assert_eq!(gact, HttpControlAction::None);
+        let gresp = core::str::from_utf8(&buf[..glen]).expect("utf8");
+        assert!(gresp.contains("\"lms_ip\":\"172.25.8.40\""));
+        assert!(gresp.contains("\"lms_port\":9000"));
+        assert!(gresp.contains("\"lms_server_ip\":{\"value\":\"172.25.8.40:9000\""));
+        assert!(gresp.contains("\"host_name\":{\"value\":\"DEVBENCH\""));
+
+        // Verify all 32 NVS override slots serialize cleanly via write_config_json.
+        let cfg32 = ConfigHandle::default();
+        let mut keys_owned = std::vec::Vec::with_capacity(MAX_NVS_OVERRIDE_SLOTS);
+        let mut vals_owned = std::vec::Vec::with_capacity(MAX_NVS_OVERRIDE_SLOTS);
+        for i in 0..MAX_NVS_OVERRIDE_SLOTS {
+            let k = format!("slot_k_{i:02}");
+            let v = format!("slot_v_{i:02}");
+            assert!(cfg32.set_nvs_override(&k, &v));
+            keys_owned.push(k);
+            vals_owned.push(v);
+        }
+        let slots32 = cfg32.nvs_overrides();
+        let mut views32 = [ConfigEntryView::new("", "", "string"); MAX_NVS_OVERRIDE_SLOTS];
+        for (i, slot) in slots32.iter().enumerate() {
+            assert!(slot.used, "slot {i} should be used");
+            views32[i] = ConfigEntryView::new(slot.key.as_str(), slot.value.as_str(), "string");
+        }
+        let wlen = write_config_json(&snap_updated, &views32, &mut buf)
+            .expect("32 NVS override slots fit in 4096B buffer");
+        let wjson = core::str::from_utf8(&buf[..wlen]).expect("utf8");
+        for (k, v) in keys_owned.iter().zip(vals_owned.iter()) {
+            let needle = format!("\"{k}\":{{\"value\":\"{v}\"");
+            assert!(wjson.contains(&needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn test_tdd_fix_b_percent_encoded_autoexec1_over_128_raw_bytes() {
+        use crate::config_handle::ConfigHandle;
+
+        let decoded = "squeezelite -o I2S -n BASEMENT_DEVBENCH -s 172.25.8.40:9000 \
+             -b 500:2000 -c flc,pcm,mp3 -d all=info -C 30 -W";
+        assert!((85..=125).contains(&decoded.len()));
+        let encoded = "squeezelite%20-o%20I2S%20-n%20BASEMENT_DEVBENCH%20-s%20172.25.8.40%3A9000\
+             %20-b%20500%3A2000%20-c%20flc%2Cpcm%2Cmp3%20-d%20all%3Dinfo%20-C%2030%20-W";
+        assert!(encoded.len() > 128);
+
+        let snap = sample_snapshot();
+        let req = format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={encoded}");
+        let mut buf = [0u8; 2048];
+        let (len, act) = handle_http_control_request(req.as_bytes(), &snap, &mut buf)
+            .expect("POST /config.json");
+        assert_eq!(act, HttpControlAction::UpdateConfig);
+        let resp = core::str::from_utf8(&buf[..len]).expect("utf8");
+        assert!(resp.contains("\"ok\":true"));
+
+        let mut cfg = ConfigHandle::default();
+        let mut local_syslog = SyslogRingBuffer::new();
+        assert!(apply_web_config_update(
+            "autoexec1",
+            encoded,
+            snap.uptime_ms,
+            &mut cfg,
+            &mut local_syslog,
+        ));
+        assert_eq!(cfg.nvs_override("autoexec1").as_deref(), Some(decoded));
+    }
+
+    #[test]
+    fn test_tdd_fix_b_rejects_invalid_config_value_instead_of_lying_ok() {
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 1024];
+
+        let req_bad_ip = b"POST /config.json HTTP/1.1\r\n\r\nkey=lms_server_ip&value=not_an_ip";
+        let (len1, act1) =
+            handle_http_control_request(req_bad_ip, &snap, &mut buf).expect("POST /config.json");
+        assert_eq!(act1, HttpControlAction::None);
+        let resp1 = core::str::from_utf8(&buf[..len1]).expect("utf8");
+        assert!(resp1.contains("\"ok\":false"));
+        assert!(resp1.contains("invalid_config_value"));
+
+        let ok_160 = "a".repeat(160);
+        let req_ok_160 = format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={ok_160}");
+        let (len_ok, act_ok) = handle_http_control_request(req_ok_160.as_bytes(), &snap, &mut buf)
+            .expect("POST /config.json 160B");
+        assert_eq!(act_ok, HttpControlAction::UpdateConfig);
+        let resp_ok = core::str::from_utf8(&buf[..len_ok]).expect("utf8");
+        assert!(resp_ok.contains("\"ok\":true"));
+
+        let too_long = "a".repeat(193);
+        let req_too_long =
+            format!("POST /config.json HTTP/1.1\r\n\r\nkey=autoexec1&value={too_long}");
+        let (len2, act2) = handle_http_control_request(req_too_long.as_bytes(), &snap, &mut buf)
+            .expect("POST /config.json");
+        assert_eq!(act2, HttpControlAction::None);
+        let resp2 = core::str::from_utf8(&buf[..len2]).expect("utf8");
+        assert!(resp2.contains("\"ok\":false"));
+        assert!(resp2.contains("invalid_config_value"));
+    }
+
+    #[test]
+    fn test_phase2_remediation_headers_origin_eq_json_and_cli_output() {
+        use crate::config_handle::ConfigHandle;
+
+        let snap = sample_snapshot();
+        let mut buf = [0u8; 4096];
+
+        // 1. GET / security headers (nosniff, X-Frame-Options, frame-ancestors)
+        let (hlen, sbody, hact) = handle_http_request_streaming(
+            b"GET / HTTP/1.1\r\nHost: 172.25.6.102\r\n\r\n",
+            &snap,
+            &mut buf,
+        )
+        .expect("GET /");
+        assert_eq!(hact, HttpControlAction::None);
+        assert!(!sbody.is_empty());
+        let hstr = core::str::from_utf8(&buf[..hlen]).expect("utf8");
+        assert!(hstr.contains("X-Content-Type-Options: nosniff\r\n"));
+        assert!(hstr.contains("X-Frame-Options: DENY\r\n"));
+        assert!(hstr.contains("Content-Security-Policy: frame-ancestors 'none'\r\n"));
+
+        // 2. Binary non-UTF8 body after \r\n\r\n + same-host split-DNS Origin
+        let mut bin_req = std::vec::Vec::from(
+            &b"POST /flash.json HTTP/1.1\r\nHost: devbench.lan\r\n\
+               Origin: http://devbench.lan\r\nContent-Length: 4\r\n\r\n"[..],
+        );
+        bin_req.extend_from_slice(&[0xE9, 0xFF, 0x80, 0x00]);
+        let (flen, fact) =
+            handle_http_control_request(&bin_req, &snap, &mut buf).expect("binary POST");
+        assert_eq!(fact, HttpControlAction::StartOtaFlash);
+        let fstr = core::str::from_utf8(&buf[..flen]).expect("utf8");
+        assert!(fstr.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        // Same-host Origin on custom corporate FQDN matches Host header
+        let corp_req = b"POST /config.json HTTP/1.1\r\nHost: devbench.corp.example.org:8080\r\n\
+            Origin: http://devbench.corp.example.org:8080\r\n\r\nkey=host_name&value=DEVBENCH";
+        let (clen, cact) =
+            handle_http_control_request(corp_req, &snap, &mut buf).expect("same-host POST");
+        assert_eq!(cact, HttpControlAction::UpdateConfig);
+        assert!(core::str::from_utf8(&buf[..clen])
+            .expect("utf8")
+            .contains("\"ok\":true"));
+
+        // Cross-origin mismatch is still rejected with 403
+        let evil_req = b"POST /config.json HTTP/1.1\r\nHost: devbench.lan\r\n\
+            Origin: https://evil.com\r\n\r\nkey=host_name&value=PWN";
+        let (elen, eact) =
+            handle_http_control_request(evil_req, &snap, &mut buf).expect("evil POST");
+        assert_eq!(eact, HttpControlAction::None);
+        assert!(core::str::from_utf8(&buf[..elen])
+            .expect("utf8")
+            .starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 3. POST /eq.json with {"bands":[1,2,3,4,5,0,-1,-2,-3,-4]}
+        let eq_req = b"POST /eq.json HTTP/1.1\r\nHost: 172.25.6.102\r\n\
+            Content-Type: application/json\r\n\r\n\
+            {\"bands\":[1,2,3,4,5,0,-1,-2,-3,-4]}";
+        let (qlen, qact) =
+            handle_http_control_request(eq_req, &snap, &mut buf).expect("POST /eq.json");
+        assert_eq!(qact, HttpControlAction::UpdateConfig);
+        assert!(core::str::from_utf8(&buf[..qlen])
+            .expect("utf8")
+            .contains("\"ok\":true"));
+        let mut cfg = ConfigHandle::default();
+        let mut local_syslog = SyslogRingBuffer::new();
+        let upd = parse_config_update_query("{\"bands\":[1,2,3,4,5,0,-1,-2,-3,-4]}").expect("eq");
+        assert!(apply_web_config_update(
+            upd.key,
+            upd.value,
+            snap.uptime_ms,
+            &mut cfg,
+            &mut local_syslog,
+        ));
+        assert_eq!(
+            cfg.nvs_override("equalizer").as_deref(),
+            Some("1,2,3,4,5,0,-1,-2,-3,-4")
+        );
+
+        // 4. /commands.json scl="27", POST /commands.json "output", "type":33
+        assert!(COMMANDS_JSON_CATALOG.contains("\"sda\":\"21\",\"scl\":\"27\""));
+        let cmd_req = b"POST /commands.json HTTP/1.1\r\n\r\n{\"command\":\"version\"}";
+        let (vlen, vact) =
+            handle_http_control_request(cmd_req, &snap, &mut buf).expect("POST /commands.json");
+        assert_eq!(vact, HttpControlAction::ExecuteCliCommand);
+        let vstr = core::str::from_utf8(&buf[..vlen]).expect("utf8");
+        assert!(vstr.contains("\"output\":\"Squeezelite-ESP32 I2S-4MFlash-Rust"));
+
+        let views = [ConfigEntryView::new(
+            "lms_server_ip",
+            "172.25.8.40:9000",
+            "string",
+        )];
+        let wlen = write_config_json(&snap, &views, &mut buf).expect("write_config_json");
+        let wjson = core::str::from_utf8(&buf[..wlen]).expect("utf8");
+        assert!(wjson.contains("\"lms_server_ip\":{\"value\":\"172.25.8.40:9000\",\"type\":33}"));
+
+        // 5. POST /cmd.json with c= body and ?c= query + split-packet detection
+        let post_cmd_req = b"POST /cmd.json HTTP/1.1\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\r\nc=vol70";
+        let (plen, pact) = handle_http_control_request(post_cmd_req, &snap, &mut buf)
+            .expect("POST /cmd.json c=vol70");
+        assert!(matches!(
+            pact,
+            HttpControlAction::PlayerIrCommand {
+                vol_pct: Some(70),
+                ..
+            }
+        ));
+        assert!(core::str::from_utf8(&buf[..plen])
+            .expect("utf8")
+            .contains("\"act\":\"vol70\""));
+
+        let mut split_hdr = std::vec::Vec::from(&b"POST /config.json HTTP/1.1\r\n"[..]);
+        split_hdr.extend_from_slice(&[b'X'; 400]);
+        split_hdr.extend_from_slice(b"\r\nContent-Length: 24\r\n\r\n");
+        assert!(http_request_needs_more_bytes(&split_hdr, 2048));
+        split_hdr.extend_from_slice(b"key=host_name&value=TEST");
+        assert!(!http_request_needs_more_bytes(&split_hdr, 2048));
+    }
+
+    #[test]
+    fn test_tdd_fix_b_commands_json_accepts_squeezelite_autoexec1() {
+        use crate::config_handle::{ConfigHandle, FlashTargetPolicy, JournalSector, RamJournal};
+
+        let snap = sample_snapshot();
+        let req = b"POST /commands.json HTTP/1.1\r\n\r\n\
+            {\"command\":\"squeezelite -o I2S -s 172.25.8.40:9000 -n DEVBENCH\"}";
+        let mut buf = [0u8; 1024];
+        let (len, act) =
+            handle_http_control_request(req, &snap, &mut buf).expect("POST /commands.json");
+        assert_eq!(act, HttpControlAction::ExecuteCliCommand);
+        let resp = core::str::from_utf8(&buf[..len]).expect("utf8");
+        assert!(resp.contains("\"ok\":true"));
+
+        let mut cfg = ConfigHandle::default();
+        let mut syslog = SyslogRingBuffer::new();
+        assert!(execute_web_cli_command(
+            "squeezelite -o I2S -s 172.25.8.40:9000 -n DEVBENCH",
+            &snap,
+            &mut cfg,
+            &mut syslog
+        ));
+
+        let cfg2 = ConfigHandle::default();
+        let mut sector = JournalSector::erased();
+        let mut journal = RamJournal::new(&mut sector, None, FlashTargetPolicy::FixedA);
+        dispatch_web_post_action(act, req, &snap, &cfg2, &mut journal);
+        assert_eq!(
+            cfg2.nvs_override("autoexec1").as_deref(),
+            Some("squeezelite -o I2S -s 172.25.8.40:9000 -n DEVBENCH")
+        );
+        assert_eq!(cfg2.lms_server_ip(), Some([172, 25, 8, 40]));
+        assert_eq!(cfg2.read(|c| c.lms_server_port), Some(9000));
+        assert_eq!(cfg2.device_name().as_str(), "DEVBENCH");
+        assert!(journal.pending_image().is_some());
     }
 }

@@ -58,7 +58,8 @@ impl TrackMetadata {
         }
     }
 
-    /// Formats a 20-byte raw Spotify image `file_id` into a lowercase hex string.
+    /// Formats a 20-byte raw Spotify image `file_id` into a lowercase hex
+    /// string.
     #[must_use]
     pub fn bytes_to_hex(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -68,7 +69,8 @@ impl TrackMetadata {
         out
     }
 
-    /// Builds a Spotify CDN artwork URL (`https://i.scdn.co/image/<hex_id>`) from hex ID.
+    /// Builds a Spotify CDN artwork URL (`https://i.scdn.co/image/<hex_id>`)
+    /// from hex ID.
     #[must_use]
     pub fn build_artwork_url(hex_id: &str) -> String {
         let trimmed = hex_id.trim_start_matches(SPOTIFY_IMAGE_CDN_BASE);
@@ -82,7 +84,8 @@ impl TrackMetadata {
         Self::build_artwork_url(&hex_id)
     }
 
-    /// Returns the full CDN artwork URL (`https://i.scdn.co/image/<hex_id>`) if present.
+    /// Returns the full CDN artwork URL (`https://i.scdn.co/image/<hex_id>`)
+    /// if present.
     #[must_use]
     pub fn artwork_url(&self) -> Option<String> {
         self.artwork_image_id
@@ -581,6 +584,9 @@ pub fn decode_varint(data: &[u8], pos: &mut usize) -> Result<u64, SpircError> {
     while *pos < data.len() {
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && (b & 0x7F) > 1 {
+            return Err(SpircError::VarintOverflow);
+        }
         result |= ((b & 0x7F) as u64) << shift;
         if (b & 0x80) == 0 {
             return Ok(result);
@@ -616,25 +622,29 @@ pub fn skip_unknown_field(wire_type: u8, data: &[u8], pos: &mut usize) -> Result
             Ok(())
         }
         1 => {
-            if *pos + 8 > data.len() {
+            let end = pos.checked_add(8).ok_or(SpircError::TruncatedMessage)?;
+            if end > data.len() {
                 return Err(SpircError::TruncatedMessage);
             }
-            *pos += 8;
+            *pos = end;
             Ok(())
         }
         2 => {
-            let len = decode_varint(data, pos)? as usize;
-            if *pos + len > data.len() {
+            let raw_len = decode_varint(data, pos)?;
+            let len = usize::try_from(raw_len).map_err(|_| SpircError::TruncatedMessage)?;
+            let end = pos.checked_add(len).ok_or(SpircError::TruncatedMessage)?;
+            if end > data.len() {
                 return Err(SpircError::TruncatedMessage);
             }
-            *pos += len;
+            *pos = end;
             Ok(())
         }
         5 => {
-            if *pos + 4 > data.len() {
+            let end = pos.checked_add(4).ok_or(SpircError::TruncatedMessage)?;
+            if end > data.len() {
                 return Err(SpircError::TruncatedMessage);
             }
-            *pos += 4;
+            *pos = end;
             Ok(())
         }
         _ => Err(SpircError::InvalidWireType),
@@ -657,7 +667,8 @@ pub struct SpircFrame {
 }
 
 impl SpircFrame {
-    /// Creates a new `SpircFrame` with the given sequence number and message type.
+    /// Creates a new `SpircFrame` with the given sequence number and message
+    /// type.
     #[must_use]
     pub const fn new(seq_nr: u32, message_type: SpircMessageType) -> Self {
         Self {
@@ -784,20 +795,24 @@ impl SpircFrame {
                     }
                 }
                 1 => {
-                    if pos + 8 > data.len() {
+                    let end = pos.checked_add(8).ok_or(SpircError::TruncatedMessage)?;
+                    if end > data.len() {
                         return Err(SpircError::TruncatedMessage);
                     }
-                    pos += 8;
+                    pos = end;
                 }
                 2 => {
-                    let len = decode_varint(data, &mut pos)? as usize;
-                    if pos + len > data.len() {
+                    let raw_len = decode_varint(data, &mut pos)?;
+                    let len = usize::try_from(raw_len).map_err(|_| SpircError::TruncatedMessage)?;
+                    let end = pos.checked_add(len).ok_or(SpircError::TruncatedMessage)?;
+                    if end > data.len() {
                         return Err(SpircError::TruncatedMessage);
                     }
-                    let sub_data = &data[pos..pos + len];
-                    pos += len;
+                    let sub_data = &data[pos..end];
+                    pos = end;
 
-                    // Inspect submessage device_state (field 7) or state (field 12)
+                    // Inspect submessage device_state (field 7) or state
+                    // (field 12).
                     if field_num == 7 {
                         let mut sub_pos = 0;
                         while sub_pos < sub_data.len() {
@@ -810,21 +825,31 @@ impl SpircFrame {
                                     volume = Some(v as u32);
                                 }
                             } else if wt_sub == 1 {
-                                if sub_pos + 8 > sub_data.len() {
-                                    break;
+                                let end =
+                                    sub_pos.checked_add(8).ok_or(SpircError::TruncatedMessage)?;
+                                if end > sub_data.len() {
+                                    return Err(SpircError::TruncatedMessage);
                                 }
-                                sub_pos += 8;
+                                sub_pos = end;
                             } else if wt_sub == 2 {
-                                let l = decode_varint(sub_data, &mut sub_pos)? as usize;
-                                if sub_pos + l > sub_data.len() {
-                                    break;
+                                let raw_l = decode_varint(sub_data, &mut sub_pos)?;
+                                let l = usize::try_from(raw_l)
+                                    .map_err(|_| SpircError::TruncatedMessage)?;
+                                let end =
+                                    sub_pos.checked_add(l).ok_or(SpircError::TruncatedMessage)?;
+                                if end > sub_data.len() {
+                                    return Err(SpircError::TruncatedMessage);
                                 }
-                                sub_pos += l;
+                                sub_pos = end;
                             } else if wt_sub == 5 {
-                                if sub_pos + 4 > sub_data.len() {
-                                    break;
+                                let end =
+                                    sub_pos.checked_add(4).ok_or(SpircError::TruncatedMessage)?;
+                                if end > sub_data.len() {
+                                    return Err(SpircError::TruncatedMessage);
                                 }
-                                sub_pos += 4;
+                                sub_pos = end;
+                            } else {
+                                return Err(SpircError::InvalidWireType);
                             }
                         }
                     } else if field_num == 12 {
@@ -839,66 +864,89 @@ impl SpircFrame {
                                     position_ms = Some(v as u32);
                                 }
                             } else if wt_sub == 1 {
-                                if sub_pos + 8 > sub_data.len() {
-                                    break;
+                                let end =
+                                    sub_pos.checked_add(8).ok_or(SpircError::TruncatedMessage)?;
+                                if end > sub_data.len() {
+                                    return Err(SpircError::TruncatedMessage);
                                 }
-                                sub_pos += 8;
+                                sub_pos = end;
                             } else if wt_sub == 2 {
-                                let l = decode_varint(sub_data, &mut sub_pos)? as usize;
-                                if sub_pos + l > sub_data.len() {
-                                    break;
+                                let raw_l = decode_varint(sub_data, &mut sub_pos)?;
+                                let l = usize::try_from(raw_l)
+                                    .map_err(|_| SpircError::TruncatedMessage)?;
+                                let end =
+                                    sub_pos.checked_add(l).ok_or(SpircError::TruncatedMessage)?;
+                                if end > sub_data.len() {
+                                    return Err(SpircError::TruncatedMessage);
                                 }
                                 if fn_sub == 27 {
                                     // TrackRef submessage
-                                    let track_slice = &sub_data[sub_pos..sub_pos + l];
+                                    let track_slice = &sub_data[sub_pos..end];
                                     let mut t_pos = 0;
                                     while t_pos < track_slice.len() {
                                         let tk = decode_varint(track_slice, &mut t_pos)?;
                                         let t_fn = (tk >> 3) as u32;
                                         let t_wt = (tk & 0x07) as u8;
                                         if t_wt == 2 {
-                                            let tl =
-                                                decode_varint(track_slice, &mut t_pos)? as usize;
-                                            if t_pos + tl > track_slice.len() {
-                                                break;
+                                            let raw_tl = decode_varint(track_slice, &mut t_pos)?;
+                                            let tl = usize::try_from(raw_tl)
+                                                .map_err(|_| SpircError::TruncatedMessage)?;
+                                            let t_end = t_pos
+                                                .checked_add(tl)
+                                                .ok_or(SpircError::TruncatedMessage)?;
+                                            if t_end > track_slice.len() {
+                                                return Err(SpircError::TruncatedMessage);
                                             }
                                             if t_fn == 2 {
-                                                let str_bytes = &track_slice[t_pos..t_pos + tl];
+                                                let str_bytes = &track_slice[t_pos..t_end];
                                                 if let Ok(uri) = core::str::from_utf8(str_bytes) {
                                                     track_uri = Some(uri.to_string());
                                                 }
                                             }
-                                            t_pos += tl;
+                                            t_pos = t_end;
                                         } else if t_wt == 0 {
                                             let _ = decode_varint(track_slice, &mut t_pos)?;
                                         } else if t_wt == 1 {
-                                            if t_pos + 8 > track_slice.len() {
-                                                break;
+                                            let t_end = t_pos
+                                                .checked_add(8)
+                                                .ok_or(SpircError::TruncatedMessage)?;
+                                            if t_end > track_slice.len() {
+                                                return Err(SpircError::TruncatedMessage);
                                             }
-                                            t_pos += 8;
+                                            t_pos = t_end;
                                         } else if t_wt == 5 {
-                                            if t_pos + 4 > track_slice.len() {
-                                                break;
+                                            let t_end = t_pos
+                                                .checked_add(4)
+                                                .ok_or(SpircError::TruncatedMessage)?;
+                                            if t_end > track_slice.len() {
+                                                return Err(SpircError::TruncatedMessage);
                                             }
-                                            t_pos += 4;
+                                            t_pos = t_end;
+                                        } else {
+                                            return Err(SpircError::InvalidWireType);
                                         }
                                     }
                                 }
-                                sub_pos += l;
+                                sub_pos = end;
                             } else if wt_sub == 5 {
-                                if sub_pos + 4 > sub_data.len() {
-                                    break;
+                                let end =
+                                    sub_pos.checked_add(4).ok_or(SpircError::TruncatedMessage)?;
+                                if end > sub_data.len() {
+                                    return Err(SpircError::TruncatedMessage);
                                 }
-                                sub_pos += 4;
+                                sub_pos = end;
+                            } else {
+                                return Err(SpircError::InvalidWireType);
                             }
                         }
                     }
                 }
                 5 => {
-                    if pos + 4 > data.len() {
+                    let end = pos.checked_add(4).ok_or(SpircError::TruncatedMessage)?;
+                    if end > data.len() {
                         return Err(SpircError::TruncatedMessage);
                     }
-                    pos += 4;
+                    pos = end;
                 }
                 _ => return Err(SpircError::InvalidWireType),
             }
@@ -987,7 +1035,8 @@ impl SpircStateMachine {
         self.metadata.as_ref()
     }
 
-    /// Returns the active track's Spotify CDN artwork URL (`https://i.scdn.co/image/<hex_id>`).
+    /// Returns the active track's Spotify CDN artwork URL
+    /// (`https://i.scdn.co/image/<hex_id>`).
     #[must_use]
     pub fn artwork_url(&self) -> Option<String> {
         self.metadata.as_ref().and_then(TrackMetadata::artwork_url)
@@ -995,6 +1044,7 @@ impl SpircStateMachine {
 
     /// Replaces the track queue and sets the active track index.
     pub fn set_track_queue(&mut self, queue: Vec<String>, start_index: usize) {
+        self.metadata = None;
         self.track_queue = queue;
         if self.track_queue.is_empty() {
             self.playing_track_index = 0;
@@ -1056,6 +1106,7 @@ impl SpircStateMachine {
     /// returns `TrackEnded`.
     pub fn notify_track_ended(&mut self) -> SpircEvent {
         self.position_ms = 0;
+        self.metadata = None;
         if !self.track_queue.is_empty() && self.playing_track_index + 1 < self.track_queue.len() {
             self.playing_track_index += 1;
             self.current_track = Some(self.track_queue[self.playing_track_index].clone());
@@ -1204,5 +1255,152 @@ impl SpircStateMachine {
         frame.extend_from_slice(&state);
 
         frame
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn test_decode_varint_rejects_10th_byte_overflow() {
+        // 2^64 encoded with 10th byte 0x02 must fail with VarintOverflow.
+        let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        let mut pos = 0;
+        assert_eq!(
+            decode_varint(&overflow, &mut pos),
+            Err(SpircError::VarintOverflow)
+        );
+
+        // u64::MAX (10th byte = 0x01) must succeed cleanly.
+        let max_u64 = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        let mut pos_ok = 0;
+        assert_eq!(decode_varint(&max_u64, &mut pos_ok), Ok(u64::MAX));
+        assert_eq!(pos_ok, 10);
+    }
+
+    #[test]
+    fn test_skip_unknown_field_rejects_overflow_and_truncation() {
+        // Wire type 2 with length = u64::MAX and trailing payload bytes.
+        let mut data = vec![0xFF; 9];
+        data.push(0x01);
+        data.extend_from_slice(b"trailing");
+        let mut pos = 0;
+        assert_eq!(
+            skip_unknown_field(2, &data, &mut pos),
+            Err(SpircError::TruncatedMessage)
+        );
+
+        // Wire type 2 with length = 0x1_0000_0005 (truncates to 5 on 32-bit).
+        let mut wrapped = vec![0x85, 0x80, 0x80, 0x80, 0x10];
+        wrapped.extend_from_slice(b"abcdef");
+        let mut pos_w = 0;
+        assert_eq!(
+            skip_unknown_field(2, &wrapped, &mut pos_w),
+            Err(SpircError::TruncatedMessage)
+        );
+
+        // Wire types 1 and 5 must reject truncated buffers safely.
+        let short = [0u8; 3];
+        let mut pos1 = 0;
+        assert_eq!(
+            skip_unknown_field(1, &short, &mut pos1),
+            Err(SpircError::TruncatedMessage)
+        );
+        let mut pos5 = 0;
+        assert_eq!(
+            skip_unknown_field(5, &short, &mut pos5),
+            Err(SpircError::TruncatedMessage)
+        );
+    }
+
+    #[test]
+    fn test_track_transitions_clear_stale_metadata() {
+        let mut sm = SpircStateMachine::new();
+        sm.set_track_queue(
+            vec![
+                "spotify:track:one".to_string(),
+                "spotify:track:two".to_string(),
+            ],
+            0,
+        );
+        let meta = TrackMetadata::new(
+            "Track One",
+            "Artist",
+            "Album",
+            100_000,
+            Some("ab67616d0000b2730123456789abcdef01234567".to_string()),
+        );
+        sm.set_metadata(meta.clone());
+        assert!(sm.metadata().is_some());
+        assert!(sm.artwork_url().is_some());
+
+        // Advancing via notify_track_ended clears stale metadata.
+        sm.set_status(PlayStatus::Play);
+        assert_eq!(sm.notify_track_ended(), SpircEvent::TrackEnded);
+        assert_eq!(sm.current_track(), Some("spotify:track:two"));
+        assert_eq!(sm.metadata(), None);
+        assert_eq!(sm.artwork_url(), None);
+        assert_eq!(sm.seek(250_000), SpircEvent::Seek(250_000));
+
+        // Replacing queue also clears stale metadata.
+        sm.set_metadata(meta);
+        sm.set_track_queue(vec!["spotify:track:three".to_string()], 0);
+        assert_eq!(sm.metadata(), None);
+        assert_eq!(sm.artwork_url(), None);
+    }
+
+    #[test]
+    fn test_spirc_frame_parse_rejects_oversized_varint_lengths() {
+        // Top-level field 7 (wire type 2) with length = u64::MAX.
+        let mut top_max = vec![(7 << 3) | 2];
+        top_max.extend_from_slice(&[0xFF; 9]);
+        top_max.push(0x01);
+        top_max.extend_from_slice(b"trailing");
+        assert_eq!(
+            SpircFrame::parse(&top_max),
+            Err(SpircError::TruncatedMessage)
+        );
+
+        // Top-level field 7 (wire type 2) with length = 0x1_0000_0005.
+        let mut top_wrap = vec![(7 << 3) | 2, 0x85, 0x80, 0x80, 0x80, 0x10];
+        top_wrap.extend_from_slice(b"abcdef");
+        assert_eq!(
+            SpircFrame::parse(&top_wrap),
+            Err(SpircError::TruncatedMessage)
+        );
+
+        // Inner device_state (field 7) with oversized wire type 2 sub-length.
+        let mut inner_sub = vec![(1 << 3) | 2, 0x85, 0x80, 0x80, 0x80, 0x10];
+        inner_sub.extend_from_slice(b"abcdef");
+        let mut outer_f7 = vec![(7 << 3) | 2, inner_sub.len() as u8];
+        outer_f7.extend_from_slice(&inner_sub);
+        assert_eq!(
+            SpircFrame::parse(&outer_f7),
+            Err(SpircError::TruncatedMessage)
+        );
+
+        // Inner state (field 12) -> TrackRef (field 27) oversized length.
+        let mut track_sub = vec![(2 << 3) | 2, 0x85, 0x80, 0x80, 0x80, 0x10];
+        track_sub.extend_from_slice(b"abcdef");
+        let mut state_sub = vec![(27 << 3) | 2, track_sub.len() as u8];
+        state_sub.extend_from_slice(&track_sub);
+        let mut outer_f12 = vec![(12 << 3) | 2, state_sub.len() as u8];
+        outer_f12.extend_from_slice(&state_sub);
+        assert_eq!(
+            SpircFrame::parse(&outer_f12),
+            Err(SpircError::TruncatedMessage)
+        );
+
+        // Truncated wire types 1 and 5 at top level.
+        assert_eq!(
+            SpircFrame::parse(&[(1 << 3) | 1, 0, 1, 2]),
+            Err(SpircError::TruncatedMessage)
+        );
+        assert_eq!(
+            SpircFrame::parse(&[(1 << 3) | 5, 0, 1]),
+            Err(SpircError::TruncatedMessage)
+        );
     }
 }

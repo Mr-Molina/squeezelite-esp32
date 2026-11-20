@@ -22,6 +22,8 @@ def read_sections(path):
     """Return {section name: size in bytes} for a 32-bit little-endian ELF."""
     with open(path, "rb") as f:
         data = f.read()
+    if len(data) < 0x34:
+        raise ValueError(f"{path}: truncated ELF header")
     if data[:4] != b"\x7fELF":
         raise ValueError(f"{path}: not an ELF file")
     if data[4] != 1 or data[5] != 1:
@@ -42,7 +44,8 @@ def read_sections(path):
     for i in range(shnum):
         name_off, _, _, _, _, size = header(i)
         end = strtab.index(b"\0", name_off)
-        sizes[strtab[name_off:end].decode("ascii", "replace")] = size
+        name = strtab[name_off:end].decode("ascii", "replace")
+        sizes[name] = sizes.get(name, 0) + size
     return sizes
 
 

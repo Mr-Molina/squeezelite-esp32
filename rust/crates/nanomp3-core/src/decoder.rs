@@ -6,11 +6,9 @@ use crate::minimp3::{self, Sample};
 pub mod __private {
     //! Internals shared with the `nanomp3` crate, which pins an exact version
     //! of this one. Not public API: no semver guarantees.
-    pub use crate::minimp3::{
-        l3_side_info, mp3d_find_frame as find_frame, FrameInfo, Header,
-    };
     use crate::decoder::Decoder;
     use crate::minimp3::{self, Sample};
+    pub use crate::minimp3::{l3_side_info, mp3d_find_frame as find_frame, FrameInfo, Header};
 
     /// `mp3dec_decode_frame` with C's `info` semantics: when no frame is
     /// found, only `frame_bytes` is written.
@@ -20,13 +18,7 @@ pub mod __private {
         pcm: Option<&mut [S]>,
         info: &mut FrameInfo,
     ) -> usize {
-        minimp3::mp3dec_decode_frame(
-            &mut dec.dec,
-            mp3,
-            pcm,
-            info,
-            dec.minimp3_compat,
-        )
+        minimp3::mp3dec_decode_frame(&mut dec.dec, mp3, pcm, info, dec.minimp3_compat)
     }
 
     /// `mp3dec_init`.
@@ -117,9 +109,7 @@ impl DecodeError {
 impl core::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            DecodeError::NoFrame => {
-                "no complete MPEG audio frame in the input"
-            }
+            DecodeError::NoFrame => "no complete MPEG audio frame in the input",
             DecodeError::ReservoirUnavailable(_) => {
                 "frame depends on bit reservoir data that wasn't decoded"
             }
@@ -196,16 +186,10 @@ impl Decoder {
         };
         let result = match info.status {
             minimp3::Status::Decoded => Ok(frame),
-            minimp3::Status::NoFrame | minimp3::Status::HeaderOnly => {
-                Err(DecodeError::NoFrame)
-            }
+            minimp3::Status::NoFrame | minimp3::Status::HeaderOnly => Err(DecodeError::NoFrame),
             minimp3::Status::Corrupt => Err(DecodeError::Corrupt(frame)),
-            minimp3::Status::ReservoirUnavailable => {
-                Err(DecodeError::ReservoirUnavailable(frame))
-            }
-            minimp3::Status::UnsupportedLayer => {
-                Err(DecodeError::UnsupportedLayer(frame))
-            }
+            minimp3::Status::ReservoirUnavailable => Err(DecodeError::ReservoirUnavailable(frame)),
+            minimp3::Status::UnsupportedLayer => Err(DecodeError::UnsupportedLayer(frame)),
         };
         (info.frame_bytes, result)
     }

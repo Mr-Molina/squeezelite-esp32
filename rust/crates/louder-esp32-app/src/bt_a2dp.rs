@@ -90,6 +90,7 @@ pub const OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY: u16 = 0x040E;
 pub const OPCODE_LINK_KEY_REQUEST_REPLY: u16 = 0x040B;
 pub const OPCODE_LINK_KEY_REQUEST_NEGATIVE_REPLY: u16 = 0x040C;
 pub const OPCODE_IO_CAPABILITY_REQUEST_REPLY: u16 = 0x042B;
+pub const OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY: u16 = 0x0434;
 pub const OPCODE_USER_CONFIRMATION_REQUEST_REPLY: u16 = 0x042C;
 pub const OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY: u16 = 0x042D;
 
@@ -868,16 +869,31 @@ impl BondingStore {
 
     /// Inserts or updates a bonded peer, evicting the least-recently-used slot
     /// when all 4 slots are occupied.
+    ///
+    /// Rejects zero addresses/keys and prevents key-type security downgrades on
+    /// an existing peer unless removed first.
     pub fn upsert(&mut self, bd_addr: [u8; 6], link_key: [u8; 16], key_type: u8) {
+        let _ = self.try_upsert(bd_addr, link_key, key_type);
+    }
+
+    /// Inserts or updates a bonded peer, returning `false` if rejected due to
+    /// an invalid zero key/address or a key-type security downgrade.
+    pub fn try_upsert(&mut self, bd_addr: [u8; 6], link_key: [u8; 16], key_type: u8) -> bool {
+        if bd_addr == [0u8; 6] || link_key == [0u8; 16] {
+            return false;
+        }
         self.clock = self.clock.wrapping_add(1);
         let tick = self.clock;
 
         for peer in &mut self.peers {
             if peer.valid && peer.bd_addr == bd_addr {
+                if key_type_security_rank(key_type) < key_type_security_rank(peer.key_type) {
+                    return false;
+                }
                 peer.link_key = link_key;
                 peer.key_type = key_type;
                 peer.lru_tick = tick;
-                return;
+                return true;
             }
         }
 
@@ -890,15 +906,16 @@ impl BondingStore {
                     valid: true,
                     lru_tick: tick,
                 };
-                return;
+                return true;
             }
         }
 
         let mut lru_idx = 0usize;
-        let mut min_tick = self.peers[0].lru_tick;
+        let mut max_age = self.clock.wrapping_sub(self.peers[0].lru_tick);
         for idx in 1..4 {
-            if self.peers[idx].lru_tick < min_tick {
-                min_tick = self.peers[idx].lru_tick;
+            let age = self.clock.wrapping_sub(self.peers[idx].lru_tick);
+            if age > max_age {
+                max_age = age;
                 lru_idx = idx;
             }
         }
@@ -909,6 +926,7 @@ impl BondingStore {
             valid: true,
             lru_tick: tick,
         };
+        true
     }
 
     /// Removes a peer from the bonding store.
@@ -934,7 +952,7 @@ impl BondingStore {
         out[0..4].copy_from_slice(&Self::MAGIC);
         out[4] = valid_count as u8;
 
-        // Sort valid indices by lru_tick ascending so decode preserves LRU order
+        // Sort valid indices by elapsed age descending so decode keeps LRU order.
         let mut indices = [0usize; 4];
         let mut n = 0usize;
         for idx in 0..4 {
@@ -945,7 +963,9 @@ impl BondingStore {
         }
         for i in 0..n {
             for j in (i + 1)..n {
-                if self.peers[indices[j]].lru_tick < self.peers[indices[i]].lru_tick {
+                let age_i = self.clock.wrapping_sub(self.peers[indices[i]].lru_tick);
+                let age_j = self.clock.wrapping_sub(self.peers[indices[j]].lru_tick);
+                if age_j > age_i {
                     indices.swap(i, j);
                 }
             }
@@ -1060,6 +1080,15 @@ impl BondingStore {
     }
 }
 
+const fn key_type_security_rank(key_type: u8) -> u8 {
+    match key_type {
+        0x05 | 0x08 => 3, // Authenticated P-192 / P-256 (MITM protected)
+        0x04 | 0x07 => 2, // Unauthenticated P-192 / P-256 (Just Works)
+        0x00 | 0x06 => 1, // Legacy / Changed Combination Key
+        _ => 0,           // Unit / Debug / unknown weak key types
+    }
+}
+
 const fn decode_hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -1073,7 +1102,8 @@ const fn decode_hex_nibble(b: u8) -> Option<u8> {
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BtPairingPolicy {
-    /// SSP "Just Works" (`NoInputNoOutput = 0x03`, general bonding) + PIN fallback.
+    /// SSP "Just Works" (`NoInputNoOutput = 0x03`, general bonding) + PIN
+    /// fallback.
     SspJustWorks,
     /// SSP Numeric Comparison (`DisplayYesNo = 0x01`, MITM required).
     SspNumericComparison,
@@ -1095,6 +1125,12 @@ pub struct BtSecurityPolicy {
     pub discoverable: bool,
 }
 
+impl Default for BtSecurityPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BtSecurityPolicy {
     #[must_use]
     pub const fn new() -> Self {
@@ -1104,19 +1140,58 @@ impl BtSecurityPolicy {
             name_buf[i] = BT_LOCAL_NAME[i];
             i += 1;
         }
-        let mut pin_buf = [0u8; 16];
-        pin_buf[0] = b'0';
-        pin_buf[1] = b'0';
-        pin_buf[2] = b'0';
-        pin_buf[3] = b'0';
         Self {
             device_name_buf: name_buf,
             device_name_len: i,
-            pin_code_buf: pin_buf,
-            pin_code_len: 4,
-            pairing_policy: BtPairingPolicy::SspJustWorks,
-            discoverable: true,
+            pin_code_buf: [0u8; 16],
+            pin_code_len: 0,
+            pairing_policy: BtPairingPolicy::SspNumericComparison,
+            discoverable: false,
         }
+    }
+
+    /// Builder override for explicit pairing policy selection.
+    #[must_use]
+    pub const fn with_pairing_policy(mut self, policy: BtPairingPolicy) -> Self {
+        self.pairing_policy = policy;
+        self
+    }
+
+    /// Builder opt-in for SSP "Just Works" pairing mode.
+    #[must_use]
+    pub const fn with_just_works(mut self) -> Self {
+        self.pairing_policy = BtPairingPolicy::SspJustWorks;
+        self
+    }
+
+    /// Builder override for enabling or disabling the discovery pairing window.
+    #[must_use]
+    pub const fn with_discoverable(mut self, discoverable: bool) -> Self {
+        self.discoverable = discoverable;
+        self
+    }
+
+    /// Builder override to configure an explicit non-default legacy PIN.
+    #[must_use]
+    pub fn with_pin_code(mut self, pin: &[u8]) -> Self {
+        self.update_pin_code(pin);
+        self
+    }
+
+    /// Enables or disables inquiry-scan discoverability for pairing windows.
+    pub fn set_discoverable(&mut self, discoverable: bool) {
+        self.discoverable = discoverable;
+    }
+
+    /// Updates the active Bluetooth pairing policy.
+    pub fn set_pairing_policy(&mut self, policy: BtPairingPolicy) {
+        self.pairing_policy = policy;
+    }
+
+    /// Clears any configured legacy PIN code.
+    pub fn clear_pin_code(&mut self) {
+        self.pin_code_buf.fill(0);
+        self.pin_code_len = 0;
     }
 
     pub fn update_device_name(&mut self, name: &str) {
@@ -1156,10 +1231,21 @@ impl BtSecurityPolicy {
     #[must_use]
     pub fn pin_code(&self) -> &[u8] {
         if self.pin_code_len == 0 {
-            b"0000"
+            &[]
         } else {
             let len = self.pin_code_len.min(self.pin_code_buf.len());
             &self.pin_code_buf[..len]
+        }
+    }
+
+    /// Returns HCI `Write_Scan_Enable` byte (`0x03` when discoverable, `0x02`
+    /// for page scan only).
+    #[must_use]
+    pub const fn scan_enable_byte(&self) -> u8 {
+        if self.discoverable {
+            0x03
+        } else {
+            0x02
         }
     }
 
@@ -1181,10 +1267,10 @@ impl BtSecurityPolicy {
     #[must_use]
     pub const fn auth_requirements_byte(&self) -> u8 {
         match self.pairing_policy {
-            BtPairingPolicy::SspNumericComparison => 0x05, // MITM Required - General Bonding
+            BtPairingPolicy::SspNumericComparison => 0x05, // MITM + Bonding
             BtPairingPolicy::SspJustWorks
             | BtPairingPolicy::LegacyPinOnly
-            | BtPairingPolicy::BondedOnly => 0x04, // MITM Not Required - General Bonding
+            | BtPairingPolicy::BondedOnly => 0x04, // No MITM + Bonding
         }
     }
 }
@@ -2888,6 +2974,11 @@ pub struct BtA2dpSink {
     pub bond_count: usize,
     pub bonding_store: BondingStore,
     pub security_policy: BtSecurityPolicy,
+    pub pending_numeric_confirmation: Option<([u8; 6], u32)>,
+    pending_numeric_timeout_ms: u32,
+    queued_numeric_reply: Option<([u8; 6], bool)>,
+    pub pairing_window_remaining_ms: u32,
+    pub scan_enable_dirty: bool,
     pub active_handle: Option<u16>,
     pub peer_bd_addr: [u8; 6],
     pub acl_reassembly: AclReassembly,
@@ -2920,6 +3011,11 @@ impl BtA2dpSink {
             bond_count: 0,
             bonding_store: BondingStore::new(),
             security_policy: BtSecurityPolicy::new(),
+            pending_numeric_confirmation: None,
+            pending_numeric_timeout_ms: 0,
+            queued_numeric_reply: None,
+            pairing_window_remaining_ms: 0,
+            scan_enable_dirty: false,
             active_handle: None,
             peer_bd_addr: [0; 6],
             acl_reassembly: AclReassembly::new(),
@@ -2951,6 +3047,11 @@ impl BtA2dpSink {
         self.bond_count = 0;
         self.bonding_store.clear();
         self.security_policy = BtSecurityPolicy::new();
+        self.pending_numeric_confirmation = None;
+        self.pending_numeric_timeout_ms = 0;
+        self.queued_numeric_reply = None;
+        self.pairing_window_remaining_ms = 0;
+        self.scan_enable_dirty = false;
         self.active_handle = None;
         self.peer_bd_addr = [0; 6];
         self.acl_reassembly.reset();
@@ -3005,6 +3106,9 @@ impl BtA2dpSink {
         self.avrcp_vol_notify_tx_label = None;
         self.track_metadata.clear();
         self.peer_bd_addr = [0; 6];
+        self.pending_numeric_confirmation = None;
+        self.pending_numeric_timeout_ms = 0;
+        self.queued_numeric_reply = None;
     }
 
     /// Step the HCI controller initialization sequence forward.
@@ -3104,8 +3208,10 @@ impl BtA2dpSink {
                 )
             }
             InitStep::WriteScanEnable => {
-                // 0x03 = Inquiry Scan + Page Scan
-                Self::send_cmd(transport, OPCODE_WRITE_SCAN_ENABLE, &[0x03])
+                // 0x03 = Inquiry + Page Scan (discoverable); 0x02 = Page only.
+                self.scan_enable_dirty = false;
+                let scan_mode = [self.security_policy.scan_enable_byte()];
+                Self::send_cmd(transport, OPCODE_WRITE_SCAN_ENABLE, &scan_mode)
             }
             InitStep::LeSetAdvertisingParameters => {
                 // Min=0x0100, Max=0x0200, Type=0x00 (ADV_IND), Public,
@@ -3342,20 +3448,21 @@ impl BtA2dpSink {
                 if params.len() >= 4 {
                     let handle = u16::from_le_bytes([params[1], params[2]]) & 0x0FFF;
                     self.handle_disconnection(handle);
-                    // Re-enable Scan Enable (0x03) immediately
-                    Self::send_cmd(transport, OPCODE_WRITE_SCAN_ENABLE, &[0x03]);
+                    // Re-apply configured scan mode (page-only vs discoverable).
+                    let scan_mode = [self.security_policy.scan_enable_byte()];
+                    if Self::send_cmd(transport, OPCODE_WRITE_SCAN_ENABLE, &scan_mode) {
+                        self.scan_enable_dirty = false;
+                    }
                 }
             }
             EVT_PIN_CODE_REQUEST => {
                 if params.len() >= 6 {
                     let mut bd_addr = [0u8; 6];
                     bd_addr.copy_from_slice(&params[..6]);
-                    if self.security_policy.pairing_policy == BtPairingPolicy::BondedOnly
-                        && self.find_bond_key(&bd_addr).is_none()
-                    {
+                    let pin = self.security_policy.pin_code();
+                    if !self.is_pairing_window_open() || pin.is_empty() {
                         Self::send_cmd(transport, OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY, &bd_addr);
                     } else {
-                        let pin = self.security_policy.pin_code();
                         let pin_len = pin.len().min(16);
                         let mut pin_reply = [0u8; 23];
                         pin_reply[..6].copy_from_slice(&bd_addr);
@@ -3391,54 +3498,215 @@ impl BtA2dpSink {
                     let mut key = [0u8; 16];
                     key.copy_from_slice(&params[6..22]);
                     let key_type = if params.len() >= 23 { params[22] } else { 0x04 };
-                    self.save_bond_key_with_type(&bd_addr, &key, key_type);
+                    if self.is_pairing_window_open()
+                        && self.try_save_bond_key_with_type(&bd_addr, &key, key_type)
+                        && self.pairing_window_remaining_ms > 0
+                    {
+                        self.close_pairing_window();
+                    }
                 }
             }
             EVT_IO_CAPABILITY_REQUEST => {
                 if params.len() >= 6 {
-                    let mut reply = [0u8; 9];
-                    reply[..6].copy_from_slice(&params[..6]);
-                    reply[6] = self.security_policy.io_capability_byte();
-                    reply[7] = 0x00; // OOB data not present
-                    reply[8] = self.security_policy.auth_requirements_byte();
-                    Self::send_cmd(transport, OPCODE_IO_CAPABILITY_REQUEST_REPLY, &reply);
+                    if !self.is_pairing_window_open()
+                        || self.security_policy.pairing_policy == BtPairingPolicy::LegacyPinOnly
+                    {
+                        let mut neg = [0u8; 7];
+                        neg[..6].copy_from_slice(&params[..6]);
+                        neg[6] = 0x05; // Authentication failure / pairing denied
+                        Self::send_cmd(
+                            transport,
+                            OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY,
+                            &neg,
+                        );
+                    } else {
+                        let mut reply = [0u8; 9];
+                        reply[..6].copy_from_slice(&params[..6]);
+                        reply[6] = self.security_policy.io_capability_byte();
+                        reply[7] = 0x00; // OOB data not present
+                        reply[8] = self.security_policy.auth_requirements_byte();
+                        Self::send_cmd(transport, OPCODE_IO_CAPABILITY_REQUEST_REPLY, &reply);
+                    }
                 }
             }
             EVT_USER_CONFIRMATION_REQUEST => {
                 if params.len() >= 6 {
                     let mut bd_addr = [0u8; 6];
                     bd_addr.copy_from_slice(&params[..6]);
-                    if self.security_policy.pairing_policy == BtPairingPolicy::BondedOnly
-                        && self.find_bond_key(&bd_addr).is_none()
-                    {
+                    if !self.is_pairing_window_open() {
                         Self::send_cmd(
                             transport,
                             OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY,
-                            &params[..6],
+                            &bd_addr,
                         );
                         return;
                     }
-                    Self::send_cmd(
-                        transport,
-                        OPCODE_USER_CONFIRMATION_REQUEST_REPLY,
-                        &params[..6],
-                    );
+                    match self.security_policy.pairing_policy {
+                        BtPairingPolicy::SspJustWorks => {
+                            self.pending_numeric_confirmation = None;
+                            self.pending_numeric_timeout_ms = 0;
+                            Self::send_cmd(
+                                transport,
+                                OPCODE_USER_CONFIRMATION_REQUEST_REPLY,
+                                &bd_addr,
+                            );
+                        }
+                        BtPairingPolicy::SspNumericComparison => {
+                            if params.len() >= 10 {
+                                let passkey = u32::from_le_bytes([
+                                    params[6], params[7], params[8], params[9],
+                                ]);
+                                self.pending_numeric_confirmation = Some((bd_addr, passkey));
+                                self.pending_numeric_timeout_ms = 30_000;
+                                self.queued_numeric_reply = None;
+                            } else {
+                                Self::send_cmd(
+                                    transport,
+                                    OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY,
+                                    &bd_addr,
+                                );
+                            }
+                        }
+                        BtPairingPolicy::LegacyPinOnly | BtPairingPolicy::BondedOnly => {
+                            Self::send_cmd(
+                                transport,
+                                OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY,
+                                &bd_addr,
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    pub fn find_bond_key(&self, addr: &[u8; 6]) -> Option<[u8; 16]> {
-        if let Some(peer) = self.bonding_store.peek(addr) {
-            return Some(peer.link_key);
+    /// Returns `true` when discovery is enabled and policy permits new pairing.
+    #[must_use]
+    pub fn is_pairing_window_open(&self) -> bool {
+        self.security_policy.discoverable
+            && self.security_policy.pairing_policy != BtPairingPolicy::BondedOnly
+    }
+
+    /// Returns the number of persisted bonded peers.
+    #[must_use]
+    pub fn bonded_peer_count(&self) -> usize {
+        self.bonding_store.count()
+    }
+
+    /// Returns any pending SSP numeric comparison `(bd_addr, passkey)`.
+    #[must_use]
+    pub const fn pending_numeric_passkey(&self) -> Option<([u8; 6], u32)> {
+        self.pending_numeric_confirmation
+    }
+
+    /// Aborts any pending SSP numeric comparison by queueing a negative reply.
+    fn abort_pending_numeric_confirmation(&mut self) {
+        self.pending_numeric_timeout_ms = 0;
+        if let Some((bd_addr, _)) = self.pending_numeric_confirmation.take() {
+            self.queued_numeric_reply = Some((bd_addr, false));
         }
-        for bond in &self.bond_table {
-            if bond.valid && &bond.bd_addr == addr {
-                return Some(bond.link_key);
+    }
+
+    /// Queues positive (`0x042C`) or negative (`0x042D`) confirmation for a
+    /// pending SSP numeric comparison request matching `bd_addr`.
+    pub fn confirm_numeric_comparison(&mut self, bd_addr: [u8; 6], accept: bool) -> bool {
+        if let Some((pending_addr, _)) = self.pending_numeric_confirmation {
+            if pending_addr == bd_addr {
+                self.pending_numeric_confirmation = None;
+                self.pending_numeric_timeout_ms = 0;
+                self.queued_numeric_reply = Some((bd_addr, accept));
+                return true;
             }
         }
-        None
+        false
+    }
+
+    /// Enables or disables inquiry-scan discoverability and flags scan update.
+    pub fn set_discoverable(&mut self, discoverable: bool) {
+        if self.security_policy.discoverable != discoverable {
+            self.security_policy.set_discoverable(discoverable);
+            self.scan_enable_dirty = true;
+        }
+        if !discoverable {
+            self.pairing_window_remaining_ms = 0;
+            self.abort_pending_numeric_confirmation();
+        }
+    }
+
+    /// Opens a time-bounded pairing window with the given pairing policy.
+    pub fn open_pairing_window(&mut self, duration_ms: u32, policy: BtPairingPolicy) {
+        if policy == BtPairingPolicy::BondedOnly || duration_ms == 0 {
+            self.close_pairing_window();
+            return;
+        }
+        self.security_policy.set_pairing_policy(policy);
+        self.pairing_window_remaining_ms = duration_ms;
+        if !self.security_policy.discoverable {
+            self.security_policy.set_discoverable(true);
+            self.scan_enable_dirty = true;
+        }
+    }
+
+    /// Closes any active pairing window and disables inquiry discoverability.
+    pub fn close_pairing_window(&mut self) {
+        self.pairing_window_remaining_ms = 0;
+        self.abort_pending_numeric_confirmation();
+        if self.security_policy.discoverable {
+            self.security_policy.set_discoverable(false);
+            self.scan_enable_dirty = true;
+        }
+    }
+
+    /// Advances the pairing window timer and closes discoverability on expiry.
+    pub fn tick_pairing_window(&mut self, elapsed_ms: u32) {
+        if self.pending_numeric_confirmation.is_some() && elapsed_ms > 0 {
+            self.pending_numeric_timeout_ms =
+                self.pending_numeric_timeout_ms.saturating_sub(elapsed_ms);
+            if self.pending_numeric_timeout_ms == 0 {
+                self.abort_pending_numeric_confirmation();
+            }
+        }
+        if self.pairing_window_remaining_ms > 0 {
+            self.pairing_window_remaining_ms =
+                self.pairing_window_remaining_ms.saturating_sub(elapsed_ms);
+            if self.pairing_window_remaining_ms == 0 {
+                self.close_pairing_window();
+            }
+        }
+    }
+
+    /// Replaces the bonding store from an uppercase/lowercase hex string.
+    pub fn load_bonds_from_hex(&mut self, hex_str: &str) -> Result<(), StorageError> {
+        let store = BondingStore::decode_hex(hex_str)?;
+        self.load_bonding_store(store);
+        Ok(())
+    }
+
+    /// Replaces the bonding store and mirrors entries into `bond_table`.
+    pub fn load_bonding_store(&mut self, store: BondingStore) {
+        self.bonding_store = store;
+        self.sync_bond_table_from_store();
+    }
+
+    fn sync_bond_table_from_store(&mut self) {
+        self.bond_table = [BondEntry::empty(); 8];
+        let mut count = 0usize;
+        for peer in self.bonding_store.peers() {
+            if peer.valid && count < self.bond_table.len() {
+                self.bond_table[count] = BondEntry {
+                    bd_addr: peer.bd_addr,
+                    link_key: peer.link_key,
+                    valid: true,
+                };
+                count += 1;
+            }
+        }
+        self.bond_count = count;
+    }
+
+    pub fn find_bond_key(&self, addr: &[u8; 6]) -> Option<[u8; 16]> {
+        self.bonding_store.peek(addr).map(|peer| peer.link_key)
     }
 
     pub fn save_bond_key(&mut self, addr: &[u8; 6], key: &[u8; 16]) {
@@ -3446,20 +3714,33 @@ impl BtA2dpSink {
     }
 
     pub fn save_bond_key_with_type(&mut self, addr: &[u8; 6], key: &[u8; 16], key_type: u8) {
-        self.bonding_store.upsert(*addr, *key, key_type);
-        for bond in &mut self.bond_table {
+        let _ = self.try_save_bond_key_with_type(addr, key, key_type);
+    }
+
+    fn try_save_bond_key_with_type(
+        &mut self,
+        addr: &[u8; 6],
+        key: &[u8; 16],
+        key_type: u8,
+    ) -> bool {
+        if !self.bonding_store.try_upsert(*addr, *key, key_type) {
+            return false;
+        }
+        self.sync_bond_table_from_store();
+        true
+    }
+
+    /// Explicitly forgets a bonded peer from both [`BondingStore`] and the
+    /// legacy `bond_table`.
+    pub fn forget_bond(&mut self, addr: &[u8; 6]) -> bool {
+        let mut removed = self.bonding_store.remove(addr);
+        for bond in &self.bond_table {
             if bond.valid && &bond.bd_addr == addr {
-                bond.link_key = *key;
-                return;
+                removed = true;
             }
         }
-        let slot = self.bond_count % 8;
-        self.bond_table[slot] = BondEntry {
-            bd_addr: *addr,
-            link_key: *key,
-            valid: true,
-        };
-        self.bond_count += 1;
+        self.sync_bond_table_from_store();
+        removed
     }
 
     /// Saves the bonding store under `"bt.bonds"` via [`BondingStore`].
@@ -3477,7 +3758,7 @@ impl BtA2dpSink {
     ) -> Result<(), StorageError> {
         let store = BondingStore::load_from_storage(storage)?;
         self.bonding_store = store;
-        self.bond_count = store.count();
+        self.sync_bond_table_from_store();
         Ok(())
     }
 
@@ -4624,6 +4905,25 @@ impl BtA2dpSink {
                 self.last_init_sent_ms = now_ms;
                 had_activity = true;
             }
+        } else if self.init_step == InitStep::Completed {
+            if let Some((bd_addr, accept)) = self.queued_numeric_reply.take() {
+                let opcode = if accept {
+                    OPCODE_USER_CONFIRMATION_REQUEST_REPLY
+                } else {
+                    OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+                };
+                if Self::send_cmd(transport, opcode, &bd_addr) {
+                    had_activity = true;
+                } else {
+                    self.queued_numeric_reply = Some((bd_addr, accept));
+                }
+            } else if self.scan_enable_dirty && !self.is_connected() {
+                let scan_mode = [self.security_policy.scan_enable_byte()];
+                if Self::send_cmd(transport, OPCODE_WRITE_SCAN_ENABLE, &scan_mode) {
+                    self.scan_enable_dirty = false;
+                    had_activity = true;
+                }
+            }
         }
 
         had_activity
@@ -4744,8 +5044,8 @@ mod tests {
         assert_eq!(&transport.tx_packets[3][4..7], &[0x14, 0x04, 0x24]);
         // 5. Simple Pairing Mode: 0x01
         assert_eq!(transport.tx_packets[4][4], 0x01);
-        // 13. Write Scan Enable: 0x03
-        assert_eq!(transport.tx_packets[12][4], 0x03);
+        // 13. Write Scan Enable: 0x02 (Page Scan only; non-discoverable default)
+        assert_eq!(transport.tx_packets[12][4], 0x02);
         // 17. LE Advertising Enable: 0x01
         assert_eq!(transport.tx_packets[16][4], 0x01);
     }
@@ -4792,6 +5092,9 @@ mod tests {
         let mut transport = MockHciTransport::new();
         let mut sink = BtA2dpSink::new();
         sink.init_step = InitStep::Completed;
+        sink.security_policy = BtSecurityPolicy::new()
+            .with_just_works()
+            .with_discoverable(true);
 
         let peer_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
@@ -6002,7 +6305,27 @@ mod tests {
             OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY
         );
 
-        // Bonded peer (addr1) PIN request -> Accepted with configured PIN "1234"
+        // Bonded peer (addr1) reconnect uses EVT_LINK_KEY_REQUEST; spoofed
+        // EVT_PIN_CODE_REQUEST under BondedOnly must be rejected.
+        let link_key_req_bonded = [
+            HCI_PKT_EVENT,
+            EVT_LINK_KEY_REQUEST,
+            6,
+            addr1[0],
+            addr1[1],
+            addr1[2],
+            addr1[3],
+            addr1[4],
+            addr1[5],
+        ];
+        sink.process_packet(&mut transport, &link_key_req_bonded, |_, _| {});
+        let last_cmd = transport.tx_packets.last().expect("link key reply");
+        assert_eq!(
+            u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
+            OPCODE_LINK_KEY_REQUEST_REPLY
+        );
+        assert_eq!(&last_cmd[10..26], &[0x11; 16]);
+
         let pin_req_bonded = [
             HCI_PKT_EVENT,
             EVT_PIN_CODE_REQUEST,
@@ -6015,12 +6338,220 @@ mod tests {
             addr1[5],
         ];
         sink.process_packet(&mut transport, &pin_req_bonded, |_, _| {});
+        let last_cmd = transport
+            .tx_packets
+            .last()
+            .expect("pin neg under BondedOnly");
+        assert_eq!(
+            u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
+            OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY
+        );
+
+        // Open pairing window with LegacyPinOnly accepts PIN reply.
+        sink.open_pairing_window(60_000, BtPairingPolicy::LegacyPinOnly);
+        sink.process_packet(&mut transport, &pin_req_bonded, |_, _| {});
         let last_cmd = transport.tx_packets.last().expect("pin reply");
         assert_eq!(
             u16::from_le_bytes([last_cmd[1], last_cmd[2]]),
             OPCODE_PIN_CODE_REQUEST_REPLY
         );
         assert_eq!(&last_cmd[11..15], b"1234");
+    }
+
+    #[test]
+    fn test_security_policy_defaults_and_builders() {
+        let policy = BtSecurityPolicy::new();
+        assert!(!policy.discoverable);
+        assert_eq!(policy.pairing_policy, BtPairingPolicy::SspNumericComparison);
+        assert!(policy.pin_code().is_empty());
+        assert_eq!(policy.io_capability_byte(), 0x01);
+        assert_eq!(policy.auth_requirements_byte(), 0x05);
+        assert_eq!(policy.scan_enable_byte(), 0x02);
+        assert!(policy.ssp_enabled());
+
+        let custom = BtSecurityPolicy::new()
+            .with_just_works()
+            .with_discoverable(true)
+            .with_pin_code(b"567890");
+        assert!(custom.discoverable);
+        assert_eq!(custom.pairing_policy, BtPairingPolicy::SspJustWorks);
+        assert_eq!(custom.pin_code(), b"567890");
+        assert_eq!(custom.io_capability_byte(), 0x03);
+        assert_eq!(custom.auth_requirements_byte(), 0x04);
+        assert_eq!(custom.scan_enable_byte(), 0x03);
+
+        let mut mutable = custom;
+        mutable.clear_pin_code();
+        assert!(mutable.pin_code().is_empty());
+        mutable.set_discoverable(false);
+        assert!(!mutable.discoverable);
+        mutable.set_pairing_policy(BtPairingPolicy::LegacyPinOnly);
+        assert!(!mutable.ssp_enabled());
+    }
+
+    #[test]
+    fn test_hci_default_numeric_comparison_and_pairing_window_gating() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+        let peer_addr = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01];
+
+        // Closed pairing window rejects EVT_IO_CAPABILITY_REQUEST with 0x0434.
+        let io_cap_req = [
+            HCI_PKT_EVENT,
+            EVT_IO_CAPABILITY_REQUEST,
+            6,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+        ];
+        sink.process_packet(&mut transport, &io_cap_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("io cap neg reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY
+        );
+        assert_eq!(cmd[10], 0x05);
+
+        // Non-discoverable default rejects unbonded confirmation & link keys.
+        let confirm_req = [
+            HCI_PKT_EVENT,
+            EVT_USER_CONFIRMATION_REQUEST,
+            10,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+        ];
+        sink.process_packet(&mut transport, &confirm_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("neg confirm");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+        );
+
+        let mut key_notif = [0u8; 26];
+        key_notif[0] = HCI_PKT_EVENT;
+        key_notif[1] = EVT_LINK_KEY_NOTIFICATION;
+        key_notif[2] = 23;
+        key_notif[3..9].copy_from_slice(&peer_addr);
+        key_notif[9..25].copy_from_slice(&[0x5A; 16]);
+        key_notif[25] = 0x05;
+        sink.process_packet(&mut transport, &key_notif, |_, _| {});
+        assert_eq!(sink.find_bond_key(&peer_addr), None);
+
+        // Empty default PIN triggers negative reply even in pairing window.
+        sink.open_pairing_window(60_000, BtPairingPolicy::SspNumericComparison);
+        sink.process_packet(&mut transport, &io_cap_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("io cap reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_IO_CAPABILITY_REQUEST_REPLY
+        );
+        assert_eq!(cmd[10], 0x01);
+        assert_eq!(cmd[12], 0x05);
+
+        let pin_req = [
+            HCI_PKT_EVENT,
+            EVT_PIN_CODE_REQUEST,
+            6,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+        ];
+        sink.process_packet(&mut transport, &pin_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("empty pin neg reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY
+        );
+
+        // SspNumericComparison stores pending passkey without blind confirm.
+        let tx_before = transport.tx_packets.len();
+        sink.process_packet(&mut transport, &confirm_req, |_, _| {});
+        assert_eq!(transport.tx_packets.len(), tx_before);
+        assert_eq!(
+            sink.pending_numeric_passkey(),
+            Some((peer_addr, 0x0403_0201))
+        );
+        assert!(sink.confirm_numeric_comparison(peer_addr, true));
+        assert_eq!(sink.pending_numeric_passkey(), None);
+        assert!(sink.poll(&mut transport, 100, |_, _| {}));
+        let cmd = transport.tx_packets.last().expect("confirm reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_USER_CONFIRMATION_REQUEST_REPLY
+        );
+        sink.process_packet(&mut transport, &key_notif, |_, _| {});
+        assert_eq!(sink.find_bond_key(&peer_addr), Some([0x5A; 16]));
+        assert!(!sink.is_pairing_window_open());
+    }
+
+    #[test]
+    fn test_bonding_store_rejects_downgrade_zero_keys_and_handles_u32_wrap() {
+        let mut store = BondingStore::new();
+        let addr1 = [0x10, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let addr2 = [0x10, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let addr3 = [0x10, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let addr4 = [0x10, 0x00, 0x00, 0x00, 0x00, 0x04];
+        let addr5 = [0x10, 0x00, 0x00, 0x00, 0x00, 0x05];
+
+        // Zero address or zero link key must be rejected.
+        assert!(!store.try_upsert([0u8; 6], [0x11; 16], 0x05));
+        assert!(!store.try_upsert(addr1, [0u8; 16], 0x05));
+        assert_eq!(store.count(), 0);
+
+        // MITM key (0x05) rejects unauthenticated downgrade (0x04 / 0x00).
+        assert!(store.try_upsert(addr1, [0xA1; 16], 0x05));
+        assert!(!store.try_upsert(addr1, [0xB1; 16], 0x04));
+        assert!(!store.try_upsert(addr1, [0xB1; 16], 0x00));
+        let peer = store.peek(&addr1).expect("addr1 still bonded");
+        assert_eq!(peer.link_key, [0xA1; 16]);
+        assert_eq!(peer.key_type, 0x05);
+
+        // Same-or-higher security (0x08 P-256 MITM) succeeds.
+        assert!(store.try_upsert(addr1, [0xC1; 16], 0x08));
+        assert_eq!(store.peek(&addr1).map(|p| p.key_type), Some(0x08));
+
+        // Explicit remove permits re-pairing at a lower key_type.
+        assert!(store.remove(&addr1));
+        assert!(store.try_upsert(addr1, [0xD1; 16], 0x04));
+        assert_eq!(store.peek(&addr1).map(|p| p.key_type), Some(0x04));
+
+        // Wraparound-safe LRU eviction across u32::MAX.
+        let mut wrap_store = BondingStore::new();
+        wrap_store.clock = u32::MAX - 2;
+        assert!(wrap_store.try_upsert(addr1, [0x11; 16], 0x05)); // tick MAX - 1
+        assert!(wrap_store.try_upsert(addr2, [0x22; 16], 0x05)); // tick MAX
+        assert!(wrap_store.try_upsert(addr3, [0x33; 16], 0x05)); // tick 0
+        assert!(wrap_store.try_upsert(addr4, [0x44; 16], 0x05)); // tick 1
+                                                                 // Touch addr1 (tick 2), making addr2 (tick MAX) the oldest.
+        assert!(wrap_store.lookup(&addr1).is_some());
+        assert!(wrap_store.try_upsert(addr5, [0x55; 16], 0x05)); // tick 3
+        assert_eq!(wrap_store.peek(&addr2), None);
+        assert!(wrap_store.peek(&addr1).is_some());
+        assert!(wrap_store.peek(&addr3).is_some());
+        assert!(wrap_store.peek(&addr4).is_some());
+        assert!(wrap_store.peek(&addr5).is_some());
+
+        // Binary round-trip preserves wrapped LRU order (addr3 oldest).
+        let mut bin = [0u8; BondingStore::BINARY_MAX_BYTES];
+        let n = wrap_store.encode_binary(&mut bin);
+        let mut decoded = BondingStore::decode_binary(&bin[..n]).expect("decode");
+        assert!(decoded.try_upsert(addr2, [0x66; 16], 0x05));
+        assert_eq!(decoded.peek(&addr3), None);
     }
 
     #[test]
@@ -6346,5 +6877,323 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_spoofed_bonded_bd_addr_rejected_when_discoverable_false() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+        let bonded_addr = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+        let orig_key = [0x42u8; 16];
+        let spoof_key = [0x99u8; 16];
+        sink.save_bond_key_with_type(&bonded_addr, &orig_key, 0x05);
+        sink.security_policy.update_pin_code(b"1234");
+        sink.close_pairing_window();
+        assert!(!sink.is_pairing_window_open());
+
+        // Reconnect via stored link key still succeeds when discoverable=false.
+        let link_key_req = [
+            HCI_PKT_EVENT,
+            EVT_LINK_KEY_REQUEST,
+            6,
+            bonded_addr[0],
+            bonded_addr[1],
+            bonded_addr[2],
+            bonded_addr[3],
+            bonded_addr[4],
+            bonded_addr[5],
+        ];
+        sink.process_packet(&mut transport, &link_key_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("link key reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_LINK_KEY_REQUEST_REPLY
+        );
+        assert_eq!(&cmd[10..26], &orig_key);
+
+        // Spoofed IO cap, confirmation, PIN, and link-key notify are rejected.
+        let io_cap_req = [
+            HCI_PKT_EVENT,
+            EVT_IO_CAPABILITY_REQUEST,
+            6,
+            bonded_addr[0],
+            bonded_addr[1],
+            bonded_addr[2],
+            bonded_addr[3],
+            bonded_addr[4],
+            bonded_addr[5],
+        ];
+        sink.process_packet(&mut transport, &io_cap_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("io cap neg");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY
+        );
+        assert_eq!(cmd[10], 0x05);
+
+        let confirm_req = [
+            HCI_PKT_EVENT,
+            EVT_USER_CONFIRMATION_REQUEST,
+            10,
+            bonded_addr[0],
+            bonded_addr[1],
+            bonded_addr[2],
+            bonded_addr[3],
+            bonded_addr[4],
+            bonded_addr[5],
+            0x10,
+            0x20,
+            0x30,
+            0x40,
+        ];
+        sink.process_packet(&mut transport, &confirm_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("confirm neg");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+        );
+
+        let pin_req = [
+            HCI_PKT_EVENT,
+            EVT_PIN_CODE_REQUEST,
+            6,
+            bonded_addr[0],
+            bonded_addr[1],
+            bonded_addr[2],
+            bonded_addr[3],
+            bonded_addr[4],
+            bonded_addr[5],
+        ];
+        sink.process_packet(&mut transport, &pin_req, |_, _| {});
+        let cmd = transport.tx_packets.last().expect("pin neg");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_PIN_CODE_REQUEST_NEGATIVE_REPLY
+        );
+
+        let mut key_notif = [0u8; 26];
+        key_notif[0] = HCI_PKT_EVENT;
+        key_notif[1] = EVT_LINK_KEY_NOTIFICATION;
+        key_notif[2] = 23;
+        key_notif[3..9].copy_from_slice(&bonded_addr);
+        key_notif[9..25].copy_from_slice(&spoof_key);
+        key_notif[25] = 0x05;
+        sink.process_packet(&mut transport, &key_notif, |_, _| {});
+        assert_eq!(sink.find_bond_key(&bonded_addr), Some(orig_key));
+    }
+
+    #[test]
+    fn test_numeric_comparison_pending_confirm_and_reject() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+        let peer_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x77];
+        sink.open_pairing_window(60_000, BtPairingPolicy::SspNumericComparison);
+
+        let confirm_req = [
+            HCI_PKT_EVENT,
+            EVT_USER_CONFIRMATION_REQUEST,
+            10,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+            0x2A,
+            0x01,
+            0x00,
+            0x00,
+        ];
+        sink.process_packet(&mut transport, &confirm_req, |_, _| {});
+        assert_eq!(sink.pending_numeric_passkey(), Some((peer_addr, 298)));
+        assert!(!sink.confirm_numeric_comparison([0x99; 6], true));
+        assert!(sink.confirm_numeric_comparison(peer_addr, false));
+        assert_eq!(sink.pending_numeric_passkey(), None);
+        assert!(sink.poll(&mut transport, 10, |_, _| {}));
+        let cmd = transport.tx_packets.last().expect("neg confirm reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+        );
+    }
+
+    #[test]
+    fn test_fifth_peer_eviction_clears_legacy_bond_table() {
+        let mut sink = BtA2dpSink::new();
+        let addrs = [
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x01],
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x02],
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x03],
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x04],
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x05],
+        ];
+        for (i, addr) in addrs[..4].iter().enumerate() {
+            sink.save_bond_key_with_type(addr, &[0x10 + i as u8; 16], 0x05);
+        }
+        // Touch peer 0 so peer 1 becomes the LRU eviction victim.
+        assert!(sink.bonding_store.lookup(&addrs[0]).is_some());
+        sink.save_bond_key_with_type(&addrs[4], &[0x55; 16], 0x05);
+
+        assert_eq!(sink.bond_count, 4);
+        assert_eq!(sink.find_bond_key(&addrs[1]), None);
+        assert!(!sink
+            .bond_table
+            .iter()
+            .any(|b| b.valid && b.bd_addr == addrs[1]));
+        assert_eq!(sink.find_bond_key(&addrs[4]), Some([0x55; 16]));
+    }
+
+    #[test]
+    fn test_runtime_pairing_window_emits_write_scan_enable_and_auto_closes() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+
+        // Open pairing window while connected defers scan update until idle.
+        sink.active_handle = Some(0x0040);
+        sink.open_pairing_window(180_000, BtPairingPolicy::SspJustWorks);
+        assert!(sink.scan_enable_dirty);
+        assert!(!sink.poll(&mut transport, 100, |_, _| {}));
+        assert!(sink.scan_enable_dirty);
+
+        sink.active_handle = None;
+        assert!(sink.poll(&mut transport, 200, |_, _| {}));
+        assert!(!sink.scan_enable_dirty);
+        let cmd = transport.tx_packets.last().expect("write scan enable 0x03");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_WRITE_SCAN_ENABLE
+        );
+        assert_eq!(cmd[4], 0x03);
+
+        // Timeout closes pairing window and emits page-only scan (0x02).
+        sink.tick_pairing_window(180_000);
+        assert!(!sink.is_pairing_window_open());
+        assert!(sink.poll(&mut transport, 300, |_, _| {}));
+        let cmd = transport.tx_packets.last().expect("write scan enable 0x02");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_WRITE_SCAN_ENABLE
+        );
+        assert_eq!(cmd[4], 0x02);
+    }
+
+    #[test]
+    fn test_legacy_pin_only_rejects_io_capability_request_when_discoverable() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+        sink.open_pairing_window(60_000, BtPairingPolicy::LegacyPinOnly);
+        assert!(sink.is_pairing_window_open());
+
+        let peer_addr = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let io_cap_req = [
+            HCI_PKT_EVENT,
+            EVT_IO_CAPABILITY_REQUEST,
+            6,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+        ];
+        sink.process_packet(&mut transport, &io_cap_req, |_, _| {});
+        let cmd = transport
+            .tx_packets
+            .last()
+            .expect("io cap negative reply under LegacyPinOnly");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_IO_CAPABILITY_REQUEST_NEGATIVE_REPLY
+        );
+        assert_eq!(&cmd[4..10], &peer_addr);
+        assert_eq!(cmd[10], 0x05);
+    }
+
+    #[test]
+    fn test_numeric_comparison_timeout_emits_negative_reply() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+        let peer_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x88];
+        sink.open_pairing_window(60_000, BtPairingPolicy::SspNumericComparison);
+
+        let confirm_req = [
+            HCI_PKT_EVENT,
+            EVT_USER_CONFIRMATION_REQUEST,
+            10,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+            0x39,
+            0x30,
+            0x00,
+            0x00,
+        ];
+        sink.process_packet(&mut transport, &confirm_req, |_, _| {});
+        assert_eq!(sink.pending_numeric_passkey(), Some((peer_addr, 12345)));
+
+        // Advance past the 30s confirmation timeout while pairing window remains open.
+        sink.tick_pairing_window(30_000);
+        assert_eq!(sink.pending_numeric_passkey(), None);
+        assert!(sink.is_pairing_window_open());
+        assert!(sink.poll(&mut transport, 10, |_, _| {}));
+        let cmd = transport
+            .tx_packets
+            .last()
+            .expect("timeout neg confirm reply");
+        assert_eq!(
+            u16::from_le_bytes([cmd[1], cmd[2]]),
+            OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+        );
+        assert_eq!(&cmd[4..10], &peer_addr);
+    }
+
+    #[test]
+    fn test_close_pairing_window_with_pending_numeric_emits_negative_reply() {
+        let mut transport = MockHciTransport::new();
+        let mut sink = BtA2dpSink::new();
+        sink.init_step = InitStep::Completed;
+        let peer_addr = [0x22, 0x33, 0x44, 0x55, 0x66, 0x99];
+        sink.open_pairing_window(60_000, BtPairingPolicy::SspNumericComparison);
+
+        let confirm_req = [
+            HCI_PKT_EVENT,
+            EVT_USER_CONFIRMATION_REQUEST,
+            10,
+            peer_addr[0],
+            peer_addr[1],
+            peer_addr[2],
+            peer_addr[3],
+            peer_addr[4],
+            peer_addr[5],
+            0x2A,
+            0x01,
+            0x00,
+            0x00,
+        ];
+        sink.process_packet(&mut transport, &confirm_req, |_, _| {});
+        assert_eq!(sink.pending_numeric_passkey(), Some((peer_addr, 298)));
+
+        sink.close_pairing_window();
+        assert_eq!(sink.pending_numeric_passkey(), None);
+        assert!(!sink.is_pairing_window_open());
+        assert!(sink.poll(&mut transport, 10, |_, _| {}));
+        let neg_cmd = transport
+            .tx_packets
+            .iter()
+            .find(|pkt| {
+                pkt.len() >= 10
+                    && u16::from_le_bytes([pkt[1], pkt[2]])
+                        == OPCODE_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY
+            })
+            .expect("close window neg confirm reply");
+        assert_eq!(&neg_cmd[4..10], &peer_addr);
     }
 }

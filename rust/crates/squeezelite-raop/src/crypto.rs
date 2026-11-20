@@ -24,6 +24,8 @@ pub enum CryptoError {
     InvalidKeyLength,
     /// The modulus is even or zero.
     InvalidModulus,
+    /// RSA CRT fault-attack verification failed.
+    FaultDetected,
     /// BigUint parsing error.
     InvalidNumber,
     /// Base64 decoding failed or invalid input length.
@@ -38,6 +40,7 @@ impl fmt::Display for CryptoError {
             Self::InvalidPadding => write!(f, "Invalid cryptographic padding"),
             Self::InvalidKeyLength => write!(f, "Expected 16-byte AES-128 key"),
             Self::InvalidModulus => write!(f, "Modulus must be odd and non-zero"),
+            Self::FaultDetected => write!(f, "RSA CRT fault verification failed"),
             Self::InvalidNumber => write!(f, "Failed to parse big number"),
             Self::InvalidBase64 => write!(f, "Invalid base64 encoding"),
         }
@@ -560,62 +563,91 @@ fn mgf1_sha1(seed: &[u8], mask_len: usize) -> Vec<u8> {
     mask
 }
 
+#[inline(never)]
+#[allow(unsafe_code)]
+fn volatile_zero_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // JUSTIFICATION: Volatile writes prevent dead-store elimination of
+        // sensitive key buffers prior to drop.
+        // SAFETY: `b` is a valid, exclusively borrowed `&mut u8` inside
+        // `buf`, so `write_volatile` is aligned and strictly in bounds.
+        unsafe {
+            core::ptr::write_volatile(b as *mut u8, 0);
+        }
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+#[inline(never)]
+#[allow(unsafe_code)]
+fn volatile_zero_u32s(buf: &mut [u32]) {
+    for w in buf.iter_mut() {
+        // JUSTIFICATION: Volatile writes prevent dead-store elimination of
+        // secret RSA CRT limbs prior to drop.
+        // SAFETY: `w` is a valid, exclusively borrowed `&mut u32` inside
+        // `buf`, so `write_volatile` is aligned and strictly in bounds.
+        unsafe {
+            core::ptr::write_volatile(w as *mut u32, 0);
+        }
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Unpads PKCS#1 v1.5 block type 02 (encryption) and extracts 16-byte key.
 pub fn unpad_pkcs1_v15_type2(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> {
-    if plaintext.len() < 11 {
+    if plaintext.len() < 27 {
         return Err(CryptoError::InvalidPadding);
     }
 
+    let expected_sep = plaintext.len() - 17;
     let mut bad_pad = 0u32;
-    bad_pad |= plaintext[0] as u32;
-    bad_pad |= (plaintext[1] as u32) ^ 0x02;
+    bad_pad |= u32::from(core::hint::black_box(plaintext[0]));
+    bad_pad |= u32::from(core::hint::black_box(plaintext[1])) ^ 0x02;
 
     let mut found_sep = 0u32;
     let mut sep_idx = 0usize;
     for (i, &b) in plaintext.iter().enumerate().skip(2) {
-        let is_zero = if b == 0x00 { 1u32 } else { 0u32 };
+        let v = u32::from(core::hint::black_box(b));
+        let is_zero = 1u32 ^ ((v | v.wrapping_neg()) >> 31);
         let first_zero = is_zero & (1 ^ found_sep);
         found_sep |= is_zero;
-        sep_idx |= i * (first_zero as usize);
+        sep_idx |= i & (first_zero as usize).wrapping_neg();
     }
 
     bad_pad |= 1 ^ found_sep;
-    if sep_idx < 10 {
-        bad_pad |= 1;
-    }
+    let sep_diff = core::hint::black_box(sep_idx ^ expected_sep);
+    let sep_bad = ((sep_diff | sep_diff.wrapping_neg()) >> (usize::BITS - 1)) as u32;
+    bad_pad |= sep_bad;
 
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&plaintext[expected_sep + 1..]);
+
+    let bad_pad = core::hint::black_box(bad_pad);
     if bad_pad != 0 {
+        volatile_zero_bytes(&mut key);
         return Err(CryptoError::InvalidPadding);
     }
-
-    let payload = &plaintext[sep_idx + 1..];
-    if payload.len() != 16 {
-        return Err(CryptoError::InvalidKeyLength);
-    }
-    let mut key = [0u8; 16];
-    key.copy_from_slice(payload);
     Ok(key)
 }
 
 /// Unpads RSAES-OAEP with SHA-1 and extracts the 16-byte AES key.
 pub fn unpad_oaep_sha1(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> {
-    if plaintext.len() < 42 {
+    if plaintext.len() < 58 {
         return Err(CryptoError::InvalidPadding);
     }
 
-    let mut bad = 0u32;
-    bad |= plaintext[0] as u32;
+    let mut bad = u32::from(core::hint::black_box(plaintext[0]));
 
     let masked_seed = &plaintext[1..21];
     let masked_db = &plaintext[21..];
 
-    let seed_mask = mgf1_sha1(masked_db, 20);
+    let mut seed_mask = mgf1_sha1(masked_db, 20);
     let mut seed = [0u8; 20];
     for i in 0..20 {
         seed[i] = masked_seed[i] ^ seed_mask[i];
     }
 
-    let db_mask = mgf1_sha1(&seed, masked_db.len());
+    let mut db_mask = mgf1_sha1(&seed, masked_db.len());
     let mut db = vec![0u8; masked_db.len()];
     for i in 0..masked_db.len() {
         db[i] = masked_db[i] ^ db_mask[i];
@@ -623,7 +655,7 @@ pub fn unpad_oaep_sha1(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> {
 
     let l_hash = Sha1::digest(b"");
     for i in 0..20 {
-        bad |= (db[i] ^ l_hash[i]) as u32;
+        bad |= u32::from(core::hint::black_box(db[i] ^ l_hash[i]));
     }
 
     let mut looking_for_one = 1u32;
@@ -631,28 +663,35 @@ pub fn unpad_oaep_sha1(plaintext: &[u8]) -> Result<[u8; 16], CryptoError> {
     let mut invalid_ps = 0u32;
 
     for (i, &b) in db.iter().enumerate().skip(20) {
-        let is_one = if b == 0x01 { 1u32 } else { 0u32 };
-        let is_zero = if b == 0x00 { 1u32 } else { 0u32 };
+        let v = u32::from(core::hint::black_box(b));
+        let is_zero = 1u32 ^ ((v | v.wrapping_neg()) >> 31);
+        let v1 = v ^ 0x01;
+        let is_one = 1u32 ^ ((v1 | v1.wrapping_neg()) >> 31);
 
         invalid_ps |= looking_for_one & (1 ^ (is_zero | is_one));
         let first_one = is_one & looking_for_one;
-        sep_idx |= i * (first_one as usize);
+        sep_idx |= i & (first_one as usize).wrapping_neg();
         looking_for_one &= 1 ^ is_one;
     }
 
-    bad |= invalid_ps;
-    bad |= looking_for_one;
+    let expected_sep = db.len() - 17;
+    let sep_diff = core::hint::black_box(sep_idx ^ expected_sep);
+    let sep_bad = ((sep_diff | sep_diff.wrapping_neg()) >> (usize::BITS - 1)) as u32;
+    bad |= invalid_ps | looking_for_one | sep_bad;
 
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&db[db.len() - 16..]);
+
+    volatile_zero_bytes(&mut seed_mask);
+    volatile_zero_bytes(&mut seed);
+    volatile_zero_bytes(&mut db_mask);
+    volatile_zero_bytes(&mut db);
+
+    let bad = core::hint::black_box(bad);
     if bad != 0 {
+        volatile_zero_bytes(&mut key);
         return Err(CryptoError::InvalidPadding);
     }
-
-    let payload = &db[sep_idx + 1..];
-    if payload.len() != 16 {
-        return Err(CryptoError::InvalidKeyLength);
-    }
-    let mut key = [0u8; 16];
-    key.copy_from_slice(payload);
     Ok(key)
 }
 
@@ -753,9 +792,91 @@ fn ct_sub_mod_32(a: &[u32; 32], b: &[u32; 32], m: &[u32; 32]) -> [u32; 32] {
     out
 }
 
+/// Constant-time comparison returning `true` iff `a[..k] < b[..k]`.
+fn ct_lt_limbs(k: usize, a: &[u32], b: &[u32]) -> bool {
+    let mut borrow = 0u64;
+    for j in 0..k {
+        let sub = u64::from(a[j])
+            .wrapping_sub(u64::from(b[j]))
+            .wrapping_sub(borrow);
+        borrow = (sub >> 63) & 1;
+    }
+    core::hint::black_box(borrow) == 1
+}
+
+/// Constant-time equality comparison over `k` limbs.
+fn ct_eq_limbs(k: usize, a: &[u32], b: &[u32]) -> bool {
+    let mut diff = 0u32;
+    for j in 0..k {
+        diff |= core::hint::black_box(a[j] ^ b[j]);
+    }
+    core::hint::black_box(diff) == 0
+}
+
+/// Multiplies two 32-limb integers into a 64-limb product.
+fn mul_32x32_to_64(a: &[u32; 32], b: &[u32; 32]) -> [u32; 64] {
+    let mut prod = [0u32; 64];
+    for i in 0..32 {
+        let mut carry = 0u64;
+        let ai = u64::from(a[i]);
+        for j in 0..32 {
+            let acc = u64::from(prod[i + j]) + ai * u64::from(b[j]) + carry;
+            prod[i + j] = acc as u32;
+            carry = acc >> 32;
+        }
+        prod[i + 32] = carry as u32;
+    }
+    prod
+}
+
+/// Reduces a 64-limb integer modulo 32-limb modulus `m > 2^1023`.
+fn ct_reduce_64_mod_32(x: &[u32; 64], m: &[u32; 32], m_r2: &[u32; 32], m_prime: u32) -> [u32; 32] {
+    let mut x_lo = [0u32; 32];
+    let mut x_hi = [0u32; 32];
+    x_lo.copy_from_slice(&x[0..32]);
+    x_hi.copy_from_slice(&x[32..64]);
+
+    let lo_m = ct_sub_if_ge_32(&x_lo, m);
+    let hi_m = ct_sub_if_ge_32(&x_hi, m);
+    let mut hi_r_m = [0u32; CRT_LIMBS];
+    cios_mont_mul(CRT_LIMBS, &hi_m, m_r2, m, m_prime, &mut hi_r_m);
+    ct_add_mod_32(&lo_m, &hi_r_m, m)
+}
+
+/// Computes `base^exp mod n` over 64 limbs for public exponent `exp`.
+fn mont_pow_public_64(
+    base: &[u32; 64],
+    exp: &BigUint,
+    n: &[u32; 64],
+    n_prime: u32,
+    r2: &[u32; 64],
+) -> [u32; 64] {
+    let mut one = [0u32; 64];
+    one[0] = 1;
+    let mut b_bar = [0u32; 64];
+    cios_mont_mul(64, base, r2, n, n_prime, &mut b_bar);
+    let mut acc = [0u32; 64];
+    cios_mont_mul(64, &one, r2, n, n_prime, &mut acc);
+    let mut tmp = [0u32; 64];
+
+    for bit_idx in (0..exp.bit_len()).rev() {
+        cios_mont_mul(64, &acc, &acc, n, n_prime, &mut tmp);
+        let bit = (exp.limbs[bit_idx / 32] >> (bit_idx % 32)) & 1;
+        if bit == 1 {
+            cios_mont_mul(64, &tmp, &b_bar, n, n_prime, &mut acc);
+        } else {
+            acc = tmp;
+        }
+    }
+
+    let mut out = [0u32; 64];
+    cios_mont_mul(64, &acc, &one, n, n_prime, &mut out);
+    out
+}
+
 /// Precomputed Chinese Remainder Theorem (CRT) parameters for 2048-bit RSA
 /// keys.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RsaCrtParams {
     p: [u32; CRT_LIMBS],
     p_prime: u32,
@@ -766,22 +887,69 @@ pub struct RsaCrtParams {
     q_r2: [u32; CRT_LIMBS],
     dq: [u32; CRT_LIMBS],
     qinv_mont_p: [u32; CRT_LIMBS],
+    n: [u32; 64],
+    n_prime: u32,
+    n_r2: [u32; 64],
+    e: Option<BigUint>,
+}
+
+impl fmt::Debug for RsaCrtParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RsaCrtParams")
+            .field("p", &"[REDACTED]")
+            .field("q", &"[REDACTED]")
+            .field("dp", &"[REDACTED]")
+            .field("dq", &"[REDACTED]")
+            .field("qinv_mont_p", &"[REDACTED]")
+            .field("has_e", &self.e.is_some())
+            .finish()
+    }
+}
+
+impl Drop for RsaCrtParams {
+    fn drop(&mut self) {
+        volatile_zero_u32s(&mut self.p);
+        volatile_zero_u32s(&mut self.p_r2);
+        volatile_zero_u32s(&mut self.dp);
+        volatile_zero_u32s(&mut self.q);
+        volatile_zero_u32s(&mut self.q_r2);
+        volatile_zero_u32s(&mut self.dq);
+        volatile_zero_u32s(&mut self.qinv_mont_p);
+        volatile_zero_u32s(core::slice::from_mut(&mut self.p_prime));
+        volatile_zero_u32s(core::slice::from_mut(&mut self.q_prime));
+    }
 }
 
 impl RsaCrtParams {
-    /// Constructs precomputed CRT parameters from 128-byte big-endian components.
+    /// Constructs precomputed CRT parameters from 128-byte big-endian
+    /// components, validating oddness, MSB bounds (`> 2^1023`), and inverse.
     pub fn new(
         p_bytes: &[u8; 128],
         q_bytes: &[u8; 128],
         dp_bytes: &[u8; 128],
         dq_bytes: &[u8; 128],
         qinv_bytes: &[u8; 128],
-    ) -> Self {
+    ) -> Result<Self, CryptoError> {
         let p = be_128_to_limbs(p_bytes);
         let q = be_128_to_limbs(q_bytes);
         let dp = be_128_to_limbs(dp_bytes);
         let dq = be_128_to_limbs(dq_bytes);
         let qinv = be_128_to_limbs(qinv_bytes);
+
+        let p_valid = (p[0] & 1) == 1 && (p[CRT_LIMBS - 1] >> 31) == 1;
+        let q_valid = (q[0] & 1) == 1 && (q[CRT_LIMBS - 1] >> 31) == 1;
+        if !p_valid || !q_valid {
+            return Err(CryptoError::InvalidModulus);
+        }
+        if !ct_lt_limbs(CRT_LIMBS, &dp, &p)
+            || !ct_lt_limbs(CRT_LIMBS, &dq, &q)
+            || !ct_lt_limbs(CRT_LIMBS, &qinv, &p)
+        {
+            return Err(CryptoError::InvalidModulus);
+        }
+        if dp.iter().all(|&x| x == 0) || dq.iter().all(|&x| x == 0) {
+            return Err(CryptoError::InvalidModulus);
+        }
 
         let p_prime = inv32(p[0]);
         let q_prime = inv32(q[0]);
@@ -795,7 +963,29 @@ impl RsaCrtParams {
         let mut qinv_mont_p = [0u32; CRT_LIMBS];
         cios_mont_mul(CRT_LIMBS, &qinv, &p_r2, &p, p_prime, &mut qinv_mont_p);
 
-        Self {
+        // Verify qinv * q == 1 mod p.
+        let q_mod_p = ct_sub_if_ge_32(&q, &p);
+        let mut qinv_q_check = [0u32; CRT_LIMBS];
+        cios_mont_mul(
+            CRT_LIMBS,
+            &qinv_mont_p,
+            &q_mod_p,
+            &p,
+            p_prime,
+            &mut qinv_q_check,
+        );
+        let mut one_32 = [0u32; CRT_LIMBS];
+        one_32[0] = 1;
+        if !ct_eq_limbs(CRT_LIMBS, &qinv_q_check, &one_32) {
+            return Err(CryptoError::InvalidModulus);
+        }
+
+        let n = mul_32x32_to_64(&p, &q);
+        let n_prime = inv32(n[0]);
+        let mut n_r2 = [0u32; 64];
+        compute_r2_mod_n(64, &n, &mut n_r2);
+
+        Ok(Self {
             p,
             p_prime,
             p_r2,
@@ -805,45 +995,39 @@ impl RsaCrtParams {
             q_r2,
             dq,
             qinv_mont_p,
-        }
+            n,
+            n_prime,
+            n_r2,
+            e: Some(BigUint::from_u32(65537)),
+        })
     }
 
-    /// Evaluates `c^d mod n` using Garner's CRT algorithm in constant time.
-    pub fn mod_pow_2048(&self, c: &BigUint) -> Vec<u8> {
-        let mut c64 = [0u32; 64];
-        for (dst, &src) in c64.iter_mut().zip(&c.limbs) {
-            *dst = src;
+    /// Sets the public exponent `e` used for CRT fault-attack verification.
+    pub fn with_public_exponent(mut self, e: BigUint) -> Self {
+        self.e = Some(e);
+        self
+    }
+
+    /// Clears the public exponent `e`, keeping modular consistency checks.
+    pub fn without_public_exponent(mut self) -> Self {
+        self.e = None;
+        self
+    }
+
+    /// Evaluates `c^d mod n` using Garner's CRT algorithm in constant time
+    /// with Bellcore fault-attack verification.
+    pub fn mod_pow_2048(&self, c: &BigUint) -> Result<Vec<u8>, CryptoError> {
+        if c.limbs.len() > 64 {
+            return Err(CryptoError::CiphertextTooLarge);
         }
-        let mut c_lo = [0u32; 32];
-        let mut c_hi = [0u32; 32];
-        c_lo.copy_from_slice(&c64[0..32]);
-        c_hi.copy_from_slice(&c64[32..64]);
+        let mut c64 = [0u32; 64];
+        c64[..c.limbs.len()].copy_from_slice(&c.limbs);
+        if !ct_lt_limbs(64, &c64, &self.n) {
+            return Err(CryptoError::CiphertextTooLarge);
+        }
 
-        let lo_p = ct_sub_if_ge_32(&c_lo, &self.p);
-        let hi_p = ct_sub_if_ge_32(&c_hi, &self.p);
-        let mut hi_r_p = [0u32; CRT_LIMBS];
-        cios_mont_mul(
-            CRT_LIMBS,
-            &hi_p,
-            &self.p_r2,
-            &self.p,
-            self.p_prime,
-            &mut hi_r_p,
-        );
-        let c_mod_p = ct_add_mod_32(&lo_p, &hi_r_p, &self.p);
-
-        let lo_q = ct_sub_if_ge_32(&c_lo, &self.q);
-        let hi_q = ct_sub_if_ge_32(&c_hi, &self.q);
-        let mut hi_r_q = [0u32; CRT_LIMBS];
-        cios_mont_mul(
-            CRT_LIMBS,
-            &hi_q,
-            &self.q_r2,
-            &self.q,
-            self.q_prime,
-            &mut hi_r_q,
-        );
-        let c_mod_q = ct_add_mod_32(&lo_q, &hi_r_q, &self.q);
+        let c_mod_p = ct_reduce_64_mod_32(&c64, &self.p, &self.p_r2, self.p_prime);
+        let c_mod_q = ct_reduce_64_mod_32(&c64, &self.q, &self.q_r2, self.q_prime);
 
         let mut m1 = [0u32; CRT_LIMBS];
         mont_pow_limbs(
@@ -867,7 +1051,9 @@ impl RsaCrtParams {
             &mut m2,
         );
 
-        let diff = ct_sub_mod_32(&m1, &m2, &self.p);
+        // Reduce m2 modulo p so ct_sub_mod_32 holds even when q > p.
+        let m2_mod_p = ct_sub_if_ge_32(&m2, &self.p);
+        let diff = ct_sub_mod_32(&m1, &m2_mod_p, &self.p);
         let mut h = [0u32; CRT_LIMBS];
         cios_mont_mul(
             CRT_LIMBS,
@@ -888,13 +1074,30 @@ impl RsaCrtParams {
                 m64[i + j] = prod as u32;
                 carry = prod >> 32;
             }
-            let mut k_idx = i + 32;
-            while carry > 0 && k_idx < 64 {
-                let sum = u64::from(m64[k_idx]) + carry;
-                m64[k_idx] = sum as u32;
-                carry = sum >> 32;
-                k_idx += 1;
+            m64[i + 32] = carry as u32;
+        }
+
+        let mut ok = ct_lt_limbs(64, &m64, &self.n);
+        let m_mod_p = ct_reduce_64_mod_32(&m64, &self.p, &self.p_r2, self.p_prime);
+        let m_mod_q = ct_reduce_64_mod_32(&m64, &self.q, &self.q_r2, self.q_prime);
+        ok &= ct_eq_limbs(CRT_LIMBS, &m_mod_p, &m1);
+        ok &= ct_eq_limbs(CRT_LIMBS, &m_mod_q, &m2);
+
+        if let Some(ref e) = self.e {
+            if e.is_zero() {
+                ok = false;
+            } else {
+                let c_check = mont_pow_public_64(&m64, e, &self.n, self.n_prime, &self.n_r2);
+                ok &= ct_eq_limbs(64, &c_check, &c64);
             }
+        }
+
+        if !core::hint::black_box(ok) {
+            volatile_zero_u32s(&mut m1);
+            volatile_zero_u32s(&mut m2);
+            volatile_zero_u32s(&mut h);
+            volatile_zero_u32s(&mut m64);
+            return Err(CryptoError::FaultDetected);
         }
 
         let mut out = vec![0u8; 256];
@@ -902,17 +1105,39 @@ impl RsaCrtParams {
             let off = (63 - i) * 4;
             out[off..off + 4].copy_from_slice(&limb.to_be_bytes());
         }
-        out
+        volatile_zero_u32s(&mut m1);
+        volatile_zero_u32s(&mut m2);
+        volatile_zero_u32s(&mut h);
+        volatile_zero_u32s(&mut m64);
+        Ok(out)
     }
 }
 
 /// RSA Private Key supporting arbitrary modulus bit sizes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RsaPrivateKey {
     pub n: BigUint,
-    pub d: BigUint,
+    d: BigUint,
     n_len: usize,
+    e: Option<BigUint>,
     crt: Option<Box<RsaCrtParams>>,
+}
+
+impl fmt::Debug for RsaPrivateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RsaPrivateKey")
+            .field("n_len", &self.n_len)
+            .field("d", &"[REDACTED]")
+            .field("has_e", &self.e.is_some())
+            .field("has_crt", &self.crt.is_some())
+            .finish()
+    }
+}
+
+impl Drop for RsaPrivateKey {
+    fn drop(&mut self) {
+        volatile_zero_u32s(&mut self.d.limbs);
+    }
 }
 
 impl RsaPrivateKey {
@@ -922,8 +1147,18 @@ impl RsaPrivateKey {
             n: BigUint::from_be_bytes(n_bytes),
             d: BigUint::from_be_bytes(d_bytes),
             n_len: n_bytes.len(),
+            e: None,
             crt: None,
         }
+    }
+
+    /// Configures the public exponent `e` for CRT fault verification.
+    pub fn with_public_exponent(mut self, e: BigUint) -> Self {
+        if let Some(ref mut crt) = self.crt {
+            crt.e = Some(e.clone());
+        }
+        self.e = Some(e);
+        self
     }
 
     /// Modulus length in bytes.
@@ -932,7 +1167,10 @@ impl RsaPrivateKey {
     }
 
     /// Attaches precomputed CRT parameters to this private key.
-    pub fn with_crt(mut self, crt: RsaCrtParams) -> Self {
+    pub fn with_crt(mut self, mut crt: RsaCrtParams) -> Self {
+        if let Some(ref e) = self.e {
+            crt.e = Some(e.clone());
+        }
         self.crt = Some(Box::new(crt));
         self
     }
@@ -949,7 +1187,7 @@ impl RsaPrivateKey {
             return Err(CryptoError::CiphertextTooLarge);
         }
         if let Some(crt) = &self.crt {
-            return Ok(crt.mod_pow_2048(&c));
+            return crt.mod_pow_2048(&c);
         }
         let m = montgomery_mod_pow(&c, &self.d, &self.n)?;
         m.to_be_bytes_padded(self.n_len)
@@ -959,13 +1197,13 @@ impl RsaPrivateKey {
     ///
     /// Auto-detects PKCS#1 v1.5 type 02 or OAEP padding.
     pub fn decrypt_session_key(&self, ciphertext: &[u8]) -> Result<[u8; 16], CryptoError> {
-        let decrypted = self.decrypt_raw(ciphertext)?;
-        // Try PKCS#1 v1.5 type 2 first
-        if let Ok(key) = unpad_pkcs1_v15_type2(&decrypted) {
-            return Ok(key);
-        }
-        // Fallback to OAEP with SHA-1
-        unpad_oaep_sha1(&decrypted)
+        let mut decrypted = self.decrypt_raw(ciphertext)?;
+        let res = match unpad_pkcs1_v15_type2(&decrypted) {
+            Ok(key) => Ok(key),
+            Err(_) => unpad_oaep_sha1(&decrypted),
+        };
+        volatile_zero_bytes(&mut decrypted);
+        res
     }
 
     /// Signs an Apple-Challenge payload using PKCS#1 v1.5 block type 01.
@@ -1310,14 +1548,18 @@ const AIRPORT_EXPRESS_QINV_BYTES: [u8; 128] = [
 /// Returns the standard Airport Express 2048-bit RSA Private Key with CRT
 /// acceleration.
 pub fn airport_express_key() -> RsaPrivateKey {
-    let crt = RsaCrtParams::new(
+    let key = RsaPrivateKey::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES, &AIRPORT_EXPRESS_D_BYTES)
+        .with_public_exponent(BigUint::from_u32(65537));
+    match RsaCrtParams::new(
         &AIRPORT_EXPRESS_P_BYTES,
         &AIRPORT_EXPRESS_Q_BYTES,
         &AIRPORT_EXPRESS_DP_BYTES,
         &AIRPORT_EXPRESS_DQ_BYTES,
         &AIRPORT_EXPRESS_QINV_BYTES,
-    );
-    RsaPrivateKey::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES, &AIRPORT_EXPRESS_D_BYTES).with_crt(crt)
+    ) {
+        Ok(crt) => key.with_crt(crt),
+        Err(_) => key,
+    }
 }
 
 /// Encodes binary bytes to standard Base64 string.
@@ -1597,5 +1839,186 @@ mod tests {
                     .expect("non-CRT random decrypt")
             );
         }
+    }
+
+    #[test]
+    fn test_pkcs1_and_oaep_uniform_invalid_padding_errors() {
+        // Non-16-byte payload under valid PKCS#1 framing returns InvalidPadding
+        let wrong_len = [
+            0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 1, 2, 3, 4, 5,
+        ];
+        assert_eq!(
+            unpad_pkcs1_v15_type2(&wrong_len),
+            Err(CryptoError::InvalidPadding)
+        );
+
+        let mut wrong_len_long = [0xFFu8; 32];
+        wrong_len_long[0] = 0x00;
+        wrong_len_long[1] = 0x02;
+        wrong_len_long[20] = 0x00;
+        assert_eq!(
+            unpad_pkcs1_v15_type2(&wrong_len_long),
+            Err(CryptoError::InvalidPadding)
+        );
+
+        let mut valid_pkcs1 = [0xAAu8; 32];
+        valid_pkcs1[0] = 0x00;
+        valid_pkcs1[1] = 0x02;
+        valid_pkcs1[15] = 0x00;
+        let expected_key = [0xAAu8; 16];
+        assert_eq!(unpad_pkcs1_v15_type2(&valid_pkcs1), Ok(expected_key));
+
+        // Build valid 64-byte OAEP-SHA1 block and verify wrong sep fails.
+        let build_oaep = |sep_pos: usize| -> [u8; 64] {
+            let l_hash = Sha1::digest(b"");
+            let mut db = [0u8; 43];
+            db[..20].copy_from_slice(&l_hash);
+            db[sep_pos] = 0x01;
+            db[sep_pos + 1..].fill(0x42);
+
+            let seed = [0x11u8; 20];
+            let db_mask = mgf1_sha1(&seed, db.len());
+            let mut masked_db = [0u8; 43];
+            for i in 0..db.len() {
+                masked_db[i] = db[i] ^ db_mask[i];
+            }
+            let seed_mask = mgf1_sha1(&masked_db, 20);
+            let mut em = [0u8; 64];
+            for i in 0..20 {
+                em[1 + i] = seed[i] ^ seed_mask[i];
+            }
+            em[21..].copy_from_slice(&masked_db);
+            em
+        };
+
+        let valid_oaep = build_oaep(43 - 17);
+        assert_eq!(unpad_oaep_sha1(&valid_oaep), Ok([0x42u8; 16]));
+
+        let wrong_sep_oaep = build_oaep(43 - 12);
+        assert_eq!(
+            unpad_oaep_sha1(&wrong_sep_oaep),
+            Err(CryptoError::InvalidPadding)
+        );
+    }
+
+    #[test]
+    fn test_crt_q_greater_than_p_recombination_and_bounds() {
+        let p_swapped = BigUint::from_be_bytes(&AIRPORT_EXPRESS_Q_BYTES);
+        let q_swapped = BigUint::from_be_bytes(&AIRPORT_EXPRESS_P_BYTES);
+        let n_big = BigUint::from_be_bytes(&AIRPORT_EXPRESS_N_BYTES);
+
+        // Compute qinv' = P^-1 mod Q via (P - Q)^(Q - 2) mod Q.
+        let qinv_swapped = montgomery_mod_pow(
+            &q_swapped.sub(&p_swapped),
+            &p_swapped.sub(&BigUint::from_u32(2)),
+            &p_swapped,
+        )
+        .expect("inverse mod Q");
+        let qinv_bytes_vec = qinv_swapped.to_be_bytes_padded(128).expect("128 bytes");
+        let mut qinv_bytes = [0u8; 128];
+        qinv_bytes.copy_from_slice(&qinv_bytes_vec);
+
+        let swapped_crt = RsaCrtParams::new(
+            &AIRPORT_EXPRESS_Q_BYTES,
+            &AIRPORT_EXPRESS_P_BYTES,
+            &AIRPORT_EXPRESS_DQ_BYTES,
+            &AIRPORT_EXPRESS_DP_BYTES,
+            &qinv_bytes,
+        )
+        .expect("swapped CRT params valid");
+
+        // m = 30 * p_swapped gives m mod p' = 0 and m mod q' > p'
+        // (m2 - m1 > p').
+        let m = p_swapped.mul(&BigUint::from_u32(30));
+        let c = montgomery_mod_pow(&m, &BigUint::from_u32(65537), &n_big).expect("encrypt");
+        let recovered = swapped_crt.mod_pow_2048(&c).expect("swapped CRT decrypt");
+        assert_eq!(recovered, m.to_be_bytes_padded(256).expect("padded m"));
+
+        // Reject oversized c >= 2^2048 and c >= n.
+        let oversized = BigUint {
+            limbs: vec![1u32; 65],
+        };
+        assert_eq!(
+            swapped_crt.mod_pow_2048(&oversized),
+            Err(CryptoError::CiphertextTooLarge)
+        );
+        assert_eq!(
+            swapped_crt.mod_pow_2048(&n_big),
+            Err(CryptoError::CiphertextTooLarge)
+        );
+
+        // Reject even prime and prime <= 2^1023.
+        let mut even_p = AIRPORT_EXPRESS_P_BYTES;
+        even_p[127] &= 0xFE;
+        assert_eq!(
+            RsaCrtParams::new(
+                &even_p,
+                &AIRPORT_EXPRESS_Q_BYTES,
+                &AIRPORT_EXPRESS_DP_BYTES,
+                &AIRPORT_EXPRESS_DQ_BYTES,
+                &AIRPORT_EXPRESS_QINV_BYTES,
+            ),
+            Err(CryptoError::InvalidModulus)
+        );
+
+        let mut small_p = AIRPORT_EXPRESS_P_BYTES;
+        small_p[0] &= 0x7F;
+        assert_eq!(
+            RsaCrtParams::new(
+                &small_p,
+                &AIRPORT_EXPRESS_Q_BYTES,
+                &AIRPORT_EXPRESS_DP_BYTES,
+                &AIRPORT_EXPRESS_DQ_BYTES,
+                &AIRPORT_EXPRESS_QINV_BYTES,
+            ),
+            Err(CryptoError::InvalidModulus)
+        );
+    }
+
+    #[test]
+    fn test_crt_fault_attack_detection_and_redacted_debug() {
+        use alloc::format;
+        use alloc::string::ToString;
+
+        let mut key = airport_express_key();
+        assert!(key.has_crt());
+
+        let dbg_key = format!("{:?}", key);
+        assert!(dbg_key.contains("[REDACTED]"));
+        assert!(!dbg_key.contains(&key.d.limbs[0].to_string()));
+        let crt_ref = key.crt.as_ref().expect("has crt");
+        let dbg_crt = format!("{:?}", crt_ref);
+        assert!(dbg_crt.contains("[REDACTED]"));
+        assert!(!dbg_crt.contains(&crt_ref.p[0].to_string()));
+
+        let mut ct = [0u8; 256];
+        ct[255] = 42;
+        let c = BigUint::from_be_bytes(&ct);
+
+        // Single-bit fault in dp must be caught by m^e mod n == c.
+        let mut faulty_dp_crt = key.crt.as_ref().expect("has crt").as_ref().clone();
+        faulty_dp_crt.dp[0] ^= 1;
+        assert_eq!(
+            faulty_dp_crt.mod_pow_2048(&c),
+            Err(CryptoError::FaultDetected)
+        );
+
+        // Recombination fault must be caught even without public exponent e.
+        let mut faulty_qinv_crt = key
+            .crt
+            .as_ref()
+            .expect("has crt")
+            .as_ref()
+            .clone()
+            .without_public_exponent();
+        faulty_qinv_crt.qinv_mont_p[0] ^= 1;
+        assert_eq!(
+            faulty_qinv_crt.mod_pow_2048(&c),
+            Err(CryptoError::FaultDetected)
+        );
+
+        // Also check RsaPrivateKey::decrypt_raw rejects on CRT fault.
+        key.crt = Some(Box::new(faulty_dp_crt));
+        assert_eq!(key.decrypt_raw(&ct), Err(CryptoError::FaultDetected));
     }
 }

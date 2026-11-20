@@ -10,6 +10,9 @@ on:
       - 'MK5-Rust'
       - 'main'
 
+permissions:
+  contents: read
+
 jobs:
   rust-ci:
     name: Rust CI
@@ -19,10 +22,10 @@ jobs:
         working-directory: rust
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: "1.92.0"
           components: rustfmt, clippy, rust-src
@@ -34,11 +37,23 @@ jobs:
 
       - name: Cargo Clippy
         working-directory: rust
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Cargo Test
         working-directory: rust
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+
+      - name: Cargo Audit
+        working-directory: rust
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit
+
+      - name: Script Lint
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install --quiet ruff
+          ruff check rust/scripts
 
       - name: Script Tests
         working-directory: ${{ github.workspace }}
@@ -57,7 +72,7 @@ jobs:
       XTENSA_ARGS: --target xtensa-esp32-none-elf -Zbuild-std=core,alloc
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Installs the `esp` toolchain (Xtensa rustc fork + xtensa-esp-elf GCC).
       # Every cargo call below uses `+esp`, so `rust/rust-toolchain.toml`
@@ -66,7 +81,7 @@ jobs:
       # token it is an anonymous caller and fails with "rate limit exceeded"
       # when several runs start close together.
       - name: Install Espressif Rust toolchain
-        uses: esp-rs/xtensa-toolchain@v1.5
+        uses: esp-rs/xtensa-toolchain@b989c80ffd4be88d30c09606ee9b449bd0d41958 # v1.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -76,7 +91,7 @@ jobs:
           ldproxy: false
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: rust
 
@@ -85,15 +100,15 @@ jobs:
       # compile for a no_std target. The two firmware binaries pull in every
       # library crate with the features the device actually uses.
       - name: Xtensa Clippy
-        run: cargo +esp clippy -p louder-esp32-app -p cyd-controller-app $XTENSA_ARGS -- -D warnings
+        run: cargo +esp clippy --locked -p louder-esp32-app -p cyd-controller-app $XTENSA_ARGS -- -D warnings
 
       # Both core-1 start paths must compile (see `esp-rtos-core1` in
       # crates/louder-esp32-app/Cargo.toml).
       - name: Check esp-rtos-core1 feature
-        run: cargo +esp check -p louder-esp32-app --features esp-rtos-core1 $XTENSA_ARGS
+        run: cargo +esp check --locked -p louder-esp32-app --features esp-rtos-core1 $XTENSA_ARGS
 
       - name: Build release firmware
-        run: cargo +esp build --release -p louder-esp32-app $XTENSA_ARGS
+        run: cargo +esp build --locked --release -p louder-esp32-app $XTENSA_ARGS
 
       - name: Check memory-section budgets
         run: python3 scripts/check_section_budget.py target/xtensa-esp32-none-elf/release/louder-esp32-app

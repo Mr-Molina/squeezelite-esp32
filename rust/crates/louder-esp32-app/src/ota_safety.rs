@@ -66,6 +66,10 @@ pub const WIFI_NVS_SALT: [u8; 16] = *b"WiFiNVSKey$Secur";
 /// Prefix indicating an encrypted Wi-Fi password in NVS (`network_wifi.c:51`).
 pub const WIFI_ENC_PREFIX: &str = "enc:";
 
+/// Prefix indicating an authenticated v2 encrypted Wi-Fi password in NVS
+/// (`enc2:<nonce_hex><ct_hex><hmac_sha256_hex>`).
+pub const WIFI_ENC2_PREFIX: &str = "enc2:";
+
 /// Required `esp_image_header_t.magic` byte at offset `0x00`
 /// (`ESP_IMAGE_HEADER_MAGIC`).
 pub const ESP_IMAGE_MAGIC_BYTE: u8 = 0xE9;
@@ -130,8 +134,70 @@ pub enum OtaSafetyError {
     CredentialsNotFound,
     /// `otadata` sector read-back after erase did not return all `0xFF` bytes.
     OtadataNotErased(usize),
+    /// `otadata` read-back slice was empty, too short, or unaligned.
+    InvalidOtadataLength(usize),
+    /// Input length violated a bounded cryptographic primitive constraint.
+    InvalidInputLength(usize),
+    /// Credential MAC authentication failed or secret/nonce is invalid.
+    AuthenticationFailed,
     /// Image failed `squeezelite-ota.c` `ota_header_check()` validation.
     InvalidBinaryHeader(&'static str),
+}
+
+/// Overwrites a sensitive byte slice with zeroes using `black_box` and a
+/// sequential compiler fence to inhibit dead-store elimination under
+/// `#![forbid(unsafe_code)]`.
+#[inline(never)]
+pub fn scrub_sensitive_bytes(buf: &mut [u8]) {
+    buf.fill(0);
+    core::hint::black_box(buf);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Stack-allocated secret buffer that scrubs itself with
+/// [`scrub_sensitive_bytes`] on drop (including early `?` returns).
+struct SensitiveBuffer<const N: usize>([u8; N]);
+
+impl<const N: usize> SensitiveBuffer<N> {
+    #[inline]
+    const fn zeroed() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> core::ops::Deref for SensitiveBuffer<N> {
+    type Target = [u8; N];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for SensitiveBuffer<N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> Drop for SensitiveBuffer<N> {
+    fn drop(&mut self) {
+        scrub_sensitive_bytes(&mut self.0);
+    }
+}
+
+fn is_all_zero(bytes: &[u8]) -> bool {
+    let acc = bytes.iter().fold(0u8, |state, &b| state | b);
+    core::hint::black_box(acc) == 0
+}
+
+fn constant_time_eq_32(lhs: &[u8; 32], rhs: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= lhs[i] ^ rhs[i];
+    }
+    core::hint::black_box(diff) == 0
 }
 
 /// Decrypted Wi-Fi Station credentials loaded from NVS (`0x9000`) or
@@ -260,13 +326,11 @@ pub fn esp_crc32_le(initial_crc: u32, buf: &[u8]) -> u32 {
 
 /// Pure-Rust FIPS 180-4 SHA-256 implementation for single-block messages
 /// (`len <= 55` bytes).
-#[must_use]
-pub fn sha256_short(data: &[u8]) -> [u8; 32] {
-    assert!(
-        data.len() <= 55,
-        "sha256_short only supports messages up to 55 bytes"
-    );
-    let mut block = [0u8; 64];
+pub fn sha256_short(data: &[u8]) -> Result<[u8; 32], OtaSafetyError> {
+    if data.len() > 55 {
+        return Err(OtaSafetyError::InvalidInputLength(data.len()));
+    }
+    let mut block = SensitiveBuffer::<64>::zeroed();
     block[..data.len()].copy_from_slice(data);
     block[data.len()] = 0x80;
     let bit_len = (data.len() as u64) * 8;
@@ -326,13 +390,61 @@ pub fn sha256_short(data: &[u8]) -> [u8; 32] {
     for (i, word) in state.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
+
+    w.fill(0);
+    core::hint::black_box(&mut w);
+    state.fill(0);
+    core::hint::black_box(&mut state);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    Ok(out)
+}
+
+/// Computes RFC 2104 HMAC-SHA256 over `parts` and scrubs all internal state.
+fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut key_block = SensitiveBuffer::<64>::zeroed();
+    if key.len() > 64 {
+        let mut hasher = Sha256Incremental::new();
+        hasher.update(key);
+        let mut hashed = SensitiveBuffer::<32>::zeroed();
+        *hashed = hasher.finalize();
+        hasher.scrub();
+        key_block[..32].copy_from_slice(&*hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = SensitiveBuffer::<64>::zeroed();
+    let mut opad = SensitiveBuffer::<64>::zeroed();
+    for i in 0..64 {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+
+    let mut inner = Sha256Incremental::new();
+    inner.update(&*ipad);
+    for &part in parts {
+        inner.update(part);
+    }
+    let mut inner_hash = SensitiveBuffer::<32>::zeroed();
+    *inner_hash = inner.finalize();
+    inner.scrub();
+
+    let mut outer = Sha256Incremental::new();
+    outer.update(&*opad);
+    outer.update(&*inner_hash);
+    let out = outer.finalize();
+    outer.scrub();
     out
 }
 
 /// Verifies that a read-back slice from `otadata` (`0xD000` and `0xE000`) is
-/// completely `0xFF`, proving the ESP-IDF 2nd-stage bootloader will boot
-/// `Factory` (`recovery` at `0x10000`) on reset.
+/// at least one 32-byte `esp_ota_select_entry_t` record (`len >= 32`,
+/// 32-byte aligned) and completely `0xFF`, proving the ESP-IDF 2nd-stage
+/// bootloader will boot `Factory` (`recovery` at `0x10000`) on reset.
 pub fn verify_otadata_erased(bytes: &[u8]) -> Result<(), OtaSafetyError> {
+    if bytes.len() < 32 || !bytes.len().is_multiple_of(32) {
+        return Err(OtaSafetyError::InvalidOtadataLength(bytes.len()));
+    }
     for (idx, &b) in bytes.iter().enumerate() {
         if b != 0xFF {
             return Err(OtaSafetyError::OtadataNotErased(idx));
@@ -341,16 +453,30 @@ pub fn verify_otadata_erased(bytes: &[u8]) -> Result<(), OtaSafetyError> {
     Ok(())
 }
 
-/// Derives the 16-byte XOR keystream from `WIFI_NVS_SALT` and the 6-byte Wi-Fi
-/// STA MAC address, matching `derive_key_from_mac()` in
+/// Verifies that a full `otadata` sector read-back (`>= 4096` bytes) is
+/// completely `0xFF`.
+pub fn verify_otadata_sector_erased(bytes: &[u8]) -> Result<(), OtaSafetyError> {
+    if bytes.len() < OTA_FLASH_SECTOR_BYTES as usize || !bytes.len().is_multiple_of(32) {
+        return Err(OtaSafetyError::InvalidOtadataLength(bytes.len()));
+    }
+    verify_otadata_erased(bytes)
+}
+
+/// Derives the legacy 16-byte XOR keystream from `WIFI_NVS_SALT` and the
+/// 6-byte Wi-Fi STA MAC address, matching `derive_key_from_mac()` in
 /// `components/wifi-manager/network_wifi.c:53-70`.
 #[must_use]
 pub fn derive_wifi_nvs_key(sta_mac: &[u8; 6]) -> [u8; 16] {
-    let mut combined = [0u8; 22];
+    let mut combined = SensitiveBuffer::<22>::zeroed();
     combined[0..16].copy_from_slice(&WIFI_NVS_SALT);
     combined[16..22].copy_from_slice(sta_mac);
 
-    let digest = sha256_short(&combined);
+    let mut hasher = Sha256Incremental::new();
+    hasher.update(&*combined);
+    let mut digest = SensitiveBuffer::<32>::zeroed();
+    *digest = hasher.finalize();
+    hasher.scrub();
+
     let mut key = [0u8; 16];
     key.copy_from_slice(&digest[0..16]);
     key
@@ -365,6 +491,29 @@ fn decode_hex_nibble(b: u8) -> Result<u8, OtaSafetyError> {
     }
 }
 
+fn decode_hex_slice(hex_bytes: &[u8], out: &mut [u8]) -> Result<(), OtaSafetyError> {
+    if hex_bytes.len() != out.len() * 2 {
+        return Err(OtaSafetyError::InvalidHexLength(hex_bytes.len()));
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = decode_hex_nibble(hex_bytes[i * 2])?;
+        let lo = decode_hex_nibble(hex_bytes[i * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(())
+}
+
+fn push_hex_bytes<const N: usize>(out: &mut String<N>, bytes: &[u8]) -> Result<(), OtaSafetyError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        out.push(char::from(HEX[(b >> 4) as usize]))
+            .map_err(|_| OtaSafetyError::CredentialStringError)?;
+        out.push(char::from(HEX[(b & 0x0F) as usize]))
+            .map_err(|_| OtaSafetyError::CredentialStringError)?;
+    }
+    Ok(())
+}
+
 fn heapless_string_from_str<const N: usize>(s: &str) -> Result<String<N>, OtaSafetyError> {
     let mut out = String::<N>::new();
     out.push_str(s)
@@ -374,21 +523,25 @@ fn heapless_string_from_str<const N: usize>(s: &str) -> Result<String<N>, OtaSaf
 
 /// Decrypts a Wi-Fi password value from NVS (`network_wifi.c:94-122`).
 ///
-/// If `raw_value` starts with `"enc:"`, hex-decodes the payload and XORs each
-/// byte with `derive_wifi_nvs_key(sta_mac)[i % 16]`. Otherwise, returns
-/// `raw_value` as plaintext.
+/// Preserves legacy `"enc:"` XOR decryption for backward read compatibility.
+/// Rejects `"enc2:"` payloads here because they require
+/// [`decrypt_nvs_wifi_password_v2`] with the device secret.
 pub fn decrypt_nvs_wifi_password(
     raw_value: &str,
     sta_mac: &[u8; 6],
 ) -> Result<String<64>, OtaSafetyError> {
     let trimmed = raw_value.trim_end_matches('\0');
+    if trimmed.starts_with(WIFI_ENC2_PREFIX) {
+        return Err(OtaSafetyError::AuthenticationFailed);
+    }
     if let Some(hex_part) = trimmed.strip_prefix(WIFI_ENC_PREFIX) {
         let hex_bytes = hex_part.as_bytes();
         if hex_bytes.is_empty() || (hex_bytes.len() % 2 != 0) || (hex_bytes.len() / 2 > 64) {
             return Err(OtaSafetyError::InvalidHexLength(hex_bytes.len()));
         }
-        let key = derive_wifi_nvs_key(sta_mac);
-        let mut out_bytes = [0u8; 64];
+        let mut key = SensitiveBuffer::<16>::zeroed();
+        *key = derive_wifi_nvs_key(sta_mac);
+        let mut out_bytes = SensitiveBuffer::<64>::zeroed();
         let out_len = hex_bytes.len() / 2;
         for i in 0..out_len {
             let hi = decode_hex_nibble(hex_bytes[i * 2])?;
@@ -406,6 +559,136 @@ pub fn decrypt_nvs_wifi_password(
         heapless_string_from_str(plain_str)
     } else {
         heapless_string_from_str(trimmed)
+    }
+}
+
+/// Encrypts a Wi-Fi password using authenticated `"enc2:"` format (96-bit
+/// CSPRNG nonce, counter-mode HMAC-SHA256 stream cipher, and Encrypt-then-MAC
+/// HMAC-SHA256 tag bound to `sta_mac` and `device_secret`).
+pub fn encrypt_nvs_wifi_password_v2(
+    plaintext: &str,
+    sta_mac: &[u8; 6],
+    device_secret: &[u8; 32],
+    nonce: &[u8; 12],
+) -> Result<String<256>, OtaSafetyError> {
+    if is_all_zero(device_secret) || is_all_zero(nonce) {
+        return Err(OtaSafetyError::AuthenticationFailed);
+    }
+    let pt_bytes = plaintext.as_bytes();
+    if pt_bytes.len() > 64 || pt_bytes.contains(&0) {
+        return Err(OtaSafetyError::CredentialStringError);
+    }
+
+    let mut enc_key = SensitiveBuffer::<32>::zeroed();
+    *enc_key = hmac_sha256_parts(device_secret, &[b"wifi-nvs-enc2-cipher-v1", sta_mac, nonce]);
+    let mut mac_key = SensitiveBuffer::<32>::zeroed();
+    *mac_key = hmac_sha256_parts(device_secret, &[b"wifi-nvs-enc2-mac-v1", sta_mac, nonce]);
+
+    let mut ct_buf = [0u8; 64];
+    for block_idx in 0..2u32 {
+        let start = (block_idx as usize) * 32;
+        if start >= pt_bytes.len() {
+            break;
+        }
+        let mut ks = SensitiveBuffer::<32>::zeroed();
+        *ks = hmac_sha256_parts(&*enc_key, &[&block_idx.to_le_bytes()]);
+        let end = pt_bytes.len().min(start + 32);
+        for i in start..end {
+            ct_buf[i] = pt_bytes[i] ^ ks[i - start];
+        }
+    }
+
+    let len_le = (pt_bytes.len() as u32).to_le_bytes();
+    let tag = hmac_sha256_parts(
+        &*mac_key,
+        &[
+            WIFI_ENC2_PREFIX.as_bytes(),
+            sta_mac,
+            nonce,
+            &len_le,
+            &ct_buf[..pt_bytes.len()],
+        ],
+    );
+
+    let mut out = String::<256>::new();
+    out.push_str(WIFI_ENC2_PREFIX)
+        .map_err(|_| OtaSafetyError::CredentialStringError)?;
+    push_hex_bytes(&mut out, nonce)?;
+    push_hex_bytes(&mut out, &ct_buf[..pt_bytes.len()])?;
+    push_hex_bytes(&mut out, &tag)?;
+    Ok(out)
+}
+
+/// Decrypts an authenticated `"enc2:"` Wi-Fi password, falling back to legacy
+/// `"enc:"` or plaintext entries via [`decrypt_nvs_wifi_password`].
+pub fn decrypt_nvs_wifi_password_v2(
+    raw_value: &str,
+    sta_mac: &[u8; 6],
+    device_secret: &[u8; 32],
+) -> Result<String<64>, OtaSafetyError> {
+    let trimmed = raw_value.trim_end_matches('\0');
+    if let Some(hex_part) = trimmed.strip_prefix(WIFI_ENC2_PREFIX) {
+        if is_all_zero(device_secret) {
+            return Err(OtaSafetyError::AuthenticationFailed);
+        }
+        let hex_bytes = hex_part.as_bytes();
+        // Format: 12-byte nonce + 0..=64-byte ciphertext + 32-byte tag.
+        if hex_bytes.len() % 2 != 0 || hex_bytes.len() < 88 || hex_bytes.len() > 216 {
+            return Err(OtaSafetyError::InvalidHexLength(hex_bytes.len()));
+        }
+        let total_bytes = hex_bytes.len() / 2;
+        let ct_len = total_bytes - 44;
+
+        let mut nonce = [0u8; 12];
+        let mut ct_buf = [0u8; 64];
+        let mut tag = [0u8; 32];
+        decode_hex_slice(&hex_bytes[..24], &mut nonce)?;
+        decode_hex_slice(&hex_bytes[24..24 + ct_len * 2], &mut ct_buf[..ct_len])?;
+        decode_hex_slice(&hex_bytes[24 + ct_len * 2..], &mut tag)?;
+
+        let mut mac_key = SensitiveBuffer::<32>::zeroed();
+        *mac_key = hmac_sha256_parts(device_secret, &[b"wifi-nvs-enc2-mac-v1", sta_mac, &nonce]);
+        let len_le = (ct_len as u32).to_le_bytes();
+        let expected_tag = hmac_sha256_parts(
+            &*mac_key,
+            &[
+                WIFI_ENC2_PREFIX.as_bytes(),
+                sta_mac,
+                &nonce,
+                &len_le,
+                &ct_buf[..ct_len],
+            ],
+        );
+        if !constant_time_eq_32(&expected_tag, &tag) {
+            return Err(OtaSafetyError::AuthenticationFailed);
+        }
+
+        let mut enc_key = SensitiveBuffer::<32>::zeroed();
+        *enc_key = hmac_sha256_parts(
+            device_secret,
+            &[b"wifi-nvs-enc2-cipher-v1", sta_mac, &nonce],
+        );
+        let mut plain_buf = SensitiveBuffer::<64>::zeroed();
+        for block_idx in 0..2u32 {
+            let start = (block_idx as usize) * 32;
+            if start >= ct_len {
+                break;
+            }
+            let mut ks = SensitiveBuffer::<32>::zeroed();
+            *ks = hmac_sha256_parts(&*enc_key, &[&block_idx.to_le_bytes()]);
+            let end = ct_len.min(start + 32);
+            for i in start..end {
+                plain_buf[i] = ct_buf[i] ^ ks[i - start];
+            }
+        }
+        if plain_buf[..ct_len].contains(&0) {
+            return Err(OtaSafetyError::CredentialStringError);
+        }
+        let plain_str = core::str::from_utf8(&plain_buf[..ct_len])
+            .map_err(|_| OtaSafetyError::CredentialStringError)?;
+        heapless_string_from_str(plain_str)
+    } else {
+        decrypt_nvs_wifi_password(trimmed, sta_mac)
     }
 }
 
@@ -925,6 +1208,18 @@ impl Sha256Incremental {
         state[5] = state[5].wrapping_add(f);
         state[6] = state[6].wrapping_add(g);
         state[7] = state[7].wrapping_add(h);
+
+        w.fill(0);
+        core::hint::black_box(&mut w);
+    }
+
+    /// Scrubs all internal SHA-256 chaining state and partial block buffer.
+    fn scrub(&mut self) {
+        self.state.fill(0);
+        core::hint::black_box(&mut self.state);
+        scrub_sensitive_bytes(&mut self.buf);
+        self.buf_len = 0;
+        self.total_bytes = 0;
     }
 
     /// Feeds a slice of bytes into the running SHA-256 computation.
@@ -966,6 +1261,9 @@ impl Sha256Incremental {
         for (i, word) in state.iter().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
         }
+        scrub_sensitive_bytes(&mut block);
+        state.fill(0);
+        core::hint::black_box(&mut state);
         out
     }
 }
@@ -974,7 +1272,8 @@ impl Sha256Incremental {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OtaStreamState {
-    /// Accumulating the initial 288-byte header before verifying `esp_app_desc_t`.
+    /// Accumulating the initial 288-byte header before verifying
+    /// `esp_app_desc_t`.
     AwaitingHeader,
     /// Header verified; actively streaming chunks into `ota_0` (`0x160000`).
     Streaming {
@@ -1096,14 +1395,15 @@ impl OtaStreamAssembler {
         &self.header_buf
     }
 
-    /// For a chunk that just crossed the 288-byte header boundary (or any chunk),
-    /// provides the byte slices that must be written to flash for this operation.
+    /// For a chunk that just crossed the 288-byte header boundary (or any
+    /// chunk), provides the byte slices that must be written to flash for this
+    /// operation.
     ///
-    /// When multi-chunk OTA headers (<288 B per chunk) cross the 288-byte boundary,
-    /// the first slice is the complete 288-byte `header_buf` and the second slice
-    /// is any trailing bytes from `chunk`.
+    /// When multi-chunk OTA headers (<288 B per chunk) cross the 288-byte
+    /// boundary, the first slice is the complete 288-byte `header_buf` and the
+    /// second slice is any trailing bytes from `chunk`.
     #[must_use]
-    pub fn get_flash_write_slices<'a>(
+    pub fn flash_write_slices<'a>(
         &'a self,
         chunk: &'a [u8],
         op: &OtaFlashWriteOp,
@@ -1111,27 +1411,41 @@ impl OtaStreamAssembler {
         if op.bytes_written == 0 {
             (&[], &[])
         } else if op.flash_offset == OTA_0_PARTITION_OFFSET && op.bytes_written > chunk.len() {
-            let tail_len = op.bytes_written - OTA_MIN_HEADER_BYTES;
-            let tail_start = chunk.len().saturating_sub(tail_len);
-            (&self.header_buf, &chunk[tail_start..])
+            if let Some(tail_len) = op.bytes_written.checked_sub(OTA_MIN_HEADER_BYTES) {
+                let bounded_tail = tail_len.min(chunk.len());
+                let tail_start = chunk.len() - bounded_tail;
+                (&self.header_buf, &chunk[tail_start..])
+            } else {
+                (&[], &[])
+            }
         } else {
-            (&[], chunk)
+            let bounded_len = op.bytes_written.min(chunk.len());
+            (&[], &chunk[..bounded_len])
         }
     }
 
-    /// Returns the byte slices that must be written to flash for this operation.
-    #[must_use]
-    pub fn flash_write_slices<'a>(
-        &'a self,
-        chunk: &'a [u8],
-        op: &OtaFlashWriteOp,
-    ) -> (&'a [u8], &'a [u8]) {
-        self.get_flash_write_slices(chunk, op)
+    fn verify_ota0_write_range(offset: u32, len: usize) -> Result<u32, OtaSafetyError> {
+        verify_flash_offset_aligned(offset)?;
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            OtaSafetyError::InvalidBinaryHeader("flash write slice exceeds u32 range")
+        })?;
+        let end = offset
+            .checked_add(len_u32)
+            .ok_or(OtaSafetyError::InvalidBinaryHeader(
+                "flash write offset overflow",
+            ))?;
+        let ota0_end = OTA_0_PARTITION_OFFSET + OTA_0_PARTITION_SIZE;
+        if offset < OTA_0_PARTITION_OFFSET || end > ota0_end {
+            return Err(OtaSafetyError::InvalidBinaryHeader(
+                "flash write falls outside ota_0 partition (0x160000..0x3F0000)",
+            ));
+        }
+        Ok(end)
     }
 
-    /// Writes the payload of this operation to flash via a closure, ensuring that
-    /// when multi-chunk headers cross the 288-byte boundary, the full 288-byte
-    /// `header_buf` plus trailing chunk bytes are written.
+    /// Writes the payload of this operation to flash via a closure, ensuring
+    /// that when multi-chunk headers cross the 288-byte boundary, the full
+    /// 288-byte `header_buf` plus trailing chunk bytes are written.
     pub fn write_chunk_to_flash<F>(
         &self,
         chunk: &[u8],
@@ -1141,21 +1455,33 @@ impl OtaStreamAssembler {
     where
         F: FnMut(u32, &[u8]),
     {
-        let (slice1, slice2) = self.get_flash_write_slices(chunk, op);
-        let mut cur_offset = op.flash_offset;
+        if op.bytes_written == 0 {
+            return Ok(());
+        }
+        let (slice1, slice2) = self.flash_write_slices(chunk, op);
+        if slice1.is_empty() && slice2.is_empty() {
+            return Err(OtaSafetyError::InvalidBinaryHeader(
+                "inconsistent OTA flash write operation",
+            ));
+        }
+        let mut next_offset = op.flash_offset;
         if !slice1.is_empty() {
-            verify_flash_offset_aligned(cur_offset)?;
-            write_flash(cur_offset, slice1);
-            cur_offset = cur_offset.saturating_add(slice1.len() as u32);
+            next_offset = Self::verify_ota0_write_range(op.flash_offset, slice1.len())?;
         }
         if !slice2.is_empty() {
-            verify_flash_offset_aligned(cur_offset)?;
-            write_flash(cur_offset, slice2);
+            let _ = Self::verify_ota0_write_range(next_offset, slice2.len())?;
+        }
+        if !slice1.is_empty() {
+            write_flash(op.flash_offset, slice1);
+        }
+        if !slice2.is_empty() {
+            write_flash(next_offset, slice2);
         }
         Ok(())
     }
 
-    /// Updates running hasher and rolling 32-byte tail window for appended SHA-256.
+    /// Updates running hasher and rolling 32-byte tail window for appended
+    /// SHA-256.
     fn update_hashers(&mut self, chunk: &[u8]) {
         self.hasher.update(chunk);
         let mut data = chunk;
@@ -1274,9 +1600,9 @@ impl OtaStreamAssembler {
                 }
             }
 
-            // Header is verified. Commit chunk to hasher, update total received bytes,
-            // and emit initial sector 0 erase and write operation covering all buffered
-            // bytes plus the remainder of this chunk.
+            // Header is verified. Commit chunk to hasher, update total received
+            // bytes, and emit initial sector 0 erase and write operation
+            // covering all buffered bytes plus the remainder of this chunk.
             self.update_hashers(chunk);
             self.bytes_received = new_total;
 
@@ -1418,14 +1744,23 @@ impl Default for CrashCounterPolicy {
 }
 
 impl CrashCounterPolicy {
+    const fn clamp_threshold(threshold: u32) -> u32 {
+        if threshold == 0 {
+            1
+        } else if threshold > 0xFFFF {
+            0xFFFF
+        } else {
+            threshold
+        }
+    }
+
     /// Creates a new [`CrashCounterPolicy`] with the given `threshold`
-    /// (clamped to `>= 1`).
+    /// (clamped to `1..=0xFFFF`).
     #[must_use]
     pub const fn new(threshold: u32) -> Self {
-        let clamped = if threshold == 0 { 1 } else { threshold };
         Self {
             crash_count: 0,
-            threshold: clamped,
+            threshold: Self::clamp_threshold(threshold),
             stable_uptime_cleared: false,
         }
     }
@@ -1435,7 +1770,6 @@ impl CrashCounterPolicy {
     /// [`CRASH_COUNTER_RTC_MAGIC`], initializes `crash_count` to `0`.
     #[must_use]
     pub const fn from_rtc_word(raw_word: u32, threshold: u32) -> Self {
-        let clamped = if threshold == 0 { 1 } else { threshold };
         let count = if (raw_word & 0xFFFF_0000) == CRASH_COUNTER_RTC_MAGIC {
             raw_word & 0x0000_FFFF
         } else {
@@ -1443,7 +1777,7 @@ impl CrashCounterPolicy {
         };
         Self {
             crash_count: count,
-            threshold: clamped,
+            threshold: Self::clamp_threshold(threshold),
             stable_uptime_cleared: false,
         }
     }
@@ -1452,7 +1786,12 @@ impl CrashCounterPolicy {
     /// prefixed with [`CRASH_COUNTER_RTC_MAGIC`].
     #[must_use]
     pub const fn to_rtc_word(&self) -> u32 {
-        CRASH_COUNTER_RTC_MAGIC | (self.crash_count & 0x0000_FFFF)
+        let capped = if self.crash_count > 0xFFFF {
+            0xFFFF
+        } else {
+            self.crash_count
+        };
+        CRASH_COUNTER_RTC_MAGIC | capped
     }
 
     /// Current consecutive crash count.
@@ -1473,10 +1812,10 @@ impl CrashCounterPolicy {
         self.crash_count >= self.threshold
     }
 
-    /// Increments the boot attempt counter and returns whether to boot
-    /// normally or enter guided recovery.
+    /// Increments the boot attempt counter (saturating at `0xFFFF`) and
+    /// returns whether to boot normally or enter guided recovery.
     pub fn record_boot_attempt(&mut self) -> BootRouteDecision {
-        self.crash_count = self.crash_count.saturating_add(1);
+        self.crash_count = self.crash_count.saturating_add(1).min(0xFFFF);
         self.stable_uptime_cleared = false;
         if self.crash_count >= self.threshold {
             BootRouteDecision::EnterGuidedRecovery {
@@ -1510,7 +1849,8 @@ impl CrashCounterPolicy {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryModeState {
-    /// Waiting in recovery mode for an HTTP firmware upload or URL fetch command.
+    /// Waiting in recovery mode for an HTTP firmware upload or URL fetch
+    /// command.
     IdleWaitingForAction,
     /// Actively fetching an OTA image from an HTTP/HTTPS URL.
     FetchingFromUrl {
@@ -1535,60 +1875,207 @@ pub enum RecoveryModeState {
     Failed(OtaSafetyError),
 }
 
-/// Checks whether an extracted hostname or IPv4 address belongs to a local LAN
-/// (RFC1918, link-local, loopback).
-#[must_use]
-pub fn is_local_lan_host(host: &str) -> bool {
-    if host.starts_with("192.168.")
-        || host.starts_with("10.")
-        || host.starts_with("169.254.")
-        || host.starts_with("127.")
-        || host == "localhost"
-    {
-        return true;
-    }
-    if let Some(rest) = host.strip_prefix("172.") {
-        if let Some(dot_pos) = rest.find('.') {
-            if let Ok(second_octet) = rest[..dot_pos].parse::<u8>() {
-                if (16..=31).contains(&second_octet) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+fn is_local_ipv4(v4: core::net::Ipv4Addr) -> bool {
+    v4.is_private() || v4.is_loopback() || v4.is_link_local()
 }
 
-/// Derives a 768-bit (96-byte) Diffie-Hellman private key from device MAC
-/// and boot count using SplitMix64 and FNV-1a nonlinear permutation across
-/// all 96 bytes.
+fn is_local_ipv6(v6: core::net::Ipv6Addr) -> bool {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_local_ipv4(mapped);
+    }
+    let seg0 = v6.segments()[0];
+    let is_ula = (seg0 & 0xFE00) == 0xFC00;
+    let is_link_local = (seg0 & 0xFFC0) == 0xFE80;
+    v6.is_loopback() || is_link_local || is_ula
+}
+
+fn ends_with_ascii_ci_label(host: &str, suffix: &str) -> bool {
+    if host.len() <= suffix.len() {
+        return false;
+    }
+    let split = host.len() - suffix.len();
+    let prefix = &host[..split];
+    !prefix.is_empty() && !prefix.ends_with('.') && host[split..].eq_ignore_ascii_case(suffix)
+}
+
+/// Extracts the bare host (without brackets or `:port`) from an HTTP `Host`
+/// or URL authority string, returning `None` if malformed.
 #[must_use]
-pub fn derive_zeroconf_dh_private_key(mac: &[u8; 6], boot_count: u32) -> [u8; 96] {
-    let mut key = [0u8; 96];
-    let mut state: u64 = 0xcbf29ce484222325;
-    for &b in mac {
-        state ^= b as u64;
-        state = state.wrapping_mul(0x100000001b3);
+pub fn strip_host_port(authority: &str) -> Option<&str> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty()
+        || trimmed.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'@' | b'/' | b'?' | b'#')
+        })
+    {
+        return None;
     }
-    state ^= boot_count as u64;
-    state = state.wrapping_mul(0x100000001b3);
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let end_bracket = rest.find(']')?;
+        let inner = &rest[..end_bracket];
+        if inner.is_empty() {
+            return None;
+        }
+        let suffix = &rest[end_bracket + 1..];
+        if !suffix.is_empty() {
+            let port_str = suffix.strip_prefix(':')?;
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return None;
+            }
+        }
+        return Some(inner);
+    }
+    if trimmed.contains('[') || trimmed.contains(']') {
+        return None;
+    }
+    let colon_count = trimmed.bytes().filter(|&b| b == b':').count();
+    if colon_count == 1 {
+        let (h, port_str) = trimmed.split_once(':')?;
+        if h.is_empty() || port_str.is_empty() || port_str.parse::<u16>().is_err() {
+            return None;
+        }
+        Some(h)
+    } else if colon_count == 0 {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
 
-    for chunk in key.chunks_mut(8) {
-        state = state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        let val = z ^ (z >> 31);
-        let bytes = val.to_le_bytes();
-        let len = chunk.len().min(bytes.len());
-        chunk[..len].copy_from_slice(&bytes[..len]);
+/// Checks whether a hostname or IP literal (with optional brackets/port)
+/// belongs to a local LAN (RFC 1918, IPv4/IPv6 loopback, link-local, ULA,
+/// IPv4-mapped local, or `localhost`/`.local`/`.lan`/`.home.arpa`).
+#[must_use]
+pub fn is_local_lan_host(host: &str) -> bool {
+    if host.is_empty()
+        || host.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'@' | b'/' | b'?' | b'#')
+        })
+    {
+        return false;
     }
 
-    // Clamp bits so it is non-zero and has valid DH private key format
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        let Some(end_bracket) = rest.find(']') else {
+            return false;
+        };
+        let inner = &rest[..end_bracket];
+        let suffix = &rest[end_bracket + 1..];
+        if !suffix.is_empty() {
+            let Some(port_str) = suffix.strip_prefix(':') else {
+                return false;
+            };
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return false;
+            }
+        }
+        return inner
+            .parse::<core::net::Ipv6Addr>()
+            .is_ok_and(is_local_ipv6);
+    } else if host.contains('[') || host.contains(']') {
+        return false;
+    } else {
+        let colon_count = host.bytes().filter(|&b| b == b':').count();
+        if colon_count == 1 {
+            let Some((h, port_str)) = host.split_once(':') else {
+                return false;
+            };
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return false;
+            }
+            h
+        } else {
+            host
+        }
+    };
+
+    if let Ok(ip) = bare.parse::<core::net::IpAddr>() {
+        return match ip {
+            core::net::IpAddr::V4(v4) => is_local_ipv4(v4),
+            core::net::IpAddr::V6(v6) => is_local_ipv6(v6),
+        };
+    }
+
+    let label = bare.strip_suffix('.').unwrap_or(bare);
+    if label.is_empty()
+        || label.starts_with('.')
+        || label.contains("..")
+        || !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return false;
+    }
+
+    let is_single_label_lan = !label.contains('.')
+        && (1..=63).contains(&label.len())
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.bytes().any(|b| b.is_ascii_alphabetic());
+
+    is_single_label_lan
+        || label.eq_ignore_ascii_case("localhost")
+        || ends_with_ascii_ci_label(label, ".localhost")
+        || ends_with_ascii_ci_label(label, ".local")
+        || ends_with_ascii_ci_label(label, ".lan")
+        || ends_with_ascii_ci_label(label, ".home")
+        || ends_with_ascii_ci_label(label, ".home.arpa")
+        || ends_with_ascii_ci_label(label, ".internal")
+}
+
+/// Derives a 768-bit (96-byte) ephemeral Diffie-Hellman private key using
+/// RFC 5869 HKDF-SHA256 seeded with hardware CSPRNG entropy (`>= 32` non-zero
+/// bytes), device `mac`, and `boot_count`.
+///
+/// Callers should scrub the returned key buffer with [`scrub_sensitive_bytes`]
+/// after completing the DH key exchange.
+pub fn derive_zeroconf_dh_private_key(
+    trng_entropy: &[u8],
+    mac: &[u8; 6],
+    boot_count: u32,
+) -> Result<[u8; 96], OtaSafetyError> {
+    if trng_entropy.len() < 32 || is_all_zero(trng_entropy) {
+        return Err(OtaSafetyError::InvalidInputLength(trng_entropy.len()));
+    }
+
+    let mut salt = [0u8; 10];
+    salt[..6].copy_from_slice(mac);
+    salt[6..10].copy_from_slice(&boot_count.to_le_bytes());
+
+    // HKDF-Extract: PRK = HMAC-SHA256(salt = mac || boot_count, IKM = entropy).
+    let mut prk = SensitiveBuffer::<32>::zeroed();
+    *prk = hmac_sha256_parts(&salt, &[trng_entropy]);
+
+    // HKDF-Expand: T(1) || T(2) || T(3) -> 96 bytes.
+    const INFO: &[u8] = b"squeezelite-zeroconf-dh-768-v1";
+    let mut key = SensitiveBuffer::<96>::zeroed();
+    let mut t_prev = SensitiveBuffer::<32>::zeroed();
+    for counter in 1u8..=3u8 {
+        let prev_slice: &[u8] = if counter == 1 { &[] } else { &*t_prev };
+        *t_prev = hmac_sha256_parts(&*prk, &[prev_slice, INFO, &[counter]]);
+        let start = usize::from(counter - 1) * 32;
+        key[start..start + 32].copy_from_slice(&*t_prev);
+    }
+
+    // Clamp bits so it is non-zero and has valid DH private key format.
     key[0] |= 0x01;
     key[95] &= 0x7F;
     key[95] |= 0x40;
-    key
+    Ok(*key)
+}
+
+/// Convenience wrapper accepting a fixed 32-byte hardware TRNG seed for
+/// [`derive_zeroconf_dh_private_key`].
+pub fn derive_zeroconf_dh_private_key_from_entropy(
+    trng_entropy: &[u8; 32],
+    mac: &[u8; 6],
+    boot_count: u32,
+) -> Result<[u8; 96], OtaSafetyError> {
+    derive_zeroconf_dh_private_key(trng_entropy, mac, boot_count)
 }
 
 /// Type alias aligning guided recovery coordinator with OTA updater interface.
@@ -1604,7 +2091,8 @@ pub struct RecoveryCoordinator {
 }
 
 impl RecoveryCoordinator {
-    /// Creates a new [`RecoveryCoordinator`] with the given [`CrashCounterPolicy`].
+    /// Creates a new [`RecoveryCoordinator`] with the given
+    /// [`CrashCounterPolicy`].
     #[must_use]
     pub fn new(crash_policy: CrashCounterPolicy) -> Self {
         let assembler = OtaStreamAssembler {
@@ -1655,15 +2143,22 @@ impl RecoveryCoordinator {
         url: &str,
         expected_size: Option<usize>,
     ) -> Result<(), OtaSafetyError> {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        let is_http = url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+        let is_https = url
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+        if !(is_http || is_https) {
             let err = OtaSafetyError::InvalidBinaryHeader("OTA URL must start with http(s)://");
             self.state = RecoveryModeState::Failed(err.clone());
             return Err(err);
         }
-        if let Some(host_part) = url.strip_prefix("http://") {
-            let host_end = host_part.find(&['/', ':'][..]).unwrap_or(host_part.len());
-            let host = &host_part[..host_end];
-            if !is_local_lan_host(host) {
+        if is_http {
+            let host_part = &url[7..];
+            let auth_end = host_part.find(['/', '?', '#']).unwrap_or(host_part.len());
+            let authority = &host_part[..auth_end];
+            if !is_local_lan_host(authority) {
                 let err = OtaSafetyError::InvalidBinaryHeader(
                     "http:// OTA only permitted for local LAN hosts; use https://",
                 );
@@ -1718,7 +2213,8 @@ impl RecoveryCoordinator {
         }
     }
 
-    /// Feeds a chunk into the OTA session and writes to flash via `write_flash`.
+    /// Feeds a chunk into the OTA session and writes to flash via
+    /// `write_flash`.
     pub fn feed_ota_chunk_and_write<F>(
         &mut self,
         chunk: &[u8],
@@ -1825,7 +2321,7 @@ mod tests {
 
     #[test]
     fn sha256_short_matches_fips_180_4_test_vectors() {
-        let empty = sha256_short(b"");
+        let empty = sha256_short(b"").expect("empty sha256");
         assert_eq!(
             empty,
             [
@@ -1834,7 +2330,7 @@ mod tests {
                 0x78, 0x52, 0xb8, 0x55
             ]
         );
-        let abc = sha256_short(b"abc");
+        let abc = sha256_short(b"abc").expect("abc sha256");
         assert_eq!(
             abc,
             [
@@ -1842,6 +2338,10 @@ mod tests {
                 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
                 0xf2, 0x00, 0x15, 0xad
             ]
+        );
+        assert_eq!(
+            sha256_short(&[0u8; 56]),
+            Err(OtaSafetyError::InvalidInputLength(56))
         );
     }
 
@@ -2112,7 +2612,8 @@ mod tests {
         assert_eq!(op2.new_sectors_to_erase, 1);
         assert!(matches!(asm.state(), OtaStreamState::Streaming { .. }));
 
-        // Remaining 4200 bytes (total 4500 > 4096): crosses into sector 1 (0x161000)
+        // Remaining 4200 bytes (total 4500 > 4096): crosses into sector 1
+        // (0x161000).
         let op3 = asm.ingest_chunk(&image[300..]).expect("chunk 3");
         assert_eq!(op3.flash_offset, OTA_0_PARTITION_OFFSET + 300);
         assert_eq!(op3.bytes_written, 4200);
@@ -2144,7 +2645,8 @@ mod tests {
         assert_eq!(op1.new_sectors_to_erase, 0);
         assert_eq!(asm.state(), &OtaStreamState::AwaitingHeader);
 
-        // Feed second chunk completing 288 bytes with invalid magic byte/app desc
+        // Feed second chunk completing 288 bytes with invalid magic byte /
+        // app desc.
         let garbage2 = [0xAAu8; 200];
         let err = asm
             .ingest_chunk(&garbage2)
@@ -2219,7 +2721,7 @@ mod tests {
             .copy_from_slice(REQUIRED_OTA_PROJECT_NAME.as_bytes());
 
         let mut asm = OtaStreamAssembler::new(Some(img.len())).expect("asm");
-        // Three chunks of 100, 100, and 200 bytes (< 288 bytes per initial chunk)
+        // Three chunks of 100, 100, and 200 bytes (< 288 B per initial chunk).
         let op1 = asm.ingest_chunk(&img[0..100]).expect("chunk 1");
         assert_eq!(op1.bytes_written, 0);
 
@@ -2233,7 +2735,7 @@ mod tests {
 
         assert_eq!(asm.header_buf(), &img[0..288]);
 
-        let (slice1, slice2) = asm.get_flash_write_slices(&img[200..400], &op3);
+        let (slice1, slice2) = asm.flash_write_slices(&img[200..400], &op3);
         assert_eq!(slice1.len(), 288);
         assert_eq!(slice1, &img[0..288]);
         assert_eq!(slice2.len(), 112);
@@ -2291,5 +2793,314 @@ mod tests {
         assert!(!is_flash_word_aligned(0x0016_0003));
         assert!(verify_flash_offset_aligned(0x0016_0000).is_ok());
         assert!(verify_flash_offset_aligned(0x0016_0001).is_err());
+    }
+
+    #[test]
+    fn test_logic_001_verify_otadata_erased_rejects_empty_and_short_slices() {
+        assert_eq!(
+            verify_otadata_erased(&[]),
+            Err(OtaSafetyError::InvalidOtadataLength(0))
+        );
+        assert_eq!(
+            verify_otadata_erased(&[0xFFu8; 1]),
+            Err(OtaSafetyError::InvalidOtadataLength(1))
+        );
+        assert_eq!(
+            verify_otadata_erased(&[0xFFu8; 31]),
+            Err(OtaSafetyError::InvalidOtadataLength(31))
+        );
+        assert_eq!(
+            verify_otadata_erased(&[0xFFu8; 33]),
+            Err(OtaSafetyError::InvalidOtadataLength(33))
+        );
+        assert_eq!(
+            verify_otadata_erased(&[0xFFu8; 63]),
+            Err(OtaSafetyError::InvalidOtadataLength(63))
+        );
+        assert!(verify_otadata_erased(&[0xFFu8; 32]).is_ok());
+        assert!(verify_otadata_erased(&[0xFFu8; 4096]).is_ok());
+        assert_eq!(
+            verify_otadata_sector_erased(&[0xFFu8; 64]),
+            Err(OtaSafetyError::InvalidOtadataLength(64))
+        );
+        assert!(verify_otadata_sector_erased(&[0xFFu8; 4096]).is_ok());
+    }
+
+    #[test]
+    fn test_sec_004_and_logic_008_flash_bounds_and_slice_guards() {
+        let asm = OtaStreamAssembler::new(Some(512)).expect("asm");
+        let buf = [0xABu8; 200];
+
+        // LOGIC-008: bytes_written < 288 at OTA_0 start must not underflow.
+        let underflow_op = OtaFlashWriteOp {
+            flash_offset: OTA_0_PARTITION_OFFSET,
+            bytes_written: 100,
+            first_new_sector_offset: None,
+            new_sectors_to_erase: 0,
+        };
+        assert_eq!(
+            asm.flash_write_slices(&buf[..50], &underflow_op),
+            (&[][..], &[][..])
+        );
+        assert!(asm
+            .write_chunk_to_flash(&buf[..50], &underflow_op, |_, _| {
+                panic!("must not write on inconsistent op");
+            })
+            .is_err());
+
+        // LOGIC-008: normal chunk must be clipped to op.bytes_written.
+        let clipped_op = OtaFlashWriteOp {
+            flash_offset: OTA_0_PARTITION_OFFSET + 512,
+            bytes_written: 64,
+            first_new_sector_offset: None,
+            new_sectors_to_erase: 0,
+        };
+        let (s1, s2) = asm.flash_write_slices(&buf, &clipped_op);
+        assert!(s1.is_empty());
+        assert_eq!(s2.len(), 64);
+
+        // SEC-004: reject below ota_0, at/past ota_0 end, and u32 overflow.
+        let ota0_end = OTA_0_PARTITION_OFFSET + OTA_0_PARTITION_SIZE;
+        for bad_offset in [
+            OTADATA_PARTITION_OFFSET,
+            OTA_0_PARTITION_OFFSET - 4,
+            ota0_end - 16,
+            ota0_end,
+            u32::MAX - 3,
+        ] {
+            let bad_op = OtaFlashWriteOp {
+                flash_offset: bad_offset,
+                bytes_written: 32,
+                first_new_sector_offset: None,
+                new_sectors_to_erase: 0,
+            };
+            assert!(asm
+                .write_chunk_to_flash(&buf[..32], &bad_op, |_, _| {
+                    panic!("out-of-partition write_flash called at {bad_offset:#x}");
+                })
+                .is_err());
+        }
+
+        // Valid write right up to exact end of ota_0 succeeds.
+        let edge_op = OtaFlashWriteOp {
+            flash_offset: ota0_end - 32,
+            bytes_written: 32,
+            first_new_sector_offset: None,
+            new_sectors_to_erase: 0,
+        };
+        let mut wrote = 0usize;
+        asm.write_chunk_to_flash(&buf[..32], &edge_op, |off, data| {
+            assert_eq!(off, ota0_end - 32);
+            wrote += data.len();
+        })
+        .expect("exact partition end write succeeds");
+        assert_eq!(wrote, 32);
+    }
+
+    #[test]
+    fn test_sec_005_and_sec_018_authenticated_enc2_and_zeroization() {
+        let secret = [0x42u8; 32];
+        let nonce_a = [0x11u8; 12];
+        let nonce_b = [0x22u8; 12];
+        let long_pass = "VeryLongPassphraseExceedingSixteenBytesForCtrModeTest!2026";
+
+        let enc_a = encrypt_nvs_wifi_password_v2(long_pass, &FIXTURE_STA_MAC, &secret, &nonce_a)
+            .expect("encrypt v2 a");
+        let enc_b = encrypt_nvs_wifi_password_v2(long_pass, &FIXTURE_STA_MAC, &secret, &nonce_b)
+            .expect("encrypt v2 b");
+        assert!(enc_a.as_str().starts_with(WIFI_ENC2_PREFIX));
+        assert_ne!(enc_a, enc_b);
+
+        let dec = decrypt_nvs_wifi_password_v2(enc_a.as_str(), &FIXTURE_STA_MAC, &secret)
+            .expect("decrypt v2");
+        assert_eq!(dec.as_str(), long_pass);
+
+        // Legacy v1 decryptor must reject enc2: instead of treating it as
+        // plaintext.
+        assert_eq!(
+            decrypt_nvs_wifi_password(enc_a.as_str(), &FIXTURE_STA_MAC),
+            Err(OtaSafetyError::AuthenticationFailed)
+        );
+
+        // Legacy enc: remains readable through v2 helper (Invariant 69).
+        let legacy = encrypt_for_test("LegacyPass!", &FIXTURE_STA_MAC);
+        let dec_legacy = decrypt_nvs_wifi_password_v2(legacy.as_str(), &FIXTURE_STA_MAC, &secret)
+            .expect("legacy fallback");
+        assert_eq!(dec_legacy.as_str(), "LegacyPass!");
+
+        // Wrong MAC or wrong secret fails HMAC authentication.
+        let other_mac = [0xC8, 0x2E, 0x18, 0xBE, 0xB8, 0x35];
+        assert_eq!(
+            decrypt_nvs_wifi_password_v2(enc_a.as_str(), &other_mac, &secret),
+            Err(OtaSafetyError::AuthenticationFailed)
+        );
+        assert_eq!(
+            decrypt_nvs_wifi_password_v2(enc_a.as_str(), &FIXTURE_STA_MAC, &[0x99u8; 32]),
+            Err(OtaSafetyError::AuthenticationFailed)
+        );
+
+        // Tampered ciphertext byte fails authentication.
+        let mut tampered: String<256> = String::new();
+        let bytes = enc_a.as_bytes();
+        for (idx, &b) in bytes.iter().enumerate() {
+            let ch = if idx == bytes.len() - 1 {
+                if b == b'0' {
+                    '1'
+                } else {
+                    '0'
+                }
+            } else {
+                char::from(b)
+            };
+            let _ = tampered.push(ch);
+        }
+        assert_eq!(
+            decrypt_nvs_wifi_password_v2(tampered.as_str(), &FIXTURE_STA_MAC, &secret),
+            Err(OtaSafetyError::AuthenticationFailed)
+        );
+
+        // Zero secret / zero nonce rejected.
+        assert_eq!(
+            encrypt_nvs_wifi_password_v2(long_pass, &FIXTURE_STA_MAC, &[0u8; 32], &nonce_a),
+            Err(OtaSafetyError::AuthenticationFailed)
+        );
+        assert_eq!(
+            encrypt_nvs_wifi_password_v2(long_pass, &FIXTURE_STA_MAC, &secret, &[0u8; 12]),
+            Err(OtaSafetyError::AuthenticationFailed)
+        );
+
+        let mut buf = [0xAAu8; 32];
+        scrub_sensitive_bytes(&mut buf);
+        assert_eq!(buf, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_sec_006_strict_local_lan_host_and_url_checks() {
+        // Rejected public/spoofed/malformed hosts.
+        for bad in [
+            "",
+            "10.attacker.com",
+            "192.168.1.1.evil.com",
+            "127.0.0.1.attacker.com",
+            "172.15.255.254",
+            "172.32.0.1",
+            "0.0.0.0",
+            "::",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+            ".local",
+            ".localhost",
+            "foo..local",
+            "10.0.0.1@evil.com",
+            "localhost:99999",
+            "[127.0.0.1]",
+        ] {
+            assert!(!is_local_lan_host(bad), "expected reject for {bad}");
+        }
+
+        // Accepted RFC1918, loopback, link-local, ULA, IPv4-mapped, local DNS.
+        for good in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.50:8080",
+            "169.254.1.2",
+            "127.0.0.1",
+            "LOCALHOST",
+            "api.LocalHost",
+            "speaker.local",
+            "speaker.LOCAL.",
+            "::1",
+            "[::1]",
+            "[::1]:8080",
+            "fe80::1",
+            "fd12:3456:789a::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.10",
+        ] {
+            assert!(is_local_lan_host(good), "expected accept for {good}");
+        }
+
+        let mut coord = RecoveryCoordinator::new(CrashCounterPolicy::default());
+        assert!(coord
+            .begin_url_ota("http://10.attacker.com/fw.bin", Some(512))
+            .is_err());
+        assert!(coord
+            .begin_url_ota("http://10.0.0.1@evil.com/fw.bin", Some(512))
+            .is_err());
+        assert!(coord
+            .begin_url_ota("http://[::1]:8080/fw.bin", Some(512))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_sec_001_zeroconf_dh_key_requires_non_zero_trng_entropy() {
+        assert_eq!(
+            derive_zeroconf_dh_private_key(&[0u8; 16], &FIXTURE_STA_MAC, 1),
+            Err(OtaSafetyError::InvalidInputLength(16))
+        );
+        assert_eq!(
+            derive_zeroconf_dh_private_key(&[0u8; 32], &FIXTURE_STA_MAC, 1),
+            Err(OtaSafetyError::InvalidInputLength(32))
+        );
+
+        let seed_a = [0xA5u8; 32];
+        let seed_b = [0x5Au8; 32];
+        let key_a = derive_zeroconf_dh_private_key_from_entropy(&seed_a, &FIXTURE_STA_MAC, 1)
+            .expect("key a");
+        let key_b = derive_zeroconf_dh_private_key_from_entropy(&seed_b, &FIXTURE_STA_MAC, 1)
+            .expect("key b");
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a[0] & 0x01, 0x01);
+        assert_eq!(key_a[95] & 0xC0, 0x40);
+    }
+
+    #[test]
+    fn test_logic_009_crash_counter_policy_saturates_16bit_rtc_word() {
+        let p_zero = CrashCounterPolicy::new(0);
+        assert_eq!(p_zero.threshold(), 1);
+        let p_huge = CrashCounterPolicy::new(100_000);
+        assert_eq!(p_huge.threshold(), 0xFFFF);
+
+        let mut policy =
+            CrashCounterPolicy::from_rtc_word(CRASH_COUNTER_RTC_MAGIC | 0xFFFE, 70_000);
+        assert_eq!(policy.threshold(), 0xFFFF);
+        assert_eq!(
+            policy.record_boot_attempt(),
+            BootRouteDecision::EnterGuidedRecovery {
+                crash_count: 0xFFFF
+            }
+        );
+        // Subsequent attempt stays saturated at 0xFFFF instead of wrapping.
+        assert_eq!(
+            policy.record_boot_attempt(),
+            BootRouteDecision::EnterGuidedRecovery {
+                crash_count: 0xFFFF
+            }
+        );
+        let rtc = policy.to_rtc_word();
+        let restored = CrashCounterPolicy::from_rtc_word(rtc, 70_000);
+        assert_eq!(restored.crash_count(), 0xFFFF);
+        assert!(restored.is_recovery_required());
+    }
+
+    #[test]
+    fn test_tdd_fix_b_single_label_lan_hostnames_allowed_and_public_domains_rejected() {
+        assert!(is_local_lan_host("devbench"));
+        assert!(is_local_lan_host("louder-esp32"));
+        assert!(is_local_lan_host("devbench:8000"));
+        assert!(is_local_lan_host("devbench.lan"));
+        assert!(is_local_lan_host("devbench.home.arpa:8080"));
+        assert_eq!(strip_host_port("devbench.lan:8080"), Some("devbench.lan"));
+        assert_eq!(strip_host_port("[::1]:8080"), Some("::1"));
+
+        for rejected in ["evil.com", "sub.example.org", "-bad", "bad-", "12345", "0"] {
+            assert!(
+                !is_local_lan_host(rejected),
+                "expected reject for {rejected}"
+            );
+        }
+        let too_long = "a".repeat(64);
+        assert!(!is_local_lan_host(&too_long));
     }
 }

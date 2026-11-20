@@ -255,33 +255,43 @@ impl DacConfigSpec {
         let mut mute_active_low = false;
 
         for token in spec.split(',') {
-            let Some((k, v)) = token.split_once('=') else {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
                 continue;
-            };
+            }
+            let (k, v) = trimmed.split_once('=')?;
             let key = k.trim();
             let val = v.trim();
+            if key.is_empty() {
+                return None;
+            }
             if key.eq_ignore_ascii_case("model") {
                 model = DacModel::from_name(val)?;
             } else if key.eq_ignore_ascii_case("bck") {
-                bck_pin = parse_i8(val);
+                bck_pin = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("ws") {
-                ws_pin = parse_i8(val);
+                ws_pin = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("do") {
-                do_pin = parse_i8(val);
+                do_pin = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("mck") || key.eq_ignore_ascii_case("mclk") {
-                mclk_pin = parse_i8(val);
+                mclk_pin = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("sda") {
-                sda_pin = parse_i8(val);
+                sda_pin = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("scl") {
-                scl_pin = parse_i8(val);
+                scl_pin = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("i2c") {
-                i2c_addr = parse_i8(val).map(|n| n as u8);
+                let addr = parse_u7(val)?;
+                i2c_addr = Some(addr);
             } else if key.eq_ignore_ascii_case("mute") {
                 if let Some((pin_str, pol_str)) = val.split_once(':') {
-                    mute_pin = parse_i8(pin_str).map(|n| n as u8);
-                    mute_active_low = pol_str.trim() == "0";
+                    mute_pin = parse_optional_gpio_pin(pin_str)?;
+                    mute_active_low = match pol_str.trim() {
+                        "0" => true,
+                        "1" => false,
+                        _ => return None,
+                    };
                 } else {
-                    mute_pin = parse_i8(val).map(|n| n as u8);
+                    mute_pin = parse_optional_gpio_pin(val)?;
                 }
             }
         }
@@ -321,17 +331,22 @@ impl SpdifConfigSpec {
         let mut ws: Option<i8> = None;
         let mut dout: Option<i8> = None;
         for token in spec.split(',') {
-            let Some((k, v)) = token.split_once('=') else {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
                 continue;
-            };
+            }
+            let (k, v) = trimmed.split_once('=')?;
             let key = k.trim();
             let val = v.trim();
+            if key.is_empty() {
+                return None;
+            }
             if key.eq_ignore_ascii_case("bck") {
-                bck = parse_i8(val);
+                bck = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("ws") {
-                ws = parse_i8(val);
+                ws = Some(parse_i8(val)?);
             } else if key.eq_ignore_ascii_case("do") {
-                dout = parse_i8(val);
+                dout = Some(parse_i8(val)?);
             }
         }
         Some(Self {
@@ -339,6 +354,20 @@ impl SpdifConfigSpec {
             ws_pin: ws?,
             do_pin: dout?,
         })
+    }
+}
+
+fn parse_u7(s: &str) -> Option<u8> {
+    let n = parse_i8(s)?;
+    u8::try_from(n).ok()
+}
+
+fn parse_optional_gpio_pin(s: &str) -> Option<Option<u8>> {
+    let n = parse_i8(s)?;
+    if n == -1 {
+        Some(None)
+    } else {
+        u8::try_from(n).ok().map(Some)
     }
 }
 
@@ -541,7 +570,8 @@ impl AudioOutputPolicy {
         }
     }
 
-    /// Applies an LMS `audo` packet payload (`0` = disabled, non-zero = enabled).
+    /// Applies an LMS `audo` packet payload (`0` = disabled, non-zero =
+    /// enabled).
     pub fn handle_audo_packet(&mut self, payload: &[u8]) {
         if let Some(&flag) = payload.first() {
             self.audo_enabled = flag != 0;
@@ -665,5 +695,37 @@ mod tests {
         policy.handle_audo_packet(&[0]);
         assert!(policy.should_mute_speaker(false, false));
         assert!(!policy.mute_gpio_level(false, false));
+    }
+
+    #[test]
+    fn test_dac_config_rejects_negative_and_malformed_tokens() {
+        // Negative i2c addresses and out-of-range values must fail.
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,i2c=-1").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,i2c=200").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,i2c=bad").is_none());
+
+        // C sentinel mute=-1 maps cleanly to None without u8 wrap.
+        let sentinel = DacConfigSpec::parse("bck=26,ws=25,do=22,mute=-1:0").unwrap();
+        assert_eq!(sentinel.mute_pin, None);
+        assert!(sentinel.mute_active_low);
+
+        // Other negative or invalid mute pins/polarities must be rejected.
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,mute=-2").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,mute=200").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,mute=33:invalid").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,mute=33:").is_none());
+
+        let active_high = DacConfigSpec::parse("bck=26,ws=25,do=22,mute=33:1,").unwrap();
+        assert_eq!(active_high.mute_pin, Some(33));
+        assert!(!active_high.mute_active_low);
+
+        // Non-empty tokens without '=' and invalid optional keys must fail.
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,garbage").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,mclk=bad").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,sda=bad").is_none());
+        assert!(DacConfigSpec::parse("bck=26,ws=25,do=22,scl=bad").is_none());
+
+        assert!(SpdifConfigSpec::parse("bck=26,ws=25,do=22,garbage").is_none());
+        assert!(SpdifConfigSpec::parse("bck=26,ws=25,do=22,").is_some());
     }
 }
