@@ -60,7 +60,7 @@ class ReviewFixTests(unittest.TestCase):
     def test_mutation_waits_for_the_guard(self):
         devbench.acquire(self.lock, "feat/a", T0)
         guard = self.lock.with_name(self.lock.name + ".guard")
-        guard.write_text("held by another process")
+        guard.write_text("held by another process", encoding="utf-8")
         with self.assertRaises(devbench.GuardBusy):
             devbench.acquire(self.lock, "feat/b", T0 + timedelta(hours=3), guard_timeout=0.2)
         guard.unlink()
@@ -68,7 +68,10 @@ class ReviewFixTests(unittest.TestCase):
         self.assertFalse(guard.exists())
 
     def test_timestamp_without_offset_is_read_as_utc(self):
-        self.lock.write_text('{"branch": "feat/a", "timestamp": "2026-11-17T12:00:00", "attempts": 0}')
+        self.lock.write_text(
+            '{"branch": "feat/a", "timestamp": "2026-11-17T12:00:00", "attempts": 0}',
+            encoding="utf-8",
+        )
         self.assertEqual(devbench.acquire(self.lock, "feat/b", T0 + timedelta(minutes=5)), "busy")
 
 class OtadataTests(unittest.TestCase):

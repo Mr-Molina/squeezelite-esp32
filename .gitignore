@@ -22,3 +22,6 @@ client_info.h
 scratch/
 .superpowers/
 .agents/backups/
+
+# Python bytecode
+__pycache__/
