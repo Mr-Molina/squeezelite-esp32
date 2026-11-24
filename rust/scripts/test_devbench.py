@@ -1,11 +1,12 @@
 # rust/scripts/test_devbench.py
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
 import devbench
 
-T0 = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
 
 class LockTests(unittest.TestCase):
     def setUp(self):

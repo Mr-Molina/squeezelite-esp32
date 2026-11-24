@@ -34,9 +34,8 @@ import tempfile
 import time
 import zlib
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 # Read from the module with `espflash board-info --port COM13` on 2026-11-17
 # (work order WO-F1-dev-module-bringup).
@@ -160,19 +159,19 @@ def _read(lock_path: Path):
         data = json.loads(text)
         stamp = datetime.fromisoformat(data["timestamp"])
         if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
+            stamp = stamp.replace(tzinfo=UTC)
         return {
             "branch": str(data["branch"]),
             "timestamp": stamp,
             "attempts": max(0, int(data.get("attempts", 0))),
         }
     except (ValueError, KeyError, TypeError):
-        mtime = datetime.fromtimestamp(lock_path.stat().st_mtime, tz=timezone.utc)
+        mtime = datetime.fromtimestamp(lock_path.stat().st_mtime, tz=UTC)
         return {"branch": "<unreadable lock>", "timestamp": mtime, "attempts": 0}
 
 
 def _payload(branch: str, now: datetime, attempts: int) -> str:
-    stamp = now.astimezone(timezone.utc).isoformat()
+    stamp = now.astimezone(UTC).isoformat()
     return json.dumps({"branch": branch, "timestamp": stamp, "attempts": attempts})
 
 
@@ -236,7 +235,7 @@ def holder(lock_path: Path, guard_timeout: float = GUARD_TIMEOUT_S):
 
 
 def record_attempt(
-    lock_path: Path, branch: str = None, guard_timeout: float = GUARD_TIMEOUT_S
+    lock_path: Path, branch: str | None = None, guard_timeout: float = GUARD_TIMEOUT_S
 ) -> int:
     """Count one flash attempt under the current lock and return the count.
 
@@ -300,6 +299,7 @@ def read_board_mac() -> str:
     try:
         proc = subprocess.run(
             ["espflash", "board-info", "--port", PORT, "--non-interactive"],
+            check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -321,7 +321,7 @@ def read_board_mac() -> str:
 
 def cmd_acquire(lock_path: Path, branch: str) -> int:
     with _guard(lock_path, GUARD_TIMEOUT_S):
-        status, previous = _acquire(lock_path, branch, datetime.now(timezone.utc))
+        status, previous = _acquire(lock_path, branch, datetime.now(UTC))
     if status == "busy":
         print(f"BUSY: dev module is held by {previous or 'another agent'}")
         return EXIT_LOCK
@@ -347,7 +347,7 @@ def cmd_check_mac(mac: str) -> int:
     return EXIT_MAC
 
 
-def validate_firmware_image(image: Path) -> Optional[str]:
+def validate_firmware_image(image: Path) -> str | None:
     """Return an error reason if `image` is not a valid ESP32 app binary."""
     if not image.is_file():
         return f"no such image {image}"
@@ -421,6 +421,7 @@ def cmd_flash(lock_path: Path, branch: str, image: Path) -> int:
                 f"{OTA_0_OFFSET:#x}",
                 str(image),
             ],
+            check=False,
             timeout=ESPFLASH_FLASH_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
@@ -463,7 +464,7 @@ def cmd_select_ota0(lock_path: Path, branch: str, no_reset: bool) -> int:
         command += [f"{OTADATA_OFFSET:#x}", str(blob)]
         print(f"select ota_0: {SECTOR} B -> {PORT} @ {OTADATA_OFFSET:#x}")
         try:
-            proc = subprocess.run(command, timeout=ESPFLASH_FLASH_TIMEOUT_S)
+            proc = subprocess.run(command, check=False, timeout=ESPFLASH_FLASH_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             print(f"NOT WRITTEN: espflash write-bin timed out after {ESPFLASH_FLASH_TIMEOUT_S}s")
             return EXIT_FAILED
