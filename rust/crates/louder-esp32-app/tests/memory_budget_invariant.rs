@@ -97,9 +97,11 @@ fn count(src: &str, needle: &str) -> usize {
 fn iram_placements_are_the_allow_list() {
     const MINIMP3_SRC: &str = include_str!("../../nanomp3-core/src/minimp3.rs");
     const EQUALIZER_SRC: &str = include_str!("../../squeezelite-audio-core/src/equalizer.rs");
+    // `service_core1_park_request` (extracted from `app_core_loop` so
+    // `esp-rtos-core1` shares the IRAM park loop during flash erase/write),
     // `app_core_loop`, `psram_send_cmd_spi1`, `init_and_map_psram_4mb`,
     // `output_decode_phase`.
-    assert_eq!(count(MAIN_SRC, "    #[esp_hal::ram]\n"), 4);
+    assert_eq!(count(MAIN_SRC, "    #[esp_hal::ram]\n"), 5);
     // `write_dma`.
     assert_eq!(count(MAIN_SRC, "#[unsafe(link_section = \".iram1\")]"), 1);
     // `process_interleaved_iram`.

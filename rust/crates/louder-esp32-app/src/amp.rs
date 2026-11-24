@@ -140,6 +140,19 @@ pub const fn percent_to_attenuation(percent: u8) -> u8 {
     }
 }
 
+/// Returns `true` when the amplifier should attempt fault recovery:
+/// active playback (`playing_or_external`), a critical amplifier fault,
+/// and at least 30 seconds elapsed since `last_recovery_ms`.
+#[must_use]
+pub fn should_recover_amp_fault(
+    playing_or_external: bool,
+    has_critical_fault: bool,
+    now_ms: u64,
+    last_recovery_ms: u64,
+) -> bool {
+    playing_or_external && has_critical_fault && now_ms.saturating_sub(last_recovery_ms) >= 30_000
+}
+
 /// Dynamic manager for the TAS58xx amplifier.
 pub struct AmpManager<I2C> {
     inner: Option<AmpInner<I2C>>,
@@ -1076,5 +1089,30 @@ mod tests {
         assert!(!amp.is_muted());
 
         i2c.done();
+    }
+
+    #[test]
+    fn test_should_recover_amp_fault_suppresses_early_boot() {
+        assert!(!should_recover_amp_fault(true, true, 29_999, 0));
+        assert!(!should_recover_amp_fault(true, true, 0, 0));
+    }
+
+    #[test]
+    fn test_should_recover_amp_fault_allows_after_cooldown() {
+        assert!(should_recover_amp_fault(true, true, 30_000, 0));
+        assert!(should_recover_amp_fault(true, true, 90_000, 50_000));
+    }
+
+    #[test]
+    fn test_should_recover_amp_fault_suppresses_during_cooldown_after_prior_recovery() {
+        assert!(!should_recover_amp_fault(true, true, 79_999, 50_000));
+        assert!(!should_recover_amp_fault(true, true, 50_000, 50_000));
+    }
+
+    #[test]
+    fn test_should_recover_amp_fault_requires_playback_and_critical_fault() {
+        assert!(!should_recover_amp_fault(false, true, 60_000, 0));
+        assert!(!should_recover_amp_fault(true, false, 60_000, 0));
+        assert!(!should_recover_amp_fault(false, false, 60_000, 0));
     }
 }
