@@ -533,3 +533,10 @@ Library-only (host-tested, never called by the firmware):
 - `display_gds.rs`, `controls.rs`, `dac_platform.rs` (other DACs, S/PDIF),
   `eth_w5500.rs`, `power_boards.rs`, the Telnet server in `console.rs`, and the
   Bluetooth A2DP source in `bt_a2dp.rs`.
+
+---
+
+## 6. What comes next
+
+This list is exhausted apart from `D1`. The follow-on backlog (`P01`-`P30`), with the feature-parity
+audit that produced it, is in [`mk5-rust-parity-audit.md`](mk5-rust-parity-audit.md).
