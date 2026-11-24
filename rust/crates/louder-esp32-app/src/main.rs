@@ -1162,28 +1162,6 @@ mod xtensa_hw {
         }
     }
 
-    struct FirmwareBssBuffers {
-        ring_storage: [u8; 4096],
-        http_rx_buf: [u8; 1024],
-        slim_rx_buf: [u8; 2048],
-        slim_tx_buf: [u8; 2048],
-        audio_rx_buf: [u8; 4096],
-        audio_tx_buf: [u8; 512],
-    }
-
-    impl FirmwareBssBuffers {
-        const fn new() -> Self {
-            Self {
-                ring_storage: [0u8; 4096],
-                http_rx_buf: [0u8; 1024],
-                slim_rx_buf: [0u8; 2048],
-                slim_tx_buf: [0u8; 2048],
-                audio_rx_buf: [0u8; 4096],
-                audio_tx_buf: [0u8; 512],
-            }
-        }
-    }
-
     #[allow(unsafe_code)]
     // JUSTIFICATION: Dedicated execution stack for Core 1 (APP_CPU) in DRAM2.
     // SAFETY: Accessed exclusively by Core 1 runner; stack bounds enforced by
@@ -1195,17 +1173,9 @@ mod xtensa_hw {
     // in DRAM2.
     // SAFETY: Managed as singleton heap storage by single Bluetooth task context.
     #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<[u8; 12 * 1024]> =
-        core::mem::MaybeUninit::uninit();
-    #[allow(unsafe_code)]
-    // JUSTIFICATION: Static allocation for Bluetooth A2DP sink state machine in
-    // DRAM2.
-    // SAFETY: Exclusive singleton access initialized once before starting
-    // Bluetooth runner.
-    #[unsafe(link_section = ".dram2_uninit")]
-    static mut STATIC_BT_SINK: core::mem::MaybeUninit<BtA2dpSink> =
-        core::mem::MaybeUninit::uninit();
-
+    static mut STATIC_BT_HEAP: core::mem::MaybeUninit<
+        [u8; louder_esp32_app::board::BT_HEAP_BYTES],
+    > = core::mem::MaybeUninit::uninit();
     pub(crate) struct Esp32VhciTransport<'d> {
         pub(crate) connector: esp_radio::ble::controller::BleConnector<'d>,
     }
@@ -1661,8 +1631,12 @@ mod xtensa_hw {
         // JUSTIFICATION: Dedicated DRAM2 memory regions for settings journal
         // and config handle.
         // SAFETY: Single-core boot initialization guarded by atomic TAKEN.
+        #[unsafe(link_section = ".dram2_uninit")]
         static mut RAM_JOURNAL: core::mem::MaybeUninit<RamJournal<'static>> =
             core::mem::MaybeUninit::uninit();
+        // JUSTIFICATION: Same DRAM2 placement for the config handle.
+        // SAFETY: Written once below (TAKEN) before any reference escapes.
+        #[unsafe(link_section = ".dram2_uninit")]
         static mut CONFIG_HANDLE: core::mem::MaybeUninit<ConfigHandle> =
             core::mem::MaybeUninit::uninit();
         static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1714,22 +1688,6 @@ mod xtensa_hw {
             }
             (&*config, journal)
         }
-    }
-
-    #[allow(unsafe_code)]
-    fn take_firmware_bss_buffers() -> &'static mut FirmwareBssBuffers {
-        static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        assert!(
-            !TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
-            "FirmwareBssBuffers already taken"
-        );
-        // JUSTIFICATION: Static BSS buffers in DRAM2 to avoid stack exhaustion.
-        // SAFETY: Single caller on PRO_CPU guarded by atomic TAKEN.
-        #[unsafe(link_section = ".dram2_uninit")]
-        static mut BSS_BUFFERS: FirmwareBssBuffers = FirmwareBssBuffers::new();
-        // JUSTIFICATION: Access to global static firmware BSS buffer singleton.
-        // SAFETY: Only a single caller on PRO_CPU takes ownership of the buffers.
-        unsafe { &mut *core::ptr::addr_of_mut!(BSS_BUFFERS) }
     }
 
     pub(crate) type HwStreamPipeline =
@@ -2538,16 +2496,6 @@ mod xtensa_hw {
         let mut sta_mac = [0u8; 6];
         sta_mac.copy_from_slice(sta_mac_addr.as_bytes());
 
-        let fw_bufs = take_firmware_bss_buffers();
-        let FirmwareBssBuffers {
-            ref mut ring_storage,
-            ref mut http_rx_buf,
-            ref mut slim_rx_buf,
-            ref mut slim_tx_buf,
-            ref mut audio_rx_buf,
-            ref mut audio_tx_buf,
-        } = fw_bufs;
-
         // Boot config resolution (spec §3.4), each field independently:
         // settings FlashJournal, then (Wi-Fi only) the C firmware's NVS, then
         // the compile-time first-boot defaults.
@@ -2557,8 +2505,9 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
+                // `BT_HEAP_BYTES >= BOOT_SCRATCH_BYTES` is asserted in `board.rs`.
                 let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr();
-                &mut *ptr
+                &mut *ptr.cast::<[u8; 12_288]>()
             };
             init_config(&mut flash, boot_scratch)
         };
@@ -2569,8 +2518,9 @@ mod xtensa_hw {
             // as temporary 12 KB scratch during early single-core boot.
             // SAFETY: Accessed exclusively during early boot before heap init.
             let boot_scratch: &mut [u8; 12_288] = unsafe {
+                // `BT_HEAP_BYTES >= BOOT_SCRATCH_BYTES` is asserted in `board.rs`.
                 let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_HEAP)).as_mut_ptr();
-                &mut *ptr
+                &mut *ptr.cast::<[u8; 12_288]>()
             };
             init_wifi_credentials(&mut flash, boot_scratch, &sta_mac)
         };
@@ -2583,14 +2533,14 @@ mod xtensa_hw {
                     .unwrap_or(first_boot_defaults::LMS_SERVER_PORT)
             }),
         );
-        ring_storage.fill(0);
         wdt.feed();
 
         // Register 4 MB external PSRAM (`0x3F80_0000`) FIRST as Region 0 of
         // `esp_alloc::HEAP` (`MemoryCapability::External`) so all standard Rust
         // `GlobalAlloc` allocations (`Box::new`, `vec!`) allocate from PSRAM,
-        // preserving 100% of internal DRAM (`43 KB` Region 1 + `22 KB` Region
-        // 2 = `65 KB` `MemoryCapability::Internal`) for `esp-rtos` and
+        // preserving 100% of internal DRAM (`board::INTERNAL_HEAP_BYTES`
+        // Region 1 + `board::BT_HEAP_BYTES` Region 2, together at least
+        // 65,536 B of `MemoryCapability::Internal`) for `esp-rtos` and
         // `esp-radio` (`Wi-Fi` + `BLE`/`BTDM`).
         #[allow(unsafe_code)]
         let psram_avail_bytes = {
@@ -2618,8 +2568,8 @@ mod xtensa_hw {
             } else {
                 0
             };
-            esp_alloc::heap_allocator!(size: 51 * 1024);
-            // JUSTIFICATION: Register secondary 14 KB internal `.dram2_uninit`
+            esp_alloc::heap_allocator!(size: louder_esp32_app::board::INTERNAL_HEAP_BYTES);
+            // JUSTIFICATION: Register the secondary internal `.dram2_uninit`
             // region as Region 2 of `esp_alloc::HEAP`.
             // SAFETY: `STATIC_BT_HEAP` is an exclusive static uninitialized
             // buffer in `.dram2_uninit` registered exactly once at boot.
@@ -2632,33 +2582,29 @@ mod xtensa_hw {
             }
             reg_size
         };
-        let (bss_stream_storage, bss_output_storage) = ring_storage.split_at_mut(2048);
+        // The board always has PSRAM, and nothing below fits without it (the
+        // rings, the TCP receive windows and every heap decoder live there).
+        // Internal RAM holds no stand-in buffers: a board whose PSRAM does not
+        // answer resets into recovery, which Gate 1 armed above.
+        if psram_avail_bytes < 1_048_576 {
+            println!("[ANTI-BRICK] PSRAM missing or too small -> resetting to recovery (0x10000)");
+            esp_hal::system::software_reset();
+        }
         // C parity: main/Kconfig.projbuild:465 (-b 500:2000): 500 KiB stream
         // buffer (512 KiB here) and a 2000 KiB output buffer. Both land in
         // the PSRAM region (the internal regions are far smaller); the 4 MiB
         // keeps ~1.2 MiB free for the FLAC/AAC/Vorbis/ALAC/Opus decoders and
         // the allocator.
-        let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) =
-            if psram_avail_bytes >= 1_048_576 {
-                (
-                    alloc::boxed::Box::leak(
-                        alloc::vec![
-                            0u8;
-                            louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES
-                        ]
-                        .into_boxed_slice(),
-                    ),
-                    alloc::boxed::Box::leak(
-                        alloc::vec![
-                            0u8;
-                            louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES
-                        ]
-                        .into_boxed_slice(),
-                    ),
-                )
-            } else {
-                (bss_stream_storage, bss_output_storage)
-            };
+        let (stream_storage, output_storage): (&'static mut [u8], &'static mut [u8]) = (
+            alloc::boxed::Box::leak(
+                alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_STREAM_RING_BYTES]
+                    .into_boxed_slice(),
+            ),
+            alloc::boxed::Box::leak(
+                alloc::vec![0u8; louder_esp32_app::pipeline::PSRAM_OUTPUT_RING_BYTES]
+                    .into_boxed_slice(),
+            ),
+        );
         wdt.feed();
         squeezelite_decoders::prewarm_opus();
         wdt.feed();
@@ -2787,27 +2733,22 @@ mod xtensa_hw {
         wdt.feed();
 
         let bt_periph = Some(peripherals.BT);
-        #[allow(unsafe_code)]
-        // JUSTIFICATION: Initialize static BtA2dpSink in `.dram2_uninit`
-        // without creating a stack temporary.
-        // SAFETY: Called once during single-core bring-up on PRO_CPU.
-        let bt_sink: &'static mut BtA2dpSink = unsafe {
-            let ptr = (*core::ptr::addr_of_mut!(STATIC_BT_SINK)).as_mut_ptr();
-            ptr.write_bytes(0, 1);
-            let sink = &mut *ptr;
-            sink.reset_in_place();
-            sink
-        };
+        let bt_sink: &'static mut BtA2dpSink =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(BtA2dpSink::new()));
 
-        let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) =
-            if psram_avail_bytes >= 655_360 {
-                (
-                    alloc::boxed::Box::leak(alloc::vec![0u8; 8_192].into_boxed_slice()),
-                    alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
-                )
-            } else {
-                (&mut slim_rx_buf[..], &mut audio_rx_buf[..])
-            };
+        // Invariant 49: both TCP receive windows live in PSRAM.
+        let (slim_rx_slice, audio_rx_slice): (&'static mut [u8], &'static mut [u8]) = (
+            alloc::boxed::Box::leak(alloc::vec![0u8; 8_192].into_boxed_slice()),
+            alloc::boxed::Box::leak(alloc::vec![0u8; 65_536].into_boxed_slice()),
+        );
+        // The small socket buffers (HTTP receive, SlimProto and audio
+        // transmit) come from the same PSRAM region (Region 0, Invariant 48).
+        let http_rx_buf: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 1_024].into_boxed_slice());
+        let slim_tx_buf: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 2_048].into_boxed_slice());
+        let audio_tx_buf: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 512].into_boxed_slice());
 
         let NetStack {
             smol_iface,
@@ -2825,9 +2766,9 @@ mod xtensa_hw {
             &mut sta_iface,
             sta_mac,
             [
-                (&mut http_rx_buf[..], &mut http_tx_buf[..]),
-                (slim_rx_slice, &mut slim_tx_buf[..]),
-                (audio_rx_slice, &mut audio_tx_buf[..]),
+                (http_rx_buf, &mut http_tx_buf[..]),
+                (slim_rx_slice, slim_tx_buf),
+                (audio_rx_slice, audio_tx_buf),
             ],
         );
 
@@ -3084,6 +3025,10 @@ mod xtensa_hw {
                 s.coordinator.end_external_playback();
             }
             AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth => {
+                s.pipeline
+                    .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
+                let _ = s.pipeline.set_sample_rate(44_100);
+                s.pipeline.set_mute(false);
                 s.pipeline.stream_buffer.flush();
             }
         }
@@ -3220,7 +3165,8 @@ mod xtensa_hw {
                                 .set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, false)));
                             s.pipeline.begin_external_audio();
                             s.pipeline.set_mute(false);
-                            s.coordinator.begin_external_playback();
+                            s.coordinator
+                                .begin_external_playback_with_pipeline(s.pipeline);
                             if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                 let _ = s.amp.start_playback_via_hiz();
                             }
@@ -3592,6 +3538,23 @@ mod xtensa_hw {
                                 ),
                                 None => (s.coordinator.current_sample_rate, 64, true, false),
                             };
+                        let (int_heap_free_bytes, int_heap_min_free_bytes) = {
+                            static INT_HEAP_MIN_FREE: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(u32::MAX);
+                            let stats = esp_alloc::HEAP.stats();
+                            let free: u32 = stats
+                                .region_stats
+                                .iter()
+                                .flatten()
+                                .filter(|r| r.size <= 1024 * 1024)
+                                .map(|r| r.free as u32)
+                                .sum();
+                            let min = INT_HEAP_MIN_FREE
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                .min(free);
+                            INT_HEAP_MIN_FREE.store(min, core::sync::atomic::Ordering::Relaxed);
+                            (free, min)
+                        };
                         let (psram_free_bytes, psram_used_bytes) = {
                             let stats = esp_alloc::HEAP.stats();
                             let mut free = 0u32;
@@ -3669,6 +3632,8 @@ mod xtensa_hw {
                             uptime_ms: now_ms.saturating_sub(s.boot_ms),
                             psram_free_bytes,
                             psram_used_bytes,
+                            int_heap_free_bytes,
+                            int_heap_min_free_bytes,
                             core1_active: s.core1.is_active(),
                             core1_loops: CORE1_HEARTBEAT
                                 .load(core::sync::atomic::Ordering::Relaxed),
@@ -3817,7 +3782,7 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator.begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4326,7 +4291,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 s.raop_streaming = true;
                                                 s.last_rtp_packet_ms = now_ms;
                                             }
@@ -4394,7 +4362,8 @@ mod xtensa_hw {
                                     )));
                                     s.pipeline.begin_external_audio();
                                     s.pipeline.set_mute(false);
-                                    s.coordinator.begin_external_playback();
+                                    s.coordinator
+                                        .begin_external_playback_with_pipeline(s.pipeline);
                                     if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                         let _ = s.amp.clear_faults();
                                         let _ = s.amp.start_playback_via_hiz();
@@ -4481,7 +4450,10 @@ mod xtensa_hw {
                                                 ));
                                                 s.pipeline.begin_external_audio();
                                                 s.pipeline.set_mute(false);
-                                                s.coordinator.begin_external_playback();
+                                                s.coordinator
+                                                    .begin_external_playback_with_pipeline(
+                                                        s.pipeline,
+                                                    );
                                                 if s.amp.mode() != louder_esp32_app::AmpMode::Play {
                                                     let _ = s.amp.clear_faults();
                                                     let _ = s.amp.start_playback_via_hiz();
