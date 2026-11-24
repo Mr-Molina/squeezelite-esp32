@@ -442,14 +442,39 @@ pub struct OakleyGroup1Dh {
     public_key: [u8; 96],
 }
 
+fn zeroize_bytes(buf: &mut [u8]) {
+    buf.fill(0);
+    core::hint::black_box(buf);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 impl OakleyGroup1Dh {
     /// Constructs a DH context from a given 96-byte private key.
-    pub fn from_private_key(priv_key: [u8; 96]) -> Result<Self, CryptoError> {
+    pub fn from_private_key(mut priv_key: [u8; 96]) -> Result<Self, CryptoError> {
         let p = BigUint::from_be_bytes(&DH_PRIME);
-        let g = BigUint::from_u32(2);
+        let one = BigUint::one();
+        let two = BigUint::from_u32(2);
+        let p_minus_two = p.sub(&two);
         let x = BigUint::from_be_bytes(&priv_key);
-        let y = montgomery_mod_pow(&g, &x, &p)?;
-        let pub_vec = y.to_be_bytes_padded(96)?;
+        if x < one || x > p_minus_two {
+            zeroize_bytes(&mut priv_key);
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        let g = two;
+        let y = match montgomery_mod_pow(&g, &x, &p) {
+            Ok(val) => val,
+            Err(err) => {
+                zeroize_bytes(&mut priv_key);
+                return Err(err);
+            }
+        };
+        let pub_vec = match y.to_be_bytes_padded(96) {
+            Ok(val) => val,
+            Err(err) => {
+                zeroize_bytes(&mut priv_key);
+                return Err(err);
+            }
+        };
         let mut public_key = [0u8; 96];
         public_key.copy_from_slice(&pub_vec);
 
@@ -487,19 +512,42 @@ impl OakleyGroup1Dh {
 
 impl Drop for OakleyGroup1Dh {
     fn drop(&mut self) {
-        self.private_key.fill(0);
-        core::hint::black_box(&mut self.private_key);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        zeroize_bytes(&mut self.private_key);
     }
 }
 
 /// Pure-Rust SHA-1 message digest implementation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Sha1 {
     state: [u32; 5],
     buffer: [u8; 64],
     buf_len: usize,
     total_len: u64,
+}
+
+impl fmt::Debug for Sha1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sha1")
+            .field("state", &"[REDACTED]")
+            .field("buffer", &"[REDACTED]")
+            .field("buf_len", &self.buf_len)
+            .field("total_len", &self.total_len)
+            .finish()
+    }
+}
+
+impl Drop for Sha1 {
+    fn drop(&mut self) {
+        self.state.fill(0);
+        core::hint::black_box(&mut self.state);
+        self.buffer.fill(0);
+        core::hint::black_box(&mut self.buffer);
+        self.buf_len = 0;
+        core::hint::black_box(&mut self.buf_len);
+        self.total_len = 0;
+        core::hint::black_box(&mut self.total_len);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Default for Sha1 {
@@ -1091,13 +1139,30 @@ fn b64_val(c: u8) -> Result<u8, CryptoError> {
     }
 }
 
-/// Decodes standard Base64 string into bytes.
+/// Decodes standard (or unpadded) Base64 string into bytes.
 pub fn base64_decode(data: &str) -> Result<Vec<u8>, CryptoError> {
-    let raw = data.trim_end_matches(|c: char| c.is_whitespace() || c == '=');
-    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
+    let trimmed = data.trim_end_matches(|c: char| c.is_whitespace());
+    let raw = trimmed.trim_end_matches('=');
+    let pad_len = trimmed.len() - raw.len();
+    if pad_len > 2 {
+        return Err(CryptoError::InvalidBase64);
+    }
+
     let bytes = raw.as_bytes();
     let chunks = bytes.chunks_exact(4);
     let rem = chunks.remainder();
+
+    let valid_rem_and_pad = match rem.len() {
+        0 => pad_len == 0,
+        2 => pad_len == 0 || pad_len == 2,
+        3 => pad_len == 0 || pad_len == 1,
+        _ => false,
+    };
+    if !valid_rem_and_pad {
+        return Err(CryptoError::InvalidBase64);
+    }
+
+    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
 
     for chunk in chunks {
         let v0 = b64_val(chunk[0])? as u32;
@@ -1114,6 +1179,9 @@ pub fn base64_decode(data: &str) -> Result<Vec<u8>, CryptoError> {
         2 => {
             let v0 = b64_val(rem[0])? as u32;
             let v1 = b64_val(rem[1])? as u32;
+            if (v1 & 0x0F) != 0 {
+                return Err(CryptoError::InvalidBase64);
+            }
             let n = (v0 << 18) | (v1 << 12);
             out.push(((n >> 16) & 0xFF) as u8);
         }
@@ -1121,6 +1189,9 @@ pub fn base64_decode(data: &str) -> Result<Vec<u8>, CryptoError> {
             let v0 = b64_val(rem[0])? as u32;
             let v1 = b64_val(rem[1])? as u32;
             let v2 = b64_val(rem[2])? as u32;
+            if (v2 & 0x03) != 0 {
+                return Err(CryptoError::InvalidBase64);
+            }
             let n = (v0 << 18) | (v1 << 12) | (v2 << 6);
             out.push(((n >> 16) & 0xFF) as u8);
             out.push(((n >> 8) & 0xFF) as u8);
@@ -1142,9 +1213,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     }
     let mut diff = 0u8;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+        diff = core::hint::black_box(diff | core::hint::black_box(x ^ y));
     }
-    diff == 0
+    core::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]
@@ -1281,5 +1352,69 @@ mod tests {
         let mut decipher = Aes128Ctr::new(&key, iv);
         decipher.process(&mut data);
         assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn test_base64_decode_strict_padding_and_unused_bits() {
+        assert_eq!(base64_decode("").as_deref(), Ok(&b""[..]));
+        assert_eq!(base64_decode("QQ==").as_deref(), Ok(&b"A"[..]));
+        assert_eq!(base64_decode("QQ==\r\n").as_deref(), Ok(&b"A"[..]));
+        assert_eq!(base64_decode("QUI=").as_deref(), Ok(&b"AB"[..]));
+        assert_eq!(base64_decode("QUJD").as_deref(), Ok(&b"ABC"[..]));
+        // Unpadded Base64 remains supported.
+        assert_eq!(base64_decode("QQ").as_deref(), Ok(&b"A"[..]));
+        assert_eq!(base64_decode("QUI").as_deref(), Ok(&b"AB"[..]));
+
+        // Reject malformed or excessive padding.
+        for bad in [
+            "=", "==", "===", "QQ=", "QQ===", "QQ= = =", "QUI==", "AAAA==", "Q",
+        ] {
+            assert_eq!(base64_decode(bad), Err(CryptoError::InvalidBase64));
+        }
+
+        // Reject non-zero unused low bits.
+        for non_canonical in ["QR==", "QR", "QUJ=", "QUJ"] {
+            assert_eq!(
+                base64_decode(non_canonical),
+                Err(CryptoError::InvalidBase64)
+            );
+        }
+    }
+
+    #[test]
+    fn test_dh_from_private_key_range_checks() {
+        assert_eq!(
+            OakleyGroup1Dh::from_private_key([0u8; 96]).err(),
+            Some(CryptoError::InvalidKeyLength)
+        );
+
+        let mut p_minus_one = DH_PRIME;
+        p_minus_one[95] = 0xfe;
+        assert_eq!(
+            OakleyGroup1Dh::from_private_key(p_minus_one).err(),
+            Some(CryptoError::InvalidKeyLength)
+        );
+        assert_eq!(
+            OakleyGroup1Dh::from_private_key(DH_PRIME).err(),
+            Some(CryptoError::InvalidKeyLength)
+        );
+
+        let mut one = [0u8; 96];
+        one[95] = 1;
+        assert!(OakleyGroup1Dh::from_private_key(one).is_ok());
+
+        let mut p_minus_two = DH_PRIME;
+        p_minus_two[95] = 0xfd;
+        assert!(OakleyGroup1Dh::from_private_key(p_minus_two).is_ok());
+    }
+
+    #[test]
+    fn test_sha1_debug_redacts_internal_state() {
+        let mut sha1 = Sha1::new();
+        sha1.update(b"super-secret-token");
+        let dbg = alloc::format!("{:?}", sha1);
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("super-secret"));
+        assert!(!dbg.contains("1732584193"));
     }
 }

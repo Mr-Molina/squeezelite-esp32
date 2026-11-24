@@ -177,13 +177,13 @@ fn test_rsa_padding_validation_and_errors() {
         Err(CryptoError::InvalidPadding)
     );
 
-    // Plaintext with wrong key length (not 16 bytes)
+    // SEC-011: wrong key length returns uniform InvalidPadding (RFC 8017)
     let wrong_len = [
         0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 1, 2, 3, 4, 5,
     ];
     assert_eq!(
         unpad_pkcs1_v15_type2(&wrong_len),
-        Err(CryptoError::InvalidKeyLength)
+        Err(CryptoError::InvalidPadding)
     );
 }
 

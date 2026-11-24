@@ -10,6 +10,7 @@ members = [
     "crates/cyd-controller-app",
     "crates/squeezelite-raop",
     "crates/squeezelite-cspot",
+    "crates/nanomp3-core",
 ]
 resolver = "2"
 

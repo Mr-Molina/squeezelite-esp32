@@ -188,6 +188,8 @@ pub enum W5500Error<E> {
         /// Caller buffer length in bytes.
         capacity: usize,
     },
+    /// Timed out polling a W5500 command or reset bit to clear.
+    CommandTimeout(u8),
 }
 
 /// Pure-Rust W5500 SPI MACRAW (`Socket 0`) Ethernet Driver.
@@ -315,8 +317,19 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
     /// (`SHAR`), assigns all 16 KB RX/TX buffer RAM to Socket 0, and opens
     /// Socket 0 in `MACRAW` (`0x04`) mode.
     pub fn init_macraw(&mut self) -> Result<(), W5500Error<SPI::Error>> {
-        // 1. Software reset (MR = 0x80)
+        // 1. Software reset (MR = 0x80) and poll until MR.RST clears
         self.write_u8(REG_MR, BSB_COMMON_REG, 0x80)?;
+        let mut reset_cleared = false;
+        for _ in 0..16 {
+            let mr = self.read_u8(REG_MR, BSB_COMMON_REG)?;
+            if (mr & 0x80) == 0 {
+                reset_cleared = true;
+                break;
+            }
+        }
+        if !reset_cleared {
+            return Err(W5500Error::CommandTimeout(0x80));
+        }
         // 2. Verify chip version (0x04)
         let ver = self.chip_version()?;
         if ver != W5500_CHIP_VERSION {
@@ -330,7 +343,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         // 5. Configure Socket 0 for MACRAW with MAC filtering enabled
         self.write_u8(S0_MR, BSB_S0_REG, SOCK_MR_MACRAW | SOCK_MR_MFEN)?;
         // 6. Open Socket 0
-        self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_OPEN)?;
+        self.exec_socket_cmd(BSB_S0_REG, SOCK_CMD_OPEN)?;
         // 7. Verify Socket 0 status is SOCK_SR_MACRAW (0x42)
         let sr = self.read_u8(S0_SR, BSB_S0_REG)?;
         if sr != SOCK_SR_MACRAW {
@@ -345,6 +358,20 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.read_u16_be(S0_RX_RSR, BSB_S0_REG)
     }
 
+    fn ring_split(ptr: u16, len: usize) -> Result<(u16, Option<usize>), W5500Error<SPI::Error>> {
+        let buf_size = usize::from(S0_BUF_SIZE);
+        if len > buf_size {
+            return Err(W5500Error::FrameTooLarge(len));
+        }
+        let offset_u16 = ptr & S0_BUF_MASK;
+        let offset = usize::from(offset_u16);
+        if offset + len <= buf_size {
+            Ok((offset_u16, None))
+        } else {
+            Ok((offset_u16, Some(buf_size - offset)))
+        }
+    }
+
     /// Reads `out.len()` bytes from Socket 0 ring buffer, wrapping around
     /// `S0_BUF_SIZE` (16 KiB) with split SPI transactions if needed.
     pub fn read_socket0_ring_block(
@@ -353,14 +380,12 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         block_select: u8,
         out: &mut [u8],
     ) -> Result<(), W5500Error<SPI::Error>> {
-        let offset = ptr & S0_BUF_MASK;
-        let len = out.len() as u16;
-        if offset.saturating_add(len) <= S0_BUF_SIZE {
-            self.read_block(offset, block_select, out)
-        } else {
-            let first_len = (S0_BUF_SIZE - offset) as usize;
-            self.read_block(offset, block_select, &mut out[..first_len])?;
-            self.read_block(0x0000, block_select, &mut out[first_len..])
+        match Self::ring_split(ptr, out.len())? {
+            (offset, None) => self.read_block(offset, block_select, out),
+            (offset, Some(first_len)) => {
+                self.read_block(offset, block_select, &mut out[..first_len])?;
+                self.read_block(0x0000, block_select, &mut out[first_len..])
+            }
         }
     }
 
@@ -372,15 +397,18 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         block_select: u8,
         data: &[u8],
     ) -> Result<(), W5500Error<SPI::Error>> {
-        let offset = ptr & S0_BUF_MASK;
-        let len = data.len() as u16;
-        if offset.saturating_add(len) <= S0_BUF_SIZE {
-            self.write_block(offset, block_select, data)
-        } else {
-            let first_len = (S0_BUF_SIZE - offset) as usize;
-            self.write_block(offset, block_select, &data[..first_len])?;
-            self.write_block(0x0000, block_select, &data[first_len..])
+        match Self::ring_split(ptr, data.len())? {
+            (offset, None) => self.write_block(offset, block_select, data),
+            (offset, Some(first_len)) => {
+                self.write_block(offset, block_select, &data[..first_len])?;
+                self.write_block(0x0000, block_select, &data[first_len..])
+            }
         }
+    }
+
+    fn advance_rx_rd(&mut self, new_rx_rd: u16) -> Result<(), W5500Error<SPI::Error>> {
+        self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
+        self.exec_socket_cmd(BSB_S0_REG, SOCK_CMD_RECV)
     }
 
     /// Reads the next complete Ethernet frame from Socket 0's `MACRAW` RX
@@ -391,21 +419,22 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         if rsr < 2 {
             return Ok(0);
         }
+        if rsr > S0_BUF_SIZE {
+            return Err(W5500Error::InvalidRxHeader(rsr));
+        }
         let rx_rd = self.read_u16_be(S0_RX_RD, BSB_S0_REG)?;
         let mut len_hdr = [0u8; 2];
         self.read_socket0_ring_block(rx_rd, BSB_S0_RX_BUF, &mut len_hdr)?;
         let packet_size = u16::from_be_bytes(len_hdr);
         if packet_size < 2 || packet_size > rsr {
-            let new_rx_rd = rx_rd.wrapping_add(2);
-            self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
-            self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
+            let new_rx_rd = rx_rd.wrapping_add(rsr.min(S0_BUF_SIZE));
+            self.advance_rx_rd(new_rx_rd)?;
             return Err(W5500Error::InvalidRxHeader(packet_size));
         }
         let frame_len = usize::from(packet_size - 2);
         if frame_len > out_frame.len() {
             let new_rx_rd = rx_rd.wrapping_add(packet_size);
-            self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
-            self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
+            self.advance_rx_rd(new_rx_rd)?;
             return Err(W5500Error::BufferTooSmall {
                 required: frame_len,
                 capacity: out_frame.len(),
@@ -414,8 +443,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         let payload_offset = rx_rd.wrapping_add(2);
         self.read_socket0_ring_block(payload_offset, BSB_S0_RX_BUF, &mut out_frame[..frame_len])?;
         let new_rx_rd = rx_rd.wrapping_add(packet_size);
-        self.write_u16_be(S0_RX_RD, BSB_S0_REG, new_rx_rd)?;
-        self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_RECV)?;
+        self.advance_rx_rd(new_rx_rd)?;
         Ok(frame_len)
     }
 
@@ -428,7 +456,8 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         if frame.len() > MAX_ETHERNET_FRAME_BYTES {
             return Err(W5500Error::FrameTooLarge(frame.len()));
         }
-        let needed = frame.len() as u16;
+        let needed =
+            u16::try_from(frame.len()).map_err(|_| W5500Error::FrameTooLarge(frame.len()))?;
         let free = self.read_u16_be(S0_TX_FSR, BSB_S0_REG)?;
         if free < needed {
             return Err(W5500Error::TxBufferFull {
@@ -440,7 +469,7 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.write_socket0_ring_block(tx_wr, BSB_S0_TX_BUF, frame)?;
         let new_tx_wr = tx_wr.wrapping_add(needed);
         self.write_u16_be(S0_TX_WR, BSB_S0_REG, new_tx_wr)?;
-        self.write_u8(S0_CR, BSB_S0_REG, SOCK_CMD_SEND)?;
+        self.exec_socket_cmd(BSB_S0_REG, SOCK_CMD_SEND)?;
         Ok(frame.len())
     }
 
@@ -454,26 +483,28 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
         self.init_macraw()
     }
 
-    /// Executes a Socket command by writing to `S0_CR` and polling until cleared
-    /// to 0x00 (bounded to 16 iterations).
+    /// Executes a Socket command by writing to `S0_CR` and polling until
+    /// cleared to `0x00` (bounded to 16 iterations).
     pub fn exec_socket_cmd(
         &mut self,
         block_select: u8,
         cmd: u8,
     ) -> Result<(), W5500Error<SPI::Error>> {
         self.write_u8(S0_CR, block_select, cmd)?;
+        let mut last_cr = cmd;
         for _ in 0..16 {
             let cr = self.read_u8(S0_CR, block_select)?;
             if cr == 0x00 {
                 return Ok(());
             }
+            last_cr = cr;
         }
-        Ok(())
+        Err(W5500Error::CommandTimeout(last_cr))
     }
 
-    /// Polls physical link and manages state transitions. When recovering from
-    /// [`W5500LinkState::LinkDown`] to [`W5500LinkState::LinkUp`], transitions
-    /// to [`W5500LinkState::Init`] and re-initializes hardware before entering
+    /// Polls physical link and manages state transitions. When entering from
+    /// [`W5500LinkState::LinkDown`], [`W5500LinkState::Init`], or
+    /// [`W5500LinkState::LinkUp`], re-initializes hardware before entering
     /// [`W5500LinkState::DhcpDiscover`].
     pub fn poll_link(
         &mut self,
@@ -484,11 +515,10 @@ impl<SPI: SpiDevice> W5500Driver<SPI> {
             return Ok(W5500LinkState::LinkDown);
         }
         match current {
-            W5500LinkState::LinkDown | W5500LinkState::Init => {
+            W5500LinkState::LinkDown | W5500LinkState::Init | W5500LinkState::LinkUp => {
                 self.init()?;
                 Ok(W5500LinkState::DhcpDiscover)
             }
-            W5500LinkState::LinkUp => Ok(W5500LinkState::DhcpDiscover),
             other => Ok(other),
         }
     }
@@ -527,6 +557,12 @@ impl<'a, SPI: SpiDevice> W5500Socket<'a, SPI> {
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, W5500Error<SPI::Error>> {
         self.driver.recv_udp_frame(buf)
     }
+
+    /// Sends a raw Ethernet frame over Socket 0 via
+    /// [`W5500Driver::write_frame`].
+    pub fn send(&mut self, frame: &[u8]) -> Result<usize, W5500Error<SPI::Error>> {
+        self.driver.write_frame(frame)
+    }
 }
 
 #[cfg(test)]
@@ -561,10 +597,14 @@ mod tests {
         ];
 
         let expectations = [
-            // 1. Soft reset MR = 0x80
+            // 1. Soft reset MR = 0x80 and poll until RST clears
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x04]),
             SpiTransaction::write_vec(std::vec![0x80]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x00]),
+            SpiTransaction::read_vec(std::vec![0x00]),
             SpiTransaction::transaction_end(),
             // 2. Read VERSIONR -> 0x04
             SpiTransaction::transaction_start(),
@@ -590,10 +630,14 @@ mod tests {
             SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x0C]),
             SpiTransaction::write_vec(std::vec![0x84]),
             SpiTransaction::transaction_end(),
-            // 6. Write S0_CR = OPEN (0x01)
+            // 6. Write S0_CR = OPEN (0x01) and poll S0_CR == 0x00
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
             SpiTransaction::write_vec(std::vec![0x01]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00]),
             SpiTransaction::transaction_end(),
             // 7. Read S0_SR -> 0x42 (SOCK_SR_MACRAW)
             SpiTransaction::transaction_start(),
@@ -610,7 +654,7 @@ mod tests {
             SpiTransaction::write_vec(std::vec![0x00, 0x24, 0x08]),
             SpiTransaction::read_vec(std::vec![0x01, 0x00]),
             SpiTransaction::transaction_end(),
-            // 10. Write frame to BSB_S0_TX_BUF (0x02 << 3 | 0x04 = 0x14) at 0x0100
+            // 10. Write frame to BSB_S0_TX_BUF at 0x0100
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x01, 0x00, 0x14]),
             SpiTransaction::write_vec(sample_frame.to_vec()),
@@ -620,10 +664,14 @@ mod tests {
             SpiTransaction::write_vec(std::vec![0x00, 0x24, 0x0C]),
             SpiTransaction::write_vec(std::vec![0x01, 0x0E]),
             SpiTransaction::transaction_end(),
-            // 12. Issue S0_CR = SEND (0x20)
+            // 12. Issue S0_CR = SEND (0x20) and poll S0_CR == 0x00
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
             SpiTransaction::write_vec(std::vec![0x20]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00]),
             SpiTransaction::transaction_end(),
             // 13. RX frame: Read S0_RX_RSR -> 16 (2-byte hdr + 14-byte frame)
             SpiTransaction::transaction_start(),
@@ -650,10 +698,14 @@ mod tests {
             SpiTransaction::write_vec(std::vec![0x00, 0x28, 0x0C]),
             SpiTransaction::write_vec(std::vec![0x00, 0x50]),
             SpiTransaction::transaction_end(),
-            // 18. Issue S0_CR = RECV (0x40)
+            // 18. Issue S0_CR = RECV (0x40) and poll S0_CR == 0x00
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
             SpiTransaction::write_vec(std::vec![0x40]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00]),
             SpiTransaction::transaction_end(),
         ];
 
@@ -678,7 +730,7 @@ mod tests {
         let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
         let write_data = [0xAA, 0xBB, 0xCC, 0xDD];
         let expectations = [
-            // 1. write_socket0_ring_block at 0x3FFE (2 bytes at 0x3FFE, 2 bytes at 0x0000)
+            // 1. write_socket0_ring_block at 0x3FFE (2B at 0x3FFE, 2B at 0x0000)
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x3F, 0xFE, (BSB_S0_TX_BUF << 3) | 0x04]),
             SpiTransaction::write_vec(std::vec![0xAA, 0xBB]),
@@ -687,7 +739,7 @@ mod tests {
             SpiTransaction::write_vec(std::vec![0x00, 0x00, (BSB_S0_TX_BUF << 3) | 0x04]),
             SpiTransaction::write_vec(std::vec![0xCC, 0xDD]),
             SpiTransaction::transaction_end(),
-            // 2. read_socket0_ring_block at 0x3FFE (2 bytes at 0x3FFE, 2 bytes at 0x0000)
+            // 2. read_socket0_ring_block at 0x3FFE (2B at 0x3FFE, 2B at 0x0000)
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(std::vec![0x3F, 0xFE, BSB_S0_RX_BUF << 3]),
             SpiTransaction::read_vec(std::vec![0x11, 0x22]),
@@ -708,6 +760,223 @@ mod tests {
         drv.read_socket0_ring_block(0x3FFE, BSB_S0_RX_BUF, &mut read_buf)
             .expect("split rx ring read");
         assert_eq!(read_buf, [0x11, 0x22, 0x33, 0x44]);
+
+        let mut spi = drv.into_inner();
+        spi.done();
+    }
+
+    #[test]
+    fn test_sec_015_ring_transfer_rejects_oversized_slices_and_rsr() {
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let expectations = [
+            // S0_RX_RSR > S0_BUF_SIZE (0x4001) must fail before ring read
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x26, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x40, 0x01]),
+            SpiTransaction::transaction_end(),
+        ];
+
+        let spi = SpiMock::new(&expectations);
+        let mut drv = W5500Driver::new(spi, mac);
+
+        let oversized_u16_wrap = std::vec![0u8; 65536];
+        assert_eq!(
+            drv.write_socket0_ring_block(0x0000, BSB_S0_TX_BUF, &oversized_u16_wrap),
+            Err(W5500Error::FrameTooLarge(65536))
+        );
+
+        let mut oversized_rx = std::vec![0u8; usize::from(S0_BUF_SIZE) + 1];
+        assert_eq!(
+            drv.read_socket0_ring_block(0x0000, BSB_S0_RX_BUF, &mut oversized_rx),
+            Err(W5500Error::FrameTooLarge(usize::from(S0_BUF_SIZE) + 1))
+        );
+
+        let mut frame_buf = [0u8; 64];
+        assert_eq!(
+            drv.read_frame(&mut frame_buf),
+            Err(W5500Error::InvalidRxHeader(0x4001))
+        );
+
+        let mut spi = drv.into_inner();
+        spi.done();
+    }
+
+    #[test]
+    fn test_logic_033_exec_socket_cmd_and_reset_timeout() {
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let mut expectations = std::vec![
+            // 1. exec_socket_cmd times out after 16 non-zero polls
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
+            SpiTransaction::write_vec(std::vec![SOCK_CMD_SEND]),
+            SpiTransaction::transaction_end(),
+        ];
+        for _ in 0..16 {
+            expectations.push(SpiTransaction::transaction_start());
+            expectations.push(SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]));
+            expectations.push(SpiTransaction::read_vec(std::vec![SOCK_CMD_SEND]));
+            expectations.push(SpiTransaction::transaction_end());
+        }
+        // 2. init_macraw times out if MR.RST remains 0x80 for 16 polls
+        expectations.push(SpiTransaction::transaction_start());
+        expectations.push(SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x04]));
+        expectations.push(SpiTransaction::write_vec(std::vec![0x80]));
+        expectations.push(SpiTransaction::transaction_end());
+        for _ in 0..16 {
+            expectations.push(SpiTransaction::transaction_start());
+            expectations.push(SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x00]));
+            expectations.push(SpiTransaction::read_vec(std::vec![0x80]));
+            expectations.push(SpiTransaction::transaction_end());
+        }
+
+        let spi = SpiMock::new(&expectations);
+        let mut drv = W5500Driver::new(spi, mac);
+
+        assert_eq!(
+            drv.exec_socket_cmd(BSB_S0_REG, SOCK_CMD_SEND),
+            Err(W5500Error::CommandTimeout(SOCK_CMD_SEND))
+        );
+        assert_eq!(drv.init_macraw(), Err(W5500Error::CommandTimeout(0x80)));
+
+        let mut spi = drv.into_inner();
+        spi.done();
+    }
+
+    #[test]
+    fn test_logic_034_read_frame_flushes_full_rsr_on_invalid_header() {
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
+        let expectations = [
+            // S0_RX_RSR = 20
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x26, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00, 0x14]),
+            SpiTransaction::transaction_end(),
+            // S0_RX_RD = 0x0100
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x28, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x01, 0x00]),
+            SpiTransaction::transaction_end(),
+            // Invalid packet_size = 1 (< 2)
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x01, 0x00, 0x18]),
+            SpiTransaction::read_vec(std::vec![0x00, 0x01]),
+            SpiTransaction::transaction_end(),
+            // S0_RX_RD must advance by full rsr (0x0100 + 20 = 0x0114)
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x28, 0x0C]),
+            SpiTransaction::write_vec(std::vec![0x01, 0x14]),
+            SpiTransaction::transaction_end(),
+            // SOCK_CMD_RECV + poll clear
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
+            SpiTransaction::write_vec(std::vec![SOCK_CMD_RECV]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00]),
+            SpiTransaction::transaction_end(),
+        ];
+
+        let spi = SpiMock::new(&expectations);
+        let mut drv = W5500Driver::new(spi, mac);
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            drv.read_frame(&mut buf),
+            Err(W5500Error::InvalidRxHeader(1))
+        );
+
+        let mut spi = drv.into_inner();
+        spi.done();
+    }
+
+    #[test]
+    fn test_logic_044_and_qa_006_poll_link_up_init_and_socket_send() {
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let frame = [0xAA, 0xBB, 0xCC, 0xDD];
+        let expectations = [
+            // PHYCFGR -> link up
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x2E, 0x00]),
+            SpiTransaction::read_vec(std::vec![0b1011_1111]),
+            SpiTransaction::transaction_end(),
+            // poll_link(LinkUp) triggers init_macraw()
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x04]),
+            SpiTransaction::write_vec(std::vec![0x80]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x00]),
+            SpiTransaction::read_vec(std::vec![0x00]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x39, 0x00]),
+            SpiTransaction::read_vec(std::vec![0x04]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x09, 0x04]),
+            SpiTransaction::write_vec(mac.to_vec()),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x1E, 0x0C]),
+            SpiTransaction::write_vec(std::vec![16]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x1F, 0x0C]),
+            SpiTransaction::write_vec(std::vec![16]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x00, 0x0C]),
+            SpiTransaction::write_vec(std::vec![0x84]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
+            SpiTransaction::write_vec(std::vec![0x01]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x03, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x42]),
+            SpiTransaction::transaction_end(),
+            // W5500Socket::send(&frame)
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x20, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x08, 0x00]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x24, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00, 0x10]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x10, 0x14]),
+            SpiTransaction::write_vec(frame.to_vec()),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x24, 0x0C]),
+            SpiTransaction::write_vec(std::vec![0x00, 0x14]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x0C]),
+            SpiTransaction::write_vec(std::vec![0x20]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(std::vec![0x00, 0x01, 0x08]),
+            SpiTransaction::read_vec(std::vec![0x00]),
+            SpiTransaction::transaction_end(),
+        ];
+
+        let spi = SpiMock::new(&expectations);
+        let mut drv = W5500Driver::new(spi, mac);
+
+        let next = drv
+            .poll_link(W5500LinkState::LinkUp)
+            .expect("poll_link on LinkUp");
+        assert_eq!(next, W5500LinkState::DhcpDiscover);
+
+        let mut sock = W5500Socket::new(&mut drv);
+        assert_eq!(sock.send(&frame), Ok(4));
 
         let mut spi = drv.into_inner();
         spi.done();

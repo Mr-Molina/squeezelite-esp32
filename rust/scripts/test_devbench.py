@@ -1,14 +1,18 @@
 # rust/scripts/test_devbench.py
-import tempfile, unittest
-from datetime import datetime, timedelta, timezone
+import tempfile
+import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
 import devbench
 
-T0 = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
 
 class LockTests(unittest.TestCase):
     def setUp(self):
-        self.lock = Path(tempfile.mkdtemp()) / "dev-module.lock"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.lock = Path(tmp.name) / "dev-module.lock"
 
     def test_second_branch_is_busy(self):
         self.assertEqual(devbench.acquire(self.lock, "feat/a", T0), "ok")
@@ -16,7 +20,11 @@ class LockTests(unittest.TestCase):
 
     def test_same_branch_reacquires(self):
         devbench.acquire(self.lock, "feat/a", T0)
+        self.assertEqual(devbench.record_attempt(self.lock, "feat/a"), 1)
         self.assertEqual(devbench.acquire(self.lock, "feat/a", T0 + timedelta(minutes=5)), "ok")
+        self.assertEqual(devbench.record_attempt(self.lock, "feat/a"), 2)
+        with self.assertRaises(devbench.TooManyAttempts):
+            devbench.record_attempt(self.lock, "feat/a")
 
     def test_stale_lock_is_taken_over(self):
         devbench.acquire(self.lock, "feat/a", T0)
@@ -48,7 +56,9 @@ class ReviewFixTests(unittest.TestCase):
     """Cases added after review; the seven above are the plan's."""
 
     def setUp(self):
-        self.lock = Path(tempfile.mkdtemp()) / "dev-module.lock"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.lock = Path(tmp.name) / "dev-module.lock"
 
     def test_attempt_is_refused_when_lock_changed_hands(self):
         devbench.acquire(self.lock, "feat/a", T0)
@@ -84,3 +94,58 @@ class OtadataTests(unittest.TestCase):
         self.assertEqual(sector[24:28], bytes([2, 0, 0, 0]))
         self.assertEqual(int.from_bytes(sector[28:32], "little"), 0x4743989A)
         self.assertEqual(sector[32:], b"\xff" * (0x1000 - 32))
+
+
+class FirmwareImageValidationTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def _make_image(self, name: str, image_magic: int = 0xE9, app_magic: bytes = b"\x32\x54\xcd\xab", size: int = 0x120) -> Path:
+        data = bytearray(size)
+        if size > 0:
+            data[0] = image_magic
+        if size >= 0x24:
+            data[0x20:0x24] = app_magic
+        path = self.dir / name
+        path.write_bytes(bytes(data))
+        return path
+
+    def test_valid_image_passes(self):
+        img = self._make_image("valid.bin")
+        self.assertIsNone(devbench.validate_firmware_image(img))
+
+    def test_missing_image_is_rejected(self):
+        err = devbench.validate_firmware_image(self.dir / "missing.bin")
+        self.assertIsNotNone(err)
+        self.assertIn("no such image", err)
+
+    def test_empty_and_undersized_images_are_rejected(self):
+        empty = self.dir / "empty.bin"
+        empty.write_bytes(b"")
+        self.assertIsNotNone(devbench.validate_firmware_image(empty))
+        small = self._make_image("small.bin", size=0x40)
+        self.assertIsNotNone(devbench.validate_firmware_image(small))
+
+    def test_oversized_image_is_rejected(self):
+        big = self.dir / "big.bin"
+        with big.open("wb") as f:
+            f.write(b"\xe9" + b"\x00" * 0x1F + b"\x32\x54\xcd\xab")
+            f.seek(devbench.OTA_0_SIZE)
+            f.write(b"\x00")
+        err = devbench.validate_firmware_image(big)
+        self.assertIsNotNone(err)
+        self.assertIn("ota_0 holds", err)
+
+    def test_bad_image_magic_is_rejected(self):
+        elf = self._make_image("not_bin.elf", image_magic=0x7F)
+        err = devbench.validate_firmware_image(elf)
+        self.assertIsNotNone(err)
+        self.assertIn("0xe9", err)
+
+    def test_bad_app_desc_magic_is_rejected(self):
+        bad_desc = self._make_image("bad_desc.bin", app_magic=b"\x00\x00\x00\x00")
+        err = devbench.validate_firmware_image(bad_desc)
+        self.assertIsNotNone(err)
+        self.assertIn("abcd5432", err)

@@ -214,7 +214,7 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
     fn write_frames(&mut self, frames: &[i32]) -> Result<usize, Self::Error> {
         let mut total_frames_written = 0;
 
-        // Process in chunks of up to 256 stereo frames (512 i32 samples = 2048 bytes)
+        // Process chunks of up to 256 stereo frames (512 i32 = 2048 bytes)
         for chunk in frames.chunks(512) {
             let frame_count = (chunk.len() / 2).min(self.dma_scratch.len() / 8);
             let bytes_needed = frame_count * 8;
@@ -248,8 +248,8 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
                 written_bytes = bytes_needed;
             }
 
-            // HALNET-402: I2S 32-bit stereo frame is 8 bytes (4B Left + 4B Right).
-            // If the DMA driver returned a partial frame (written_bytes % 8 != 0),
+            // HALNET-402: I2S 32-bit stereo frame is 8 bytes (4B L + 4B R).
+            // If DMA returned a partial frame (written_bytes % 8 != 0),
             // loop to write remaining bytes so channels never split or swap!
             if written_bytes % 8 != 0 {
                 let aligned_end = written_bytes + (8 - (written_bytes % 8));
@@ -303,7 +303,8 @@ impl<D: I2sDmaDriver> AudioOutputSink for EspI2sSink<D> {
 
 /// Hardware UART communication port trait.
 pub trait UartPort {
-    /// Reads up to `buf.len()` bytes from the hardware RX FIFO. Returns bytes read.
+    /// Reads up to `buf.len()` bytes from the hardware RX FIFO and returns
+    /// bytes read.
     fn read_rx(&mut self, buf: &mut [u8]) -> usize;
 
     /// Writes `data` bytes to the hardware TX FIFO. Returns bytes written.
@@ -631,6 +632,9 @@ impl<F: FlashPartition> NvsFlashBackend<F> {
 
     /// Erases a specific sector (0 or 1) in the flash partition.
     pub fn erase_sector(&mut self, sector_idx: u8) -> Result<(), StorageError> {
+        if sector_idx > 1 {
+            return Err(StorageError::CapacityExceeded);
+        }
         self.flash.erase_sector(sector_idx)
     }
 
@@ -708,7 +712,8 @@ impl TargetI2cBus {
         Self::for_active_board()
     }
 
-    /// Creates a target I2C bus with pin mappings from active board configuration.
+    /// Creates a target I2C bus with pin mappings from active board
+    /// configuration.
     pub fn for_active_board() -> Self {
         Self::with_pins(
             crate::board::pins::I2C_SDA as u8,
@@ -750,17 +755,19 @@ impl I2c for TargetI2cBus {
             return Ok(());
         }
 
-        self.current_reg = write[0];
-        let mut reg = write[0] as usize;
-        for &val in &write[1..] {
-            if reg < 256 {
-                self.registers[reg] = val;
-                reg += 1;
-            }
+        let start_reg = write[0];
+        if (start_reg as usize) + (write.len() - 1) > 256 {
+            return Err(TargetI2cError::InvalidRegister);
         }
 
-        // Hardware simulation: FAULT_CLEAR register (0x78) handling (AUD13-009).
-        // Bit 7 clears analog faults (0x70, 0x72, 0x73).
+        self.current_reg = start_reg;
+        for (offset, &val) in write[1..].iter().enumerate() {
+            let reg = start_reg.wrapping_add(offset as u8);
+            self.registers[reg as usize] = val;
+        }
+
+        // Hardware simulation: FAULT_CLEAR register (0x78) handling
+        // (AUD13-009). Bit 7 clears analog faults (0x70, 0x72, 0x73).
         // Bit 0 or bit 7 clears GLOBAL_FAULT1 (0x71).
         if write.len() > 1 && write[0] == registers::FAULT_CLEAR {
             if (write[1] & 0x80) != 0 {
@@ -837,8 +844,11 @@ impl LoopbackWifiDriver {
 
 impl WifiDriver for LoopbackWifiDriver {
     fn start_connect(&mut self, ssid: &str, _passphrase: &str) -> Result<(), &'static str> {
-        self.last_ssid.clear();
-        let _ = self.last_ssid.push_str(ssid);
+        let mut next_ssid = heapless::String::<32>::new();
+        next_ssid
+            .push_str(ssid)
+            .map_err(|_| "SSID exceeds 32 bytes")?;
+        self.last_ssid = next_ssid;
         Ok(())
     }
 
@@ -964,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_esp_i2s_sink_partial_dma_frame_completion() {
-        // HALNET-402: Simulate DMA returning 3 bytes, then 3 bytes, then 2 bytes
+        // HALNET-402: Simulate DMA returning 3 bytes, then 3 bytes, then 2B
         // for first 8-byte stereo frame. Verify EspI2sSink loops to complete
         // full 8-byte frame so Left/Right channels are never split or swapped.
         let driver = PartialDmaDriver::new(vec![3, 3, 2]);
@@ -994,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_cyd_uart_bridge_partial_tx_flush() {
-        // HALNET-407: Simulate UART TX FIFO accepting only 3 bytes per write_tx call.
+        // HALNET-407: Simulate UART TX FIFO accepting 3 bytes per write_tx.
         let port = PartialTxUartPort::new(3);
         let mut bridge = CydUartBridge::new(port);
 
@@ -1109,7 +1119,7 @@ mod tests {
         let creds = WifiCredentials::new("StudioWiFi", "SuperPassphrase123").unwrap();
         creds.save_to(&mut store).unwrap();
 
-        // 2. Commit store to dual flash partition -> Writes Sector A with sequence 1
+        // 2. Commit store to dual flash partition -> Sector A with seq 1
         let seq1 = backend.commit_store(&store).unwrap();
         assert_eq!(seq1, 1);
         assert_eq!(backend.last_seq(), 1);
@@ -1121,7 +1131,7 @@ mod tests {
         assert_eq!(seq2, 2);
         assert_eq!(backend.last_seq(), 2);
 
-        // 4. Simulate power cycle by transferring flash partition to new backend
+        // 4. Simulate power cycle by transferring flash partition to backend
         let flash_sim = backend.into_flash();
         let mut new_backend = NvsFlashBackend::new(flash_sim);
         let mut restored_store = MemConfigStore::<16>::new();
@@ -1173,7 +1183,7 @@ mod tests {
 
     #[test]
     fn test_esp_wifi_adapter_connecting_to_connected_transition() {
-        // HALNET-411: Verify poll_connection transitions Connecting -> Connected
+        // HALNET-411: Verify poll_connection Connecting -> Connected
         let mut driver = LoopbackWifiDriver::new();
         let mut store = MemConfigStore::<32>::new();
         let creds = WifiCredentials::new("TestNet", "SecretPass123").unwrap();
@@ -1191,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_i2s_pin_config_mclk_pin_none_for_3wire_bclk_pll() {
-        // HALNET-412: Louder-ESP32 uses 3-wire BCLK PLL mode with mclk_pin = None
+        // HALNET-412: Louder-ESP32 uses 3-wire BCLK PLL (mclk_pin = None)
         let cfg = crate::board::I2sPinConfig::for_active_board();
         assert_eq!(cfg.mclk_pin, None);
         assert_eq!(cfg.bclk_pin, crate::board::pins::I2S_BCLK as u8);
@@ -1394,5 +1404,41 @@ mod tests {
         assert_eq!(loopback.write_dma(&raw), Ok(8));
         assert_eq!(loopback.dma_bytes_written, 8);
         assert_eq!(loopback.last_frame_samples, [100, -100]);
+    }
+
+    #[test]
+    fn test_nvs_flash_backend_erase_sector_bounds() {
+        let mut backend = NvsFlashBackend::new(MemFlashPartition::new());
+        assert_eq!(backend.erase_sector(0), Ok(()));
+        assert_eq!(backend.erase_sector(1), Ok(()));
+        assert_eq!(backend.erase_sector(2), Err(StorageError::CapacityExceeded));
+        assert_eq!(
+            backend.erase_sector(255),
+            Err(StorageError::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn test_target_i2c_bus_write_out_of_bounds_returns_invalid_register() {
+        let mut bus = TargetI2cBus::new();
+        assert_eq!(bus.write(0x2D, &[0xFF, 0xAA]), Ok(()));
+        assert_eq!(bus.registers[0xFF], 0xAA);
+
+        assert_eq!(
+            bus.write(0x2D, &[0xFF, 0x11, 0x22]),
+            Err(TargetI2cError::InvalidRegister)
+        );
+        assert_eq!(bus.registers[0xFF], 0xAA);
+    }
+
+    #[test]
+    fn test_loopback_wifi_driver_rejects_oversized_ssid() {
+        let mut driver = LoopbackWifiDriver::new();
+        assert_eq!(driver.start_connect("MyValidSsid", "pass"), Ok(()));
+        assert_eq!(driver.last_ssid.as_str(), "MyValidSsid");
+
+        let err = driver.start_connect("this_ssid_is_longer_than_32_bytes!", "pass");
+        assert_eq!(err, Err("SSID exceeds 32 bytes"));
+        assert_eq!(driver.last_ssid.as_str(), "MyValidSsid");
     }
 }

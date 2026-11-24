@@ -978,7 +978,9 @@ impl TelnetSession {
     /// and dispatching each newline-terminated command via `registry`.
     ///
     /// Writes formatted command replies + `louder> ` prompts into `tx_out`,
-    /// returning `(tx_bytes_written, last_side_effect)`.
+    /// returning `(tx_bytes_written, first_side_effect)`.
+    /// Stops consuming pipelined bytes once a command emits a non-`None`
+    /// [`CliSideEffect`] so earlier side effects are never overwritten.
     pub fn ingest_bytes(
         &mut self,
         rx_bytes: &[u8],
@@ -986,7 +988,6 @@ impl TelnetSession {
         tx_out: &mut [u8],
     ) -> (usize, CliSideEffect) {
         let mut tx_len = 0usize;
-        let mut last_effect = CliSideEffect::None;
 
         for &byte in rx_bytes {
             match self.iac_state {
@@ -1017,10 +1018,10 @@ impl TelnetSession {
                             } else {
                                 let res = registry.execute(self.line_buf.as_str());
                                 self.line_buf.clear();
-                                if res.side_effect != CliSideEffect::None {
-                                    last_effect = res.side_effect;
-                                }
                                 tx_len = Self::append_reply(tx_out, tx_len, res.output.as_str());
+                                if res.side_effect != CliSideEffect::None {
+                                    return (tx_len, res.side_effect);
+                                }
                             }
                         }
                         0x08 | 0x7F => {
@@ -1030,7 +1031,7 @@ impl TelnetSession {
                         }
                         0x20..=0x7E => {
                             if self.overflowed {
-                                // Line already exceeded capacity; discard remainder.
+                                // Line overflowed; discard remainder.
                             } else if self.line_buf.push(byte as char).is_err() {
                                 self.overflowed = true;
                                 self.line_buf.clear();
@@ -1047,10 +1048,7 @@ impl TelnetSession {
                         self.iac_state = IacState::InSubnegotiation;
                     }
                     TELNET_IAC => {
-                        if !self.overflowed && self.line_buf.push(TELNET_IAC as char).is_err() {
-                            self.overflowed = true;
-                            self.line_buf.clear();
-                        }
+                        // Discard 0xFF like other non-ASCII bytes; return to Normal.
                         self.iac_state = IacState::Normal;
                     }
                     _ => {
@@ -1076,7 +1074,7 @@ impl TelnetSession {
             }
         }
 
-        (tx_len, last_effect)
+        (tx_len, CliSideEffect::None)
     }
 
     fn append_reply(tx_out: &mut [u8], mut offset: usize, output: &str) -> usize {
@@ -1263,13 +1261,24 @@ mod tests {
         let mut session = TelnetSession::new();
         let mut tx = [0u8; 512];
 
-        // 1. Escaped IAC (0xFF 0xFF) inside regular stream appends literal 0xFF
+        // 1. Escaped IAC (0xFF 0xFF) returns to Normal and discards 0xFF
+        // so line_buf remains strictly 7-bit printable ASCII.
         let stream1: &[u8] = &[b'a', TELNET_IAC, TELNET_IAC, b'b'];
         session.ingest_bytes(stream1, &reg, &mut tx);
-        assert_eq!(session.pending_line(), "a\u{ff}b");
+        assert_eq!(session.pending_line(), "ab");
 
-        // 2. Subnegotiation containing escaped IAC (0xFF 0xFF) resumes InSubnegotiation
-        // and terminates cleanly on IAC SE
+        // Escaped IAC at 127 buffered bytes does not inject UTF-8 or trip overflow.
+        let mut session_cap = TelnetSession::new();
+        let mut stream_cap = [b'x'; 130];
+        stream_cap[127] = TELNET_IAC;
+        stream_cap[128] = TELNET_IAC;
+        stream_cap[129] = b'z';
+        session_cap.ingest_bytes(&stream_cap, &reg, &mut tx);
+        assert_eq!(session_cap.pending_line().len(), 128);
+        assert!(session_cap.pending_line().ends_with('z'));
+
+        // 2. Subnegotiation containing escaped IAC (0xFF 0xFF) resumes
+        // InSubnegotiation and terminates cleanly on IAC SE.
         let mut session2 = TelnetSession::new();
         let stream2: &[u8] = &[
             TELNET_IAC, TELNET_SB, 0x24, TELNET_IAC,
@@ -1279,6 +1288,30 @@ mod tests {
         ];
         session2.ingest_bytes(stream2, &reg, &mut tx);
         assert_eq!(session2.pending_line(), "c");
+    }
+
+    #[test]
+    fn test_telnet_pipelined_side_effects_preserve_first_and_stop() {
+        let reg = CliRegistry::new();
+        let mut session = TelnetSession::new();
+        let mut tx = [0u8; 1024];
+
+        // Pure informational command followed by two side-effecting commands:
+        // must return the first non-None side effect and stop before reboot.
+        let pipelined = b"help\r\ni2c scan\r\nsystem reboot\r\n";
+        let (tx_len, effect) = session.ingest_bytes(pipelined, &reg, &mut tx);
+        assert_eq!(effect, CliSideEffect::I2cScan);
+        let reply = core::str::from_utf8(&tx[..tx_len]).expect("utf8");
+        assert!(reply.contains("OK: scanning I2C0 (0x08..0x77)"));
+        assert!(!reply.contains("OK: rebooting"));
+
+        // Lifecycle side effect first must not be overwritten by trailing command.
+        let mut session2 = TelnetSession::new();
+        let (tx_len2, effect2) =
+            session2.ingest_bytes(b"system reboot\r\nplayer play\r\n", &reg, &mut tx);
+        assert_eq!(effect2, CliSideEffect::Reboot);
+        let reply2 = core::str::from_utf8(&tx[..tx_len2]).expect("utf8");
+        assert!(!reply2.contains("OK: player play"));
     }
 
     #[test]

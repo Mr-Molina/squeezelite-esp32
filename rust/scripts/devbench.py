@@ -34,7 +34,7 @@ import tempfile
 import time
 import zlib
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 # Read from the module with `espflash board-info --port COM13` on 2026-11-17
@@ -72,6 +72,15 @@ MAC_LINE = re.compile(r"MAC address:\s*([0-9A-Fa-f:]{17})")
 
 OTADATA_OFFSET = 0xD000
 SECTOR = 0x1000
+
+ESP_IMAGE_MIN_SIZE = 0x120
+ESP_IMAGE_MAGIC = 0xE9
+ESP_APP_DESC_MAGIC_OFFSET = 0x20
+ESP_APP_DESC_MAGIC = b"\x32\x54\xcd\xab"  # 0xABCD5432 little-endian
+
+GIT_TIMEOUT_S = 10
+ESPFLASH_INFO_TIMEOUT_S = 10
+ESPFLASH_FLASH_TIMEOUT_S = 120
 
 
 def otadata_ota0_sector() -> bytes:
@@ -150,19 +159,19 @@ def _read(lock_path: Path):
         data = json.loads(text)
         stamp = datetime.fromisoformat(data["timestamp"])
         if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
+            stamp = stamp.replace(tzinfo=UTC)
         return {
             "branch": str(data["branch"]),
             "timestamp": stamp,
             "attempts": max(0, int(data.get("attempts", 0))),
         }
     except (ValueError, KeyError, TypeError):
-        mtime = datetime.fromtimestamp(lock_path.stat().st_mtime, tz=timezone.utc)
+        mtime = datetime.fromtimestamp(lock_path.stat().st_mtime, tz=UTC)
         return {"branch": "<unreadable lock>", "timestamp": mtime, "attempts": 0}
 
 
 def _payload(branch: str, now: datetime, attempts: int) -> str:
-    stamp = now.astimezone(timezone.utc).isoformat()
+    stamp = now.astimezone(UTC).isoformat()
     return json.dumps({"branch": branch, "timestamp": stamp, "attempts": attempts})
 
 
@@ -226,7 +235,7 @@ def holder(lock_path: Path, guard_timeout: float = GUARD_TIMEOUT_S):
 
 
 def record_attempt(
-    lock_path: Path, branch: str = None, guard_timeout: float = GUARD_TIMEOUT_S
+    lock_path: Path, branch: str | None = None, guard_timeout: float = GUARD_TIMEOUT_S
 ) -> int:
     """Count one flash attempt under the current lock and return the count.
 
@@ -275,6 +284,9 @@ def default_lock_path() -> Path:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=GIT_TIMEOUT_S,
     ).stdout.strip()
     common = Path(out)
     if not common.is_absolute():
@@ -284,11 +296,20 @@ def default_lock_path() -> Path:
 
 def read_board_mac() -> str:
     """Ask the board on PORT for its MAC. Resets it into its bootloader."""
-    proc = subprocess.run(
-        ["espflash", "board-info", "--port", PORT, "--non-interactive"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["espflash", "board-info", "--port", PORT, "--non-interactive"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=ESPFLASH_INFO_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as err:
+        raise RuntimeError(
+            f"espflash board-info timed out after {ESPFLASH_INFO_TIMEOUT_S}s"
+        ) from err
     output = proc.stdout + proc.stderr
     if proc.returncode != 0:
         raise RuntimeError(f"espflash board-info failed:\n{output}")
@@ -300,7 +321,7 @@ def read_board_mac() -> str:
 
 def cmd_acquire(lock_path: Path, branch: str) -> int:
     with _guard(lock_path, GUARD_TIMEOUT_S):
-        status, previous = _acquire(lock_path, branch, datetime.now(timezone.utc))
+        status, previous = _acquire(lock_path, branch, datetime.now(UTC))
     if status == "busy":
         print(f"BUSY: dev module is held by {previous or 'another agent'}")
         return EXIT_LOCK
@@ -326,6 +347,38 @@ def cmd_check_mac(mac: str) -> int:
     return EXIT_MAC
 
 
+def validate_firmware_image(image: Path) -> str | None:
+    """Return an error reason if `image` is not a valid ESP32 app binary."""
+    if not image.is_file():
+        return f"no such image {image}"
+    size = image.stat().st_size
+    if size > OTA_0_SIZE:
+        return f"image is {size} B, ota_0 holds {OTA_0_SIZE} B"
+    if size < ESP_IMAGE_MIN_SIZE:
+        return f"image is {size} B, minimum valid ESP32 app image is {ESP_IMAGE_MIN_SIZE} B"
+    try:
+        with image.open("rb") as f:
+            header = f.read(ESP_APP_DESC_MAGIC_OFFSET + len(ESP_APP_DESC_MAGIC))
+    except OSError as err:
+        return f"cannot read {image}: {err}"
+    if len(header) < ESP_APP_DESC_MAGIC_OFFSET + len(ESP_APP_DESC_MAGIC):
+        return f"truncated image header in {image}"
+    if header[0] != ESP_IMAGE_MAGIC:
+        return (
+            f"invalid ESP32 image magic 0x{header[0]:02x} in {image} "
+            f"(expected 0x{ESP_IMAGE_MAGIC:02x})"
+        )
+    app_magic = header[
+        ESP_APP_DESC_MAGIC_OFFSET : ESP_APP_DESC_MAGIC_OFFSET + len(ESP_APP_DESC_MAGIC)
+    ]
+    if app_magic != ESP_APP_DESC_MAGIC:
+        return (
+            f"invalid esp_app_desc magic 0x{int.from_bytes(app_magic, 'little'):08x} in {image} "
+            f"(expected 0x{int.from_bytes(ESP_APP_DESC_MAGIC, 'little'):08x})"
+        )
+    return None
+
+
 def cmd_flash(lock_path: Path, branch: str, image: Path) -> int:
     current = holder(lock_path)
     if current != branch:
@@ -334,12 +387,9 @@ def cmd_flash(lock_path: Path, branch: str, image: Path) -> int:
             "Run acquire first."
         )
         return EXIT_LOCK
-    if not image.is_file():
-        print(f"NOT FLASHED: no such image {image}")
-        return EXIT_FAILED
-    size = image.stat().st_size
-    if size > OTA_0_SIZE:
-        print(f"NOT FLASHED: image is {size} B, ota_0 holds {OTA_0_SIZE} B")
+    err = validate_firmware_image(image)
+    if err is not None:
+        print(f"NOT FLASHED: {err}")
         return EXIT_FAILED
     try:
         mac = read_board_mac()
@@ -360,17 +410,23 @@ def cmd_flash(lock_path: Path, branch: str, image: Path) -> int:
         print(f"NOT FLASHED: {err}. Release the lock, restore the last good image and report.")
         return EXIT_ATTEMPTS
     print(f"flash attempt {attempt} of {MAX_ATTEMPTS}: {image} -> {PORT} @ {OTA_0_OFFSET:#x}")
-    proc = subprocess.run(
-        [
-            "espflash",
-            "write-bin",
-            "--port",
-            PORT,
-            "--non-interactive",
-            f"{OTA_0_OFFSET:#x}",
-            str(image),
-        ]
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "espflash",
+                "write-bin",
+                "--port",
+                PORT,
+                "--non-interactive",
+                f"{OTA_0_OFFSET:#x}",
+                str(image),
+            ],
+            check=False,
+            timeout=ESPFLASH_FLASH_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"NOT FLASHED: espflash write-bin timed out after {ESPFLASH_FLASH_TIMEOUT_S}s")
+        return EXIT_FAILED
     return EXIT_OK if proc.returncode == 0 else EXIT_FAILED
 
 
@@ -407,7 +463,11 @@ def cmd_select_ota0(lock_path: Path, branch: str, no_reset: bool) -> int:
             command += ["--after", "no-reset"]
         command += [f"{OTADATA_OFFSET:#x}", str(blob)]
         print(f"select ota_0: {SECTOR} B -> {PORT} @ {OTADATA_OFFSET:#x}")
-        proc = subprocess.run(command)
+        try:
+            proc = subprocess.run(command, check=False, timeout=ESPFLASH_FLASH_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            print(f"NOT WRITTEN: espflash write-bin timed out after {ESPFLASH_FLASH_TIMEOUT_S}s")
+            return EXIT_FAILED
     return EXIT_OK if proc.returncode == 0 else EXIT_FAILED
 
 

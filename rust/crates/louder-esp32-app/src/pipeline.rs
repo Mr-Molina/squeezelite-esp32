@@ -353,6 +353,11 @@ pub struct StreamPipeline<'a, S: AudioOutputSink> {
     pub active_sample_rate_hz: u32,
     /// Optional polyphase FIR resampler stage between decoder output and EQ.
     pub resampler: Option<Box<Resampler>>,
+    /// Persisted target output sample rate in Hz for dynamic resampler
+    /// re-engagement after a bypass (`sr == to_hz`).
+    pub target_out_hz: Option<u32>,
+    /// Resampler quality tier persisted alongside `target_out_hz`.
+    pub resample_quality: ResampleQuality,
     /// Pre-buffer cushion threshold in frames required before output starts
     /// (`PROT-504`).
     pub output_threshold_frames: u32,
@@ -406,6 +411,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             loudness_level: 0,
             active_sample_rate_hz: sample_rate,
             resampler: None,
+            target_out_hz: None,
+            resample_quality: ResampleQuality::Medium,
             output_threshold_frames: 0,
             threshold_satisfied: true,
             resample_tail: [0i32; 256],
@@ -448,6 +455,60 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.stream_buffer.write(data)
     }
 
+    /// Drains staged `pcm_pending_samples` from `pcm_scratch` into
+    /// `output_buffer` and returns the number of frames written.
+    fn drain_pcm_pending_to_output(&mut self) -> usize {
+        if self.pcm_pending_samples == 0 {
+            return 0;
+        }
+        let avail_frames = self.output_buffer.available_write() / OUTPUT_FRAME_BYTES;
+        if avail_frames == 0 {
+            return 0;
+        }
+        let pending_frames = self.pcm_pending_samples / 2;
+        let frames_to_write = pending_frames.min(avail_frames);
+        let samples_to_write = frames_to_write * 2;
+        let slice =
+            &self.pcm_scratch[self.pcm_pending_offset..self.pcm_pending_offset + samples_to_write];
+        let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
+        let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+        let frames_written = written / OUTPUT_FRAME_BYTES;
+        let samples_written = frames_written * 2;
+        self.pcm_pending_offset += samples_written;
+        self.pcm_pending_samples -= samples_written;
+        if self.pcm_pending_samples == 0 {
+            self.pcm_pending_offset = 0;
+        }
+        frames_written
+    }
+
+    /// Drains staged `resample_tail_samples` from `resample_tail` into
+    /// `output_buffer` and returns the number of frames written.
+    fn drain_resample_tail_to_output(&mut self) -> usize {
+        if self.resample_tail_samples == 0 {
+            return 0;
+        }
+        let avail_frames = self.output_buffer.available_write() / OUTPUT_FRAME_BYTES;
+        if avail_frames == 0 {
+            return 0;
+        }
+        let pending_frames = self.resample_tail_samples / 2;
+        let frames_to_write = pending_frames.min(avail_frames);
+        let samples_to_write = frames_to_write * 2;
+        let slice = &self.resample_tail
+            [self.resample_tail_offset..self.resample_tail_offset + samples_to_write];
+        let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
+        let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+        let frames_written = written / OUTPUT_FRAME_BYTES;
+        let samples_written = frames_written * 2;
+        self.resample_tail_offset += samples_written;
+        self.resample_tail_samples -= samples_written;
+        if self.resample_tail_samples == 0 {
+            self.resample_tail_offset = 0;
+        }
+        frames_written
+    }
+
     /// Decodes a chunk from `stream_buffer`, processes EQ, and stores it in
     /// `output_buffer`. Gain (volume, replay gain, fade, polarity, channel
     /// select) is applied when the output step plays the frames, as C does
@@ -466,51 +527,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     ///   consumes 1 byte from `stream_buffer` to advance past the corrupted
     ///   byte and prevent an infinite decode loop (`PIPE-501`).
     pub fn process_decode_step(&mut self) -> Result<usize, DecoderError> {
-        // Drain pending PCM frames from previous decode if output buffer was previously
-        // constrained (LOGIC-601/602)
+        // Drain pending PCM frames from previous decode if output buffer was
+        // previously constrained (LOGIC-601/602)
         if self.pcm_pending_samples > 0 {
-            let avail_frames = self.output_buffer.available_write() / 8;
-            if avail_frames == 0 {
-                return Ok(0);
-            }
-            let pending_frames = self.pcm_pending_samples / 2;
-            let frames_to_write = pending_frames.min(avail_frames);
-            let samples_to_write = frames_to_write * 2;
-            let slice = &self.pcm_scratch
-                [self.pcm_pending_offset..self.pcm_pending_offset + samples_to_write];
-            let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
-            let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
-            let frames_written = written / 8;
-            let samples_written = frames_written * 2;
-            self.pcm_pending_offset += samples_written;
-            self.pcm_pending_samples -= samples_written;
-            if self.pcm_pending_samples == 0 {
-                self.pcm_pending_offset = 0;
-            }
-            return Ok(frames_written);
+            return Ok(self.drain_pcm_pending_to_output());
         }
 
-        // Drain pending resampled tail frames before accepting new decoder frames
+        // Drain pending resampled tail frames before accepting new decoder
+        // frames
         if self.resample_tail_samples > 0 {
-            let avail_frames = self.output_buffer.available_write() / 8;
-            if avail_frames == 0 {
-                return Ok(0);
-            }
-            let pending_frames = self.resample_tail_samples / 2;
-            let frames_to_write = pending_frames.min(avail_frames);
-            let samples_to_write = frames_to_write * 2;
-            let slice = &self.resample_tail
-                [self.resample_tail_offset..self.resample_tail_offset + samples_to_write];
-            let pcm_bytes: &[u8] = bytemuck::cast_slice(slice);
-            let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
-            let frames_written = written / 8;
-            let samples_written = frames_written * 2;
-            self.resample_tail_offset += samples_written;
-            self.resample_tail_samples -= samples_written;
-            if self.resample_tail_samples == 0 {
-                self.resample_tail_offset = 0;
-            }
-            return Ok(frames_written);
+            return Ok(self.drain_resample_tail_to_output());
         }
 
         // Process any unconsumed raw input frames held back during
@@ -522,8 +548,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Ok(frames_written);
         }
 
-        // Drain pending PCM frames from decoder if available (e.g. FlacDecoder pending
-        // frames)
+        // Drain pending PCM frames from decoder if available (e.g. FlacDecoder
+        // pending frames)
         if self.decoder.has_pending_pcm() {
             let avail_frames = self.output_buffer.available_write() / 8;
             if avail_frames == 0 {
@@ -561,7 +587,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             return Err(DecoderError::NeedMoreData);
         }
 
-        // Guarantee output buffer has space for at least 1 stereo frame (8 bytes)
+        // Guarantee output buffer has space for at least 1 stereo frame
+        // (8 bytes)
         if self.output_buffer.available_write() < 8 {
             return Ok(0); // Output buffer backpressure
         }
@@ -581,8 +608,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             Err(DecoderError::NeedMoreData) => return Err(DecoderError::NeedMoreData),
             Err(DecoderError::BufferOverflow) => return Err(DecoderError::BufferOverflow),
             Err(e) => {
-                // Consume at least 1 byte on corrupted frame / invalid header to prevent
-                // infinite busy loop
+                // Consume at least 1 byte on corrupted frame / invalid header
+                // to prevent infinite busy loop
                 self.stream_buffer.consume(1);
                 return Err(e);
             }
@@ -595,11 +622,11 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
         if frames_produced > 0 {
             self.check_decoder_sample_rate();
-            // The decoder's rate is the next track's rate, applied when playback reaches
-            // the track start (C parity: pcm.c:216-236, mad.c:254-256,
-            // flac.c:147-170 set `output.next_sample_rate` with `track_start`;
-            // output.c:154 switches). A rate change inside a track is ignored,
-            // as in C (only `new_stream` reads the rate).
+            // The decoder's rate is the next track's rate, applied when
+            // playback reaches the track start (C parity: pcm.c:216-236,
+            // mad.c:254-256, flac.c:147-170 set `output.next_sample_rate` with
+            // `track_start`; output.c:154 switches). A rate change inside a
+            // track is ignored, as in C (only `new_stream` reads the rate).
             self.mark_track_start();
             let _ = self.commit_decoded_pcm(frames_produced);
         }
@@ -631,31 +658,38 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
     }
 
     /// Inspects the active decoder's detected sample rate and updates the
-    /// pipeline, retuning the 10-band equalizer and reconfiguring or disengaging
-    /// the resampler if the stream's sample rate changed dynamically (LOGIC-202).
+    /// pipeline, retuning the 10-band equalizer and reconfiguring or
+    /// disengaging the resampler if the stream's sample rate changed
+    /// dynamically (LOGIC-202).
     fn check_decoder_sample_rate(&mut self) {
         if let Some(sr) = self.decoder.sample_rate() {
             if sr > 0 && sr != self.active_sample_rate_hz {
                 self.active_sample_rate_hz = sr;
-                self.retune_equalizer();
-                if let Some(r) = self.resampler.as_ref() {
-                    let to_hz = r.to_hz();
-                    let quality = r.quality();
-                    if r.from_hz() != sr {
-                        if sr == to_hz {
-                            self.clear_resampler();
-                        } else {
+                if let Some(to_hz) = self.target_out_hz {
+                    let quality = self.resample_quality;
+                    if sr == to_hz {
+                        if self.resampler.is_some() {
+                            self.bypass_resampler();
+                        }
+                    } else {
+                        let needs_reconfig = self
+                            .resampler
+                            .as_ref()
+                            .is_none_or(|r| r.from_hz() != sr || r.to_hz() != to_hz);
+                        if needs_reconfig {
                             self.configure_resampler(sr, to_hz, quality);
                         }
                     }
                 }
+                self.retune_equalizer();
             }
         }
     }
 
     /// Commits decoded PCM frames through the resampler and equalizer stages
     /// into `output_buffer`. Bounded chunk processing guarantees zero frame
-    /// drops during polyphase upsampling without in-place collision (`PIPE-201`).
+    /// drops during polyphase upsampling without in-place collision
+    /// (`PIPE-201`).
     fn commit_decoded_pcm(&mut self, frames_produced: usize) -> usize {
         if let Some(resampler) = self.resampler.as_mut() {
             let mut total_frames_written = 0;
@@ -800,8 +834,9 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
         if let Some(marker) = self.boundary.marker {
             if marker.bytes_ahead == 0 {
-                // C parity: output.c:127 `track_start == readp`, only with real frames to
-                // play (`frames == 0` is silence there, output.c:111-114).
+                // C parity: output.c:127 `track_start == readp`, only with real
+                // frames to play (`frames == 0` is silence there,
+                // output.c:111-114).
                 self.reach_track_start(marker);
                 if self.boundary.silence_frames > 0 {
                     return self.write_boundary_silence();
@@ -935,16 +970,18 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             let offset = usize::try_from(new_ahead)
                 .unwrap_or(usize::MAX)
                 .saturating_mul(OUTPUT_FRAME_BYTES);
-            // `prepare` checked that the new frames follow (output.c:231): the old samples
-            // are already converted, so the byte scratch is free for them.
+            // `prepare` checked that the new frames follow (output.c:231): the
+            // old samples are already converted, so the byte scratch is free
+            // for them.
             let expected_bytes = frames * OUTPUT_FRAME_BYTES;
             debug_assert!(expected_bytes <= self.write_scratch.len());
             let to_process = expected_bytes.min(self.write_scratch.len());
             let got = self
                 .output_buffer
                 .peek_at(offset, &mut self.write_scratch[..to_process]);
-            // `prepare` guarantees used > dur_f + size, so the whole chunk of new frames is
-            // there; a short read would mix only part of the chunk.
+            // `prepare` guarantees used > dur_f + size, so the whole chunk of
+            // new frames is there; a short read would mix only part of the
+            // chunk.
             debug_assert_eq!(got, expected_bytes, "crossfade new-track frames missing");
             for (sample, new) in samples
                 .iter_mut()
@@ -957,17 +994,17 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         } else {
             false
         };
-        // C parity: output.c:54-55 (replay gain on all output, 0 = none) and :243-245
-        // (plain volume while crossfading: the weights above carry both tracks'
-        // replay gains).
+        // C parity: output.c:54-55 (replay gain on all output, 0 = none) and
+        // :243-245 (plain volume while crossfading: the weights above carry
+        // both tracks' replay gains).
         self.gain_stage.replay_gain_q16 = if crossfading {
             0
         } else {
             self.boundary.current_replay_gain
         };
-        // C parity: output.c:226-228, the fade gain of this chunk (unity outside a fade
-        // up/down). Refreshed once per chunk, so a volume change never touches fade
-        // progress.
+        // C parity: output.c:226-228, the fade gain of this chunk (unity
+        // outside a fade up/down). Refreshed once per chunk, so a volume change
+        // never touches fade progress.
         self.gain_stage.fade_q16 = self.fade.gain_q16();
         debug_assert!(
             !matches!(chunk_gain, ChunkGain::Fade(g) if g as u32 != self.gain_stage.fade_q16)
@@ -1003,11 +1040,12 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         }
         self.frames_played = 0;
         self.boundary.crossed = Some(marker);
-        // The clock switch is requested here, when the sink reaches the boundary.
-        // Frames of the previous track still queued in the sink's DMA then play
-        // at the new rate; C has the same window (output_i2s.c:627-643 switches
-        // after `_output_frames` and zeroes the DMA). Exact DMA-drain
-        // sequencing is Task 15. A refused rate keeps the old clock.
+        // The clock switch is requested here, when the sink reaches the
+        // boundary. Frames of the previous track still queued in the sink's DMA
+        // then play at the new rate; C has the same window
+        // (output_i2s.c:627-643 switches after `_output_frames` and zeroes the
+        // DMA). Exact DMA-drain sequencing is Task 15. A refused rate keeps the
+        // old clock.
         if marker.sample_rate != self.sample_rate
             && self.sink.set_sample_rate(marker.sample_rate).is_ok()
         {
@@ -1015,8 +1053,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
             self.active_sample_rate_hz = marker.sample_rate;
             self.retune_equalizer();
         }
-        // C parity: output.c:157-159, a crossfade keeps the old track's gain for its
-        // tail.
+        // C parity: output.c:157-159, a crossfade keeps the old track's gain
+        // for its tail.
         if !self.fade.holds_replay_gain() {
             self.boundary.current_replay_gain = marker.replay_gain;
         }
@@ -1293,7 +1331,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.output_buffer
             .rewind_read(frames.saturating_mul(OUTPUT_FRAME_BYTES));
         let mut rewound = self.output_buffer.available_read() - before;
-        // Whole frames only: the ring may clamp to a byte count that splits a frame.
+        // Whole frames only: the ring may clamp to a byte count that splits a
+        // frame.
         let partial = rewound % OUTPUT_FRAME_BYTES;
         if partial != 0 {
             self.output_buffer.consume(partial);
@@ -1474,7 +1513,8 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         self.equalizer.loudness_enabled() || self.loudness_level > 0
     }
 
-    /// Returns the effective sample rate (in Hz) used for RBJ equalizer synthesis.
+    /// Returns the effective sample rate (in Hz) used for RBJ equalizer
+    /// synthesis.
     #[must_use]
     pub fn effective_sample_rate_hz(&self) -> u32 {
         if let Some(ref r) = self.resampler {
@@ -1516,7 +1556,16 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
         out_rate: u32,
         quality: ResampleQuality,
     ) -> bool {
-        if in_rate == 0 || out_rate == 0 || in_rate == out_rate {
+        if out_rate == 0 {
+            self.flush_resampler_tail();
+            self.resampler = None;
+            self.target_out_hz = None;
+            return false;
+        }
+        self.target_out_hz = Some(out_rate);
+        self.resample_quality = quality;
+        if in_rate == 0 || in_rate == out_rate {
+            self.flush_resampler_tail();
             self.resampler = None;
             return false;
         }
@@ -1533,61 +1582,101 @@ impl<'a, S: AudioOutputSink> StreamPipeline<'a, S> {
 
     /// Drains the FIR group-delay tail of the active polyphase resampler into
     /// the output buffer so the final audio frames are not abruptly truncated
-    /// on EOF (LOGIC-207). If output ringbuffer has insufficient space,
-    /// unwritten tail frames are staged into `pcm_scratch` as pending PCM.
+    /// on EOF (LOGIC-207). Existing `pcm_pending_samples` are drained first,
+    /// and any tail samples that do not fit are staged into `pcm_scratch` up
+    /// to `PCM_SCRATCH_SAMPLES` without losing frames on backpressure.
     pub fn flush_resampler_tail(&mut self) {
-        let Some(resampler) = self.resampler.as_mut() else {
+        if self.resampler.is_none() {
             return;
-        };
+        }
+        let _ = self.drain_pcm_pending_to_output();
+        if self.pcm_pending_samples == 0 && self.resample_tail_samples > 0 {
+            let _ = self.drain_resample_tail_to_output();
+            if self.resample_tail_samples > 0 {
+                let rem = self.resample_tail_samples.min(PCM_SCRATCH_SAMPLES) & !1;
+                let start = self.resample_tail_offset;
+                self.pcm_scratch[..rem].copy_from_slice(&self.resample_tail[start..start + rem]);
+                self.pcm_pending_offset = 0;
+                self.pcm_pending_samples = rem;
+                self.resample_tail_offset = 0;
+                self.resample_tail_samples = 0;
+            }
+        }
         let mut tail_buf = [0i32; 256];
+        let mut compacted = false;
         loop {
-            let produced = resampler.flush(&mut tail_buf);
+            let produced = {
+                let Some(resampler) = self.resampler.as_mut() else {
+                    break;
+                };
+                resampler.flush(&mut tail_buf)
+            };
             if produced == 0 {
                 break;
             }
             self.equalizer
                 .process_interleaved(&mut tail_buf[..produced]);
-            let avail_frames = self.output_buffer.available_write() / 8;
-            let frames_to_write = (produced / 2).min(avail_frames);
-            let samples_to_write = frames_to_write * 2;
-            let frames_written = if frames_to_write > 0 {
-                let pcm_bytes: &[u8] = bytemuck::cast_slice(&tail_buf[..samples_to_write]);
-                debug_assert_eq!(pcm_bytes.len() % 8, 0);
-                let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
-                written / 8
-            } else {
-                0
-            };
-            let samples_written = frames_written * 2;
-            if samples_written < produced {
-                let rem = produced - samples_written;
-                let dest = if self.pcm_pending_samples == 0 {
-                    self.pcm_pending_offset = 0;
-                    0
-                } else if self.pcm_pending_offset > 0 {
-                    self.pcm_scratch.copy_within(
-                        self.pcm_pending_offset..self.pcm_pending_offset + self.pcm_pending_samples,
-                        0,
-                    );
-                    self.pcm_pending_offset = 0;
-                    self.pcm_pending_samples
+
+            let mut staged_start = 0;
+            if self.pcm_pending_samples == 0 && self.resample_tail_samples == 0 {
+                let avail_frames = self.output_buffer.available_write() / OUTPUT_FRAME_BYTES;
+                let frames_to_write = (produced / 2).min(avail_frames);
+                let samples_to_write = frames_to_write * 2;
+                let frames_written = if frames_to_write > 0 {
+                    let pcm_bytes: &[u8] = bytemuck::cast_slice(&tail_buf[..samples_to_write]);
+                    debug_assert_eq!(pcm_bytes.len() % OUTPUT_FRAME_BYTES, 0);
+                    let written = self.output_buffer.write(pcm_bytes).unwrap_or(0);
+                    written / OUTPUT_FRAME_BYTES
                 } else {
-                    self.pcm_pending_samples
+                    0
                 };
-                let to_copy = rem.min(PCM_SCRATCH_SAMPLES.saturating_sub(dest));
-                self.pcm_scratch[dest..dest + to_copy]
-                    .copy_from_slice(&tail_buf[samples_written..samples_written + to_copy]);
-                self.pcm_pending_samples += to_copy;
-                break;
+                staged_start = frames_written * 2;
+            }
+
+            if staged_start < produced {
+                if !compacted {
+                    if self.pcm_pending_samples == 0 {
+                        self.pcm_pending_offset = 0;
+                    } else if self.pcm_pending_offset > 0 {
+                        self.pcm_scratch.copy_within(
+                            self.pcm_pending_offset
+                                ..self.pcm_pending_offset + self.pcm_pending_samples,
+                            0,
+                        );
+                        self.pcm_pending_offset = 0;
+                    }
+                    compacted = true;
+                }
+                let rem = produced - staged_start;
+                let dest = self.pcm_pending_offset + self.pcm_pending_samples;
+                let space = PCM_SCRATCH_SAMPLES.saturating_sub(dest);
+                let to_copy = rem.min(space) & !1;
+                if to_copy > 0 {
+                    self.pcm_scratch[dest..dest + to_copy]
+                        .copy_from_slice(&tail_buf[staged_start..staged_start + to_copy]);
+                    self.pcm_pending_samples += to_copy;
+                }
+                if to_copy < rem {
+                    break;
+                }
             }
         }
     }
 
+    /// Bypasses the active resampler while retaining `target_out_hz` and
+    /// `resample_quality` so dynamic sample-rate changes can re-engage it.
+    fn bypass_resampler(&mut self) {
+        self.flush_resampler_tail();
+        self.resampler = None;
+    }
+
     /// Disengages and drops any active polyphase FIR resampler after draining
-    /// any remaining group-delay tail frames into the output buffer (LOGIC-207).
+    /// any remaining group-delay tail frames into the output buffer
+    /// (LOGIC-207). Also clears `target_out_hz`.
     pub fn clear_resampler(&mut self) {
         self.flush_resampler_tail();
         self.resampler = None;
+        self.target_out_hz = None;
     }
 
     /// Returns `true` when the polyphase FIR resampler is currently engaged.
@@ -1756,10 +1845,11 @@ mod tests {
 
     #[test]
     fn test_lossless_backpressure_draining() {
-        // Stream storage large enough for 8 stereo frames of 16-bit PCM (32 bytes)
+        // Stream storage large enough for 8 stereo frames of 16-bit PCM (32
+        // bytes)
         let mut stream_storage = [0u8; 128];
-        // Output storage restricted to 32 bytes (capacity 32 -> available_write = 31
-        // bytes -> max 3 frames = 24 bytes)
+        // Output storage restricted to 32 bytes (capacity 32 -> available_write
+        // = 31 bytes -> max 3 frames = 24 bytes)
         let mut output_storage = [0u8; 32];
         let pcm_decoder = PcmDecoder::new(16, 2, true);
         let sink = MockAudioSink::<64>::new();
@@ -1785,9 +1875,9 @@ mod tests {
         let ingested = pipeline.ingest_stream_data(&raw_stream).unwrap();
         assert_eq!(ingested, 32);
 
-        // First decode step:
-        // Output buffer only has room for 3 frames (24 bytes).
-        // Decoder produces 8 frames. 3 frames are written, 5 frames remain pending!
+        // First decode step: Output buffer only has room for 3 frames (24
+        // bytes). Decoder produces 8 frames. 3 frames are written, 5 frames
+        // remain pending!
         let consumed = pipeline.process_decode_step().unwrap();
         assert_eq!(consumed, 32); // All stream bytes ingested by decoder
         assert_eq!(pipeline.pcm_pending_samples, 10); // 5 frames * 2 samples
@@ -1824,7 +1914,8 @@ mod tests {
         assert_eq!(out_frames3, 2);
         assert_eq!(pipeline.frames_played, 8);
 
-        // Verify all 8 stereo frames (16 samples) arrived at sink completely lossless!
+        // Verify all 8 stereo frames (16 samples) arrived at sink completely
+        // lossless!
         let recorded = pipeline.sink.recorded_samples();
         assert_eq!(recorded.len(), 16);
         for frame in 0..8i16 {
@@ -1917,7 +2008,8 @@ mod tests {
         assert_eq!(pipeline.output_buffer_available(), 32);
         assert_eq!(pipeline.frames_played, 0);
 
-        // 2. Clear failure, but simulate partial write (sink accepts only 1 frame)
+        // 2. Clear failure, but simulate partial write (sink accepts only 1
+        // frame)
         pipeline.sink.fail_next = false;
         pipeline.sink.max_accept_frames = Some(1);
 
@@ -2066,9 +2158,9 @@ mod tests {
         assert_eq!(consumed, 52);
 
         // Task 12 (C parity): the decoder's rate is the next track's rate (C
-        // `output.next_sample_rate`, pcm.c:231-237); the clock switches when playback
-        // reaches the track start (output.c:154), not when the frames are
-        // decoded.
+        // `output.next_sample_rate`, pcm.c:231-237); the clock switches when
+        // playback reaches the track start (output.c:154), not when the frames
+        // are decoded.
         assert_eq!(pipeline.track_marker().map(|m| m.sample_rate), Some(48000));
         assert_eq!(pipeline.sink.sample_rate, 44100);
         pipeline.process_output_step().unwrap();
@@ -2097,7 +2189,8 @@ mod tests {
         pipeline.ingest_stream_data(&garbage).unwrap();
         assert_eq!(pipeline.stream_buffer_available(), 8);
 
-        // Process decode steps: must consume bytes and progress without deadlock
+        // Process decode steps: must consume bytes and progress without
+        // deadlock
         for _ in 0..8 {
             if pipeline.stream_buffer_available() == 0 {
                 break;
@@ -2369,7 +2462,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Task 12: gapless track boundary (C `output.track_start`, output.c:126-166)
+    // Task 12: gapless track boundary (C `output.track_start`,
+    // output.c:126-166)
     // -------------------------------------------------------------------------
 
     /// Sink recording every sample plus the clock rate each write was made at.
@@ -2476,17 +2570,18 @@ mod tests {
     fn test_first_frames_of_new_stream_set_boundary_at_write_position() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 8192]);
         let mut p = rec_pipeline(&mut s, &mut o);
-        // C decode_init: new_stream = true, so the very first frames mark a track
-        // start.
+        // C decode_init: new_stream = true, so the very first frames mark a
+        // track start.
         feed(&mut p, &track_pcm(1, 100));
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
-        // Play 40 frames of track 1 (crossing its boundary), then the next track
-        // arrives.
+        // Play 40 frames of track 1 (crossing its boundary), then the next
+        // track arrives.
         p.process_output_step().unwrap();
         assert!(p.active_marker_crossed().is_some());
         let played = p.frames_played as usize;
         next_stream(&mut p, 44_100, 0);
-        // strm s keeps the output ring (C slimproto.c:436-489 never flushes outputbuf).
+        // strm s keeps the output ring (C slimproto.c:436-489 never flushes
+        // outputbuf).
         assert_eq!(p.output_buffer_available(), (100 - played) * 8);
         assert!(
             p.track_marker().is_none(),
@@ -2512,8 +2607,8 @@ mod tests {
         assert_eq!(p.process_output_step().unwrap(), 6);
         assert!(p.active_marker_crossed().is_none());
         assert_eq!(p.frames_played, 70);
-        // The next step crosses first (frames_played = 0, C output.c:151), then plays
-        // track 2.
+        // The next step crosses first (frames_played = 0, C output.c:151), then
+        // plays track 2.
         assert_eq!(p.process_output_step().unwrap(), 10);
         assert!(p.active_marker_crossed().is_some());
         assert_eq!(p.frames_played, 10);
@@ -2549,9 +2644,9 @@ mod tests {
         assert_eq!(p.track_marker().map(|m| m.sample_rate), Some(48_000));
         let crossings = drain_output(&mut p);
         assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
-        // C output.c:138-148: current_rate * delay / 2000 silent frames at the old
-        // rate, the track start (rate switch), then next_rate * delay / 2000 at
-        // the new rate.
+        // C output.c:138-148: current_rate * delay / 2000 silent frames at the
+        // old rate, the track start (rate switch), then next_rate * delay /
+        // 2000 at the new rate.
         let first_half = 44_100 * 20 / 2000;
         let second_half = 48_000 * 20 / 2000;
         let l = left(&p.sink.samples);
@@ -2570,7 +2665,8 @@ mod tests {
         assert_eq!(frames_at(48_000), second_half + 30);
         assert_eq!(p.sink.rate_changes, [48_000]);
         assert_eq!(p.sample_rate, 48_000);
-        // Silence is not played audio (C output.c:277-280 counts only real frames).
+        // Silence is not played audio (C output.c:277-280 counts only real
+        // frames).
         assert_eq!(p.frames_played, 30);
     }
 
@@ -2613,8 +2709,9 @@ mod tests {
         assert_eq!(p.boundary.current_replay_gain, 0x1_0000);
         next_stream(&mut p, 44_100, 0x8000);
         feed(&mut p, &track_pcm(2, 10));
-        // C slimproto.c:485 stores next_replay_gain at strm s; output.c:158-160 applies
-        // it at the boundary. Until then the playing track keeps its gain.
+        // C slimproto.c:485 stores next_replay_gain at strm s; output.c:158-160
+        // applies it at the boundary. Until then the playing track keeps its
+        // gain.
         assert_eq!(p.boundary.next_replay_gain, 0x8000);
         assert_eq!(p.boundary.current_replay_gain, 0x1_0000);
         drain_output(&mut p);
@@ -2630,7 +2727,8 @@ mod tests {
         assert!(p.active_marker_crossed().is_some());
         next_stream(&mut p, 44_100, 0);
         feed(&mut p, &track_pcm(2, 50));
-        // C output_flush_streaming (output.c:461-470): writep = track_start, flushed.
+        // C output_flush_streaming (output.c:461-470): writep = track_start,
+        // flushed.
         assert!(p.flush_streaming());
         assert!(p.track_marker().is_none());
         assert_eq!(p.output_buffer_available(), 36 * 8);
@@ -2664,14 +2762,14 @@ mod tests {
         let first = p.track_marker().copied().unwrap();
         next_stream(&mut p, 44_100, 0);
         feed(&mut p, &track_pcm(3, 20));
-        // One slot (C output.track_start): the newer track start replaces the unreached
-        // one.
+        // One slot (C output.track_start): the newer track start replaces the
+        // unreached one.
         let second = p.track_marker().copied().unwrap();
         assert_eq!(second.bytes_ahead, first.bytes_ahead + 20 * 8);
         let crossings = drain_output(&mut p);
         assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
-        // strm s never flushes outputbuf: track 2's decoded part still plays (C), then
-        // track 3.
+        // strm s never flushes outputbuf: track 2's decoded part still plays
+        // (C), then track 3.
         let mut expected = track_left(1, 100);
         expected.extend(track_left(2, 20));
         expected.extend(track_left(3, 20));
@@ -2710,12 +2808,12 @@ mod tests {
         assert!(p.active_marker_crossed().is_some());
         next_stream(&mut p, 44_100, 0);
         feed(&mut p, &track_pcm(2, 10));
-        // Rewinding replays 16 already-played frames: the boundary moves 16 frames
-        // further away.
+        // Rewinding replays 16 already-played frames: the boundary moves 16
+        // frames further away.
         assert_eq!(p.rewind_output_frames(16), 16);
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some((36 + 16) * 8));
-        // A skip stops at the boundary, so the track start is still processed by the
-        // output.
+        // A skip stops at the boundary, so the track start is still processed
+        // by the output.
         assert_eq!(p.skip_output_frames(1_000), 52);
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(0));
         assert_eq!(p.process_output_step().unwrap(), 10);
@@ -2762,8 +2860,8 @@ mod tests {
     fn test_inout_on_empty_buffer_fades_up() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
-        // INOUT, 2 s at 100 Hz: 100 frames each way (output.c:292-296). The buffer is
-        // empty, so the first frames fade up from the write position
+        // INOUT, 2 s at 100 Hz: 100 frames each way (output.c:292-296). The
+        // buffer is empty, so the first frames fade up from the write position
         // (output.c:298-309).
         next_stream_with(&mut p, 100, 0, FadeMode::InOut, 2, false);
         feed(&mut p, &track_pcm(1, 300));
@@ -2789,14 +2887,15 @@ mod tests {
         assert_eq!(p.process_output_step().unwrap(), 64);
         assert_eq!(p.process_output_step().unwrap(), 36);
         assert!(p.active_marker_crossed().is_some(), "track 1's own start");
-        // Decode complete (C decode.c:103 `_checkfade(false)`): fade down over the last
-        // 100 frames before the write position (output.c:311-321).
+        // Decode complete (C decode.c:103 `_checkfade(false)`): fade down over
+        // the last 100 frames before the write position (output.c:311-321).
         p.fade_track_end();
         assert_eq!(
             (p.fade.state(), p.fade.dir(), p.fade.start_ahead()),
             (FadeState::Due, FadeDir::Down, 100)
         );
-        // The next track: INOUT on a non-empty buffer arms nothing at its start.
+        // The next track: INOUT on a non-empty buffer arms nothing at its
+        // start.
         next_stream_with(&mut p, 100, 0, FadeMode::InOut, 2, false);
         feed(&mut p, &track_pcm(2, 300));
         assert_eq!(p.fade.dir(), FadeDir::Down);
@@ -2848,8 +2947,8 @@ mod tests {
     fn test_crossfade_skips_dur_of_new_track_on_completion() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = crossfade_setup(&mut s, &mut o, 100, 100, 400);
-        // C output.c:328-339: 100 frames over the old track's last 236; the track start
-        // moves to the fade start.
+        // C output.c:328-339: 100 frames over the old track's last 236; the
+        // track start moves to the fade start.
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(136 * 8));
         assert_eq!(
             (p.fade.state(), p.fade.dir(), p.fade.duration_frames()),
@@ -2860,7 +2959,8 @@ mod tests {
             let n = p.process_output_step().unwrap();
             if p.active_marker_crossed().is_some() {
                 crossings.push(p.sink.samples.len() / 2 - n);
-                // The old track keeps its replay gain into the fade (output.c:157).
+                // The old track keeps its replay gain into the fade
+                // (output.c:157).
                 assert_eq!(p.boundary.current_replay_gain, 0);
             }
             if n == 0 {
@@ -2868,9 +2968,9 @@ mod tests {
             }
         }
         assert_eq!(crossings, [200], "STMs at the fade start");
-        // Old tail plain up to the fade start, then old x (1 - in) + new x in x next
-        // replay gain, per chunk (output.c:231-246), then the new track from
-        // dur_f on.
+        // Old tail plain up to the fade start, then old x (1 - in) + new x in x
+        // next replay gain, per chunk (output.c:231-246), then the new track
+        // from dur_f on.
         let mut expected = scaled(1, 0..200, FIXED_ONE);
         for (start, len) in [(0usize, 64usize), (64, 36)] {
             let gin = to_gain(start as f32 / 100.0);
@@ -2883,8 +2983,9 @@ mod tests {
                     .map(|(&a, &b)| gain(gout, a).saturating_add(gain(gin, b))),
             );
         }
-        // Task 14: after the crossfade the new track's replay gain applies to all its
-        // output (C output.c:54-55), continuous with its weight inside the mix.
+        // Task 14: after the crossfade the new track's replay gain applies to
+        // all its output (C output.c:54-55), continuous with its weight inside
+        // the mix.
         expected.extend(scaled(2, 100..400, 0x8000));
         assert_eq!(
             p.sink.samples.len(),
@@ -2897,8 +2998,8 @@ mod tests {
             &p.sink.samples[400..528],
             &scaled(1, 200..264, FIXED_ONE)[..]
         );
-        // Completion: the new replay gain is current (output.c:203); the skipped frames
-        // are not counted as played (output.c:199).
+        // Completion: the new replay gain is current (output.c:203); the
+        // skipped frames are not counted as played (output.c:199).
         assert_eq!(p.boundary.current_replay_gain, 0x8000);
         assert_eq!(p.frames_played, 400);
         assert_eq!(p.output_buffer_available(), 0);
@@ -2911,7 +3012,8 @@ mod tests {
         assert_eq!(p.track_marker().map(|m| m.bytes_ahead), Some(136 * 8));
         let crossings = drain_output(&mut p);
         assert_eq!(crossings.iter().filter(|c| c.is_some()).count(), 1);
-        // used (150) <= dur_f + size (164): no mix, no skip (output.c:231, 247-249).
+        // used (150) <= dur_f + size (164): no mix, no skip (output.c:231,
+        // 247-249).
         let mut expected = scaled(1, 0..300, FIXED_ONE);
         expected.extend(scaled(2, 0..50, FIXED_ONE));
         assert_eq!(p.sink.samples, expected);
@@ -2945,8 +3047,9 @@ mod tests {
     fn test_fade_with_invert_negates() {
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
-        // strm s flags & 0x03 == 0x03 (slimproto.c:488): the standard gain is negated
-        // (output.c:57) and the fade gain multiplies it (output.c:224-226).
+        // strm s flags & 0x03 == 0x03 (slimproto.c:488): the standard gain is
+        // negated (output.c:57) and the fade gain multiplies it
+        // (output.c:224-226).
         next_stream_with(&mut p, 100, 0, FadeMode::In, 1, true);
         feed(&mut p, &track_pcm(1, 200));
         drain_output(&mut p);
@@ -2969,7 +3072,8 @@ mod tests {
         feed(&mut p, &track_pcm(2, 300));
         assert_eq!(p.fade.start_ahead(), 236);
         drain_output(&mut p);
-        // Chunks end on the fade start (output.c:178-180) and the fade end (:212-214).
+        // Chunks end on the fade start (output.c:178-180) and the fade end
+        // (:212-214).
         assert_eq!(write_sizes(&p), [64, 64, 64, 64, 44, 64, 36, 64, 64, 64, 8]);
         let mut expected = scaled(1, 0..300, FIXED_ONE);
         expected.extend(scaled(2, 0..64, 0));
@@ -2988,8 +3092,9 @@ mod tests {
         next_stream_with(&mut p, 100, 0, FadeMode::Cross, 1, false);
         feed(&mut p, &track_pcm(2, 300));
         assert_eq!(p.fade.state(), FadeState::Due);
-        // strm f drops the next track and the old tail from the fade start (C writep =
-        // track_start = fade_start); the crossfade over dropped audio goes too.
+        // strm f drops the next track and the old tail from the fade start (C
+        // writep = track_start = fade_start); the crossfade over dropped audio
+        // goes too.
         assert!(p.flush_streaming());
         assert_eq!(p.output_buffer_available(), 136 * 8);
         assert_eq!(p.fade.state(), FadeState::Inactive);
@@ -3041,9 +3146,9 @@ mod tests {
 
     #[test]
     fn test_replay_gain_applies_to_all_output_composed_with_volume() {
-        // C output.c:54-55: gainL = gain(output.gainL, current_replay_gain), one
-        // composed gain per channel; the brief's fixture: volume 0.5 x replay
-        // gain 2.0 = unity.
+        // C output.c:54-55: gainL = gain(output.gainL, current_replay_gain),
+        // one composed gain per channel; the brief's fixture: volume 0.5 x
+        // replay gain 2.0 = unity.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         p.set_volume(0x8000, 0x8000);
@@ -3057,7 +3162,8 @@ mod tests {
         p.sink.samples.clear();
         drain_output(&mut p);
         assert_eq!(p.sink.samples, scaled(2, 0..100, 0x8000));
-        // An odd composition: gain(gain(vol, rg), s), truncating at each step as C.
+        // An odd composition: gain(gain(vol, rg), s), truncating at each step
+        // as C.
         next_stream(&mut p, 100, 0x1_6A09);
         feed(&mut p, &track_pcm(3, 100));
         p.sink.samples.clear();
@@ -3067,8 +3173,8 @@ mod tests {
 
     #[test]
     fn test_gain_change_during_fade_preserves_fade_progress() {
-        // Review Focus #3. Fade in over 128 frames (64 Hz, 2 s); the first 64-frame
-        // chunk leaves the fade at 50 %.
+        // Review Focus #3. Fade in over 128 frames (64 Hz, 2 s); the first
+        // 64-frame chunk leaves the fade at 50 %.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         next_stream_with(&mut p, 64, 0, FadeMode::In, 2, false);
@@ -3079,18 +3185,20 @@ mod tests {
             (FadeState::Active, 128)
         );
         let fade_before = p.fade;
-        // Volume change mid-fade: the fade's position, length and gain are untouched.
+        // Volume change mid-fade: the fade's position, length and gain are
+        // untouched.
         p.set_volume(0x8000, 0x8000);
         assert_eq!(p.fade, fade_before);
         assert_eq!(p.process_output_step().unwrap(), 64);
-        // The chunk reflects both: fade 50 % x volume 50 % (output.c:54, :226-228).
+        // The chunk reflects both: fade 50 % x volume 50 % (output.c:54,
+        // :226-228).
         assert_eq!(p.gain_stage.fade_q16, 0x8000);
         assert_eq!(
             &p.sink.samples[128..256],
             &scaled(1, 64..128, gain(0x8000, 0x8000))[..]
         );
-        // Another change at the last fade frame changes nothing in the fade either; it
-        // ends on schedule (no restart, no jump to unity).
+        // Another change at the last fade frame changes nothing in the fade
+        // either; it ends on schedule (no restart, no jump to unity).
         p.set_volume(0x1_0000, 0x1_0000);
         drain_output(&mut p);
         assert_eq!(p.fade.state(), FadeState::Inactive);
@@ -3103,9 +3211,9 @@ mod tests {
 
     #[test]
     fn test_invert_with_volume_replay_gain_and_fade_negates_once() {
-        // C output.c:54-57 then :224-226; the inversion is applied exactly once under
-        // the fade (declared divergence from C's second negation, ruled in Task
-        // 13).
+        // C output.c:54-57 then :224-226; the inversion is applied exactly once
+        // under the fade (declared divergence from C's second negation, ruled
+        // in Task 13).
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = rec_pipeline(&mut s, &mut o);
         p.set_volume(0x8000, 0x8000);
@@ -3117,8 +3225,8 @@ mod tests {
         expected.extend(scaled(1, 64..100, gain(standard, to_gain(0.64))));
         expected.extend(scaled(1, 100..200, standard));
         assert_eq!(p.sink.samples, expected);
-        // Inverted before, during and after the fade: left samples (positive in the
-        // source) are never positive.
+        // Inverted before, during and after the fade: left samples (positive in
+        // the source) are never positive.
         assert!(left(&p.sink.samples).iter().all(|&v| v <= 0));
         assert!(left(&p.sink.samples[128..]).iter().all(|&v| v < 0));
     }
@@ -3186,9 +3294,9 @@ mod tests {
 
     #[test]
     fn test_crossfade_applies_replay_gain_once() {
-        // Inside a crossfade C's standard gain is the plain volume (output.c:243-245)
-        // and each weight carries its track's replay gain (:234-239): replay
-        // gain is never doubled.
+        // Inside a crossfade C's standard gain is the plain volume
+        // (output.c:243-245) and each weight carries its track's replay gain
+        // (:234-239): replay gain is never doubled.
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
         let mut p = crossfade_rg(
             &mut s,
@@ -3200,8 +3308,8 @@ mod tests {
         );
         p.set_volume(0x8000, 0x8000);
         drain_output(&mut p);
-        // Before the fade: volume x track 1's replay gain (the first 64 frames were
-        // played at unity volume, before set_volume).
+        // Before the fade: volume x track 1's replay gain (the first 64 frames
+        // were played at unity volume, before set_volume).
         let mut expected = scaled(1, 0..64, gain(FIXED_ONE, 0x8000));
         expected.extend(scaled(1, 64..200, gain(0x8000, 0x8000)));
         for (start, len) in [(0usize, 64usize), (64, 36)] {
@@ -3219,9 +3327,9 @@ mod tests {
         expected.extend(scaled(2, 100..400, gain(0x8000, 0xC000)));
         assert_eq!(p.sink.samples, expected);
         assert_eq!(p.boundary.current_replay_gain, 0xC000);
-        // The first mixed chunk (in = 0) equals the old track at volume x replay gain
-        // within the truncation of the two-step product, not volume x replay
-        // gain squared.
+        // The first mixed chunk (in = 0) equals the old track at volume x
+        // replay gain within the truncation of the two-step product, not volume
+        // x replay gain squared.
         let first_mixed = &p.sink.samples[400..402];
         let v = i32::from(1200i16) << 16;
         assert!(
@@ -3232,10 +3340,10 @@ mod tests {
 
     #[test]
     fn test_crossfade_edges_keep_constant_level_with_replay_gain() {
-        // A constant-level sine through a crossfade between two tracks with the same
-        // replay gain (0.5): the level must not step at either edge. The period
-        // (20 frames) divides the fade start (200), so old and new samples are
-        // in phase inside the mix.
+        // A constant-level sine through a crossfade between two tracks with the
+        // same replay gain (0.5): the level must not step at either edge. The
+        // period (20 frames) divides the fade start (200), so old and new
+        // samples are in phase inside the mix.
         const AMP: f64 = 20_000.0;
         let (t1, t2) = (sine_pcm(300, 20, AMP), sine_pcm(400, 20, AMP));
         let (mut s, mut o) = ([0u8; 4096], [0u8; 16384]);
@@ -3293,7 +3401,8 @@ mod tests {
             (p.fade.mode(), p.fade.state()),
             (FadeMode::None, FadeState::Inactive)
         );
-        // Volume and polarity are player settings (C keeps output.gainL/R and invert).
+        // Volume and polarity are player settings (C keeps output.gainL/R and
+        // invert).
         assert_eq!(
             (p.gain_stage.volume_l_q16, p.gain_stage.invert_polarity),
             (0x8000, true)
@@ -3353,7 +3462,8 @@ mod tests {
             "1 kHz band b1 must retune when sample rate changes from 44.1 kHz to 96 kHz"
         );
 
-        // Enable Fletcher-Munson loudness level 8 and drop volume from 100% to ~55%.
+        // Enable Fletcher-Munson loudness level 8 and drop volume from 100% to
+        // ~55%.
         p.set_eq_gains_db(&[0.0; 10]);
         assert!(!p.equalizer.is_enabled());
         p.set_loudness_level(8);
@@ -3478,7 +3588,8 @@ mod tests {
         assert_eq!(resampler_ref.to_hz(), 96_000);
         let ptr_before: *const _ = &**resampler_ref;
 
-        // Reconfigure with same quality modifies in-place without new Box allocation
+        // Reconfigure with same quality modifies in-place without new Box
+        // allocation
         assert!(p.configure_resampler(48_000, 96_000, ResampleQuality::Low));
         let resampler_after = p.resampler.as_ref().expect("resampler must exist");
         let ptr_after: *const _ = &**resampler_after;
@@ -3633,7 +3744,8 @@ mod tests {
         // Replay gain must be zeroed during crossfade per C output.c:243-245
         assert_eq!(p.gain_stage.replay_gain_q16, 0);
 
-        // Verify scratch filled with new track frames (16 bytes = 2 frames * 8 bytes)
+        // Verify scratch filled with new track frames (16 bytes = 2 frames * 8
+        // bytes)
         assert_eq!(
             &p.write_scratch[..16],
             bytemuck::cast_slice::<i32, u8>(&new_frames)
@@ -3644,5 +3756,122 @@ mod tests {
         assert_eq!(p.output_i32_scratch[1], old_frames[1] + new_frames[1]);
         assert_eq!(p.output_i32_scratch[2], old_frames[2] + new_frames[2]);
         assert_eq!(p.output_i32_scratch[3], old_frames[3] + new_frames[3]);
+    }
+
+    #[test]
+    fn test_pipeline_check_decoder_sample_rate_reengages_after_bypass() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 32768]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        assert!(p.configure_resampler(44_100, 48_000, ResampleQuality::Low));
+        assert!(p.is_resampler_engaged());
+        assert_eq!(p.target_out_hz, Some(48_000));
+
+        let wav_header = |sr: u32| -> [u8; 44] {
+            let mut h = [0u8; 44];
+            h[0..4].copy_from_slice(b"RIFF");
+            h[4..8].copy_from_slice(&(44u32 + 16 - 8).to_le_bytes());
+            h[8..12].copy_from_slice(b"WAVE");
+            h[12..16].copy_from_slice(b"fmt ");
+            h[16..20].copy_from_slice(&16u32.to_le_bytes());
+            h[20..22].copy_from_slice(&1u16.to_le_bytes());
+            h[22..24].copy_from_slice(&2u16.to_le_bytes());
+            h[24..28].copy_from_slice(&sr.to_le_bytes());
+            h[28..32].copy_from_slice(&(sr * 4).to_le_bytes());
+            h[32..34].copy_from_slice(&4u16.to_le_bytes());
+            h[34..36].copy_from_slice(&16u16.to_le_bytes());
+            h[36..40].copy_from_slice(b"data");
+            h[40..44].copy_from_slice(&16u32.to_le_bytes());
+            h
+        };
+
+        // Dynamic change to 48 kHz bypasses resampler while retaining target.
+        p.ingest_stream_data(&wav_header(48_000)).unwrap();
+        p.ingest_stream_data(&[0u8; 16]).unwrap();
+        let _ = p.process_decode_step();
+        assert_eq!(p.active_sample_rate_hz, 48_000);
+        assert!(!p.is_resampler_engaged());
+        assert_eq!(p.target_out_hz, Some(48_000));
+
+        // Subsequent dynamic change to 44.1 kHz re-engages 44.1 -> 48 kHz.
+        p.set_decoder(ActiveDecoder::Pcm(PcmDecoder::new(16, 2, true)));
+        p.ingest_stream_data(&wav_header(44_100)).unwrap();
+        p.ingest_stream_data(&[0u8; 16]).unwrap();
+        let _ = p.process_decode_step();
+        assert_eq!(p.active_sample_rate_hz, 44_100);
+        assert!(p.is_resampler_engaged());
+        assert_eq!(
+            p.resampler
+                .as_ref()
+                .map(|r| (r.from_hz(), r.to_hz(), r.quality())),
+            Some((44_100, 48_000, ResampleQuality::Low))
+        );
+
+        // Explicit clear_resampler drops both active resampler and target.
+        p.clear_resampler();
+        assert!(!p.is_resampler_engaged());
+        assert_eq!(p.target_out_hz, None);
+    }
+
+    #[test]
+    fn test_pipeline_flush_tail_preserves_order_and_multi_chunk_backpressure() {
+        let (mut s, mut o) = ([0u8; 8192], [0u8; 512]);
+        let mut p = rec_pipeline(&mut s, &mut o);
+
+        // Medium quality (32 taps) at 22.05 -> 192 kHz yields > 256 tail samples.
+        assert!(p.configure_resampler(22_050, 192_000, ResampleQuality::Medium));
+        for i in 0..200 {
+            p.pcm_scratch[i] = 10_000;
+        }
+        let _ = p.commit_decoded_pcm(100);
+
+        // Drain output buffer completely.
+        let mut drain = [0u8; 512];
+        let avail = p.output_buffer.available_read();
+        if avail > 0 {
+            let _ = p.output_buffer.read(&mut drain[..avail]);
+        }
+
+        // Pre-stage 4 older pending frames at offset 4.
+        let sentinel = [111_i32, 222, 333, 444, 555, 666, 777, 888];
+        p.pcm_scratch[4..12].copy_from_slice(&sentinel);
+        p.pcm_pending_offset = 4;
+        p.pcm_pending_samples = 8;
+
+        // Fill output buffer leaving room for only 2 stereo frames (16 bytes).
+        let free = p.output_buffer.available_write();
+        let fill_bytes = free.saturating_sub(16);
+        let dummy = [0u8; 64];
+        let mut filled = 0;
+        while filled < fill_bytes {
+            let chunk = (fill_bytes - filled).min(dummy.len());
+            let w = p.output_buffer.write(&dummy[..chunk]).unwrap_or(0);
+            if w == 0 {
+                break;
+            }
+            filled += w;
+        }
+
+        p.flush_resampler_tail();
+
+        // First 2 pending frames must have been written first in order.
+        let mut out_check = [0u8; 512];
+        let got = p.output_buffer.read(&mut out_check[..filled + 16]).unwrap();
+        assert_eq!(got, filled + 16);
+        let mut written_i32 = [0_i32; 4];
+        for (idx, chunk) in out_check[filled..filled + 16].chunks_exact(4).enumerate() {
+            written_i32[idx] = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        assert_eq!(written_i32, [111, 222, 333, 444]);
+
+        // Remaining 2 sentinel frames + full multi-chunk FIR tail (> 256)
+        // staged.
+        assert_eq!(p.pcm_pending_offset, 0);
+        assert_eq!(&p.pcm_scratch[0..4], &[555, 666, 777, 888]);
+        assert!(
+            p.pcm_pending_samples > 260,
+            "expected multi-chunk FIR tail > 256 samples, got {}",
+            p.pcm_pending_samples
+        );
     }
 }

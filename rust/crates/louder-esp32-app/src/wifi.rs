@@ -685,21 +685,32 @@ impl StaticIpConfig {
     }
 }
 
+/// Overwrites the entire capacity of a `heapless::String` with NUL bytes using
+/// `black_box` and a compiler fence to prevent dead-store elimination.
+fn scrub_string<const N: usize>(s: &mut String<N>) {
+    s.clear();
+    while s.push('\0').is_ok() {}
+    core::hint::black_box(s.as_bytes());
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    s.clear();
+    core::hint::black_box(s.len());
+}
+
 /// Validated IEEE 802.11d regulatory domain / country code configuration.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WifiCountryCode {
-    /// Two-character uppercase ISO 3166-1 alpha-2 country code.
-    pub code: [u8; 2],
-    /// First allowed 2.4 GHz channel (`1`).
-    pub start_channel: u8,
-    /// Number of allowed 2.4 GHz channels (`11` FCC, `13` ETSI, `14` JP).
-    pub num_channels: u8,
+    code: [u8; 2],
+    start_channel: u8,
+    num_channels: u8,
 }
 
 impl WifiCountryCode {
     /// Parses and validates a 2-character country code string (`"US"`, `"EU"`,
     /// `"JP"`, `"GB"`, `"DE"`, `"FR"`, `"CA"`, `"AU"`, `"01"`, etc.).
+    ///
+    /// World-safe `"01"` and unrecognized country codes default conservatively
+    /// to 11 channels (`1..=11`).
     pub fn parse(raw: &str) -> Result<Self, StorageError> {
         let trimmed = raw.trim();
         let bytes = trimmed.as_bytes();
@@ -715,15 +726,37 @@ impl WifiCountryCode {
         }
         let code = [c0, c1];
         let num_channels = match &code {
-            b"US" | b"CA" | b"TW" => 11,
             b"JP" => 14,
-            _ => 13,
+            b"EU" | b"GB" | b"DE" | b"FR" | b"ES" | b"IT" | b"NL" | b"BE" | b"AT" | b"CH"
+            | b"SE" | b"NO" | b"DK" | b"FI" | b"PL" | b"PT" | b"IE" | b"CZ" | b"GR" | b"HU"
+            | b"RO" | b"BG" | b"HR" | b"SK" | b"SI" | b"LT" | b"LV" | b"EE" | b"LU" | b"MT"
+            | b"CY" | b"IS" | b"AU" | b"NZ" | b"CN" | b"KR" | b"IN" | b"SG" | b"HK" | b"BR"
+            | b"ZA" | b"RU" => 13,
+            _ => 11,
         };
         Ok(Self {
             code,
             start_channel: 1,
             num_channels,
         })
+    }
+
+    /// Returns the 2-character uppercase country code bytes.
+    #[must_use]
+    pub const fn code(&self) -> [u8; 2] {
+        self.code
+    }
+
+    /// Returns the first allowed 2.4 GHz channel (`1`).
+    #[must_use]
+    pub const fn start_channel(&self) -> u8 {
+        self.start_channel
+    }
+
+    /// Returns the number of allowed 2.4 GHz channels (`11`, `13`, or `14`).
+    #[must_use]
+    pub const fn num_channels(&self) -> u8 {
+        self.num_channels
     }
 
     /// Returns the 2-character country code as a `&str`.
@@ -834,15 +867,27 @@ impl<S: KeyValueStorage> WifiManager<S> {
         };
 
         // Attempt to auto-load saved credentials from store
-        if let Ok(Some(creds)) = WifiCredentials::load_from(&mgr.store) {
+        if let Ok(Some(mut creds)) = WifiCredentials::load_from(&mgr.store) {
             mgr.config.ssid.clear();
-            let _ = mgr.config.ssid.push_str(creds.ssid.as_str());
-            mgr.config.password.clear();
-            let _ = mgr.config.password.push_str(creds.passphrase.as_str());
-            mgr.credentials = Some(creds.clone());
-
-            if creds.autoconnect && !creds.ssid.is_empty() {
-                mgr.state = WifiState::Connecting;
+            scrub_string(&mut mgr.config.password);
+            if mgr.config.ssid.push_str(creds.ssid.as_str()).is_ok()
+                && mgr
+                    .config
+                    .password
+                    .push_str(creds.passphrase.as_str())
+                    .is_ok()
+            {
+                let autoconnect = creds.autoconnect && !creds.ssid.is_empty();
+                mgr.credentials = Some(creds);
+                if autoconnect {
+                    mgr.state = WifiState::Connecting;
+                }
+            } else {
+                mgr.config.ssid.clear();
+                scrub_string(&mut mgr.config.password);
+                scrub_string(&mut creds.passphrase);
+                mgr.credentials = None;
+                mgr.state = WifiState::Disconnected;
             }
         }
 
@@ -883,33 +928,54 @@ impl<S: KeyValueStorage> WifiManager<S> {
             return Err(StorageError::InvalidFormat);
         }
 
-        self.retry_count = 0;
-
-        self.config.ssid.clear();
-        self.config
-            .ssid
+        let mut next_ssid = String::<32>::new();
+        next_ssid
             .push_str(ssid)
             .map_err(|_| StorageError::CapacityExceeded)?;
-        self.config.password.clear();
-        self.config
-            .password
-            .push_str(password)
-            .map_err(|_| StorageError::CapacityExceeded)?;
+        let mut next_password = String::<64>::new();
+        if next_password.push_str(password).is_err() {
+            scrub_string(&mut next_password);
+            return Err(StorageError::CapacityExceeded);
+        }
 
-        // Persist to storage, preserving static IP settings if present
-        // (CODE-CFG-001)
-        let existing = WifiCredentials::load_from(&self.store).ok().flatten();
-        let mut creds = WifiCredentials::new(ssid, password)?;
-        if let Some(prev) = existing {
+        // Persist to storage before mutating in-memory state, preserving static
+        // IP settings if present (CODE-CFG-001).
+        let existing = match WifiCredentials::load_from(&self.store) {
+            Ok(opt) => opt,
+            Err(err) => {
+                scrub_string(&mut next_password);
+                return Err(err);
+            }
+        };
+        let mut creds = match WifiCredentials::new(ssid, password) {
+            Ok(c) => c,
+            Err(err) => {
+                scrub_string(&mut next_password);
+                return Err(err);
+            }
+        };
+        if let Some(mut prev) = existing {
             creds.static_ip = prev.static_ip;
             creds.gateway = prev.gateway;
             creds.subnet = prev.subnet;
             creds.dns = prev.dns;
             creds.autoconnect = prev.autoconnect;
+            scrub_string(&mut prev.passphrase);
         }
-        creds.save_to(&mut self.store)?;
+        if let Err(err) = creds.save_to(&mut self.store) {
+            scrub_string(&mut next_password);
+            scrub_string(&mut creds.passphrase);
+            return Err(err);
+        }
 
+        scrub_string(&mut self.config.password);
+        self.config.ssid = next_ssid;
+        self.config.password = next_password;
+        if let Some(mut old_creds) = self.credentials.take() {
+            scrub_string(&mut old_creds.passphrase);
+        }
         self.credentials = Some(creds);
+        self.retry_count = 0;
         self.state = WifiState::Connecting;
         Ok(self.state)
     }
@@ -976,7 +1042,8 @@ impl<S: KeyValueStorage> WifiManager<S> {
         self.record_success();
     }
 
-    /// Callback invoked when station link and IP lease are acquired (PERIPH-605).
+    /// Callback invoked when station link and IP lease are acquired
+    /// (PERIPH-605).
     pub fn on_connected(&mut self) {
         self.record_success();
     }
@@ -988,25 +1055,19 @@ impl<S: KeyValueStorage> WifiManager<S> {
 
     /// Forgets saved credentials and clears them from persistent storage.
     pub fn forget_credentials(&mut self) -> Result<(), StorageError> {
+        WifiCredentials::clear(&mut self.store)?;
+
         self.config.ssid.clear();
-        self.config.password.clear();
-        for _ in 0..64 {
-            let _ = self.config.password.push('\0');
-        }
-        self.config.password.clear();
+        scrub_string(&mut self.config.password);
 
         if let Some(mut creds) = self.credentials.take() {
-            creds.passphrase.clear();
-            for _ in 0..64 {
-                let _ = creds.passphrase.push('\0');
-            }
-            creds.passphrase.clear();
+            creds.ssid.clear();
+            scrub_string(&mut creds.passphrase);
         }
-        self.credentials = None;
 
         self.state = WifiState::Disconnected;
         self.retry_count = 0;
-        WifiCredentials::clear(&mut self.store)
+        Ok(())
     }
 
     /// Evaluates whether the station should fall back to SoftAP provisioning
@@ -1038,8 +1099,10 @@ impl<S: KeyValueStorage> WifiManager<S> {
         raw_password: &str,
         sta_mac: &[u8; 6],
     ) -> Result<WifiState, StorageError> {
-        let decrypted = decode_legacy_c_password(raw_password, sta_mac)?;
-        self.begin_connect(ssid, decrypted.as_str())
+        let mut decrypted = decode_legacy_c_password(raw_password, sta_mac)?;
+        let res = self.begin_connect(ssid, decrypted.as_str());
+        scrub_string(&mut decrypted);
+        res
     }
 
     /// Persists a validated [`StaticIpConfig`] into the underlying credential
@@ -1053,7 +1116,12 @@ impl<S: KeyValueStorage> WifiManager<S> {
         creds.gateway = Some(static_cfg.gateway);
         creds.subnet = Some(static_cfg.netmask);
         creds.dns = Some(static_cfg.dns);
-        creds.save_to(&mut self.store)
+        creds.save_to(&mut self.store)?;
+        if let Some(mut old_creds) = self.credentials.take() {
+            scrub_string(&mut old_creds.passphrase);
+        }
+        self.credentials = Some(creds);
+        Ok(())
     }
 }
 
@@ -1407,15 +1475,30 @@ mod tests {
 
         let us = WifiCountryCode::parse("US").expect("US");
         assert_eq!(us.as_str(), "US");
+        assert_eq!(us.code(), *b"US");
+        assert_eq!(us.start_channel(), 1);
+        assert_eq!(us.num_channels(), 11);
         assert!(us.is_channel_allowed(11));
         assert!(!us.is_channel_allowed(12));
 
+        let world = WifiCountryCode::parse("01").expect("01");
+        assert_eq!(world.as_str(), "01");
+        assert_eq!(world.num_channels(), 11);
+        assert!(world.is_channel_allowed(11));
+        assert!(!world.is_channel_allowed(12));
+
+        let unknown = WifiCountryCode::parse("ZZ").expect("ZZ");
+        assert_eq!(unknown.num_channels(), 11);
+        assert!(!unknown.is_channel_allowed(12));
+
         let eu = WifiCountryCode::parse("eu").expect("EU");
         assert_eq!(eu.as_str(), "EU");
+        assert_eq!(eu.num_channels(), 13);
         assert!(eu.is_channel_allowed(13));
         assert!(!eu.is_channel_allowed(14));
 
         let jp = WifiCountryCode::parse("JP").expect("JP");
+        assert_eq!(jp.num_channels(), 14);
         assert!(jp.is_channel_allowed(14));
 
         // Legacy C "enc:" XOR credential compatibility
@@ -1438,5 +1521,88 @@ mod tests {
         );
         assert_eq!(wifi.config.password.as_str(), plain);
         wifi.apply_static_ip(static_ip).expect("apply static ip");
+        let synced = wifi.credentials.as_ref().expect("credentials synced");
+        assert_eq!(synced.static_ip, Some(static_ip.ip));
+        assert_eq!(synced.gateway, Some(static_ip.gateway));
+        assert_eq!(synced.subnet, Some(static_ip.netmask));
+        assert_eq!(synced.dns, Some(static_ip.dns));
+    }
+
+    #[test]
+    fn test_wifi_manager_storage_error_atomicity_and_scrubbing() {
+        struct FaultyStore {
+            inner: MemConfigStore<32>,
+            fail_get: bool,
+            fail_set: bool,
+            fail_remove: bool,
+        }
+
+        impl KeyValueStorage for FaultyStore {
+            fn get(&self, key: &str, out: &mut [u8]) -> Result<usize, StorageError> {
+                if self.fail_get {
+                    return Err(StorageError::CapacityExceeded);
+                }
+                self.inner.get(key, out)
+            }
+
+            fn set(&mut self, key: &str, val: &[u8]) -> Result<(), StorageError> {
+                if self.fail_set {
+                    return Err(StorageError::CapacityExceeded);
+                }
+                self.inner.set(key, val)
+            }
+
+            fn remove(&mut self, key: &str) -> Result<(), StorageError> {
+                if self.fail_remove {
+                    return Err(StorageError::CapacityExceeded);
+                }
+                self.inner.remove(key)
+            }
+
+            fn contains(&self, key: &str) -> bool {
+                self.inner.contains(key)
+            }
+        }
+
+        let store = FaultyStore {
+            inner: MemConfigStore::<32>::new(),
+            fail_get: false,
+            fail_set: false,
+            fail_remove: false,
+        };
+        let mut wifi = WifiManager::with_store(store);
+        wifi.connect("PrimaryNet", "PrimaryPass123")
+            .expect("initial");
+        wifi.record_failure();
+        assert_eq!(wifi.retry_count(), 1);
+        assert_eq!(wifi.state(), WifiState::Failed);
+
+        // Storage write failure must not mutate retry_count, config, or state.
+        wifi.store_mut().fail_set = true;
+        assert!(wifi.begin_connect("BrokenNet", "BrokenPass123").is_err());
+        assert_eq!(wifi.retry_count(), 1);
+        assert_eq!(wifi.state(), WifiState::Failed);
+        assert_eq!(wifi.config.ssid.as_str(), "PrimaryNet");
+        assert_eq!(wifi.config.password.as_str(), "PrimaryPass123");
+        wifi.store_mut().fail_set = false;
+
+        // Storage read failure must propagate instead of overwriting settings.
+        wifi.store_mut().fail_get = true;
+        assert!(wifi.begin_connect("ReadErrNet", "ReadErrPass123").is_err());
+        assert_eq!(wifi.config.ssid.as_str(), "PrimaryNet");
+        wifi.store_mut().fail_get = false;
+
+        // Storage remove failure must not wipe in-memory state prematurely.
+        wifi.store_mut().fail_remove = true;
+        assert!(wifi.forget_credentials().is_err());
+        assert!(wifi.credentials.is_some());
+        assert_eq!(wifi.config.ssid.as_str(), "PrimaryNet");
+        wifi.store_mut().fail_remove = false;
+
+        wifi.forget_credentials().expect("forget succeeds");
+        assert!(wifi.credentials.is_none());
+        assert!(wifi.config.ssid.is_empty());
+        assert!(wifi.config.password.is_empty());
+        assert_eq!(wifi.state(), WifiState::Disconnected);
     }
 }
