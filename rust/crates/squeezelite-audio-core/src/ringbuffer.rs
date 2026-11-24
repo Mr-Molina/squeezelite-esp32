@@ -172,9 +172,12 @@ impl<'a> AudioRingBuffer<'a> {
             // JUSTIFICATION: Non-overlapping memory copy for wrap-around read.
             // SAFETY: The peek range wraps around buffer boundary. It is split
             // into two disjoint contiguous slices:
-            // 1. `self.storage.add(r)` of size `data_to_end` into `dst[..data_to_end]`.
-            // 2. `self.storage` of size `remainder` into `dst[data_to_end..to_peek]`.
-            // Both source and destination pointers are valid and non-overlapping.
+            // 1. `self.storage.add(r)` of size `data_to_end` into
+            //    `dst[..data_to_end]`.
+            // 2. `self.storage` of size `remainder` into
+            //    `dst[data_to_end..to_peek]`.
+            // Both source and destination pointers are valid and
+            // non-overlapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), data_to_end);
                 let remainder = to_peek - data_to_end;
@@ -280,7 +283,8 @@ impl<'a> AudioRingBuffer<'a> {
         if to_write <= space_to_end {
             // JUSTIFICATION: Non-overlapping memory copy for contiguous write.
             // SAFETY: `w + to_write <= self.capacity` because
-            // `to_write <= space_to_end` and `space_to_end = self.capacity - w`.
+            // `to_write <= space_to_end` and
+            // `space_to_end = self.capacity - w`.
             // `src` is valid for `to_write` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), self.storage.add(w), to_write);
@@ -291,7 +295,8 @@ impl<'a> AudioRingBuffer<'a> {
             // two disjoint contiguous slices:
             // 1. `src[..space_to_end]` into `self.storage.add(w)`.
             // 2. `src[space_to_end..to_write]` into `self.storage`.
-            // Both source and destination pointers are valid and non-overlapping.
+            // Both source and destination pointers are valid and
+            // non-overlapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), self.storage.add(w), space_to_end);
                 let remainder = to_write - space_to_end;
@@ -341,9 +346,12 @@ impl<'a> AudioRingBuffer<'a> {
             // JUSTIFICATION: Non-overlapping memory copy for wrap-around read.
             // SAFETY: The read range wraps around buffer boundary. Split into
             // two disjoint contiguous slices:
-            // 1. `self.storage.add(r)` of size `data_to_end` into `dst[..data_to_end]`.
-            // 2. `self.storage` of size `remainder` into `dst[data_to_end..to_read]`.
-            // Both source and destination pointers are valid and non-overlapping.
+            // 1. `self.storage.add(r)` of size `data_to_end` into
+            //    `dst[..data_to_end]`.
+            // 2. `self.storage` of size `remainder` into
+            //    `dst[data_to_end..to_read]`.
+            // Both source and destination pointers are valid and
+            // non-overlapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.storage.add(r), dst.as_mut_ptr(), data_to_end);
                 let remainder = to_read - data_to_end;
@@ -639,7 +647,8 @@ mod tests {
         assert_eq!(rb.available_read(), 4);
         assert_eq!(rb.available_write(), 11);
 
-        // Rewinding by 3 bytes should succeed normally (3 of 6 read bytes rewound)
+        // Rewinding by 3 bytes should succeed normally (3 of 6 read bytes
+        // rewound)
         rb.rewind_read(3);
         assert_eq!(rb.available_read(), 7);
         assert_eq!(rb.available_write(), 8);

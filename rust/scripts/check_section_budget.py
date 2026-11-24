@@ -51,6 +51,8 @@ SHT_SYMTAB = 2
 def _load(path):
     with open(path, "rb") as f:
         data = f.read()
+    if len(data) < 0x34:
+        raise ValueError(f"{path}: truncated ELF header")
     if data[:4] != b"\x7fELF":
         raise ValueError(f"{path}: not an ELF file")
     if data[4] != 1 or data[5] != 1:
@@ -81,7 +83,8 @@ def read_sections(path):
     sizes = {}
     for i in range(shnum):
         name_off, _, _, _, _, size = header(i)
-        sizes[_cstr(strtab, name_off)] = size
+        name = _cstr(strtab, name_off)
+        sizes[name] = sizes.get(name, 0) + size
     return sizes
 
 

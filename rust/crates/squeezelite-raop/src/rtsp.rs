@@ -161,15 +161,24 @@ impl<'a> RtspRequest<'a> {
             core::str::from_utf8(&buffer[..sep]).map_err(|_| RtspError::MalformedHeader)?;
         let body = &buffer[sep + 4..];
 
-        let mut lines = header_str.lines();
+        let mut lines = header_str.split("\r\n");
         let request_line = lines.next().ok_or(RtspError::MalformedRequestLine)?;
+        if request_line.contains(['\r', '\n']) {
+            return Err(RtspError::MalformedRequestLine);
+        }
 
-        let mut req_parts = request_line.split_whitespace();
+        let mut req_parts = request_line.split(' ');
         let method_str = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
         let uri = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
         let version = req_parts.next().ok_or(RtspError::MalformedRequestLine)?;
 
-        if !version.starts_with("RTSP/1.") {
+        if req_parts.next().is_some()
+            || method_str.is_empty()
+            || uri.is_empty()
+            || method_str.contains(char::is_whitespace)
+            || uri.contains(char::is_whitespace)
+            || version != "RTSP/1.0"
+        {
             return Err(RtspError::MalformedRequestLine);
         }
 
@@ -177,7 +186,7 @@ impl<'a> RtspRequest<'a> {
 
         let mut cseq = None;
         let mut content_type = None;
-        let mut content_length = 0usize;
+        let mut content_length: Option<usize> = None;
         let mut transport = None;
         let mut apple_challenge = None;
         let mut dacp_id = None;
@@ -185,23 +194,31 @@ impl<'a> RtspRequest<'a> {
         let mut rtp_info = None;
 
         for line in lines {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            if line.is_empty() || line.contains(['\r', '\n']) {
+                return Err(RtspError::MalformedHeader);
             }
-            let colon_idx = trimmed.find(':').ok_or(RtspError::MalformedHeader)?;
-            let key = trimmed[..colon_idx].trim();
-            let value = trimmed[colon_idx + 1..].trim();
+            let colon_idx = line.find(':').ok_or(RtspError::MalformedHeader)?;
+            let key = &line[..colon_idx];
+            if key.is_empty() || key.contains(char::is_whitespace) {
+                return Err(RtspError::MalformedHeader);
+            }
+            let value = line[colon_idx + 1..].trim_matches([' ', '\t']);
 
             if key.eq_ignore_ascii_case("CSeq") {
                 cseq = value.parse::<u32>().ok();
             } else if key.eq_ignore_ascii_case("Content-Type") {
                 content_type = Some(value);
             } else if key.eq_ignore_ascii_case("Content-Length") {
+                if content_length.is_some() {
+                    return Err(RtspError::InvalidContentLength);
+                }
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(RtspError::InvalidContentLength);
+                }
                 let len = value
                     .parse::<usize>()
                     .map_err(|_| RtspError::InvalidContentLength)?;
-                content_length = len;
+                content_length = Some(len);
             } else if key.eq_ignore_ascii_case("Transport") {
                 transport = Some(value);
             } else if key.eq_ignore_ascii_case("Apple-Challenge") {
@@ -216,6 +233,7 @@ impl<'a> RtspRequest<'a> {
         }
 
         let cseq_val = cseq.ok_or(RtspError::MissingCSeq)?;
+        let content_length = content_length.unwrap_or(0);
 
         if body.len() < content_length {
             return Err(RtspError::InvalidContentLength);
@@ -266,7 +284,11 @@ impl SdpSession {
                 let decoded = base64_decode(key_b64).map_err(RtspError::Crypto)?;
                 session.rsaaeskey = Some(decoded);
             } else if let Some(rest) = trimmed.strip_prefix("a=aesiv:") {
-                let decoded = base64_decode(rest.trim()).map_err(RtspError::Crypto)?;
+                let iv_b64 = rest.trim();
+                if iv_b64.len() > 32 {
+                    return Err(RtspError::MalformedSdp);
+                }
+                let decoded = base64_decode(iv_b64).map_err(RtspError::Crypto)?;
                 if decoded.len() != 16 {
                     return Err(RtspError::MalformedSdp);
                 }
@@ -815,5 +837,68 @@ mod tests {
             server.handle_request(&record_req),
             Err(RtspError::InvalidSessionState)
         ));
+    }
+
+    #[test]
+    fn test_duplicate_content_length_rejected() {
+        let dup_cl = concat!(
+            "SET_PARAMETER rtsp://127.0.0.1/1 RTSP/1.0\r\n",
+            "CSeq: 1\r\n",
+            "Content-Length: 5\r\n",
+            "Content-Length: 0\r\n\r\n",
+            "hello"
+        );
+        assert_eq!(
+            RtspRequest::parse(dup_cl.as_bytes()),
+            Err(RtspError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn test_non_strict_crlf_and_header_whitespace_rejected() {
+        let bare_cr = concat!(
+            "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r",
+            "Content-Length: 99\r\n",
+            "CSeq: 1\r\n\r\n"
+        );
+        assert_eq!(
+            RtspRequest::parse(bare_cr.as_bytes()),
+            Err(RtspError::MalformedRequestLine)
+        );
+
+        let bare_lf_hdr = concat!(
+            "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r\n",
+            "CSeq: 1\n",
+            "User-Agent: test\r\n\r\n"
+        );
+        assert_eq!(
+            RtspRequest::parse(bare_lf_hdr.as_bytes()),
+            Err(RtspError::MalformedHeader)
+        );
+
+        let ws_key = concat!(
+            "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0\r\n",
+            "CSeq : 1\r\n\r\n"
+        );
+        assert_eq!(
+            RtspRequest::parse(ws_key.as_bytes()),
+            Err(RtspError::MalformedHeader)
+        );
+
+        let extra_token = concat!(
+            "OPTIONS rtsp://127.0.0.1/1 RTSP/1.0 EXTRA\r\n",
+            "CSeq: 1\r\n\r\n"
+        );
+        assert_eq!(
+            RtspRequest::parse(extra_token.as_bytes()),
+            Err(RtspError::MalformedRequestLine)
+        );
+    }
+
+    #[test]
+    fn test_oversized_sdp_aesiv_rejected_before_decode() {
+        let long_iv = "a".repeat(64);
+        let sdp = format!("a=aesiv:{}\r\n", long_iv);
+        assert_eq!(SdpSession::parse(&sdp), Err(RtspError::MalformedSdp));
     }
 }

@@ -536,8 +536,8 @@ impl<const BANDS: usize> Equalizer<BANDS> {
     }
 
     /// Process interleaved stereo 32-bit audio samples in-place.
-    /// Operates in normalized $[-1.0, 1.0]$ float domain with denormal flushing,
-    /// NaN state isolation, and accurate 32-bit boundary saturation.
+    /// Operates in normalized $[-1.0, 1.0]$ float domain with denormal
+    /// flushing, NaN state isolation, and accurate 32-bit boundary saturation.
     #[inline]
     pub fn process_interleaved(&mut self, samples: &mut [i32]) {
         if !self.enabled {
@@ -589,7 +589,8 @@ fn process_interleaved_iram(
     const SUBCHUNK_FRAMES: usize = 64;
     const NORM: f32 = 1.0 / 2147483648.0;
     const DENORM: f32 = 2147483648.0;
-    const MAX_F32_I32: f32 = 2147483520.0; // Largest representable f32 <= i32::MAX
+    // Largest representable f32 <= i32::MAX
+    const MAX_F32_I32: f32 = 2147483520.0;
     const MIN_F32_I32: f32 = i32::MIN as f32;
     const ANTI_DENORMAL_DC: f32 = 1e-25_f32;
 
@@ -615,7 +616,8 @@ fn process_interleaved_iram(
             buf_r[k] = pair[1] as f32 * NORM;
         }
 
-        // Step B: Bands-outer loop over active bands with zero per-sample branches
+        // Step B: Bands-outer loop over active bands with zero per-sample
+        // branches
         for &i in active_bands {
             let f = filters[i];
             let (mut z1_l, mut z2_l) = hist_left[i];
@@ -1001,7 +1003,8 @@ impl Equalizer<10> {
     /// Retunes all 10 equalizer bands for `gains_db` at sample rate `fs_hz`
     /// using the RBJ peaking EQ designer, verifies Schur-Cohn BIBO stability
     /// for each band, and conditionally resets internal filter delay history
-    /// only if transitioning to disabled or if history contains non-finite values.
+    /// only if transitioning to disabled or if history contains non-finite
+    /// values.
     pub fn retune(&mut self, gains_db: &[f32; 10], fs_hz: f32) {
         self.gains_db = *gains_db;
         let bands = design_bands(gains_db, fs_hz);
@@ -1220,7 +1223,8 @@ mod tests {
         };
         assert!(!boundary_neg_a2.is_stable());
 
-        // Boundary case: a1 = 1.5, a2 = 0.5 (|a1| < 1.0 + a2 fails: 1.5 < 1.5 is false)
+        // Boundary case: a1 = 1.5, a2 = 0.5 (|a1| < 1.0 + a2 fails:
+        // 1.5 < 1.5 is false)
         let boundary_triangle = BiquadCoeffs {
             b0: 1.0,
             b1: 0.0,
@@ -1342,7 +1346,8 @@ mod tests {
         let mut peak_out = 0i32;
         for n in 0..2048 {
             let theta = (n as f32) * core::f32::consts::TAU * 62.5 / 44_100.0;
-            // Taylor-series / Bhaskara sine approximation for no_std test compatibility
+            // Taylor-series / Bhaskara sine approximation for no_std test
+            // compatibility
             let x = theta % core::f32::consts::TAU;
             let x_pi = if x > core::f32::consts::PI {
                 x - core::f32::consts::TAU
@@ -1650,7 +1655,8 @@ mod tests {
     fn test_equalizer_subnormal_flushing_bitspace() {
         let mut eq = Equalizer::<10>::new();
         eq.set_enabled(true);
-        // Activate band 0 with non-bypass filter so it is processed in active_bands
+        // Activate band 0 with non-bypass filter so it is processed in
+        // active_bands
         assert!(eq
             .set_filter(
                 0,

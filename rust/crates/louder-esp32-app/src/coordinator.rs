@@ -741,9 +741,9 @@ impl PlayerCoordinator {
         transport.send(&buf[..len])?;
         // Used for this one HELO (slimproto.c:1171-1174), once it went out.
         self.syncgroup = None;
-        // Deliberate divergence: C sends no SETD after HELO (it answers `setd` queries
-        // only, slimproto.c:589-593). The Rust firmware announces its name here
-        // since Task 9; LMS accepts the unsolicited name.
+        // Deliberate divergence: C sends no SETD after HELO (it answers `setd`
+        // queries only, slimproto.c:589-593). The Rust firmware announces its
+        // name here since Task 9; LMS accepts the unsolicited name.
         send_setd_name(transport, &self.player_name)?;
         if self.state == PlayerState::Disconnected {
             self.state = PlayerState::Connected;
@@ -813,7 +813,9 @@ impl PlayerCoordinator {
             self.arbiter.active(),
             AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
         );
-        if self.arbiter.active_source() == AudioSource::SlimProto && self.stream == StreamLink::Open
+        if self.external_playback
+            || (self.arbiter.active_source() == AudioSource::SlimProto
+                && self.stream == StreamLink::Open)
         {
             self.state = PlayerState::Playing;
         } else {
@@ -848,7 +850,9 @@ impl PlayerCoordinator {
         pipeline: &mut StreamPipeline<'_, S>,
     ) {
         self.end_external_playback();
-        self.reinstall_lms_decoder(pipeline);
+        if !self.external_playback {
+            self.reinstall_lms_decoder(pipeline);
+        }
     }
 
     /// Returns the currently active audio source owning the output pipeline.
@@ -897,11 +901,18 @@ impl PlayerCoordinator {
     /// it returns `None` after every [`Self::tick`]: see
     /// [`CYD_QUEUE_DEPTH`].
     pub fn take_cyd_message(&mut self) -> Option<CydMessage> {
-        Some(match self.cyd_queue.pop_front()? {
-            CydNote::State(state) => CydMessage::PlaybackState(state),
-            CydNote::Volume(pct) => CydMessage::Volume(pct),
-            CydNote::Metadata => self.track_metadata_message()?,
-        })
+        while let Some(note) = self.cyd_queue.pop_front() {
+            match note {
+                CydNote::State(state) => return Some(CydMessage::PlaybackState(state)),
+                CydNote::Volume(pct) => return Some(CydMessage::Volume(pct)),
+                CydNote::Metadata => {
+                    if let Some(msg) = self.track_metadata_message() {
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// C `set_volume(left, right)` (output_embedded.c:118-126) for an `audg`.
@@ -930,8 +941,9 @@ impl PlayerCoordinator {
         backend: &mut B,
         pipeline: &mut StreamPipeline<'_, S>,
     ) {
-        // C parity: output_embedded.c:126 `equalizer_set_volume(left, right)` always
-        // sees the requested volume; kept for the loudness contour (Task 16).
+        // C parity: output_embedded.c:126 `equalizer_set_volume(left, right)`
+        // always sees the requested volume; kept for the loudness contour (Task
+        // 16).
         pipeline.set_requested_volume(left, right);
         let (soft_left, soft_right) = if backend.has_hw_volume() {
             let louder = left.max(right);
@@ -940,7 +952,8 @@ impl PlayerCoordinator {
             if louder == 0 {
                 (0, 0)
             } else {
-                // In u64: `l << 16` overflows u32 at l = 0x10000 (balanced full volume).
+                // In u64: `l << 16` overflows u32 at l = 0x10000 (balanced full
+                // volume).
                 let ratio = |g: u32| ((u64::from(g) << 16) / u64::from(louder)) as u32;
                 (ratio(left), ratio(right))
             }
@@ -1050,7 +1063,8 @@ impl PlayerCoordinator {
         self.lms_track = false;
         self.pending_rate = None;
         self.crossed_rate = None;
-        // A new track (`strm s`) or a stop (`strm q`) ends the previous ICY title.
+        // A new track (`strm s`) or a stop (`strm q`) ends the previous ICY
+        // title.
         self.track_metadata = None;
     }
 
@@ -1162,8 +1176,8 @@ impl PlayerCoordinator {
         let _ = self.poll_stream(source, pipeline);
         self.apply_output_deadlines(pipeline, backend, now_ms);
         self.last_tick_frames = if self.external_audio_pump || self.external_playback {
-            // Decode/output belong to the caller's pump phases; only the play state moves
-            // here.
+            // Decode/output belong to the caller's pump phases; only the play
+            // state moves here.
             self.evaluate_state(pipeline);
             0
         } else {
@@ -1173,9 +1187,9 @@ impl PlayerCoordinator {
             let _ = backend.set_sample_rate(rate);
         }
         self.dma_outstanding_frames = backend.dma_outstanding_frames();
-        // C parity (slimproto.c:842-844, 907): a decoder that stopped with the stream
-        // still open disconnects it, without a DSCO (stream_disconnect sets
-        // STOPPED).
+        // C parity (slimproto.c:842-844, 907): a decoder that stopped with the
+        // stream still open disconnects it, without a DSCO (stream_disconnect
+        // sets STOPPED).
         if self.decode_failed && self.stream == StreamLink::Open {
             self.close_stream(source);
         }
@@ -1318,9 +1332,9 @@ impl PlayerCoordinator {
         self.stream = StreamLink::Idle;
         self.stream_end = Some(DisconnectReason::Unreachable);
         self.pending_dsco = Some(DisconnectReason::Unreachable);
-        // The connect concerns the stream only: an output still RUNNING with the
-        // previous track's tail plays it out (then STMu), as C never touches
-        // the output here.
+        // The connect concerns the stream only: an output still RUNNING with
+        // the previous track's tail plays it out (then STMu), as C never
+        // touches the output here.
         if !self.output_running() {
             self.state = PlayerState::Stopped;
             self.push_cyd(CydNote::State(PlayState::Stopped));
@@ -1346,7 +1360,8 @@ impl PlayerCoordinator {
             AudioFormat::Mp3 => pipeline.use_mp3_decoder(),
             AudioFormat::Flac => {
                 match &mut pipeline.decoder {
-                    // Same codec again (`codc`): restart the decoder at a frame boundary.
+                    // Same codec again (`codc`): restart the decoder at a frame
+                    // boundary.
                     ActiveDecoder::Flac(current) => current.flush(),
                     _ => pipeline.set_decoder(ActiveDecoder::new_flac()),
                 }
@@ -1529,12 +1544,12 @@ impl PlayerCoordinator {
         if self.state != PlayerState::Playing || !self.decoder_may_run() {
             return 0;
         }
-        self.signal_end_of_input(pipeline);
         let mut progressed_steps = 0;
         for _ in 0..max_steps {
+            self.signal_end_of_input(pipeline);
             if pipeline.has_pending_pcm()
                 || pipeline.output_buffer.available_write() < PUMP_DECODE_MIN_OUTPUT_SPACE
-                || pipeline.stream_buffer.available_read() == 0
+                || (pipeline.stream_buffer.available_read() == 0 && !self.stream_eof)
             {
                 break;
             }
@@ -1632,21 +1647,40 @@ impl PlayerCoordinator {
 
     /// Builds the HTTP request for a `strm s` from its header bytes
     /// (`COORD-503`): an empty header block requests `GET /stream.mp3
-    /// HTTP/1.0`; non-UTF-8 (e.g. Latin-1) headers are truncated to 1024
-    /// bytes with every non-ASCII byte replaced by `?`; the request is
-    /// terminated with a blank line if the server did not include one.
+    /// HTTP/1.0`; UTF-8 headers are bounded to 2048 bytes and non-UTF-8
+    /// (e.g. Latin-1) headers are truncated to 1024 bytes with non-ASCII
+    /// replaced by `?`; NUL bytes are stripped, embedded `\r\n\r\n` terminates
+    /// the request, and a trailing blank line is appended if absent.
     fn build_http_request(http_headers: &[u8]) -> Vec<u8> {
-        let mut request: Vec<u8> = if http_headers.is_empty() {
+        const MAX_UTF8_HEADER_BYTES: usize = 2048;
+        if http_headers.is_empty() {
             return DEFAULT_HTTP_REQUEST.to_vec();
-        } else if core::str::from_utf8(http_headers).is_ok() {
-            http_headers.to_vec()
+        }
+        let mut request: Vec<u8> = if let Ok(text) = core::str::from_utf8(http_headers) {
+            let mut end = text.len().min(MAX_UTF8_HEADER_BYTES);
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.as_bytes()[..end]
+                .iter()
+                .copied()
+                .filter(|&b| b != 0)
+                .collect()
         } else {
             http_headers
                 .iter()
                 .take(1024)
-                .map(|&b| if b.is_ascii() { b } else { b'?' })
+                .copied()
+                .filter(|&b| b != 0)
+                .map(|b| if b.is_ascii() { b } else { b'?' })
                 .collect()
         };
+        if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            request.truncate(pos + 4);
+        }
+        if request.is_empty() {
+            return DEFAULT_HTTP_REQUEST.to_vec();
+        }
         if !request.ends_with(b"\r\n\r\n") {
             if request.ends_with(b"\r\n") {
                 request.extend_from_slice(b"\r\n");
@@ -1713,15 +1747,16 @@ impl PlayerCoordinator {
                     now_ms,
                 ),
                 StreamCommandType::Pause => {
-                    // C parity (slimproto.c:395-410): the strm p "replay_gain" field is an
-                    // interval in ms.
+                    // C parity (slimproto.c:395-410): the strm p "replay_gain"
+                    // field is an interval in ms.
                     let interval = replay_gain;
                     if interval > 0 {
-                        // OUTPUT_PAUSE_FRAMES in any output state (slimproto.c:399-401,
-                        // output.c:86-96): silence for `interval`, then RUNNING by itself; no
-                        // STMp. A track still buffering keeps buffering (silence already) and
-                        // plays once started. Rust has no frame-exact silence insertion yet, so
-                        // the deadline is checked every tick.
+                        // OUTPUT_PAUSE_FRAMES in any output state
+                        // (slimproto.c:399-401, output.c:86-96): silence for
+                        // `interval`, then RUNNING by itself; no STMp. A track
+                        // still buffering keeps buffering (silence already) and
+                        // plays once started. Rust has no frame-exact silence
+                        // insertion yet, so the deadline is checked every tick.
                         self.unpause_at_jiffies = None;
                         if !self.external_playback && self.state != PlayerState::Buffering {
                             self.state = PlayerState::Paused;
@@ -1729,7 +1764,8 @@ impl PlayerCoordinator {
                         self.pause_until_ms = Some(now_ms.wrapping_add(interval));
                         return Ok(());
                     }
-                    // Interval 0: output STOPPED and an STMp (slimproto.c:402-408).
+                    // Interval 0: output STOPPED and an STMp
+                    // (slimproto.c:402-408).
                     self.pause_until_ms = None;
                     self.unpause_at_jiffies = None;
                     if !self.external_playback {
@@ -1743,16 +1779,16 @@ impl PlayerCoordinator {
                     Ok(())
                 }
                 StreamCommandType::Resume => {
-                    // C parity (slimproto.c:423-434): STMr always; with jiffies the output
-                    // waits (OUTPUT_START_AT) until that time, unless it is more than 10 s
-                    // ahead (output.c:99-109).
+                    // C parity (slimproto.c:423-434): STMr always; with jiffies
+                    // the output waits (OUTPUT_START_AT) until that time,
+                    // unless it is more than 10 s ahead (output.c:99-109).
                     let jiffies = replay_gain;
                     self.pause_until_ms = None;
                     let ahead = jiffies.wrapping_sub(now_ms) as i32;
                     if jiffies != 0 && ahead > 0 && ahead as u32 <= START_AT_MAX_AHEAD_MS {
                         self.unpause_at_jiffies = Some(jiffies);
-                        // A track still buffering keeps buffering: threshold and STMd stay
-                        // with the decoder (slimproto.c:825-845).
+                        // A track still buffering keeps buffering: threshold
+                        // and STMd stay with the decoder (slimproto.c:825-845).
                         if self.state != PlayerState::Buffering {
                             self.state = PlayerState::Paused;
                         }
@@ -1765,9 +1801,10 @@ impl PlayerCoordinator {
                     Ok(())
                 }
                 StreamCommandType::Stop => {
-                    // C parity (slimproto.c:386-394): decode_flush, output_flush, frames_played
-                    // = 0, stream_disconnect, streambuf flush, and no reply (the STMf there is
-                    // only for 'f').
+                    // C parity (slimproto.c:386-394): decode_flush,
+                    // output_flush, frames_played = 0, stream_disconnect,
+                    // streambuf flush, and no reply (the STMf there is only for
+                    // 'f').
                     self.arbiter.release_source(AudioSource::SlimProto);
                     self.buffer_threshold_bytes = 0;
                     self.close_stream(source);
@@ -1789,8 +1826,9 @@ impl PlayerCoordinator {
                 }
                 StreamCommandType::Flush => self.flush_command(transport, source, pipeline, now_ms),
                 StreamCommandType::Unknown(b't') => {
-                    // RUST-06 / C parity (slimproto.c:371-373): strm t always answers STMt,
-                    // echoing replay_gain as the server timestamp.
+                    // RUST-06 / C parity (slimproto.c:371-373): strm t always
+                    // answers STMt, echoing replay_gain as the server
+                    // timestamp.
                     send_stat_with_metrics(
                         transport,
                         StatEvent::Heartbeat,
@@ -1804,16 +1842,17 @@ impl PlayerCoordinator {
                     )
                 }
                 StreamCommandType::Unknown(b'a') => {
-                    // C parity (slimproto.c:412-421, output.c:70-82): skip `interval` ms of
-                    // output: consume up to interval * rate / 1000 frames of the output buffer
-                    // (8-byte stereo i32 frames) and count them as played. No reply.
-                    // Task 12: the skip stops at a pending track start (see
+                    // C parity (slimproto.c:412-421, output.c:70-82): skip
+                    // `interval` ms of output: consume up to interval * rate /
+                    // 1000 frames of the output buffer (8-byte stereo i32
+                    // frames) and count them as played. No reply. Task 12: the
+                    // skip stops at a pending track start (see
                     // `StreamPipeline::skip_output_frames`).
                     let frames = u64::from(replay_gain) * u64::from(pipeline.sample_rate) / 1000;
                     pipeline.skip_output_frames(frames);
                     self.frames_played = pipeline.frames_played;
-                    // OUTPUT_SKIP_FRAMES replaced any START_AT / PAUSE_FRAMES wait and ends in
-                    // RUNNING (slimproto.c:417, output.c:82).
+                    // OUTPUT_SKIP_FRAMES replaced any START_AT / PAUSE_FRAMES
+                    // wait and ends in RUNNING (slimproto.c:417, output.c:82).
                     let pausing = self.pause_until_ms.take().is_some();
                     let waiting = self.unpause_at_jiffies.take().is_some();
                     if pausing || waiting {
@@ -1829,9 +1868,10 @@ impl PlayerCoordinator {
                 digital_atten,
                 ..
             } => {
-                // C parity: slimproto.c:569 `set_volume(adjust ? gainL : FIXED_ONE, adjust ?
-                // gainR : FIXED_ONE)`. `adjust` (digital_atten) 0 is LMS's fixed-volume mode
-                // (an external amplifier sets the level): unity, the gains are ignored.
+                // C parity: slimproto.c:569 `set_volume(adjust ? gainL :
+                // FIXED_ONE, adjust ? gainR : FIXED_ONE)`. `adjust`
+                // (digital_atten) 0 is LMS's fixed-volume mode (an external
+                // amplifier sets the level): unity, the gains are ignored.
                 let (left, right) = if digital_atten != 0 {
                     (gain_left, gain_right)
                 } else {
@@ -1845,12 +1885,13 @@ impl PlayerCoordinator {
             }
             ServerCommand::SetDevice { sample_rate } => {
                 if sample_rate <= u8::MAX as u32 {
-                    // C parity (slimproto.c:589-593): the id-0 query is answered only when
-                    // the player has a name.
+                    // C parity (slimproto.c:589-593): the id-0 query is
+                    // answered only when the player has a name.
                     if sample_rate == 0 && !self.player_name.is_empty() {
                         send_setd_name(transport, &self.player_name)?;
                     }
-                    // 1-byte id != 0 query is NOT a sample rate; do not update current_sample_rate
+                    // 1-byte id != 0 query is NOT a sample rate; do not update
+                    // current_sample_rate
                     return Ok(());
                 }
                 let bytes = sample_rate.to_be_bytes();
@@ -1858,12 +1899,14 @@ impl PlayerCoordinator {
                     if let Ok(name) = core::str::from_utf8(&bytes[1..]) {
                         self.set_player_name(name);
                     }
-                    // C parity (slimproto.c:600-601): a name change is confirmed with SETD.
+                    // C parity (slimproto.c:600-601): a name change is
+                    // confirmed with SETD.
                     send_setd_name(transport, &self.player_name)?;
                     return Ok(());
                 }
-                // Not a C path (C's process_setd only handles id 0): a legacy Rust sample-rate
-                // form. The clock refusing it keeps the previous clock; no STMn.
+                // Not a C path (C's process_setd only handles id 0): a legacy
+                // Rust sample-rate form. The clock refusing it keeps the
+                // previous clock; no STMn.
                 self.current_sample_rate = sample_rate;
                 let _ = pipeline.set_sample_rate(sample_rate);
                 let _ = backend.set_sample_rate(sample_rate);
@@ -1884,16 +1927,17 @@ impl PlayerCoordinator {
                     pipeline.sink.set_mute(!dac_enable);
                     backend.set_power(dac_enable);
                 } else if let Some(metaint) = cmd.stream_continue() {
-                    // C parity (slimproto.c:501-521): autostart -= 2, STREAMING_WAIT ->
-                    // STREAMING_BUFFERING with the ICY interval. STMl/start follow from the
-                    // status logic.
+                    // C parity (slimproto.c:501-521): autostart -= 2,
+                    // STREAMING_WAIT -> STREAMING_BUFFERING with the ICY
+                    // interval. STMl/start follow from the status logic.
                     self.awaiting_cont = false;
                     if metaint > 0 && self.stream_active() {
                         source.set_icy_metaint(metaint as usize);
                     }
                 } else if opcode == *b"codc" && !payload.is_empty() {
-                    // Codec change: format, sample size, rate, channels, endianness. C parity
-                    // (slimproto.c:523-532): codec_open, so decode READY if the codec exists.
+                    // Codec change: format, sample size, rate, channels,
+                    // endianness. C parity (slimproto.c:523-532): codec_open,
+                    // so decode READY if the codec exists.
                     let format = AudioFormat::from_byte(payload[0]);
                     let bits = payload.get(1).map_or(16, |&b| Self::normalize_pcm_bits(b));
                     let channels = payload
@@ -1909,7 +1953,8 @@ impl PlayerCoordinator {
                     if !self.external_playback {
                         self.decode_ready =
                             Self::select_decoder(pipeline, format, bits, channels, is_be);
-                        // C decode.c:287: codec_open starts a new stream (next track start).
+                        // C decode.c:287: codec_open starts a new stream (next
+                        // track start).
                         pipeline.open_stream();
                     } else {
                         self.decode_ready = true;
@@ -1918,7 +1963,8 @@ impl PlayerCoordinator {
                     self.switch_server(ip, syncgroup);
                 } else if let Some(setting) = cmd.device_setting() {
                     if setting.id == 0 {
-                        // LMS NUL-terminates the name; never keep (or echo) the terminator.
+                        // LMS NUL-terminates the name; never keep (or echo) the
+                        // terminator.
                         let data = setting.data.split(|&b| b == 0).next().unwrap_or(&[]);
                         if !data.is_empty() && data.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
                             if let Ok(name) = core::str::from_utf8(data) {
@@ -1933,7 +1979,8 @@ impl PlayerCoordinator {
                             let _ = pipeline.set_sample_rate(sample_rate);
                             let _ = backend.set_sample_rate(sample_rate);
                         } else {
-                            // C parity (slimproto.c:600-601): a name change is confirmed with SETD.
+                            // C parity (slimproto.c:600-601): a name change is
+                            // confirmed with SETD.
                             send_setd_name(transport, &self.player_name)?;
                         }
                     }
@@ -1970,17 +2017,17 @@ impl PlayerCoordinator {
         pipeline: &mut StreamPipeline<'_, S>,
         now_ms: u32,
     ) -> Result<(), TransportError> {
-        // C parity: slimproto.c:449, STMf is the first reply, before the codec is
-        // opened and the stream connected.
+        // C parity: slimproto.c:449, STMf is the first reply, before the codec
+        // is opened and the stream connected.
         self.send_metrics_stat(transport, StatEvent::StreamFlushed, pipeline, now_ms)?;
 
-        // Task 12, C parity: `strm s` flushes only the stream buffer (stream_sock,
-        // stream.c:624, 738) and opens the codec; the output buffer and output
-        // state are untouched, so the previous track's tail keeps playing and
-        // the new track follows it gaplessly. The new decoder's first frames
-        // set the track boundary (pipeline `TrackMarker`). An output still
-        // RUNNING (Playing with audio out) stays Playing; otherwise the track
-        // starts from Buffering as before.
+        // Task 12, C parity: `strm s` flushes only the stream buffer
+        // (stream_sock, stream.c:624, 738) and opens the codec; the output
+        // buffer and output state are untouched, so the previous track's tail
+        // keeps playing and the new track follows it gaplessly. The new
+        // decoder's first frames set the track boundary (pipeline
+        // `TrackMarker`). An output still RUNNING (Playing with audio out)
+        // stays Playing; otherwise the track starts from Buffering as before.
         let output_continues = self.output_running();
         let pending_stms = self.pending_track_started;
         let was_external = self.external_playback;
@@ -2038,23 +2085,23 @@ impl PlayerCoordinator {
             AudioSource::AirPlay | AudioSource::Spotify | AudioSource::Bluetooth
         );
 
-        // C slimproto.c:484-485: output.threshold and next_replay_gain for the new
-        // track.
+        // C slimproto.c:484-485: output.threshold and next_replay_gain for the
+        // new track.
         pipeline.begin_stream(output_rate, p.replay_gain, p.output_threshold);
-        // C parity: slimproto.c:486-489, fade_mode, fade_secs, invert ((flags & 0x03)
-        // == 0x03) and channels ((flags & 0x0c) >> 2). The fade settings arm
-        // fades at the new track's first decoded frames and at the end of its
-        // decoding.
+        // C parity: slimproto.c:486-489, fade_mode, fade_secs, invert ((flags &
+        // 0x03) == 0x03) and channels ((flags & 0x0c) >> 2). The fade settings
+        // arm fades at the new track's first decoded frames and at the end of
+        // its decoding.
         pipeline.set_transition(
             p.fade_mode,
             u32::from(p.fade_secs),
             p.flags & 0x03 == 0x03,
             ChannelMode::from_strm_flags(p.flags),
         );
-        // Nothing of an earlier track left to play (or another source's audio, which
-        // LMS replaces): the clock can switch now, and the frame counters start
-        // at 0 (COORD-506/509; C resets them at the track start, which then
-        // comes first).
+        // Nothing of an earlier track left to play (or another source's audio,
+        // which LMS replaces): the clock can switch now, and the frame counters
+        // start at 0 (COORD-506/509; C resets them at the track start, which
+        // then comes first).
         let output_idle = was_external || pipeline.output_buffer_available() == 0;
         if output_idle {
             pipeline.flush();
@@ -2082,8 +2129,8 @@ impl PlayerCoordinator {
         self.pcm_channels = channels;
         self.pcm_big_endian = p.big_endian;
 
-        // codec_open (slimproto.c:455-463): '?' waits for `codc` and needs autostart >=
-        // 2.
+        // codec_open (slimproto.c:455-463): '?' waits for `codc` and needs
+        // autostart >= 2.
         if p.format == AudioFormat::Unknown(b'?') {
             if !self.awaiting_cont {
                 // "unknown codec requires autostart >= 2": nothing after STMf.
@@ -2092,13 +2139,14 @@ impl PlayerCoordinator {
                 return Ok(());
             }
         } else if !was_external {
-            // C decode.c:286-317: READY only if a codec for the format exists. A missing
-            // one is no error (no STMn); the track simply never starts. (A
-            // format this build cannot decode also gets a muted PCM decoder,
-            // see `select_decoder`.)
+            // C decode.c:286-317: READY only if a codec for the format exists.
+            // A missing one is no error (no STMn); the track simply never
+            // starts. (A format this build cannot decode also gets a muted PCM
+            // decoder, see `select_decoder`.)
             self.decode_ready =
                 Self::select_decoder(pipeline, p.format, bits, channels, p.big_endian);
-            // codec_open: its first frames start the next track (C decode.c:287).
+            // codec_open: its first frames start the next track (C
+            // decode.c:287).
             pipeline.open_stream();
         } else {
             self.decode_ready = true;
@@ -2109,8 +2157,8 @@ impl PlayerCoordinator {
         // i2s_set_sample_rates): mapped to DECODE_ERROR, i.e. STMn from the
         // status pass (slimproto.c:840), with no stream. Compressed formats
         // learn their rate from the decoder, so the strm field is a hint.
-        // With the previous track still to play the clock is only checked here: it
-        // switches when playback reaches the new track (C output.c:154,
+        // With the previous track still to play the clock is only checked here:
+        // it switches when playback reaches the new track (C output.c:154,
         // pipeline track boundary).
         let verified = crate::clock_table::VERIFIED_RATES.contains(&sample_rate)
             && crate::clock_table::i2s_clock_config(sample_rate).is_some();
@@ -2142,15 +2190,15 @@ impl PlayerCoordinator {
         if output_idle {
             let _ = pipeline.set_sample_rate(sample_rate);
         }
-        // Track start powers the amplifier (device: Hi-Z -> Play when idle), unless LMS
-        // disabled the DAC (`aude`).
+        // Track start powers the amplifier (device: Hi-Z -> Play when idle),
+        // unless LMS disabled the DAC (`aude`).
         if self.dac_enabled {
             backend.set_power(true);
         }
 
-        // C stream.threshold = threshold * 1024 (slimproto.c:471). Clamped below the
-        // stream ring (much smaller than C's), so a large threshold cannot
-        // deadlock.
+        // C stream.threshold = threshold * 1024 (slimproto.c:471). Clamped
+        // below the stream ring (much smaller than C's), so a large threshold
+        // cannot deadlock.
         let requested_threshold = (p.threshold_kb as usize).saturating_mul(1024);
         let max_safe_threshold = pipeline.stream_buffer.capacity().saturating_sub(1024);
         self.buffer_threshold_bytes = if max_safe_threshold > 0 {
@@ -2159,9 +2207,9 @@ impl PlayerCoordinator {
             requested_threshold.min(pipeline.stream_buffer.capacity())
         };
 
-        // stream_sock (slimproto.c:440-442, 468-471): ip 0 is the slimproto server; the
-        // port is used as is. Port 0 cannot connect, so it is the connect
-        // failure C would see (stream.c:684-688), without trying.
+        // stream_sock (slimproto.c:440-442, 468-471): ip 0 is the slimproto
+        // server; the port is used as is. Port 0 cannot connect, so it is the
+        // connect failure C would see (stream.c:684-688), without trying.
         let ip = if p.server_ip == [0, 0, 0, 0] {
             self.lms_ip
         } else {
@@ -2189,8 +2237,8 @@ impl PlayerCoordinator {
             Err(_) => return self.report_stream_unreachable(transport, source, pipeline, now_ms),
         }
 
-        // STREAMING_BUFFERING until more than the threshold arrived (stream.c:527). A
-        // RUNNING output keeps playing meanwhile (gapless).
+        // STREAMING_BUFFERING until more than the threshold arrived
+        // (stream.c:527). A RUNNING output keeps playing meanwhile (gapless).
         if !output_continues && !was_external {
             self.state = PlayerState::Buffering;
         }
@@ -2235,9 +2283,9 @@ impl PlayerCoordinator {
     ) -> Result<(), TransportError> {
         let had_stream = self.stream_active();
         if !self.external_playback {
-            // C decode_flush(false): the decoder stops; PCM it decoded but did not deliver
-            // yet is audio C would not have decoded (its decoders write straight to
-            // outputbuf).
+            // C decode_flush(false): the decoder stops; PCM it decoded but did
+            // not deliver yet is audio C would not have decoded (its decoders
+            // write straight to outputbuf).
             pipeline.discard_decoder_backlog();
         }
         let flushed_output = if self.external_playback {
@@ -2285,8 +2333,9 @@ impl PlayerCoordinator {
     /// one clears it).
     fn switch_server(&mut self, ip: [u8; 4], syncgroup: Option<&[u8]>) {
         if ip == SQUEEZENETWORK_MARKER_IP {
-            // C resolves SQUEEZENETWORK by DNS (slimproto.c:633-634). This firmware has no
-            // resolver yet (Phase 3 discovery), so the switch is ignored.
+            // C resolves SQUEEZENETWORK by DNS (slimproto.c:633-634). This
+            // firmware has no resolver yet (Phase 3 discovery), so the switch
+            // is ignored.
             return;
         }
         self.server_switch = Some(ip);
@@ -2448,17 +2497,25 @@ impl PlayerCoordinator {
             self.stream_past_threshold = true;
         }
 
-        // C slimproto.c:825-834: stream STREAMING_HTTP (or ended with DISCONNECT_OK)
-        // and decode READY -> decode RUNNING; autostart 0 sends STMl once
-        // (sentSTMl), autostart 1 starts the output. Autostart 2/3 wait for
-        // `cont` (awaiting_cont). STREAMING_HTTP is "past the threshold with
-        // the stream still up"; DISCONNECT_OK counts on this one pass only.
-        let clean_end_this_pass = core::mem::take(&mut self.disconnect_ok_unseen);
+        // C slimproto.c:825-834: stream STREAMING_HTTP (or ended with
+        // DISCONNECT_OK) and decode READY -> decode RUNNING; autostart 0 sends
+        // STMl once (sentSTMl), autostart 1 starts the output. Autostart 2/3
+        // wait for `cont` (awaiting_cont). STREAMING_HTTP is "past the
+        // threshold with the stream still up"; DISCONNECT_OK counts on this one
+        // pass only.
+        let clean_end_this_pass =
+            if matches!(self.state, PlayerState::Buffering | PlayerState::Playing)
+                && !self.awaiting_cont
+            {
+                core::mem::take(&mut self.disconnect_ok_unseen)
+            } else {
+                false
+            };
         let streaming = self.stream_past_threshold && self.stream_active();
-        // Task 12: the decoder state is independent of the output (C decode.state vs
-        // output.state). A `strm s` that arrives while the previous track still plays
-        // leaves the player Playing (output RUNNING); its decoder starts here
-        // too.
+        // Task 12: the decoder state is independent of the output (C
+        // decode.state vs output.state). A `strm s` that arrives while the
+        // previous track still plays leaves the player Playing (output
+        // RUNNING); its decoder starts here too.
         if matches!(self.state, PlayerState::Buffering | PlayerState::Playing)
             && self.decode_ready
             && !self.awaiting_cont
@@ -2476,8 +2533,8 @@ impl PlayerCoordinator {
             } else if self.autostart_mode.is_auto() || self.output_start_requested {
                 self.state = PlayerState::Playing;
             } else {
-                // Rust decodes only while Playing, so the decoder starts with `strm u` (C
-                // already fills the output buffer here).
+                // Rust decodes only while Playing, so the decoder starts with
+                // `strm u` (C already fills the output buffer here).
                 self.state = PlayerState::Paused;
             }
             self.output_start_requested = false;
@@ -2486,8 +2543,8 @@ impl PlayerCoordinator {
         let output_empty =
             pipeline.output_buffer.available_read() == 0 && !pipeline.has_pending_pcm();
 
-        // C slimproto.c:838-845 (DECODE_COMPLETE): the decoder used up a stream that
-        // ended.
+        // C slimproto.c:838-845 (DECODE_COMPLETE): the decoder used up a stream
+        // that ended.
         if self.state == PlayerState::Playing
             && self.decode_running
             && self.stream_eof
@@ -2497,12 +2554,14 @@ impl PlayerCoordinator {
             self.decode_running = false;
             self.decode_complete_sent = true;
             self.pending_decode_ready = true;
-            // C decode.c:103: `if (output.fade_mode) _checkfade(false)` (fade-out, in-out).
+            // C decode.c:103: `if (output.fade_mode) _checkfade(false)`
+            // (fade-out, in-out).
             pipeline.fade_track_end();
         }
 
-        // C slimproto.c:872-879: output RUNNING and empty, stream <= DISCONNECT, decode
-        // STOPPED -> STMu once per track (sentSTMu), output STOPPED.
+        // C slimproto.c:872-879: output RUNNING and empty, stream <=
+        // DISCONNECT, decode STOPPED -> STMu once per track (sentSTMu), output
+        // STOPPED.
         if self.output_running()
             && !self.track_underrun_reported
             && output_empty
@@ -2514,12 +2573,12 @@ impl PlayerCoordinator {
             self.pending_underrun = true;
         }
 
-        // C slimproto.c:881-884: output RUNNING and empty while the stream is still
-        // STREAMING_HTTP -> STMo, once per track (sentSTMo). Rust subset: "empty" also
-        // needs the stream ring empty (nothing left to decode), because the
-        // Rust output ring is routinely drained into the DMA between decode
-        // bursts; the DMA backlog itself is counted once output-device frame
-        // counters exist (Task 15).
+        // C slimproto.c:881-884: output RUNNING and empty while the stream is
+        // still STREAMING_HTTP -> STMo, once per track (sentSTMo). Rust subset:
+        // "empty" also needs the stream ring empty (nothing left to decode),
+        // because the Rust output ring is routinely drained into the DMA
+        // between decode bursts; the DMA backlog itself is counted once
+        // output-device frame counters exist (Task 15).
         if self.output_running()
             && !self.output_underrun_reported
             && output_empty
@@ -2583,8 +2642,8 @@ impl PlayerCoordinator {
         let mut msgs = heapless::Vec::new();
         let _ = msgs.push(CydMessage::PlaybackState(self.cyd_playback_state()));
 
-        // The louder side of the requested volume, as the audg CYD note: a balance
-        // ratio in the software gain must not read as a lower volume.
+        // The louder side of the requested volume, as the audg CYD note: a
+        // balance ratio in the software gain must not read as a lower volume.
         let (left, right) = pipeline.requested_volume_q16();
         let _ = msgs.push(CydMessage::Volume(lms_gain_to_hardware_volume_percent(
             left.max(right),
@@ -2615,10 +2674,12 @@ impl PlayerCoordinator {
     ) -> Option<CydMessage> {
         match cmd {
             CydCommand::Play => {
-                self.state = PlayerState::Playing;
-                pipeline.sink.set_mute(false);
-                backend.set_mute(false);
-                Some(CydMessage::PlaybackState(PlayState::Playing))
+                if self.state == PlayerState::Paused {
+                    self.state = PlayerState::Playing;
+                    pipeline.sink.set_mute(false);
+                    backend.set_mute(false);
+                }
+                Some(CydMessage::PlaybackState(self.cyd_playback_state()))
             }
             CydCommand::Pause => {
                 if self.state == PlayerState::Playing || self.state == PlayerState::Buffering {
@@ -2626,24 +2687,23 @@ impl PlayerCoordinator {
                     self.buffer_threshold_bytes = 0;
                     pipeline.sink.set_mute(true);
                 }
-                Some(CydMessage::PlaybackState(PlayState::Paused))
+                Some(CydMessage::PlaybackState(self.cyd_playback_state()))
             }
             CydCommand::Toggle => {
                 if self.state == PlayerState::Playing || self.state == PlayerState::Buffering {
                     self.state = PlayerState::Paused;
                     self.buffer_threshold_bytes = 0;
                     pipeline.sink.set_mute(true);
-                    Some(CydMessage::PlaybackState(PlayState::Paused))
-                } else {
+                } else if self.state == PlayerState::Paused {
                     self.state = PlayerState::Playing;
                     pipeline.sink.set_mute(false);
                     backend.set_mute(false);
-                    Some(CydMessage::PlaybackState(PlayState::Playing))
                 }
+                Some(CydMessage::PlaybackState(self.cyd_playback_state()))
             }
             CydCommand::SetVolume(vol) => {
-                // Through the single volume entry: the device policy applies and the balance
-                // LMS set is kept.
+                // Through the single volume entry: the device policy applies
+                // and the balance LMS set is kept.
                 self.set_volume_percent(vol, backend, pipeline);
                 Some(CydMessage::Volume(vol))
             }
@@ -3131,8 +3191,8 @@ mod tests {
         let mut output_storage = [0u8; 2048];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // Start stream: autostart, PCM 44.1 kHz, threshold 0, body held back by the
-        // server. C parity: STREAMING_BUFFERING until a byte arrives
+        // Start stream: autostart, PCM 44.1 kHz, threshold 0, body held back by
+        // the server. C parity: STREAMING_BUFFERING until a byte arrives
         // (stream.c:527).
         rig.src.hold_data = true;
         let cyd_msg = rig.command(
@@ -3153,13 +3213,14 @@ mod tests {
             f1_l[0], f1_l[1], f1_r[0], f1_r[1], f2_l[0], f2_l[1], f2_r[0], f2_r[1],
         ];
 
-        // The tick that ingests the body starts, decodes and plays it, then emits the
-        // STMs
+        // The tick that ingests the body starts, decodes and plays it, then
+        // emits the STMs
         rig.command(&mut pipeline, &server_frame(b"body", &raw_audio), 150);
         assert_eq!(rig.coord.state, PlayerState::Playing);
         assert_eq!(rig.coord.last_tick_frames(), 2);
         assert!(!rig.coord.pending_track_started);
-        // The output then runs dry with the stream still open: STMo (slimproto.c:881).
+        // The output then runs dry with the stream still open: STMo
+        // (slimproto.c:881).
         assert_eq!(
             rig.lines(),
             ["STAT:STMf", "STAT:STMc", "RESP", "STAT:STMs", "STAT:STMo"]
@@ -3170,9 +3231,9 @@ mod tests {
         assert_eq!(rec[0], 1000 << 16);
         assert_eq!(rec[1], -1000 << 16);
 
-        // Volume adjustment with digital_atten: 1 (gain 0.5 = -6 dB): the amplifier
-        // attenuates, software gain stays at unity (device policy, no double
-        // attenuation)
+        // Volume adjustment with digital_atten: 1 (gain 0.5 = -6 dB): the
+        // amplifier attenuates, software gain stays at unity (device policy, no
+        // double attenuation)
         let cyd_vol = rig.command(&mut pipeline, &audg_frame(32768, 32768, 1), 200);
         assert_eq!(cyd_vol, Some(CydMessage::Volume(91)));
         let reg = lms_gain_to_tas5805m_vol_reg(32768);
@@ -3219,7 +3280,8 @@ mod tests {
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
         // threshold_kb = 255 -> 255 * 1024 = 261120 bytes requested.
-        // Capacity is 2048 bytes. max_safe_threshold = 2048.saturating_sub(1024) =
+        // Capacity is 2048 bytes. max_safe_threshold =
+        // 2048.saturating_sub(1024) =
         // 1024. effective_threshold should clamp to 1024, preventing buffer
         // deadlock.
         start_held(&mut rig, &mut pipeline, true, 255);
@@ -3238,10 +3300,12 @@ mod tests {
         rig.tick(&mut pipeline, 40).unwrap();
         assert_eq!(rig.coord.state, PlayerState::Playing);
 
-        // Full-buffer exit when available_write() == 0 even before reaching threshold
+        // Full-buffer exit when available_write() == 0 even before reaching
+        // threshold
         start_held(&mut rig, &mut pipeline, true, 1);
         rig.coord.buffer_threshold_bytes = 2000;
-        // Fill buffer until completely full (capacity - 1 due to slot reservation)
+        // Fill buffer until completely full (capacity - 1 due to slot
+        // reservation)
         pipeline.ingest_stream_data(&[0xAAu8; 2047]).unwrap();
         assert_eq!(pipeline.stream_buffer.available_write(), 0);
         rig.tick(&mut pipeline, 50).unwrap();
@@ -3250,8 +3314,8 @@ mod tests {
 
     #[test]
     fn test_strm_threshold_kb_is_clamped_to_stream_buffer() {
-        // The same clamp, through a real `strm s` (threshold_kb = 255, 2 KiB stream
-        // buffer)
+        // The same clamp, through a real `strm s` (threshold_kb = 255, 2 KiB
+        // stream buffer)
         let mut rig = Rig::with_source(
             [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
             "TestPlayer",
@@ -3468,8 +3532,8 @@ mod tests {
 
     #[test]
     fn test_coordinator_end_to_end_http_audio_streaming() {
-        // 4 stereo frames of 16-bit big-endian PCM: (100,-100) (200,-200) (300,-300)
-        // (400,-400)
+        // 4 stereo frames of 16-bit big-endian PCM: (100,-100) (200,-200)
+        // (300,-300) (400,-400)
         static STREAM: Segments = &[
             OK_HEAD,
             b"\x00\x64\xff\x9c\x00\xc8\xff\x38\x01\x2c\xfe\xd4\x01\x90\xfe\x70",
@@ -3535,10 +3599,12 @@ mod tests {
     fn test_short_eof_stream_exits_buffering_and_emits_stms_stmu() {
         // COORD-501, COORD-502, COORD-504:
         // A short track smaller than threshold_kb that hits HTTP EOF must:
-        // 1. Transition out of Buffering -> Playing and emit STMs once PCM is written
-        // 2. Once all decoded PCM frames are played out, transition Playing -> Stopped
-        // 3. Emit DSCO(0) at EOF (stream.c:508), then STMd and STMu (C status-loop
-        //    order)
+        // 1. Transition out of Buffering -> Playing and emit STMs once PCM is
+        // written
+        // 2. Once all decoded PCM frames are played out, transition Playing ->
+        // Stopped
+        // 3. Emit DSCO(0) at EOF (stream.c:508), then STMd and STMu (C
+        // status-loop order)
         let mac = [0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
         let mut rig = Rig::with_source(
             mac,
@@ -3551,8 +3617,8 @@ mod tests {
         let mut output_storage = [0u8; 4096];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // threshold_kb = 2 (2048 bytes) and empty http_headers (COORD-503 default
-        // request)
+        // threshold_kb = 2 (2048 bytes) and empty http_headers (COORD-503
+        // default request)
         let start = strm_frame(b's', true, 2, 0, 9000, [127, 0, 0, 1], &[]);
         rig.command(&mut pipeline, &start, 10);
         assert_eq!(rig.coord.state, PlayerState::Buffering);
@@ -3618,10 +3684,10 @@ mod tests {
 
     #[test]
     fn test_latin1_headers_and_http_error_reports_unreachable() {
-        // COORD-503, COORD-509: Non-UTF8 (Latin-1) headers are sent with each non-ASCII
-        // byte replaced by '?'. An HTTP 404 answer arriving after the connect
-        // went pending is a connect failure: STMc + DSCO(3), Stopped, no STMn
-        // (slimproto.c:473, stream.c:687-688).
+        // COORD-503, COORD-509: Non-UTF8 (Latin-1) headers are sent with each
+        // non-ASCII byte replaced by '?'. An HTTP 404 answer arriving after the
+        // connect went pending is a connect failure: STMc + DSCO(3), Stopped,
+        // no STMn (slimproto.c:473, stream.c:687-688).
         static NOT_FOUND: Segments = &[b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"];
         let mac = [0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let mut rig =
@@ -3632,13 +3698,14 @@ mod tests {
         let mut output_storage = [0u8; 1024];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // Pre-populate pipeline with dirty state to verify Start flushes and resets
-        // frames_played (COORD-506, COORD-509)
+        // Pre-populate pipeline with dirty state to verify Start flushes and
+        // resets frames_played (COORD-506, COORD-509)
         pipeline.ingest_stream_data(&[1, 2, 3, 4]).unwrap();
         pipeline.frames_played = 999;
         rig.coord.frames_played = 999;
 
-        // Latin-1 invalid UTF-8 byte 0xE9 ('é') in HTTP request header (COORD-503)
+        // Latin-1 invalid UTF-8 byte 0xE9 ('é') in HTTP request header
+        // (COORD-503)
         let start = strm_frame(
             b's',
             true,
@@ -3670,9 +3737,9 @@ mod tests {
 
     #[test]
     fn test_poll_error_after_connect_drops_stream() {
-        // COORD-508: a stream that connected and then fails while polling (truncated
-        // chunked body) is dropped and marked ended; it is not a connect
-        // failure. C parity: a read error is REMOTE_DISCONNECT, DSCO(2)
+        // COORD-508: a stream that connected and then fails while polling
+        // (truncated chunked body) is dropped and marked ended; it is not a
+        // connect failure. C parity: a read error is REMOTE_DISCONNECT, DSCO(2)
         // (stream.c:364/510).
         static TRUNCATED: Segments =
             &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n\x01\x00\xff\x00"];
@@ -3713,8 +3780,8 @@ mod tests {
 
     #[test]
     fn test_redirect_failure_is_connect_failure_immediately_or_after_wouldblock() {
-        // A redirect whose target cannot be fetched fails the connect. Whether that
-        // surfaces on the first `connect` call or after `WouldBlock`, the
+        // A redirect whose target cannot be fetched fails the connect. Whether
+        // that surfaces on the first `connect` call or after `WouldBlock`, the
         // result is identical.
         static REDIRECT: Segments = &[b"HTTP/1.0 302 Found\r\nLocation: /gone\r\n\r\n"];
         let run = |hold_connect: bool| {
@@ -3777,7 +3844,8 @@ mod tests {
         assert!(!rig.coord.pending_track_started);
         assert_eq!(rig.lines(), ["STAT:STMf", "STAT:STMc", "RESP"]);
 
-        // PCM arrives: the tick that writes it to the sink emits the deferred STMs
+        // PCM arrives: the tick that writes it to the sink emits the deferred
+        // STMs
         rig.src.hold_data = false;
         let mut written = 0;
         for _ in 0..100 {
@@ -3801,10 +3869,10 @@ mod tests {
 
     #[test]
     fn test_coordinator_eof_emits_stmd_then_stmu_after_output_drain() {
-        // Steps the private stages one by one so the output buffer still holds frames
-        // when the decoder finishes. C parity: DSCO(0) as soon as the socket
-        // hits EOF (stream.c:508), STMd on DECODE_COMPLETE, STMu only after the
-        // running output drained (slimproto.c:872).
+        // Steps the private stages one by one so the output buffer still holds
+        // frames when the decoder finishes. C parity: DSCO(0) as soon as the
+        // socket hits EOF (stream.c:508), STMd on DECODE_COMPLETE, STMu only
+        // after the running output drained (slimproto.c:872).
         let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0xBB];
         let mut rig = Rig::with_source(
             mac,
@@ -3978,16 +4046,16 @@ mod tests {
         assert_eq!(rig.coord.volume.gain_left, 65536);
         assert_eq!(rig.coord.volume.gain_right, 65536);
 
-        // Task 14, re-pinned to C (slimproto.c:569): digital_atten (adjust) 0 is fixed
-        // volume, `set_volume(FIXED_ONE, FIXED_ONE)` whatever the gains: unity
-        // in software and 0 dB on the amplifier, never mute.
+        // Task 14, re-pinned to C (slimproto.c:569): digital_atten (adjust) 0
+        // is fixed volume, `set_volume(FIXED_ONE, FIXED_ONE)` whatever the
+        // gains: unity in software and 0 dB on the amplifier, never mute.
         rig.command(&mut pipeline, &audg_frame(0, 0, 0), 100);
         assert_eq!(rig.coord.volume.gain_left, 65536);
         assert_eq!(rig.coord.volume.gain_right, 65536);
         assert_eq!(rig.backend.hw_vol, (0x30, 0x30));
 
-        // 4-byte player name [0, 'B', 'o', 'b'] updates player_name and replies with
-        // SETD without altering current_sample_rate
+        // 4-byte player name [0, 'B', 'o', 'b'] updates player_name and replies
+        // with SETD without altering current_sample_rate
         rig.command(
             &mut pipeline,
             &server_frame(b"setd", &[0x00, b'B', b'o', b'b']),
@@ -4028,8 +4096,8 @@ mod tests {
 
     #[test]
     fn test_digital_atten_zero_forces_unity_sw_gain() {
-        // C parity: slimproto.c:569 `set_volume(adjust ? gainL : FIXED_ONE, adjust ?
-        // gainR : FIXED_ONE)`; the gains are ignored, mute included.
+        // C parity: slimproto.c:569 `set_volume(adjust ? gainL : FIXED_ONE,
+        // adjust ? gainR : FIXED_ONE)`; the gains are ignored, mute included.
         for hw_volume in [true, false] {
             let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x07], "Test");
             rig.backend.hw_volume = hw_volume;
@@ -4071,15 +4139,16 @@ mod tests {
         let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
         let mut pipeline = pcm_pipeline(&mut s, &mut o);
         let sw = |p: &TestPipeline<'_>| (p.gain_stage.volume_l_q16, p.gain_stage.volume_r_q16);
-        // Balanced full volume: exactly unity, not 0 (u32 l << 16 would wrap to 0).
+        // Balanced full volume: exactly unity, not 0 (u32 l << 16 would wrap to
+        // 0).
         rig.command(&mut pipeline, &audg_frame(0x1_0000, 0x1_0000, 1), 10);
         assert_eq!(sw(&pipeline), (0x1_0000, 0x1_0000));
         assert_eq!(rig.backend.hw_vol, (0x30, 0x30));
         // Above unity (LMS never sends it, but no wrap either).
         rig.command(&mut pipeline, &audg_frame(u32::MAX, u32::MAX, 1), 11);
         assert_eq!(sw(&pipeline), (0x1_0000, 0x1_0000));
-        // Hard left / hard right: the amplifier from the louder side, the other side
-        // silent.
+        // Hard left / hard right: the amplifier from the louder side, the other
+        // side silent.
         rig.command(&mut pipeline, &audg_frame(0x8000, 0, 1), 12);
         assert_eq!(sw(&pipeline), (0x1_0000, 0));
         assert_eq!(rig.backend.hw_vol, (0x39, 0x39));
@@ -4098,9 +4167,9 @@ mod tests {
 
     #[test]
     fn test_local_volume_changes_keep_the_balance() {
-        // CYD SetVolume (and the HTTP/IR and boot paths, through the same entry) set
-        // the level through the hardware/software policy and keep LMS's L/R
-        // ratio.
+        // CYD SetVolume (and the HTTP/IR and boot paths, through the same
+        // entry) set the level through the hardware/software policy and keep
+        // LMS's L/R ratio.
         let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x0A], "Test");
         let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
         let mut pipeline = pcm_pipeline(&mut s, &mut o);
@@ -4118,8 +4187,8 @@ mod tests {
             &mut pipeline,
         );
         assert_eq!(msg, Some(CydMessage::Volume(50)));
-        // The amplifier gets the 50 % register (same as percent_to_attenuation), the
-        // software keeps the quarter on the right.
+        // The amplifier gets the 50 % register (same as
+        // percent_to_attenuation), the software keeps the quarter on the right.
         assert_eq!(
             rig.backend.hw_vol,
             (
@@ -4133,8 +4202,8 @@ mod tests {
             "{}",
             pipeline.gain_stage.volume_r_q16
         );
-        // The requested volume (Task 16's loudness input) follows: louder side at the
-        // 50 % level.
+        // The requested volume (Task 16's loudness input) follows: louder side
+        // at the 50 % level.
         let (l, r) = pipeline.requested_volume_q16();
         assert_eq!(lms_gain_to_hardware_volume_percent(l.max(r)), 50);
         assert!((u64::from(r) * 4).abs_diff(u64::from(l)) <= 4, "({l}, {r})");
@@ -4174,8 +4243,8 @@ mod tests {
 
     #[test]
     fn test_cyd_telemetry_volume_from_requested_volume() {
-        // Hard-left balance must not read as half volume: the percent is the louder
-        // side's, as the audg CYD note.
+        // Hard-left balance must not read as half volume: the percent is the
+        // louder side's, as the audg CYD note.
         let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x0B], "Test");
         let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
         let mut pipeline = pcm_pipeline(&mut s, &mut o);
@@ -4199,8 +4268,8 @@ mod tests {
 
     #[test]
     fn test_audg_software_volume_without_hardware_volume() {
-        // C parity: output_embedded.c:118-126, no volume_cb: output.gainL/R = the
-        // gains, per channel (balance kept), applied by the gain stage.
+        // C parity: output_embedded.c:118-126, no volume_cb: output.gainL/R =
+        // the gains, per channel (balance kept), applied by the gain stage.
         let mut rig = Rig::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x08], "Test");
         rig.backend.hw_volume = false;
         let (mut s, mut o) = ([0u8; 1024], [0u8; 1024]);
@@ -4238,9 +4307,9 @@ mod tests {
         let mut output_storage = [0u8; 1024];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // Unequal channels: the louder one sets both TAS channels (Task 7), and the
-        // software gain keeps the balance as the per-channel ratio to it (Task
-        // 14 fix round: C honors independent L/R gains, output.c:54-55;
+        // Unequal channels: the louder one sets both TAS channels (Task 7), and
+        // the software gain keeps the balance as the per-channel ratio to it
+        // (Task 14 fix round: C honors independent L/R gains, output.c:54-55;
         // Balance=1, embedded.h:47). 1842 = LMS 51% slider (-31 dB) -> 55% ->
         // 0x5D (-22.5 dB)
         let msg = rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 10);
@@ -4258,8 +4327,8 @@ mod tests {
             (65536, 65536)
         );
         rig.command(&mut pipeline, &audg_frame(1842, 900, 1), 16);
-        // The requested volume (C equalizer_set_volume's input, Task 16) is LMS's, per
-        // channel.
+        // The requested volume (C equalizer_set_volume's input, Task 16) is
+        // LMS's, per channel.
         assert_eq!(pipeline.requested_volume_q16(), (1842, 900));
 
         // Zero gain: amplifier muted, software gain 0
@@ -4289,8 +4358,8 @@ mod tests {
         assert_eq!(pipeline.sample_rate, 48_000);
         assert_eq!(rig.backend.rate, 48_000);
 
-        // A rate the clock refuses keeps the previous clock; the coordinator state
-        // still follows the server (no STMn yet).
+        // A rate the clock refuses keeps the previous clock; the coordinator
+        // state still follows the server (no STMn yet).
         rig.command(
             &mut pipeline,
             &server_frame(b"setd", &12_345u32.to_be_bytes()),
@@ -4344,8 +4413,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Task 9: device path through the coordinator (pumps, decoder provider, codc,
-    // STMl, ...)
+    // Task 9: device path through the coordinator (pumps, decoder provider,
+    // codc, STMl, ...)
     // -------------------------------------------------------------------------
 
     /// `strm_frame` with another format byte.
@@ -4363,8 +4432,8 @@ mod tests {
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
         rig.coord.external_audio_pump = true;
         start_held(&mut rig, &mut pipeline, true, 0);
-        // Bytes reach the stream ring; the tick starts the track, the device pumps
-        // decode and output itself.
+        // Bytes reach the stream ring; the tick starts the track, the device
+        // pumps decode and output itself.
         pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
         rig.tick(&mut pipeline, 15).unwrap();
         assert_eq!(rig.coord.state, PlayerState::Playing);
@@ -4386,9 +4455,9 @@ mod tests {
 
     #[test]
     fn test_eof_with_undecodable_tail_still_ends_the_track() {
-        // A stream ending in a partial frame used to leave the tail in the stream ring
-        // forever (no STMd/STMu). The device firmware dropped it; the
-        // coordinator now does too.
+        // A stream ending in a partial frame used to leave the tail in the
+        // stream ring forever (no STMd/STMu). The device firmware dropped it;
+        // the coordinator now does too.
         let mut rig = Rig::with_source(
             [2; 6],
             "T",
@@ -4533,7 +4602,8 @@ mod tests {
         assert_eq!(rig.coord.current_format, Some(AudioFormat::Flac));
         rig.command(&mut pipeline, &server_frame(b"codc", b"m"), 20);
         assert!(matches!(pipeline.decoder, ActiveDecoder::Mp3(_)));
-        // PCM: format, sample size, rate, channels, endianness ('1' = little endian).
+        // PCM: format, sample size, rate, channels, endianness ('1' = little
+        // endian).
         rig.command(&mut pipeline, &server_frame(b"codc", b"p231\x01"), 30);
         match &pipeline.decoder {
             ActiveDecoder::Pcm(d) => {
@@ -4555,8 +4625,8 @@ mod tests {
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
         rig.command(&mut pipeline, &strm_frame_fmt(b'm', true, 0), 10);
         assert!(matches!(pipeline.decoder, ActiveDecoder::Mp3(_)));
-        // Unknown format ('z') is not decodable: never feed its bytes to the previous
-        // (MP3) decoder.
+        // Unknown format ('z') is not decodable: never feed its bytes to the
+        // previous (MP3) decoder.
         rig.command(&mut pipeline, &strm_frame_fmt(b'z', true, 0), 20);
         assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
         assert!(pipeline.user_muted);
@@ -4569,9 +4639,9 @@ mod tests {
 
     #[test]
     fn test_mp3_decoder_comes_from_the_pipeline_slot_and_returns_to_it() {
-        // Firmware builds have no heap MP3 decoder: bring-up parks the static one in
-        // the pipeline's MP3 slot. The coordinator must use (and give back)
-        // that very decoder.
+        // Firmware builds have no heap MP3 decoder: bring-up parks the static
+        // one in the pipeline's MP3 slot. The coordinator must use (and give
+        // back) that very decoder.
         let mut rig = Rig::new([6; 6], "T");
         let mut stream_storage = [0u8; 1024];
         let mut output_storage = [0u8; 1024];
@@ -4624,7 +4694,8 @@ mod tests {
         );
         assert_eq!(&rig.sent[1].1[1..], b"Kitchen");
         assert_eq!(rig.coord.state, PlayerState::Connected);
-        // C parity: no STAT after HELO until output runs or LMS asks (slimproto.c:890).
+        // C parity: no STAT after HELO until output runs or LMS asks
+        // (slimproto.c:890).
         rig.tick(&mut pipeline, 5_101).unwrap();
         assert_eq!(rig.lines(), ["HELO", "SETD"]);
     }
@@ -4693,8 +4764,8 @@ mod tests {
         for t in 0..4 {
             rig.tick(&mut pipeline, 20 + t).unwrap();
         }
-        // The 8-byte track ends (DSCO(0)) below the 1 KB threshold: DISCONNECT_OK
-        // starts it like the threshold would, so STMl follows
+        // The 8-byte track ends (DSCO(0)) below the 1 KB threshold:
+        // DISCONNECT_OK starts it like the threshold would, so STMl follows
         // (slimproto.c:825-831).
         let lines = rig.lines();
         assert_eq!(
@@ -4770,7 +4841,8 @@ mod tests {
         let mut stream_storage = [0u8; 2048];
         let mut output_storage = [0u8; 2048];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
-        // An LMS track plays to the end (STMd ... STMu leave per-track flags behind).
+        // An LMS track plays to the end (STMd ... STMu leave per-track flags
+        // behind).
         rig.command(
             &mut pipeline,
             &strm_frame(b's', true, 0, 0, 9000, [127, 0, 0, 1], &[]),
@@ -4806,8 +4878,8 @@ mod tests {
 
     #[test]
     fn test_external_frame_buffer_receives_frames_and_bounds_their_size() {
-        // The firmware hands the coordinator a static frame buffer (off the task
-        // stack).
+        // The firmware hands the coordinator a static frame buffer (off the
+        // task stack).
         let mut rig = Rig::new([12; 6], "T");
         let mut stream_storage = [0u8; 1024];
         let mut output_storage = [0u8; 1024];
@@ -4815,7 +4887,8 @@ mod tests {
         rig.coord.set_frame_buffer(Box::leak(Box::new([0u8; 64])));
         rig.command(&mut pipeline, &server_frame(b"setd", b"\x00Den"), 10);
         assert_eq!(rig.coord.player_name.as_str(), "Den");
-        // A frame larger than the buffer is dropped by the transport (Io) and skipped.
+        // A frame larger than the buffer is dropped by the transport (Io) and
+        // skipped.
         let long_name = [b'x'; 80];
         let mut payload = vec![0u8];
         payload.extend_from_slice(&long_name);
@@ -4826,9 +4899,9 @@ mod tests {
 
     #[test]
     fn test_external_audio_pump_keeps_decode_and_output_out_of_tick() {
-        // Device: the pump phases own decode/output; tick must not play audio on its
-        // own, but state transitions (Buffering -> Playing, STMs from pumped
-        // output) still happen.
+        // Device: the pump phases own decode/output; tick must not play audio
+        // on its own, but state transitions (Buffering -> Playing, STMs from
+        // pumped output) still happen.
         let mut rig =
             Rig::with_source([13; 6], "T", GatedSource::new(b"/stream.mp3", SHORT_STREAM));
         rig.coord.external_audio_pump = true;
@@ -5022,8 +5095,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Task 11: C-parity protocol sequencing (slimproto.c status loop, process_strm,
-    // process_serv)
+    // Task 11: C-parity protocol sequencing (slimproto.c status loop,
+    // process_strm, process_serv)
     // -------------------------------------------------------------------------
 
     /// `strm` frame with an explicit format byte, autostart byte and flags.
@@ -5106,10 +5179,10 @@ mod tests {
 
     #[test]
     fn test_connect_failure_sends_dsco_unreachable_once_no_stmn() {
-        // C parity: STMf first (slimproto.c:449), STMc after stream_sock returns even
-        // when the connect failed (slimproto.c:473), then DSCO(UNREACHABLE)
-        // once from the status loop (stream.c:684-688, slimproto.c:804-808 +
-        // 910). No STMn: that is DECODE_ERROR only.
+        // C parity: STMf first (slimproto.c:449), STMc after stream_sock
+        // returns even when the connect failed (slimproto.c:473), then
+        // DSCO(UNREACHABLE) once from the status loop (stream.c:684-688,
+        // slimproto.c:804-808 + 910). No STMn: that is DECODE_ERROR only.
         let mut rig = Rig::new([0x21; 6], "T");
         rig.src.inner.fail_connect = true;
         let mut stream_storage = [0u8; 2048];
@@ -5131,8 +5204,8 @@ mod tests {
 
     #[test]
     fn test_port_zero_is_a_connect_failure_not_a_buffering_stall() {
-        // C uses the strm port as is (slimproto.c:442, stream.c:677): port 0 never
-        // connects. The Rust player used to sit in Buffering forever with
+        // C uses the strm port as is (slimproto.c:442, stream.c:677): port 0
+        // never connects. The Rust player used to sit in Buffering forever with
         // threshold > 0.
         let mut rig = Rig::new([0x22; 6], "T");
         let mut stream_storage = [0u8; 2048];
@@ -5151,9 +5224,9 @@ mod tests {
 
     #[test]
     fn test_unknown_codec_opens_no_decoder_and_sends_no_stmn() {
-        // C parity: codec_open() for a format with no codec logs "codec not found" and
-        // leaves decode STOPPED (decode.c:286-317): no DECODE_ERROR, so no
-        // STMn, and the track never starts (slimproto.c:825 needs
+        // C parity: codec_open() for a format with no codec logs "codec not
+        // found" and leaves decode STOPPED (decode.c:286-317): no DECODE_ERROR,
+        // so no STMn, and the track never starts (slimproto.c:825 needs
         // DECODE_READY). The stream itself still connects.
         let mut rig = Rig::with_source(
             [0x23; 6],
@@ -5184,8 +5257,8 @@ mod tests {
 
     #[test]
     fn test_unsupported_rate_sends_stmn() {
-        // The clock refuses the PCM rate. C has no clean equivalent (it resamples, or
-        // logs the i2s_set_sample_rates failure and plays on,
+        // The clock refuses the PCM rate. C has no clean equivalent (it
+        // resamples, or logs the i2s_set_sample_rates failure and plays on,
         // output_i2s.c:638-641); the accepted mapping is DECODE_ERROR: STMn
         // from the status loop (slimproto.c:840), no stream.
         let mut rig = Rig::with_source(
@@ -5222,8 +5295,8 @@ mod tests {
 
     #[test]
     fn test_decoder_error_sends_stmn_and_closes_the_stream() {
-        // DECODE_ERROR (here: a sample format the decoder refuses) -> STMn, the stream
-        // is disconnected without a DSCO (slimproto.c:838-845,
+        // DECODE_ERROR (here: a sample format the decoder refuses) -> STMn, the
+        // stream is disconnected without a DSCO (slimproto.c:838-845,
         // stream_disconnect sets STOPPED).
         let mut rig = Rig::with_source(
             [0x25; 6],
@@ -5252,9 +5325,9 @@ mod tests {
 
     #[test]
     fn test_output_underrun_emits_stmo_once_per_track() {
-        // C parity: STMo once per track (sentSTMo, reset at strm s, slimproto.c:474)
-        // when output runs dry while the stream is still STREAMING_HTTP
-        // (slimproto.c:881-884).
+        // C parity: STMo once per track (sentSTMo, reset at strm s,
+        // slimproto.c:474) when output runs dry while the stream is still
+        // STREAMING_HTTP (slimproto.c:881-884).
         let mut rig = Rig::with_source(
             [0x26; 6],
             "T",
@@ -5291,8 +5364,8 @@ mod tests {
 
     #[test]
     fn test_pause_interval_resumes_after_ms() {
-        // C parity: strm p with an interval is OUTPUT_PAUSE_FRAMES: silence for the
-        // interval, then RUNNING again by itself, and no STMp
+        // C parity: strm p with an interval is OUTPUT_PAUSE_FRAMES: silence for
+        // the interval, then RUNNING again by itself, and no STMp
         // (slimproto.c:395-410, output.c:86-96).
         let mut rig = Rig::with_source(
             [0x27; 6],
@@ -5335,8 +5408,9 @@ mod tests {
 
     #[test]
     fn test_unpause_at_jiffies() {
-        // C parity: strm u answers STMr and, with jiffies, starts output at that time
-        // (slimproto.c:423-434, output.c:99-109); more than 10 s ahead starts at once.
+        // C parity: strm u answers STMr and, with jiffies, starts output at
+        // that time (slimproto.c:423-434, output.c:99-109); more than 10 s
+        // ahead starts at once.
         let mut rig = Rig::with_source(
             [0x28; 6],
             "T",
@@ -5409,8 +5483,8 @@ mod tests {
 
     #[test]
     fn test_stml_waits_for_threshold_and_ready_decoder() {
-        // C parity: STMl only with autostart 0, the stream past the threshold and
-        // decode READY (slimproto.c:825-831); not when the response is
+        // C parity: STMl only with autostart 0, the stream past the threshold
+        // and decode READY (slimproto.c:825-831); not when the response is
         // accepted. No STMp at strm s.
         let mut rig = Rig::with_source(
             [0x2A; 6],
@@ -5465,8 +5539,8 @@ mod tests {
                 "STAT:STMu"
             ]
         );
-        // STMu is once per track (sentSTMu): an unpause after the end does not repeat
-        // it.
+        // STMu is once per track (sentSTMu): an unpause after the end does not
+        // repeat it.
         rig.sent.clear();
         rig.command(&mut pipeline, &simple_strm(b'u'), 40);
         rig.tick(&mut pipeline, 41).unwrap();
@@ -5511,8 +5585,8 @@ mod tests {
 
     #[test]
     fn test_strm_q_sends_nothing_and_strm_f_only_reports_a_real_flush() {
-        // C parity: strm q has no reply (slimproto.c:386-394); strm f answers STMf only
-        // when a stream was disconnected or output flushed
+        // C parity: strm q has no reply (slimproto.c:386-394); strm f answers
+        // STMf only when a stream was disconnected or output flushed
         // (slimproto.c:374-385).
         let mut rig = Rig::with_source(
             [0x2D; 6],
@@ -5544,9 +5618,9 @@ mod tests {
 
     #[test]
     fn test_strm_a_skips_ms_of_output_frames() {
-        // C parity: skip_frames = interval * rate / 1000, consumed from the output
-        // buffer and counted as played (slimproto.c:412-421, output.c:70-82).
-        // Output frames are 8 bytes.
+        // C parity: skip_frames = interval * rate / 1000, consumed from the
+        // output buffer and counted as played (slimproto.c:412-421,
+        // output.c:70-82). Output frames are 8 bytes.
         let mut rig = Rig::new([0x2E; 6], "T");
         let mut stream_storage = [0u8; 1024];
         let mut output_storage = [0u8; 4096];
@@ -5573,8 +5647,8 @@ mod tests {
 
     #[test]
     fn test_serv_reconnects_with_syncgroup_in_helo() {
-        // C parity: process_serv keeps a 10-byte SyncgroupID for the next HELO only
-        // (slimproto.c:633-656, 1171-1174); a serv without one clears it.
+        // C parity: process_serv keeps a 10-byte SyncgroupID for the next HELO
+        // only (slimproto.c:633-656, 1171-1174); a serv without one clears it.
         let mut rig = Rig::new([0x2F; 6], "T");
         let mut stream_storage = [0u8; 1024];
         let mut output_storage = [0u8; 1024];
@@ -5611,8 +5685,8 @@ mod tests {
         rig.drain_sent();
         assert!(!rig.sent[0].1.windows(11).any(|w| w == b"SyncgroupID"));
 
-        // SqueezeNetwork (0.0.0.1) needs DNS, which this firmware does not have:
-        // ignored.
+        // SqueezeNetwork (0.0.0.1) needs DNS, which this firmware does not
+        // have: ignored.
         rig.command(&mut pipeline, &server_frame(b"serv", &[0, 0, 0, 1]), 40);
         assert_eq!(rig.coord.take_server_switch(), None);
     }
@@ -5663,8 +5737,8 @@ mod tests {
 
     #[test]
     fn test_cyd_queue_keeps_every_message_of_a_tick() {
-        // A connect failure resolved in the same tick as an audg must not lose either
-        // update.
+        // A connect failure resolved in the same tick as an audg must not lose
+        // either update.
         let mut rig = Rig::new([0x31; 6], "T");
         let mut stream_storage = [0u8; 1024];
         let mut output_storage = [0u8; 1024];
@@ -5695,8 +5769,9 @@ mod tests {
 
     #[test]
     fn test_strm_a_ends_a_start_at_or_pause_frames_wait() {
-        // C parity: strm a sets OUTPUT_SKIP_FRAMES over any START_AT / PAUSE_FRAMES
-        // wait, and the skip ends in RUNNING (slimproto.c:417, output.c:82).
+        // C parity: strm a sets OUTPUT_SKIP_FRAMES over any START_AT /
+        // PAUSE_FRAMES wait, and the skip ends in RUNNING (slimproto.c:417,
+        // output.c:82).
         for wait in *b"up" {
             let mut rig = Rig::with_source(
                 [0x40; 6],
@@ -5776,12 +5851,12 @@ mod tests {
         assert_eq!(rig.coord.state, PlayerState::Playing);
         assert!(!rig.backend.muted);
 
-        // While buffering, the track keeps buffering and plays once started, even with
-        // autostart off (C output already RUNNING when the decoder starts).
-        // Task 12 (C parity): this strm s arrives with the output RUNNING, which it
-        // never touches (slimproto.c:436-489), so the player stays Playing; the
-        // threshold gates the decoder (decode READY until slimproto.c:825-834),
-        // not the output.
+        // While buffering, the track keeps buffering and plays once started,
+        // even with autostart off (C output already RUNNING when the decoder
+        // starts). Task 12 (C parity): this strm s arrives with the output
+        // RUNNING, which it never touches (slimproto.c:436-489), so the player
+        // stays Playing; the threshold gates the decoder (decode READY until
+        // slimproto.c:825-834), not the output.
         start_held(&mut rig, &mut pipeline, false, 1);
         rig.command(
             &mut pipeline,
@@ -5805,8 +5880,8 @@ mod tests {
 
     #[test]
     fn test_strm_u_jiffies_while_buffering_keeps_threshold_and_stmd() {
-        // An unpause time that arrives before the threshold must not bypass it, and the
-        // decoder must still report STMd (slimproto.c:825-845).
+        // An unpause time that arrives before the threshold must not bypass it,
+        // and the decoder must still report STMd (slimproto.c:825-845).
         let mut rig = Rig::with_source(
             [0x42; 6],
             "T",
@@ -5829,8 +5904,8 @@ mod tests {
             "deadline passed, threshold not"
         );
         assert_eq!(pipeline.frames_played, 0);
-        // The body (8 bytes, below the threshold) and EOF arrive: DISCONNECT_OK starts
-        // it.
+        // The body (8 bytes, below the threshold) and EOF arrive: DISCONNECT_OK
+        // starts it.
         rig.src.hold_data = false;
         for t in 0..10 {
             rig.tick(&mut pipeline, 700 + t).unwrap();
@@ -5911,9 +5986,9 @@ mod tests {
 
     #[test]
     fn test_clean_end_starts_a_track_only_on_the_pass_that_sees_it() {
-        // C parity: the DISCONNECT_OK start condition holds on one status pass only
-        // (slimproto.c:804-808, 825-827). A decoder that becomes ready later (codc
-        // after the stream ended) never starts the track.
+        // C parity: the DISCONNECT_OK start condition holds on one status pass
+        // only (slimproto.c:804-808, 825-827). A decoder that becomes ready
+        // later (codc after the stream ended) never starts the track.
         let mut rig = Rig::with_source(
             [0x45; 6],
             "T",
@@ -5946,7 +6021,8 @@ mod tests {
 
     #[test]
     fn test_setd_query_is_answered_only_with_a_name() {
-        // C parity (slimproto.c:589-593): `if (strlen(player_name)) sendSETDName(...)`.
+        // C parity (slimproto.c:589-593): `if (strlen(player_name))
+        // sendSETDName(...)`.
         let mut rig = Rig::new([0x46; 6], "");
         let mut stream_storage = [0u8; 1024];
         let mut output_storage = [0u8; 1024];
@@ -5959,7 +6035,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Task 12: gapless track boundaries (C output.track_start, output.c:126-166)
+    // Task 12: gapless track boundaries (C output.track_start,
+    // output.c:126-166)
     // -------------------------------------------------------------------------
 
     /// Sink recording every sample and the clock rate each write was made at.
@@ -6086,7 +6163,8 @@ mod tests {
             *now += 10;
             rig.tick(pipeline, *now).unwrap();
             if rig.coord.external_audio_pump {
-                // The device loop's pump phases (main.rs: output, decode, output).
+                // The device loop's pump phases (main.rs: output, decode,
+                // output).
                 rig.coord.pump_output(pipeline, 16);
                 rig.coord.pump_decode(pipeline, 4);
                 rig.coord.pump_output(pipeline, 16);
@@ -6121,7 +6199,8 @@ mod tests {
         assert!(p.output_buffer_available() > 0);
         let played_before_strm = p.sink.samples.len();
 
-        // LMS sends the next track on STMd. C: no output flush, output stays RUNNING.
+        // LMS sends the next track on STMd. C: no output flush, output stays
+        // RUNNING.
         now += 10;
         rig.command(&mut p, &strm_start(2, b'3', true), now);
         assert_eq!(rig.coord.state, PlayerState::Playing);
@@ -6138,7 +6217,8 @@ mod tests {
         let mut expected = track_samples(1, 600);
         expected.extend(track_samples(2, 400));
         assert_eq!(p.sink.samples, expected);
-        // Exactly one STMs per track; the second one at the boundary sample index.
+        // Exactly one STMs per track; the second one at the boundary sample
+        // index.
         assert_eq!(stms_at, [0, 600]);
         assert_eq!(
             status_lines(&rig),
@@ -6184,8 +6264,8 @@ mod tests {
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
             count(&r.lines(), "STAT:STMd") == 1
         });
-        // C decode.c:103 `_checkfade(false)`: down over the last min(unread, 1 s)
-        // frames.
+        // C decode.c:103 `_checkfade(false)`: down over the last min(unread, 1
+        // s) frames.
         assert_ne!(p.fade.state(), FadeState::Inactive);
         assert_eq!(p.fade.dir(), FadeDir::Down);
         let dur = p.fade.duration_frames() as usize;
@@ -6204,8 +6284,8 @@ mod tests {
 
     #[test]
     fn test_strm_s_flags_set_channel_mode_and_polarity() {
-        // C parity: slimproto.c:488-489, invert = (flags & 0x03) == 0x03, channels =
-        // (flags & 0x0c) >> 2 with MONO_LEFT 0x01, MONO_RIGHT 0x02
+        // C parity: slimproto.c:488-489, invert = (flags & 0x03) == 0x03,
+        // channels = (flags & 0x0c) >> 2 with MONO_LEFT 0x01, MONO_RIGHT 0x02
         // (squeezelite.h:663-664).
         for (flags, invert, mode) in [
             (0x00, false, ChannelMode::Stereo),
@@ -6232,7 +6312,8 @@ mod tests {
 
     #[test]
     fn test_gapless_through_the_device_pump_path() {
-        // Same engine on the device: decode and output run in the pump phases (Task 9).
+        // Same engine on the device: decode and output run in the pump phases
+        // (Task 9).
         let (t1, t2) = (track_bytes(1, 600), track_bytes(2, 400));
         let mut rig = gapless_rig(&[t1, t2]);
         rig.coord.external_audio_pump = true;
@@ -6277,7 +6358,8 @@ mod tests {
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |_, p| {
             p.track_marker().is_some()
         });
-        // Pause with the next track queued behind the boundary (strm p, interval 0).
+        // Pause with the next track queued behind the boundary (strm p,
+        // interval 0).
         now += 10;
         rig.command(&mut p, &simple_strm(b'p'), now);
         assert_eq!(rig.coord.state, PlayerState::Paused);
@@ -6329,8 +6411,8 @@ mod tests {
         });
         let lines_before = rig.sent.len();
 
-        // strm f: C output_flush_streaming drops track 2 (writep = track_start) and
-        // reports STMf because something was flushed, even though stream 2
+        // strm f: C output_flush_streaming drops track 2 (writep = track_start)
+        // and reports STMf because something was flushed, even though stream 2
         // already ended (slimproto.c:374-383, output.c:461-470).
         now += 10;
         rig.command(&mut p, &simple_strm(b'f'), now);
@@ -6410,8 +6492,8 @@ mod tests {
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
             count(&r.lines(), "STAT:STMd") == 2
         });
-        // Boundary position in sink frames: frames played so far plus the frames ahead
-        // of it.
+        // Boundary position in sink frames: frames played so far plus the
+        // frames ahead of it.
         let boundary_at = |p: &GaplessPipeline<'_>| {
             p.sink.samples.len() / 2 + p.track_marker().unwrap().bytes_ahead as usize / 8
         };
@@ -6422,14 +6504,14 @@ mod tests {
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
             count(&r.lines(), "STAT:STMd") == 3
         });
-        // One pending boundary (C output.track_start): track 3's start replaced track
-        // 2's.
+        // One pending boundary (C output.track_start): track 3's start replaced
+        // track 2's.
         assert_eq!(boundary_at(&p), first + 50);
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
             count(&r.lines(), "STAT:STMu") == 1
         });
-        // strm s never flushes outputbuf, so track 2's audio still plays (C), but only
-        // one track start is reported after track 1's: track 3's.
+        // strm s never flushes outputbuf, so track 2's audio still plays (C),
+        // but only one track start is reported after track 1's: track 3's.
         let mut expected = track_samples(1, 600);
         expected.extend(track_samples(2, 50));
         expected.extend(track_samples(3, 80));
@@ -6462,8 +6544,8 @@ mod tests {
         assert_eq!(rig.coord.current_sample_rate, 48_000);
         assert_eq!(p.sink.rate, 48_000);
 
-        // C output.c:128-148: 441 silent frames at 44.1 kHz before the boundary, 480 at
-        // 48 kHz after it.
+        // C output.c:128-148: 441 silent frames at 44.1 kHz before the
+        // boundary, 480 at 48 kHz after it.
         let (first_half, second_half) = (441, 480);
         let mut expected = track_samples(1, 600);
         expected.extend(std::iter::repeat_n(0, (first_half + second_half) * 2));
@@ -6689,7 +6771,8 @@ mod tests {
         rig.coord.current_sample_rate = 40_000;
         pipeline.frames_played = 10_000;
 
-        // Trigger a heartbeat query (`strm 't'`) with 2_000 frames still in DMA.
+        // Trigger a heartbeat query (`strm 't'`) with 2_000 frames still in
+        // DMA.
         rig.lms.inject_frame(&simple_strm(b't')).unwrap();
         rig.coord
             .tick(&mut rig.lms, &mut rig.src, &mut backend, &mut pipeline, 500)
@@ -6701,7 +6784,8 @@ mod tests {
         let stat_payload = &rig.sent[0].1;
         // STAT payload layout (after 8-byte frame header):
         // [37..41] elapsed_seconds, [43..47] elapsed_ms.
-        // 8_000 frames at 40_000 Hz = 0 s, 200 ms (vs 250 ms without DMA subtraction).
+        // 8_000 frames at 40_000 Hz = 0 s, 200 ms (vs 250 ms without DMA
+        // subtraction).
         let elapsed_secs = u32::from_be_bytes(stat_payload[37..41].try_into().unwrap());
         let elapsed_ms = u32::from_be_bytes(stat_payload[43..47].try_into().unwrap());
         assert_eq!(elapsed_secs, 0);
@@ -6724,15 +6808,17 @@ mod tests {
         assert_eq!(rig.backend.rate, 44_100);
         assert!(p.output_buffer_available() > 0);
 
-        // Track 2 (`48 kHz`, `b'4'`) arrives while Track 1 is still in `output_buffer`.
-        // Hardware rate switch MUST be deferred until the TrackMarker is crossed.
+        // Track 2 (`48 kHz`, `b'4'`) arrives while Track 1 is still in
+        // `output_buffer`. Hardware rate switch MUST be deferred until the
+        // TrackMarker is crossed.
         now += 10;
         rig.command(&mut p, &strm_start(2, b'4', true), now);
         assert_eq!(rig.coord.pending_rate, Some(48_000));
         assert_eq!(rig.backend.rate, 44_100);
         assert_eq!(rig.coord.current_sample_rate, 44_100);
 
-        // Drain until Track 2 crosses the boundary (`STMs` #2) and finishes (`STMu`).
+        // Drain until Track 2 crosses the boundary (`STMs` #2) and finishes
+        // (`STMu`).
         run_until(&mut rig, &mut p, &mut now, &mut stms_at, |r, _| {
             count(&r.lines(), "STAT:STMu") == 1
         });
@@ -6776,8 +6862,8 @@ mod tests {
         let mut output_storage = [0u8; 1024];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // Send `eqlz` with 10 signed i8 gains, including out-of-range values (+20, -18)
-        // that must clamp to [-12.0, +12.0].
+        // Send `eqlz` with 10 signed i8 gains, including out-of-range values
+        // (+20, -18) that must clamp to [-12.0, +12.0].
         let eqlz_payload: [u8; 10] = [
             20i8 as u8,
             -18i8 as u8,
@@ -6797,7 +6883,8 @@ mod tests {
             [12.0, -12.0, 6.0, -4.0, 0.0, 3.0, -2.0, 5.0, 8.0, -10.0]
         );
 
-        // Reset base EQ to flat, enable loudness level 10, and lower volume via `audg`.
+        // Reset base EQ to flat, enable loudness level 10, and lower volume via
+        // `audg`.
         rig.command(&mut pipeline, &server_frame(b"eqlz", &[0u8; 10]), 20);
         assert!(!pipeline.equalizer.is_enabled());
         rig.command(&mut pipeline, &server_frame(b"loud", &[10u8]), 30);
@@ -6814,7 +6901,8 @@ mod tests {
         let mut output_storage = [0u8; 4096];
         let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
 
-        // 1. Verified rate (44.1 kHz, code `b'3'`) with no cap: resampler NOT engaged.
+        // 1. Verified rate (44.1 kHz, code `b'3'`) with no cap: resampler NOT
+        // engaged.
         rig.command(&mut pipeline, &strm_start(1, b'3', true), 10);
         assert!(!pipeline.is_resampler_engaged());
         assert_eq!(rig.backend.rate, 44_100);
@@ -6828,8 +6916,8 @@ mod tests {
         assert_eq!(rig.backend.rate, 48_000);
         assert_eq!(rig.coord.current_sample_rate, 48_000);
 
-        // 3. Unverified rate (384 kHz, code `b'>'`) with `resampler_enabled = true`:
-        //    resampler engages and targets 48 kHz!
+        // 3. Unverified rate (384 kHz, code `b'>'`) with `resampler_enabled =
+        // true`: resampler engages and targets 48 kHz!
         rig.command(&mut pipeline, &simple_strm(b'q'), 40);
         rig.coord.set_max_sample_rate(0);
         rig.coord.set_resampler_enabled(true);
@@ -7064,5 +7152,257 @@ mod tests {
 
         verify_ogg_1728_pump(b'o', VORBIS_OGG, 22_080, 44_100);
         verify_ogg_1728_pump(b'u', OPUS_OGG, 24_648, 48_000);
+    }
+
+    #[test]
+    fn test_end_external_playback_promotes_suspended_source() {
+        let mut rig = gapless_rig(&[track_bytes(1, 32)]);
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+
+        rig.coord.current_format = Some(AudioFormat::Flac);
+        assert!(rig.coord.request_source(AudioSource::SlimProto));
+        assert!(rig.coord.request_source(AudioSource::Spotify));
+        assert!(rig.coord.request_source(AudioSource::AirPlay));
+        rig.coord
+            .begin_external_playback_with_pipeline(&mut pipeline);
+        pipeline.ingest_stream_data(&[0x55; 32]).unwrap();
+
+        // Releasing AirPlay promotes suspended Spotify: stay Playing and keep
+        // the external PCM pipeline untouched.
+        rig.coord.end_external_playback_and_restore(&mut pipeline);
+        assert!(rig.coord.external_playback);
+        assert_eq!(rig.coord.active_source(), AudioSource::Spotify);
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+        assert_eq!(pipeline.stream_buffer.available_read(), 32);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Pcm(_)));
+
+        // Releasing Spotify ends external playback and restores LMS decoder.
+        rig.coord.end_external_playback_and_restore(&mut pipeline);
+        assert!(!rig.coord.external_playback);
+        assert_eq!(rig.coord.active_source(), AudioSource::SlimProto);
+        assert_eq!(rig.coord.state, PlayerState::Stopped);
+        assert_eq!(pipeline.stream_buffer.available_read(), 0);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+    }
+
+    #[test]
+    fn test_take_cyd_message_skips_empty_metadata() {
+        let mut coord = PlayerCoordinator::new([0x71; 6], "CydQueue");
+        assert!(
+            coord.cyd_queue.push_back(CydNote::Metadata).is_ok(),
+            "enqueue Metadata"
+        );
+        assert!(
+            coord
+                .cyd_queue
+                .push_back(CydNote::State(PlayState::Playing))
+                .is_ok(),
+            "enqueue State"
+        );
+        assert!(
+            coord.cyd_queue.push_back(CydNote::Volume(42)).is_ok(),
+            "enqueue Volume"
+        );
+
+        assert_eq!(
+            coord.take_cyd_message(),
+            Some(CydMessage::PlaybackState(PlayState::Playing))
+        );
+        assert_eq!(coord.take_cyd_message(), Some(CydMessage::Volume(42)));
+        assert_eq!(coord.take_cyd_message(), None);
+    }
+
+    #[test]
+    fn test_pump_decode_drains_buffered_decoder_at_eof() {
+        const FLAC_FIXTURE: &[u8] =
+            include_bytes!("../../squeezelite-decoders/tests/fixtures/stereo_16bit.flac");
+        let mut rig = Rig::with_source(
+            [0x72; 6],
+            "FlacEof",
+            GatedSource::new(b"/stream.mp3", SHORT_STREAM),
+        );
+        let mut stream_storage = vec![0u8; 16_384];
+        let mut output_storage = vec![0u8; 1 << 17];
+        let mut pipeline = gapless_pipeline(&mut stream_storage, &mut output_storage);
+        rig.coord.external_audio_pump = true;
+        rig.src.hold_data = true;
+        rig.command(&mut pipeline, &strm_frame_fmt(b'f', true, 9000), 10);
+        assert!(matches!(pipeline.decoder, ActiveDecoder::Flac(_)));
+
+        pipeline.ingest_stream_data(FLAC_FIXTURE).unwrap();
+        rig.tick(&mut pipeline, 20).unwrap();
+        assert_eq!(rig.coord.state, PlayerState::Playing);
+
+        let mut iters = 0usize;
+        while pipeline.stream_buffer.available_read() > 0 || pipeline.has_pending_pcm() {
+            let decoded = rig.coord.pump_decode(&mut pipeline, 16);
+            let written = rig.coord.pump_output(&mut pipeline, 16);
+            iters += 1;
+            assert!(iters < 128);
+            if decoded == 0 && written == 0 {
+                break;
+            }
+        }
+        assert_eq!(pipeline.stream_buffer.available_read(), 0);
+
+        // Mark EOF with empty stream ring: pump_decode must still signal EOF
+        // and drain any remaining buffered frames before stopping cleanly.
+        rig.coord.stream_eof = true;
+        for _ in 0..16 {
+            let decoded = rig.coord.pump_decode(&mut pipeline, 16);
+            let _ = rig.coord.pump_output(&mut pipeline, 16);
+            if decoded == 0 && !pipeline.has_pending_pcm() {
+                break;
+            }
+        }
+        assert!(!rig.coord.decode_failed);
+        assert_eq!(rig.coord.pump_decode(&mut pipeline, 16), 0);
+        let _ = rig.coord.pump_output(&mut pipeline, 64);
+        assert!(pipeline.frames_played > 0);
+        assert!(pipeline.sink.samples.iter().any(|&s| s != 0));
+    }
+
+    #[test]
+    fn test_build_http_request_sanitizes_and_bounds() {
+        assert_eq!(
+            PlayerCoordinator::build_http_request(b""),
+            DEFAULT_HTTP_REQUEST
+        );
+        assert_eq!(
+            PlayerCoordinator::build_http_request(b"\0\0"),
+            DEFAULT_HTTP_REQUEST
+        );
+
+        let smuggled = b"GET /a HTTP/1.0\r\nHost: lms\r\n\r\nGET /evil\r\n\r\n";
+        assert_eq!(
+            PlayerCoordinator::build_http_request(smuggled),
+            b"GET /a HTTP/1.0\r\nHost: lms\r\n\r\n"
+        );
+
+        let with_nul = b"GET /a\0 HTTP/1.0\r\nHost: lms";
+        assert_eq!(
+            PlayerCoordinator::build_http_request(with_nul),
+            b"GET /a HTTP/1.0\r\nHost: lms\r\n\r\n"
+        );
+
+        // UTF-8 payload > 2048 bytes with multi-byte char straddling 2048.
+        let mut oversized = "a".repeat(2047);
+        oversized.push('é');
+        oversized.push_str("tail");
+        let built = PlayerCoordinator::build_http_request(oversized.as_bytes());
+        assert_eq!(built.len(), 2047 + 4);
+        assert!(built.ends_with(b"\r\n\r\n"));
+
+        // Non-UTF-8 payload keeps 1024-byte cap and `?` fallback.
+        let mut latin1 = vec![0xE9u8; 1200];
+        latin1[0] = b'G';
+        let built_latin1 = PlayerCoordinator::build_http_request(&latin1);
+        assert_eq!(built_latin1.len(), 1024 + 4);
+        assert_eq!(built_latin1[0], b'G');
+        assert!(built_latin1[1..1024].iter().all(|&b| b == b'?'));
+    }
+
+    #[test]
+    fn test_evaluate_state_preserves_disconnect_ok_while_awaiting_cont() {
+        let mut rig = Rig::with_source(
+            [0x73; 6],
+            "ContEof",
+            GatedSource::new(b"/stream.mp3", SHORT_STREAM),
+        );
+        let mut stream_storage = [0u8; 2048];
+        let mut output_storage = [0u8; 2048];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        rig.src.hold_data = true;
+
+        // Autostart mode 2 waits for `cont` before decoding.
+        rig.command(
+            &mut pipeline,
+            &strm_full(b's', b'2', b'p', 1, 0, 9000, [127, 0, 0, 1]),
+            10,
+        );
+        pipeline.ingest_stream_data(TWO_FRAMES).unwrap();
+        rig.coord.stream_eof = true;
+        rig.coord.disconnect_ok_unseen = true;
+        for t in 0..5 {
+            rig.tick(&mut pipeline, 20 + t).unwrap();
+        }
+        assert!(rig.coord.is_stream_eof());
+        assert!(rig.coord.awaiting_cont);
+        assert!(rig.coord.decode_ready);
+        assert!(rig.coord.disconnect_ok_unseen);
+        assert_eq!(pipeline.frames_played, 0);
+
+        // Once `cont` and `strm u` arrive, the preserved `DISCONNECT_OK`
+        // starts decode even below the 1 KiB threshold.
+        rig.command(
+            &mut pipeline,
+            &server_frame(b"cont", &0u32.to_be_bytes()),
+            30,
+        );
+        rig.command(&mut pipeline, &simple_strm(b'u'), 31);
+        for t in 0..5 {
+            rig.tick(&mut pipeline, 40 + t).unwrap();
+        }
+        assert!(!rig.coord.awaiting_cont);
+        assert!(!rig.coord.decode_ready);
+        assert!(!rig.coord.disconnect_ok_unseen);
+        assert!(pipeline.frames_played > 0);
+    }
+
+    #[test]
+    fn test_handle_cyd_command_stopped_and_pause_sync() {
+        let mut coord = PlayerCoordinator::new([0x74; 6], "CydStop");
+        let mut stream_storage = [0u8; 1024];
+        let mut output_storage = [0u8; 1024];
+        let mut pipeline = pcm_pipeline(&mut stream_storage, &mut output_storage);
+        let mut backend = MockBackend::new();
+
+        pipeline.sink.set_mute(true);
+        backend.set_mute(true);
+        assert_eq!(coord.state, PlayerState::Disconnected);
+
+        for cmd in [CydCommand::Play, CydCommand::Pause, CydCommand::Toggle] {
+            assert_eq!(
+                coord.handle_cyd_command(cmd, &mut backend, &mut pipeline),
+                Some(CydMessage::PlaybackState(PlayState::Stopped))
+            );
+            assert_eq!(coord.state, PlayerState::Disconnected);
+            assert!(pipeline.sink.muted);
+            assert!(backend.muted);
+        }
+
+        coord.state = PlayerState::Stopped;
+        assert_eq!(
+            coord.handle_cyd_command(CydCommand::Play, &mut backend, &mut pipeline),
+            Some(CydMessage::PlaybackState(PlayState::Stopped))
+        );
+        assert_eq!(coord.state, PlayerState::Stopped);
+        assert!(pipeline.sink.muted);
+        assert!(backend.muted);
+
+        assert_eq!(
+            coord.handle_cyd_command(CydCommand::Pause, &mut backend, &mut pipeline),
+            Some(CydMessage::PlaybackState(PlayState::Stopped))
+        );
+        assert_eq!(coord.state, PlayerState::Stopped);
+
+        assert_eq!(
+            coord.handle_cyd_command(CydCommand::Toggle, &mut backend, &mut pipeline),
+            Some(CydMessage::PlaybackState(PlayState::Stopped))
+        );
+        assert_eq!(coord.state, PlayerState::Stopped);
+        assert!(pipeline.sink.muted);
+        assert!(backend.muted);
+
+        coord.state = PlayerState::Paused;
+        assert_eq!(
+            coord.handle_cyd_command(CydCommand::Play, &mut backend, &mut pipeline),
+            Some(CydMessage::PlaybackState(PlayState::Playing))
+        );
+        assert_eq!(coord.state, PlayerState::Playing);
+        assert!(!pipeline.sink.muted);
+        assert!(!backend.muted);
     }
 }

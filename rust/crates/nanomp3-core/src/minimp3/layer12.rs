@@ -21,13 +21,20 @@ struct SubbandAlloc {
 }
 
 const fn alloc(tab_offset: u8, code_tab_width: u8, band_count: u8) -> SubbandAlloc {
-    SubbandAlloc { tab_offset, code_tab_width, band_count }
+    SubbandAlloc {
+        tab_offset,
+        code_tab_width,
+        band_count,
+    }
 }
 
 static G_ALLOC_L1: [SubbandAlloc; 1] = [alloc(76, 4, 32)];
 static G_ALLOC_L2M2: [SubbandAlloc; 3] = [alloc(60, 4, 4), alloc(44, 3, 7), alloc(44, 2, 19)];
 static G_ALLOC_L2M1: [SubbandAlloc; 4] = [
-    alloc(0, 4, 3), alloc(16, 4, 8), alloc(32, 3, 12), alloc(40, 2, 7),
+    alloc(0, 4, 3),
+    alloc(16, 4, 8),
+    alloc(32, 3, 12),
+    alloc(40, 2, 7),
 ];
 static G_ALLOC_L2M1_LOWRATE: [SubbandAlloc; 2] = [alloc(44, 4, 2), alloc(44, 3, 10)];
 
@@ -91,7 +98,10 @@ fn l12_subband_alloc_table(hdr: Header, sci: &mut ScaleInfo) -> &'static [Subban
             kbps = 192; // free-format
         }
         if kbps < 56 {
-            (&G_ALLOC_L2M1_LOWRATE, if sample_rate_idx == 2 { 12 } else { 8 })
+            (
+                &G_ALLOC_L2M1_LOWRATE,
+                if sample_rate_idx == 2 { 12 } else { 8 },
+            )
         } else if kbps >= 96 && sample_rate_idx != 1 {
             (&G_ALLOC_L2M1, 30)
         } else {
@@ -108,7 +118,11 @@ fn l12_read_scalefactors(bs: &mut Bs, sci: &mut ScaleInfo, bands: usize) {
     for i in 0..bands {
         let mut s = 0.0;
         let ba = sci.bitalloc[i] as usize;
-        let mask = if ba != 0 { 4 + ((19 >> sci.scfcod[i]) & 3) } else { 0 };
+        let mask = if ba != 0 {
+            4 + ((19 >> sci.scfcod[i]) & 3)
+        } else {
+            0
+        };
         for (j, m) in [4, 2, 1].into_iter().enumerate() {
             if mask & m != 0 {
                 let b = bs.get_bits(6) as usize;
@@ -240,8 +254,7 @@ pub(super) fn decode_frame<S: Sample>(
     let mut i = 0;
     let mut out = 0;
     for igr in 0..3 {
-        let Ok(grbuf): Result<&mut [f32; 1152], _> =
-            scratch.grbuf.as_flattened_mut().try_into()
+        let Ok(grbuf): Result<&mut [f32; 1152], _> = scratch.grbuf.as_flattened_mut().try_into()
         else {
             return 0;
         };

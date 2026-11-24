@@ -163,9 +163,11 @@ impl RtpHeader {
 pub struct RtpSyncPacket {
     /// True if the extension bit (`0x10` in byte 0) indicates initial sync.
     pub is_first_sync: bool,
-    /// Control flags in bytes `2..4` (e.g. `4` or `7` adds 11,025 sample delay).
+    /// Control flags in bytes `2..4` (e.g. `4` or `7` adds 11,025 sample
+    /// delay).
     pub flags: u16,
-    /// RTP timestamp currently playing at the receiver DAC (`rtp_now - latency`).
+    /// RTP timestamp currently playing at the receiver DAC
+    /// (`rtp_now - latency`).
     pub rtp_timestamp_latency: u32,
     /// Upper 32 bits of the sender's 64-bit NTP clock (seconds).
     pub ntp_seconds: u32,

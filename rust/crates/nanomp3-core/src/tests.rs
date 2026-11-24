@@ -21,7 +21,7 @@ fn measure_length_of_march() {
             n += frame_info.samples_produced;
         }
     }
-    
+
     assert_eq!(n, 243072);
 }
 #[test]
@@ -81,8 +81,14 @@ fn decode_errors() {
     let mut pcm = [0f32; MAX_SAMPLES_PER_FRAME];
 
     // Nothing, and junk, are consumed whole.
-    assert_eq!(decoder.decode(&[], &mut pcm), (0, Err(DecodeError::NoFrame)));
-    assert_eq!(decoder.decode(&[0x55; 1000], &mut pcm), (1000, Err(DecodeError::NoFrame)));
+    assert_eq!(
+        decoder.decode(&[], &mut pcm),
+        (0, Err(DecodeError::NoFrame))
+    );
+    assert_eq!(
+        decoder.decode(&[0x55; 1000], &mut pcm),
+        (1000, Err(DecodeError::NoFrame))
+    );
 
     // Starting mid-stream, the first frames can't be decoded until the bit
     // reservoir has been filled; they're still identified.
@@ -97,7 +103,10 @@ fn decode_errors() {
                 break;
             }
             Err(DecodeError::ReservoirUnavailable(info)) => {
-                assert_eq!((info.layer, info.sample_rate, info.samples_produced), (3, 48000, 0));
+                assert_eq!(
+                    (info.layer, info.sample_rate, info.samples_produced),
+                    (3, 48000, 0)
+                );
                 reservoir_misses += 1;
             }
             Err(e) => panic!("unexpected {e:?}"),

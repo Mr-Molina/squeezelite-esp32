@@ -4129,6 +4129,7 @@ mod tests {
         );
 
         let mut coordinator = PlayerCoordinator::new([0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01], "Test");
+        coordinator.state = PlayerState::Paused;
         let mut cyd_bridge = CydUartBridge::new(LoopbackUartPort::new());
         let mut amp = AmpManager::for_active_board(TargetI2cBus::new());
         amp.initialize(32).unwrap();
@@ -4164,6 +4165,7 @@ mod tests {
             I2cTrans::write(addr, vec![registers::PAGE_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::BOOK_SELECT, 0x00]),
             I2cTrans::write(addr, vec![registers::FAULT_CLEAR, 0x80]),
+            I2cTrans::write_read(addr, vec![registers::SAP_CTRL_1], vec![0x00]),
             I2cTrans::write(addr, vec![registers::SAP_CTRL_1, 0x03]),
             // configure_silicon_maximization(0x08)
             I2cTrans::write(addr, vec![registers::DEVICE_CTRL_1, 0x02]),
