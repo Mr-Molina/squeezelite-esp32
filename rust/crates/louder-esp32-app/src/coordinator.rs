@@ -60,7 +60,7 @@ pub const HELO_MODEL_NAME: &str = "SqueezeESP32";
 
 /// Codecs advertised in `HELO`: exactly the formats the firmware decodes (Phase
 /// 2 adds more).
-pub const HELO_CODECS: &str = "flc,pcm,wav,aif,mp3";
+pub const HELO_CODECS: &str = "flc,pcm,wav,aif,mp3,aac";
 
 /// `Firmware` advertised in `HELO` (C: `VERSION`, `squeezelite.h:31-35`).
 pub const HELO_FIRMWARE: &str = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -4639,7 +4639,7 @@ mod tests {
                 "Model=squeezeesp32,AccuratePlayPoints=1,",
                 "HasPolarityInversion=1,Balance=1,Depth=32,Firmware=v",
                 env!("CARGO_PKG_VERSION"),
-                ",ModelName=SqueezeESP32,MaxSampleRate=192000,flc,pcm,wav,aif,mp3"
+                ",ModelName=SqueezeESP32,MaxSampleRate=192000,flc,pcm,wav,aif,mp3,aac"
             )
         );
         assert!(caps.contains(&format!(
